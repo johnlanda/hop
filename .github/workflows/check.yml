@@ -1,0 +1,46 @@
+# Runs the same `make check` developers run, once per supported OS/architecture.
+#
+# Every entry of the supported matrix has a GitHub-hosted runner of that exact
+# OS and architecture, so every entry runs the full gate natively and is
+# test-verified. An entry without a native runner would be listed in a separate
+# cross-compile job and labeled build-verified only; there is none today.
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: make check (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux/amd64
+            runner: ubuntu-24.04
+          - target: darwin/arm64
+            runner: macos-15
+          - target: darwin/amd64
+            runner: macos-15-intel
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Confirm the runner is the matrix target
+        run: |
+          actual="$(go env GOOS)/$(go env GOARCH)"
+          test "$actual" = "${{ matrix.target }}" || { echo "runner is $actual, not ${{ matrix.target }}"; exit 1; }
+      - name: Report the toolchain
+        run: go version
+      - name: make check
+        run: make check
+      - name: make build
+        run: make build && .bin/hop version

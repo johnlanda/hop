@@ -1,7 +1,10 @@
 # HOP engineering plan
 
 These are required implementation standards and proposed validation mechanisms.
-No build targets or tests described here exist yet.
+The Phase 0 bootstrap implements the build targets, the architecture and guide
+checkers and the lint configuration; [internal/AGENTS.md](../../internal/AGENTS.md)
+and the root guide describe exactly what exists. Sections below still describe
+the intended design where it goes beyond the implemented slice.
 
 ## Reference assessment
 

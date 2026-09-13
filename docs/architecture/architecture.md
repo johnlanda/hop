@@ -5,7 +5,10 @@
 Confirmed: Go, hexagonal architecture, DDD, strictly inward dependencies enforced
 by tests, table-driven testing, declarative comments, strict linting and
 progressive package guides. The package layout and entity boundaries below are
-proposed. No Go implementation or executable architecture checks exist yet.
+proposed. Implemented so far: the `cmd/hop` composition root with a version
+command and the `internal` checker package that enforces the import direction
+(see [internal/AGENTS.md](../../internal/AGENTS.md)); no domain, application or
+adapter package exists yet.
 
 HOP is one local application with several domain modules, not a set of services.
 Herdr provides agent terminals and runtime observations. HOP provides durable

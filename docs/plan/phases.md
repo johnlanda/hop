@@ -1,7 +1,8 @@
 # HOP phased implementation
 
-Status: proposed sequence. HOP currently contains planning documents; none of these
-implementation phases is complete. Commands below describe the intended interface.
+Status: proposed sequence. Phase 0 is implemented on the engineering-foundation
+branch (module, `hop version`, `make check`, checkers, guides, CI); later phases
+are not started. Commands below describe the intended interface.
 
 ## Delivery strategy
 
