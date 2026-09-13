@@ -171,8 +171,10 @@ type ruleTable map[string]rule
 // A new package fails the architecture check until it has an entry here.
 func productionRules() ruleTable {
 	return ruleTable{
-		"cmd/hop":  {category: categoryComposition},
-		"internal": {category: categoryArchitectureTest},
+		"cmd/hop":                 {category: categoryComposition, firstParty: []string{"internal/app", "internal/adapters/herdr"}},
+		"internal":                {category: categoryArchitectureTest},
+		"internal/app":            {category: categoryApplication},
+		"internal/adapters/herdr": {category: categoryDrivenAdapter, firstParty: []string{"internal/app"}},
 	}
 }
 
@@ -811,7 +813,7 @@ func TestArchitectureRealTree(t *testing.T) {
 		t.Fatalf("checking %s: %v", root, err)
 	}
 
-	for _, want := range []string{"cmd/hop", "internal"} {
+	for _, want := range []string{"cmd/hop", "internal", "internal/app", "internal/adapters/herdr"} {
 		if !slices.Contains(result.packages, want) {
 			t.Errorf("the inventory does not contain %s; it found %v", want, result.packages)
 		}

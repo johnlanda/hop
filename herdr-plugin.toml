@@ -1,0 +1,31 @@
+# HOP's Herdr plugin manifest. The repository root is the plugin root: link
+# it with `herdr plugin link .` after `make build` so `.bin/hop` exists.
+# Herdr runs every command below with this directory as its working
+# directory; linked plugins never run build commands.
+id = "hop"
+name = "HOP"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Herdr Orchestrator Plugin"
+platforms = ["macos", "linux"]
+
+# Startup runs once per server start, after restore and socket readiness. It
+# records the injected invocation context in the plugin command log.
+[[startup]]
+command = [".bin/hop", "plugin-context"]
+
+[[actions]]
+id = "doctor"
+title = "HOP doctor"
+command = [".bin/hop", "doctor"]
+
+[[actions]]
+id = "show-context"
+title = "Show plugin invocation context"
+command = [".bin/hop", "plugin-context"]
+
+[[panes]]
+id = "doctor"
+title = "HOP doctor"
+placement = "split"
+command = ["/bin/sh", "-c", ".bin/hop doctor; sleep 600"]

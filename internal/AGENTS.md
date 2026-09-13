@@ -5,8 +5,8 @@
 Two roles share this directory. As a Go package, `internal` holds HOP's
 repository-wide checks: the architecture checker over import boundaries and
 the guide checker over AGENTS.md coverage. It contains test files only and is
-never imported. As a grouping directory, it is the parent of every future
-domain, application and adapter package; none exists yet.
+never imported. As a grouping directory, it is the parent of the application
+and adapter packages, and of every future domain package.
 
 ## Quick reference
 
@@ -18,9 +18,13 @@ domain, application and adapter package; none exists yet.
 
 ## Child guides
 
-None yet. The grouping directories the architecture proposes (`internal/domain`,
-`internal/adapters`) receive index guides, and packages receive leaf guides,
-in the change that creates them.
+- [internal/app](app/AGENTS.md): use cases and consumer-owned ports.
+- [internal/adapters](adapters/AGENTS.md): adapter index; currently the
+  Herdr adapter.
+
+The remaining grouping directory the architecture proposes
+(`internal/domain`) receives an index guide, and its packages receive leaf
+guides, in the change that creates them.
 
 ## Invariants
 

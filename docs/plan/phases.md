@@ -1,8 +1,10 @@
 # HOP phased implementation
 
-Status: proposed sequence. Phase 0 is implemented on the engineering-foundation
-branch (module, `hop version`, `make check`, checkers, guides, CI); later phases
-are not started. Commands below describe the intended interface.
+Status: proposed sequence. Phase 0 is implemented (module, `hop version`,
+`make check`, checkers, guides, CI). Phase 1 is in progress: backlog item 4
+(application ports, `hop doctor`, the Herdr adapter's protocol client and the
+linkable manifest) is implemented; items 5–7 are not started. Commands below
+otherwise describe the intended interface.
 
 ## Delivery strategy
 

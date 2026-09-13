@@ -1,6 +1,8 @@
 // Package main is the hop composition root. It parses the command line,
 // constructs concrete dependencies and dispatches to the selected command.
-// No business rule lives here; the only command today reports the build version.
+// No business rule lives here: version reports the build, doctor wires the
+// herdr installation probe into the application's doctor use case, and
+// plugin-context reports the plugin invocation environment.
 package main
 
 import (
@@ -41,6 +43,10 @@ func dispatch(args []string, stdout, stderr io.Writer) (int, error) {
 	switch args[0] {
 	case "version":
 		return runVersion(args[1:], stdout, stderr)
+	case "doctor":
+		return runDoctor(args[1:], stdout, stderr, os.Getenv)
+	case "plugin-context":
+		return runPluginContext(args[1:], stdout, stderr, os.Environ())
 	case "help", "-h", "-help", "--help":
 		return exitOK, printUsage(stdout)
 	default:
@@ -55,7 +61,9 @@ func dispatch(args []string, stdout, stderr io.Writer) (int, error) {
 func printUsage(w io.Writer) error {
 	_, err := fmt.Fprint(w, "Usage: hop <command> [arguments]\n\n"+
 		"Commands:\n"+
-		"  version    Print the hop build version\n"+
-		"  help       Print this usage text\n")
+		"  version         Print the hop build version\n"+
+		"  doctor          Check the Herdr installation and harness support\n"+
+		"  plugin-context  Print the Herdr plugin invocation environment\n"+
+		"  help            Print this usage text\n")
 	return err
 }

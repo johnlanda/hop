@@ -17,13 +17,19 @@ model-routing dependency.
   composition root.
 - [Internal guide](internal/AGENTS.md): HOP packages and the architecture and
   guide checkers.
+- `herdr-plugin.toml`: the Herdr plugin manifest; the repository root is the
+  linkable plugin directory and its commands run the built `.bin/hop`.
 - `repos/`: reference checkouts; HOP implementation belongs outside these trees.
 
-The repository contains the Phase 0 engineering foundation: the Go module
-`github.com/johnlanda/hop`, the `cmd/hop` composition root with a `version`
-command, the `internal` checker package, the Makefile targets, pinned lint and
-format configuration and a CI workflow. Domain, application and adapter
-packages named in the planning documents are proposed, not existing code.
+The repository contains the Phase 0 engineering foundation (the Go module
+`github.com/johnlanda/hop`, the `internal` checker package, the Makefile
+targets, pinned lint and format configuration, a CI workflow) and the first
+Phase 1 slice: the `cmd/hop` composition root with `version`, `doctor` and
+`plugin-context` commands, the application layer `internal/app` (doctor and
+plugin-invocation use cases with the `Probe` port), the Herdr adapter
+`internal/adapters/herdr` (NDJSON socket client and installation probe) and
+the linkable plugin manifest. Domain packages and the other adapters named in
+the planning documents are proposed, not existing code.
 
 ## Toolchain and gate
 
