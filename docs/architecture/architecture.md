@@ -161,7 +161,8 @@ only trigger for required work; the controller consumes durable pending operatio
 4. Implement atomic SQLite reservations and recovery tests with fake runtime ports.
 5. Connect Herdr and native account adapters; validate one complete workflow.
 
-Module hosting path, exact Go/tool versions, SQLite driver and CLI/TUI libraries
-remain implementation selections. They do not need to be chosen to review the
-inward dependency contracts. Confirm native harness credential isolation before
+The module path (`github.com/johnlanda/hop`), the Go toolchain (1.27.1) and the
+linter (golangci-lint v2.13.2) are fixed by the Phase 0 bootstrap. The SQLite
+driver and CLI/TUI libraries remain implementation selections; they do not need
+to be chosen to review the inward dependency contracts. Confirm native harness credential isolation before
 claiming cross-account resume or automatic account failover.

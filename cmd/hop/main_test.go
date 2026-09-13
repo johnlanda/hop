@@ -28,6 +28,7 @@ func TestRunReportsWriteFailuresThroughTheExitCode(t *testing.T) {
 		{name: "help cannot be written", args: []string{"help"}, stdout: failingWriter{}, stderr: io.Discard},
 		{name: "version cannot be written", args: []string{"version"}, stdout: failingWriter{}, stderr: io.Discard},
 		{name: "version argument error cannot be reported", args: []string{"version", "x"}, stdout: io.Discard, stderr: failingWriter{}},
+		{name: "version flag error cannot be reported", args: []string{"version", "-json"}, stdout: io.Discard, stderr: failingWriter{}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

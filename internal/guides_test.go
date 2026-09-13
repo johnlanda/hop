@@ -79,16 +79,56 @@ func guidePath(dir string) string {
 // markdownLinkPattern matches the target of an inline link or image.
 var markdownLinkPattern = regexp.MustCompile(`\]\(\s*<?([^)\s>]+)>?(?:\s+"[^"]*")?\s*\)`)
 
+// markdownDefinitionPattern matches a reference definition line, capturing
+// its label and target.
+var markdownDefinitionPattern = regexp.MustCompile(`(?m)^ {0,3}\[([^\]]+)\]:[ \t]*<?([^\s>]+)>?`)
+
+// markdownReferencePattern matches a full or collapsed reference use,
+// capturing its text and its label; an empty label means the text is the label.
+var markdownReferencePattern = regexp.MustCompile(`\[([^\]]+)\]\[([^\]]*)\]`)
+
 // linkSchemePattern matches a link that starts with a URL scheme.
 var linkSchemePattern = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9+.-]*:`)
 
-// markdownLinks returns the targets of every inline link in content.
+// markdownLinks returns the targets of every link in content: inline links
+// and images, and the targets of reference definitions, which is where a
+// reference-style link names its file.
 func markdownLinks(content string) []string {
 	var links []string
 	for _, match := range markdownLinkPattern.FindAllStringSubmatch(content, -1) {
 		links = append(links, match[1])
 	}
+	for _, match := range markdownDefinitionPattern.FindAllStringSubmatch(content, -1) {
+		links = append(links, match[2])
+	}
 	return links
+}
+
+// referenceLabel normalizes a reference label the way Markdown matches it:
+// case-insensitively, with runs of whitespace collapsed.
+func referenceLabel(label string) string {
+	return strings.ToLower(strings.Join(strings.Fields(label), " "))
+}
+
+// undefinedReferences returns, sorted, the labels of reference-style links
+// in content that no definition line resolves.
+func undefinedReferences(content string) []string {
+	defined := map[string]bool{}
+	for _, match := range markdownDefinitionPattern.FindAllStringSubmatch(content, -1) {
+		defined[referenceLabel(match[1])] = true
+	}
+	var undefined []string
+	for _, match := range markdownReferencePattern.FindAllStringSubmatch(content, -1) {
+		label := match[2]
+		if label == "" {
+			label = match[1]
+		}
+		if normalized := referenceLabel(label); !defined[normalized] && !slices.Contains(undefined, normalized) {
+			undefined = append(undefined, normalized)
+		}
+	}
+	slices.Sort(undefined)
+	return undefined
 }
 
 // linkResolution is the outcome of resolving one link written in a guide.
@@ -152,8 +192,8 @@ func findGuides(root string) ([]string, error) {
 
 // checkGuides inventories the Go packages below root and reports every
 // directory that must carry an AGENTS.md but does not, every guide that
-// fails to link an immediate child guide, and every local link in any
-// AGENTS.md that does not resolve.
+// fails to link an immediate child guide, every local link in any AGENTS.md
+// that does not resolve, and every reference-style link without a definition.
 func checkGuides(root string) (*guideReport, error) {
 	tree, err := walkSources(root)
 	if err != nil {
@@ -191,6 +231,9 @@ func checkGuides(root string) (*guideReport, error) {
 		}
 	}
 	for _, guide := range guides {
+		for _, label := range undefinedReferences(contents[guide]) {
+			issues = append(issues, guideIssue{guide: guide, link: "[" + label + "]", rule: "reference link has no definition"})
+		}
 		for _, link := range markdownLinks(contents[guide]) {
 			resolved := resolveLink(guide, link)
 			switch {
@@ -285,6 +328,56 @@ func TestGuidesDirectoryMap(t *testing.T) {
 
 			if !maps.EqualFunc(got, tc.want, slices.Equal) {
 				t.Errorf("guideDirectories(%v) = %v, want %v", tc.packages, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestGuidesMarkdownLinks(t *testing.T) {
+	cases := []struct {
+		name          string
+		content       string
+		wantLinks     []string
+		wantUndefined []string
+	}{
+		{
+			name:      "inline link and image",
+			content:   "See [main](main.go) and ![diagram](flow.svg \"title\").\n",
+			wantLinks: []string{"main.go", "flow.svg"},
+		},
+		{
+			name:      "reference definition is a link and resolves its uses",
+			content:   "[Internal][internal] and [internal][] and [Internal].\n\n[internal]: internal/AGENTS.md\n",
+			wantLinks: []string{"internal/AGENTS.md"},
+		},
+		{
+			name:      "definition in angle brackets with a title",
+			content:   "[docs]: <docs/AGENTS.md> \"Docs\"\n",
+			wantLinks: []string{"docs/AGENTS.md"},
+		},
+		{
+			name:          "reference use without a definition",
+			content:       "[Missing][missing] and [Other Thing][]\n",
+			wantUndefined: []string{"missing", "other thing"},
+		},
+		{
+			name:    "labels match case-insensitively with collapsed whitespace",
+			content: "[x][Package  Guide]\n\n[package guide]: AGENTS.md\n",
+			wantLinks: []string{
+				"AGENTS.md",
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			links := markdownLinks(tc.content)
+			undefined := undefinedReferences(tc.content)
+
+			if !slices.Equal(links, tc.wantLinks) {
+				t.Errorf("markdownLinks = %q, want %q", links, tc.wantLinks)
+			}
+			if !slices.Equal(undefined, tc.wantUndefined) {
+				t.Errorf("undefinedReferences = %q, want %q", undefined, tc.wantUndefined)
 			}
 		})
 	}
@@ -394,6 +487,20 @@ func TestGuidesFixtures(t *testing.T) {
 			name:       "broken local link",
 			files:      map[string]string{"cmd/hop/AGENTS.md": "# cmd/hop\n\n[wire.go](wire.go) and the [parent](../AGENTS.md).\n"},
 			wantIssues: []string{"cmd/hop/AGENTS.md: wire.go: broken local link"},
+		},
+		{
+			name:       "broken reference-style link",
+			files:      map[string]string{"cmd/hop/AGENTS.md": "# cmd/hop\n\n[main.go](main.go), the [parent](../AGENTS.md) and [Missing][missing].\n\n[missing]: nonexistent.md\n"},
+			wantIssues: []string{"cmd/hop/AGENTS.md: nonexistent.md: broken local link"},
+		},
+		{
+			name:  "child link written as a reference",
+			files: map[string]string{"AGENTS.md": "# root\n\n- [Commands][cmd]\n- [Internal][]\n\n[cmd]: cmd/AGENTS.md\n[internal]: internal/AGENTS.md\n"},
+		},
+		{
+			name:       "reference link without a definition",
+			files:      map[string]string{"cmd/hop/AGENTS.md": "# cmd/hop\n\n[main.go](main.go), the [parent](../AGENTS.md) and [Wiring][wiring].\n"},
+			wantIssues: []string{"cmd/hop/AGENTS.md: [wiring]: reference link has no definition"},
 		},
 		{
 			name:       "absolute link",

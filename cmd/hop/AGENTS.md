@@ -12,13 +12,15 @@ only command is `hop version`.
 | File | Entities / functions | Responsibility |
 | --- | --- | --- |
 | [main.go](main.go) | `main`, `run`, `dispatch`, `printUsage`, `exitOK`, `exitFailure`, `exitUsage` | Entry point; maps a command name to its handler and a failed write to `exitFailure` |
-| [version.go](version.go) | `version`, `devVersion`, `runVersion`, `resolveVersion`, `shortRevision` | `hop version`: prints the resolved version with the Go version and platform of the build |
+| [version.go](version.go) | `version`, `devVersion`, `recordingWriter`, `runVersion`, `resolveVersion`, `shortRevision` | `hop version`: prints the resolved version with the Go version and platform of the build; flag diagnostics pass through `recordingWriter` so their write failures are reported too |
 | [main_test.go](main_test.go) | `TestRun`, `TestRunReportsWriteFailuresThroughTheExitCode`, `TestResolveVersion` | Table-driven behavior of dispatch, exit codes and version precedence |
 
 ## Invariants
 
 - Exit codes: 0 success, 1 a write to stdout or stderr failed, 2 usage error.
-  Usage text goes to stderr on an error and to stdout for `help`.
+  Usage text goes to stderr on an error and to stdout for `help`. A write
+  failure takes precedence over a usage error, including when the failed
+  write is a flag diagnostic produced while parsing.
 - Version precedence: a value stamped with `-ldflags "-X main.version=..."`,
   then the main module version recorded in build information, then
   `devel+<revision>` (suffixed `.modified` for a dirty tree), then `devel`.

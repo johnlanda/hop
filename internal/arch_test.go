@@ -267,17 +267,48 @@ func compareDiagnostics(a, b diagnostic) int {
 
 // listedModule is the module metadata `go list -json` attaches to a package.
 type listedModule struct {
-	Path string
-	Main bool
+	Path    string
+	Main    bool
+	Dir     string
+	Replace *listedModule
+}
+
+// listedError is a load error the go tool attaches to a package listed
+// with -e instead of failing the listing.
+type listedError struct {
+	ImportStack []string
+	Pos         string
+	Err         string
 }
 
 // listedPackage is the subset of `go list -json` output the checker uses.
+// Dir is where the package's files physically live, which for a replaced
+// module can be inside the checked tree.
 type listedPackage struct {
 	ImportPath string
+	Dir        string
 	Standard   bool
 	ForTest    string
 	Module     *listedModule
 	Deps       []string
+	Error      *listedError
+	DepsErrors []listedError
+}
+
+// isBuildConstraintExclusion reports whether a load error only says that no
+// file of an existing package is selected on this host. Such a package is
+// not unresolved: the build matrix compiles it where its constraints apply.
+func isBuildConstraintExclusion(err string) bool {
+	return strings.Contains(err, "build constraints exclude all Go files")
+}
+
+// resolvedPath returns p with symbolic links evaluated, or p itself when
+// they cannot be.
+func resolvedPath(p string) string {
+	if resolved, err := filepath.EvalSymlinks(p); err == nil {
+		return resolved
+	}
+	return p
 }
 
 // goList runs `go list -json` with args in dir and decodes every package it
@@ -330,9 +361,24 @@ const (
 // checker evaluates one module tree against a rule table using both
 // inventories: the parsed source files and the go tool's package listing.
 type checker struct {
-	tree  *sourceTree
-	table ruleTable
-	index map[string]*listedPackage
+	tree         *sourceTree
+	table        ruleTable
+	index        map[string]*listedPackage
+	resolvedRoot string // tree root with symbolic links evaluated, for comparing against go list directories
+}
+
+// excludedRoot returns the excluded tree a listed package is physically
+// rooted in, such as a module replaced into repos/, or "" when the package
+// lives outside the checked tree or inside its scanned part.
+func (c *checker) excludedRoot(pkg *listedPackage) string {
+	if pkg == nil || pkg.Dir == "" {
+		return ""
+	}
+	rel, err := filepath.Rel(c.resolvedRoot, resolvedPath(pkg.Dir))
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return ""
+	}
+	return excludedComponent(filepath.ToSlash(rel))
 }
 
 // report is the outcome of checking one module tree.
@@ -358,12 +404,14 @@ func checkTree(ctx context.Context, root string, table ruleTable) (*report, erro
 	if err != nil {
 		return nil, err
 	}
-	c := &checker{tree: tree, table: table, index: indexListing(listing)}
-	if err := c.resolveUnlistedImports(ctx); err != nil {
+	c := &checker{tree: tree, table: table, index: indexListing(listing), resolvedRoot: resolvedPath(root)}
+	loadDiagnostics, err := c.resolveUnlistedImports(ctx)
+	if err != nil {
 		return nil, err
 	}
 	packages := slices.Sorted(maps.Keys(tree.packages))
 	var diagnostics []diagnostic
+	diagnostics = append(diagnostics, loadDiagnostics...)
 	diagnostics = append(diagnostics, c.checkInventoryAgreement()...)
 	diagnostics = append(diagnostics, c.checkRuleCoverage()...)
 	for _, pkg := range packages {
@@ -383,8 +431,10 @@ func checkTree(ctx context.Context, root string, table ruleTable) (*report, erro
 
 // resolveUnlistedImports classifies the imports the source walk found that
 // the main listing did not reach, such as imports in build-constrained files
-// the host never compiles.
-func (c *checker) resolveUnlistedImports(ctx context.Context) error {
+// the host never compiles. The listing runs with -e so that one unresolvable
+// import does not hide the others; the load errors it records are returned
+// as diagnostics at every file that imports the affected package.
+func (c *checker) resolveUnlistedImports(ctx context.Context) ([]diagnostic, error) {
 	seen := map[string]bool{}
 	var unlisted []string
 	for _, files := range c.tree.packages {
@@ -401,19 +451,61 @@ func (c *checker) resolveUnlistedImports(ctx context.Context) error {
 		}
 	}
 	if len(unlisted) == 0 {
-		return nil
+		return nil, nil
 	}
 	slices.Sort(unlisted)
 	extra, err := goList(ctx, c.tree.root, append([]string{"-e"}, unlisted...)...)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	var diagnostics []diagnostic
 	for i := range extra {
-		if _, ok := c.index[extra[i].ImportPath]; !ok {
-			c.index[extra[i].ImportPath] = &extra[i]
+		pkg := &extra[i]
+		if _, ok := c.index[pkg.ImportPath]; !ok {
+			c.index[pkg.ImportPath] = pkg
+		}
+		diagnostics = append(diagnostics, c.loadDiagnostics(pkg)...)
+	}
+	return diagnostics, nil
+}
+
+// loadDiagnostics reports, at every file importing pkg, the load errors the
+// go tool attached to it: an import it cannot resolve, or a dependency of
+// that import it cannot load. A package whose files are all excluded by
+// build constraints on this host is not reported; it exists, and the build
+// matrix compiles it where its constraints select it.
+func (c *checker) loadDiagnostics(pkg *listedPackage) []diagnostic {
+	var reasons []string
+	if pkg.Error != nil && !isBuildConstraintExclusion(pkg.Error.Err) {
+		reasons = append(reasons, "import cannot be resolved by the go tool: "+oneLine(pkg.Error.Err))
+	}
+	for _, depErr := range pkg.DepsErrors {
+		if !isBuildConstraintExclusion(depErr.Err) {
+			reasons = append(reasons, "a dependency of the import cannot be loaded: "+oneLine(depErr.Err))
 		}
 	}
-	return nil
+	if len(reasons) == 0 {
+		return nil
+	}
+	var diagnostics []diagnostic
+	for _, pkgDir := range slices.Sorted(maps.Keys(c.tree.packages)) {
+		files := c.tree.packages[pkgDir]
+		for i := range files {
+			file := &files[i]
+			if !slices.Contains(file.imports, pkg.ImportPath) {
+				continue
+			}
+			for _, reason := range reasons {
+				diagnostics = append(diagnostics, diagnostic{importer: pkgDir, file: file.path, imported: pkg.ImportPath, rule: reason + fileNature(file)})
+			}
+		}
+	}
+	return diagnostics
+}
+
+// oneLine collapses the whitespace of a multi-line go tool message.
+func oneLine(message string) string {
+	return strings.Join(strings.Fields(message), " ")
 }
 
 // classify decides whether an import is standard, first-party or third-party.
@@ -497,6 +589,9 @@ func (c *checker) checkImports(pkg string, r *rule) []diagnostic {
 			}
 			if reason != "" {
 				diagnostics = append(diagnostics, diagnostic{importer: pkg, file: file.path, imported: imp, rule: reason + fileNature(file)})
+			}
+			if tree := c.excludedRoot(c.index[imp]); tree != "" {
+				diagnostics = append(diagnostics, diagnostic{importer: pkg, file: file.path, imported: imp, rule: fmt.Sprintf("imports a package rooted in the excluded tree %q", tree) + fileNature(file)})
 			}
 		}
 	}
@@ -656,7 +751,9 @@ func defaultPackageName(importPath string) string {
 
 // checkProductionClosure reports production packages whose transitive
 // dependency closure, as the go tool resolves it, reaches a test-only
-// package, the composition root, a package without a rule or an excluded tree.
+// package, the composition root, a package without a rule or an excluded
+// tree, whether the excluded tree is named by a first-party import path or
+// is where a replaced third-party module physically lives.
 func (c *checker) checkProductionClosure() []diagnostic {
 	var diagnostics []diagnostic
 	for pkg := range c.tree.packages {
@@ -669,6 +766,10 @@ func (c *checker) checkProductionClosure() []diagnostic {
 			continue
 		}
 		for _, dep := range listed.Deps {
+			if tree := c.excludedRoot(c.index[dep]); tree != "" {
+				diagnostics = append(diagnostics, diagnostic{importer: pkg, imported: dep, rule: fmt.Sprintf("production closure reaches the excluded tree %q", tree)})
+				continue
+			}
 			if !c.tree.isFirstParty(dep) {
 				continue
 			}
@@ -788,7 +889,7 @@ func fixtureRules() ruleTable {
 		"internal/adapters/sqlite": {category: categoryDrivenAdapter, firstParty: []string{"internal/app", "internal/domain/run"}, thirdParty: []string{"example.org/lib"}},
 		"internal/adapters/herdr":  {category: categoryDrivenAdapter, firstParty: []string{"internal/app"}},
 		"internal/adapters/system": {category: categoryDrivenAdapter},
-		"test/integration":         {category: categoryIntegrationTest, firstParty: []string{"internal/adapters/sqlite"}},
+		"test/integration":         {category: categoryIntegrationTest, firstParty: []string{"internal/adapters/sqlite", "internal/domain/run"}},
 	}
 }
 
@@ -812,7 +913,7 @@ func fixtureModuleFiles() map[string]string {
 		"internal/adapters/herdr/client.go": "package herdr\n\nimport \"example.com/hop/internal/app\"\n\n// New builds the runtime adapter.\nfunc New(app.Runs) {}\n",
 		"internal/adapters/system/clock.go": "package system\n\nimport \"time\"\n\n// Now reads the wall clock.\nfunc Now() time.Time { return time.Now() }\n",
 		"cmd/fix/main.go":                   "package main\n\nimport (\n\t\"example.com/hop/internal/adapters/cli\"\n\t\"example.com/hop/internal/adapters/sqlite\"\n)\n\nfunc main() { cli.Execute(&sqlite.Store{}) }\n",
-		"test/integration/store_test.go":    "package integration\n\nimport (\n\t\"testing\"\n\n\t\"example.com/hop/internal/adapters/sqlite\"\n)\n\nfunc TestStore(t *testing.T) {\n\tvar s sqlite.Store\n\tif err := s.Save(t.Context(), struct{}{}); err != nil {\n\t\tt.Fatal(err)\n\t}\n}\n",
+		"test/integration/store_test.go":    "package integration\n\nimport (\n\t\"testing\"\n\n\t\"example.com/hop/internal/adapters/sqlite\"\n\t\"example.com/hop/internal/domain/run\"\n)\n\nfunc TestStore(t *testing.T) {\n\tvar s sqlite.Store\n\tif err := s.Save(t.Context(), run.Run{}); err != nil {\n\t\tt.Fatal(err)\n\t}\n}\n",
 		"testdata/ignored/ignored.go":       "package ignored\n\nimport _ \"os\"\n",
 		".worktrees/copy/go.mod":            "module example.com/copy\n\ngo 1.24\n",
 		".worktrees/copy/main.go":           "package main\n\nimport _ \"os\"\n\nfunc main() {}\n",
@@ -1020,6 +1121,32 @@ func TestArchitectureFixtures(t *testing.T) {
 			wantDiagnostics: []string{`repos/ref: -: -: go list compiles Go files inside the excluded tree "repos"`},
 		},
 		{
+			name: "approved library replaced into a reference checkout",
+			files: map[string]string{
+				"go.mod":               strings.ReplaceAll(fixtureGoMod(goVersion), "example.org/lib => ../thirdparty/lib", "example.org/lib => ./repos/lib"),
+				"repos/lib/go.mod":     "module example.org/lib\n\ngo " + goVersion + "\n",
+				"repos/lib/lib.go":     "package lib\n\n// Do does nothing.\nfunc Do() {}\n",
+				"repos/lib/sub/sub.go": "package sub\n\n// Do does nothing.\nfunc Do() {}\n",
+			},
+			wantDiagnostics: []string{
+				`internal/adapters/sqlite: internal/adapters/sqlite/store.go: example.org/lib: imports a package rooted in the excluded tree "repos"`,
+				`internal/adapters/sqlite: internal/adapters/sqlite/store.go: example.org/lib/sub: imports a package rooted in the excluded tree "repos"`,
+				`internal/adapters/sqlite: -: example.org/lib: production closure reaches the excluded tree "repos"`,
+				`internal/adapters/sqlite: -: example.org/lib/sub: production closure reaches the excluded tree "repos"`,
+				`cmd/fix: -: example.org/lib: production closure reaches the excluded tree "repos"`,
+				`cmd/fix: -: example.org/lib/sub: production closure reaches the excluded tree "repos"`,
+			},
+		},
+		{
+			name:            "hidden import of a missing package inside an approved family",
+			files:           map[string]string{"internal/adapters/sqlite/hidden.go": "//go:build ignore\n\npackage sqlite\n\nimport _ \"example.org/lib/missing\"\n"},
+			wantDiagnostics: []string{"internal/adapters/sqlite: internal/adapters/sqlite/hidden.go: example.org/lib/missing: import cannot be resolved by the go tool: "},
+		},
+		{
+			name:  "platform-constrained standard package is not a load error",
+			files: map[string]string{"internal/adapters/sqlite/wasm.go": "//go:build js && wasm\n\npackage sqlite\n\nimport _ \"syscall/js\"\n"},
+		},
+		{
 			name: "rule table granting an outward import",
 			rules: func(table ruleTable) ruleTable {
 				return withRule(table, "internal/domain/run", &rule{category: categoryDomain, firstParty: []string{"internal/app"}})
@@ -1078,6 +1205,25 @@ func TestArchitectureFixtures(t *testing.T) {
 			}
 			assertDiagnostics(t, result.diagnostics, tc.wantDiagnostics)
 		})
+	}
+}
+
+// TestArchitectureCleanFixtureCompiles asserts that the clean synthetic
+// module type-checks, production and test files alike, so that its passing
+// the checker is evidence about a valid tree rather than about one the go
+// tool merely lists.
+func TestArchitectureCleanFixtureCompiles(t *testing.T) {
+	goVersion, err := goModDirective(moduleRoot(t), "go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := writeFixtureModule(t, goVersion, nil)
+
+	cmd := exec.CommandContext(t.Context(), "go", "vet", "./...")
+	cmd.Dir = root
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("go vet ./... in the clean fixture: %v\n%s", err, out)
 	}
 }
 
