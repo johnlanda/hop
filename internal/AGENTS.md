@@ -14,7 +14,7 @@ domain, application and adapter package; none exists yet.
 | --- | --- | --- |
 | [tree_test.go](tree_test.go) | `moduleRoot`, `readTreeFile`, `goModDirective`, `isExcludedDirectory`, `excludedComponent`, `sourceFile`, `sourceTree`, `walkSources`, `parseSourceFile`, `hasBuildConstraint`, `writeFiles` | Source inventory shared by both checkers: parses every Go file outside `repos/`, `vendor`, `testdata` and hidden or underscore-prefixed directories (so `.worktrees/` too), including tests, generated and build-constrained files; fails on a nested module, a parse error or an empty tree |
 | [arch_test.go](arch_test.go) | `category`, `rule`, `ruleTable`, `productionRules`, `validateRules`, `inFamily`, `diagnostic`, `listedPackage`, `listedError`, `isBuildConstraintExclusion`, `goList`, `checker`, `excludedRoot`, `loadDiagnostics`, `checkTree`, `forbiddenSelectors`, `fixtureRules`, `writeFixtureModule`, `TestArchitectureRuleTableIsValid`, `TestArchitectureRealTree`, `TestArchitectureThirdPartyFamilyMatching`, `TestArchitectureDefaultPackageName`, `TestArchitectureFixtures`, `TestArchitectureCleanFixtureCompiles` | Import and purity rules: exact per-package allowlists, category matrix, `go list -deps -test` resolution and production closure, physical excluded-tree check on listed packages, load-error diagnostics, ambient clock and randomness check, synthetic positive and negative fixtures |
-| [guides_test.go](guides_test.go) | `guideIssue`, `guideDirectories`, `markdownDocument`, `parseMarkdown`, `stripMarkdownCode`, `resolveLink`, `findGuides`, `checkGuides`, `TestGuidesRealTree`, `TestGuidesDirectoryMap`, `TestGuidesMarkdownLinks`, `TestGuidesLinkResolution`, `TestGuidesFixtures` | Guide coverage: an AGENTS.md in the root, every package directory and every grouping directory; immediate-child links among the rendered links; resolvable inline, image, reference-use and definition targets in every AGENTS.md, with code blocks, code spans and escapes read literally |
+| [guides_test.go](guides_test.go) | `guideIssue`, `guideDirectories`, `markdownDocument`, `parseMarkdown`, `bracketSpan`, `inlineDestination`, `stripMarkdownCode`, `listContentIndent`, `blankInlineCode`, `resolveLink`, `findGuides`, `checkGuides`, `TestGuidesRealTree`, `TestGuidesDirectoryMap`, `TestGuidesMarkdownLinks`, `TestGuidesLinkResolution`, `TestGuidesFixtures` | Guide coverage: an AGENTS.md in the root, every package directory and every grouping directory; immediate-child links among the rendered links; resolvable inline, image, reference-use and definition targets in every AGENTS.md, with code blocks, code spans and escapes read literally |
 
 ## Child guides
 
@@ -68,11 +68,27 @@ in the change that creates them.
   collapsed `[label][]` and shortcut `[label]` reference uses resolved through
   the guide's definitions; a definition alone renders nothing and never
   counts as navigation, though its target must still resolve. Every such
-  local target in every AGENTS.md outside the excluded trees must exist, a
-  full or collapsed reference use without a definition is an issue, and
-  fenced or indented code blocks, inline code spans and backslash escapes are
-  read literally so Go types like `map[string][]Task` are never links. Links
+  local target in every AGENTS.md outside the excluded trees must exist, and
+  a full or collapsed reference use without a definition is an issue. Links
   into `repos/` are skipped because reference checkouts may be absent.
+- Markdown handling is a purpose-built scanner, not a CommonMark renderer.
+  Handled: fenced code blocks (three or more backticks or tildes, closed by a
+  run of the same character at least as long); indented code blocks (a line
+  after a blank line indented four columns beyond the content column of the
+  most recent list item, or four columns outside a list; a tab counts to the
+  next multiple of four); inline code spans (matching backtick-run length,
+  never across a blank line, an unmatched run is literal); backslash escapes
+  of ASCII punctuation; balanced brackets inside link and reference text;
+  destinations in angle brackets or bare up to whitespace or an unbalanced
+  `)`, with an optional quoted or parenthesized title; list items marked by
+  `-`, `+`, `*` or a number with `.` or `)`, whose continuation paragraphs
+  after a blank line are prose; lines holding only spaces or tabs as blank
+  lines; CR LF line endings. Limits: a reference label may not contain
+  brackets; only one line of list nesting is tracked (a less-indented
+  non-list line leaves the list); blockquotes, HTML blocks, setext headings,
+  autolinks and multi-line definitions are not modeled, so links inside
+  those constructs are read as ordinary text; an angle-bracket destination
+  must stay on one line.
 
 ## Dependencies and ports
 

@@ -83,30 +83,24 @@ var linkSchemePattern = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9+.-]*:`)
 // a line, capturing its label and target.
 var markdownDefinitionPattern = regexp.MustCompile(`(?m)^ {0,3}\[([^\[\]]+)\]:[ \t]*<?([^\s>]+)>?`)
 
-// markdownInlinePattern matches an inline link or image, capturing its target.
-var markdownInlinePattern = regexp.MustCompile(`\[[^\[\]]*\]\(\s*<?([^)\s>]+)>?(?:\s+"[^"]*")?\s*\)`)
-
-// markdownReferencePattern matches a full or collapsed reference use,
-// capturing its text and its label; an empty label means the text is the label.
-var markdownReferencePattern = regexp.MustCompile(`\[([^\[\]]+)\]\[([^\[\]]*)\]`)
-
-// markdownShortcutPattern matches a bracketed span, which is a shortcut
-// reference only when a definition carries its label.
-var markdownShortcutPattern = regexp.MustCompile(`\[([^\[\]]+)\]`)
+// listItemPattern matches the start of a list item, capturing its leading
+// spaces, its marker and the spaces after the marker.
+var listItemPattern = regexp.MustCompile(`^( *)([-+*]|\d{1,9}[.)])( +|$)`)
 
 // markdownDocument is the link-relevant content of one guide.
 type markdownDocument struct {
-	links       []string // targets of rendered links: inline links and images, then reference uses resolved through their definitions
+	links       []string // targets of rendered links: inline links, images and reference uses resolved through their definitions, in document order
 	definitions []string // targets of reference definitions; validated as links but rendering nothing, so they never count as navigation
 	undefined   []string // normalized labels of full or collapsed reference uses without a definition, sorted
 }
 
 // parseMarkdown extracts the links of a guide. Fenced and indented code
-// blocks, inline code spans and backslash escapes are read literally, so the
-// brackets of a Go type such as map[string][]Task never form a link. Full
-// [text][label] and collapsed [label][] uses resolve through the definition
-// table or are reported as undefined; a shortcut [label] is a link only when
-// a definition carries its label and is plain text otherwise.
+// blocks, inline code spans and backslash escapes are read literally first,
+// so the brackets of a Go type such as map[string][]Task never form a link.
+// Link text may contain balanced brackets. Full [text][label] and collapsed
+// [label][] uses resolve through the definition table or are reported as
+// undefined; a shortcut [label] is a link only when a definition carries its
+// label and is plain text otherwise. A label may not itself contain brackets.
 func parseMarkdown(content string) markdownDocument {
 	text := stripMarkdownCode(content)
 	var doc markdownDocument
@@ -118,26 +112,131 @@ func parseMarkdown(content string) markdownDocument {
 		}
 	}
 	text = markdownDefinitionPattern.ReplaceAllString(text, "")
-	for _, match := range markdownInlinePattern.FindAllStringSubmatch(text, -1) {
-		doc.links = append(doc.links, match[1])
-	}
-	text = markdownInlinePattern.ReplaceAllString(text, "")
-	for _, match := range markdownReferencePattern.FindAllStringSubmatch(text, -1) {
-		label := referenceLabel(cmp.Or(match[2], match[1]))
-		if target := defined[label]; target != "" {
-			doc.links = append(doc.links, target)
-		} else if !slices.Contains(doc.undefined, label) {
-			doc.undefined = append(doc.undefined, label)
+	for i := 0; i < len(text); {
+		if text[i] != '[' {
+			i++
+			continue
 		}
-	}
-	text = markdownReferencePattern.ReplaceAllString(text, "")
-	for _, match := range markdownShortcutPattern.FindAllStringSubmatch(text, -1) {
-		if target := defined[referenceLabel(match[1])]; target != "" {
-			doc.links = append(doc.links, target)
+		end := bracketSpan(text, i)
+		if end < 0 {
+			i++
+			continue
 		}
+		label := text[i+1 : end-1]
+		if target, next, ok := inlineDestination(text, end); ok {
+			if target != "" {
+				doc.links = append(doc.links, target)
+			}
+			i = next
+			continue
+		}
+		if end < len(text) && text[end] == '[' {
+			if refEnd := bracketSpan(text, end); refEnd >= 0 {
+				refLabel := cmp.Or(text[end+1:refEnd-1], label)
+				if validLabel(refLabel) {
+					if target := defined[referenceLabel(refLabel)]; target != "" {
+						doc.links = append(doc.links, target)
+					} else if normalized := referenceLabel(refLabel); !slices.Contains(doc.undefined, normalized) {
+						doc.undefined = append(doc.undefined, normalized)
+					}
+				}
+				i = refEnd
+				continue
+			}
+		}
+		if validLabel(label) {
+			if target := defined[referenceLabel(label)]; target != "" {
+				doc.links = append(doc.links, target)
+			}
+		}
+		i = end
 	}
 	slices.Sort(doc.undefined)
 	return doc
+}
+
+// bracketSpan returns the index just past the ']' that balances the '[' at
+// open, or -1 when the brackets do not balance before the text ends.
+func bracketSpan(text string, open int) int {
+	depth := 0
+	for i := open; i < len(text); i++ {
+		switch text[i] {
+		case '[':
+			depth++
+		case ']':
+			depth--
+			if depth == 0 {
+				return i + 1
+			}
+		}
+	}
+	return -1
+}
+
+// inlineDestination parses the "(destination "title")" part of an inline
+// link starting at index at and returns the destination and the index just
+// past the closing parenthesis. A destination in angle brackets stays on
+// one line; a bare destination ends at whitespace or an unbalanced ')'.
+func inlineDestination(text string, at int) (target string, next int, ok bool) {
+	if at >= len(text) || text[at] != '(' {
+		return "", 0, false
+	}
+	j := skipWhitespace(text, at+1)
+	if j < len(text) && text[j] == '<' {
+		closing := strings.IndexByte(text[j:], '>')
+		if closing < 0 || strings.Contains(text[j:j+closing], "\n") {
+			return "", 0, false
+		}
+		target = text[j+1 : j+closing]
+		j += closing + 1
+	} else {
+		start := j
+		depth := 0
+	scan:
+		for ; j < len(text); j++ {
+			switch text[j] {
+			case ' ', '\t', '\n':
+				break scan
+			case '(':
+				depth++
+			case ')':
+				if depth == 0 {
+					break scan
+				}
+				depth--
+			}
+		}
+		target = text[start:j]
+	}
+	j = skipWhitespace(text, j)
+	if j < len(text) {
+		if closer, titled := map[byte]byte{'"': '"', '\'': '\'', '(': ')'}[text[j]]; titled {
+			closing := strings.IndexByte(text[j+1:], closer)
+			if closing < 0 {
+				return "", 0, false
+			}
+			j = skipWhitespace(text, j+1+closing+1)
+		}
+	}
+	if j < len(text) && text[j] == ')' {
+		return target, j + 1, true
+	}
+	return "", 0, false
+}
+
+// skipWhitespace returns the index of the first byte at or after i that is
+// not a space, tab or line break.
+func skipWhitespace(text string, i int) int {
+	for i < len(text) && (text[i] == ' ' || text[i] == '\t' || text[i] == '\n') {
+		i++
+	}
+	return i
+}
+
+// validLabel reports whether a reference label is well formed: non-blank
+// and free of brackets.
+func validLabel(label string) bool {
+	return strings.TrimSpace(label) != "" && !strings.ContainsAny(label, "[]")
 }
 
 // referenceLabel normalizes a reference label the way Markdown matches it:
@@ -149,28 +248,43 @@ func referenceLabel(label string) string {
 // stripMarkdownCode blanks what Markdown renders literally: fenced code
 // blocks, indented code blocks, inline code spans and backslash-escaped
 // punctuation. Line breaks are kept so that definitions stay anchored to
-// line starts. An indented line opens a code block only after a blank line,
-// so wrapped list items keep their text.
+// line starts, and lines holding only spaces or tabs become empty so they
+// bound paragraphs. An indented line opens a code block only after a blank
+// line and only when indented four columns beyond the content of the
+// enclosing list item, so a wrapped list item and a list item's continuation
+// paragraph keep their text.
 func stripMarkdownCode(content string) string {
 	var prose strings.Builder
 	fence := ""        // the run of backticks or tildes that opened the current fenced block
 	afterBlank := true // the previous line was blank, so an indented line starts a code block
 	indented := false  // inside an indented code block
+	contentIndent := 0 // column where the current list item's content starts; 0 outside a list
 	for line := range strings.Lines(content) {
 		text, newline := strings.CutSuffix(line, "\n")
-		trimmed := strings.TrimLeft(text, " ")
+		text = strings.TrimSuffix(text, "\r")
+		trimmed := strings.TrimLeft(text, " \t")
 		switch {
 		case fence != "":
 			if closesFence(trimmed, fence) {
 				fence = ""
 			}
+		case trimmed == "":
+			afterBlank = true
+			indented = false
 		case fenceRun(trimmed) != "":
 			fence = fenceRun(trimmed)
-		case (afterBlank || indented) && (strings.HasPrefix(text, "    ") || strings.HasPrefix(text, "\t")):
+			afterBlank = false
+			indented = false
+		case (afterBlank || indented) && leadingIndent(text) >= contentIndent+4:
 			indented = true
 		default:
 			indented = false
-			afterBlank = strings.TrimSpace(text) == ""
+			afterBlank = false
+			if itemIndent, ok := listContentIndent(text); ok {
+				contentIndent = itemIndent
+			} else if leadingIndent(text) < contentIndent {
+				contentIndent = 0
+			}
 			prose.WriteString(text)
 		}
 		if newline {
@@ -178,6 +292,38 @@ func stripMarkdownCode(content string) string {
 		}
 	}
 	return blankInlineCode(prose.String())
+}
+
+// leadingIndent returns the column at which a line's content starts, with a
+// tab advancing to the next multiple of four.
+func leadingIndent(text string) int {
+	column := 0
+	for i := 0; i < len(text); i++ {
+		switch text[i] {
+		case ' ':
+			column++
+		case '\t':
+			column += 4 - column%4
+		default:
+			return column
+		}
+	}
+	return column
+}
+
+// listContentIndent returns the column at which the content of a list item
+// line starts and whether the line starts a list item. More than four spaces
+// after the marker count as one, the rest being content.
+func listContentIndent(text string) (int, bool) {
+	match := listItemPattern.FindStringSubmatch(text)
+	if match == nil {
+		return 0, false
+	}
+	spaces := len(match[3])
+	if spaces == 0 || spaces > 4 {
+		spaces = 1
+	}
+	return len(match[1]) + len(match[2]) + spaces, true
 }
 
 // fenceRun returns the run of at least three backticks or tildes that
@@ -204,7 +350,8 @@ func closesFence(trimmed, fence string) bool {
 
 // blankInlineCode blanks backtick code spans and backslash-escaped
 // punctuation. A span closes at the next backtick run of the same length and
-// cannot cross a blank line; an unmatched run is literal text.
+// cannot cross a blank line, which stripMarkdownCode has reduced to an empty
+// line even when it held spaces or tabs; an unmatched run is literal text.
 func blankInlineCode(text string) string {
 	var out strings.Builder
 	for i := 0; i < len(text); {
@@ -545,6 +692,46 @@ func TestGuidesMarkdownLinks(t *testing.T) {
 			content: "A stray ` here and [Real][real].\n\n[real]: real.md\n",
 			want:    markdownDocument{links: []string{"real.md"}, definitions: []string{"real.md"}},
 		},
+		{
+			name:    "nested brackets in link text",
+			content: "[Commands [CLI]](cmd/AGENTS.md) and ![shot [1]](shot.png)\n",
+			want:    markdownDocument{links: []string{"cmd/AGENTS.md", "shot.png"}},
+		},
+		{
+			name:    "nested brackets in reference text",
+			content: "[Commands [CLI]][cmd] and [Internal [checkers]][]\n\n[cmd]: cmd/AGENTS.md\n",
+			want:    markdownDocument{links: []string{"cmd/AGENTS.md"}, definitions: []string{"cmd/AGENTS.md"}},
+		},
+		{
+			name:    "unbalanced bracket is plain text",
+			content: "A [N byte array and [Real](real.md)\n",
+			want:    markdownDocument{links: []string{"real.md"}},
+		},
+		{
+			name:    "destination with a title and parentheses",
+			content: "[a](docs/a.md \"Title\") [b](docs/b(1).md) [c](<docs/c d.md> 'T') [d]( docs/d.md )\n",
+			want:    markdownDocument{links: []string{"docs/a.md", "docs/b(1).md", "docs/c d.md", "docs/d.md"}},
+		},
+		{
+			name:    "list continuation paragraph after a blank line is prose",
+			content: "- Package guides:\n\n    [Commands](cmd/AGENTS.md) and [Internal](internal/AGENTS.md)\n",
+			want:    markdownDocument{links: []string{"cmd/AGENTS.md", "internal/AGENTS.md"}},
+		},
+		{
+			name:    "indented code inside a list item is literal",
+			content: "- Example:\n\n      tasks := map[string][]Task{}\n      [fake][nowhere]\n\n[real](main.go)\n",
+			want:    markdownDocument{links: []string{"main.go"}},
+		},
+		{
+			name:    "whitespace-only line bounds a paragraph for code spans",
+			content: "`unfinished\n   \n[Commands](cmd/AGENTS.md) closing`\n \t \n[Internal](internal/AGENTS.md)\n",
+			want:    markdownDocument{links: []string{"cmd/AGENTS.md", "internal/AGENTS.md"}},
+		},
+		{
+			name:    "whitespace-only line bounds an indented code block",
+			content: "text\n   \n    [fake][nowhere]\n",
+			want:    markdownDocument{},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -710,6 +897,35 @@ func TestGuidesFixtures(t *testing.T) {
 		{
 			name:  "escaped brackets are literal",
 			files: map[string]string{"cmd/hop/AGENTS.md": "# cmd/hop\n\n[main.go](main.go) and the [parent](../AGENTS.md).\n\nWrite \\[label\\], \\[x][y] and \\[text](nowhere.md) literally.\n"},
+		},
+		{
+			name:  "nested brackets in inline link label",
+			files: map[string]string{"AGENTS.md": "# Root\n\n[Commands [CLI]](cmd/AGENTS.md)\n[Internal](internal/AGENTS.md)\n"},
+		},
+		{
+			name:       "broken target behind a nested-bracket label",
+			files:      map[string]string{"cmd/hop/AGENTS.md": "# cmd/hop\n\n[main.go](main.go), the [parent](../AGENTS.md) and [Wiring [planned]](wire.go).\n"},
+			wantIssues: []string{"cmd/hop/AGENTS.md: wire.go: broken local link"},
+		},
+		{
+			name:  "list continuation paragraph after blank line",
+			files: map[string]string{"AGENTS.md": "# Root\n\n- Package guides:\n\n    [Commands](cmd/AGENTS.md) and [Internal](internal/AGENTS.md)\n"},
+		},
+		{
+			name:  "indented code block inside a list item is not a link",
+			files: map[string]string{"AGENTS.md": "# Root\n\n- [Commands](cmd/AGENTS.md) and [Internal](internal/AGENTS.md), for example:\n\n      tasks := map[string][]Task{}\n      [fake link][nowhere]\n"},
+		},
+		{
+			name:  "backticks separated by empty line",
+			files: map[string]string{"AGENTS.md": "# Root\n\n`unfinished\n\n[Commands](cmd/AGENTS.md) closing`\n\n[Internal](internal/AGENTS.md)\n"},
+		},
+		{
+			name:  "backticks separated by spaces-only blank line",
+			files: map[string]string{"AGENTS.md": "# Root\n\n`unfinished\n   \n[Commands](cmd/AGENTS.md) closing`\n\n[Internal](internal/AGENTS.md)\n"},
+		},
+		{
+			name:  "table with backticked Go symbols",
+			files: map[string]string{"AGENTS.md": "# Root\n\n| Package | Symbols |\n| --- | --- |\n| [Commands](cmd/AGENTS.md) | `run`, `map[string][]Task` |\n| [Internal](internal/AGENTS.md) | `sourceTree`, `[N]byte` |\n"},
 		},
 		{
 			name:       "absolute link",
