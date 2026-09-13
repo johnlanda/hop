@@ -1,1 +1,4 @@
 repos/
+.worktrees/
+.bin/
+/hop
