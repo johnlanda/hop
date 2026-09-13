@@ -78,17 +78,21 @@ in the change that creates them.
   most recent list item, or four columns outside a list; a tab counts to the
   next multiple of four); inline code spans (matching backtick-run length,
   never across a blank line, an unmatched run is literal); backslash escapes
-  of ASCII punctuation; balanced brackets inside link and reference text;
-  destinations in angle brackets or bare up to whitespace or an unbalanced
-  `)`, with an optional quoted or parenthesized title; list items marked by
-  `-`, `+`, `*` or a number with `.` or `)`, whose continuation paragraphs
-  after a blank line are prose; lines holding only spaces or tabs as blank
-  lines; CR LF line endings. Limits: a reference label may not contain
-  brackets; only one line of list nesting is tracked (a less-indented
-  non-list line leaves the list); blockquotes, HTML blocks, setext headings,
-  autolinks and multi-line definitions are not modeled, so links inside
-  those constructs are read as ordinary text; an angle-bracket destination
-  must stay on one line.
+  of ASCII punctuation; balanced brackets inside link and reference text,
+  with a bracketed span that is not itself a link scanned inside so an
+  enclosed link is still found; destinations in angle brackets or bare up to
+  whitespace or an unbalanced `)`, with an optional quoted or parenthesized
+  title; list items marked by `-`, `+`, `*` or a number with `.` or `)`,
+  whose continuation paragraphs after a blank line are prose; lines holding
+  only spaces or tabs as blank lines; CR LF line endings. Tab handling is
+  indentation measurement only (a tab advances to the next multiple of
+  four): a list marker is recognized with space indentation and a space
+  after the marker, so a tab-indented or tab-separated marker is not a list
+  item. Limits: a reference label may not contain brackets; only one line of
+  list nesting is tracked (a less-indented non-list line leaves the list);
+  blockquotes, HTML blocks, setext headings, autolinks and multi-line
+  definitions are not modeled, so links inside those constructs are read as
+  ordinary text; an angle-bracket destination must stay on one line.
 
 ## Dependencies and ports
 

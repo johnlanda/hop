@@ -101,6 +101,8 @@ type markdownDocument struct {
 // [label][] uses resolve through the definition table or are reported as
 // undefined; a shortcut [label] is a link only when a definition carries its
 // label and is plain text otherwise. A label may not itself contain brackets.
+// A bracketed span that is not a link is scanned inside, so links enclosed
+// in bracketed prose or in the text of an undefined reference are found.
 func parseMarkdown(content string) markdownDocument {
 	text := stripMarkdownCode(content)
 	var doc markdownDocument
@@ -136,20 +138,25 @@ func parseMarkdown(content string) markdownDocument {
 				if validLabel(refLabel) {
 					if target := defined[referenceLabel(refLabel)]; target != "" {
 						doc.links = append(doc.links, target)
-					} else if normalized := referenceLabel(refLabel); !slices.Contains(doc.undefined, normalized) {
+						i = refEnd
+						continue
+					}
+					if normalized := referenceLabel(refLabel); !slices.Contains(doc.undefined, normalized) {
 						doc.undefined = append(doc.undefined, normalized)
 					}
 				}
-				i = refEnd
-				continue
 			}
 		}
 		if validLabel(label) {
 			if target := defined[referenceLabel(label)]; target != "" {
 				doc.links = append(doc.links, target)
+				i = end
+				continue
 			}
 		}
-		i = end
+		// The span is not a link: bracketed prose, an undefined reference or
+		// an unknown shortcut. Its text still renders, so scan inside it.
+		i++
 	}
 	slices.Sort(doc.undefined)
 	return doc
@@ -732,6 +739,21 @@ func TestGuidesMarkdownLinks(t *testing.T) {
 			content: "text\n   \n    [fake][nowhere]\n",
 			want:    markdownDocument{},
 		},
+		{
+			name:    "links inside bracketed prose are found",
+			content: "[See [Commands](cmd/AGENTS.md)] and [note: [Internal][internal]] and [[deep](deep.md)]\n\n[internal]: internal/AGENTS.md\n",
+			want:    markdownDocument{links: []string{"cmd/AGENTS.md", "internal/AGENTS.md", "deep.md"}, definitions: []string{"internal/AGENTS.md"}},
+		},
+		{
+			name:    "undefined reference text still exposes its links",
+			content: "[See [Real](real.md)][nolabel]\n",
+			want:    markdownDocument{links: []string{"real.md"}, undefined: []string{"nolabel"}},
+		},
+		{
+			name:    "recognized link consumes its nested brackets",
+			content: "[a [b]](c.md) and [x [b]][y]\n\n[b]: b.md\n[y]: y.md\n",
+			want:    markdownDocument{links: []string{"c.md", "y.md"}, definitions: []string{"b.md", "y.md"}},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -926,6 +948,15 @@ func TestGuidesFixtures(t *testing.T) {
 		{
 			name:  "table with backticked Go symbols",
 			files: map[string]string{"AGENTS.md": "# Root\n\n| Package | Symbols |\n| --- | --- |\n| [Commands](cmd/AGENTS.md) | `run`, `map[string][]Task` |\n| [Internal](internal/AGENTS.md) | `sourceTree`, `[N]byte` |\n"},
+		},
+		{
+			name:  "bracketed aside containing a child link navigates",
+			files: map[string]string{"AGENTS.md": "# Root\n\n[See [Commands](cmd/AGENTS.md)]\n[Internal](internal/AGENTS.md)\n"},
+		},
+		{
+			name:       "bracketed aside containing a broken target is reported",
+			files:      map[string]string{"AGENTS.md": "# Root\n\n[Commands](cmd/AGENTS.md)\n[Internal](internal/AGENTS.md)\n[See [Wiring](missing.md)]\n"},
+			wantIssues: []string{"AGENTS.md: missing.md: broken local link"},
 		},
 		{
 			name:       "absolute link",
