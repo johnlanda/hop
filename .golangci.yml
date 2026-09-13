@@ -11,6 +11,12 @@ run:
   # Analyze test files together with production files.
   tests: true
   modules-download-mode: readonly
+  # golangci-lint takes a run lock that is per user cache directory, not per
+  # repository. Serial runners wait for a running instance instead of failing
+  # on it, so neither a sequential make target nor a lint running in another
+  # repository on the same machine can break `make check`. Runs stay serial;
+  # this is not allow-parallel-runners.
+  allow-serial-runners: true
 
 formatters:
   enable:

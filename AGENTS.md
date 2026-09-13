@@ -31,10 +31,14 @@ packages named in the planning documents are proposed, not existing code.
   `GOTOOLCHAIN` from it, so `make` is the reproducible entrypoint and a bare
   `go test` may run on a newer local toolchain.
 - golangci-lint v2.13.2 is pinned in the Makefile alone and installed into
-  `.bin/` on first use. It bundles the formatters `make fmt` applies: gofumpt
-  v0.11.0 with the extra rules and goimports from golang.org/x/tools v0.49.0
-  with local prefix `github.com/johnlanda/hop`. `.golangci.yml` is validated
-  against that release's schema by `make lint`.
+  `.bin/` on first use by the release's install script, whose sha256 is
+  pinned next to the version and verified before it runs. It bundles the
+  formatters `make fmt` applies: gofumpt v0.11.0 with the extra rules and
+  goimports from golang.org/x/tools v0.49.0 with local prefix
+  `github.com/johnlanda/hop`. `.golangci.yml` is validated against that
+  release's schema by `make lint`. Lint waits for a concurrently running
+  golangci-lint instance, in this or any other repository on the machine,
+  rather than failing on its lock.
 - `make check` is the non-mutating gate (fmt-check, docs-check, lint, race and
   shuffle tests) and fails on unformatted code; `make fmt` is the only target
   that rewrites files. CI runs `make check` natively on linux/amd64,
