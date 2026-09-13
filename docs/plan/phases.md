@@ -135,7 +135,7 @@ commands so users can understand execution without opening a board.
 ## Phase 5 — Account profiles and pools
 
 Deliver common account login/list/status and pool management, starting with Claude
-Code and Codex. Prefer native login/refresh and isolate harness profiles. Store
+Code, Codex and opencode. Prefer native login/refresh and isolate harness profiles. Store
 non-secret account metadata and credential references; preserve user settings.
 Install Herdr integrations in the correct profile where supported.
 
