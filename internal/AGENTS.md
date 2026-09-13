@@ -14,7 +14,7 @@ domain, application and adapter package; none exists yet.
 | --- | --- | --- |
 | [tree_test.go](tree_test.go) | `moduleRoot`, `readTreeFile`, `goModDirective`, `isExcludedDirectory`, `excludedComponent`, `sourceFile`, `sourceTree`, `walkSources`, `parseSourceFile`, `hasBuildConstraint`, `writeFiles` | Source inventory shared by both checkers: parses every Go file outside `repos/`, `vendor`, `testdata` and hidden or underscore-prefixed directories (so `.worktrees/` too), including tests, generated and build-constrained files; fails on a nested module, a parse error or an empty tree |
 | [arch_test.go](arch_test.go) | `category`, `rule`, `ruleTable`, `productionRules`, `validateRules`, `inFamily`, `diagnostic`, `listedPackage`, `listedError`, `isBuildConstraintExclusion`, `goList`, `checker`, `excludedRoot`, `loadDiagnostics`, `checkTree`, `forbiddenSelectors`, `fixtureRules`, `writeFixtureModule`, `TestArchitectureRuleTableIsValid`, `TestArchitectureRealTree`, `TestArchitectureThirdPartyFamilyMatching`, `TestArchitectureDefaultPackageName`, `TestArchitectureFixtures`, `TestArchitectureCleanFixtureCompiles` | Import and purity rules: exact per-package allowlists, category matrix, `go list -deps -test` resolution and production closure, physical excluded-tree check on listed packages, load-error diagnostics, ambient clock and randomness check, synthetic positive and negative fixtures |
-| [guides_test.go](guides_test.go) | `guideIssue`, `guideDirectories`, `markdownLinks`, `undefinedReferences`, `resolveLink`, `findGuides`, `checkGuides`, `TestGuidesRealTree`, `TestGuidesDirectoryMap`, `TestGuidesMarkdownLinks`, `TestGuidesLinkResolution`, `TestGuidesFixtures` | Guide coverage: an AGENTS.md in the root, every package directory and every grouping directory; immediate-child links; resolvable inline, image and reference-style links in every AGENTS.md |
+| [guides_test.go](guides_test.go) | `guideIssue`, `guideDirectories`, `markdownDocument`, `parseMarkdown`, `stripMarkdownCode`, `resolveLink`, `findGuides`, `checkGuides`, `TestGuidesRealTree`, `TestGuidesDirectoryMap`, `TestGuidesMarkdownLinks`, `TestGuidesLinkResolution`, `TestGuidesFixtures` | Guide coverage: an AGENTS.md in the root, every package directory and every grouping directory; immediate-child links among the rendered links; resolvable inline, image, reference-use and definition targets in every AGENTS.md, with code blocks, code spans and escapes read literally |
 
 ## Child guides
 
@@ -63,11 +63,16 @@ in the change that creates them.
   cannot be inventoried (nested module, parse error, failed listing, no
   packages, invalid table) is an error, never a pass.
 - Guide rule: the root, every package directory and every grouping directory
-  carry an AGENTS.md that links each immediate child guide; every local link
-  in every AGENTS.md outside the excluded trees resolves, whether written
-  inline, as an image or as a reference definition, and a reference-style
-  use without a definition is an issue; links into `repos/` are skipped
-  because reference checkouts may be absent.
+  carry an AGENTS.md whose rendered links reach each immediate child guide.
+  Rendered links are inline links, images, and full `[text][label]`,
+  collapsed `[label][]` and shortcut `[label]` reference uses resolved through
+  the guide's definitions; a definition alone renders nothing and never
+  counts as navigation, though its target must still resolve. Every such
+  local target in every AGENTS.md outside the excluded trees must exist, a
+  full or collapsed reference use without a definition is an issue, and
+  fenced or indented code blocks, inline code spans and backslash escapes are
+  read literally so Go types like `map[string][]Task` are never links. Links
+  into `repos/` are skipped because reference checkouts may be absent.
 
 ## Dependencies and ports
 

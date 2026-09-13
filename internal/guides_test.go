@@ -76,32 +76,68 @@ func guidePath(dir string) string {
 	return dir + "/AGENTS.md"
 }
 
-// markdownLinkPattern matches the target of an inline link or image.
-var markdownLinkPattern = regexp.MustCompile(`\]\(\s*<?([^)\s>]+)>?(?:\s+"[^"]*")?\s*\)`)
-
-// markdownDefinitionPattern matches a reference definition line, capturing
-// its label and target.
-var markdownDefinitionPattern = regexp.MustCompile(`(?m)^ {0,3}\[([^\]]+)\]:[ \t]*<?([^\s>]+)>?`)
-
-// markdownReferencePattern matches a full or collapsed reference use,
-// capturing its text and its label; an empty label means the text is the label.
-var markdownReferencePattern = regexp.MustCompile(`\[([^\]]+)\]\[([^\]]*)\]`)
-
 // linkSchemePattern matches a link that starts with a URL scheme.
 var linkSchemePattern = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9+.-]*:`)
 
-// markdownLinks returns the targets of every link in content: inline links
-// and images, and the targets of reference definitions, which is where a
-// reference-style link names its file.
-func markdownLinks(content string) []string {
-	var links []string
-	for _, match := range markdownLinkPattern.FindAllStringSubmatch(content, -1) {
-		links = append(links, match[1])
+// markdownDefinitionPattern matches a reference definition at the start of
+// a line, capturing its label and target.
+var markdownDefinitionPattern = regexp.MustCompile(`(?m)^ {0,3}\[([^\[\]]+)\]:[ \t]*<?([^\s>]+)>?`)
+
+// markdownInlinePattern matches an inline link or image, capturing its target.
+var markdownInlinePattern = regexp.MustCompile(`\[[^\[\]]*\]\(\s*<?([^)\s>]+)>?(?:\s+"[^"]*")?\s*\)`)
+
+// markdownReferencePattern matches a full or collapsed reference use,
+// capturing its text and its label; an empty label means the text is the label.
+var markdownReferencePattern = regexp.MustCompile(`\[([^\[\]]+)\]\[([^\[\]]*)\]`)
+
+// markdownShortcutPattern matches a bracketed span, which is a shortcut
+// reference only when a definition carries its label.
+var markdownShortcutPattern = regexp.MustCompile(`\[([^\[\]]+)\]`)
+
+// markdownDocument is the link-relevant content of one guide.
+type markdownDocument struct {
+	links       []string // targets of rendered links: inline links and images, then reference uses resolved through their definitions
+	definitions []string // targets of reference definitions; validated as links but rendering nothing, so they never count as navigation
+	undefined   []string // normalized labels of full or collapsed reference uses without a definition, sorted
+}
+
+// parseMarkdown extracts the links of a guide. Fenced and indented code
+// blocks, inline code spans and backslash escapes are read literally, so the
+// brackets of a Go type such as map[string][]Task never form a link. Full
+// [text][label] and collapsed [label][] uses resolve through the definition
+// table or are reported as undefined; a shortcut [label] is a link only when
+// a definition carries its label and is plain text otherwise.
+func parseMarkdown(content string) markdownDocument {
+	text := stripMarkdownCode(content)
+	var doc markdownDocument
+	defined := map[string]string{}
+	for _, match := range markdownDefinitionPattern.FindAllStringSubmatch(text, -1) {
+		doc.definitions = append(doc.definitions, match[2])
+		if label := referenceLabel(match[1]); defined[label] == "" {
+			defined[label] = match[2]
+		}
 	}
-	for _, match := range markdownDefinitionPattern.FindAllStringSubmatch(content, -1) {
-		links = append(links, match[2])
+	text = markdownDefinitionPattern.ReplaceAllString(text, "")
+	for _, match := range markdownInlinePattern.FindAllStringSubmatch(text, -1) {
+		doc.links = append(doc.links, match[1])
 	}
-	return links
+	text = markdownInlinePattern.ReplaceAllString(text, "")
+	for _, match := range markdownReferencePattern.FindAllStringSubmatch(text, -1) {
+		label := referenceLabel(cmp.Or(match[2], match[1]))
+		if target := defined[label]; target != "" {
+			doc.links = append(doc.links, target)
+		} else if !slices.Contains(doc.undefined, label) {
+			doc.undefined = append(doc.undefined, label)
+		}
+	}
+	text = markdownReferencePattern.ReplaceAllString(text, "")
+	for _, match := range markdownShortcutPattern.FindAllStringSubmatch(text, -1) {
+		if target := defined[referenceLabel(match[1])]; target != "" {
+			doc.links = append(doc.links, target)
+		}
+	}
+	slices.Sort(doc.undefined)
+	return doc
 }
 
 // referenceLabel normalizes a reference label the way Markdown matches it:
@@ -110,25 +146,129 @@ func referenceLabel(label string) string {
 	return strings.ToLower(strings.Join(strings.Fields(label), " "))
 }
 
-// undefinedReferences returns, sorted, the labels of reference-style links
-// in content that no definition line resolves.
-func undefinedReferences(content string) []string {
-	defined := map[string]bool{}
-	for _, match := range markdownDefinitionPattern.FindAllStringSubmatch(content, -1) {
-		defined[referenceLabel(match[1])] = true
-	}
-	var undefined []string
-	for _, match := range markdownReferencePattern.FindAllStringSubmatch(content, -1) {
-		label := match[2]
-		if label == "" {
-			label = match[1]
+// stripMarkdownCode blanks what Markdown renders literally: fenced code
+// blocks, indented code blocks, inline code spans and backslash-escaped
+// punctuation. Line breaks are kept so that definitions stay anchored to
+// line starts. An indented line opens a code block only after a blank line,
+// so wrapped list items keep their text.
+func stripMarkdownCode(content string) string {
+	var prose strings.Builder
+	fence := ""        // the run of backticks or tildes that opened the current fenced block
+	afterBlank := true // the previous line was blank, so an indented line starts a code block
+	indented := false  // inside an indented code block
+	for line := range strings.Lines(content) {
+		text, newline := strings.CutSuffix(line, "\n")
+		trimmed := strings.TrimLeft(text, " ")
+		switch {
+		case fence != "":
+			if closesFence(trimmed, fence) {
+				fence = ""
+			}
+		case fenceRun(trimmed) != "":
+			fence = fenceRun(trimmed)
+		case (afterBlank || indented) && (strings.HasPrefix(text, "    ") || strings.HasPrefix(text, "\t")):
+			indented = true
+		default:
+			indented = false
+			afterBlank = strings.TrimSpace(text) == ""
+			prose.WriteString(text)
 		}
-		if normalized := referenceLabel(label); !defined[normalized] && !slices.Contains(undefined, normalized) {
-			undefined = append(undefined, normalized)
+		if newline {
+			prose.WriteByte('\n')
 		}
 	}
-	slices.Sort(undefined)
-	return undefined
+	return blankInlineCode(prose.String())
+}
+
+// fenceRun returns the run of at least three backticks or tildes that
+// starts a trimmed line, or "" when the line is not a fence.
+func fenceRun(trimmed string) string {
+	for _, marker := range []byte{'`', '~'} {
+		run := 0
+		for run < len(trimmed) && trimmed[run] == marker {
+			run++
+		}
+		if run >= 3 {
+			return trimmed[:run]
+		}
+	}
+	return ""
+}
+
+// closesFence reports whether a trimmed line closes the fenced block opened
+// by fence: the same marker at least as long, followed by nothing.
+func closesFence(trimmed, fence string) bool {
+	run := fenceRun(trimmed)
+	return run != "" && run[0] == fence[0] && len(run) >= len(fence) && strings.TrimSpace(trimmed[len(run):]) == ""
+}
+
+// blankInlineCode blanks backtick code spans and backslash-escaped
+// punctuation. A span closes at the next backtick run of the same length and
+// cannot cross a blank line; an unmatched run is literal text.
+func blankInlineCode(text string) string {
+	var out strings.Builder
+	for i := 0; i < len(text); {
+		switch c := text[i]; {
+		case c == '\\' && i+1 < len(text) && isASCIIPunctuation(text[i+1]):
+			out.WriteString("  ")
+			i += 2
+		case c == '`':
+			run := backtickRun(text, i)
+			end := closingBacktickRun(text, i+run, run)
+			if end < 0 {
+				out.WriteString(text[i : i+run])
+				i += run
+				continue
+			}
+			for _, r := range text[i:end] {
+				if r == '\n' {
+					out.WriteByte('\n')
+				} else {
+					out.WriteByte(' ')
+				}
+			}
+			i = end
+		default:
+			out.WriteByte(c)
+			i++
+		}
+	}
+	return out.String()
+}
+
+// backtickRun returns the number of consecutive backticks starting at i.
+func backtickRun(text string, i int) int {
+	run := 0
+	for i+run < len(text) && text[i+run] == '`' {
+		run++
+	}
+	return run
+}
+
+// closingBacktickRun returns the index just past the run of exactly length
+// backticks that closes a span opened before from, or -1 when a blank line
+// or the end of text comes first.
+func closingBacktickRun(text string, from, length int) int {
+	for j := from; j < len(text); {
+		if strings.HasPrefix(text[j:], "\n\n") {
+			return -1
+		}
+		if text[j] != '`' {
+			j++
+			continue
+		}
+		run := backtickRun(text, j)
+		if run == length {
+			return j + run
+		}
+		j += run
+	}
+	return -1
+}
+
+// isASCIIPunctuation reports whether a backslash before b is an escape.
+func isASCIIPunctuation(b byte) bool {
+	return strings.IndexByte("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~", b) >= 0
 }
 
 // linkResolution is the outcome of resolving one link written in a guide.
@@ -191,9 +331,10 @@ func findGuides(root string) ([]string, error) {
 }
 
 // checkGuides inventories the Go packages below root and reports every
-// directory that must carry an AGENTS.md but does not, every guide that
-// fails to link an immediate child guide, every local link in any AGENTS.md
-// that does not resolve, and every reference-style link without a definition.
+// directory that must carry an AGENTS.md but does not, every guide whose
+// rendered links do not reach an immediate child guide, every local link or
+// reference definition in any AGENTS.md that does not resolve, and every
+// reference-style use without a definition.
 func checkGuides(root string) (*guideReport, error) {
 	tree, err := walkSources(root)
 	if err != nil {
@@ -203,38 +344,38 @@ func checkGuides(root string) (*guideReport, error) {
 	if err != nil {
 		return nil, err
 	}
-	contents := make(map[string]string, len(guides))
+	documents := make(map[string]markdownDocument, len(guides))
 	for _, guide := range guides {
 		data, err := readTreeFile(root, guide)
 		if err != nil {
 			return nil, err
 		}
-		contents[guide] = string(data)
+		documents[guide] = parseMarkdown(string(data))
 	}
 	packages := slices.Sorted(maps.Keys(tree.packages))
 	var issues []guideIssue
 	dirs := guideDirectories(packages)
 	for _, dir := range slices.Sorted(maps.Keys(dirs)) {
 		guide := guidePath(dir)
-		content, ok := contents[guide]
+		doc, ok := documents[guide]
 		if !ok {
 			issues = append(issues, guideIssue{guide: guide, rule: missingGuideRule(dir, tree)})
 			continue
 		}
-		links := markdownLinks(content)
 		for _, child := range dirs[dir] {
 			want := guidePath(child)
-			linked := slices.ContainsFunc(links, func(link string) bool { return resolveLink(guide, link).target == want })
+			linked := slices.ContainsFunc(doc.links, func(link string) bool { return resolveLink(guide, link).target == want })
 			if !linked {
 				issues = append(issues, guideIssue{guide: guide, link: want, rule: "guide does not link its immediate child guide"})
 			}
 		}
 	}
 	for _, guide := range guides {
-		for _, label := range undefinedReferences(contents[guide]) {
+		doc := documents[guide]
+		for _, label := range doc.undefined {
 			issues = append(issues, guideIssue{guide: guide, link: "[" + label + "]", rule: "reference link has no definition"})
 		}
-		for _, link := range markdownLinks(contents[guide]) {
+		for _, link := range slices.Concat(doc.links, doc.definitions) {
 			resolved := resolveLink(guide, link)
 			switch {
 			case resolved.problem != "":
@@ -335,49 +476,88 @@ func TestGuidesDirectoryMap(t *testing.T) {
 
 func TestGuidesMarkdownLinks(t *testing.T) {
 	cases := []struct {
-		name          string
-		content       string
-		wantLinks     []string
-		wantUndefined []string
+		name    string
+		content string
+		want    markdownDocument
 	}{
 		{
-			name:      "inline link and image",
-			content:   "See [main](main.go) and ![diagram](flow.svg \"title\").\n",
-			wantLinks: []string{"main.go", "flow.svg"},
+			name:    "inline link and image",
+			content: "See [main](main.go) and ![diagram](flow.svg \"title\").\n",
+			want:    markdownDocument{links: []string{"main.go", "flow.svg"}},
 		},
 		{
-			name:      "reference definition is a link and resolves its uses",
-			content:   "[Internal][internal] and [internal][] and [Internal].\n\n[internal]: internal/AGENTS.md\n",
-			wantLinks: []string{"internal/AGENTS.md"},
+			name:    "full, collapsed and shortcut uses resolve through the definition",
+			content: "[Internal][internal] and [internal][] and [Internal].\n\n[internal]: internal/AGENTS.md\n",
+			want:    markdownDocument{links: []string{"internal/AGENTS.md", "internal/AGENTS.md", "internal/AGENTS.md"}, definitions: []string{"internal/AGENTS.md"}},
 		},
 		{
-			name:      "definition in angle brackets with a title",
-			content:   "[docs]: <docs/AGENTS.md> \"Docs\"\n",
-			wantLinks: []string{"docs/AGENTS.md"},
+			name:    "definition alone renders nothing",
+			content: "[docs]: <docs/AGENTS.md> \"Docs\"\n",
+			want:    markdownDocument{definitions: []string{"docs/AGENTS.md"}},
 		},
 		{
-			name:          "reference use without a definition",
-			content:       "[Missing][missing] and [Other Thing][]\n",
-			wantUndefined: []string{"missing", "other thing"},
+			name:    "full and collapsed uses without a definition",
+			content: "[Missing][missing] and [Other Thing][]\n",
+			want:    markdownDocument{undefined: []string{"missing", "other thing"}},
+		},
+		{
+			name:    "shortcut without a definition is plain text",
+			content: "The [importer] field names the package.\n",
+			want:    markdownDocument{},
 		},
 		{
 			name:    "labels match case-insensitively with collapsed whitespace",
 			content: "[x][Package  Guide]\n\n[package guide]: AGENTS.md\n",
-			wantLinks: []string{
-				"AGENTS.md",
-			},
+			want:    markdownDocument{links: []string{"AGENTS.md"}, definitions: []string{"AGENTS.md"}},
+		},
+		{
+			name:    "inline code spans are literal",
+			content: "Keep `map[string][]Task` and `` a ` b [c][d] `` in prose.\n",
+			want:    markdownDocument{},
+		},
+		{
+			name:    "fenced code block is literal",
+			content: "```go\nvar tasks map[string][]Task\n[fake][nowhere]\n[nowhere]: missing.md\n```\n\n[real](main.go)\n",
+			want:    markdownDocument{links: []string{"main.go"}},
+		},
+		{
+			name:    "tilde fence is literal",
+			content: "~~~\n[fake][nowhere]\n~~~\n",
+			want:    markdownDocument{},
+		},
+		{
+			name:    "indented code block is literal",
+			content: "Example:\n\n    tasks := map[string][]Task{}\n    [fake][nowhere]\n\n[real](main.go)\n",
+			want:    markdownDocument{links: []string{"main.go"}},
+		},
+		{
+			name:    "wrapped list item is prose",
+			content: "- [Commands](cmd/AGENTS.md) and a long line that\n    wraps to [Internal](internal/AGENTS.md)\n",
+			want:    markdownDocument{links: []string{"cmd/AGENTS.md", "internal/AGENTS.md"}},
+		},
+		{
+			name:    "escaped brackets are literal",
+			content: "Use \\[label\\] literally, \\[a][b], \\[c]\\[d] and \\[not a link](main.go).\n",
+			want:    markdownDocument{},
+		},
+		{
+			name:    "unmatched backtick is literal text",
+			content: "A stray ` here and [Real][real].\n\n[real]: real.md\n",
+			want:    markdownDocument{links: []string{"real.md"}, definitions: []string{"real.md"}},
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			links := markdownLinks(tc.content)
-			undefined := undefinedReferences(tc.content)
+			got := parseMarkdown(tc.content)
 
-			if !slices.Equal(links, tc.wantLinks) {
-				t.Errorf("markdownLinks = %q, want %q", links, tc.wantLinks)
+			if !slices.Equal(got.links, tc.want.links) {
+				t.Errorf("links = %q, want %q", got.links, tc.want.links)
 			}
-			if !slices.Equal(undefined, tc.wantUndefined) {
-				t.Errorf("undefinedReferences = %q, want %q", undefined, tc.wantUndefined)
+			if !slices.Equal(got.definitions, tc.want.definitions) {
+				t.Errorf("definitions = %q, want %q", got.definitions, tc.want.definitions)
+			}
+			if !slices.Equal(got.undefined, tc.want.undefined) {
+				t.Errorf("undefined = %q, want %q", got.undefined, tc.want.undefined)
 			}
 		})
 	}
@@ -494,13 +674,42 @@ func TestGuidesFixtures(t *testing.T) {
 			wantIssues: []string{"cmd/hop/AGENTS.md: nonexistent.md: broken local link"},
 		},
 		{
-			name:  "child link written as a reference",
-			files: map[string]string{"AGENTS.md": "# root\n\n- [Commands][cmd]\n- [Internal][]\n\n[cmd]: cmd/AGENTS.md\n[internal]: internal/AGENTS.md\n"},
+			name:  "child links written as reference uses backed by definitions",
+			files: map[string]string{"AGENTS.md": "# root\n\n- [Commands][cmd]\n- [Internal][]\n- [docs]\n\n[cmd]: cmd/AGENTS.md\n[internal]: internal/AGENTS.md\n[docs]: docs/AGENTS.md\n"},
+		},
+		{
+			name:  "only unused reference definitions do not navigate",
+			files: map[string]string{"AGENTS.md": "# Root\n\n[cmd]: cmd/AGENTS.md\n[internal]: internal/AGENTS.md\n"},
+			wantIssues: []string{
+				"AGENTS.md: cmd/AGENTS.md: guide does not link its immediate child guide",
+				"AGENTS.md: internal/AGENTS.md: guide does not link its immediate child guide",
+			},
+		},
+		{
+			name:       "unused definition with a broken target",
+			files:      map[string]string{"cmd/hop/AGENTS.md": "# cmd/hop\n\n[main.go](main.go) and the [parent](../AGENTS.md).\n\n[stale]: nowhere.md\n"},
+			wantIssues: []string{"cmd/hop/AGENTS.md: nowhere.md: broken local link"},
 		},
 		{
 			name:       "reference link without a definition",
 			files:      map[string]string{"cmd/hop/AGENTS.md": "# cmd/hop\n\n[main.go](main.go), the [parent](../AGENTS.md) and [Wiring][wiring].\n"},
 			wantIssues: []string{"cmd/hop/AGENTS.md: [wiring]: reference link has no definition"},
+		},
+		{
+			name:  "inline code span with brackets is prose",
+			files: map[string]string{"cmd/hop/AGENTS.md": "# cmd/hop\n\n[main.go](main.go) and the [parent](../AGENTS.md).\n\nThe store keeps `map[string][]Task` per run.\n"},
+		},
+		{
+			name:  "fenced Go block with brackets is not a link",
+			files: map[string]string{"cmd/hop/AGENTS.md": "# cmd/hop\n\n[main.go](main.go) and the [parent](../AGENTS.md).\n\n```go\nvar tasks map[string][]Task\n[fake link][nowhere]\n[nowhere]: missing.md\n```\n"},
+		},
+		{
+			name:  "indented code block with brackets is not a link",
+			files: map[string]string{"cmd/hop/AGENTS.md": "# cmd/hop\n\n[main.go](main.go) and the [parent](../AGENTS.md).\n\n    tasks := map[string][]Task{}\n    [fake link][nowhere]\n"},
+		},
+		{
+			name:  "escaped brackets are literal",
+			files: map[string]string{"cmd/hop/AGENTS.md": "# cmd/hop\n\n[main.go](main.go) and the [parent](../AGENTS.md).\n\nWrite \\[label\\], \\[x][y] and \\[text](nowhere.md) literally.\n"},
 		},
 		{
 			name:       "absolute link",
