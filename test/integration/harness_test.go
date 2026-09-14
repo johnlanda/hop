@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -182,18 +183,91 @@ type testServer struct {
 
 // serverProcess is one launched herdr server: its process handle, the
 // process-group id captured while it was certainly alive (Setpgid made it the
-// group leader, so pgid == pid), its open log files, and whether it has been
-// reaped. pgid is never re-resolved after the reap, so a recycled pid can
-// never map this back to an unrelated group. A single goroutine started at
-// launch owns the one `cmd.Wait`; it closes `exited` when the leader has
-// actually terminated, which both the graceful restart barrier and the forced
-// reap read instead of calling Wait themselves.
+// group leader, so pgid == pid) and its open log files.
+//
+// Ownership is single-owner and lock-serialized, with no background wait
+// goroutine. `mu` guards `reaped` and the reap itself: the leader is reaped
+// only through tryReap (a non-blocking Wait4 under the lock, which sets
+// reaped), and the group is signaled only through killGroupIfUnreaped (which,
+// under the same lock, signals only while reaped is false). Because signaling
+// and reaping cannot interleave, a SIGKILL is always issued while the leader
+// is provably unreaped — the pgid cannot have been recycled — closing the
+// check-then-signal race a concurrent Wait would open. pgid is captured once at
+// launch and never re-resolved.
 type serverProcess struct {
 	cmd            *exec.Cmd
 	pgid           int
 	stdout, stderr *os.File
-	reaped         bool
-	exited         chan struct{} // closed once the wait goroutine has reaped the leader
+
+	mu         sync.Mutex
+	reaped     bool
+	exitStatus syscall.WaitStatus // valid once reaped
+	torndown   bool               // teardown (reap + close logs) has completed
+}
+
+// tryReap makes one non-blocking attempt to reap the leader. It returns true
+// if the leader has terminated (and is now reaped by this call or a prior
+// one), false if it is still running. Reaping happens under mu so it cannot
+// interleave with killGroupIfUnreaped.
+func (sp *serverProcess) tryReap() bool {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	if sp.reaped {
+		return true
+	}
+	var ws syscall.WaitStatus
+	wpid, err := syscall.Wait4(sp.pgid, &ws, syscall.WNOHANG, nil)
+	if err != nil {
+		if errors.Is(err, syscall.ECHILD) {
+			sp.reaped = true // no such child: already gone
+			return true
+		}
+		return false // EINTR or transient; the caller polls again
+	}
+	if wpid == sp.pgid {
+		sp.reaped = true
+		sp.exitStatus = ws
+		return true
+	}
+	return false // wpid == 0: still running
+}
+
+// killGroupIfUnreaped SIGKILLs the leader's process group, but only while the
+// leader is provably unreaped (reaped is false under mu, so no concurrent
+// tryReap can have reaped it and freed the pgid for reuse). It is a no-op once
+// the leader has been reaped.
+func (sp *serverProcess) killGroupIfUnreaped(t *testing.T) {
+	t.Helper()
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	if sp.reaped {
+		return
+	}
+	if !safeToSignalGroup(sp.pgid, syscall.Getpgrp()) {
+		t.Errorf("refusing to signal unsafe process group %d", sp.pgid)
+		return
+	}
+	if err := syscall.Kill(-sp.pgid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		t.Logf("kill process group %d: %v", sp.pgid, err)
+	}
+}
+
+// reapLeader polls tryReap until the leader is reaped, bounded by the poll
+// deadline; it reports whether the leader was reaped in time.
+func (sp *serverProcess) reapLeader() bool {
+	return waitUntil(sp.tryReap)
+}
+
+// takeTeardown returns true exactly once per server: the caller that gets true
+// owns teardown, later callers get false and skip.
+func (sp *serverProcess) takeTeardown() bool {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	if sp.torndown {
+		return false
+	}
+	sp.torndown = true
+	return true
 }
 
 // testConfig is the test-only configuration: no onboarding, fixed headless
@@ -363,19 +437,11 @@ func (s *testServer) start(t *testing.T) {
 // inconclusive restart, not a successful one.
 const gracefulStopTimeout = 20 * time.Second
 
-// newServerProcess wraps an already-started server command and launches the
-// single goroutine that owns its cmd.Wait, closing exited when the leader has
-// terminated. Both the graceful barrier and the forced reap read exited rather
-// than calling Wait, so the leader is waited on exactly once.
+// newServerProcess wraps an already-started server command. It starts no
+// background wait: the leader is reaped only through the lock-serialized
+// tryReap, so signaling the group and reaping it can never interleave.
 func newServerProcess(cmd *exec.Cmd, stdout, stderr *os.File) *serverProcess {
-	sp := &serverProcess{cmd: cmd, pgid: cmd.Process.Pid, stdout: stdout, stderr: stderr, exited: make(chan struct{})}
-	go func() {
-		// A SIGKILLed or non-zero server exit is expected; the reap (not the
-		// error) is the point, so the Wait result is intentionally discarded.
-		_ = sp.cmd.Wait() //nolint:errcheck // the wait reaps the leader; its exit status is expected and unused
-		close(sp.exited)
-	}()
-	return sp
+	return &serverProcess{cmd: cmd, pgid: cmd.Process.Pid, stdout: stdout, stderr: stderr}
 }
 
 // closeLogs closes a server's log files, tolerating nil (a failed start).
@@ -407,52 +473,74 @@ func (s *testServer) restart(t *testing.T) {
 		t.Fatal("restart called before start")
 	}
 	current := s.running[len(s.running)-1]
+	if !current.takeTeardown() {
+		t.Fatal("restart called on an already-torn-down server")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	if err := s.client.Call(ctx, "server.stop", nil, nil); err != nil {
 		t.Logf("server.stop before restart: %v", err)
 	}
 	cancel()
-	if !awaitProcessExit(current, gracefulStopTimeout) {
-		// The server did not shut down on its own; its save may be incomplete.
-		// Force-kill and fail — restore evidence from here would be timing
-		// dependent.
-		current.reaped = true
+	if !awaitGracefulExit(current, gracefulStopTimeout) {
+		// The leader did not exit on its own; tryReap kept failing, so it is
+		// still unreaped and killGroupIfUnreaped can signal it safely. Its save
+		// may be incomplete, so fail — restore evidence would be timing
+		// dependent, never treat a forced shutdown as a completed save.
 		s.forceReap(t, current)
 		closeLogs(t, current.stdout, current.stderr)
 		t.Fatal("herdr did not exit within the graceful-stop deadline; restore evidence would be inconclusive")
 	}
-	// The leader exited on its own, so the shutdown save completed. It is
-	// already reaped by the wait goroutine; do not signal its (now possibly
-	// recycled) pgid. Its pane shells lose their PTY on the server's exit and
-	// terminate on their own; wait for the group to empty.
-	current.reaped = true
-	s.awaitGroupGone(t, current.pgid)
+	// The leader exited on its own (reaped by awaitGracefulExit's tryReap), so
+	// the shutdown save completed. Verify it was a clean exit, not a signal.
+	current.mu.Lock()
+	status := current.exitStatus
+	current.mu.Unlock()
+	if !status.Exited() {
+		closeLogs(t, current.stdout, current.stderr)
+		t.Fatalf("herdr exited via signal during graceful restart (%v); the save may be incomplete (inconclusive)", status)
+	}
+	if code := status.ExitStatus(); code != 0 {
+		t.Logf("herdr graceful exit code %d (nonzero)", code)
+	}
+	// Its pane shells lose their PTY on the server's exit and terminate on
+	// their own. The leader is reaped, so its pgid must not be signaled; wait
+	// for the group to empty and fail (inconclusive) if it does not, rather
+	// than signaling a possibly recycled pgid.
+	if !waitUntil(func() bool { return errors.Is(syscall.Kill(-current.pgid, 0), syscall.ESRCH) }) {
+		closeLogs(t, current.stdout, current.stderr)
+		t.Fatalf("old server group %d did not retire after graceful exit; restore evidence would be inconclusive", current.pgid)
+	}
 	closeLogs(t, current.stdout, current.stderr)
 	s.start(t)
 }
 
-// awaitProcessExit reports whether the server's leader terminated within the
-// timeout, observed through the wait goroutine rather than by reaping here.
-func awaitProcessExit(sp *serverProcess, timeout time.Duration) bool {
-	select {
-	case <-sp.exited:
-		return true
-	case <-time.After(timeout):
-		return false
+// awaitGracefulExit polls for the leader's natural exit (reaping it when it
+// happens) until the timeout, without ever signaling it. It returns true if
+// the leader exited on its own in time, false if it is still running (and thus
+// still unreaped, safe to force-signal).
+func awaitGracefulExit(sp *serverProcess, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if sp.tryReap() {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(pollInterval)
 	}
 }
 
 // reapServer is the forced teardown used by cleanup: a best-effort graceful
-// stop, then a group SIGKILL (only while the leader is still unreaped, so the
-// pgid cannot have been recycled) and a wait for the whole group to be gone.
-// It is idempotent per server, so restart and the stacked cleanups never tear
-// one down twice.
+// stop, then a group SIGKILL (issued only while the leader is provably
+// unreaped, via killGroupIfUnreaped) and a reap of the leader and its group.
+// It runs teardown at most once per server, so restart and the stacked
+// cleanups never tear one down twice.
 func (s *testServer) reapServer(t *testing.T, sp *serverProcess) {
 	t.Helper()
-	if sp.reaped {
+	if !sp.takeTeardown() {
 		return
 	}
-	sp.reaped = true
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	if err := s.client.Call(ctx, "server.stop", nil, nil); err != nil {
 		t.Logf("server.stop: %v (falling back to the process group)", err)
@@ -462,27 +550,18 @@ func (s *testServer) reapServer(t *testing.T, sp *serverProcess) {
 	closeLogs(t, sp.stdout, sp.stderr)
 }
 
-// forceReap ensures the server and its whole process group are gone. If the
-// leader has not yet exited it SIGKILLs the group while the leader is still
-// unreaped (so the pgid cannot have been recycled), then waits for the wait
-// goroutine to reap it; if the leader already exited on its own it does not
-// signal the pgid at all (it could have been recycled), and only waits for the
-// group to drain. Either way it then confirms the group is empty.
+// forceReap ensures the server and its whole process group are gone. It signals
+// the group only while the leader is provably unreaped (killGroupIfUnreaped, so
+// the pgid cannot have been recycled), then reaps the leader and waits for the
+// group to drain. killGroupIfUnreaped signals whenever the leader is unreaped —
+// alive or an unreaped zombie — because either still occupies the pgid, which
+// kills any surviving descendants too; it declines only once the leader has
+// been reaped (when the pgid could have been recycled).
 func (s *testServer) forceReap(t *testing.T, sp *serverProcess) {
 	t.Helper()
-	select {
-	case <-sp.exited:
-		// Already reaped by the wait goroutine; do not signal a possibly
-		// recycled pgid. Reparented descendants are drained below.
-	default:
-		if safeToSignalGroup(sp.pgid, syscall.Getpgrp()) {
-			if err := syscall.Kill(-sp.pgid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-				t.Logf("kill process group %d: %v", sp.pgid, err)
-			}
-		} else {
-			t.Errorf("refusing to signal unsafe process group %d", sp.pgid)
-		}
-		<-sp.exited
+	sp.killGroupIfUnreaped(t)
+	if !sp.reapLeader() {
+		t.Errorf("leader %d was not reaped before the deadline", sp.pgid)
 	}
 	s.awaitGroupGone(t, sp.pgid)
 }

@@ -186,11 +186,23 @@ func TestSpikeRestoreAutoRelaunchBypassesLauncher(t *testing.T) {
 		t.Fatalf("restored pane never appeared as a claude agent in the snapshot:\n%s", server.snapshotDump(t))
 	}
 	artifacts.save(t, "snapshot-delayed-restore-window.txt", server.snapshotDump(t))
-	if info, err := server.tryProcessInfo(t, restoredPane); err == nil {
+	// Classify the phantom precisely: the snapshot listed the agent, and
+	// process_info must show NO live process — either the specific no-runtime
+	// API error (the deferred resume has not spawned the shell) or a successful
+	// read with no live claude foreground. Any other inspection error is not
+	// accepted as absence evidence and fails the test.
+	info, err := server.tryProcessInfo(t, restoredPane)
+	switch {
+	case err == nil:
 		if live := foregroundClaudeProcess(info); live != nil {
 			t.Errorf("delayed-restore window is not a phantom: a live claude process (pid %d) already runs while only the snapshot agent was expected", live.PID)
 		}
-	} // an error here means no runtime yet, which is itself the phantom
+		artifacts.save(t, "phantom-classification.txt", "process_info ok, no live claude foreground (phantom)\n")
+	case isNoRuntimeError(err):
+		artifacts.save(t, "phantom-classification.txt", fmt.Sprintf("process_info no-runtime error (phantom): %v\n", err))
+	default:
+		t.Fatalf("unexpected process_info error during the phantom window (not the no-runtime result): %v", err)
+	}
 
 	// A client supplies geometry, which is what lets the deferred resume fire.
 	client := server.attachPTYClient(t)
@@ -216,13 +228,18 @@ func TestSpikeRestoreAutoRelaunchBypassesLauncher(t *testing.T) {
 	artifacts.save(t, "snapshot-after-relaunch.txt", server.snapshotDump(t))
 	artifacts.save(t, "resumed-process.txt", renderProcessInfo(server.processInfo(t, restoredPane)))
 
-	// Exact resume argv: `<claude> --resume <sessionID>` — the launch bypassed
-	// any HOP launcher and used Herdr's native resume command.
-	if base := filepath.Base(resumed.Argv[0]); base != "claude" {
-		t.Errorf("resumed argv[0] basename = %q, want claude; argv=%q", base, resumed.Argv)
-	}
-	if len(resumed.Argv) < 3 || resumed.Argv[1] != "--resume" || resumed.Argv[2] != sessionID {
-		t.Errorf("resumed argv = %q, want [claude --resume %s]", resumed.Argv, sessionID)
+	// Exact resume argv: exactly `<claude> --resume <sessionID>` — three
+	// entries, no more — proving the launch bypassed any HOP launcher and used
+	// Herdr's native resume command verbatim.
+	if len(resumed.Argv) != 3 {
+		t.Errorf("resumed argv = %q, want exactly 3 entries [claude --resume %s]", resumed.Argv, sessionID)
+	} else {
+		if base := filepath.Base(resumed.Argv[0]); base != "claude" {
+			t.Errorf("resumed argv[0] basename = %q, want claude; argv=%q", base, resumed.Argv)
+		}
+		if resumed.Argv[1] != "--resume" || resumed.Argv[2] != sessionID {
+			t.Errorf("resumed argv = %q, want [claude --resume %s]", resumed.Argv, sessionID)
+		}
 	}
 
 	// The relaunched process's environment, correlated by its pid: HERDR_*

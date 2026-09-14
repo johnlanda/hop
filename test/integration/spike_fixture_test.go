@@ -12,6 +12,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/johnlanda/hop/internal/adapters/herdr"
 )
 
 // The TestSpike* tests are the Phase 2 capability spike: they establish, with
@@ -197,13 +199,15 @@ func copyExecutable(t *testing.T, from, to string) {
 }
 
 // runInOwnedGroup runs a command as its own process-group leader with a
-// bounded lifecycle, and after it returns confirms the whole group is gone. It
-// gives a real external binary (S4's claude, and the self-test's fixture
-// leader) an owned teardown: on the context deadline cmd.Cancel SIGKILLs the
-// whole group so a descendant cannot outlive the leader or hold the output
-// pipe open, and WaitDelay bounds pipe draining so CombinedOutput cannot block
-// indefinitely. It returns the combined output, the run error, and whether the
-// deadline fired.
+// bounded lifecycle, and after it returns retires the whole group. It gives a
+// real external binary (S4's claude, and the self-test's fixture leader) an
+// owned teardown: on the context deadline cmd.Cancel SIGKILLs the whole group,
+// and WaitDelay bounds pipe draining so CombinedOutput cannot block
+// indefinitely. Crucially it also retires the group after a NORMAL leader exit
+// — a backgrounded child can outlive the leader whether or not it still holds
+// the output pipe — by signaling the group and waiting for it to drain, since
+// cmd.Cancel fires only on the deadline. It returns the combined output,
+// whether the deadline fired, and the run error.
 func runInOwnedGroup(t *testing.T, timeout time.Duration, name string, env []string, dir string, args ...string) (out []byte, timedOut bool, err error) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), timeout)
@@ -212,7 +216,7 @@ func runInOwnedGroup(t *testing.T, timeout time.Duration, name string, env []str
 	cmd.Env = env
 	cmd.Dir = dir
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.WaitDelay = 10 * time.Second
+	cmd.WaitDelay = 5 * time.Second
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
 			return nil
@@ -227,11 +231,16 @@ func runInOwnedGroup(t *testing.T, timeout time.Duration, name string, env []str
 	}
 	out, err = cmd.CombinedOutput()
 	timedOut = ctx.Err() != nil
-	// After CombinedOutput the leader is reaped; confirm no descendant (which
-	// would have been reparented to init) survives holding the group open.
+	// Retire the owned group unconditionally: after a normal leader exit a
+	// backgrounded child may survive, and cmd.Cancel did not fire, so signal the
+	// group (it is non-empty exactly when such a child survives; ESRCH when
+	// already empty) and wait for it to drain within the poll bound.
 	if cmd.Process != nil {
 		pgid := cmd.Process.Pid
 		if safeToSignalGroup(pgid, syscall.Getpgrp()) {
+			if killErr := syscall.Kill(-pgid, syscall.SIGKILL); killErr != nil && !errors.Is(killErr, syscall.ESRCH) {
+				t.Logf("retire owned process group %d: %v", pgid, killErr)
+			}
 			if !waitUntil(func() bool { return errors.Is(syscall.Kill(-pgid, 0), syscall.ESRCH) }) {
 				t.Errorf("owned process group %d still had members after teardown", pgid)
 			}
@@ -309,6 +318,19 @@ func (s *testServer) tryProcessInfo(t *testing.T, paneID string) (spikeProcessIn
 	}
 	err := s.client.Call(ctx, "pane.process_info", map[string]any{"pane_id": paneID}, &result)
 	return result.ProcessInfo, err
+}
+
+// isNoRuntimeError reports whether a pane.process_info error is the specific
+// "no live runtime" result — Herdr's handler returns the API error
+// {code: pane_not_found} when the pane has no terminal runtime (its
+// lookup_runtime returns None), which in the delayed-restore window means the
+// deferred resume has not yet spawned the pane's shell
+// (repos/herdr/src/app/api/panes.rs handle_pane_process_info). Any other error
+// (timeout, transport, decode, a different API code) is NOT accepted as
+// no-runtime evidence.
+func isNoRuntimeError(err error) bool {
+	var apiErr *herdr.APIError
+	return errors.As(err, &apiErr) && apiErr.Code == "pane_not_found"
 }
 
 // envDumpForPID reads and parses one fixture env dump (spike-env-<pid>.txt)
