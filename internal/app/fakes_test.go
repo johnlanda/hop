@@ -78,6 +78,11 @@ type fakeStore struct {
 
 	clock interface{ Now() time.Time }
 
+	// HeartbeatHook, when set, runs at the start of every Heartbeat call,
+	// outside the store lock: a test can take the lease over from another
+	// controller at exactly the pre-dispatch revalidation point.
+	HeartbeatHook func()
+
 	repoByRoot map[string]identity.RepositoryID
 	seqByRepo  map[identity.RepositoryID]int
 
@@ -204,6 +209,9 @@ func (s *fakeStore) matchesHeldLease(lease app.Lease) bool {
 }
 
 func (s *fakeStore) Heartbeat(_ context.Context, lease app.Lease) error {
+	if s.HeartbeatHook != nil {
+		s.HeartbeatHook()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.matchesHeldLease(lease) {

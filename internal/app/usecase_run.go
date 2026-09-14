@@ -157,7 +157,7 @@ func (c *Controller) StartRun(ctx context.Context, req StartRunRequest) (StartRu
 	if err != nil {
 		return StartRunResult{}, RunHandle{}, fmt.Errorf("app: initialize run: %w", err)
 	}
-	handle := RunHandle{runID: runID, lease: lease}
+	handle := newRunHandle(runID, lease)
 
 	detail, err := c.Read.LoadRunStatus(ctx, runID)
 	if err != nil {
@@ -265,13 +265,18 @@ func (c *Controller) createWorktree(ctx context.Context, handle RunHandle, ids g
 		return WorktreeInfo{}, fmt.Errorf("app: record worktree.create intent: %w", err)
 	}
 
-	info, actErr := c.Runtime.CreateWorktree(ctx, WorktreeRequest{
+	if err := c.revalidateForDispatch(ctx, handle, false); err != nil {
+		return WorktreeInfo{}, fmt.Errorf("app: revalidate before worktree.create: %w", err)
+	}
+	actCtx, release := handle.actContext(ctx)
+	info, actErr := c.Runtime.CreateWorktree(actCtx, WorktreeRequest{
 		RepositoryRoot: repositoryRoot, Branch: branch, BaseRef: intent.BaseRef,
 	})
 	var baseCommit string
 	if actErr == nil {
-		baseCommit, actErr = c.resolveWorktreeProvenance(ctx, info.Path, repositoryRoot)
+		baseCommit, actErr = c.resolveWorktreeProvenance(actCtx, info.Path, repositoryRoot)
 	}
+	release()
 
 	outcomeErr := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 		op, getErr := uow.Operations().Get(ctx, opID)
@@ -354,15 +359,20 @@ func (c *Controller) openPane(ctx context.Context, handle RunHandle, ids generat
 		return fmt.Errorf("app: record pane.open intent: %w", err)
 	}
 
-	paneHandle, actErr := c.Runtime.OpenWorkerPane(ctx, WorkerPaneRequest{
+	if err := c.revalidateForDispatch(ctx, handle, false); err != nil {
+		return fmt.Errorf("app: revalidate before pane.open: %w", err)
+	}
+	actCtx, release := handle.actContext(ctx)
+	paneHandle, actErr := c.Runtime.OpenWorkerPane(actCtx, WorkerPaneRequest{
 		WorkspaceID: worktree.WorkspaceID, Cwd: worktree.Path, Command: argv, Env: env, Label: opID.String(),
 	})
 	if actErr != nil {
-		if ref, found, findErr := c.Runtime.FindPaneByLabel(ctx, opID.String()); findErr == nil && found {
+		if ref, found, findErr := c.Runtime.FindPaneByLabel(actCtx, opID.String()); findErr == nil && found {
 			paneHandle = PaneHandle(ref)
 			actErr = nil
 		}
 	}
+	release()
 
 	outcomeErr := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 		op, getErr := uow.Operations().Get(ctx, opID)

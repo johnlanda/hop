@@ -144,6 +144,12 @@ type fakeCommands struct {
 	Errs    map[string]error
 	Calls   []app.Command
 
+	// CheckExecFn, when set, handles the hop check-exec spawn (matched by
+	// argv[1] == "check-exec"), receiving the act context so a test can
+	// block until dispatch cancellation or inject state mid-execution; git
+	// commands keep their scripted defaults.
+	CheckExecFn func(ctx context.Context, cmd app.Command) (app.CommandResult, error)
+
 	// CheckExecExitCode and CheckExecErr script the hop check-exec spawn
 	// specifically, matched by argv[1] == "check-exec" rather than by exact
 	// argv text, since its argv always includes a freshly generated
@@ -158,16 +164,21 @@ func newFakeCommands() *fakeCommands {
 
 func (*fakeCommands) key(cmd app.Command) string { return strings.Join(cmd.Argv, " ") }
 
-func (c *fakeCommands) Run(_ context.Context, cmd app.Command) (app.CommandResult, error) {
+func (c *fakeCommands) Run(ctx context.Context, cmd app.Command) (app.CommandResult, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.Calls = append(c.Calls, cmd)
 	if len(cmd.Argv) >= 2 && cmd.Argv[1] == "check-exec" {
+		if fn := c.CheckExecFn; fn != nil {
+			c.mu.Unlock()
+			return fn(ctx, cmd)
+		}
+		defer c.mu.Unlock()
 		if c.CheckExecErr != nil {
 			return app.CommandResult{}, c.CheckExecErr
 		}
 		return app.CommandResult{ExitCode: c.CheckExecExitCode}, nil
 	}
+	defer c.mu.Unlock()
 	k := c.key(cmd)
 	if err, ok := c.Errs[k]; ok {
 		return app.CommandResult{}, err

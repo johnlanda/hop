@@ -148,7 +148,7 @@ func (c *Controller) stopLaunching(ctx context.Context, handle RunHandle, detail
 		return StopReport{RunState: string(run.RunStopping)}, nil
 	}
 	evidence := run.OccupantEvidence{Label: detail.Binding.CreationLabel, ArgvMarker: detail.AttemptID.String(), PID: detail.Claim.PID}
-	closed, err := c.closeUnderCloseRule(ctx, detail.Binding.PaneID, evidence)
+	closed, err := c.closeUnderCloseRule(ctx, handle, detail.Binding.PaneID, evidence)
 	if err != nil {
 		return StopReport{RunState: string(run.RunStopping)}, fmt.Errorf("app: close launching pane: %w", err)
 	}
@@ -171,6 +171,9 @@ func (c *Controller) stopRunning(ctx context.Context, handle RunHandle, detail R
 	}
 	if !OccupantMatches(*detail.Binding.Occupant, pane) {
 		return c.finishStop(ctx, handle, detail, "worker termination observed")
+	}
+	if err := c.revalidateForDispatch(ctx, handle, true); err != nil {
+		return StopReport{RunState: string(run.RunStopping)}, err
 	}
 	if err := c.Runtime.ClosePane(ctx, detail.Binding.PaneID); err != nil {
 		return StopReport{RunState: string(run.RunStopping)}, fmt.Errorf("app: close running pane: %w", err)
@@ -207,7 +210,10 @@ func (c *Controller) stopChecking(ctx context.Context, handle RunHandle, detail 
 	}
 
 	intent, _ := decodeOperationPayload[CheckRunIntent](checkOp.Intent) // a decode failure leaves expectedArgv nil, which ClassifyGroupRetirement treats as never matching — fails closed, not a panic.
-	outcome := c.retireGroup(ctx, claim.PID, intent.CheckArgv)
+	outcome, retireErr := c.retireGroup(ctx, handle, claim.PID, intent.CheckArgv)
+	if retireErr != nil {
+		return StopReport{RunState: string(run.RunStopping)}, retireErr
+	}
 	switch outcome {
 	case GroupEmpty, GroupMatched:
 		return c.finishStop(ctx, handle, detail, "check process group retired")
@@ -216,11 +222,15 @@ func (c *Controller) stopChecking(ctx context.Context, handle RunHandle, detail 
 	}
 }
 
-// closeUnderCloseRule applies the Runtime close rule: it re-inspects the
-// pane and matches the occupant against evidence immediately before
-// closing; on mismatch, missing identity or inspection failure it fails
-// closed (no close) and returns false.
-func (c *Controller) closeUnderCloseRule(ctx context.Context, paneID string, evidence run.OccupantEvidence) (bool, error) {
+// closeUnderCloseRule applies the Runtime close rule: it revalidates the
+// dispatch (heartbeat, generation), re-inspects the pane and matches the
+// occupant against evidence immediately before closing; on mismatch,
+// missing identity or inspection failure it fails closed (no close) and
+// returns false.
+func (c *Controller) closeUnderCloseRule(ctx context.Context, handle RunHandle, paneID string, evidence run.OccupantEvidence) (bool, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per close attempt.
+	if err := c.revalidateForDispatch(ctx, handle, true); err != nil {
+		return false, err
+	}
 	pane, err := c.Runtime.InspectPane(ctx, paneID)
 	if err != nil {
 		return false, nil //nolint:nilerr // inspection failure fails closed: no close, caller stays ambiguous.
@@ -235,14 +245,22 @@ func (c *Controller) closeUnderCloseRule(ctx context.Context, paneID string, evi
 }
 
 // retireGroup lists pgid through ProcessGroupInspector and classifies it
-// against expectedArgv, signaling the group only when matched.
-func (c *Controller) retireGroup(ctx context.Context, pgid int, expectedArgv []string) GroupRetirementOutcome {
+// against expectedArgv, signaling the group only when matched, after
+// pre-dispatch revalidation. A signal failure is returned, never
+// discarded: the caller records it as reconciliation evidence.
+func (c *Controller) retireGroup(ctx context.Context, handle RunHandle, pgid int, expectedArgv []string) (GroupRetirementOutcome, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per retirement round.
 	processes, err := c.Groups.GroupProcesses(ctx, pgid)
 	outcome := ClassifyGroupRetirement(processes, err, expectedArgv)
-	if outcome == GroupMatched {
-		_ = c.Groups.SignalGroup(ctx, pgid) //nolint:errcheck // best-effort signal; the caller re-observes absence on its next round rather than trusting this return.
+	if outcome != GroupMatched {
+		return outcome, nil
 	}
-	return outcome
+	if err := c.revalidateForDispatch(ctx, handle, true); err != nil {
+		return outcome, err
+	}
+	if err := c.Groups.SignalGroup(ctx, pgid); err != nil {
+		return outcome, fmt.Errorf("app: signal check process group %d: %w", pgid, err)
+	}
+	return outcome, nil
 }
 
 // finishStop interrupts the run's task, attempt and session (whichever are

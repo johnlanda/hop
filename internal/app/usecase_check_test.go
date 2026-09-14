@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/johnlanda/hop/internal/app"
 	"github.com/johnlanda/hop/internal/domain/run"
 )
 
@@ -127,8 +128,13 @@ func TestClaimAndRunCheck(t *testing.T) {
 		if _, err := tc.Controller.SubmitResult(context.Background(), defaultSubmitRequest(detail)); err != nil {
 			t.Fatalf("SubmitResult() error = %v", err)
 		}
-		if err := tc.Controller.RequestStop(context.Background(), detail.RunID.String()); err != nil {
-			t.Fatalf("RequestStop() error = %v", err)
+		// The stop request arrives while the check command is executing: the
+		// outcome transaction re-reads the stop flag and applies precedence.
+		tc.Commands.CheckExecFn = func(ctx context.Context, _ app.Command) (app.CommandResult, error) {
+			if err := tc.Controller.RequestStop(ctx, detail.RunID.String()); err != nil {
+				t.Errorf("RequestStop() during check error = %v", err)
+			}
+			return app.CommandResult{ExitCode: 0}, nil
 		}
 
 		report, err := tc.Controller.ClaimAndRunCheck(context.Background(), handle, "/usr/local/bin/hop", "/repo", "/state", checkArgv, false, nil)
@@ -145,6 +151,35 @@ func TestClaimAndRunCheck(t *testing.T) {
 		}
 		if updated.State != run.RunStopped {
 			t.Fatalf("Run.State = %s, want %s", updated.State, run.RunStopped)
+		}
+	})
+
+	t.Run("a stop request already recorded refuses to start unstarted check work", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		handle, detail := runningRun(t, tc)
+		if _, err := tc.Controller.SubmitResult(context.Background(), defaultSubmitRequest(detail)); err != nil {
+			t.Fatalf("SubmitResult() error = %v", err)
+		}
+		if err := tc.Controller.RequestStop(context.Background(), detail.RunID.String()); err != nil {
+			t.Fatalf("RequestStop() error = %v", err)
+		}
+
+		report, err := tc.Controller.ClaimAndRunCheck(context.Background(), handle, "/usr/local/bin/hop", "/repo", "/state", checkArgv, false, nil)
+		if err != nil {
+			t.Fatalf("ClaimAndRunCheck() error = %v", err)
+		}
+		if report.Ran {
+			t.Fatalf("report = %+v, want Ran=false: unstarted work is never started after stop", report)
+		}
+		for _, cmd := range tc.Commands.Calls {
+			if len(cmd.Argv) >= 2 && cmd.Argv[1] == "check-exec" {
+				t.Fatalf("hop check-exec was spawned despite the stop request")
+			}
+		}
+		for _, cr := range tc.Store.CheckRequests {
+			if cr.State != app.CheckRequestRequested {
+				t.Fatalf("check request state = %s, want requested (left for stop handling)", cr.State)
+			}
 		}
 	})
 }

@@ -106,6 +106,9 @@ func (c *Controller) ClaimAndRunCheck(ctx context.Context, handle RunHandle, hop
 		return CheckReport{}, fmt.Errorf("app: record check.run intent: %w", err)
 	}
 
+	if err := c.revalidateForDispatch(ctx, handle, false); err != nil {
+		return CheckReport{}, fmt.Errorf("app: revalidate before check checkout: %w", err)
+	}
 	if err := c.materializeCheckout(ctx, repositoryRoot, checkoutPath, commitOID); err != nil {
 		return c.recordCheckOutcome(ctx, handle, opID, checkRequest.AttemptID, checkRunOutcome{Unknown: true}, false, fmt.Errorf("materialize checkout: %w", err))
 	}
@@ -113,7 +116,12 @@ func (c *Controller) ClaimAndRunCheck(ctx context.Context, handle RunHandle, hop
 
 	spawnEnv = withHOPStateDir(spawnEnv, stateRoot)
 	spawnArgv := append([]string{hopPath, "check-exec", "--op", opID.String(), "--"}, checkArgv...)
-	cmdResult, runErr := c.Commands.Run(ctx, Command{Argv: spawnArgv, Dir: checkoutPath, Env: spawnEnv})
+	if err := c.revalidateForDispatch(ctx, handle, false); err != nil {
+		return CheckReport{}, fmt.Errorf("app: revalidate before check spawn: %w", err)
+	}
+	actCtx, release := handle.actContext(ctx)
+	cmdResult, runErr := c.Commands.Run(actCtx, Command{Argv: spawnArgv, Dir: checkoutPath, Env: spawnEnv})
+	release()
 	if runErr != nil {
 		return c.recordCheckOutcome(ctx, handle, opID, checkRequest.AttemptID, checkRunOutcome{Unknown: true}, checkRepeatable, fmt.Errorf("spawn hop check-exec: %w", runErr))
 	}
@@ -130,6 +138,15 @@ func (c *Controller) claimCheckRequest(ctx context.Context, handle RunHandle) (b
 		request CheckRequest
 	)
 	err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		r, _, getErr := uow.Runs().Get(ctx, handle.runID)
+		if getErr != nil {
+			return getErr
+		}
+		if r.StopRequested {
+			// Unstarted work is never started after stop: the pending
+			// request stays requested; stop handling interrupts it.
+			return nil
+		}
 		pending, found, getErr := uow.CheckRequests().Pending(ctx, handle.runID)
 		if getErr != nil {
 			return getErr

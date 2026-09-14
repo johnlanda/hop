@@ -2,11 +2,17 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/johnlanda/hop/internal/domain/identity"
 )
+
+// ErrStopRequested reports that an external act was refused at pre-dispatch
+// revalidation because the run has a stop request: unstarted work is never
+// started after stop (docs/plan/phase-2-design.md sections 4-5).
+var ErrStopRequested = errors.New("app: run has a stop request")
 
 // Controller is HOP's run-controller application service: the driving API
 // cmd/hop calls to implement hop run, hop status, hop stop, hop resume, hop
@@ -31,14 +37,110 @@ type Controller struct {
 // controller holds on it, returned by StartRun and Resume and consumed by
 // every other use-case method that keeps acting on the same run within one
 // controller process. Composition holds it opaquely; it never needs to
-// import the identity package to do so.
+// import the identity package to do so. Handles returned by StartRun and
+// Resume carry a dispatch scope: the cancelable context every external act
+// for the run derives from, canceled when a heartbeat fails or the
+// controller detaches so in-flight external calls are canceled with it.
 type RunHandle struct {
-	runID identity.RunID
-	lease Lease
+	runID    identity.RunID
+	lease    Lease
+	dispatch *dispatchState
 }
 
 // RunID renders the handle's run identity as a string, for display only.
 func (h *RunHandle) RunID() string { return h.runID.String() }
+
+// dispatchState is one controller process's cancelable dispatch scope for
+// one run. It is shared by every copy of the RunHandle that created it.
+type dispatchState struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+// newRunHandle builds a handle with a fresh dispatch scope.
+func newRunHandle(runID identity.RunID, lease Lease) RunHandle {
+	ctx, cancel := context.WithCancel(context.Background())
+	return RunHandle{runID: runID, lease: lease, dispatch: &dispatchState{ctx: ctx, cancel: cancel}}
+}
+
+// cancelDispatch cancels the handle's dispatch scope, if it has one.
+func (h *RunHandle) cancelDispatch() {
+	if h.dispatch != nil {
+		h.dispatch.cancel()
+	}
+}
+
+// actContext derives the context an external act runs under: the caller's
+// ctx, additionally canceled when the handle's dispatch scope is canceled
+// (a failed heartbeat, or detach). The returned release func must be
+// called once the act returns; it detaches the link without canceling the
+// caller's own ctx.
+func (h *RunHandle) actContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if h.dispatch == nil {
+		return ctx, func() {}
+	}
+	merged, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(h.dispatch.ctx, cancel)
+	return merged, func() { stop(); cancel() }
+}
+
+// Heartbeat extends the handle's lease TTL through the store's CAS
+// contract (run, controller, generation, held). Composition calls it on
+// the design's 10s interval so a long check or wait never outlives the 30s
+// TTL. A failed heartbeat cancels the handle's dispatch scope — in-flight
+// external calls are canceled — and the caller must stop acting
+// (docs/plan/phase-2-design.md section 4).
+func (c *Controller) Heartbeat(ctx context.Context, handle RunHandle) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; heartbeat runs on a 10s interval, never a hot loop.
+	if err := c.Store.Heartbeat(ctx, handle.lease); err != nil {
+		handle.cancelDispatch()
+		return fmt.Errorf("app: heartbeat: %w", err)
+	}
+	return nil
+}
+
+// Detach releases the run without stopping it (docs/plan/phase-2-design.md
+// section 5, controller signals): journal the detach as transition
+// evidence, cancel in-flight external calls, and release the lease
+// (CAS to released, generation preserved). The worker keeps running and
+// the run keeps its state; only `hop stop` ever stops a run.
+func (c *Controller) Detach(ctx context.Context, handle RunHandle) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per controller shutdown.
+	now := c.Clock.Now()
+	journalErr := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		r, _, err := uow.Runs().Get(ctx, handle.runID)
+		if err != nil {
+			return err
+		}
+		return recordTransition(ctx, uow, EntityRun, handle.runID.String(), string(r.State), string(r.State), "controller detached; lease released", gen(handle.lease.Generation), now)
+	})
+	handle.cancelDispatch()
+	if err := c.Store.ReleaseLease(ctx, handle.lease); err != nil {
+		return fmt.Errorf("app: release lease on detach: %w", err)
+	}
+	return journalErr
+}
+
+// revalidateForDispatch is the section 4 transaction-rule step 2
+// revalidation, applied immediately before every external mutation:
+// heartbeat fresh (the CAS verifies run, controller, generation and held),
+// and — unless the act is itself part of stopping — the stop flag re-read
+// under a fenced unit of work. Any failure means the act must not be
+// dispatched; an already-committed intent stays pending for recovery per
+// the operation decision table.
+func (c *Controller) revalidateForDispatch(ctx context.Context, handle RunHandle, actIsStopping bool) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per external act.
+	if err := c.Heartbeat(ctx, handle); err != nil {
+		return err
+	}
+	return c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		r, _, err := uow.Runs().Get(ctx, handle.runID)
+		if err != nil {
+			return err
+		}
+		if !actIsStopping && r.StopRequested {
+			return fmt.Errorf("%w: run %s", ErrStopRequested, handle.runID)
+		}
+		return nil
+	})
+}
 
 // generatedIdentities are every identity a use case mints through
 // IDGenerator before a store call that expects them already parsed.

@@ -68,7 +68,7 @@ func (c *Controller) Resume(ctx context.Context, req ResumeRequest) (ResumeResul
 	if err != nil {
 		return ResumeResult{}, RunHandle{}, fmt.Errorf("app: acquire lease: %w", err)
 	}
-	handle := RunHandle{runID: runID, lease: lease}
+	handle := newRunHandle(runID, lease)
 	now := c.Clock.Now()
 
 	if enterErr := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
@@ -265,7 +265,7 @@ func (c *Controller) retireAndRelaunch(ctx context.Context, handle RunHandle, de
 		return ResumeResult{}, fmt.Errorf("app: record restored-observed binding: %w", err)
 	}
 
-	if closed, closeErr := c.closeUnderCloseRule(ctx, detail.Binding.PaneID, run.OccupantEvidence{Label: detail.Binding.CreationLabel, ArgvMarker: nativeRef, PID: firstForeground(pane).PID}); closeErr != nil || !closed {
+	if closed, closeErr := c.closeUnderCloseRule(ctx, handle, detail.Binding.PaneID, run.OccupantEvidence{Label: detail.Binding.CreationLabel, ArgvMarker: nativeRef, PID: firstForeground(pane).PID}); closeErr != nil || !closed {
 		return ResumeResult{Outcome: ResumeReconciling, Detail: "positive-evidence occupant recorded; retirement close did not complete"}, closeErr
 	}
 	return c.coldRelaunch(ctx, handle, detail, req)
