@@ -253,15 +253,10 @@ func runInOwnedGroup(t *testing.T, timeout time.Duration, name string, env []str
 	anchor, anchorErr := startAnchor(pgid)
 	if anchorErr != nil {
 		// The command exited before the anchor could join its group; retire the
-		// leader (still ours and unreaped) and report inconclusive.
-		if killErr := syscall.Kill(-pgid, syscall.SIGKILL); killErr != nil && !errors.Is(killErr, syscall.ESRCH) {
-			t.Logf("kill unanchored owned-group leader %d: %v", pgid, killErr)
-		}
-		if werr := leader.Wait(); werr != nil {
-			t.Logf("reap unanchored owned-group leader %d: %v", pgid, werr)
-		}
-		<-readDone // the dead leader closed the write end, so the reader drains
-		closeOrLog(t, "owned-group pipe read end", pipeR)
+		// leader (still ours and unreaped) and report inconclusive. The drain is
+		// bounded so this failure path cannot hang either.
+		retireUnanchoredLeader(t, leader)
+		joinReader(t, readDone, pipeR, ownedGroupDrainTimeout)
 		t.Fatalf("anchor could not join the owned group %d (command exited at once?): %v", pgid, anchorErr)
 	}
 
@@ -288,25 +283,70 @@ func runInOwnedGroup(t *testing.T, timeout time.Duration, name string, env []str
 		t.Errorf("refusing to signal unsafe process group %d", pgid)
 	}
 	if timedOut {
-		err = <-leaderExited // the SIGKILL unblocked the leader's Wait
-	}
-	if awErr := anchor.Wait(); awErr != nil {
-		var exitErr *exec.ExitError
-		if !errors.As(awErr, &exitErr) {
-			t.Logf("reap owned-group anchor %d: %v", pgid, awErr)
+		// Bounded: the SIGKILL should unblock the leader's Wait promptly.
+		select {
+		case err = <-leaderExited:
+		case <-time.After(ownedGroupDrainTimeout):
+			t.Errorf("owned-group leader %d did not exit within the teardown deadline (inconclusive)", pgid)
 		}
 	}
-	// All group members are dead, so the pipe's write ends are closed and the
-	// reader reaches EOF; drain it, then close the read end.
-	<-readDone
-	if copyErr != nil {
+	// Bounded anchor reap: after the SIGKILL the anchor exits promptly.
+	if !reapCmdBounded(t, anchor, ownedGroupDrainTimeout) {
+		t.Errorf("owned-group anchor %d was not reaped within the teardown deadline (inconclusive)", pgid)
+	}
+	// Bounded output drain: a descendant that escaped the group could still hold
+	// the write end open, so the reader is joined against a deadline; on expiry
+	// the read end is closed to unblock it and the capture is reported
+	// incomplete (inconclusive), never hung.
+	if !joinReader(t, readDone, pipeR, ownedGroupDrainTimeout) {
+		t.Errorf("owned-group %d output drain did not finish within the teardown deadline (inconclusive)", pgid)
+	}
+	if copyErr != nil && !errors.Is(copyErr, os.ErrClosed) {
 		t.Logf("owned-group output copy: %v", copyErr)
 	}
-	closeOrLog(t, "owned-group pipe read end", pipeR)
-	if !waitUntil(func() bool { return errors.Is(syscall.Kill(-pgid, 0), syscall.ESRCH) }) {
+	if !groupIsGone(pgid) {
 		t.Errorf("owned process group %d still had members after teardown", pgid)
 	}
 	return buf.Bytes(), timedOut, err
+}
+
+// ownedGroupDrainTimeout bounds each teardown wait (leader reap, anchor reap,
+// output drain) in runInOwnedGroup, so no failure path can hang.
+const ownedGroupDrainTimeout = 10 * time.Second
+
+// joinReader waits for the reader goroutine (readDone) up to the timeout. On
+// expiry it closes r to unblock a reader stuck on a write end held outside the
+// group, then joins the reader. It returns whether the reader finished before
+// the deadline.
+func joinReader(t *testing.T, readDone <-chan struct{}, r io.Closer, timeout time.Duration) bool {
+	t.Helper()
+	select {
+	case <-readDone:
+		return true
+	case <-time.After(timeout):
+		closeOrLog(t, "owned-group pipe read end (drain deadline)", r)
+		<-readDone
+		return false
+	}
+}
+
+// reapCmdBounded reaps cmd in its own goroutine, bounded by timeout; it reports
+// whether the reap completed in time. A SIGKILLed process reports an ExitError,
+// which is expected and not logged.
+func reapCmdBounded(t *testing.T, cmd *exec.Cmd, timeout time.Duration) bool {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		var exitErr *exec.ExitError
+		if err != nil && !errors.As(err, &exitErr) {
+			t.Logf("reap %v: %v", cmd.Args, err)
+		}
+		return true
+	case <-time.After(timeout):
+		return false
+	}
 }
 
 // closeOrLog closes c, logging a non-nil error against name.

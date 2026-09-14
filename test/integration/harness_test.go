@@ -364,8 +364,13 @@ func (s *testServer) start(t *testing.T) {
 	// gone (the server died at once) and the launch is inconclusive.
 	anchor, err := startAnchor(cmd.Process.Pid)
 	if err != nil {
+		// The server started but could not be anchored (e.g. sleep unresolved);
+		// it is not necessarily dead and has no Wait owner or cleanup registered
+		// yet, so retire and reap it here before failing — no live server, no
+		// unreaped pid. Do not infer leader exit from an anchor error.
+		retireUnanchoredLeader(t, cmd)
 		closeLogs(t, stdout, stderr)
-		t.Fatalf("anchor could not join the server's process group %d (server exited at once?): %v", cmd.Process.Pid, err)
+		t.Fatalf("anchor could not join the server's process group %d: %v", cmd.Process.Pid, err)
 	}
 	sp := newServerProcess(cmd, anchor, stdout, stderr)
 	s.running = append(s.running, sp)
@@ -479,9 +484,7 @@ func (s *testServer) restart(t *testing.T) {
 		// The leader did not exit on its own; it is still running (and the anchor
 		// still pins the group), so retire the group and fail — a forced
 		// shutdown's save may be incomplete, never treat it as restored state.
-		s.retireGroup(t, current)
-		closeLogs(t, current.stdout, current.stderr)
-		t.Fatal("herdr did not exit within the graceful-stop deadline; restore evidence would be inconclusive")
+		s.failRestart(t, current, "herdr did not exit within the graceful-stop deadline; restore evidence would be inconclusive")
 	}
 	// The leader exited on its own, so the shutdown save completed. Verify it
 	// was a clean exit (code 0), not a signal or an error, before trusting the
@@ -489,28 +492,40 @@ func (s *testServer) restart(t *testing.T) {
 	status := current.leaderCmd.ProcessState
 	switch {
 	case current.leaderWaitErr != nil && status == nil:
-		s.retireGroup(t, current)
-		closeLogs(t, current.stdout, current.stderr)
-		t.Fatalf("herdr leader wait failed during graceful restart (%v); inconclusive", current.leaderWaitErr)
+		s.failRestart(t, current, fmt.Sprintf("herdr leader wait failed during graceful restart (%v); inconclusive", current.leaderWaitErr))
 	case !status.Exited():
-		s.retireGroup(t, current)
-		closeLogs(t, current.stdout, current.stderr)
-		t.Fatalf("herdr exited via signal during graceful restart (%v); the save may be incomplete (inconclusive)", status)
+		s.failRestart(t, current, fmt.Sprintf("herdr exited via signal during graceful restart (%v); the save may be incomplete (inconclusive)", status))
 	case status.ExitCode() != 0:
-		s.retireGroup(t, current)
-		closeLogs(t, current.stdout, current.stderr)
-		t.Fatalf("herdr graceful exit code %d (nonzero); the save may be incomplete (inconclusive)", status.ExitCode())
+		s.failRestart(t, current, fmt.Sprintf("herdr graceful exit code %d (nonzero); the save may be incomplete (inconclusive)", status.ExitCode()))
 	}
 	// Retire the still-anchored group: the anchor pins the pgid, so the single
 	// SIGKILL that clears any lingering pane shells is safe even though the
-	// leader is already reaped.
-	s.retireGroup(t, current)
+	// leader is already reaped. A failed retirement is fatal — the old group
+	// may still hold artifact files or a live process, so never relaunch.
+	if err := current.retireGroup(); err != nil {
+		closeLogs(t, current.stdout, current.stderr)
+		t.Fatalf("old server group did not retire after graceful exit (%v); restore evidence would be inconclusive", err)
+	}
 	closeLogs(t, current.stdout, current.stderr)
 	s.start(t)
 }
 
+// failRestart retires the old group and fails the restart as inconclusive; the
+// retirement error, if any, is folded into the message so a lingering group is
+// never silently followed by a relaunch.
+func (*testServer) failRestart(t *testing.T, sp *serverProcess, reason string) {
+	t.Helper()
+	retireErr := sp.retireGroup()
+	closeLogs(t, sp.stdout, sp.stderr)
+	if retireErr != nil {
+		t.Fatalf("%s; retirement also failed: %v", reason, retireErr)
+	}
+	t.Fatal(reason)
+}
+
 // reapServer is the cleanup teardown, run at most once per server, so restart
-// and the stacked cleanups never tear one down twice.
+// and the stacked cleanups never tear one down twice. As a cleanup it reports a
+// retirement failure but does not stop other cleanups.
 func (s *testServer) reapServer(t *testing.T, sp *serverProcess) {
 	t.Helper()
 	if !sp.takeTeardown() {
@@ -521,26 +536,35 @@ func (s *testServer) reapServer(t *testing.T, sp *serverProcess) {
 		t.Logf("server.stop: %v (falling back to the process group)", err)
 	}
 	cancel()
-	s.retireGroup(t, sp)
+	if err := sp.retireGroup(); err != nil {
+		t.Errorf("retire server group on cleanup: %v", err)
+	}
 	closeLogs(t, sp.stdout, sp.stderr)
 }
 
-// retireGroup tears the server's whole process group down safely. The single
-// group SIGKILL is sent while the anchor is provably unreaped, so it targets
-// only this group's members and never a recycled pgid; only afterward are the
-// anchor and leader reaped (each by exactly one owner). It must run at most
-// once per server (its callers hold takeTeardown).
-func (s *testServer) retireGroup(t *testing.T, sp *serverProcess) {
-	t.Helper()
+// retireGroup tears the server's whole process group down safely and reports
+// the first failure it hit. The single group SIGKILL is sent while the anchor
+// is provably unreaped, so it targets only this group's members and never a
+// recycled pgid; only afterward are the anchor and leader reaped (each by
+// exactly one owner). It must run at most once per server (its callers hold
+// takeTeardown). A non-nil error means retirement could not be established;
+// restart treats that as inconclusive and must not relaunch.
+func (sp *serverProcess) retireGroup() error {
+	var firstErr error
+	record := func(err error) {
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
 	// One SIGKILL to the whole group. The anchor is still unreaped here, so the
 	// pgid is pinned to our group; this kills the leader (if alive), the anchor,
 	// and every descendant.
 	if safeToSignalGroup(sp.pgid, syscall.Getpgrp()) {
 		if err := syscall.Kill(-sp.pgid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-			t.Logf("kill process group %d: %v", sp.pgid, err)
+			record(fmt.Errorf("kill process group %d: %w", sp.pgid, err))
 		}
 	} else {
-		t.Errorf("refusing to signal unsafe process group %d", sp.pgid)
+		record(fmt.Errorf("refusing to signal unsafe process group %d", sp.pgid))
 	}
 	// Reap the leader (its single owning goroutine) and the anchor (here, its
 	// single owner). No group signal is sent after this point.
@@ -548,24 +572,49 @@ func (s *testServer) retireGroup(t *testing.T, sp *serverProcess) {
 	if err := sp.anchorCmd.Wait(); err != nil {
 		var exitErr *exec.ExitError
 		if !errors.As(err, &exitErr) { // a SIGKILLed anchor reports an ExitError; anything else is unexpected
-			t.Logf("reap group anchor %d: %v", sp.pgid, err)
+			record(fmt.Errorf("reap group anchor %d: %w", sp.pgid, err))
 		}
 	}
 	// Confirm the group is empty: signal 0 only reads existence, so even if the
 	// now-unpinned pgid were recycled this cannot signal an unrelated process;
 	// it just waits until no member with that pgid remains.
-	s.awaitGroupGone(t, sp.pgid)
+	if !groupIsGone(sp.pgid) {
+		record(fmt.Errorf("process group %d still had members after the deadline; a descendant may still hold artifact files", sp.pgid))
+	}
+	return firstErr
 }
 
-// awaitGroupGone waits until no process remains in the group: signal 0 returns
-// ESRCH only once every member, including reparented descendants, has exited
-// and been reaped. A timeout means a lingering writer could still hold artifact
-// files, so it fails the test rather than leaving that unguaranteed.
-func (*testServer) awaitGroupGone(t *testing.T, pgid int) {
+// retireUnanchoredLeader kills and reaps a just-started leader whose group
+// could not be anchored. The leader has no Wait owner yet and is still
+// unreaped, so signaling its own pgid is safe; this leaves no live process and
+// no unreaped pid before the caller fails.
+func retireUnanchoredLeader(t *testing.T, cmd *exec.Cmd) {
 	t.Helper()
-	if !waitUntil(func() bool { return errors.Is(syscall.Kill(-pgid, 0), syscall.ESRCH) }) {
-		t.Errorf("process group %d still had members after the deadline; a descendant may still hold artifact files", pgid)
+	pgid := cmd.Process.Pid
+	if safeToSignalGroup(pgid, syscall.Getpgrp()) {
+		if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+			t.Logf("kill unanchored leader group %d: %v", pgid, err)
+		}
+	} else {
+		t.Errorf("refusing to signal unsafe process group %d", pgid)
 	}
+	if err := cmd.Wait(); err != nil {
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			t.Logf("reap unanchored leader %d: %v", pgid, err)
+		}
+	}
+	if !groupIsGone(pgid) {
+		t.Errorf("unanchored leader group %d still had members after teardown", pgid)
+	}
+}
+
+// groupIsGone reports whether no process remains in the group: signal 0 returns
+// ESRCH only once every member, including reparented descendants, has exited
+// and been reaped. It polls until the bounded deadline. Signal 0 sends nothing,
+// so even if the now-unpinned pgid were recycled this only reads existence.
+func groupIsGone(pgid int) bool {
+	return waitUntil(func() bool { return errors.Is(syscall.Kill(-pgid, 0), syscall.ESRCH) })
 }
 
 // killProcessGroupThenReap SIGKILLs the process group identified by pgid,

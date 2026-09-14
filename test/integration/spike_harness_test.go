@@ -3,6 +3,7 @@ package integration
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -46,7 +47,7 @@ func TestSpikeRestartBarrier(t *testing.T) {
 			t.Errorf("leader exit status = %v, want a clean exit(0)", ps)
 		}
 		if leader.takeTeardown() {
-			(&testServer{}).retireGroup(t, leader)
+			retireInTest(t, leader)
 		}
 		if !leader.groupGone(t) {
 			t.Error("group not gone after retiring a cleanly exited leader")
@@ -63,7 +64,7 @@ func TestSpikeRestartBarrier(t *testing.T) {
 		// retireGroup is what restart runs on the inconclusive branch: it kills
 		// the group while the anchor pins it, then reaps.
 		if leader.takeTeardown() {
-			(&testServer{}).retireGroup(t, leader)
+			retireInTest(t, leader)
 		}
 		if !leader.groupGone(t) {
 			t.Error("the force-killed leader's group is not gone")
@@ -85,7 +86,7 @@ func TestSpikeGroupAnchor(t *testing.T) {
 			t.Fatal("group is already empty after the leader exited; the anchor did not pin it")
 		}
 		if leader.takeTeardown() {
-			(&testServer{}).retireGroup(t, leader)
+			retireInTest(t, leader)
 		}
 		if !leader.groupGone(t) {
 			t.Error("retirement did not empty the anchored group")
@@ -162,6 +163,41 @@ func TestSpikeOwnedGroupTeardown(t *testing.T) {
 	}
 }
 
+// TestSpikeOwnedGroupDrainDeadline proves the output-drain deadline: a write
+// descriptor held OUTSIDE any killed group keeps the reader from reaching EOF,
+// so joinReader must fire its deadline, close the read end to unblock the
+// reader, and join it rather than hang. The write end is owned and cleaned up
+// by this test, so nothing leaks.
+func TestSpikeOwnedGroupDrainDeadline(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { closeOrLog(t, "test-owned write end", w) }) // this test owns and retires w
+
+	var cerr error
+	readDone := make(chan struct{})
+	go func() {
+		_, cerr = io.Copy(io.Discard, r)
+		close(readDone)
+	}()
+
+	// w is still open, so the reader cannot reach EOF on its own; the deadline
+	// must fire.
+	if joinReader(t, readDone, r, 200*time.Millisecond) {
+		t.Error("joinReader reported the drain finished, but the write end was still held open")
+	}
+	// joinReader closed r and joined the reader; the goroutine has returned.
+	select {
+	case <-readDone:
+	default:
+		t.Error("the reader was not joined after the drain deadline")
+	}
+	if cerr != nil && !errors.Is(cerr, os.ErrClosed) {
+		t.Logf("drain copy after deadline: %v", cerr)
+	}
+}
+
 // startFixtureLeader starts a /bin/sh leader in its own process group, anchors
 // that group, and wraps both as a serverProcess, so the ownership helpers can
 // be exercised without a herdr binary. It has no log files. Its cleanup retires
@@ -177,26 +213,29 @@ func startFixtureLeader(t *testing.T, script string) *serverProcess {
 	}
 	anchor, err := startAnchor(cmd.Process.Pid)
 	if err != nil {
-		if killErr := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); killErr != nil && !errors.Is(killErr, syscall.ESRCH) {
-			t.Logf("kill unanchored fixture leader: %v", killErr)
-		}
-		if werr := cmd.Wait(); werr != nil {
-			t.Logf("reap unanchored fixture leader: %v", werr)
-		}
+		retireUnanchoredLeader(t, cmd)
 		t.Fatalf("anchor could not join fixture leader group: %v", err)
 	}
 	sp := newServerProcess(cmd, anchor, nil, nil)
 	t.Cleanup(func() {
 		if sp.takeTeardown() {
-			(&testServer{}).retireGroup(t, sp)
+			retireInTest(t, sp)
 		}
 	})
 	return sp
+}
+
+// retireInTest retires a fixture group and reports a failure.
+func retireInTest(t *testing.T, sp *serverProcess) {
+	t.Helper()
+	if err := sp.retireGroup(); err != nil {
+		t.Errorf("retire group: %v", err)
+	}
 }
 
 // groupGone reports whether the leader's process group has no members left,
 // bounded by the suite's poll deadline.
 func (sp *serverProcess) groupGone(t *testing.T) bool {
 	t.Helper()
-	return waitUntil(func() bool { return errors.Is(syscall.Kill(-sp.pgid, 0), syscall.ESRCH) })
+	return groupIsGone(sp.pgid)
 }
