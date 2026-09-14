@@ -52,6 +52,7 @@ func TestPresentationReportMetadata(t *testing.T) {
 	err := presentation.ReportMetadata(testContext(t), app.PaneMetadata{
 		PaneID:    "w1:p1",
 		Tokens:    map[string]string{"hop_role": "manager", "hop_run": "r1"},
+		Clear:     []string{"hop_task", "hop_account"},
 		TTLMillis: 5000,
 	})
 	if err != nil {
@@ -75,6 +76,14 @@ func TestPresentationReportMetadata(t *testing.T) {
 	tokens, ok := params["tokens"].(map[string]any)
 	if !ok || tokens["hop_role"] != "manager" {
 		t.Errorf("tokens = %v, want the manager role token", params["tokens"])
+	}
+	// Cleared tokens are sent as JSON null so Herdr removes them. In the
+	// decoded request a JSON null is a Go nil value that is still present.
+	for _, cleared := range []string{"hop_task", "hop_account"} {
+		value, present := tokens[cleared]
+		if !present || value != nil {
+			t.Errorf("cleared token %q = %v (present=%t), want a null value", cleared, value, present)
+		}
 	}
 }
 

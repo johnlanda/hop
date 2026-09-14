@@ -11,45 +11,75 @@ import (
 
 func TestAgentDisplayTokens(t *testing.T) {
 	cases := []struct {
-		name    string
-		display app.AgentDisplay
-		want    map[string]string
+		name        string
+		display     app.AgentDisplay
+		wantTokens  map[string]string
+		wantCleared []string
 	}{
 		{
-			name: "manager omits task, parent and account",
+			name: "manager clears task, parent and account",
 			display: app.AgentDisplay{
 				PaneID: "w1:p1", Run: "r18", RunSequence: 18,
 				Role: app.RoleManager, WorkerSequence: 0, State: "planning",
 			},
-			want: map[string]string{
+			wantTokens: map[string]string{
 				"hop_run": "r18", "hop_run_order": "000018",
 				"hop_order": "0000000", "hop_role": "manager", "hop_state": "planning",
 			},
+			wantCleared: []string{"hop_account", "hop_parent", "hop_task"},
 		},
 		{
-			name: "worker carries every populated token",
+			name: "worker carries every populated token and clears nothing",
 			display: app.AgentDisplay{
 				PaneID: "w1:p2", Run: "r18", RunSequence: 18,
 				Role: app.RoleImplementer, WorkerSequence: 10,
 				Task: "retry policy", ParentLabel: "manager-r18",
 				Account: "claude-a", State: "awaiting checks",
 			},
-			want: map[string]string{
+			wantTokens: map[string]string{
 				"hop_run": "r18", "hop_run_order": "000018",
 				"hop_order": "1000010", "hop_role": "implementer",
 				"hop_task": "retry policy", "hop_parent": "manager-r18",
 				"hop_account": "claude-a", "hop_state": "awaiting checks",
 			},
+			wantCleared: nil,
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := tc.display.Tokens()
-
-			if !reflect.DeepEqual(got, tc.want) {
-				t.Errorf("Tokens() = %v, want %v", got, tc.want)
+			if got := tc.display.Tokens(); !reflect.DeepEqual(got, tc.wantTokens) {
+				t.Errorf("Tokens() = %v, want %v", got, tc.wantTokens)
+			}
+			if got := tc.display.Cleared(); !reflect.DeepEqual(got, tc.wantCleared) {
+				t.Errorf("Cleared() = %v, want %v", got, tc.wantCleared)
 			}
 		})
+	}
+}
+
+func TestPresenterPublishClearsUnsetOptionalTokens(t *testing.T) {
+	fake := &recordingPresentation{}
+	presenter := &app.Presenter{Presentation: fake}
+	// A worker that has lost its task and account: publishing it must delete
+	// those tokens, not leave them as a stale sparse patch.
+	display := app.AgentDisplay{
+		PaneID: "w1:p2", Run: "r1", RunSequence: 1,
+		Role: app.RoleImplementer, WorkerSequence: 1, State: "idle",
+	}
+
+	if err := presenter.Publish(t.Context(), &display); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	if len(fake.metadata) != 1 {
+		t.Fatalf("recorded %d reports, want 1", len(fake.metadata))
+	}
+	got := fake.metadata[0]
+	if _, present := got.Tokens["hop_task"]; present {
+		t.Errorf("Tokens still writes hop_task for an unset task: %v", got.Tokens)
+	}
+	if !reflect.DeepEqual(got.Clear, []string{"hop_account", "hop_parent", "hop_task"}) {
+		t.Errorf("Clear = %v, want the unset optional tokens deleted", got.Clear)
 	}
 }
 

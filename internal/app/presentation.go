@@ -79,9 +79,28 @@ func (d *AgentDisplay) orderKey() string {
 	return fmt.Sprintf("%d%0*d", rank, orderKeyWidth, d.WorkerSequence)
 }
 
-// Tokens renders the display as the metadata token map HOP reports. Empty
-// optional fields are omitted so non-HOP agents and unset values stay
-// readable rather than showing blanks.
+// optionalFields pairs each optional token with the display value it renders,
+// in a fixed order.
+func (d *AgentDisplay) optionalFields() []struct {
+	name  string
+	value string
+} {
+	return []struct {
+		name  string
+		value string
+	}{
+		{FieldTask, d.Task},
+		{FieldParent, d.ParentLabel},
+		{FieldAccount, d.Account},
+		{FieldState, d.State},
+	}
+}
+
+// Tokens renders the tokens HOP writes for the display: the always-present
+// required tokens plus every optional token that has a value. Empty optional
+// fields are not written here; they are deleted through Cleared, because
+// pane.report_metadata is a patch and an omitted key would otherwise keep its
+// stale value.
 func (d *AgentDisplay) Tokens() map[string]string {
 	tokens := map[string]string{
 		FieldRun:      d.Run,
@@ -89,25 +108,40 @@ func (d *AgentDisplay) Tokens() map[string]string {
 		FieldOrder:    d.orderKey(),
 		FieldRole:     string(d.Role),
 	}
-	for name, value := range map[string]string{
-		FieldTask:    d.Task,
-		FieldParent:  d.ParentLabel,
-		FieldAccount: d.Account,
-		FieldState:   d.State,
-	} {
-		if value != "" {
-			tokens[name] = value
+	for _, field := range d.optionalFields() {
+		if field.value != "" {
+			tokens[field.name] = field.value
 		}
 	}
 	return tokens
 }
 
+// Cleared returns the optional token keys that are unset for this display and
+// so must be deleted from the pane's metadata, sorted for determinism.
+// Publishing a full display is thus a complete replacement of HOP's optional
+// tokens: a worker that loses its account or task has that token removed
+// rather than left behind.
+func (d *AgentDisplay) Cleared() []string {
+	var cleared []string
+	for _, field := range d.optionalFields() {
+		if field.value == "" {
+			cleared = append(cleared, field.name)
+		}
+	}
+	sort.Strings(cleared)
+	return cleared
+}
+
 // PaneMetadata is one metadata report the AgentPresentation port applies. It
 // is the boundary value: the adapter turns it into a pane.report_metadata
-// request under HOP's source.
+// request under HOP's source. Tokens are written; Clear names token keys to
+// delete. The adapter translates a delete into a JSON null, which Herdr
+// treats as a removal, since its token map is a patch that leaves omitted
+// keys untouched.
 type PaneMetadata struct {
 	PaneID string
 	Tokens map[string]string
+	Clear  []string
 	// TTLMillis, when non-zero, expires the reported tokens after that many
 	// milliseconds; use it for transient progress, not durable labels.
 	TTLMillis int
@@ -144,9 +178,15 @@ type Presenter struct {
 	Presentation AgentPresentation
 }
 
-// Publish reports one agent's display metadata.
+// Publish reports one agent's display metadata: it writes the current tokens
+// and deletes the optional tokens that are now unset, so a full display is a
+// complete replacement of HOP's tokens for the pane.
 func (p *Presenter) Publish(ctx context.Context, display *AgentDisplay) error {
-	return p.Presentation.ReportMetadata(ctx, PaneMetadata{PaneID: display.PaneID, Tokens: display.Tokens()})
+	return p.Presentation.ReportMetadata(ctx, PaneMetadata{
+		PaneID: display.PaneID,
+		Tokens: display.Tokens(),
+		Clear:  display.Cleared(),
+	})
 }
 
 // Focus installs the manager-first view for one run.

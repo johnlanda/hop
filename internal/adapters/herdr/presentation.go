@@ -22,22 +22,31 @@ func NewPresentation(socketPath string) *Presentation {
 	return &Presentation{client: NewClient(socketPath)}
 }
 
-// paneReportMetadataParams is the wire shape of pane.report_metadata. Only
-// the token patch is used here; presentation guards and TTL are set when
-// present. A nil-valued token clears that key, so the map carries strings.
+// paneReportMetadataParams is the wire shape of pane.report_metadata. The
+// token map carries `any` values so a set token is a string and a deleted
+// token is JSON null, which Herdr treats as a removal.
 type paneReportMetadataParams struct {
-	PaneID string            `json:"pane_id"`
-	Source string            `json:"source"`
-	Tokens map[string]string `json:"tokens,omitempty"`
-	TTLMs  int               `json:"ttl_ms,omitempty"`
+	PaneID string         `json:"pane_id"`
+	Source string         `json:"source"`
+	Tokens map[string]any `json:"tokens,omitempty"`
+	TTLMs  int            `json:"ttl_ms,omitempty"`
 }
 
-// ReportMetadata applies one pane metadata token patch under HOP's source.
+// ReportMetadata applies one pane metadata token patch under HOP's source:
+// set tokens are written and cleared tokens are sent as JSON null so Herdr
+// removes them.
 func (p *Presentation) ReportMetadata(ctx context.Context, metadata app.PaneMetadata) error {
+	tokens := make(map[string]any, len(metadata.Tokens)+len(metadata.Clear))
+	for name, value := range metadata.Tokens {
+		tokens[name] = value
+	}
+	for _, name := range metadata.Clear {
+		tokens[name] = nil
+	}
 	params := paneReportMetadataParams{
 		PaneID: metadata.PaneID,
 		Source: app.PresentationSource,
-		Tokens: metadata.Tokens,
+		Tokens: tokens,
 		TTLMs:  metadata.TTLMillis,
 	}
 	if err := p.client.Call(ctx, "pane.report_metadata", params, nil); err != nil {

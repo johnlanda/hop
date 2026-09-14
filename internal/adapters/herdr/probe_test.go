@@ -92,6 +92,8 @@ func TestInstallationProbeBinaryMissing(t *testing.T) {
 
 func TestInstallationProbeBinaryWithoutVersionIsStillFound(t *testing.T) {
 	dir := t.TempDir()
+	// A real executable that runs but exits nonzero for --version is found
+	// with an unknown version, distinct from a path that cannot be executed.
 	stub := writeStub(t, dir, "herdr", "exit 3")
 	probe := &herdr.InstallationProbe{BinaryPath: stub}
 
@@ -101,6 +103,42 @@ func TestInstallationProbeBinaryWithoutVersionIsStillFound(t *testing.T) {
 	}
 	if info.Path != stub || info.Version != "" {
 		t.Errorf("Binary = %+v, want the path with an empty version", info)
+	}
+}
+
+func TestInstallationProbeBinaryRejectsNonExecutablePaths(t *testing.T) {
+	cases := []struct {
+		name    string
+		setup   func(t *testing.T) string
+		wantErr string
+	}{
+		{
+			name:    "a directory is not a binary",
+			setup:   func(t *testing.T) string { return t.TempDir() },
+			wantErr: "is a directory",
+		},
+		{
+			name: "a non-executable regular file is not a binary",
+			setup: func(t *testing.T) string {
+				path := filepath.Join(t.TempDir(), "herdr")
+				if err := os.WriteFile(path, []byte("not executable"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return path
+			},
+			wantErr: "is not executable",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			probe := &herdr.InstallationProbe{BinaryPath: tc.setup(t)}
+
+			_, err := probe.Binary(t.Context())
+
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Binary error = %v, want one containing %q", err, tc.wantErr)
+			}
+		})
 	}
 }
 

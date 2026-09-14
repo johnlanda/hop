@@ -41,8 +41,10 @@ func (*InstallationProbe) Harness(ctx context.Context, executable string) (app.B
 }
 
 // executableInfo resolves an executable, preferring the explicit path, and
-// reports its path and --version line. A binary that is present but does not
-// answer --version is still reported found, with an empty version.
+// reports its path and --version line. An executable that runs but exits
+// nonzero for --version is still reported found, with an empty version; a
+// path that is not a runnable regular executable, or that cannot be spawned
+// at all, is an error rather than a false "found".
 func executableInfo(ctx context.Context, explicit, name string) (app.BinaryInfo, error) {
 	path := explicit
 	if path == "" {
@@ -51,15 +53,38 @@ func executableInfo(ctx context.Context, explicit, name string) (app.BinaryInfo,
 			return app.BinaryInfo{}, fmt.Errorf("%s is not on PATH: %w", name, err)
 		}
 		path = resolved
-	} else if _, err := os.Stat(path); err != nil {
-		return app.BinaryInfo{}, fmt.Errorf("%s: %w", name, err)
+	} else if err := verifyExecutable(path, name); err != nil {
+		return app.BinaryInfo{}, err
 	}
 	out, err := runScrubbed(ctx, path, "--version")
 	if err != nil {
-		return app.BinaryInfo{Path: path}, nil
+		// An executable that ran and exited nonzero is found but versionless;
+		// a failure to spawn at all (not an ExitError) means no usable binary.
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return app.BinaryInfo{Path: path}, nil
+		}
+		return app.BinaryInfo{}, fmt.Errorf("%s at %s could not be executed: %w", name, path, err)
 	}
 	version, _, _ := strings.Cut(strings.TrimSpace(string(out)), "\n")
 	return app.BinaryInfo{Path: path, Version: strings.TrimSpace(version)}, nil
+}
+
+// verifyExecutable reports why an explicit path is not a runnable executable:
+// a missing path, a directory, or a file without an executable bit. A PATH
+// lookup already applies these checks, so this guards only explicit paths.
+func verifyExecutable(path, name string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("%s: %w", name, err)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("%s: %s is a directory, not an executable", name, path)
+	}
+	if info.Mode().Perm()&0o111 == 0 {
+		return fmt.Errorf("%s: %s is not executable", name, path)
+	}
+	return nil
 }
 
 // Schema runs `herdr api schema --json` and extracts the protocol number and
