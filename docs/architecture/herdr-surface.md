@@ -203,6 +203,16 @@ workspace/tab/pane creation and layout leaf requests accept env overrides. Creat
 the shell with the selected account's profile context before starting its agent;
 HOP's process environment does not reconfigure an already-running shell. For a
 new worktree, opening a tab/pane there with explicit env is a viable path.
+The Phase 2 capability spike sharpened this surface on herdr 0.9.0:
+`layout.apply` pane nodes additionally carry a `command` argv and a creation
+`label`, and the argv is the pane's process directly (no shell) — HOP's
+worker-launch transport (see
+[the Phase 2 design](../plan/phase-2-design.md), section 6); `agent.start`
+cannot carry a wrapper argv (kind must be a known agent label, args only
+append) and types a bare executable name into the shell, which macOS
+`path_helper` PATH reordering can resolve to an unintended binary; and agent
+detection is foreground process-name identification of known harness names —
+it corroborates a launch but never completes one.
 
 Claude integration installation honors `CLAUDE_CONFIG_DIR`; Codex honors
 `CODEX_HOME`. Per-profile hooks can therefore be installed while preserving native

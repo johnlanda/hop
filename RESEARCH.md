@@ -116,7 +116,7 @@ results. Neither should be appended indefinitely to standing instructions.
 | Plugin responsibility | Existing Herdr primitive | New plugin work |
 | --- | --- | --- |
 | Entry points | Manifest actions, keybindings, terminal panes | Start/status/resume/stop/review commands and board |
-| Worker launch | `worktree create`, `workspace create`, `pane split`, `agent start` (a general Herdr capability; HOP launches the sanitized worker through the pane text transport instead) | Role assignment, launch config and concurrency control |
+| Worker launch | `worktree create`, `workspace create`, `pane split`, `layout apply`, `agent start` (a general Herdr capability; HOP instead launches the sanitized worker as a `layout.apply` pane whose command is the launcher argv, with a send-text line into an env-carrying shell pane as the fallback — see `docs/plan/phase-2-design.md`, section 6) | Role assignment, launch config and concurrency control |
 | Agent interaction | `agent prompt`, `agent read`, `agent wait` | Durable inbox, serialized delivery and explicit task result protocol |
 | Observation | `events.subscribe`, snapshots | Reconciliation, recovery and normalized workflow events |
 | Lifecycle callbacks | Manifest `[[events]]` | Short handlers where useful; do not duplicate event-stream processing |

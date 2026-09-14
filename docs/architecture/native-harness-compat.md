@@ -85,7 +85,11 @@ verifies that profile beyond reporting the harness's own login status in
 leases and cross-account resume are deferred to a later, optional phase. Every
 HOP-launched worker still passes through the sanitizing launcher described
 above at the harness exec boundary, stripping provider credential variables
-by default with explicit opt-in passthrough per run or role.
+by default with explicit opt-in passthrough per run or role. The launcher's
+exact contract — its transport (a `layout.apply` command pane, with a
+send-text line as fallback), strip matrix, launch claim and corroboration
+predicate — is specified in
+[the Phase 2 design](../plan/phase-2-design.md), section 6.
 
 HOP still runs on the user's normal Herdr server with no configuration
 change — that half of the decision stands on its own. It is a choice about
@@ -494,9 +498,13 @@ policy at a fresh harness exec boundary by cold-relaunching, or otherwise
 mark the attempt `reconciling`; this is not a claim that repairing session
 metadata changes a running restored harness's own environment. See the
 fail-closed retire/relaunch coordination contract (`docs/plan/phase-2-design.md`,
-section 5, "Resume") for the mechanism. HOP runs on the user's normal Herdr
-server either way — a dedicated server is not required to satisfy this
-coordination, and none is proposed here as the fix.
+section 5, "Resume") for the mechanism. A human absence attestation
+(`hop resume --confirm-absent`) does not authorize relaunch while a prior
+Herdr restore or launch request may still execute; those pending mechanisms
+must first be retired independently, so the post-server-restart case stays
+in recovery until they are (same contract, section 5, item 5). HOP runs on
+the user's normal Herdr server either way — a dedicated server is not
+required to satisfy this coordination, and none is proposed here as the fix.
 
 ## Opt-in live smoke test (described, not implemented)
 

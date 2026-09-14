@@ -31,8 +31,8 @@ launched process.
 | `workspace.create` | Yes | Supported: the workspace's root pane shell sees the env. Verified. |
 | `tab.create` | Yes | Supported: the new tab's root pane shell sees the env. Verified. |
 | `pane.split` | Yes | Supported: the new pane's shell sees the env. Verified. |
-| `layout.apply` pane nodes | Yes (per pane node) | Supported by schema; a declarative tab can set per-pane env. Not exercised in the current suite. |
-| `worktree.create` | No | Unsupported at the request: it has no env field. Open a tab or pane **inside** the worktree with env, then run `hop launch` there through the pane text transport (see [Current policy](#current-policy)). |
+| `layout.apply` pane nodes | Yes (per pane node) | Supported by schema; a pane node also carries a `command` argv and a creation `label`, and the argv is the pane's process directly — no shell. Exercised by the Phase 2 capability spike (command, env and label delivered; see [Phase 2 design](../plan/phase-2-design.md), section 11), not yet by this file's verifying suite. |
+| `worktree.create` | No | Unsupported at the request: it has no env field. Create the launch pane **inside** the worktree with env (see [Current policy](#current-policy)). |
 | `agent.start` | No | Unsupported: it has no env field. The env must already be on the shell before the harness starts. |
 
 For a worker in a new worktree, the env-carrying part of the path is
@@ -67,12 +67,19 @@ end to end.
 
 ## Current policy
 
-HOP's actual worker-launch path does not call `agent.start`. It opens a tab
-or pane with the launch env (one of the supported rows above), then runs the
-sanitizing launcher there as a plain command — not through `agent.start`'s
-harness-kind launch — which strips credential variables, applies the
-resolved profile env, and execs the harness. `agent.start` is not part of
-this path; see [architecture](architecture.md) and
+HOP's actual worker-launch path does not call `agent.start`. The primary
+transport is a `layout.apply` pane whose command IS the sanitizing
+launcher's argv, created with the additive env and a unique creation label —
+no shell parses anything. The documented fallback opens a tab or pane with
+the launch env (one of the supported rows above) and sends the launcher as
+one fixed-grammar `exec` line into that shell. In both cases the launcher
+strips credential variables, applies the resolved profile env, and execs
+the harness; a durable launch claim recorded before exec, settled only by a
+corroborating process observation, is the launch acknowledgment — agent
+detection never completes a launch by itself. `agent.start` is not part of
+this path (it cannot interpose a wrapper argv). See
+[Phase 2 design](../plan/phase-2-design.md), section 6, for the transport
+and claim contract, and [architecture](architecture.md) and
 [native harness compatibility](native-harness-compat.md) for the launcher
 and the profile decision it applies.
 
