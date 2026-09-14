@@ -160,9 +160,11 @@ type boundedWaitEvidence struct {
 // from previous generations per the section 4 decision table, oldest
 // first, before any new act: worktree.create by provenance-validated
 // adoption, pane.open/launch.send by creation-label lookup with a bounded
-// wait, and unknown operation kinds fail closed into reconciling.
-// pane.close and check.run operations are resolved by their own drivers
-// (DriveStop, retirement and the check use case), never here.
+// wait, check.run by claim-and-group retirement (recoverCheckExecution),
+// and unknown operation kinds fail closed into reconciling. pane.close
+// operations are resolved by the shared close procedure their own drivers
+// re-enter (DriveStop and positive-evidence retirement), and attestations
+// are journal-only.
 func (c *Controller) recoverPendingOperations(ctx context.Context, handle RunHandle, detail RunDetail) error { //nolint:gocritic // hugeParam: RunHandle and RunDetail are per-call DTOs; this runs once per resume.
 	var frozen *FrozenRun
 	for i := range detail.PendingOperations {
@@ -1154,8 +1156,6 @@ func (c *Controller) sessionNativeRef(ctx context.Context, handle RunHandle, ses
 	return ref, err
 }
 
-// enterReconciling moves Attempt and, when it exists, the attempt's current
-// Session into reconciling, recording both transitions.
 // retirePendingLaunchIntents marks every still-pending pane.open operation
 // whose intent named previousSession as superseded, in the same
 // transaction that creates a cold relaunch's replacement session — before
@@ -1187,6 +1187,8 @@ func retirePendingLaunchIntents(ctx context.Context, uow UnitOfWork, runID ident
 	return nil
 }
 
+// enterReconciling moves Attempt and, when it exists, the attempt's current
+// Session into reconciling, recording both transitions.
 func enterReconciling(ctx context.Context, uow UnitOfWork, detail RunDetail, generation *int64, now time.Time) error { //nolint:gocritic // hugeParam: RunDetail is a per-call DTO; this runs once per resume round.
 	a, aRev, err := uow.Attempts().Get(ctx, detail.AttemptID)
 	if err != nil {

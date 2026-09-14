@@ -327,9 +327,9 @@ func (c *Controller) recordAssignmentArtifact(ctx context.Context, lease Lease, 
 // createWorktree drives the OpWorktreeCreate operation: intent, then the
 // external call, then outcome. Worktree.create is never retried blindly
 // while a prior intent is unresolved (the operation decision table); a
-// controller crash recovery path that finds a pending worktree.create
-// operation is resume's job (Advance), not StartRun's, since StartRun only
-// ever runs at the moment a run is first created.
+// controller crash that leaves a pending worktree.create operation is
+// recovered by Resume (recoverWorktreeCreate), not StartRun, since
+// StartRun only ever runs at the moment a run is first created.
 func (c *Controller) createWorktree(ctx context.Context, handle RunHandle, ids generatedIdentities, repositoryRoot, branch string, now time.Time) (WorktreeInfo, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design (see Lease's own doc comment); this path runs once per run start, never in a hot loop.
 	opID, err := c.newOperationID()
 	if err != nil {
