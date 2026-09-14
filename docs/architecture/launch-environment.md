@@ -31,7 +31,7 @@ launched process.
 | `workspace.create` | Yes | Supported: the workspace's root pane shell sees the env. Verified. |
 | `tab.create` | Yes | Supported: the new tab's root pane shell sees the env. Verified. |
 | `pane.split` | Yes | Supported: the new pane's shell sees the env. Verified. |
-| `layout.apply` pane nodes | Yes (per pane node) | Supported by schema; a pane node also carries a `command` argv and a creation `label`, and the argv is the pane's process directly — no shell. Exercised by the Phase 2 capability spike (command, env and label delivered; see [Phase 2 design](../plan/phase-2-design.md), section 11), not yet by this file's verifying suite. |
+| `layout.apply` pane nodes | Yes (per pane node) | Supported by schema; a pane node also carries a `command` argv and a creation `label`, and the argv is the pane's process directly — no shell. Exercised by the Phase 2 capability spike: command, env and label delivered; addressed by `workspace_id` it only adds one tab, leaving pre-existing tabs and panes untouched; the pane closes identically on any exit and `pane.exited` carries no exit status (see [Phase 2 design](../plan/phase-2-design.md), section 11). Not yet in this file's verifying suite. |
 | `worktree.create` | No | Unsupported at the request: it has no env field. Create the launch pane **inside** the worktree with env (see [Current policy](#current-policy)). |
 | `agent.start` | No | Unsupported: it has no env field. The env must already be on the shell before the harness starts. |
 

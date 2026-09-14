@@ -20,11 +20,10 @@ principle write the store or artifacts directly (see
 in this design protect against accidental races, stale processes and crashed
 controllers, not against a malicious same-UID agent.
 
-A bounded real-process spike (task 0, section 10) precedes port freezing;
-its interim findings (S1, S2, S5, S6, S7 established on herdr 0.9.0 with
-executed evidence) are folded into this revision. Items below marked
-"pending S3" or "pending S4" name the still-open spike results that settle
-them; section 11 tabulates all seven.
+A bounded real-process spike (task 0, section 10) preceded port freezing;
+all seven items (S1–S7, plus the S3/S4 and layout.apply follow-ups) are
+established on herdr 0.9.0 with executed evidence and folded into this
+revision; section 11 tabulates them.
 
 ## 1. Scope and exit criteria
 
@@ -515,7 +514,7 @@ updates run `... WHERE id = ? AND revision = ?` and zero affected rows is
 | `tasks` | id PK, run_id FK, state, revision, … | one row per run in this phase |
 | `attempts` | id PK, task_id FK, number, state, revision, … | UNIQUE(task_id, number); partial UNIQUE(task_id) WHERE state in active set |
 | `sessions` | id PK, run_id FK, attempt_id FK, role, harness, native_session_ref NULL, native_ref_source NULL (assigned, captured), state, revision, … | reference immutable once set; a cold relaunch inserts a new session for the same attempt |
-| `runtime_bindings` | id PK, session_id FK, incarnation_id, server_socket_path, server_instance NULL (pending S3), workspace_id, tab_id, pane_id, creation_label, occupant_evidence JSON NULL (label + argv marker + pid; never pid alone), launch_kind (initial, resume, restored-observed), observed_at, superseded, superseded_evidence NULL | append-only; UNIQUE(session_id, incarnation_id) |
+| `runtime_bindings` | id PK, session_id FK, incarnation_id, server_socket_path, server_instance NULL (reserved; the spike surfaced no verified server-instance identifier), workspace_id, tab_id, pane_id, creation_label, occupant_evidence JSON NULL (label + argv marker + pid; never pid alone), launch_kind (initial, resume, restored-observed), observed_at, superseded, superseded_evidence NULL | append-only; UNIQUE(session_id, incarnation_id) |
 | `launch_claims` | incarnation_id PK, run_id, attempt_id, executable (expected absolute harness/fixture path, for the section 6 predicate), argv_digest, pid, state (exec_pending, execed, exec_failed), error NULL, claimed_at, settled_at NULL, settlement_evidence NULL | claimed by hop launch before exec; settled to execed only by the controller on corroboration; a claim with a different pid for an existing incarnation is rejected |
 | `worktrees` | id PK, repository_id FK, run_id FK, path, branch, base_commit, state, created_at | UNIQUE(path); adoption validates repository and base, not path existence (decision table) |
 | `results` | id PK, attempt_id FK, commit_oid, summary, content_digest, accepted, submitted_at | partial UNIQUE(attempt_id) WHERE accepted = 1; UNIQUE(attempt_id, content_digest) |
@@ -597,7 +596,12 @@ controller can perform an already-committed intent after takeover. The
 decision table below is therefore normative; the barrier test (controller A
 resumes after controller B takes over) exercises it. Unresolved
 prior-generation intents block replacement even when a snapshot currently
-shows absence.
+shows absence — and snapshots are weak evidence in both directions: S3
+established that a post-restart `session.snapshot` can report an agent
+before any process is live (a phantom), so presence or absence of a
+snapshot row never substitutes for live process inspection, and
+`pane.exited` carries no exit status, so no pane event ever proves worker
+success.
 
 | Operation | Crash between intent and act | Crash between act and outcome | Takeover with the intent unresolved |
 | --- | --- | --- | --- |
@@ -704,9 +708,13 @@ A session's settling evidence must come from a current runtime binding; an
 observation from a superseded binding is ignored.
 
 Worker-exit observation: under the primary transport the pane's process IS
-the worker, and the pane closes when it exits, so exit is observed as pane
-absence together with the launch claim's process being gone. The controller
-therefore captures ReadPane evidence periodically during the run and before
+the worker, and the pane closes when it exits — identically for success and
+failure, and `pane.exited` carries NO exit status (its payload is pane id,
+type and workspace id; S6 follow-up, established). Worker success therefore
+comes only from the result protocol and the check, never from a pane event.
+Exit is observed as pane absence together with the launch claim's process
+being gone. The controller
+captures ReadPane evidence periodically during the run and before
 every stop or retirement action — scrollback vanishes with the pane. A
 worker exit and a human closing the pane produce the same observable
 evidence; HOP distinguishes them only as far as the evidence allows and
@@ -783,7 +791,12 @@ explicit `hop stop`.
 `hop resume <run-id>` acquires the lease (new generation) and reconciles.
 The bootstrap is a bounded `app.Reconcile` (subscribe before snapshot,
 Phase 1 semantics, short context) followed by continuous watching; decisions
-come from `InspectPane` and the store, not from status events alone.
+come from `InspectPane` and the store, not from status events alone — and
+not from snapshots either: S3 established that after a server restart
+`session.snapshot` can report a pane's agent (kind and status) BEFORE any
+process is live, because the restore plan is deferred until a client
+supplies geometry. A snapshot row is therefore never evidence of a live
+process, and absence is established only by live process inspection.
 Pending or ambiguous operations from the previous generation are resolved
 per the decision table (section 4) before any new act.
 
@@ -815,7 +828,11 @@ per the decision table (section 4) before any new act.
    an observed process command line carrying the run's pre-assigned native
    session reference (`--resume <uuid>` / `--session-id <uuid>`) — S2
    established that full process argv IS observable through pane
-   inspection; whether restore composes the argv this way is pending S3.
+   inspection, and S3 established that a recorded native session makes
+   Herdr auto-relaunch exactly as `claude --resume <id>` (bypassing
+   `hop launch` and dropping the `HOP_*` env — the restored process's
+   dump showed `HERDR_*` present and `HOP_RUN_ID` absent), so this
+   positive-evidence mechanism is verified end to end.
    Such an occupant is recorded as an
    observed-restoration binding (`launch_kind = restored-observed`, with
    the observation as its evidence) and becomes a guarded retirement
@@ -840,13 +857,16 @@ per the decision table (section 4) before any new act.
    argv is never rendered for another harness, and Codex/opencode cold
    resume is out of Phase 2 scope (their capture is unspecified; resume
    reports an actionable unsupported state).
-4. Restore-settled condition (pending S3): snapshot absence does not
-   exclude a pending Herdr restore — agents may appear after client
-   attachment. No verified "restoration finished" signal is currently
-   known. Until one is verified, after a server restart the run stays
-   `resuming` with `reconciling` operations and the item-2 report, and
-   relaunches only through item 2 (positive-evidence retirement) or the
-   attestation below.
+4. Restore-settled condition (S3, established): there is NO "restoration
+   finished" signal — only ordinary detection/status events exist — and a
+   deferred restore fires only when a client supplies geometry (plus a
+   short theme wait), so snapshot absence never excludes a pending
+   restore; worse, a post-restart snapshot can show the agent as a phantom
+   before any process runs (the resume-intro note above). After a server
+   restart the run therefore stays `resuming` with `reconciling`
+   operations and the item-2 report, and relaunches only through item 2
+   (positive-evidence retirement of the restored occupant once it actually
+   runs). This is the established behavior, not a pending question.
 5. Finite exit from a stuck reconciliation: `hop resume --confirm-absent`
    records a human attestation as an `absence.attested` journal entry with
    the reported evidence. The attestation must cover BOTH facts: no worker
@@ -854,7 +874,8 @@ per the decision table (section 4) before any new act.
    mechanism that could still start one has been retired — for HOP's own
    side that is the launch claims and intents the claim table retires;
    for Herdr it would require canceling or settling a deferred native
-   restore, and no verified route for that exists yet (pending S3). A
+   restore, and S3 established that no route for that exists on herdr
+   0.9.0. A
    truthful present-tense "no worker is running" cannot retire a restore
    Herdr may still fire on a later client attachment, so:
    `--confirm-absent` does not authorize relaunch while a prior Herdr
@@ -863,9 +884,9 @@ per the decision table (section 4) before any new act.
    item-3 cold relaunch only in the non-restart cases (a controller crash
    with the server up, where the outstanding launch intents are HOP's own
    and the claim table retires them); the post-server-restart case stays
-   `resuming` with the item-2 report until S3 supplies a verified
-   cancellation or settlement route for deferred restore, or the restored
-   occupant appears and is retired by positive evidence. It is retirement
+   `resuming` with the item-2 report until the restored occupant appears
+   and is retired by positive evidence — S3 established there is no
+   cancellation or settlement route for a deferred restore. It is retirement
    evidence, not a bypass: there is no force-relaunch that skips
    prior-intent retirement. `hop stop` is always available as the other
    finite exit.
@@ -911,10 +932,11 @@ The controller creates the worker pane and its command in one request: a
 with cwd = the worktree, the additive env map, and the launch operation ID
 as the pane's creation label. All executable paths are absolute — the HOP
 path here and the harness path the launcher resolves — never bare names
-(S5). One S6 follow-up confirmation is outstanding: that `layout.apply` can
-add one tab to an existing workspace without disturbing the user's other
-tabs and panes, with the pane cwd set to the worktree; the fallback below
-is the documented transport if it cannot.
+(S5). The S6 follow-up established that a `layout.apply` addressed by
+`workspace_id` only ADDS one tab and leaves every pre-existing tab and
+pane untouched (`tab_id` would name a tab to replace, and is not used);
+the transport is confirmed as primary, with the fallback below retained as
+the documented alternative.
 
 The launch-claim deadline (default 120s from pane creation) bounds
 mechanical launcher start: if no claim row appears, the operation is never
@@ -974,8 +996,12 @@ and never-resend rule apply.
    `claude --session-id <native-ref> "<fixed initial prompt>"`; cold
    resume: `claude --resume <native-ref>`. The native reference is a
    crypto-random UUID minted by the controller and persisted on the session
-   lineage before the first launch intent (spike S4 verifies `--session-id`
-   end to end against the installed version). The initial prompt is a fixed
+   lineage before the first launch intent. S4 established the contract
+   against claude 2.1.270 (scratch profile, credential-free): a
+   pre-assigned `--session-id <uuid>` creates the transcript under that
+   UUID and `--resume <uuid>` finds it from a different cwd; the contract
+   is version-scoped and re-verified on version drift. The initial prompt
+   is a fixed
    template containing only absolute paths and identities, no brief text:
    it instructs the worker to read the assignment artifact at its absolute
    path and to submit with the absolute HOP path (`<hop> result submit`),
@@ -1288,13 +1314,13 @@ ships with its interruption/retry tests in the same change, per
 
 | Layer | Tests |
 | --- | --- |
-| Spike (`test/integration`, task 0) | Established with executed evidence on herdr 0.9.0: S1 launch-line detection and shell readiness (`TestSpikeLaunchLineDetection`, `TestSpikeUnrecognizedProcessNameIsNotDetected`); S2 pane process identity surface (`TestSpikePaneProcessIdentity`); S5 `agent.start` cannot wrap (NO); S6 layout.apply command panes (`TestSpikeLayoutApplyCommandPane`); S7 creation labels round-trip (`TestSpikeCreationMarkerTabLabel`). In progress: S3 restore behavior/timing, settled-signal search, restored argv shape; S4 `claude --session-id`/`--resume` with a preassigned UUID in a scratch profile, unauthenticated; plus the S6 follow-up (layout.apply adding one tab to an existing workspace without disturbing it) |
+| Spike (`test/integration`, task 0) | Complete, with executed evidence on herdr 0.9.0: S1 launch-line detection and shell readiness (`TestSpikeLaunchLineDetection`, `TestSpikeUnrecognizedProcessNameIsNotDetected`); S2 pane process identity surface (`TestSpikePaneProcessIdentity`); S3 restore behavior (`TestSpikeRestorePlainPaneLosesAdditiveEnv`, `TestSpikeRestoreAutoRelaunchBypassesLauncher`); S4 preassigned Claude session id on claude 2.1.270 (`TestSpikeClaudePreassignedSessionID`); S5 `agent.start` cannot wrap (NO); S6 layout.apply command panes (`TestSpikeLayoutApplyCommandPane`) and the workspace-preservation follow-up (`TestSpikeLayoutApplyAddsTabToExistingWorkspace`); S7 creation labels round-trip (`TestSpikeCreationMarkerTabLabel`) |
 | Domain (`internal/domain/...`) | Table-driven transitions matching the section 5 tables plus complete traces (initial launch to completion; stop injected at every step; exec failure; warm takeover; cold replacement through relaunching), stop monotonicity and precedence, result acceptance context (duplicate in every state incl. terminal, conflicting never disturbing the accepted result, transient for unsettled-claim launching, stale by incarnation and by state), binding supersession evidence, ID parsing (with fuzz) |
 | Application (`internal/app`) | Handwritten fakes for every port. Scenarios: intent/act/outcome ordering with revalidation before dispatch; every row and column of the operation decision table, including the takeover barrier (A resumes after B took over), never-resend, claim-state adoption (exec_pending ambiguous, execed adopt, exec_failed dead), non-adoption of cwd-matching panes, worktree provenance validation; stop while launching/running/checking, stop retiring a pre-exec claim, stop cancels the check group, stop precedence in the outcome transaction; detach vs stop; resume cases 1–5 of section 5 including delayed restore, positive-evidence retirement, same-kind replacement failing closed, and the attestation path; lease CAS (stale release, stale heartbeat, post-release commit rejection, expiry at commit); raced InitializeRun; group-retirement classification against a fake `ProcessGroupInspector` (all four typed outcomes); the section 5 reference traces as app-level scenarios; `SanitizeEnvironment` precedence tables (task 4); canonical digest vectors; submission validation order (receipt-before-state proven by a duplicate against a `completed` run; conflicting-before-eligibility proven by a changed-content retry against a `checking` attempt; early submission in all three orders relative to detection and check claiming) |
 | SQLite (`internal/adapters/sqlite`) | Real temporary database, separate `*sql.DB` handles for cross-process claims: atomic attempt reservation raced from two connections; revision conflicts; lease CAS matrix raced from two connections (acquire on held/released/expired, stale heartbeat, stale release, generation monotonic across release); InitializeRun raced (repository get-or-create through the unique constraint); launch-claim different-pid rejection raced; concurrent open+migrate from two processes; connection-churn PRAGMA verification; immediate-transaction busy retry with act-after-commit ordering; reopen mid-operation and journal recovery; fixed-width timestamp round-trips; constraint coverage (one accepted result, unique (attempt, digest), unique check request, unique worktree path) |
 | Herdr adapter | Fake NDJSON endpoint tests for the new `Runtime` methods (request shapes, error mapping, cancellation), same style as the existing client tests; `PaneProcess` decoding matches the S2-verified fields |
 | Process/config/system adapters | `Exec` and process-group `CommandRunner` behavior (cancellation reaps the group; leader-exit-with-children retirement by group); TOML decoding tables: comments, escaped strings, multiline arrays, duplicate keys, unknown keys, invalid timeout/harness, `check.repeatable`, relative profile dir resolved absolute |
-| Real process (`test/integration`) | Extends the Phase 1 harness (`prepareServer`, `stagePlugin`, `waitUntil`, artifact retention). CI-safe deterministic run: fixture repository + fixture worker driven end to end — run → worktree → launch pane (env, label, argv) → claim → corroborated settlement → sanitized exec (section 6 assertions) → assignment content validated by the fixture → result submit → detached-checkout check → completed; the send-text fallback exercised as its own scenario; duplicate submission after completion; transient early submission; stale submission from a retired incarnation; the launcher claim-protocol tests of section 6; stop with termination observed including a running check group and a pre-exec claim; controller kill + resume warm reattach; server restart + positive-evidence retirement and the fail-closed same-kind replacement (as far as S3 findings allow); `--confirm-absent` cold relaunch in the non-restart case and its refusal after a server restart; detach distinct from stop; failed-check run ends `failed` with retained artifacts; check death after spawn before the claim write, leader exit with live children, claim-write failure refusing to run, and unknown outcome under both `check.repeatable` settings; git-dependent check succeeding in the detached checkout; submodule repository failing clearly |
+| Real process (`test/integration`) | Extends the Phase 1 harness (`prepareServer`, `stagePlugin`, `waitUntil`, artifact retention). CI-safe deterministic run: fixture repository + fixture worker driven end to end — run → worktree → launch pane (env, label, argv) → claim → corroborated settlement → sanitized exec (section 6 assertions) → assignment content validated by the fixture → result submit → detached-checkout check → completed; the send-text fallback exercised as its own scenario; duplicate submission after completion; transient early submission; stale submission from a retired incarnation; the launcher claim-protocol tests of section 6; stop with termination observed including a running check group and a pre-exec claim; controller kill + resume warm reattach; server restart + positive-evidence retirement of the auto-relaunched `--resume` occupant, the phantom-snapshot case (agent reported before any live process), and the fail-closed same-kind replacement; `--confirm-absent` cold relaunch in the non-restart case and its refusal after a server restart; detach distinct from stop; failed-check run ends `failed` with retained artifacts; check death after spawn before the claim write, leader exit with live children, claim-write failure refusing to run, and unknown outcome under both `check.repeatable` settings; git-dependent check succeeding in the detached checkout; submodule repository failing clearly |
 | Live (opt-in) | One named test, `TestLiveClaudeDefaultProfileRun`, gated on `HOP_LIVE_HARNESS=1` and skipped otherwise with an explicit reason: real Claude Code in the user's default profile against the fixture repository, one small brief to a passing check, plus one `--resume <preassigned-uuid>` continuation. Never runs in CI or `make check` |
 
 Fixture repository generator (test helper in `test/integration`): a
@@ -1360,17 +1386,17 @@ Assumed decisions (directed by the orchestrator, pending human override):
 4. Occupant retirement requires positive evidence or human attestation;
    `check.repeatable` defaults to false (sections 5, 7).
 
-Spike results (task 0; interim findings folded into this revision, on
-herdr 0.9.0 with executed evidence):
+Spike results (task 0; complete, folded into this revision, on herdr 0.9.0
+with executed evidence):
 
 | Item | Status | Design consequence |
 | --- | --- | --- |
 | S1 launch-line detection, shell readiness, fork topology | Established (YES) | Send-text fallback verified under sh and zsh login shells; detection is process-name identification of known harness names; after `exec` the harness pid = shell pid = foreground group (section 6) |
 | S2 pane process identity fields, command-line observability | Established (YES, with caveats) | `PaneProcess` fields frozen (shell pid, foreground group, per-process pid/name/argv0/argv/cmdline/cwd); NO process start time exists, so occupant identity is label + argv marker + pid, never pid alone; no guarded close upstream — inspect-then-close is a documented race (sections 3–5) |
-| S3 restore behavior and settled signal, restored argv shape | In progress | Whether resume after server restart can relaunch other than through positive-evidence retirement or attestation (section 5, items 2–4) |
-| S4 `claude --session-id`/`--resume` with preassigned UUID | In progress | Cold-resume argv claims and the live test's resume leg (sections 5–6) |
+| S3 restore behavior and settled signal, restored argv shape | Established (YES) | Restore restores the pane label but not the additive env; a recorded native session auto-relaunches exactly as `claude --resume <id>`, deferred until a client supplies geometry, bypassing `hop launch` and dropping `HOP_*` (env dump verified) — so positive-evidence retirement is verified end to end; a post-restart snapshot can show a phantom agent before any process runs, so absence is established only by live process inspection; no "restore finished" signal and no cancellation route exist — the post-restart `--confirm-absent` limitation and reconciling-plus-report stance stand as established behavior (section 5, items 2–5) |
+| S4 `claude --session-id`/`--resume` with preassigned UUID | Established (YES, claude 2.1.270) | Print mode in a scratch profile with a credential-free env: `--session-id <uuid>` accepted, transcript created under the pre-assigned UUID, `--resume <uuid>` finds it from a different cwd, unknown UUID rejected; version-scoped, re-verify on drift (sections 5–6) |
 | S5 `agent.start` argv capability | Established (NO) | agent.start cannot interpose the sanitizer and types bare names (PATH-unsafe under macOS path_helper); absolute executable paths everywhere (section 6) |
-| S6 pane creation with command argv | Established (YES) | layout.apply command panes are the primary transport — no shell, no rc, no PATH ambiguity; the pane closes when the command exits (sections 5–6); one follow-up outstanding: adding a tab to an existing workspace without disturbing it |
+| S6 pane creation with command argv, plus the workspace-preservation follow-up | Established (YES) | layout.apply command panes are the primary transport — no shell, no rc, no PATH ambiguity; addressed by `workspace_id` it only adds one tab, leaving every pre-existing tab and pane untouched; the pane closes identically on success and failure and `pane.exited` carries no exit status, so worker success comes only from the result protocol and check (sections 5–6) |
 | S7 creation-time markers | Established (YES) | Creation labels round-trip through responses, tab.list and session.snapshot; the pane-open decision-table row recovers by unique label (section 4) |
 
 Open questions for the human (beyond confirming the assumed decisions):
@@ -1380,13 +1406,13 @@ Risks and mitigations:
 
 | Risk | Mitigation |
 | --- | --- |
-| The layout.apply follow-up fails (adding a tab disturbs the user's workspace) | The S1-verified send-text fallback carries the identical launcher contract; the claim-or-reconciling rule means a lost launch never causes an automatic resend or a duplicate worker on either transport |
+| A future herdr version changes layout.apply's add-a-tab semantics | The workspace-preservation behavior is spike-established against herdr 0.9.0 only; the S1-verified send-text fallback carries the identical launcher contract, and the claim-or-reconciling rule means a lost launch never causes an automatic resend or a duplicate worker on either transport |
 | The fixture worker's unrecognized process name is never agent-detected | Established behavior (S1), designed for: claim settlement has the process-observation path (argv marker), and detection is only ever corroboration, never the authority |
 | Herdr auto-restore races resume | Restored occupants are never adopted; retirement needs positive evidence or attestation; without either, resume fails closed with the exact human action (section 5) |
 | A stale controller acts on an already-committed intent after takeover | The operation decision table plus pre-dispatch revalidation, claim-based process identity and the takeover barrier test (section 4); fencing alone is explicitly not treated as external fencing |
 | `modernc.org/sqlite` behavior differences (locking, WAL, pool PRAGMAs) | Exact version pin; DSN-applied per-connection settings with churn tests; immediate write transactions with bounded whole-transaction retry and act-after-confirmed-commit ordering; concurrent open/migrate tests |
 | Same-UID worker interference with store, artifacts, incarnation env or gate content | Out of scope by the stated trust model; the design freezes policy selection, isolates check execution per checkout/execution ID, and claims nothing stronger |
-| Claude version drift invalidates `--session-id`/strip-matrix assumptions | S4 records the probed version; the strip matrix is version-scoped and named; the live test exercises the real binary |
+| Claude version drift invalidates `--session-id`/strip-matrix assumptions | The `--session-id` contract is established against claude 2.1.270 and re-verified on drift; the strip matrix is version-scoped and named; the live test exercises the real binary |
 | Unsupported login shells mangle the fallback launch line | Primary transport involves no shell at all; the fallback grammar is restricted to a single-quoted path plus UUID flags, valid in sh/bash/zsh (S1-verified for sh and zsh); other shells documented as unsupported for worker panes in Phase 2 |
 | pid or pgid reuse defeats process identity (no start time observable) | Occupant identity always pairs the pid with the creation label and argv marker; group retirement lists and argv-matches members before signaling and never signals blindly; documented residual limitation |
-| A run with no restore occupant and no S3 signal stays in recovery | Finite exits exist by design: `hop stop` always, and `hop resume --confirm-absent` in the non-restart cases; the post-server-restart case deliberately stays reconciling until pending restore is retired (a deferred Herdr restore firing after a truthful absence attestation would otherwise duplicate the native lineage) — documented as a support limitation, not silent relaunch |
+| A run with no restore occupant stays in recovery (no settled signal or cancellation route exists — S3-established) | Finite exits exist by design: `hop stop` always, and `hop resume --confirm-absent` in the non-restart cases; the post-server-restart case deliberately stays reconciling until pending restore is retired (a deferred Herdr restore firing after a truthful absence attestation would otherwise duplicate the native lineage) — documented as a support limitation, not silent relaunch |

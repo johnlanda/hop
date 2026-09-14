@@ -445,6 +445,18 @@ installed `herdr 0.9.0` documentation):
   never strips provider credential variables, and restore hands it no
   `extra` entries at all.
 
+The Phase 2 capability spike confirmed this live on herdr 0.9.0
+(`TestSpikeRestorePlainPaneLosesAdditiveEnv`,
+`TestSpikeRestoreAutoRelaunchBypassesLauncher`): a graceful restart
+restores the pane's creation label but not its additive env; a recorded
+native session auto-relaunches exactly as `claude --resume <id>`, deferred
+until a client supplies geometry, and the restored process's environment
+dump shows the `HERDR_*` identity present and HOP's launch context
+(`HOP_RUN_ID`) absent; a post-restart `session.snapshot` can report the
+agent before any process is live (a phantom), so snapshot presence is
+never evidence of a live process; and no "restore finished" or
+cancellation surface exists — only ordinary detection/status events.
+
 Together these mean native auto-restore never re-runs the sanitizing
 launcher HOP used at the original launch. Whatever that launcher stripped —
 a stray provider key, or a profile-selecting variable such as
