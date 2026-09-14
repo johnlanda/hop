@@ -85,8 +85,14 @@ packages.
   `TestReconcileDrainsBufferedEventsBeforeCancellation` proves `Reconcile`
   drains `Events()` fully until it closes rather than stopping at the first
   cancellation it observes, against a staged fake stream that only ever hands
-  over one event at a time. The `DrainRemaining` fold itself is proven
-  end-to-end against the real adapter; see
+  over one event at a time.
+  `TestReconcileFoldsDrainRemainingAfterChannelEvents` proves the
+  `DrainRemaining` fold itself against a fake stream with both channel events
+  and a non-empty overflow, on both exit paths (channel closed normally,
+  context canceled): the overflow is appended after the channel events, so
+  its transition for a pane the channel already touched wins and its
+  transition for a pane the channel never mentioned still appears. It is also
+  proven end-to-end against the real adapter; see
   [internal/adapters/herdr/AGENTS.md](../adapters/herdr/AGENTS.md).
 - Test fixtures: none on disk; the fakes and environ slices live in the
   test files.

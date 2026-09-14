@@ -242,6 +242,74 @@ func TestReconcileDrainsBufferedEventsBeforeCancellation(t *testing.T) {
 	}
 }
 
+// TestReconcileFoldsDrainRemainingAfterChannelEvents proves the DrainRemaining
+// fold itself: with a stream whose channel delivers some events and whose
+// DrainRemaining also returns some (a backlog held behind a full channel by
+// the real adapter), Reconcile must append the channel events first, then the
+// DrainRemaining overflow, on both exit paths. The overflow's transition for
+// a pane the channel already touched must win (last writer), and its
+// transition for a pane the channel never mentioned must still appear —
+// neither is true if the overflow is silently dropped.
+func TestReconcileFoldsDrainRemainingAfterChannelEvents(t *testing.T) {
+	channelEvents := []app.StatusEvent{
+		{PaneID: "w1:p1", WorkspaceID: "w1", Status: app.StatusWorking},
+		{PaneID: "w1:p1", WorkspaceID: "w1", Status: app.StatusBlocked},
+	}
+	overflow := []app.StatusEvent{
+		{PaneID: "w1:p1", WorkspaceID: "w1", Status: app.StatusDone},
+		{PaneID: "w2:p1", WorkspaceID: "w2", Status: app.StatusWorking},
+	}
+	snapshot := []app.PaneObservation{{PaneID: "w1:p1", Status: app.StatusIdle}}
+
+	cases := []struct {
+		name      string
+		newStream func() *fakeStream
+		cancel    bool
+	}{
+		{
+			name:      "channel closes without cancellation",
+			newStream: func() *fakeStream { return newFakeStream(channelEvents) },
+		},
+		{
+			// The staged stream only hands over one event at a time, as the
+			// real adapter does, so this exercises the ctx.Done() branch's
+			// own drain loop rather than the plain channel-close branch.
+			name:      "context canceled before the channel drains",
+			newStream: func() *fakeStream { return newStagedStream(channelEvents) },
+			cancel:    true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stream := tc.newStream()
+			stream.overflow = overflow
+			observer := &fakeObserver{stream: stream, snapshot: snapshot}
+			ctx := t.Context()
+			if tc.cancel {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel() // canceled up front; every event was already accepted
+			}
+
+			result, err := app.Reconcile(ctx, observer)
+			if err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+
+			want := append(append([]app.StatusEvent{}, channelEvents...), overflow...)
+			if !reflect.DeepEqual(result.Events, want) {
+				t.Errorf("Events = %v, want the channel events followed by the DrainRemaining overflow %v", result.Events, want)
+			}
+			if got := result.State["w1:p1"].Status; got != app.StatusDone {
+				t.Errorf("w1:p1 status = %s, want the overflow's done transition to win over the channel's blocked transition", got)
+			}
+			if got := result.State["w2:p1"].Status; got != app.StatusWorking {
+				t.Errorf("w2:p1 status = %s, want the overflow event to add a pane the channel never mentioned", got)
+			}
+		})
+	}
+}
+
 func TestReconcileStopsAtContextCancellation(t *testing.T) {
 	// A stream with nothing buffered that closes on cancellation: the drain
 	// ends immediately, returning the snapshot state.
