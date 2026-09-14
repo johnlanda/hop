@@ -295,6 +295,7 @@ type UnitOfWork interface {
 	Results() ResultRepository
 	Artifacts() ArtifactRepository
 	Bindings() BindingRepository
+	LaunchClaims() LaunchClaimRepository
 	Operations() OperationRepository
 	Transitions() TransitionRepository
 	CheckRequests() CheckRequestRepository
