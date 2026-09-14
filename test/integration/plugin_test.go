@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 // TestRealProcessPluginLifecycle links the staged HOP plugin into a
@@ -121,7 +120,7 @@ func TestRealProcessPluginLifecycle(t *testing.T) {
 	}
 
 	var snapshot string
-	rendered := waitUntil(60*time.Second, func() bool {
+	rendered := waitUntil(func() bool {
 		snapshot = server.readPane(t, paneID)
 		return strings.Contains(snapshot, "herdr binary")
 	})

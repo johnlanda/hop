@@ -5,13 +5,14 @@ Status: proposed sequence. Phase 0 is implemented (module, `hop version`,
 (application ports, `hop doctor`, the Herdr adapter's protocol client and the
 linkable manifest), item 5 (the isolated real-process fixture in
 `test/integration`: disposable server, link/invoke/log/pane/unlink, startup
-hook on server start, no user-global registry leak) and the protocol-facing
-part of item 6 (the `AgentPresentation` and `Observer` ports with manager-first
-metadata/view and subscribe-before-snapshot reconciliation, proven against a
-deterministic fixture: metadata round-trip, owned view clear with another
-owner intact, event reconciliation, explicit launch environment and context
-injection) are implemented; the PTY-attached rendering smoke and item 7 are
-not started. Commands below otherwise describe the intended interface.
+hook on server start, no user-global registry leak) and item 6 (the
+`AgentPresentation` and `Observer` ports with manager-first metadata/view and
+subscribe-before-snapshot reconciliation, proven against a deterministic
+fixture: metadata round-trip, owned view clear with another owner intact,
+event reconciliation, explicit launch environment, context injection, and a
+PTY-attached rendering smoke at fixed 100x30 dimensions showing manager-first
+rows) are implemented; item 7 is not started. Commands below otherwise
+describe the intended interface.
 
 ## Delivery strategy
 

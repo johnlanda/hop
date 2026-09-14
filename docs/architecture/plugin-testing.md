@@ -107,5 +107,9 @@ protocol tests live in `internal/adapters/herdr` and the first real-process
 suite lives in `test/integration` (see its guide), both running under the
 ordinary `make check`; the real-process suite skips with an explicit reason
 where no herdr binary is installed, and CI runners have none. Of the table
-above, the link-and-invoke and startup rows are implemented; the remaining
-rows and the live-harness tests are planned, not implemented.
+above, the link-and-invoke, startup, worktree-event (covered by the launch
+environment and metadata tests), native-Agent-view and board rows are
+implemented, and the PTY-attached rendering evidence (layer 4) is a
+separately named smoke, `TestRealProcessPTYRendering`, at fixed 100x30
+dimensions; the restart/registry/failure-cleanup rows and the live-harness
+tests (layer 5) are planned, not implemented.

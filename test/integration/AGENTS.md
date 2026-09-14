@@ -16,6 +16,8 @@ this tree, and drives everything through HOP's own protocol client.
 | [plugin_test.go](plugin_test.go) | `TestRealProcessPluginLifecycle`, `TestRealProcessStartupHookRunsOnServerStart` | Link → action list → invoke → completed log records with real output → workspace/pane open and rendered evidence → unlink; and the startup hook proven to run on server start, not on link |
 | [presentation_test.go](presentation_test.go) | `TestRealProcessAgentPresentationAndView`, `createRunFixture` | A deterministic manager+workers fixture (custom agent identity/state via `pane.report_agent`), HOP metadata published through the presentation adapter, tokens round-tripped through `agent.list`, manager-first ordering, HOP's owned view select/clear, and another owner's view surviving HOP's owned clear |
 | [observation_test.go](observation_test.go) | `TestRealProcessEventObservationReconcile`, `TestRealProcessLaunchEnvironment`, `TestRealProcessContextInjection` | Subscribe-before-snapshot reconciliation over a real status transition; an explicit launch environment injected into a launched pane and read back; and context injected into a live pane through `pane.send_text` |
+| [pty_test.go](pty_test.go) | `TestRealProcessPTYRendering`, `ptyClient` | A PTY-attached client at fixed 100x30 dimensions capturing how the native Agents sidebar renders HOP's projection: the fixture agents drawn, manager-first order on screen, and a HOP metadata token in the rows |
+| [artifacts_test.go](artifacts_test.go) | `TestArtifactDirRemovedOnPassingRun`, `TestArtifactRetentionDecision` | Harness self-tests for the evidence-retention contract; they need no herdr binary |
 
 ## Invariants
 
@@ -51,6 +53,11 @@ this tree, and drives everything through HOP's own protocol client.
   and wire-shape structs the assertions need are declared locally in the
   tests.
 - Consumed/implemented ports: none; the suite drives `herdr.Client` directly.
+- External libraries: `github.com/creack/pty` (test-only), used by the PTY
+  smoke to attach a client on a pseudo-terminal — Go's standard library has
+  no PTY. It is allowlisted only for this integration-test package
+  (`testThirdParty` in the `test/integration` rule); the architecture
+  checker's production-closure check proves no production package reaches it.
 - External binaries: `herdr` (skipped when absent) and the `go` tool to
   build the staged plugin.
 

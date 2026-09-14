@@ -8,11 +8,13 @@ package integration
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -24,6 +26,10 @@ const callTimeout = 30 * time.Second
 
 // pollInterval is the pace of bounded condition polls.
 const pollInterval = 25 * time.Millisecond
+
+// conditionTimeout bounds a polled wait for a live condition (a plugin log
+// completing, a pane or sidebar rendering the expected text).
+const conditionTimeout = 60 * time.Second
 
 // sessionName is the disposable server's named session. It stays one
 // character so the socket path fits the platform's Unix socket length cap.
@@ -85,15 +91,39 @@ func newArtifactDir(t *testing.T) *artifactDir {
 	}
 	artifacts := &artifactDir{path: path}
 	t.Cleanup(func() {
-		if t.Failed() {
+		if retainArtifacts(t.Failed()) {
 			t.Logf("artifacts retained at %s", path)
 			return
 		}
-		if err := os.RemoveAll(path); err != nil {
-			t.Logf("remove artifacts: %v", err)
-		}
+		removeArtifactDir(t, path)
 	})
 	return artifacts
+}
+
+// retainArtifacts decides whether a test's evidence directory is kept: a
+// failing run retains it for inspection, a passing run leaves nothing.
+func retainArtifacts(failed bool) bool {
+	return failed
+}
+
+// removeArtifactDir removes a passing test's artifact directory, retrying
+// briefly. Server teardown reaps the process group before this runs, but a
+// descendant that is a hair slow to exit could still hold a log file for a
+// moment; a bounded retry closes that window so a passing run leaves nothing.
+func removeArtifactDir(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		err := os.RemoveAll(path)
+		if err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Errorf("remove artifacts %s: %v", path, err)
+			return
+		}
+		time.Sleep(pollInterval)
+	}
 }
 
 // sanitizeName makes a test name usable as a directory component.
@@ -142,9 +172,15 @@ type testServer struct {
 }
 
 // testConfig is the test-only configuration: no onboarding, fixed headless
-// geometry for repeatable pane snapshots, and nesting allowed so a pane
-// inside the test server may attach a client to that same test server.
-const testConfig = "onboarding = false\n\n[server]\nheadless_cols = 100\nheadless_rows = 30\n\n[experimental]\nallow_nested = true\n"
+// geometry for repeatable pane snapshots, nesting allowed so a client may
+// attach inside the test server, and an Agent sidebar layout that renders
+// HOP's own metadata tokens so the PTY smoke can assert row rendering. The
+// sidebar rows affect only an attached client's rendering, so they are inert
+// for the API-only tests. Missing token values simply disappear.
+const testConfig = "onboarding = false\n" +
+	"\n[server]\nheadless_cols = 100\nheadless_rows = 30\n" +
+	"\n[experimental]\nallow_nested = true\n" +
+	"\n[ui.sidebar.agents]\nrows = [[\"state_icon\", \"agent\", \"$hop_role\"], [\"$hop_run\", \"$hop_task\"]]\n"
 
 // newServerRoots prepares the temporary config/state/runtime roots and the
 // test-only config file. The base directory is created outside t.TempDir
@@ -218,6 +254,12 @@ func (s *testServer) start(t *testing.T) {
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	cmd.Stdin = nil
+	// Put the server in its own process group so its pane-shell descendants,
+	// which inherit the server-log file descriptors in the artifact
+	// directory, can be reaped as a group on stop. An orphaned shell that
+	// outlived a bare server kill would keep those files open and could
+	// leave the artifact directory behind on cleanup.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start herdr server: %v", err)
 	}
@@ -257,9 +299,13 @@ func (s *testServer) start(t *testing.T) {
 }
 
 // stop shuts the server down through its own API, then falls back to the
-// process handle. Only this test's spawned process is ever signaled.
+// process handle. Whether the shutdown is graceful or forced, it finishes by
+// reaping the server's own process group so no pane-shell descendant lingers
+// holding artifact files open. Only this test's spawned process group is ever
+// signaled; nothing is matched by name.
 func (s *testServer) stop(t *testing.T, exited <-chan error) {
 	t.Helper()
+	pid := s.cmd.Process.Pid
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := s.client.Call(ctx, "server.stop", nil, nil); err != nil {
@@ -267,16 +313,33 @@ func (s *testServer) stop(t *testing.T, exited <-chan error) {
 	}
 	select {
 	case <-exited:
+		s.reapProcessGroup(t, pid)
 		return
 	case <-time.After(10 * time.Second):
 	}
-	if err := s.cmd.Process.Kill(); err != nil {
-		t.Logf("kill herdr server: %v", err)
-	}
+	s.reapProcessGroup(t, pid)
 	select {
 	case <-exited:
 	case <-time.After(10 * time.Second):
-		t.Errorf("herdr server pid %d did not exit after kill", s.cmd.Process.Pid)
+		t.Errorf("herdr server pid %d did not exit after killing its process group", pid)
+	}
+	// Reap any straggler descendants once more after the leader has exited.
+	s.reapProcessGroup(t, pid)
+}
+
+// reapProcessGroup sends SIGKILL to the server's process group, reaping the
+// server and every pane-shell descendant it started. A missing group (already
+// gone) is not an error.
+func (*testServer) reapProcessGroup(t *testing.T, pid int) {
+	t.Helper()
+	pgid, err := syscall.Getpgid(pid)
+	if err != nil {
+		// The leader is already gone; try the pid's own group id, which
+		// equals its pid because it was started with Setpgid.
+		pgid = pid
+	}
+	if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		t.Logf("kill process group %d: %v", pgid, err)
 	}
 }
 
@@ -389,10 +452,10 @@ func assertNoRegistryLeak(t *testing.T, before map[string]string) {
 	}
 }
 
-// waitUntil polls a condition with a bounded deadline and no fixed sleeps
+// waitUntil polls a condition until conditionTimeout, with no fixed sleeps
 // beyond the poll interval. It reports whether the condition became true.
-func waitUntil(timeout time.Duration, condition func() bool) bool {
-	deadline := time.Now().Add(timeout)
+func waitUntil(condition func() bool) bool {
+	deadline := time.Now().Add(conditionTimeout)
 	for {
 		if condition() {
 			return true
@@ -453,7 +516,7 @@ type pluginLogRecord struct {
 func (s *testServer) waitForLog(t *testing.T, match func(*pluginLogRecord) bool) pluginLogRecord {
 	t.Helper()
 	var found pluginLogRecord
-	completed := waitUntil(60*time.Second, func() bool {
+	completed := waitUntil(func() bool {
 		for _, record := range s.pluginLogs(t) {
 			if match(&record) && record.Status != "running" {
 				found = record

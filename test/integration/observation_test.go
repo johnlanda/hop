@@ -152,7 +152,7 @@ func awaitStatusEvent(t *testing.T, stream app.StatusStream, paneID string, want
 func (s *testServer) waitForPaneText(t *testing.T, paneID, want string) string {
 	t.Helper()
 	var snapshot string
-	found := waitUntil(60*time.Second, func() bool {
+	found := waitUntil(func() bool {
 		snapshot = s.readPane(t, paneID)
 		return strings.Contains(snapshot, want)
 	})
