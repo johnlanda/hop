@@ -23,11 +23,11 @@ func (c *Controller) RequestStop(ctx context.Context, runIDStr string) error {
 	return nil
 }
 
-// checkRunIntent is the OpCheckRun operation's intent payload: what the
+// CheckRunIntent is the OpCheckRun operation's intent payload: what the
 // check use case recorded before spawning hop check-exec, and what stop
 // and resume's group-retirement classification matches an inspected
 // process group's argv against.
-type checkRunIntent struct {
+type CheckRunIntent struct {
 	CheckoutPath string   `json:"checkout_path"`
 	CheckArgv    []string `json:"check_argv"`
 }
@@ -206,7 +206,7 @@ func (c *Controller) stopChecking(ctx context.Context, handle RunHandle, detail 
 		return StopReport{RunState: string(run.RunStopping)}, nil
 	}
 
-	intent, _ := checkOp.Intent.(checkRunIntent) //nolint:errcheck // a decode failure leaves expectedArgv nil, which ClassifyGroupRetirement treats as never matching — fails closed, not a panic.
+	intent, _ := checkOp.Intent.(CheckRunIntent) //nolint:errcheck // a decode failure leaves expectedArgv nil, which ClassifyGroupRetirement treats as never matching — fails closed, not a panic.
 	outcome := c.retireGroup(ctx, claim.PID, intent.CheckArgv)
 	switch outcome {
 	case GroupEmpty, GroupMatched:
@@ -330,6 +330,24 @@ func terminateSession(ctx context.Context, uow UnitOfWork, sessionID identity.Se
 	if s.State == run.SessionTerminated {
 		return nil
 	}
+	// Terminate is invalid directly from active (section 5: "a stop against
+	// a corroborated live process goes through launching → stopping" first).
+	// reserved, launching, stopping and reconciling all terminate directly.
+	if s.State == run.SessionActive {
+		stoppingFrom := s.State
+		s, err = s.Stop(now)
+		if err != nil {
+			return err
+		}
+		sRev, err = uow.Sessions().Save(ctx, s, sRev)
+		if err != nil {
+			return err
+		}
+		if transErr := recordTransition(ctx, uow, EntitySession, sessionID.String(), string(stoppingFrom), string(s.State), reason, generation, now); transErr != nil {
+			return transErr
+		}
+	}
+
 	sFrom := s.State
 	s, err = s.Terminate(now)
 	if err != nil {

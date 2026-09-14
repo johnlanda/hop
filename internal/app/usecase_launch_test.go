@@ -29,7 +29,7 @@ func startedRun(t *testing.T, tc *testController) (app.RunHandle, app.RunDetail)
 
 // claim writes a launch claim for the started run's incarnation, as hop
 // launch would before exec.
-func claimLaunch(t *testing.T, tc *testController, detail app.RunDetail, pid int) { //nolint:gocritic // hugeParam: detail is the test's already-loaded RunDetail, passed once per call in test setup, never a hot path.
+func claimLaunch(t *testing.T, tc *testController, detail app.RunDetail, pid int) { //nolint:gocritic,unparam // hugeParam: detail is the test's already-loaded RunDetail, passed once per call in test setup, never a hot path. unparam: every current test scripts the same launcher pid, but the parameter documents that InspectPaneFn stubs must match whatever pid is claimed here.
 	t.Helper()
 	if err := tc.Store.ClaimLaunch(context.Background(), app.LaunchClaim{
 		IncarnationID: detail.Binding.IncarnationID, RunID: detail.RunID, AttemptID: detail.AttemptID,

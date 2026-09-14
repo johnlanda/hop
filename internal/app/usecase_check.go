@@ -53,7 +53,7 @@ func (c *Controller) ClaimAndRunCheck(ctx context.Context, handle RunHandle, hop
 		return CheckReport{}, err
 	}
 	checkoutPath := filepath.Join(stateRoot, "runs", handle.runID.String(), "checks", opID.String(), "tree")
-	intent := checkRunIntent{CheckoutPath: checkoutPath, CheckArgv: checkArgv}
+	intent := CheckRunIntent{CheckoutPath: checkoutPath, CheckArgv: checkArgv}
 	now := c.Clock.Now()
 
 	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
