@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -167,14 +168,69 @@ type testServer struct {
 	configHome string
 	socketPath string
 	config     string
-	cmd        *exec.Cmd
-	// pgid is the server's process-group id, captured once at start. Setpgid
-	// makes the child a group leader so pgid == pid; it is recorded here and
-	// never re-resolved after the process is reaped, so a recycled pid can
-	// never map this back to an unrelated group.
-	pgid      int
+	// shell overrides the SHELL every subprocess (and therefore every pane
+	// login shell) uses; empty means the default /bin/sh. The spike tests set
+	// it to exercise zsh login-shell behavior.
+	shell string
+	// running holds every server process the suite has launched on these
+	// roots, newest last. A restart (S3) launches a second one; each is
+	// reaped exactly once, by restart or by cleanup, so a graceful restart
+	// never leaves a stray server or a doubly-signaled group.
+	running   []*serverProcess
 	client    *herdr.Client
 	artifacts *artifactDir
+}
+
+// serverProcess is one launched herdr server plus a group anchor. The leader
+// is a group leader (Setpgid, pgid == leader pid); the anchor is a tiny
+// long-lived process launched into that SAME group and kept unreaped until
+// retirement.
+//
+// The anchor is what makes group signaling safe. A process group's id stays
+// reserved (its number is not recycled as a pid, and no new group is assigned
+// that id) as long as the group has an unreaped member. So while the anchor
+// lives unreaped, kill(-pgid, …) provably targets only this server's group,
+// even after the leader itself has been reaped. That decouples reaping from
+// signaling: the leader is reaped by exactly one owner — a single goroutine's
+// leaderCmd.Wait, whose result closes leaderExited — at any time, with no
+// recycled-pgid window, because the anchor holds the group. The anchor is
+// reaped exactly once, by retireGroup, and only after the group's single
+// SIGKILL has been sent.
+//
+// Documented limitations:
+//
+// Cleanup targets the owned process group. A descendant that deliberately
+// leaves that group is outside this harness's retirement guarantee; a retained
+// output descriptor causes bounded capture failure, not proof that the escaped
+// process was retired.
+//
+// A teardown deadline reports retirement as inconclusive. If the operating
+// system does not complete a signaled process's exit, its sole Wait owner may
+// remain pending; the harness neither claims successful cleanup nor signals a
+// potentially recycled group to force completion.
+type serverProcess struct {
+	leaderCmd      *exec.Cmd
+	anchorCmd      *exec.Cmd
+	pgid           int
+	stdout, stderr *os.File
+
+	leaderExited  chan struct{} // closed once the single leader Wait has returned
+	leaderWaitErr error         // valid once leaderExited is closed
+
+	mu       sync.Mutex
+	torndown bool // teardown (retire + close logs) has completed
+}
+
+// takeTeardown returns true exactly once per server: the caller that gets true
+// owns teardown, later callers get false and skip.
+func (sp *serverProcess) takeTeardown() bool {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	if sp.torndown {
+		return false
+	}
+	sp.torndown = true
+	return true
 }
 
 // testConfig is the test-only configuration: no onboarding, fixed headless
@@ -242,11 +298,15 @@ func (s *testServer) environ() []string {
 	// opencode resolves the harmless stubs, never the developer's real
 	// harness binaries; herdr, go and the shell resolve from the inherited
 	// PATH after it.
+	shell := s.shell
+	if shell == "" {
+		shell = "/bin/sh"
+	}
 	return []string{
 		"PATH=" + filepath.Join(s.base, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"),
 		"HOME=" + s.homeDir(),
 		"TMPDIR=" + os.Getenv("TMPDIR"),
-		"SHELL=/bin/sh",
+		"SHELL=" + shell,
 		"XDG_CONFIG_HOME=" + filepath.Join(s.base, "c"),
 		"XDG_STATE_HOME=" + filepath.Join(s.base, "st"),
 		"XDG_RUNTIME_DIR=" + filepath.Join(s.base, "r"),
@@ -284,8 +344,13 @@ func prepareServer(t *testing.T, artifacts *artifactDir) *testServer {
 // to answer ping, with a bounded deadline and no fixed sleeps.
 func (s *testServer) start(t *testing.T) {
 	t.Helper()
-	stdout := s.artifacts.create(t, "server-stdout.log")
-	stderr := s.artifacts.create(t, "server-stderr.log")
+	stdoutName, stderrName := "server-stdout.log", "server-stderr.log"
+	if len(s.running) > 0 {
+		stdoutName = fmt.Sprintf("server-stdout-%d.log", len(s.running))
+		stderrName = fmt.Sprintf("server-stderr-%d.log", len(s.running))
+	}
+	stdout := s.artifacts.create(t, stdoutName)
+	stderr := s.artifacts.create(t, stderrName)
 	cmd := exec.CommandContext(context.Background(), s.herdrBin, "--session", sessionName, "server") //nolint:gosec // G204: the binary is the pinned or PATH-resolved herdr under test. The context is deliberately unbounded: stop owns the shutdown through the API and the process handle.
 	cmd.Env = s.environ()
 	cmd.Stdout = stdout
@@ -298,23 +363,30 @@ func (s *testServer) start(t *testing.T) {
 	// leave the artifact directory behind on cleanup.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
+		// The log files were created before the failed Start; close them here so
+		// a start failure does not leak descriptors (no cleanup is registered
+		// yet at this point).
+		closeLogs(t, stdout, stderr)
 		t.Fatalf("start herdr server: %v", err)
 	}
-	s.cmd = cmd
-	// Capture the process-group id once, now, while the pid is certainly the
-	// live server. Setpgid made it a group leader, so its pgid equals its
-	// pid. The leader is never reaped until stop's final Wait, so this pgid
-	// cannot be reused before it is signaled.
-	s.pgid = cmd.Process.Pid
-	t.Cleanup(func() {
-		s.stop(t)
-		if closeErr := stdout.Close(); closeErr != nil {
-			t.Logf("close server stdout: %v", closeErr)
-		}
-		if closeErr := stderr.Close(); closeErr != nil {
-			t.Logf("close server stderr: %v", closeErr)
-		}
-	})
+	// Setpgid made the server a group leader, so its pgid equals its pid; it is
+	// captured once, now, while the pid is certainly the live server. Launch an
+	// anchor into that group immediately so an unreaped member of ours pins the
+	// pgid until retirement; if the anchor cannot join, the group is already
+	// gone (the server died at once) and the launch is inconclusive.
+	anchor, err := startAnchor(cmd.Process.Pid)
+	if err != nil {
+		// The server started but could not be anchored (e.g. sleep unresolved);
+		// it is not necessarily dead and has no Wait owner or cleanup registered
+		// yet, so retire and reap it here before failing — no live server, no
+		// unreaped pid. Do not infer leader exit from an anchor error.
+		retireUnanchoredLeader(t, cmd)
+		closeLogs(t, stdout, stderr)
+		t.Fatalf("anchor could not join the server's process group %d: %v", cmd.Process.Pid, err)
+	}
+	sp := newServerProcess(cmd, anchor, stdout, stderr)
+	s.running = append(s.running, sp)
+	t.Cleanup(func() { s.reapServer(t, sp) })
 	deadline := time.Now().Add(30 * time.Second)
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -333,19 +405,230 @@ func (s *testServer) start(t *testing.T) {
 	}
 }
 
-// stop shuts the server down: it asks for a graceful stop, then kills the
-// server's whole process group (reaping every pane-shell descendant that
-// might hold artifact files open) and finally reaps the leader. No goroutine
-// reaps the leader earlier, so its group is signaled while the leader is
-// still alive or a zombie — never after the pid could have been reused.
-func (s *testServer) stop(t *testing.T) {
+// gracefulStopTimeout bounds how long a graceful restart waits for the server
+// to actually exit after server.stop. The shutdown save of a small session is
+// fast; a server that has not exited by this deadline is treated as an
+// inconclusive restart, not a successful one.
+const gracefulStopTimeout = 20 * time.Second
+
+// startAnchor launches a tiny long-lived process into the existing process
+// group pgid, so an unreaped member of ours pins the pgid until retirement.
+// setpgid into an existing group fails (EPERM/ESRCH) once that group is empty —
+// the leader already exited — which the caller treats as an inconclusive
+// launch. The anchor gets no stdio, so it never inherits the artifact-log fds.
+func startAnchor(pgid int) (*exec.Cmd, error) {
+	sleepBin, err := exec.LookPath("sleep")
+	if err != nil {
+		return nil, fmt.Errorf("resolve sleep for the group anchor: %w", err)
+	}
+	anchor := exec.CommandContext(context.Background(), sleepBin, "100000") //nolint:gosec // G204: a fixed sleep binary; the anchor only pins the process group.
+	anchor.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pgid: pgid}
+	if err := anchor.Start(); err != nil {
+		return nil, err
+	}
+	return anchor, nil
+}
+
+// newServerProcess wraps an already-started leader and its group anchor, and
+// starts the single goroutine that owns the leader's one Wait — its result
+// closes leaderExited. Nothing else waits on the leader pid; the anchor keeps
+// the pgid pinned, so this reap may complete at any time without opening a
+// recycled-pgid window.
+func newServerProcess(leaderCmd, anchorCmd *exec.Cmd, stdout, stderr *os.File) *serverProcess {
+	sp := &serverProcess{
+		leaderCmd:    leaderCmd,
+		anchorCmd:    anchorCmd,
+		pgid:         leaderCmd.Process.Pid,
+		stdout:       stdout,
+		stderr:       stderr,
+		leaderExited: make(chan struct{}),
+	}
+	go func() {
+		sp.leaderWaitErr = sp.leaderCmd.Wait()
+		close(sp.leaderExited)
+	}()
+	return sp
+}
+
+// closeLogs closes a server's log files, tolerating nil (a failed start).
+func closeLogs(t *testing.T, stdout, stderr *os.File) {
 	t.Helper()
+	if stdout != nil {
+		if err := stdout.Close(); err != nil {
+			t.Logf("close server stdout: %v", err)
+		}
+	}
+	if stderr != nil {
+		if err := stderr.Close(); err != nil {
+			t.Logf("close server stderr: %v", err)
+		}
+	}
+}
+
+// restart gracefully stops the current server and launches a fresh one on the
+// same roots, so persisted session state survives across the restart. The
+// graceful save runs only as the run loop exits (save_session_on_shutdown), so
+// restart waits for the leader to ACTUALLY exit — never merely for ping to
+// fail, which Herdr returns while it is still shutting down and before it
+// saves. If the server does not exit within the deadline the restart is
+// inconclusive: the old server is force-killed and the test fails rather than
+// treating a truncated save as restored state.
+func (s *testServer) restart(t *testing.T) {
+	t.Helper()
+	if len(s.running) == 0 {
+		t.Fatal("restart called before start")
+	}
+	current := s.running[len(s.running)-1]
+	if !current.takeTeardown() {
+		t.Fatal("restart called on an already-torn-down server")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	if err := s.client.Call(ctx, "server.stop", nil, nil); err != nil {
+		t.Logf("server.stop before restart: %v", err)
+	}
+	cancel()
+	// Wait for the leader to ACTUALLY exit — never merely for a failed ping,
+	// which Herdr returns while it is still shutting down and before the run
+	// loop's save. The save runs only as the leader exits.
+	select {
+	case <-current.leaderExited:
+	case <-time.After(gracefulStopTimeout):
+		// The leader did not exit on its own; it is still running (and the anchor
+		// still pins the group), so retire the group and fail — a forced
+		// shutdown's save may be incomplete, never treat it as restored state.
+		s.failRestart(t, current, "herdr did not exit within the graceful-stop deadline; restore evidence would be inconclusive")
+	}
+	// The leader exited on its own, so the shutdown save completed. Verify it
+	// was a clean exit (code 0), not a signal or an error, before trusting the
+	// restored state.
+	status := current.leaderCmd.ProcessState
+	switch {
+	case current.leaderWaitErr != nil && status == nil:
+		s.failRestart(t, current, fmt.Sprintf("herdr leader wait failed during graceful restart (%v); inconclusive", current.leaderWaitErr))
+	case !status.Exited():
+		s.failRestart(t, current, fmt.Sprintf("herdr exited via signal during graceful restart (%v); the save may be incomplete (inconclusive)", status))
+	case status.ExitCode() != 0:
+		s.failRestart(t, current, fmt.Sprintf("herdr graceful exit code %d (nonzero); the save may be incomplete (inconclusive)", status.ExitCode()))
+	}
+	// Retire the still-anchored group: the anchor pins the pgid, so the single
+	// SIGKILL that clears any lingering pane shells is safe even though the
+	// leader is already reaped. A failed retirement is fatal — the old group
+	// may still hold artifact files or a live process, so never relaunch.
+	if err := current.retireGroup(); err != nil {
+		closeLogs(t, current.stdout, current.stderr)
+		t.Fatalf("old server group did not retire after graceful exit (%v); restore evidence would be inconclusive", err)
+	}
+	closeLogs(t, current.stdout, current.stderr)
+	s.start(t)
+}
+
+// failRestart retires the old group and fails the restart as inconclusive; the
+// retirement error, if any, is folded into the message so a lingering group is
+// never silently followed by a relaunch.
+func (*testServer) failRestart(t *testing.T, sp *serverProcess, reason string) {
+	t.Helper()
+	retireErr := sp.retireGroup()
+	closeLogs(t, sp.stdout, sp.stderr)
+	if retireErr != nil {
+		t.Fatalf("%s; retirement also failed: %v", reason, retireErr)
+	}
+	t.Fatal(reason)
+}
+
+// reapServer is the cleanup teardown, run at most once per server, so restart
+// and the stacked cleanups never tear one down twice. As a cleanup it reports a
+// retirement failure but does not stop other cleanups.
+func (s *testServer) reapServer(t *testing.T, sp *serverProcess) {
+	t.Helper()
+	if !sp.takeTeardown() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	if err := s.client.Call(ctx, "server.stop", nil, nil); err != nil {
 		t.Logf("server.stop: %v (falling back to the process group)", err)
 	}
-	killProcessGroupThenReap(t, s.cmd, s.pgid, syscall.Getpgrp())
+	cancel()
+	if err := sp.retireGroup(); err != nil {
+		t.Errorf("retire server group on cleanup: %v", err)
+	}
+	closeLogs(t, sp.stdout, sp.stderr)
+}
+
+// retireGroup tears the server's whole process group down safely and reports
+// the first failure it hit. The single group SIGKILL is sent while the anchor
+// is provably unreaped, so it targets only this group's members and never a
+// recycled pgid; only afterward are the anchor and leader reaped (each by
+// exactly one owner). It must run at most once per server (its callers hold
+// takeTeardown). A non-nil error means retirement could not be established;
+// restart treats that as inconclusive and must not relaunch.
+func (sp *serverProcess) retireGroup() error {
+	var firstErr error
+	record := func(err error) {
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	// One SIGKILL to the whole group. The anchor is still unreaped here, so the
+	// pgid is pinned to our group; this kills the leader (if alive), the anchor,
+	// and every descendant.
+	if safeToSignalGroup(sp.pgid, syscall.Getpgrp()) {
+		if err := syscall.Kill(-sp.pgid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+			record(fmt.Errorf("kill process group %d: %w", sp.pgid, err))
+		}
+	} else {
+		record(fmt.Errorf("refusing to signal unsafe process group %d", sp.pgid))
+	}
+	// Observe the leader's exit (reaped by its single owning goroutine) and reap
+	// the anchor (its single owner here), each bounded so a stuck reap cannot
+	// hang teardown. On a timeout the sole Wait owner is left in place — no
+	// second waiter, no post-anchor-reap group signal — and retirement is
+	// reported inconclusive. No group signal is sent after this point.
+	select {
+	case <-sp.leaderExited:
+	case <-time.After(ownedGroupDrainTimeout):
+		record(fmt.Errorf("leader %d did not exit within the teardown deadline (inconclusive)", sp.pgid))
+	}
+	if err := reapCmdBounded(sp.anchorCmd, ownedGroupDrainTimeout); err != nil {
+		record(fmt.Errorf("reap group anchor %d: %w", sp.pgid, err))
+	}
+	// Confirm the group is empty: signal 0 only reads existence, so even if the
+	// now-unpinned pgid were recycled this cannot signal an unrelated process;
+	// it just waits until no member with that pgid remains.
+	if !groupIsGone(sp.pgid) {
+		record(fmt.Errorf("process group %d still had members after the deadline; a descendant may still hold artifact files", sp.pgid))
+	}
+	return firstErr
+}
+
+// retireUnanchoredLeader kills and reaps a just-started leader whose group
+// could not be anchored. The leader has no Wait owner yet and is still
+// unreaped, so signaling its own pgid is safe; this leaves no live process and
+// no unreaped pid before the caller fails. Its single Wait is bounded, so this
+// cleanup path cannot hang either.
+func retireUnanchoredLeader(t *testing.T, cmd *exec.Cmd) {
+	t.Helper()
+	pgid := cmd.Process.Pid
+	if safeToSignalGroup(pgid, syscall.Getpgrp()) {
+		if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+			t.Logf("kill unanchored leader group %d: %v", pgid, err)
+		}
+	} else {
+		t.Errorf("refusing to signal unsafe process group %d", pgid)
+	}
+	if err := reapCmdBounded(cmd, ownedGroupDrainTimeout); err != nil {
+		t.Errorf("retire unanchored leader %d: %v", pgid, err)
+	}
+	if !groupIsGone(pgid) {
+		t.Errorf("unanchored leader group %d still had members after teardown", pgid)
+	}
+}
+
+// groupIsGone reports whether no process remains in the group: signal 0 returns
+// ESRCH only once every member, including reparented descendants, has exited
+// and been reaped. It polls until the bounded deadline. Signal 0 sends nothing,
+// so even if the now-unpinned pgid were recycled this only reads existence.
+func groupIsGone(pgid int) bool {
+	return waitUntil(func() bool { return errors.Is(syscall.Kill(-pgid, 0), syscall.ESRCH) })
 }
 
 // killProcessGroupThenReap SIGKILLs the process group identified by pgid,
