@@ -303,13 +303,11 @@ func (s *testServer) start(t *testing.T) {
 	s.cmd = cmd
 	// Capture the process-group id once, now, while the pid is certainly the
 	// live server. Setpgid made it a group leader, so its pgid equals its
-	// pid. Never re-resolve this after the process is reaped: a recycled pid
-	// could otherwise map to an unrelated group.
+	// pid. The leader is never reaped until stop's final Wait, so this pgid
+	// cannot be reused before it is signaled.
 	s.pgid = cmd.Process.Pid
-	exited := make(chan error, 1)
-	go func() { exited <- cmd.Wait() }()
 	t.Cleanup(func() {
-		s.stop(t, exited)
+		s.stop(t)
 		if closeErr := stdout.Close(); closeErr != nil {
 			t.Logf("close server stdout: %v", closeErr)
 		}
@@ -328,11 +326,6 @@ func (s *testServer) start(t *testing.T) {
 		if err == nil && pong.Version != "" {
 			return
 		}
-		select {
-		case waitErr := <-exited:
-			t.Fatalf("herdr server exited before its socket answered: %v", waitErr)
-		default:
-		}
 		if time.Now().After(deadline) {
 			t.Fatalf("herdr server socket %s did not answer ping before the deadline; last error: %v", s.socketPath, err)
 		}
@@ -340,47 +333,38 @@ func (s *testServer) start(t *testing.T) {
 	}
 }
 
-// stop shuts the server down through its own API, then falls back to the
-// process handle. Whether the shutdown is graceful or forced, it finishes by
-// reaping the server's own process group so no pane-shell descendant lingers
-// holding artifact files open. Only this test's spawned process group is ever
-// signaled; nothing is matched by name.
-func (s *testServer) stop(t *testing.T, exited <-chan error) {
+// stop shuts the server down: it asks for a graceful stop, then kills the
+// server's whole process group (reaping every pane-shell descendant that
+// might hold artifact files open) and finally reaps the leader. No goroutine
+// reaps the leader earlier, so its group is signaled while the leader is
+// still alive or a zombie — never after the pid could have been reused.
+func (s *testServer) stop(t *testing.T) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := s.client.Call(ctx, "server.stop", nil, nil); err != nil {
-		t.Logf("server.stop: %v (falling back to the process handle)", err)
+		t.Logf("server.stop: %v (falling back to the process group)", err)
 	}
-	select {
-	case <-exited:
-		s.reapProcessGroup(t)
-		return
-	case <-time.After(10 * time.Second):
-	}
-	s.reapProcessGroup(t)
-	select {
-	case <-exited:
-	case <-time.After(10 * time.Second):
-		t.Errorf("herdr server pgid %d did not exit after killing its process group", s.pgid)
-	}
-	// Reap any straggler descendants once more after the leader has exited.
-	s.reapProcessGroup(t)
+	killProcessGroupThenReap(t, s.cmd, s.pgid, syscall.Getpgrp())
 }
 
-// reapProcessGroup sends SIGKILL to the server's process group, reaping the
-// server and every pane-shell descendant it started. It uses the pgid
-// captured at start (never re-resolved from a possibly-reaped pid) and
-// refuses to signal an unsafe target, so a recycled pid can never make this
-// kill an unrelated group. A group that is already gone is not an error.
-func (s *testServer) reapProcessGroup(t *testing.T) {
+// killProcessGroupThenReap SIGKILLs the process group identified by pgid and
+// then reaps the leader with Wait. The order matters: the leader is signaled
+// while it is still unreaped, so pgid cannot have been recycled onto an
+// unrelated process, and only the group the suite owns is ever signaled.
+func killProcessGroupThenReap(t *testing.T, cmd *exec.Cmd, pgid, ownGroup int) {
 	t.Helper()
-	if !safeToSignalGroup(s.pgid, syscall.Getpgrp()) {
-		t.Errorf("refusing to signal unsafe process group %d", s.pgid)
-		return
+	if safeToSignalGroup(pgid, ownGroup) {
+		if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+			t.Logf("kill process group %d: %v", pgid, err)
+		}
+	} else {
+		t.Errorf("refusing to signal unsafe process group %d", pgid)
 	}
-	if err := syscall.Kill(-s.pgid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-		t.Logf("kill process group %d: %v", s.pgid, err)
+	// Reap the leader last. A SIGKILLed process reports a signal error, which
+	// is expected here.
+	if err := cmd.Wait(); err != nil {
+		t.Logf("herdr server exited: %v", err)
 	}
 }
 
