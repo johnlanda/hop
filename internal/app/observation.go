@@ -41,6 +41,12 @@ type StatusEvent struct {
 // why, with nil meaning a deliberate close.
 type StatusStream interface {
 	Events() <-chan StatusEvent
+	// DrainRemaining returns events that were accepted into the subscription
+	// before it ended but could not be delivered through Events, for example
+	// a backlog held behind a full channel when the consumer was descheduled
+	// during a cancellation. It is meaningful only after Events has closed,
+	// and returns nothing when every accepted event was delivered.
+	DrainRemaining() []StatusEvent
 	Close() error
 	Err() error
 }
@@ -125,18 +131,21 @@ func Reconcile(ctx context.Context, observer Observer) (Reconciliation, error) {
 	for {
 		select {
 		case <-ctx.Done():
-			// Fold every remaining buffered event until the stream closes,
-			// so nothing accepted before cancellation is dropped by select's
-			// choice among ready cases.
+			// Fold every remaining event: first those still flowing through
+			// the channel until it closes, then any backlog the subscription
+			// held behind a full channel while the consumer was descheduled.
+			// Nothing accepted before cancellation is dropped.
 			for event := range stream.Events() {
 				events = append(events, event)
 			}
+			events = append(events, stream.DrainRemaining()...)
 			return Reconciliation{State: ReconcileState(snapshot, events), Events: events}, nil
 		case event, ok := <-stream.Events():
 			if !ok {
 				if streamErr := stream.Err(); streamErr != nil {
 					return Reconciliation{}, fmt.Errorf("status stream ended: %w", streamErr)
 				}
+				events = append(events, stream.DrainRemaining()...)
 				return Reconciliation{State: ReconcileState(snapshot, events), Events: events}, nil
 			}
 			events = append(events, event)

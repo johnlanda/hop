@@ -372,9 +372,11 @@ func killProcessGroupThenReap(t *testing.T, cmd *exec.Cmd, pgid, ownGroup int) {
 	}
 	// Wait until no process remains in the group: signal 0 to the group
 	// returns ESRCH only once every member, including reparented descendants,
-	// has exited and been reaped.
+	// has exited and been reaped. A timeout here means a lingering writer
+	// could still hold artifact files, so it fails the test rather than
+	// leaving a passing run's emptiness unguaranteed.
 	if !waitUntil(func() bool { return errors.Is(syscall.Kill(-pgid, 0), syscall.ESRCH) }) {
-		t.Logf("process group %d still had members after the deadline", pgid)
+		t.Errorf("process group %d still had members after the deadline; a descendant may still hold artifact files", pgid)
 	}
 }
 

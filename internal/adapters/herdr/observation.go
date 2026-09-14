@@ -52,6 +52,9 @@ type statusStream struct {
 	closeOnce sync.Once
 	closed    chan struct{} // closed by Close to release a pump blocked on delivery
 	finished  chan struct{} // closed when the decode pump has exited
+
+	mu       sync.Mutex
+	overflow []app.StatusEvent // events accepted before the stream ended that the pump could not deliver
 }
 
 // Events lazily starts the decode pump and returns the normalized channel.
@@ -74,18 +77,16 @@ func (s *statusStream) Done() <-chan struct{} {
 
 // pump decodes raw events into status events until the raw stream ends. Each
 // delivery prefers a ready consumer, but honors both the Close signal and the
-// subscription context's cancellation, so a consumer that stops reading
-// cannot leave this goroutine blocked — whether it closed the stream or only
-// canceled the context — while a consumer that keeps draining still receives
-// every buffered event.
+// subscription context's cancellation, so a consumer that stops reading cannot
+// leave this goroutine blocked. When it stops for either reason it does not
+// discard what it was holding: the pending event and the remaining raw
+// backlog are moved to the overflow so DrainRemaining can return them, which
+// preserves every accepted event independently of when the consumer resumes.
 func (s *statusStream) pump() {
 	defer close(s.finished)
 	defer close(s.events)
 	for raw := range s.stream.Events() {
-		if !isAgentStatusEvent(raw.Name) {
-			continue
-		}
-		event, ok := decodeStatusEvent(raw.Data)
+		event, ok := decodeStatusFrame(raw)
 		if !ok {
 			continue
 		}
@@ -97,11 +98,44 @@ func (s *statusStream) pump() {
 		select {
 		case s.events <- event:
 		case <-s.closed:
+			s.flushBacklog(event)
 			return
 		case <-s.ctx.Done():
+			s.flushBacklog(event)
 			return
 		}
 	}
+}
+
+// decodeStatusFrame filters and decodes one raw frame into a status event.
+func decodeStatusFrame(raw RawEvent) (app.StatusEvent, bool) {
+	if !isAgentStatusEvent(raw.Name) {
+		return app.StatusEvent{}, false
+	}
+	return decodeStatusEvent(raw.Data)
+}
+
+// flushBacklog records the undelivered pending event and drains every event
+// still accepted in the raw subscription buffer into the overflow, so they
+// survive the pump's exit. The raw stream closes on cancellation or Close, so
+// this range terminates.
+func (s *statusStream) flushBacklog(pending app.StatusEvent) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.overflow = append(s.overflow, pending)
+	for raw := range s.stream.Events() {
+		if event, ok := decodeStatusFrame(raw); ok {
+			s.overflow = append(s.overflow, event)
+		}
+	}
+}
+
+// DrainRemaining returns the events the pump could not deliver before it
+// exited. It is meaningful after Events has closed.
+func (s *statusStream) DrainRemaining() []app.StatusEvent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.overflow
 }
 
 // Err reports why the underlying stream ended.

@@ -111,11 +111,12 @@ type RawEvent struct {
 // in arrival order on Events; after that channel closes, Err reports why the
 // stream ended, and nil means it was closed by Close or context cancellation.
 type EventStream struct {
-	conn     net.Conn
-	stop     func() bool
-	events   chan RawEvent
-	done     chan struct{} // closed by Close to release a pump blocked on a full events channel
-	finished chan struct{} // closed when the read pump has exited
+	conn      net.Conn
+	stop      func() bool
+	closeConn func() // closes conn exactly once, shared by Close, the read pump and the context watcher
+	events    chan RawEvent
+	done      chan struct{} // closed by Close to release a pump blocked on a full events channel
+	finished  chan struct{} // closed when the read pump has exited
 
 	mu     sync.Mutex
 	closed bool
@@ -131,10 +132,15 @@ func (c *Client) Subscribe(ctx context.Context, subscriptions []EventSubscriptio
 	if err != nil {
 		return nil, err
 	}
-	stop := context.AfterFunc(ctx, func() { closeConn(conn) })
+	// One owner closes the connection: a sync.Once shared by the context
+	// watcher, an abort, Close and the read pump's finish, so a Close racing
+	// the pump's own connection close cannot report an already-closed error.
+	var connOnce sync.Once
+	closeThisConn := func() { connOnce.Do(func() { closeConn(conn) }) }
+	stop := context.AfterFunc(ctx, closeThisConn)
 	abort := func() {
 		stop()
-		closeConn(conn)
+		closeThisConn()
 	}
 	id := fmt.Sprintf("hop-%d", c.nextID.Add(1))
 	params := struct {
@@ -155,11 +161,12 @@ func (c *Client) Subscribe(ctx context.Context, subscriptions []EventSubscriptio
 		return nil, err
 	}
 	stream := &EventStream{
-		conn:     conn,
-		stop:     stop,
-		events:   make(chan RawEvent, eventBufferSize),
-		done:     make(chan struct{}),
-		finished: make(chan struct{}),
+		conn:      conn,
+		stop:      stop,
+		closeConn: closeThisConn,
+		events:    make(chan RawEvent, eventBufferSize),
+		done:      make(chan struct{}),
+		finished:  make(chan struct{}),
 	}
 	go stream.read(ctx, reader)
 	return stream, nil
@@ -185,9 +192,11 @@ func (s *EventStream) Err() error {
 	return s.err
 }
 
-// Close ends the stream. The Events channel closes shortly after. Closing the
-// done channel releases a pump goroutine blocked on a full events channel so
-// it cannot leak.
+// Close ends the stream and returns after the read pump has exited. Closing
+// the done channel releases a pump blocked on a full events channel; the
+// connection is then closed through the shared sync.Once, so whether the pump
+// or Close closes it first, Close reports no error. Repeated and concurrent
+// Close calls are safe.
 func (s *EventStream) Close() error {
 	s.mu.Lock()
 	if !s.closed {
@@ -196,7 +205,9 @@ func (s *EventStream) Close() error {
 	}
 	s.mu.Unlock()
 	s.stop()
-	return s.conn.Close()
+	s.closeConn()
+	<-s.finished
+	return nil
 }
 
 // read delivers pushed events until the connection ends, then records the
@@ -251,7 +262,7 @@ func (s *EventStream) send(ctx context.Context, event RawEvent) bool {
 // finish records why the stream ended. Errors caused by a deliberate Close
 // or a canceled context are not failures.
 func (s *EventStream) finish(ctx context.Context, err error) {
-	closeConn(s.conn)
+	s.closeConn()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	switch {

@@ -83,6 +83,7 @@ type fakeStream struct {
 	closeOnce sync.Once
 	stop      chan struct{}
 	closed    bool
+	overflow  []app.StatusEvent // returned by DrainRemaining
 }
 
 func newFakeStream(events []app.StatusEvent) *fakeStream {
@@ -116,8 +117,9 @@ func newStagedStream(events []app.StatusEvent) *fakeStream {
 	return s
 }
 
-func (s *fakeStream) Events() <-chan app.StatusEvent { return s.events }
-func (s *fakeStream) Err() error                     { return s.err }
+func (s *fakeStream) Events() <-chan app.StatusEvent    { return s.events }
+func (s *fakeStream) DrainRemaining() []app.StatusEvent { return s.overflow }
+func (s *fakeStream) Err() error                        { return s.err }
 func (s *fakeStream) Close() error {
 	s.closed = true
 	if s.stop != nil {

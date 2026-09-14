@@ -16,7 +16,7 @@ wire the two sides together.
 | [doctor.go](doctor.go) | `Doctor`, `Report`, `Check`, `CheckStatus`, `requiredFeatures`, `supportedHarnesses` | Builds a report of checks: herdr binary, bundled API schema, per-feature method support, configured server socket, and the fixed harness set (Claude Code, Codex, opencode) |
 | [invocation.go](invocation.go) | `Invocation`, `InvocationFromEnviron`, `Trigger`, `Validate`, `Describe`, `ErrNotPluginInvocation` | Reads the `HERDR_*` plugin environment into a value, names the trigger, validates it and renders deterministic report lines |
 | [presentation.go](presentation.go) | `AgentPresentation`, `Presenter`, `AgentDisplay`, `PaneMetadata`, `ViewSelection`, `Role`, `SortDisplays`, token constants | Consumer-owned presentation port and its ordering: a display's manager-first `hop_order` key and padded token map, and the view selection HOP installs |
-| [observation.go](observation.go) | `Observer`, `StatusStream`, `PaneObservation`, `StatusEvent`, `Reconcile`, `ReconcileState`, `AgentStatus` | Consumer-owned observation port and the no-replay reconciliation: subscribe first, snapshot second, fold buffered events onto the snapshot |
+| [observation.go](observation.go) | `Observer`, `StatusStream`, `PaneObservation`, `StatusEvent`, `Reconcile`, `ReconcileState`, `AgentStatus` | Consumer-owned observation port and the no-replay reconciliation: subscribe first, snapshot second, fold buffered events plus `StatusStream.DrainRemaining()`'s accepted backlog onto the snapshot |
 
 ## Invariants
 
@@ -48,8 +48,15 @@ wire the two sides together.
 - Reconciliation assumes no event replay: a caller subscribes before it
   snapshots, and `ReconcileState` folds the buffered events onto the snapshot
   with the last writer winning per pane. `Reconcile` prefers a buffered event
-  over cancellation and drains the buffer before returning, so a transition
-  observed before the cutoff is never dropped.
+  over cancellation, drains `Events()` until it closes, and then appends
+  `StatusStream.DrainRemaining()` on both the cancellation and the normal
+  channel-close exit paths, so a transition observed before the cutoff is
+  never dropped — including one still held behind a full channel when the
+  consumer was descheduled.
+- `StatusStream.DrainRemaining` returns events a subscription accepted before
+  it ended but could not deliver through `Events`; it is meaningful only
+  after `Events` has closed, and implementations return nothing when every
+  accepted event was already delivered.
 
 ## Intentionally deferred
 
@@ -75,6 +82,12 @@ packages.
   handwritten `Probe` fake, invocation parsing/trigger/validation/output,
   the presentation token and manager-first ordering logic, and reconciliation
   against handwritten `AgentPresentation` and `Observer` fakes.
+  `TestReconcileDrainsBufferedEventsBeforeCancellation` proves `Reconcile`
+  drains `Events()` fully until it closes rather than stopping at the first
+  cancellation it observes, against a staged fake stream that only ever hands
+  over one event at a time. The `DrainRemaining` fold itself is proven
+  end-to-end against the real adapter; see
+  [internal/adapters/herdr/AGENTS.md](../adapters/herdr/AGENTS.md).
 - Test fixtures: none on disk; the fakes and environ slices live in the
   test files.
 

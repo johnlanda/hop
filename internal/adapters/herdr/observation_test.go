@@ -247,6 +247,96 @@ func TestReconcileFoldsRawBufferedEventsOnCancellation(t *testing.T) {
 	}
 }
 
+// saturatingObserver wraps a real Observer and returns a stream that pauses
+// the consumer until both the raw and the normalized buffers are full, then
+// cancels and waits for the pump to exit before letting the consumer resume.
+type saturatingObserver struct {
+	inner  *herdr.Observer
+	t      *testing.T
+	cancel context.CancelFunc
+}
+
+func (o saturatingObserver) Snapshot(ctx context.Context) ([]app.PaneObservation, error) {
+	return o.inner.Snapshot(ctx)
+}
+
+func (o saturatingObserver) Subscribe(ctx context.Context) (app.StatusStream, error) {
+	stream, err := o.inner.Subscribe(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &saturatingStream{StatusStream: stream, t: o.t, cancel: o.cancel}, nil
+}
+
+// saturatingStream models a consumer descheduled during an event burst: on the
+// first Events call it starts the real decode pump, waits until both pumps are
+// parked (both 256-slot buffers full, >=512 accepted), cancels, and waits for
+// the pump to exit — so by the time the consumer drains, the pump has already
+// stopped and the backlog can only survive through DrainRemaining.
+type saturatingStream struct {
+	app.StatusStream
+	t         *testing.T
+	cancel    context.CancelFunc
+	saturated bool
+}
+
+func (s *saturatingStream) Events() <-chan app.StatusEvent {
+	channel := s.StatusStream.Events()
+	if !s.saturated {
+		s.saturated = true
+		waitParkedInSelect(s.t, "(*statusStream).pump")
+		waitParkedInSelect(s.t, "(*EventStream).send")
+		s.cancel()
+		done, ok := s.StatusStream.(interface{ Done() <-chan struct{} })
+		if !ok {
+			s.t.Fatal("stream has no Done() signal")
+		}
+		select {
+		case <-done.Done():
+		case <-time.After(barrierTimeout):
+			s.t.Fatal("pump did not exit after cancellation")
+		}
+	}
+	return channel
+}
+
+// TestReconcileFoldsBothLayerBacklogsOnCancellation proves the two-layer
+// saturation cutoff: with the raw queue (256) AND the normalized channel (256)
+// both full before cancellation, and the consumer resuming only after the pump
+// has exited, Reconcile must still fold every accepted event (>=512). The raw
+// backlog survives the pump's exit through DrainRemaining rather than being
+// discarded when the stream closes.
+func TestReconcileFoldsBothLayerBacklogsOnCancellation(t *testing.T) {
+	endpoint := startFakeEndpoint(t, func(t *testing.T, conn net.Conn) {
+		reader := bufio.NewReader(conn)
+		for {
+			request := readRequestLoop(t, reader)
+			if request == nil {
+				return
+			}
+			id := requestID(t, request)
+			if request["method"] == "session.snapshot" {
+				writeLine(t, conn, fmt.Sprintf(`{"id":%q,"result":{"type":"session_snapshot","snapshot":{"panes":[]}}}`, id))
+				continue
+			}
+			writeLine(t, conn, fmt.Sprintf(`{"id":%q,"result":{"type":"subscription_started"}}`, id))
+			floodLines(conn, `{"event":"pane.agent_status_changed","data":{"pane_id":"w1:p1","workspace_id":"w1","agent_status":"done"}}`, 1000)
+			holdUntilPeerCloses(conn)
+		}
+	})
+	ctx, cancel := context.WithCancel(testContext(t))
+	defer cancel()
+	observer := saturatingObserver{inner: herdr.NewObserver(endpoint.socketPath, "w1:p1"), t: t, cancel: cancel}
+
+	result, err := app.Reconcile(ctx, observer)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(result.Events) < 512 {
+		t.Errorf("Reconcile folded %d events, want the >=512 accepted across both full buffers before cancellation", len(result.Events))
+	}
+}
+
 // TestObserverFeedsReconcileState proves the adapter's Subscribe and Snapshot
 // satisfy the reconciliation contract: subscribing first, then snapshotting,
 // then folding the buffered event onto the snapshot yields the transition

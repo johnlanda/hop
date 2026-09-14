@@ -11,11 +11,11 @@ harness executables) for the application's doctor use case.
 
 | File | Entities / functions | Responsibility |
 | --- | --- | --- |
-| [client.go](client.go) | `Client`, `NewClient`, `Call`, `Subscribe`, `EventStream`, `EventSubscription`, `RawEvent` | One connection per call and per subscription, mirroring the herdr CLI; correlates the response ID, decodes results into caller structs, and streams pushed events in arrival order after the subscribe acknowledgement |
+| [client.go](client.go) | `Client`, `NewClient`, `Call`, `Subscribe`, `EventStream`, `EventSubscription`, `RawEvent` | One connection per call and per subscription, mirroring the herdr CLI; correlates the response ID, decodes results into caller structs, streams pushed events in arrival order after the subscribe acknowledgement, and closes the subscription's connection exactly once through a shared `sync.Once` regardless of whether `Close`, context cancellation or the read pump's own exit triggers it first |
 | [errors.go](errors.go) | `APIError`, `ProtocolError` | Server error responses keep their code and message; protocol violations (ID mismatch, non-protocol frames, oversized lines) are distinct from transport errors |
 | [probe.go](probe.go) | `InstallationProbe`, `parseSchema` | Implements `app.Probe`: resolves executables, reads `--version` lines, extracts protocol and method constants from `herdr api schema --json`, pings the configured socket |
 | [presentation.go](presentation.go) | `Presentation`, `NewPresentation` | Implements `app.AgentPresentation`: `pane.report_metadata` token patches, `agent.view.set` with a manager-first token sort and `agent.view.clear` — all under HOP's fixed source so its view is owned and clearable |
-| [observation.go](observation.go) | `Observer`, `NewObserver` | Implements `app.Observer`: one `pane.agent_status_changed` subscription per watched pane, normalized into `app.StatusEvent`, and a `session.snapshot` reduced to `app.PaneObservation` |
+| [observation.go](observation.go) | `Observer`, `NewObserver`, `statusStream`, `DrainRemaining`, `flushBacklog` | Implements `app.Observer`: one `pane.agent_status_changed` subscription per watched pane, normalized into `app.StatusEvent`, and a `session.snapshot` reduced to `app.PaneObservation`; on stop-intake, the decode pump moves its pending event and the rest of the raw backlog into an overflow slice that `DrainRemaining` exposes |
 
 ## Invariants
 
@@ -31,6 +31,18 @@ harness executables) for the application's doctor use case.
   nil only for a deliberate `Close` or context cancellation.
 - A line is capped at 64 MiB; a longer one is a protocol violation rather
   than unbounded memory growth.
+- Stopping intake (`Close` or context cancellation) never discards what was
+  already accepted: `statusStream.pump` moves its pending event and the rest
+  of the raw subscription's buffered events into an overflow slice, and
+  `DrainRemaining` returns it. Every event accepted into the raw queue before
+  cancellation is folded, independently of when the consumer resumes
+  reading — this holds even with both the raw and normalized buffers full at
+  once.
+- `EventStream`'s connection is closed exactly once through a shared
+  `sync.Once` (`closeConn`), shared by `Close`, the context-cancellation
+  watcher and the read pump's own `finish`. `Close` waits for the read pump
+  to exit before returning, so it always reports nil for an intentional
+  shutdown rather than racing the pump for a `net.ErrClosed` result.
 - Probe subprocesses run with every `HERDR_*` variable scrubbed from the
   environment, so a session this process runs inside cannot be addressed by
   accident. A binary that exists but fails `--version` is reported found
@@ -62,7 +74,14 @@ harness executables) for the application's doctor use case.
   partial frames, disconnects, interleaved events, unknown fields,
   cancellation) and probe behavior against stub shell executables. These
   tests prove HOP behavior, not Herdr compatibility; that is
-  the real-process suite's job.
+  the real-process suite's job. `TestReconcileFoldsBothLayerBacklogsOnCancellation`
+  saturates the real raw and normalized buffers together, cancels once both
+  pumps are parked, and proves the accepted backlog is still folded through
+  `DrainRemaining`; `TestReconcileFoldsRawBufferedEventsOnCancellation` covers
+  the raw-only case. `TestObserverCloseReleasesBlockedPump` and
+  `TestObserverCancellationReleasesBlockedPump` prove a pump blocked on a full
+  channel is released, and that `Close`/cancellation report success rather
+  than racing the pump's own connection close.
 - Test fixtures: none on disk; stubs and wire lines are written by the tests.
 
 ## Related guides

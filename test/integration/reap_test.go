@@ -1,6 +1,7 @@
 package integration
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -47,6 +48,23 @@ func TestKillProcessGroupThenReapKillsDescendants(t *testing.T) {
 		t.Fatalf("start fixture leader: %v", err)
 	}
 	pgid := cmd.Process.Pid // Setpgid makes the leader its own group leader
+	// Guard against a Fatal below killProcessGroupThenReap's own cleanup: if
+	// this test exits before reaching that call, this reaps the fixture
+	// leader and its grandchild anyway. reaped is set once
+	// killProcessGroupThenReap has actually run, so the normal path does not
+	// signal the group twice.
+	var reaped bool
+	t.Cleanup(func() {
+		if reaped {
+			return
+		}
+		if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+			t.Logf("failure-path kill process group %d: %v", pgid, err)
+		}
+		if err := cmd.Wait(); err != nil {
+			t.Logf("failure-path reap fixture leader: %v", err)
+		}
+	})
 
 	var grandchild int
 	if !waitUntil(func() bool {
@@ -64,6 +82,7 @@ func TestKillProcessGroupThenReapKillsDescendants(t *testing.T) {
 	}
 
 	killProcessGroupThenReap(t, cmd, pgid, syscall.Getpgrp())
+	reaped = true
 
 	// The leader was reaped by the teardown; the grandchild, reparented after
 	// its SIGKILL, is reaped by init. Both are gone.
