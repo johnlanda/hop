@@ -1,6 +1,7 @@
 package app
 
 import (
+	"path/filepath"
 	"slices"
 	"strings"
 	"time"
@@ -101,14 +102,31 @@ const (
 	GroupInspectionFailed GroupRetirementOutcome = "inspection-failed"
 )
 
+// ArgvUnavailable is the sentinel GroupProcess.Argv carries, as its sole
+// element, for a group member whose argv could not be read (EPERM, or the
+// process exited between listing and read). internal/adapters/process
+// (task 4b) mirrors this exact literal; the classifier never treats such a
+// member as proof of mismatch, only as ambiguity.
+const ArgvUnavailable = "<argv unavailable>"
+
 // ClassifyGroupRetirement classifies a ProcessGroupInspector.GroupProcesses
 // listing against expectedArgv. listErr is the error GroupProcesses
 // returned, if any; a non-nil listErr always classifies as
 // GroupInspectionFailed regardless of processes. An empty, error-free
-// listing is GroupEmpty. A non-empty listing classifies as GroupMatched
-// when any member's argv exactly equals expectedArgv, GroupMismatched
-// otherwise. Group identity is always corroborated by argv, never by pid or
-// pgid alone: there is no process start time anywhere in the observable
+// listing is GroupEmpty. Every group the process adapter runs (including
+// every check) carries its own supervisory sleep anchor process
+// (argv `<sleep path> 100000`) that outlives a crashed controller and pins
+// the pgid until retirement; a listing whose only live members are that
+// anchor means the check itself has already exited, so it classifies as
+// GroupMatched too — the caller signals the anchor and treats the group as
+// already gone, rather than waiting out the anchor's own ~27.8-hour sleep.
+// Otherwise, a listing classifies as GroupMatched when any member's argv
+// exactly equals expectedArgv; GroupInspectionFailed when no member matches
+// but at least one member's argv could not be read (ArgvUnavailable is
+// ambiguous, never proof of mismatch, and is never signaled on); and
+// GroupMismatched only when every member's argv was read and none matches.
+// Group identity is always corroborated by argv, never by pid or pgid
+// alone: there is no process start time anywhere in the observable
 // surface, so a recycled pgid is never trusted on its own.
 func ClassifyGroupRetirement(processes []GroupProcess, listErr error, expectedArgv []string) GroupRetirementOutcome {
 	if listErr != nil {
@@ -117,10 +135,34 @@ func ClassifyGroupRetirement(processes []GroupProcess, listErr error, expectedAr
 	if len(processes) == 0 {
 		return GroupEmpty
 	}
+	unavailable := false
+	onlyAnchors := true
 	for _, p := range processes {
+		if len(p.Argv) == 1 && p.Argv[0] == ArgvUnavailable {
+			unavailable = true
+			onlyAnchors = false
+			continue
+		}
 		if slices.Equal(p.Argv, expectedArgv) {
 			return GroupMatched
 		}
+		if !isSleepAnchor(p.Argv) {
+			onlyAnchors = false
+		}
+	}
+	if onlyAnchors {
+		return GroupMatched
+	}
+	if unavailable {
+		return GroupInspectionFailed
 	}
 	return GroupMismatched
+}
+
+// isSleepAnchor reports whether argv is the process adapter's supervisory
+// sleep anchor: a two-element argv naming a "sleep" executable (by base
+// name, portable across the anchor's absolute path on different platforms)
+// with "100000" as its sole argument.
+func isSleepAnchor(argv []string) bool {
+	return len(argv) == 2 && argv[1] == "100000" && filepath.Base(argv[0]) == "sleep"
 }
