@@ -25,10 +25,17 @@ func forbiddenClaudeEnv() []string {
 	}
 }
 
-// requireClaude returns the installed claude binary or skips. Only S4 runs the
-// real harness, and only in print mode against a scratch profile.
+// requireClaude returns the installed claude binary or skips. S4 is the only
+// spike that runs a real harness, so it is opt-in: it runs only under
+// HOP_LIVE_HARNESS=1 (the same gate the Phase 2 live test uses) and never in
+// the normal suite, and it also skips when no claude binary is installed. Even
+// opted in it runs claude only in print mode against a credential-free scratch
+// profile, so it contacts no provider.
 func requireClaude(t *testing.T) string {
 	t.Helper()
+	if os.Getenv("HOP_LIVE_HARNESS") != "1" {
+		t.Skip("S4 skipped, not run: live-harness test; set HOP_LIVE_HARNESS=1 to opt in")
+	}
 	path, err := exec.LookPath("claude")
 	if err != nil {
 		t.Skipf("S4 skipped, not run: no claude binary on PATH (%v)", err)

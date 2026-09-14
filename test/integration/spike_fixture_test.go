@@ -283,6 +283,30 @@ func (s *testServer) waitForAgent(t *testing.T, paneID, agent string) spikeAgent
 	return last[paneID]
 }
 
+// waitForShellReady polls pane.process_info until the pane's own login shell
+// is the sole foreground process — its startup files have finished and no
+// child is running — which is the condition Herdr's agent.start requires to
+// treat the pane as an available shell (repos/herdr/src/platform/mod.rs:301
+// available_pane_shell_from_job). It fails on timeout with the last info.
+func (s *testServer) waitForShellReady(t *testing.T, paneID string) {
+	t.Helper()
+	var last spikeProcessInfo
+	ready := waitUntil(func() bool {
+		last = s.processInfo(t, paneID)
+		if last.ShellPID == 0 || last.ForegroundProcessGroup != last.ShellPID {
+			return false
+		}
+		if len(last.ForegroundProcesses) != 1 {
+			return false
+		}
+		return last.ForegroundProcesses[0].PID == last.ShellPID
+	})
+	if !ready {
+		t.Fatalf("pane %s shell never became the sole idle foreground process; last:\n%s",
+			paneID, renderProcessInfo(last))
+	}
+}
+
 // negativeObservationWindow is how long a not-detected assertion keeps
 // polling before concluding absence. Detection is a periodic poll inside
 // Herdr, so a short bounded window is required to observe a negative; this

@@ -76,7 +76,11 @@ func TestSpikeAgentStartArgvCapability(t *testing.T) {
 	// A recognized kind with args: the line typed into the pane shell is the
 	// fixed executable for the kind followed by the args. The stub `claude`
 	// on the fixture PATH answers it, proving argv[0] resolved as the
-	// harness name, not any caller-chosen program.
+	// harness name, not any caller-chosen program. agent.start requires the
+	// pane shell to be idle and the sole foreground process, so wait for that
+	// before issuing it (otherwise it races the login shell's startup and
+	// returns agent_pane_busy).
+	server.waitForShellReady(t, pane)
 	runID := newSpikeUUID(t)
 	err := server.client.Call(testContext(t), "agent.start", map[string]any{
 		"name": "spike-agent", "kind": "claude", "pane_id": pane,
