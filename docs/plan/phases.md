@@ -179,8 +179,8 @@ alternate-profile pointer's variables round-trip through the sanitizing
 launcher established in phases 1–2; omitting the pointer launches in the
 harness's own default profile with no further HOP involvement.
 
-Multi-account pools, round-robin selection, leases and cross-account resume
-remain a later, optional phase — see phase 8 below and
+Multi-account pools, round-robin selection, account-capacity leases and
+cross-account resume remain a later, optional phase — see phase 8 below and
 [RESEARCH.md](../../RESEARCH.md). Users who need multiple accounts today run
 separate harness profiles, or a tool such as CLIProxyAPI, outside HOP.
 

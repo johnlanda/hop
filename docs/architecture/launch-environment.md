@@ -32,7 +32,7 @@ launched process.
 | `tab.create` | Yes | Supported: the new tab's root pane shell sees the env. Verified. |
 | `pane.split` | Yes | Supported: the new pane's shell sees the env. Verified. |
 | `layout.apply` pane nodes | Yes (per pane node) | Supported by schema; a declarative tab can set per-pane env. Not exercised in the current suite. |
-| `worktree.create` | No | Unsupported at the request: it has no env field. Open a tab or pane **inside** the worktree with env, then `agent.start` there. |
+| `worktree.create` | No | Unsupported at the request: it has no env field. Open a tab or pane **inside** the worktree with env, then run `hop launch` there through the pane text transport (see [Current policy](#current-policy)). |
 | `agent.start` | No | Unsupported: it has no env field. The env must already be on the shell before the harness starts. |
 
 For a worker in a new worktree, the env-carrying part of the path is

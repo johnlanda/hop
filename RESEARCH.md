@@ -94,14 +94,18 @@ Keep policy in the target repository, for example:
   tasks/example.md            # optional reusable task briefs
 ```
 
-Put the optional alternate-profile pointer configuration in the plugin config
-directory; HOP stores no credentials or credential references itself — see
+Point the optional alternate-profile pointer at the repository's own
+`.herdr-orchestrator/config.toml` (a `[profile]` table naming the directory,
+resolved relative to the repository root); HOP stores no credentials or
+credential references itself — see
 [Account management](#account-management-delegated-to-harnesses-now-pools-later).
-Put SQLite state and artifacts under `HERDR_PLUGIN_STATE_DIR`, keyed by repository
-identity and run UUID. Snapshot the effective policy, role instructions, workflow,
-brief and resolved profile source (default, or the configured pointer) at run
-creation. A policy change must not silently alter a running workflow. Continue
-honoring the repository's existing AGENTS.md.
+Put SQLite state and artifacts under the canonical state-directory resolver
+(`${XDG_STATE_HOME:-$HOME/.local/state}/hop`, with `HOP_STATE_DIR` as the only
+override — not `HERDR_PLUGIN_STATE_DIR`), keyed by repository identity and run
+UUID. Snapshot the effective policy, role instructions, workflow, brief and
+resolved profile source (default, or the configured pointer) at run creation.
+A policy change must not silently alter a running workflow. Continue honoring
+the repository's existing AGENTS.md.
 
 The brief describes this run's objective, constraints and acceptance criteria.
 Mutable state records task graph, assignments, attempts, messages, decisions and
@@ -112,7 +116,7 @@ results. Neither should be appended indefinitely to standing instructions.
 | Plugin responsibility | Existing Herdr primitive | New plugin work |
 | --- | --- | --- |
 | Entry points | Manifest actions, keybindings, terminal panes | Start/status/resume/stop/review commands and board |
-| Worker launch | `worktree create`, `workspace create`, `pane split`, `agent start` | Role assignment, launch config and concurrency control |
+| Worker launch | `worktree create`, `workspace create`, `pane split`, `agent start` (a general Herdr capability; HOP launches the sanitized worker through the pane text transport instead) | Role assignment, launch config and concurrency control |
 | Agent interaction | `agent prompt`, `agent read`, `agent wait` | Durable inbox, serialized delivery and explicit task result protocol |
 | Observation | `events.subscribe`, snapshots | Reconciliation, recovery and normalized workflow events |
 | Lifecycle callbacks | Manifest `[[events]]` | Short handlers where useful; do not duplicate event-stream processing |

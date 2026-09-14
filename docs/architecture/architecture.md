@@ -118,7 +118,7 @@ such as `internal/domain` or `internal/adapters`; those directories have index g
 | `AgentPresentation` | Herdr | Publish display metadata and select/clear native Agent views without changing domain state |
 | `HarnessProfiles` (Phase 5) | Claude/Codex/opencode adapters | Report the harness's own verified login status; passthrough only — no login, no credential storage. Not involved in Phase 2's profile-env resolution, which is plain application configuration |
 | `ConfigurationSource` | Config adapter | Decode and validate policy/role/playbook input into application values |
-| `CommandRunner` | Process adapter | Execute argv with explicit cwd/env, cancellation and structured result; also wraps (`Exec`) the sanitized worker-launch exec |
+| `CommandRunner` | Process adapter | Execute argv with explicit cwd/env, cancellation and structured result |
 | `Clock`, `IDGenerator` | System adapter | Explicit time and identity generation |
 
 Application service methods are the driving API: examples include `StartRun`,
