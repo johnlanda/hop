@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -47,6 +48,38 @@ func startFakeRuntimeError(t *testing.T, code, message string) *herdr.Runtime {
 	return herdr.NewRuntime(endpoint.socketPath)
 }
 
+// assertRequestParams asserts a fake endpoint's decoded request has the
+// given method and params structurally equal to wantParamsJSON: the exact
+// set of keys (no extras, none missing), equal values and JSON types at
+// every level, and array elements in the given order. Both sides are
+// compared as decoded JSON (map[string]any / []any / scalars), so object
+// key order — which carries no meaning in JSON — is not asserted, while a
+// renamed, dropped, added or reordered array field fails.
+func assertRequestParams(t *testing.T, request map[string]any, method, wantParamsJSON string) {
+	t.Helper()
+	if request["method"] != method {
+		t.Fatalf("method = %v, want %s", request["method"], method)
+	}
+	var want any
+	if err := json.Unmarshal([]byte(wantParamsJSON), &want); err != nil {
+		t.Fatalf("invalid expected params fixture: %v", err)
+	}
+	got := request["params"]
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("%s params =\n%s\nwant\n%s", method, prettyJSON(t, got), prettyJSON(t, want))
+	}
+}
+
+// prettyJSON renders a decoded JSON value for a readable test failure.
+func prettyJSON(t *testing.T, v any) string {
+	t.Helper()
+	out, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal for diff: %v", err)
+	}
+	return string(out)
+}
+
 func TestRuntimeCreateWorktree(t *testing.T) {
 	runtime, got := startFakeRuntime(t, `{"type":"worktree_created",`+
 		`"workspace":{"workspace_id":"w9"},"tab":{"tab_id":"t1"},"root_pane":{"pane_id":"w9:p1"},`+
@@ -63,16 +96,21 @@ func TestRuntimeCreateWorktree(t *testing.T) {
 		t.Errorf("info = %+v, want workspace w9, path /work/tree, branch feature-x", info)
 	}
 
-	request := <-got
-	if request["method"] != "worktree.create" {
-		t.Fatalf("method = %v, want worktree.create", request["method"])
+	assertRequestParams(t, <-got, "worktree.create", `{"cwd":"/repo/root","branch":"feature-x","base":"HEAD"}`)
+}
+
+func TestRuntimeCreateWorktreeBranchOmittedIsEmpty(t *testing.T) {
+	// branch is schema-optional (a detached checkout has none); its
+	// absence must decode to an empty string, not a decode error.
+	runtime, _ := startFakeRuntime(t, `{"type":"worktree_created","workspace":{"workspace_id":"w9"},`+
+		`"worktree":{"path":"/work/tree"}}`)
+
+	info, err := runtime.CreateWorktree(testContext(t), app.WorktreeRequest{RepositoryRoot: "/repo", Branch: "b", BaseRef: "HEAD"})
+	if err != nil {
+		t.Fatalf("CreateWorktree: %v", err)
 	}
-	params := paramsOf(t, request)
-	if params["cwd"] != "/repo/root" || params["branch"] != "feature-x" || params["base"] != "HEAD" {
-		t.Errorf("params = %v, want cwd/branch/base from the request", params)
-	}
-	if len(params) != 3 {
-		t.Errorf("params = %v, want exactly cwd, branch and base — worktree.create carries no env", params)
+	if info.Branch != "" {
+		t.Errorf("branch = %q, want empty when the response omits it", info.Branch)
 	}
 }
 
@@ -84,6 +122,37 @@ func TestRuntimeCreateWorktreeMapsAPIError(t *testing.T) {
 	var apiErr *herdr.APIError
 	if !errors.As(err, &apiErr) || apiErr.Code != "not_git_worktree" {
 		t.Fatalf("CreateWorktree error = %v, want an APIError not_git_worktree", err)
+	}
+}
+
+func TestRuntimeCreateWorktreeMapsPartialResponse(t *testing.T) {
+	cases := []struct {
+		name   string
+		result string
+	}{
+		{"wrong result type", `{"type":"something_else","workspace":{"workspace_id":"w9"},"worktree":{"path":"/x"}}`},
+		{"missing workspace_id", `{"type":"worktree_created","workspace":{},"worktree":{"path":"/x"}}`},
+		{"empty workspace_id", `{"type":"worktree_created","workspace":{"workspace_id":""},"worktree":{"path":"/x"}}`},
+		{"missing path", `{"type":"worktree_created","workspace":{"workspace_id":"w9"},"worktree":{}}`},
+		{"empty path", `{"type":"worktree_created","workspace":{"workspace_id":"w9"},"worktree":{"path":""}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runtime, _ := startFakeRuntime(t, tc.result)
+
+			info, err := runtime.CreateWorktree(testContext(t), app.WorktreeRequest{RepositoryRoot: "/repo", Branch: "b", BaseRef: "HEAD"})
+
+			if err == nil {
+				t.Fatalf("CreateWorktree with a %s response did not error; info = %+v", tc.name, info)
+			}
+			var protocolErr *herdr.ProtocolError
+			if !errors.As(err, &protocolErr) {
+				t.Fatalf("CreateWorktree error = %v, want a ProtocolError", err)
+			}
+			if info != (app.WorktreeInfo{}) {
+				t.Errorf("info = %+v, want the zero value on error", info)
+			}
+		})
 	}
 }
 
@@ -106,46 +175,26 @@ func TestRuntimeOpenWorkerPane(t *testing.T) {
 		t.Errorf("handle = %+v, want workspace w1, tab t2, pane w1:p9", handle)
 	}
 
-	request := <-got
-	if request["method"] != "layout.apply" {
-		t.Fatalf("method = %v, want layout.apply", request["method"])
+	assertRequestParams(t, <-got, "layout.apply", `{"workspace_id":"w1","focus":false,`+
+		`"root":{"type":"pane","label":"launch-op-1","cwd":"/work/tree",`+
+		`"command":["/abs/hop","launch","--run","r1"],"env":{"HOP_RUN_ID":"r1"}}}`)
+}
+
+func TestRuntimeOpenWorkerPaneOmitsEmptyOptionalFields(t *testing.T) {
+	runtime, got := startFakeRuntime(t, `{"type":"layout_apply","layout":{"workspace_id":"w1","tab_id":"t2",`+
+		`"root":{"type":"pane","pane_id":"w1:p9"}}}`)
+
+	_, err := runtime.OpenWorkerPane(testContext(t), app.WorkerPaneRequest{
+		WorkspaceID: "w1",
+		Command:     []string{"/bin/x"},
+	})
+	if err != nil {
+		t.Fatalf("OpenWorkerPane: %v", err)
 	}
-	rawParams, marshalErr := json.Marshal(request["params"])
-	if marshalErr != nil {
-		t.Fatal(marshalErr)
-	}
-	var params struct {
-		WorkspaceID string `json:"workspace_id"`
-		Focus       bool   `json:"focus"`
-		Root        struct {
-			Type    string            `json:"type"`
-			Label   string            `json:"label"`
-			Cwd     string            `json:"cwd"`
-			Command []string          `json:"command"`
-			Env     map[string]string `json:"env"`
-		} `json:"root"`
-	}
-	if err := json.Unmarshal(rawParams, &params); err != nil {
-		t.Fatal(err)
-	}
-	if params.WorkspaceID != "w1" {
-		t.Errorf("workspace_id = %q, want w1", params.WorkspaceID)
-	}
-	if params.Focus {
-		t.Error("focus = true, want false so opening a worker pane never steals focus")
-	}
-	if _, hasTabID := paramsOf(t, request)["tab_id"]; hasTabID {
-		t.Error("layout.apply must never carry tab_id: naming one replaces that tab instead of adding one")
-	}
-	if params.Root.Type != "pane" || params.Root.Label != "launch-op-1" || params.Root.Cwd != "/work/tree" {
-		t.Errorf("root = %+v, want type pane, label launch-op-1, cwd /work/tree", params.Root)
-	}
-	if got := strings.Join(params.Root.Command, " "); got != "/abs/hop launch --run r1" {
-		t.Errorf("command = %q, want the exact launch argv", got)
-	}
-	if params.Root.Env["HOP_RUN_ID"] != "r1" {
-		t.Errorf("env = %v, want HOP_RUN_ID r1", params.Root.Env)
-	}
+
+	// No label, cwd or env were supplied: omitempty must drop them from the
+	// wire request rather than sending empty strings/objects.
+	assertRequestParams(t, <-got, "layout.apply", `{"workspace_id":"w1","focus":false,"root":{"type":"pane","command":["/bin/x"]}}`)
 }
 
 func TestRuntimeOpenWorkerPaneRequiresWorkspaceID(t *testing.T) {
@@ -168,6 +217,36 @@ func TestRuntimeOpenWorkerPaneRequiresWorkspaceID(t *testing.T) {
 	}
 }
 
+func TestRuntimeOpenWorkerPaneMapsPartialResponse(t *testing.T) {
+	cases := []struct {
+		name   string
+		result string
+	}{
+		{"wrong result type", `{"type":"something_else","layout":{"workspace_id":"w1","tab_id":"t2","root":{"pane_id":"p9"}}}`},
+		{"missing workspace_id", `{"type":"layout_apply","layout":{"tab_id":"t2","root":{"pane_id":"p9"}}}`},
+		{"missing tab_id", `{"type":"layout_apply","layout":{"workspace_id":"w1","root":{"pane_id":"p9"}}}`},
+		{"missing root pane_id", `{"type":"layout_apply","layout":{"workspace_id":"w1","tab_id":"t2","root":{}}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runtime, _ := startFakeRuntime(t, tc.result)
+
+			handle, err := runtime.OpenWorkerPane(testContext(t), app.WorkerPaneRequest{WorkspaceID: "w1", Command: []string{"/bin/x"}})
+
+			if err == nil {
+				t.Fatalf("OpenWorkerPane with a %s response did not error; handle = %+v", tc.name, handle)
+			}
+			var protocolErr *herdr.ProtocolError
+			if !errors.As(err, &protocolErr) {
+				t.Fatalf("OpenWorkerPane error = %v, want a ProtocolError", err)
+			}
+			if handle != (app.PaneHandle{}) {
+				t.Errorf("handle = %+v, want the zero value on error", handle)
+			}
+		})
+	}
+}
+
 func TestRuntimeFindPaneByLabel(t *testing.T) {
 	t.Run("unique label found", func(t *testing.T) {
 		runtime, got := startFakeRuntime(t, `{"type":"session_snapshot","snapshot":{"panes":[`+
@@ -186,13 +265,7 @@ func TestRuntimeFindPaneByLabel(t *testing.T) {
 			t.Errorf("ref = %+v, want %+v", ref, want)
 		}
 
-		request := <-got
-		if request["method"] != "session.snapshot" {
-			t.Errorf("method = %v, want session.snapshot", request["method"])
-		}
-		if params := paramsOf(t, request); len(params) != 0 {
-			t.Errorf("params = %v, want no params for session.snapshot", params)
-		}
+		assertRequestParams(t, <-got, "session.snapshot", `{}`)
 	})
 
 	t.Run("no match", func(t *testing.T) {
@@ -208,6 +281,18 @@ func TestRuntimeFindPaneByLabel(t *testing.T) {
 		}
 		if ref != (app.PaneRef{}) {
 			t.Errorf("ref = %+v, want the zero value when not found", ref)
+		}
+	})
+
+	t.Run("no panes at all is a legitimate not-found", func(t *testing.T) {
+		runtime, _ := startFakeRuntime(t, `{"type":"session_snapshot","snapshot":{}}`)
+
+		_, found, err := runtime.FindPaneByLabel(testContext(t), "missing")
+		if err != nil {
+			t.Fatalf("FindPaneByLabel: %v", err)
+		}
+		if found {
+			t.Error("found = true, want false when the snapshot has no panes")
 		}
 	})
 
@@ -238,6 +323,48 @@ func TestRuntimeFindPaneByLabel(t *testing.T) {
 			t.Error("found = true against a dead socket")
 		}
 	})
+
+	t.Run("wrong result type", func(t *testing.T) {
+		runtime, _ := startFakeRuntime(t, `{"type":"something_else","snapshot":{"panes":[]}}`)
+
+		_, found, err := runtime.FindPaneByLabel(testContext(t), "any")
+
+		var protocolErr *herdr.ProtocolError
+		if !errors.As(err, &protocolErr) {
+			t.Fatalf("FindPaneByLabel error = %v, want a ProtocolError", err)
+		}
+		if found {
+			t.Error("found = true on a result-type mismatch")
+		}
+	})
+
+	t.Run("missing snapshot wrapper", func(t *testing.T) {
+		runtime, _ := startFakeRuntime(t, `{"type":"session_snapshot"}`)
+
+		_, found, err := runtime.FindPaneByLabel(testContext(t), "any")
+
+		var protocolErr *herdr.ProtocolError
+		if !errors.As(err, &protocolErr) {
+			t.Fatalf("FindPaneByLabel error = %v, want a ProtocolError for a missing snapshot wrapper", err)
+		}
+		if found {
+			t.Error("found = true although the snapshot wrapper is missing")
+		}
+	})
+
+	t.Run("matched pane missing required ids", func(t *testing.T) {
+		runtime, _ := startFakeRuntime(t, `{"type":"session_snapshot","snapshot":{"panes":[{"label":"launch-op-1"}]}}`)
+
+		ref, found, err := runtime.FindPaneByLabel(testContext(t), "launch-op-1")
+
+		var protocolErr *herdr.ProtocolError
+		if !errors.As(err, &protocolErr) {
+			t.Fatalf("FindPaneByLabel error = %v, want a ProtocolError for a matched pane missing its ids", err)
+		}
+		if found || ref != (app.PaneRef{}) {
+			t.Errorf("found = %v, ref = %+v, want the zero value and false alongside the error", found, ref)
+		}
+	})
 }
 
 func TestRuntimeSendText(t *testing.T) {
@@ -249,13 +376,13 @@ func TestRuntimeSendText(t *testing.T) {
 	}
 
 	request := <-got
-	if request["method"] != "pane.send_text" {
-		t.Fatalf("method = %v, want pane.send_text", request["method"])
-	}
-	params := paramsOf(t, request)
-	if params["pane_id"] != "w1:p1" || params["text"] != text {
-		t.Errorf("params = %v, want the exact pane id and text", params)
-	}
+	assertRequestParams(t, request, "pane.send_text", func() string {
+		raw, err := json.Marshal(map[string]string{"pane_id": "w1:p1", "text": text})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(raw)
+	}())
 }
 
 func TestRuntimeSendTextMapsPaneNotFound(t *testing.T) {
@@ -280,23 +407,21 @@ func TestRuntimeReadPane(t *testing.T) {
 		t.Errorf("text = %q, want the exact scrollback text", text)
 	}
 
-	params := paramsOf(t, <-got)
-	if params["pane_id"] != "w1:p1" || params["source"] != "recent" || params["lines"] != float64(50) {
-		t.Errorf("params = %v, want pane_id w1:p1, source recent, lines 50", params)
-	}
+	assertRequestParams(t, <-got, "pane.read", `{"pane_id":"w1:p1","source":"recent","lines":50}`)
 }
 
 func TestRuntimeReadPaneOmitsLinesWhenNotPositive(t *testing.T) {
 	runtime, got := startFakeRuntime(t, `{"type":"pane_read","read":{"text":""}}`)
 
-	if _, err := runtime.ReadPane(testContext(t), "w1:p1", 0); err != nil {
+	text, err := runtime.ReadPane(testContext(t), "w1:p1", 0)
+	if err != nil {
 		t.Fatalf("ReadPane: %v", err)
 	}
-
-	params := paramsOf(t, <-got)
-	if _, present := params["lines"]; present {
-		t.Errorf("params = %v, want lines omitted for a non-positive line count", params)
+	if text != "" {
+		t.Errorf("text = %q, want the legitimate empty scrollback text", text)
 	}
+
+	assertRequestParams(t, <-got, "pane.read", `{"pane_id":"w1:p1","source":"recent"}`)
 }
 
 func TestRuntimeReadPaneMapsPaneNotFound(t *testing.T) {
@@ -306,6 +431,35 @@ func TestRuntimeReadPaneMapsPaneNotFound(t *testing.T) {
 
 	if !errors.Is(err, herdr.ErrPaneNotFound) {
 		t.Fatalf("ReadPane error = %v, want ErrPaneNotFound", err)
+	}
+}
+
+func TestRuntimeReadPaneMapsPartialResponse(t *testing.T) {
+	cases := []struct {
+		name   string
+		result string
+	}{
+		{"wrong result type", `{"type":"something_else","read":{"text":"x"}}`},
+		{"missing read wrapper", `{"type":"pane_read"}`},
+		{"missing text", `{"type":"pane_read","read":{}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runtime, _ := startFakeRuntime(t, tc.result)
+
+			text, err := runtime.ReadPane(testContext(t), "w1:p1", 10)
+
+			if err == nil {
+				t.Fatalf("ReadPane with a %s response did not error; text = %q", tc.name, text)
+			}
+			var protocolErr *herdr.ProtocolError
+			if !errors.As(err, &protocolErr) {
+				t.Fatalf("ReadPane error = %v, want a ProtocolError", err)
+			}
+			if text != "" {
+				t.Errorf("text = %q, want empty on error", text)
+			}
+		})
 	}
 }
 
@@ -333,13 +487,7 @@ func TestRuntimeInspectPane(t *testing.T) {
 		t.Errorf("argv = %q, want the full argv vector", fg.Argv)
 	}
 
-	request := <-got
-	if request["method"] != "pane.process_info" {
-		t.Fatalf("method = %v, want pane.process_info", request["method"])
-	}
-	if params := paramsOf(t, request); params["pane_id"] != "w1:p1" {
-		t.Errorf("params = %v, want pane_id w1:p1", params)
-	}
+	assertRequestParams(t, <-got, "pane.process_info", `{"pane_id":"w1:p1"}`)
 }
 
 func TestRuntimeInspectPaneEmptyForeground(t *testing.T) {
@@ -352,6 +500,22 @@ func TestRuntimeInspectPaneEmptyForeground(t *testing.T) {
 	}
 	if len(process.Foreground) != 0 {
 		t.Errorf("foreground = %+v, want empty: no foreground process observed", process.Foreground)
+	}
+}
+
+func TestRuntimeInspectPaneOmittedForegroundProcesses(t *testing.T) {
+	// Herdr's own schema omits foreground_processes entirely when empty
+	// (skip_serializing_if = "Vec::is_empty"); this must behave identically
+	// to an explicit empty array, not be treated as a missing field.
+	runtime, _ := startFakeRuntime(t, `{"type":"pane_process_info","process_info":{"pane_id":"w1:p1",`+
+		`"shell_pid":100,"foreground_process_group_id":100}}`)
+
+	process, err := runtime.InspectPane(testContext(t), "w1:p1")
+	if err != nil {
+		t.Fatalf("InspectPane: %v", err)
+	}
+	if len(process.Foreground) != 0 {
+		t.Errorf("foreground = %+v, want empty when the field is omitted", process.Foreground)
 	}
 }
 
@@ -381,6 +545,57 @@ func TestRuntimeInspectPaneUnknownAPIErrorIsNotPaneNotFound(t *testing.T) {
 	}
 }
 
+func TestRuntimeInspectPaneMapsPartialResponse(t *testing.T) {
+	cases := []struct {
+		name   string
+		result string
+	}{
+		{"wrong result type", `{"type":"something_else","process_info":{}}`},
+		{"missing process_info wrapper", `{"type":"pane_process_info"}`},
+		{
+			"foreground process missing pid",
+			`{"type":"pane_process_info","process_info":{"foreground_processes":[{"name":"claude"}]}}`,
+		},
+		{
+			"foreground process missing name",
+			`{"type":"pane_process_info","process_info":{"foreground_processes":[{"pid":150}]}}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runtime, _ := startFakeRuntime(t, tc.result)
+
+			process, err := runtime.InspectPane(testContext(t), "w1:p1")
+
+			if err == nil {
+				t.Fatalf("InspectPane with a %s response did not error; process = %+v", tc.name, process)
+			}
+			var protocolErr *herdr.ProtocolError
+			if !errors.As(err, &protocolErr) {
+				t.Fatalf("InspectPane error = %v, want a ProtocolError", err)
+			}
+			if process.ShellPID != 0 || process.ForegroundGroupID != 0 || len(process.Foreground) != 0 {
+				t.Errorf("process = %+v, want the zero value on error", process)
+			}
+		})
+	}
+}
+
+func TestRuntimeInspectPaneRejectsWrongTypedArgv(t *testing.T) {
+	// argv as a string instead of an array is a JSON type mismatch that
+	// the standard decoder itself rejects, before any adapter-level field
+	// validation runs.
+	runtime, _ := startFakeRuntime(t, `{"type":"pane_process_info","process_info":{`+
+		`"foreground_processes":[{"pid":150,"name":"claude","argv":"not-an-array"}]}}`)
+
+	_, err := runtime.InspectPane(testContext(t), "w1:p1")
+
+	var protocolErr *herdr.ProtocolError
+	if !errors.As(err, &protocolErr) {
+		t.Fatalf("InspectPane error = %v, want a ProtocolError for a wrong-typed argv", err)
+	}
+}
+
 func TestRuntimeClosePane(t *testing.T) {
 	runtime, got := startFakeRuntime(t, `{"type":"ok"}`)
 
@@ -388,14 +603,7 @@ func TestRuntimeClosePane(t *testing.T) {
 		t.Fatalf("ClosePane: %v", err)
 	}
 
-	request := <-got
-	if request["method"] != "pane.close" {
-		t.Fatalf("method = %v, want pane.close", request["method"])
-	}
-	params := paramsOf(t, request)
-	if len(params) != 1 || params["pane_id"] != "w1:p1" {
-		t.Errorf("params = %v, want exactly pane_id w1:p1", params)
-	}
+	assertRequestParams(t, <-got, "pane.close", `{"pane_id":"w1:p1"}`)
 }
 
 func TestRuntimeClosePaneMapsPaneNotFound(t *testing.T) {
@@ -427,6 +635,27 @@ func TestRuntimeMapsMalformedResponse(t *testing.T) {
 	var protocolErr *herdr.ProtocolError
 	if !errors.As(err, &protocolErr) {
 		t.Fatalf("CreateWorktree error = %v, want a ProtocolError for a resultless response", err)
+	}
+}
+
+// TestRuntimeMapsResponseEnvelopeIDTypeMismatch proves a response whose id
+// is the wrong JSON type (a number instead of a string) surfaces as the
+// Client's own ProtocolError from decoding the envelope itself, before any
+// adapter-level result decoding runs.
+func TestRuntimeMapsResponseEnvelopeIDTypeMismatch(t *testing.T) {
+	endpoint := startFakeEndpoint(t, func(t *testing.T, conn net.Conn) {
+		if request := readRequestLine(t, bufio.NewReader(conn)); request == nil {
+			return
+		}
+		writeLine(t, conn, `{"id":12345,"result":{"type":"worktree_created"}}`)
+	})
+	runtime := herdr.NewRuntime(endpoint.socketPath)
+
+	_, err := runtime.CreateWorktree(testContext(t), app.WorktreeRequest{RepositoryRoot: "/repo", Branch: "b", BaseRef: "HEAD"})
+
+	var protocolErr *herdr.ProtocolError
+	if !errors.As(err, &protocolErr) {
+		t.Fatalf("CreateWorktree error = %v, want a ProtocolError for a non-string response id", err)
 	}
 }
 

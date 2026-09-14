@@ -92,6 +92,22 @@ worker-launch use case.
   occupant-conditioned or compare-and-swap close upstream (S2), so the close
   rule (re-inspect and match occupant evidence immediately before closing)
   is enforced by application code around this method, never inside it.
+- Every result-bearing `Runtime` method validates its response before
+  returning: the result's `type` discriminator must match the expected one
+  (`worktree_created`, `layout_apply`, `session_snapshot`, `pane_read`,
+  `pane_process_info`), and every field the port actually consumes — an id,
+  a path, a required process field — must be present, using a nil pointer
+  in the wire struct to detect an absent key distinctly from one present
+  with Go's zero value. A mismatch or an absent required field is a
+  `ProtocolError` naming it; a zero-value id, path or pane handle never
+  escapes the adapter as a false success. A JSON field the wire struct does
+  not declare — a schema-optional field this port does not consume, or a
+  field a newer server added — is tolerated and ignored, matching the
+  unknown-fields invariant above; only fields the port actually reads are
+  validated. A field the schema itself marks optional (worktree branch, a
+  pane's label, shell pid, foreground process group id, argv0/argv/cmdline/
+  cwd) keeps Go's zero value when absent — that is its correct, intentional
+  representation, not a decode error.
 
 ## Dependencies and ports
 
@@ -117,12 +133,22 @@ worker-launch use case.
   channel is released, and that `Close`/cancellation report success rather
   than racing the pump's own connection close.
 - `TestRuntime*` in [runtime_test.go](runtime_test.go) cover every `Runtime`
-  method against a fake NDJSON endpoint: byte-exact request shapes,
-  response decoding, `ErrPaneNotFound`/`ErrWorkspaceIDRequired` mapping, an
-  unrelated API error code passing through unwrapped, a malformed response
-  surfacing as the `Client`'s own `ProtocolError`, context cancellation
-  across every method, and `FindPaneByLabel`'s not-found/ambiguous/transport-
-  error cases.
+  method against a fake NDJSON endpoint. Request shapes are asserted by
+  `assertRequestParams`: full structural equality against a literal JSON
+  fixture — the exact key set (no extras, none missing), equal values and
+  JSON types at every level, and array elements in the given order, so a
+  renamed, dropped, added or reordered-in-a-meaningful-way field fails;
+  object key order carries no JSON meaning and is not asserted. Response
+  coverage includes nominal decoding, a schema-optional field's correct
+  absence-as-zero-value, `*MapsPartialResponse` tables per result-bearing
+  method (wrong `type` discriminator, a missing required wrapper or leaf,
+  an ambiguous match), `ErrPaneNotFound`/`ErrWorkspaceIDRequired` mapping,
+  an unrelated API error code passing through unwrapped, a malformed
+  response and a non-string response id surfacing as the `Client`'s own
+  `ProtocolError`, a wrong-typed field (`argv` as a string) rejected by the
+  standard decoder itself before any adapter validation runs, context
+  cancellation across every method, and `FindPaneByLabel`'s
+  not-found/ambiguous/transport-error cases.
 - Test fixtures: none on disk; stubs and wire lines are written by the tests.
 
 ## Related guides
