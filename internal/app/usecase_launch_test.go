@@ -3,6 +3,7 @@ package app_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/johnlanda/hop/internal/app"
 	"github.com/johnlanda/hop/internal/domain/identity"
@@ -224,4 +225,50 @@ func TestCorroborateLaunch(t *testing.T) {
 			t.Fatalf("Session.State = %s after corroboration, want %s (early-accepted session activated)", got, run.SessionActive)
 		}
 	})
+}
+
+// TestLaunchClaimDeadline proves the section 6 mechanical launch bound: no
+// claim within LaunchClaimDeadline of the journaled launch moves the
+// operation to reconciling with a pane snapshot as evidence, and the pane
+// is never re-created or re-sent.
+func TestLaunchClaimDeadline(t *testing.T) {
+	tc := newTestController(defaultPolicy())
+	handle, detail := startedRun(t, tc)
+	tc.Runtime.PaneContents[detail.Binding.PaneID] = "shell prompt with no launcher output"
+
+	// Within the deadline the claim is simply pending.
+	progress, err := tc.Controller.CorroborateLaunch(context.Background(), handle)
+	if err != nil || progress != app.LaunchPending {
+		t.Fatalf("CorroborateLaunch() = %s, err %v; want pending within the deadline", progress, err)
+	}
+
+	// The controller keeps heartbeating on the design's 10s interval while
+	// it waits, so the lease stays live as the deadline passes.
+	for elapsed := time.Duration(0); elapsed < 3*time.Minute; elapsed += 10 * time.Second {
+		tc.Clock.Advance(10 * time.Second)
+		if hbErr := tc.Controller.Heartbeat(context.Background(), handle); hbErr != nil {
+			t.Fatalf("Heartbeat() error = %v", hbErr)
+		}
+	}
+
+	progress, err = tc.Controller.CorroborateLaunch(context.Background(), handle)
+	if err != nil {
+		t.Fatalf("CorroborateLaunch() error = %v", err)
+	}
+	if progress != app.LaunchOverdue {
+		t.Fatalf("progress = %s, want %s past the deadline", progress, app.LaunchOverdue)
+	}
+	var op app.Operation
+	for id := range tc.Store.Operations {
+		if tc.Store.Operations[id].Kind == app.OpPaneOpen {
+			op = tc.Store.Operations[id]
+		}
+	}
+	if op.State != app.OperationReconciling {
+		t.Fatalf("pane.open operation state = %s, want reconciling with the pane snapshot as evidence", op.State)
+	}
+	evidence, isMap := op.ActEvidence.(map[string]any)
+	if !isMap || evidence["pane_snapshot"] != "shell prompt with no launcher output" {
+		t.Fatalf("operation evidence = %+v, want the captured pane snapshot", op.ActEvidence)
+	}
 }

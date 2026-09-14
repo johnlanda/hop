@@ -31,6 +31,11 @@ const (
 	// still-launching session is activated — and is otherwise a no-op
 	// (docs/plan/phase-2-design.md section 7).
 	LaunchAlreadySettled LaunchProgress = "already-settled"
+	// LaunchOverdue means no claim row appeared within LaunchClaimDeadline
+	// of pane creation: the launch operation went reconciling with a pane
+	// snapshot as evidence, and is never re-created or re-sent
+	// (docs/plan/phase-2-design.md section 6).
+	LaunchOverdue LaunchProgress = "overdue"
 )
 
 // CorroborateLaunch performs one inspection round toward settling a launch
@@ -51,6 +56,13 @@ func (c *Controller) CorroborateLaunch(ctx context.Context, handle RunHandle) (L
 	if detail.Claim == nil {
 		if recoverErr := c.recoverBindingByLabel(ctx, handle, detail); recoverErr != nil {
 			return "", recoverErr
+		}
+		overdue, deadlineErr := c.driveLaunchDeadline(ctx, handle, detail)
+		if deadlineErr != nil {
+			return "", deadlineErr
+		}
+		if overdue {
+			return LaunchOverdue, nil
 		}
 		return LaunchPending, nil
 	}
@@ -95,6 +107,67 @@ func (c *Controller) CorroborateLaunch(ctx context.Context, handle RunHandle) (L
 		return LaunchPending, nil
 	}
 	return LaunchPending, nil
+}
+
+// driveLaunchDeadline enforces the launch-claim deadline: once
+// LaunchClaimDeadline has passed since the launch operation was journaled
+// with no claim row appearing, the operation goes reconciling with a pane
+// snapshot as evidence — never re-created, never re-sent. Human
+// interaction time after a claim exists is unbounded; this bounds only
+// the mechanical launcher start.
+func (c *Controller) driveLaunchDeadline(ctx context.Context, handle RunHandle, detail RunDetail) (bool, error) { //nolint:gocritic // hugeParam: RunHandle and RunDetail are per-call values; called once per corroboration round.
+	var newest *Operation
+	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		for _, kind := range []OperationKind{OpPaneOpen, OpLaunchSend} {
+			ops, opErr := uow.Operations().ByKind(ctx, handle.runID, kind)
+			if opErr != nil {
+				return opErr
+			}
+			for i := range ops {
+				if newest == nil || ops[i].CreatedAt.After(newest.CreatedAt) {
+					op := ops[i]
+					newest = &op
+				}
+			}
+		}
+		return nil
+	}); err != nil {
+		return false, err
+	}
+	if newest == nil || !LaunchDeadlineExpired(newest.CreatedAt, c.Clock.Now()) {
+		return false, nil
+	}
+	if newest.State == OperationReconciling {
+		return true, nil
+	}
+
+	snapshot := ""
+	if detail.Binding != nil && detail.Binding.PaneID != "" {
+		if content, readErr := c.Runtime.ReadPane(ctx, detail.Binding.PaneID, paneScrollbackLines); readErr == nil {
+			snapshot = content
+		}
+	}
+	now := c.Clock.Now()
+	err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		op, getErr := uow.Operations().Get(ctx, newest.ID)
+		if getErr != nil {
+			return getErr
+		}
+		if op.State == OperationReconciling {
+			return nil
+		}
+		op.State = OperationReconciling
+		op.Outcome = "no launch claim appeared within the launch-claim deadline; reconciling, never re-sent"
+		if snapshot != "" {
+			op.ActEvidence = map[string]string{"pane_snapshot": snapshot}
+		}
+		op.UpdatedAt = now
+		return uow.Operations().Save(ctx, op)
+	})
+	if err != nil {
+		return false, fmt.Errorf("app: record launch deadline: %w", err)
+	}
+	return true, nil
 }
 
 // launchMarkers derives the argv markers the corroboration predicate

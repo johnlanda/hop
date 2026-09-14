@@ -303,6 +303,21 @@ func (c *Controller) recoverPaneOpen(ctx context.Context, handle RunHandle, op *
 		return c.markOperationReconciling(ctx, handle, op.ID, "pane.open intent could not be decoded; failing closed")
 	}
 
+	bindingExists := false
+	if uowErr := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		_, found, bErr := uow.Bindings().Current(ctx, intent.SessionID)
+		bindingExists = found
+		return bErr
+	}); uowErr != nil {
+		return uowErr
+	}
+	if bindingExists {
+		// The pane's binding is already recorded; whatever state the
+		// operation reached (including a launch-deadline reconciliation)
+		// stands — there is nothing left to recover here.
+		return nil
+	}
+
 	ref, found, err := c.Runtime.FindPaneByLabel(ctx, intent.Label)
 	if err != nil {
 		return nil //nolint:nilerr // a failed lookup is ambiguous; recovery retries on a later round.
