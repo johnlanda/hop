@@ -2,6 +2,7 @@ package herdr_test
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"net"
 	"testing"
@@ -108,41 +109,140 @@ func TestObserverSubscribeRequestsEachPane(t *testing.T) {
 	}
 }
 
-func TestObserverCloseReleasesBlockedPump(t *testing.T) {
-	// The normalized pump uses an unbuffered channel, so it blocks on its
-	// first event when no one reads. Close must release it so the stream ends
-	// rather than leaking the goroutine.
+// normalizedPumpSymbol is the goroutine the barrier tests watch for the
+// normalized (statusStream) pump.
+const normalizedPumpSymbol = "(*statusStream).pump"
+
+// subscribeAndStartPump subscribes and starts the decode pump without reading
+// it, so the pump parks blocked on its first delivery.
+func subscribeAndStartPump(t *testing.T, ctx context.Context) app.StatusStream {
+	t.Helper()
 	endpoint := startFakeEndpoint(t, func(t *testing.T, conn net.Conn) {
 		request := readRequestLine(t, bufio.NewReader(conn))
 		if request == nil {
 			return
 		}
 		writeLine(t, conn, fmt.Sprintf(`{"id":%q,"result":{"type":"subscription_started"}}`, requestID(t, request)))
-		floodLines(conn, `{"event":"pane.agent_status_changed","data":{"pane_id":"w1:p1","workspace_id":"w1","agent_status":"working"}}`, 8)
+		// Flood past both the raw and the normalized buffer so, with no
+		// consumer, the normalized pump parks blocked in its delivery select.
+		floodLines(conn, `{"event":"pane.agent_status_changed","data":{"pane_id":"w1:p1","workspace_id":"w1","agent_status":"working"}}`, 600)
 		holdUntilPeerCloses(conn)
 	})
-	observer := herdr.NewObserver(endpoint.socketPath, "w1:p1")
-
-	stream, err := observer.Subscribe(testContext(t))
+	stream, err := herdr.NewObserver(endpoint.socketPath, "w1:p1").Subscribe(ctx)
 	if err != nil {
 		t.Fatalf("Subscribe: %v", err)
 	}
-	// Start the pump but never drain it, then close.
-	events := stream.Events()
+	stream.Events() // start the pump; deliberately never read it
+	return stream
+}
+
+// pumpDone type-asserts a stream to its pump-completion signal.
+func pumpDone(t *testing.T, stream app.StatusStream) <-chan struct{} {
+	t.Helper()
+	done, ok := stream.(interface{ Done() <-chan struct{} })
+	if !ok {
+		t.Fatalf("stream %T has no Done() signal", stream)
+	}
+	return done.Done()
+}
+
+func TestObserverCloseReleasesBlockedPump(t *testing.T) {
+	// The normalized pump uses an unbuffered channel and parks blocked in its
+	// delivery select when no one reads. Close must release it. The test
+	// never reads the events channel, so it cannot itself release the leak.
+	stream := subscribeAndStartPump(t, testContext(t))
+	waitParkedInSelect(t, normalizedPumpSymbol)
+
 	if err := stream.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 
-	done := make(chan struct{})
-	go func() {
-		for range events { //nolint:revive // draining to completion; the point is that the channel closes
-		}
-		close(done)
-	}()
+	assertGoroutineGone(t, normalizedPumpSymbol)
 	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the normalized status stream did not end after Close; the pump leaked")
+	case <-pumpDone(t, stream):
+	case <-time.After(barrierTimeout):
+		t.Fatal("the normalized pump did not finish after Close")
+	}
+}
+
+func TestObserverCancellationReleasesBlockedPump(t *testing.T) {
+	// Cancellation WITHOUT Close must also release the blocked normalized
+	// pump, so its send select honors the subscription context, not only the
+	// Close signal.
+	ctx, cancel := context.WithCancel(testContext(t))
+	stream := subscribeAndStartPump(t, ctx)
+	defer closeQuietly(stream)
+	waitParkedInSelect(t, normalizedPumpSymbol)
+
+	cancel()
+
+	assertGoroutineGone(t, normalizedPumpSymbol)
+	select {
+	case <-pumpDone(t, stream):
+	case <-time.After(barrierTimeout):
+		t.Fatal("the normalized pump did not finish after cancellation")
+	}
+}
+
+// barrierObserver wraps a real Observer and cancels the context the moment
+// the raw read pump is parked in its send select — i.e. the subscription
+// buffer is full and every buffered event predates cancellation. It cancels
+// from Snapshot, before Reconcile begins draining, so the cutoff is exact.
+type barrierObserver struct {
+	inner  *herdr.Observer
+	t      *testing.T
+	cancel context.CancelFunc
+}
+
+func (o barrierObserver) Subscribe(ctx context.Context) (app.StatusStream, error) {
+	return o.inner.Subscribe(ctx)
+}
+
+func (o barrierObserver) Snapshot(ctx context.Context) ([]app.PaneObservation, error) {
+	observations, err := o.inner.Snapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	waitParkedInSelect(o.t, "(*EventStream).send")
+	o.cancel()
+	return observations, nil
+}
+
+// TestReconcileFoldsRawBufferedEventsOnCancellation proves R4 against the real
+// Observer, Client and Reconcile: with more events accepted into the raw
+// subscription buffer than the normalized channel can hold ready, cancellation
+// must still fold every accepted event before returning. A drain that only
+// takes what is ready on the normalized channel returns zero.
+func TestReconcileFoldsRawBufferedEventsOnCancellation(t *testing.T) {
+	endpoint := startFakeEndpoint(t, func(t *testing.T, conn net.Conn) {
+		reader := bufio.NewReader(conn)
+		for {
+			request := readRequestLoop(t, reader)
+			if request == nil {
+				return
+			}
+			id := requestID(t, request)
+			if request["method"] == "session.snapshot" {
+				writeLine(t, conn, fmt.Sprintf(`{"id":%q,"result":{"type":"session_snapshot","snapshot":{"panes":[]}}}`, id))
+				continue
+			}
+			writeLine(t, conn, fmt.Sprintf(`{"id":%q,"result":{"type":"subscription_started"}}`, id))
+			// Flood well past the raw buffer capacity; the read pump accepts
+			// eventBufferSize (256) and parks on the next send.
+			floodLines(conn, `{"event":"pane.agent_status_changed","data":{"pane_id":"w1:p1","workspace_id":"w1","agent_status":"done"}}`, 400)
+			holdUntilPeerCloses(conn)
+		}
+	})
+	ctx, cancel := context.WithCancel(testContext(t))
+	defer cancel()
+	observer := barrierObserver{inner: herdr.NewObserver(endpoint.socketPath, "w1:p1"), t: t, cancel: cancel}
+
+	result, err := app.Reconcile(ctx, observer)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(result.Events) < 256 {
+		t.Errorf("Reconcile folded %d events, want the >=256 accepted into the raw buffer before cancellation", len(result.Events))
 	}
 }
 

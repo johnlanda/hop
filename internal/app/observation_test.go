@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"sync"
 	"testing"
 
 	"github.com/johnlanda/hop/internal/app"
@@ -73,11 +74,15 @@ func TestReconcileState(t *testing.T) {
 	}
 }
 
-// fakeStream is a handwritten StatusStream delivering a fixed event slice.
+// fakeStream is a handwritten StatusStream. A closed channel of buffered
+// events models a stream that has already ended; a staged stream (see
+// newStagedStream) models the adapter's two-stage delivery under cancellation.
 type fakeStream struct {
-	events chan app.StatusEvent
-	err    error
-	closed bool
+	events    chan app.StatusEvent
+	err       error
+	closeOnce sync.Once
+	stop      chan struct{}
+	closed    bool
 }
 
 func newFakeStream(events []app.StatusEvent) *fakeStream {
@@ -89,22 +94,35 @@ func newFakeStream(events []app.StatusEvent) *fakeStream {
 	return &fakeStream{events: channel}
 }
 
-// newOpenBufferedStream buffers events in an OPEN channel: the events are
-// deliverable but the stream never ends on its own, so a reader must stop on
-// cancellation. This exercises the cancellation-drain path rather than the
-// clean end-of-stream path.
-func newOpenBufferedStream(events []app.StatusEvent) *fakeStream {
-	channel := make(chan app.StatusEvent, len(events))
-	for _, event := range events {
-		channel <- event
-	}
-	return &fakeStream{events: channel}
+// newStagedStream models the real adapter's delivery: events are held in a
+// source ("the subscription buffer") and handed one at a time to a consumer
+// over an UNBUFFERED channel, then the channel is closed. At any instant no
+// event is sitting ready on the channel, so a reader that only takes what is
+// immediately ready folds almost nothing; only a reader that drains until the
+// channel closes folds them all. This is what distinguishes a correct
+// cancellation drain from a non-blocking one.
+func newStagedStream(events []app.StatusEvent) *fakeStream {
+	s := &fakeStream{events: make(chan app.StatusEvent), stop: make(chan struct{})}
+	go func() {
+		defer close(s.events)
+		for _, event := range events {
+			select {
+			case s.events <- event:
+			case <-s.stop:
+				return
+			}
+		}
+	}()
+	return s
 }
 
 func (s *fakeStream) Events() <-chan app.StatusEvent { return s.events }
 func (s *fakeStream) Err() error                     { return s.err }
 func (s *fakeStream) Close() error {
 	s.closed = true
+	if s.stop != nil {
+		s.closeOnce.Do(func() { close(s.stop) })
+	}
 	return nil
 }
 
@@ -202,11 +220,12 @@ func TestReconcileDrainsBufferedEventsBeforeCancellation(t *testing.T) {
 		}
 		events[i] = app.StatusEvent{PaneID: "w1:p1", WorkspaceID: "w1", Status: status}
 	}
-	// The stream stays open, so Reconcile can only stop on cancellation; the
-	// buffered events must still all be folded first.
-	observer := &fakeObserver{stream: newOpenBufferedStream(events), snapshot: []app.PaneObservation{{PaneID: "w1:p1", Status: app.StatusIdle}}}
+	// The events are staged behind an unbuffered channel, as the adapter
+	// delivers its subscription buffer; only draining until the stream closes
+	// folds them all.
+	observer := &fakeObserver{stream: newStagedStream(events), snapshot: []app.PaneObservation{{PaneID: "w1:p1", Status: app.StatusIdle}}}
 	ctx, cancel := context.WithCancel(t.Context())
-	cancel() // cancel up front; every event is already buffered
+	cancel() // cancel up front; every event was accepted before cancellation
 
 	result, err := app.Reconcile(ctx, observer)
 	if err != nil {
@@ -214,7 +233,7 @@ func TestReconcileDrainsBufferedEventsBeforeCancellation(t *testing.T) {
 	}
 
 	if len(result.Events) != count {
-		t.Errorf("folded %d events, want all %d buffered before cancellation", len(result.Events), count)
+		t.Errorf("folded %d events, want all %d accepted before cancellation", len(result.Events), count)
 	}
 	if got := result.State["w1:p1"].Status; got != app.StatusDone {
 		t.Errorf("final status = %s, want the last buffered transition done", got)
@@ -222,10 +241,9 @@ func TestReconcileDrainsBufferedEventsBeforeCancellation(t *testing.T) {
 }
 
 func TestReconcileStopsAtContextCancellation(t *testing.T) {
-	// A live stream that never closes: the drain must end when the caller
-	// cancels, returning the state reconciled so far.
-	stream := &fakeStream{events: make(chan app.StatusEvent)}
-	observer := &fakeObserver{stream: stream, snapshot: []app.PaneObservation{{PaneID: "w1:p1", Status: app.StatusIdle}}}
+	// A stream with nothing buffered that closes on cancellation: the drain
+	// ends immediately, returning the snapshot state.
+	observer := &fakeObserver{stream: newStagedStream(nil), snapshot: []app.PaneObservation{{PaneID: "w1:p1", Status: app.StatusIdle}}}
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 

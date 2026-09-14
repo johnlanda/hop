@@ -111,10 +111,11 @@ type RawEvent struct {
 // in arrival order on Events; after that channel closes, Err reports why the
 // stream ended, and nil means it was closed by Close or context cancellation.
 type EventStream struct {
-	conn   net.Conn
-	stop   func() bool
-	events chan RawEvent
-	done   chan struct{} // closed by Close to release a pump blocked on a full events channel
+	conn     net.Conn
+	stop     func() bool
+	events   chan RawEvent
+	done     chan struct{} // closed by Close to release a pump blocked on a full events channel
+	finished chan struct{} // closed when the read pump has exited
 
 	mu     sync.Mutex
 	closed bool
@@ -153,7 +154,13 @@ func (c *Client) Subscribe(ctx context.Context, subscriptions []EventSubscriptio
 		abort()
 		return nil, err
 	}
-	stream := &EventStream{conn: conn, stop: stop, events: make(chan RawEvent, eventBufferSize), done: make(chan struct{})}
+	stream := &EventStream{
+		conn:     conn,
+		stop:     stop,
+		events:   make(chan RawEvent, eventBufferSize),
+		done:     make(chan struct{}),
+		finished: make(chan struct{}),
+	}
 	go stream.read(ctx, reader)
 	return stream, nil
 }
@@ -161,6 +168,13 @@ func (c *Client) Subscribe(ctx context.Context, subscriptions []EventSubscriptio
 // Events returns the pushed-event channel. It is closed when the stream ends.
 func (s *EventStream) Events() <-chan RawEvent {
 	return s.events
+}
+
+// Done returns a channel closed when the read pump has exited. It lets a
+// caller (or a test) observe that the goroutine is gone without draining the
+// events channel, which would itself release a blocked pump.
+func (s *EventStream) Done() <-chan struct{} {
+	return s.finished
 }
 
 // Err reports why the stream ended. It is meaningful after Events is closed;
@@ -189,6 +203,7 @@ func (s *EventStream) Close() error {
 // reason and closes the channel. A response line on a subscription
 // connection after the acknowledgement is a protocol violation.
 func (s *EventStream) read(ctx context.Context, reader *bufio.Reader) {
+	defer close(s.finished)
 	defer close(s.events)
 	for {
 		line, err := readLine(reader)

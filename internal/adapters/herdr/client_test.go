@@ -100,23 +100,6 @@ func holdUntilPeerCloses(conn net.Conn) {
 	}
 }
 
-// assertStreamEnds runs a drain and fails if it does not finish within the
-// timeout, which is how a leaked pump goroutine that never closes its channel
-// manifests.
-func assertStreamEnds(t *testing.T, drain func()) {
-	t.Helper()
-	done := make(chan struct{})
-	go func() {
-		drain()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(protocolTimeout):
-		t.Fatal("the event stream did not end; the pump goroutine leaked")
-	}
-}
-
 // readRequestLine decodes the next request the client sent.
 func readRequestLine(t *testing.T, reader *bufio.Reader) map[string]any {
 	t.Helper()
@@ -168,6 +151,33 @@ func floodLines(conn net.Conn, line string, count int) {
 			return
 		}
 	}
+}
+
+// subscribeToFlood opens a subscription to a fake endpoint that floods far
+// more events than the buffer holds and holds the connection open, so the
+// read pump fills its buffer and parks blocked in its send.
+func subscribeToFlood(t *testing.T) *herdr.EventStream {
+	t.Helper()
+	return subscribeToFloodCtx(t, testContext(t))
+}
+
+// subscribeToFloodCtx is subscribeToFlood with an explicit context.
+func subscribeToFloodCtx(t *testing.T, ctx context.Context) *herdr.EventStream {
+	t.Helper()
+	endpoint := startFakeEndpoint(t, func(t *testing.T, conn net.Conn) {
+		request := readRequestLine(t, bufio.NewReader(conn))
+		if request == nil {
+			return
+		}
+		writeLine(t, conn, fmt.Sprintf(`{"id":%q,"result":{"type":"subscription_started"}}`, requestID(t, request)))
+		floodLines(conn, `{"event":"pane_created","data":{"type":"pane_created"}}`, 400)
+		holdUntilPeerCloses(conn)
+	})
+	stream, err := herdr.NewClient(endpoint.socketPath).Subscribe(ctx, nil)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	return stream
 }
 
 func testContext(t *testing.T) context.Context {
@@ -623,53 +633,41 @@ func TestClientSubscribe(t *testing.T) {
 	})
 
 	t.Run("close releases a pump blocked on a full events channel", func(t *testing.T) {
-		// The fake floods the stream with more events than the buffer holds,
-		// then keeps the connection open. With no consumer draining, the pump
-		// blocks on a full channel; Close must still release it so the stream
-		// ends rather than leaking the goroutine.
-		endpoint := startFakeEndpoint(t, func(t *testing.T, conn net.Conn) {
-			request := readRequestLine(t, bufio.NewReader(conn))
-			if request == nil {
-				return
-			}
-			writeLine(t, conn, fmt.Sprintf(`{"id":%q,"result":{"type":"subscription_started"}}`, requestID(t, request)))
-			floodLines(conn, `{"event":"pane_created","data":{"type":"pane_created"}}`, 400)
-			holdUntilPeerCloses(conn) // keep the connection open; no EOF
-		})
-		client := herdr.NewClient(endpoint.socketPath)
+		// The fake floods the stream past its buffer, then holds the
+		// connection open. With no consumer, the read pump parks blocked in
+		// its send select; Close must release it so the goroutine exits. The
+		// test never drains the events channel — draining would itself
+		// release the leak it claims to detect.
+		stream := subscribeToFlood(t)
+		waitParkedInSelect(t, "(*EventStream).send")
 
-		stream, err := client.Subscribe(testContext(t), nil)
-		if err != nil {
-			t.Fatalf("Subscribe: %v", err)
-		}
 		if err := stream.Close(); err != nil {
 			t.Fatalf("Close: %v", err)
 		}
 
-		assertStreamEnds(t, func() { drainEvents(stream) })
+		assertGoroutineGone(t, "(*EventStream).read")
+		select { // the pump's own completion signal, without draining events
+		case <-stream.Done():
+		case <-time.After(barrierTimeout):
+			t.Fatal("EventStream.Done() did not close after Close")
+		}
 	})
 
-	t.Run("cancellation releases a pump blocked on a full events channel", func(t *testing.T) {
-		endpoint := startFakeEndpoint(t, func(t *testing.T, conn net.Conn) {
-			request := readRequestLine(t, bufio.NewReader(conn))
-			if request == nil {
-				return
-			}
-			writeLine(t, conn, fmt.Sprintf(`{"id":%q,"result":{"type":"subscription_started"}}`, requestID(t, request)))
-			floodLines(conn, `{"event":"pane_created","data":{"type":"pane_created"}}`, 400)
-			holdUntilPeerCloses(conn)
-		})
-		client := herdr.NewClient(endpoint.socketPath)
+	t.Run("cancellation alone releases a pump blocked on a full events channel", func(t *testing.T) {
+		// Cancellation WITHOUT Close must also release the blocked send.
 		ctx, cancel := context.WithCancel(testContext(t))
-
-		stream, err := client.Subscribe(ctx, nil)
-		if err != nil {
-			t.Fatalf("Subscribe: %v", err)
-		}
+		stream := subscribeToFloodCtx(t, ctx)
 		defer closeQuietly(stream)
+		waitParkedInSelect(t, "(*EventStream).send")
+
 		cancel()
 
-		assertStreamEnds(t, func() { drainEvents(stream) })
+		assertGoroutineGone(t, "(*EventStream).read")
+		select {
+		case <-stream.Done():
+		case <-time.After(barrierTimeout):
+			t.Fatal("EventStream.Done() did not close after cancellation")
+		}
 	})
 
 	t.Run("close ends the stream without an error", func(t *testing.T) {

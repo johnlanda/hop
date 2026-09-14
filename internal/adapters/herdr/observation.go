@@ -39,32 +39,47 @@ func (o *Observer) Subscribe(ctx context.Context) (app.StatusStream, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &statusStream{stream: stream, closed: make(chan struct{})}, nil
+	return &statusStream{ctx: ctx, stream: stream, closed: make(chan struct{}), finished: make(chan struct{})}, nil
 }
 
 // statusStream adapts a raw event stream into an app.StatusStream, decoding
 // each agent-status event and dropping any other pushed frame.
 type statusStream struct {
+	ctx       context.Context //nolint:containedctx // the subscription context whose cancellation must release the pump; it is not request-scoped state.
 	stream    *EventStream
 	events    chan app.StatusEvent
 	start     sync.Once
 	closeOnce sync.Once
-	closed    chan struct{} // closed by Close to release a pump blocked on a full events channel
+	closed    chan struct{} // closed by Close to release a pump blocked on delivery
+	finished  chan struct{} // closed when the decode pump has exited
 }
 
 // Events lazily starts the decode pump and returns the normalized channel.
+// The channel is buffered to the same depth as the raw subscription buffer,
+// so that on cancellation the pump can hand every buffered event to a
+// draining consumer without a delivery racing the cancellation signal.
 func (s *statusStream) Events() <-chan app.StatusEvent {
 	s.start.Do(func() {
-		s.events = make(chan app.StatusEvent)
+		s.events = make(chan app.StatusEvent, eventBufferSize)
 		go s.pump()
 	})
 	return s.events
 }
 
-// pump decodes raw events into status events until the raw stream ends,
-// abandoning a delivery when Close is called so a consumer that stops reading
-// cannot leave this goroutine blocked on the channel.
+// Done returns a channel closed when the decode pump has exited, so a caller
+// can observe the goroutine is gone without draining the events channel.
+func (s *statusStream) Done() <-chan struct{} {
+	return s.finished
+}
+
+// pump decodes raw events into status events until the raw stream ends. Each
+// delivery prefers a ready consumer, but honors both the Close signal and the
+// subscription context's cancellation, so a consumer that stops reading
+// cannot leave this goroutine blocked — whether it closed the stream or only
+// canceled the context — while a consumer that keeps draining still receives
+// every buffered event.
 func (s *statusStream) pump() {
+	defer close(s.finished)
 	defer close(s.events)
 	for raw := range s.stream.Events() {
 		if !isAgentStatusEvent(raw.Name) {
@@ -75,8 +90,15 @@ func (s *statusStream) pump() {
 			continue
 		}
 		select {
+		case s.events <- event: // a ready consumer receives it immediately
+			continue
+		default:
+		}
+		select {
 		case s.events <- event:
 		case <-s.closed:
+			return
+		case <-s.ctx.Done():
 			return
 		}
 	}

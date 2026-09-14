@@ -97,10 +97,18 @@ type Reconciliation struct {
 
 // Reconcile performs the no-replay reconciliation against a live Observer: it
 // subscribes first so transitions are buffered, takes the snapshot base,
-// then drains every event observed up to the caller's context deadline or an
+// then folds every event observed up to the caller's cancellation or an
 // explicit stream end. The buffered events override the snapshot, so a
 // transition between subscribe and snapshot is not lost. The caller bounds
-// the drain by canceling ctx; that is the intended way to end a live watch.
+// the watch by canceling ctx.
+//
+// Cutoff: every event the subscription accepted before cancellation is folded
+// before Reconcile returns. Cancellation stops new intake at the source but
+// not the events already buffered in the subscription; those flow through the
+// stream until it closes, and Reconcile keeps draining to completion rather
+// than returning at the instant of cancellation. Because a canceled
+// subscription stops accepting new events and then closes, this drain
+// terminates.
 func Reconcile(ctx context.Context, observer Observer) (Reconciliation, error) {
 	stream, err := observer.Subscribe(ctx)
 	if err != nil {
@@ -115,27 +123,14 @@ func Reconcile(ctx context.Context, observer Observer) (Reconciliation, error) {
 
 	var events []StatusEvent
 	for {
-		// Prefer an already-buffered event over cancellation, so a
-		// transition that arrived before the context was canceled is folded
-		// in rather than dropped by select's random choice among ready cases.
-		select {
-		case event, ok := <-stream.Events():
-			if !ok {
-				if streamErr := stream.Err(); streamErr != nil {
-					return Reconciliation{}, fmt.Errorf("status stream ended: %w", streamErr)
-				}
-				return Reconciliation{State: ReconcileState(snapshot, events), Events: events}, nil
-			}
-			events = append(events, event)
-			continue
-		default:
-		}
-
 		select {
 		case <-ctx.Done():
-			// Drain the events already buffered at cancellation before
-			// returning, so none observed before cancellation is lost.
-			events = drainBuffered(stream, events)
+			// Fold every remaining buffered event until the stream closes,
+			// so nothing accepted before cancellation is dropped by select's
+			// choice among ready cases.
+			for event := range stream.Events() {
+				events = append(events, event)
+			}
 			return Reconciliation{State: ReconcileState(snapshot, events), Events: events}, nil
 		case event, ok := <-stream.Events():
 			if !ok {
@@ -145,23 +140,6 @@ func Reconcile(ctx context.Context, observer Observer) (Reconciliation, error) {
 				return Reconciliation{State: ReconcileState(snapshot, events), Events: events}, nil
 			}
 			events = append(events, event)
-		}
-	}
-}
-
-// drainBuffered appends every event already sitting in the stream's channel,
-// without blocking, so cancellation does not drop events that had already
-// been delivered.
-func drainBuffered(stream StatusStream, events []StatusEvent) []StatusEvent {
-	for {
-		select {
-		case event, ok := <-stream.Events():
-			if !ok {
-				return events
-			}
-			events = append(events, event)
-		default:
-			return events
 		}
 	}
 }
