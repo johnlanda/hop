@@ -996,3 +996,57 @@ func TestCreationInstanceProvenance(t *testing.T) {
 		}
 	})
 }
+
+// TestSettledClaimIsNotLiveAdoption proves lifecycle catch-up for an
+// already-execed claim never doubles as warm adoption: the occupant must
+// still be verified under the corroboration predicate, and an absent or
+// replaced pane fails closed.
+func TestSettledClaimIsNotLiveAdoption(t *testing.T) {
+	settledStuckLaunch := func(t *testing.T, tc *testController) app.RunDetail {
+		t.Helper()
+		_, detail := startedRun(t, tc)
+		claimLaunch(t, tc, detail, 4242)
+		// A prior generation settled the claim but its lifecycle was lost.
+		claim := tc.Store.LaunchClaims[detail.Binding.IncarnationID]
+		claim.State = app.LaunchClaimExeced
+		tc.Store.LaunchClaims[detail.Binding.IncarnationID] = claim
+		return detail
+	}
+
+	t.Run("absent pane: catch-up applies but the outcome is never warm", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		detail := settledStuckLaunch(t, tc)
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			return app.PaneProcess{}, app.ErrPaneNotFound
+		}
+
+		tc.Clock.Advance(leaseTTL + time.Second)
+		result, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String()))
+		if err != nil {
+			t.Fatalf("Resume() error = %v", err)
+		}
+		if result.Outcome == app.ResumeWarmReattached {
+			t.Fatalf("Outcome = %s; an absent worker must never be adopted through lifecycle catch-up", result.Outcome)
+		}
+		if got := tc.Store.Attempts[detail.AttemptID].value.State; got != run.AttemptReconciling {
+			t.Fatalf("Attempt.State = %s, want %s (caught up, then reconciling)", got, run.AttemptReconciling)
+		}
+	})
+
+	t.Run("replaced occupant: catch-up applies and the outcome fails closed", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		detail := settledStuckLaunch(t, tc)
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 9999, Argv0: "/bin/bash", Argv: []string{"bash"}}}}, nil
+		}
+
+		tc.Clock.Advance(leaseTTL + time.Second)
+		result, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String()))
+		if err != nil {
+			t.Fatalf("Resume() error = %v", err)
+		}
+		if result.Outcome != app.ResumeFailedClosed {
+			t.Fatalf("Outcome = %s, want %s (a replaced occupant is never adopted)", result.Outcome, app.ResumeFailedClosed)
+		}
+	})
+}

@@ -544,7 +544,17 @@ func (c *Controller) reconcileActive(ctx context.Context, handle RunHandle, deta
 			if restoreErr := c.restoreRunAfterAdoption(ctx, handle); restoreErr != nil {
 				return ResumeResult{}, restoreErr
 			}
-			return ResumeResult{Outcome: ResumeWarmReattached, Detail: "launch claim corroborated on resume"}, nil
+			// Applying a settled claim's lifecycle consequences is
+			// historical catch-up, never evidence of a currently surviving
+			// worker: reload and decide again with the attempt out of
+			// launching, so the occupant is verified under the one
+			// corroboration predicate — absent, replaced or unobservable
+			// occupants fail closed — before any warm report.
+			reloaded, loadErr := c.Read.LoadRunStatus(ctx, handle.runID)
+			if loadErr != nil {
+				return ResumeResult{}, fmt.Errorf("app: load run status: %w", loadErr)
+			}
+			return c.reconcileActive(ctx, handle, reloaded, req)
 		case LaunchNeedsInteraction:
 			paneID := ""
 			if detail.Binding != nil {
