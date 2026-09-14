@@ -385,19 +385,26 @@ func (r fakeSessionRepo) Get(_ context.Context, id identity.SessionID) (run.Sess
 	return base.value, base.revision, nil
 }
 
+// sessionCurrent reports whether a session is the attempt's current one:
+// neither terminated nor lost — a cold relaunch's replaced session is
+// history, never current.
+func sessionCurrent(s *run.Session) bool {
+	return s.State != run.SessionTerminated && s.State != run.SessionLost
+}
+
 func (r fakeSessionRepo) Current(_ context.Context, attempt identity.AttemptID) (run.Session, int64, error) {
 	for _, staged := range r.u.sessions {
-		if staged.value.AttemptID == attempt && staged.value.State != run.SessionTerminated {
+		if staged.value.AttemptID == attempt && sessionCurrent(&staged.value) {
 			return staged.value, staged.revision, nil
 		}
 	}
-	for _, sess := range r.u.sessionCreated { //nolint:gocritic // rangeValCopy: test fake; the domain snapshot is small and read-only here, and indexing would only obscure the loop.
-		if sess.AttemptID == attempt && sess.State != run.SessionTerminated {
-			return sess, 1, nil
+	for i := range r.u.sessionCreated {
+		if r.u.sessionCreated[i].AttemptID == attempt && sessionCurrent(&r.u.sessionCreated[i]) {
+			return r.u.sessionCreated[i], 1, nil
 		}
 	}
 	for _, base := range r.u.store.Sessions {
-		if base.value.AttemptID == attempt && base.value.State != run.SessionTerminated {
+		if base.value.AttemptID == attempt && sessionCurrent(&base.value) {
 			if staged, ok := r.u.sessions[base.value.ID]; ok {
 				return staged.value, staged.revision, nil
 			}
