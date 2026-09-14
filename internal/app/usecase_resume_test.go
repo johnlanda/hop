@@ -504,3 +504,112 @@ func TestResumeRounds(t *testing.T) {
 		}
 	})
 }
+
+// TestResumePositiveEvidenceRetirement is the complete section 5 case 2
+// scenario: a restored occupant carrying the run's pre-assigned native
+// session reference is recorded as an observed-restoration binding under
+// a distinct observation incarnation, retired through the guarded
+// pane.close operation, superseded on observed absence, and only then
+// replaced by a cold relaunch that inherits the native lineage and
+// workspace.
+func TestResumePositiveEvidenceRetirement(t *testing.T) {
+	tc := newTestController(defaultPolicy())
+	_, detail := runningRun(t, tc)
+	nativeRef := tc.Store.Sessions[detail.SessionID].value.NativeSessionRef
+	if nativeRef == "" {
+		t.Fatalf("no native session reference was pre-assigned")
+	}
+	originalIncarnation := detail.Binding.IncarnationID
+	originalWorkspace := detail.Binding.WorkspaceID
+
+	// Herdr's native restore replaced the worker: a new pid running
+	// `claude --resume <native-ref>`, bypassing the launcher.
+	tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+		return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 7777, Argv0: "/usr/bin/claude", Argv: []string{"claude", "--resume", nativeRef}}}}, nil
+	}
+
+	tc.Clock.Advance(leaseTTL + time.Second)
+	first, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String()))
+	if err != nil {
+		t.Fatalf("first Resume() error = %v", err)
+	}
+	if first.Outcome != app.ResumeReconciling {
+		t.Fatalf("first Outcome = %s, want %s (close dispatched, termination not yet observed)", first.Outcome, app.ResumeReconciling)
+	}
+
+	history := tc.Store.Bindings[detail.SessionID]
+	if len(history) != 2 {
+		t.Fatalf("binding history length = %d, want 2 (launch binding + observed restoration)", len(history))
+	}
+	if !history[0].Superseded {
+		t.Fatalf("the launch binding was not superseded by the positive evidence")
+	}
+	observed := history[1]
+	if observed.LaunchKind != run.LaunchRestoredObserved {
+		t.Fatalf("observed binding launch kind = %s, want %s", observed.LaunchKind, run.LaunchRestoredObserved)
+	}
+	if observed.IncarnationID == originalIncarnation {
+		t.Fatalf("the observed-restoration binding reused the launch incarnation; UNIQUE(session_id, incarnation_id) demands a distinct observation identity")
+	}
+	if observed.Occupant == nil || observed.Occupant.PID != 7777 || observed.Occupant.ArgvMarker != nativeRef {
+		t.Fatalf("observed binding occupant = %+v, want the restored process evidence", observed.Occupant)
+	}
+	if len(tc.Runtime.ClosedPanes) != 1 {
+		t.Fatalf("ClosePane calls = %d, want 1 guarded close against the observed target", len(tc.Runtime.ClosedPanes))
+	}
+	scrollbackCaptured := false
+	for _, a := range tc.Store.Artifacts {
+		if a.Kind == run.ArtifactPaneSnapshot {
+			scrollbackCaptured = true
+		}
+	}
+	if !scrollbackCaptured {
+		t.Fatalf("pane scrollback was not captured before the retirement close")
+	}
+
+	// The occupant is observed gone on the next round: the retirement
+	// completes and authorizes the cold relaunch — no attestation needed.
+	tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+		return app.PaneProcess{}, nil
+	}
+	tc.Clock.Advance(leaseTTL + time.Second)
+	second, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String()))
+	if err != nil {
+		t.Fatalf("second Resume() error = %v", err)
+	}
+	if second.Outcome != app.ResumeColdRelaunched {
+		t.Fatalf("second Outcome = %s, want %s", second.Outcome, app.ResumeColdRelaunched)
+	}
+
+	history = tc.Store.Bindings[detail.SessionID]
+	if !history[1].Superseded {
+		t.Fatalf("the observed-restoration binding was not superseded after confirmed retirement")
+	}
+	for id := range tc.Store.Operations {
+		op := tc.Store.Operations[id]
+		if op.Kind == app.OpPaneClose && op.State != app.OperationSucceeded {
+			t.Fatalf("pane.close operation state = %s, want succeeded after observed absence", op.State)
+		}
+	}
+
+	updated, err := tc.Store.LoadRunStatus(context.Background(), detail.RunID)
+	if err != nil {
+		t.Fatalf("LoadRunStatus() error = %v", err)
+	}
+	if updated.SessionID == detail.SessionID {
+		t.Fatalf("cold relaunch did not bind a new session")
+	}
+	replacement := tc.Store.Sessions[updated.SessionID].value
+	if replacement.NativeSessionRef != nativeRef {
+		t.Fatalf("replacement session native ref = %q, want the inherited lineage %q", replacement.NativeSessionRef, nativeRef)
+	}
+	if oldSession := tc.Store.Sessions[detail.SessionID].value; oldSession.State != run.SessionLost {
+		t.Fatalf("prior session state = %s, want %s", oldSession.State, run.SessionLost)
+	}
+	if updated.AttemptState != run.AttemptRelaunching {
+		t.Fatalf("Attempt.State = %s, want %s", updated.AttemptState, run.AttemptRelaunching)
+	}
+	if updated.Binding == nil || updated.Binding.WorkspaceID != originalWorkspace {
+		t.Fatalf("relaunch pane workspace = %+v, want the recorded placement %q", updated.Binding, originalWorkspace)
+	}
+}

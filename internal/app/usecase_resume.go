@@ -572,10 +572,49 @@ func (c *Controller) reconcileActive(ctx context.Context, handle RunHandle, deta
 		}, nil
 	}
 
+	// A pending positive-evidence retirement completes on observed absence:
+	// the recorded close target is adopted and relaunch is authorized by
+	// the retirement evidence itself, no attestation needed.
+	retired, retireErr := c.completePendingRetirement(ctx, handle, detail)
+	if retireErr != nil {
+		return ResumeResult{}, retireErr
+	}
+	if retired {
+		return c.coldRelaunch(ctx, handle, detail, req)
+	}
+
 	if execFailed || req.ConfirmAbsent {
 		return c.coldRelaunch(ctx, handle, detail, req)
 	}
 	return ResumeResult{Outcome: ResumeReconciling, Detail: "no live process observed; rerun with --confirm-absent once no worker for this run is running anywhere"}, nil
+}
+
+// completePendingRetirement finds an unresolved positive-evidence
+// pane.close operation targeting the current binding and re-drives it:
+// with the target now observed absent, the retirement completes and
+// authorizes the cold relaunch it was recorded for.
+func (c *Controller) completePendingRetirement(ctx context.Context, handle RunHandle, detail RunDetail) (bool, error) { //nolint:gocritic // hugeParam: RunHandle and RunDetail are per-call DTOs; this runs once per resume round.
+	if detail.Binding == nil {
+		return false, nil
+	}
+	for i := range detail.PendingOperations {
+		op := &detail.PendingOperations[i]
+		if op.Kind != OpPaneClose {
+			continue
+		}
+		intent, ok := decodeOperationPayload[paneCloseIntent](op.Intent)
+		if !ok || intent.Reason != closeReasonRetirement || intent.PaneID != detail.Binding.PaneID {
+			continue
+		}
+		target := paneCloseTarget{
+			PaneID: intent.PaneID, Label: intent.Label,
+			SessionID: intent.SessionID, IncarnationID: intent.IncarnationID,
+			PID: intent.PID, Markers: intent.ArgvMarkers, Reason: intent.Reason,
+		}
+		retired, _, err := c.closePaneOperation(ctx, handle, detail, &target)
+		return retired, err
+	}
+	return false, nil
 }
 
 // observePane inspects a binding's pane and classifies the observation.
@@ -777,7 +816,7 @@ func (c *Controller) retireAndRelaunch(ctx context.Context, handle RunHandle, de
 			PaneID: binding.PaneID, Label: binding.CreationLabel,
 			SessionID: detail.SessionID, IncarnationID: binding.IncarnationID,
 			PID: firstForeground(pane).PID, Markers: []string{nativeRef},
-			Reason: "positive-evidence retirement",
+			Reason: closeReasonRetirement,
 		}
 		if binding.LaunchKind == run.LaunchRestoredObserved {
 			return nil
@@ -813,8 +852,13 @@ func (c *Controller) retireAndRelaunch(ctx context.Context, handle RunHandle, de
 }
 
 // coldRelaunch authorizes a cold relaunch: a new session and incarnation
-// bound to the same attempt, a fresh pane in the same worktree. Only
-// Claude's resume semantics are supported in Phase 2.
+// bound to the same attempt, a fresh pane in the same worktree and
+// workspace. The replacement session inherits the prior session's
+// immutable native reference — a real launcher cannot render
+// `claude --resume <native-ref>` without it — so a missing reference or
+// unrecorded workspace placement refuses the relaunch before any
+// transition commits. Only Claude's resume semantics are supported in
+// Phase 2.
 func (c *Controller) coldRelaunch(ctx context.Context, handle RunHandle, detail RunDetail, req ResumeRequest) (ResumeResult, error) { //nolint:gocritic // hugeParam: RunHandle, RunDetail and ResumeRequest are per-call DTOs; this runs once per resume round.
 	harness, err := c.sessionHarness(ctx, handle, detail.SessionID)
 	if err != nil {
@@ -822,6 +866,26 @@ func (c *Controller) coldRelaunch(ctx context.Context, handle RunHandle, detail 
 	}
 	if harness != run.HarnessClaude {
 		return ResumeResult{Outcome: ResumeUnsupported, Detail: fmt.Sprintf("cold resume is not supported for harness %q in Phase 2", harness)}, nil
+	}
+	if req.HOPPath == "" || req.StateRoot == "" {
+		return ResumeResult{}, errors.New("app: resume requires HOPPath and StateRoot to open the relaunch pane")
+	}
+
+	// Validate every relaunch input before any transition commits.
+	priorRef, priorSource, err := c.sessionNativeLineage(ctx, handle, detail.SessionID)
+	if err != nil {
+		return ResumeResult{}, err
+	}
+	if priorRef == "" {
+		return ResumeResult{}, fmt.Errorf("app: session %s has no native session reference; a Claude cold relaunch cannot be rendered", detail.SessionID)
+	}
+	worktree, err := c.currentWorktree(ctx, handle)
+	if err != nil {
+		return ResumeResult{}, err
+	}
+	worktree.WorkspaceID = c.relaunchWorkspace(ctx, handle, detail)
+	if worktree.WorkspaceID == "" {
+		return ResumeResult{Outcome: ResumeReconciling, Detail: "no recorded workspace placement for the relaunch pane; failing closed"}, nil
 	}
 
 	sessionID, err := identity.ParseSessionID(c.IDs.NewID())
@@ -883,7 +947,12 @@ func (c *Controller) coldRelaunch(ctx context.Context, handle RunHandle, detail 
 		}
 
 		newSession := run.NewSession(sessionID, handle.runID, detail.AttemptID, harness, now)
-		newSession, launchSessErr := newSession.Launch(now)
+		newSession, assignErr := newSession.AssignNativeRef(priorRef, priorSource, now)
+		if assignErr != nil {
+			return assignErr
+		}
+		var launchSessErr error
+		newSession, launchSessErr = newSession.Launch(now)
 		if launchSessErr != nil {
 			return launchSessErr
 		}
@@ -904,13 +973,6 @@ func (c *Controller) coldRelaunch(ctx context.Context, handle RunHandle, detail 
 		return ResumeResult{}, fmt.Errorf("app: authorize cold relaunch: %w", err)
 	}
 
-	worktree, err := c.currentWorktree(ctx, handle)
-	if err != nil {
-		return ResumeResult{}, err
-	}
-	if req.HOPPath == "" || req.StateRoot == "" {
-		return ResumeResult{}, fmt.Errorf("app: resume requires HOPPath and StateRoot to open the relaunch pane")
-	}
 	ids := generatedIdentities{Run: handle.runID, Task: detail.TaskID, Attempt: detail.AttemptID, Session: sessionID, Incarnation: incarnationID}
 	if err := c.openRelaunchPane(ctx, handle, ids, worktree, req.HOPPath, req.StateRoot); err != nil {
 		return ResumeResult{}, err
@@ -944,6 +1006,53 @@ func (c *Controller) sessionHarness(ctx context.Context, handle RunHandle, sessi
 		return nil
 	})
 	return harness, err
+}
+
+// sessionNativeLineage reads a session's immutable native reference and
+// its source, "" when unassigned.
+func (c *Controller) sessionNativeLineage(ctx context.Context, handle RunHandle, sessionID identity.SessionID) (string, run.NativeRefSource, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per relaunch.
+	var (
+		ref    string
+		source run.NativeRefSource
+	)
+	err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		s, _, getErr := uow.Sessions().Get(ctx, sessionID)
+		if getErr != nil {
+			return getErr
+		}
+		ref = s.NativeSessionRef
+		source = s.NativeRefSource
+		return nil
+	})
+	return ref, source, err
+}
+
+// relaunchWorkspace recovers the workspace the relaunch pane must join
+// from recorded placement: the run detail's binding (captured before any
+// retirement superseded it), or the worktree.create outcome's workspace.
+func (c *Controller) relaunchWorkspace(ctx context.Context, handle RunHandle, detail RunDetail) string { //nolint:gocritic // hugeParam: RunHandle and RunDetail are per-call DTOs; called once per relaunch.
+	if detail.Binding != nil && detail.Binding.WorkspaceID != "" {
+		return detail.Binding.WorkspaceID
+	}
+	var workspace string
+	_ = c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error { //nolint:errcheck // a failed read leaves workspace empty and the caller fails closed.
+		ops, opErr := uow.Operations().ByKind(ctx, handle.runID, OpWorktreeCreate)
+		if opErr != nil {
+			return opErr
+		}
+		for i := range ops {
+			if outcome, ok := decodeOperationPayload[worktreeCreateOutcome](ops[i].ActEvidence); ok && outcome.Info.WorkspaceID != "" {
+				workspace = outcome.Info.WorkspaceID
+				return nil
+			}
+			if outcome, ok := decodeOperationPayload[worktreeCreateOutcome](ops[i].Outcome); ok && outcome.Info.WorkspaceID != "" {
+				workspace = outcome.Info.WorkspaceID
+				return nil
+			}
+		}
+		return nil
+	})
+	return workspace
 }
 
 // sessionNativeRef reads a session's native reference, "" when unassigned.

@@ -55,6 +55,12 @@ func (r *fakeRuntime) OpenWorkerPane(_ context.Context, req app.WorkerPaneReques
 	if r.OpenWorkerPaneFn != nil {
 		return r.OpenWorkerPaneFn(req)
 	}
+	// The port's documented contract: the pane joins an existing workspace
+	// with a command argv, a cwd and a unique creation label; the fake
+	// rejects omissions rather than silently accepting them.
+	if req.WorkspaceID == "" || req.Cwd == "" || len(req.Command) == 0 || req.Label == "" {
+		return app.PaneHandle{}, fmt.Errorf("app_test: WorkerPaneRequest is missing required fields: %+v", req)
+	}
 	if r.OpenWorkerPaneErr != nil {
 		return app.PaneHandle{}, r.OpenWorkerPaneErr
 	}

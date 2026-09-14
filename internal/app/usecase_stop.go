@@ -60,6 +60,15 @@ type paneCloseOutcome struct {
 	Detail          string `json:"detail"`
 }
 
+// Close reasons a pane.close intent records.
+const (
+	// closeReasonStop interrupts the session's own corroborated worker.
+	closeReasonStop = "stop"
+	// closeReasonRetirement retires a positively identified restored
+	// occupant — a foreign process, never the session's own worker.
+	closeReasonRetirement = "positive-evidence retirement"
+)
+
 // paneCloseTarget is the recorded evidence one pane close is authorized
 // against; it is frozen into the operation intent before any act.
 type paneCloseTarget struct {
@@ -282,7 +291,7 @@ func (c *Controller) retireWorker(ctx context.Context, handle RunHandle, detail 
 		IncarnationID: detail.Binding.IncarnationID,
 		PID:           detail.Claim.PID,
 		Markers:       markers,
-		Reason:        "stop",
+		Reason:        closeReasonStop,
 	}
 	retired, outstanding, err := c.closePaneOperation(ctx, handle, detail, &target)
 	if err != nil {
@@ -425,10 +434,12 @@ func (c *Controller) capturePaneScrollback(ctx context.Context, handle RunHandle
 	})
 }
 
-// recordCloseDispatched journals the close dispatch as act evidence and
-// moves the target's session to stopping when it was still live: the
-// interrupt has been dispatched; termination is observed later, never
-// declared here.
+// recordCloseDispatched journals the close dispatch as act evidence and —
+// for a stop, whose target is the session's own corroborated worker —
+// moves the session to stopping: the interrupt has been dispatched;
+// termination is observed later, never declared here. A retirement close
+// targets a foreign restored occupant, so the session is left for the
+// relaunch decision to settle (lost, with the retirement as evidence).
 func (c *Controller) recordCloseDispatched(ctx context.Context, handle RunHandle, opID identity.OperationID, target *paneCloseTarget) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per dispatched close.
 	now := c.Clock.Now()
 	return c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
@@ -442,7 +453,7 @@ func (c *Controller) recordCloseDispatched(ctx context.Context, handle RunHandle
 			return saveErr
 		}
 
-		if target.SessionID == "" {
+		if target.SessionID == "" || target.Reason != closeReasonStop {
 			return nil
 		}
 		s, sRev, err := uow.Sessions().Get(ctx, target.SessionID)
