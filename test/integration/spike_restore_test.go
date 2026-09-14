@@ -1,8 +1,10 @@
 package integration
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -67,18 +69,19 @@ func TestSpikeRestorePlainPaneLosesAdditiveEnv(t *testing.T) {
 	}
 	artifacts.save(t, "snapshot-after-restart.txt", server.snapshotDump(t))
 
-	// The restored shell has lost the additive variable.
+	// The restored shell has lost the additive variable. Wait for the complete
+	// output-only value AFTER=[]DONE: the echoed command line contains
+	// AFTER=[%s]DONE, so that literal appears only when the shell actually ran
+	// the printf and expanded an empty HOP_RUN_ID — terminal echo cannot
+	// satisfy it.
 	server.call(t, "pane.send_text", map[string]any{
 		"pane_id": restoredPane,
 		"text":    "printf 'AFTER=[%s]DONE\\n' \"$HOP_RUN_ID\"\n",
 	}, nil)
-	snapshot := server.waitForPaneText(t, restoredPane, "AFTER=[")
+	snapshot := server.waitForPaneText(t, restoredPane, "AFTER=[]DONE")
 	artifacts.save(t, "restored-pane.txt", snapshot)
 	if strings.Contains(snapshot, "AFTER=["+runID+"]") {
 		t.Errorf("restored pane still carries the additive HOP_RUN_ID; want it absent\n%s", snapshot)
-	}
-	if !strings.Contains(snapshot, "AFTER=[]DONE") {
-		t.Errorf("restored shell did not report an empty HOP_RUN_ID as expected\n%s", snapshot)
 	}
 }
 
@@ -87,15 +90,19 @@ func TestSpikeRestorePlainPaneLosesAdditiveEnv(t *testing.T) {
 // id) is relaunched on restart by Herdr's own auto-restore, which runs
 // `claude --resume <id>` in a fresh login shell — bypassing any HOP launcher
 // and carrying none of the creation-time additive HOP_* environment. It
-// establishes (a) that and when the relaunch happens (deferred until a client
-// supplies geometry), (b) what the delayed-restore window looks like in
-// session.snapshot, (c) that the only observable "restoration progressed"
-// signals are ordinary agent detection/status events, and (d) that the
-// relaunched process's environment lacks the additive vars.
+// asserts (a) the relaunch happens and is deferred until a client supplies
+// geometry, (b) the delayed-restore window is a phantom — the snapshot lists
+// the agent while pane.process_info shows no live process, (c) the exact
+// resume argv (`claude --resume <sessionID>`), and (d) the relaunched
+// process's environment carries HERDR_* but not the additive HOP_RUN_ID,
+// correlated to the resumed pid via a complete atomic env dump.
+//
+// That no dedicated "restoration finished" event exists is a source-audited
+// observation (see FINDINGS.md), not something one test run can prove; this
+// test asserts only the positive signals above.
 //
 // The fixture directory is first on the pane shell's PATH, so the bare
-// `claude` the resume command runs resolves to the fixture harness, which
-// dumps its environment to a pid-named file in the worktree.
+// `claude` the resume command runs resolves to the fixture harness.
 func TestSpikeRestoreAutoRelaunchBypassesLauncher(t *testing.T) {
 	fixtures := buildSpikeFixtures(t)
 	artifacts := newArtifactDir(t)
@@ -132,15 +139,21 @@ func TestSpikeRestoreAutoRelaunchBypassesLauncher(t *testing.T) {
 	pane := tab.RootPane.PaneID
 
 	// Launch the fixture harness so the pane is a live, detected claude agent,
-	// carrying the additive HOP_RUN_ID.
+	// carrying the additive HOP_RUN_ID. Wait for its env dump to be durably
+	// written (SPIKE-ENV-WRITTEN follows the atomic rename) and capture the
+	// initial pid so the resumed process is unambiguously a different one.
 	server.call(t, "pane.send_text", map[string]any{
 		"pane_id": pane,
 		"text":    "exec claude --run " + runID + "\n",
 	}, nil)
 	server.waitForPaneText(t, pane, "SPIKE-HARNESS-STARTED name=[claude]")
 	server.waitForPaneText(t, pane, "SPIKE-HOP_RUN_ID=["+runID+"]")
+	server.waitForPaneText(t, pane, "SPIKE-ENV-WRITTEN")
 	server.waitForAgent(t, pane, "claude")
-	initialEnvFiles := spikeEnvFiles(t, server.workDir())
+	initialPID := foregroundClaudeProcess(server.waitForForegroundProcess(t, pane)).PID
+	if _, ok := envDumpForPID(t, server.workDir(), initialPID); !ok {
+		t.Fatalf("initial fixture env dump for pid %d not present after SPIKE-ENV-WRITTEN", initialPID)
+	}
 
 	// Record the native conversation session so Herdr's auto-restore will
 	// build a `claude --resume <sessionID>` plan for this pane.
@@ -153,67 +166,89 @@ func TestSpikeRestoreAutoRelaunchBypassesLauncher(t *testing.T) {
 
 	artifacts.save(t, "snapshot-before-restart.txt", server.snapshotDump(t))
 
-	// Graceful restart on the same roots. The old server is fully reaped
-	// before the new one starts.
+	// Graceful restart on the same roots. restart() waits for the old server to
+	// actually exit (its shutdown save completed) before the new one starts.
 	server.restart(t)
 
-	// Delayed-restore window: right after restart, before any client supplies
-	// geometry, capture what session.snapshot shows. Recorded as evidence;
-	// the exact content of this window is the point of the observation.
+	// Delayed-restore window: after restart, before any client supplies
+	// geometry, the deferred resume cannot have fired. Assert the phantom: the
+	// snapshot lists the pane as a claude agent while pane.process_info shows
+	// no live claude process. This is the ordering the design must guard
+	// against — snapshot agent presence precedes a live process.
+	var restoredPane string
+	if !waitUntil(func() bool {
+		p, ok := server.snapshotAgentPane(t, "claude")
+		if ok {
+			restoredPane = p
+		}
+		return ok
+	}) {
+		t.Fatalf("restored pane never appeared as a claude agent in the snapshot:\n%s", server.snapshotDump(t))
+	}
 	artifacts.save(t, "snapshot-delayed-restore-window.txt", server.snapshotDump(t))
+	if info, err := server.tryProcessInfo(t, restoredPane); err == nil {
+		if live := foregroundClaudeProcess(info); live != nil {
+			t.Errorf("delayed-restore window is not a phantom: a live claude process (pid %d) already runs while only the snapshot agent was expected", live.PID)
+		}
+	} // an error here means no runtime yet, which is itself the phantom
 
 	// A client supplies geometry, which is what lets the deferred resume fire.
 	client := server.attachPTYClient(t)
 	defer client.close(t)
 
-	// The relaunch happened: a NEW fixture-harness env dump appears in the
-	// worktree (a different pid from the pre-restart launch).
-	var resumedEnvFile string
+	// The relaunch happened: pane.process_info now shows a live claude process
+	// with a NEW pid, started via `claude --resume <sessionID>`.
+	var resumed spikeProcessDetails
 	if !waitUntil(func() bool {
-		for f := range spikeEnvFiles(t, server.workDir()) {
-			if !initialEnvFiles[f] {
-				resumedEnvFile = f
-				return true
-			}
+		info, err := server.tryProcessInfo(t, restoredPane)
+		if err != nil {
+			return false
 		}
-		return false
+		live := foregroundClaudeProcess(info)
+		if live == nil || live.PID == initialPID || len(live.Argv) == 0 {
+			return false
+		}
+		resumed = *live
+		return true
 	}) {
-		t.Fatalf("auto-restore never relaunched the harness; snapshot:\n%s", server.snapshotDump(t))
+		t.Fatalf("auto-restore never relaunched a new claude process; snapshot:\n%s", server.snapshotDump(t))
 	}
 	artifacts.save(t, "snapshot-after-relaunch.txt", server.snapshotDump(t))
+	artifacts.save(t, "resumed-process.txt", renderProcessInfo(server.processInfo(t, restoredPane)))
 
-	content, err := os.ReadFile(resumedEnvFile) //nolint:gosec // G304: a path under this test's own worktree.
-	if err != nil {
-		t.Fatalf("read resumed env dump: %v", err)
+	// Exact resume argv: `<claude> --resume <sessionID>` — the launch bypassed
+	// any HOP launcher and used Herdr's native resume command.
+	if base := filepath.Base(resumed.Argv[0]); base != "claude" {
+		t.Errorf("resumed argv[0] basename = %q, want claude; argv=%q", base, resumed.Argv)
 	}
-	environ := string(content)
-	artifacts.save(t, "resumed-environ.txt", environ)
+	if len(resumed.Argv) < 3 || resumed.Argv[1] != "--resume" || resumed.Argv[2] != sessionID {
+		t.Errorf("resumed argv = %q, want [claude --resume %s]", resumed.Argv, sessionID)
+	}
 
-	// The resumed process was started via `claude --resume <sessionID>` — its
-	// argv carries the resume flag, and its environment carries HERDR_* but
-	// NOT the creation-time additive HOP_RUN_ID.
-	if !strings.Contains(environ, "HERDR_PANE_ID=") {
-		t.Errorf("resumed process environment lacks HERDR_ identity vars:\n%s", environ)
+	// The relaunched process's environment, correlated by its pid: HERDR_*
+	// identity present, but the creation-time additive HOP_RUN_ID dropped.
+	env := server.waitForEnvDump(t, server.workDir(), resumed.PID)
+	artifacts.save(t, "resumed-environ.txt", renderEnv(env))
+	if env["HERDR_PANE_ID"] == "" {
+		t.Errorf("resumed process environment lacks HERDR_PANE_ID: %v", env)
 	}
-	if strings.Contains(environ, "HOP_RUN_ID="+runID) {
-		t.Errorf("resumed process unexpectedly kept the additive HOP_RUN_ID=%s; auto-restore was expected to drop it\n%s", runID, environ)
+	if _, present := env["HOP_RUN_ID"]; present {
+		t.Errorf("resumed process kept the additive HOP_RUN_ID=%q; auto-restore was expected to drop it", env["HOP_RUN_ID"])
 	}
 }
 
-// spikeEnvFiles returns the set of fixture env-dump files currently in dir.
-func spikeEnvFiles(t *testing.T, dir string) map[string]bool {
-	t.Helper()
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatalf("read worktree dir: %v", err)
+// renderEnv formats a parsed env map deterministically for evidence files.
+func renderEnv(env map[string]string) string {
+	names := make([]string, 0, len(env))
+	for name := range env {
+		names = append(names, name)
 	}
-	files := map[string]bool{}
-	for _, entry := range entries {
-		if strings.HasPrefix(entry.Name(), "spike-env-") {
-			files[filepath.Join(dir, entry.Name())] = true
-		}
+	sort.Strings(names)
+	var out strings.Builder
+	for _, name := range names {
+		out.WriteString(name + "=" + env[name] + "\n")
 	}
-	return files
+	return out.String()
 }
 
 // snapshotDump renders session.snapshot's tabs and panes for evidence files.
@@ -250,7 +285,7 @@ func (s *testServer) snapshotDump(t *testing.T) string {
 	}
 	out.WriteString("agents:\n")
 	for _, agent := range result.Snapshot.Agents {
-		out.WriteString("  " + agent.PaneID + " agent=" + agent.Agent + "\n")
+		fmt.Fprintf(&out, "  %s agent=%s launch_pending=%t\n", agent.PaneID, agent.Agent, agent.LaunchPending)
 	}
 	return out.String()
 }

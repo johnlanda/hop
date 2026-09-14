@@ -1,7 +1,6 @@
 package integration
 
 import (
-	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -30,7 +29,10 @@ func forbiddenClaudeEnv() []string {
 // HOP_LIVE_HARNESS=1 (the same gate the Phase 2 live test uses) and never in
 // the normal suite, and it also skips when no claude binary is installed. Even
 // opted in it runs claude only in print mode against a credential-free scratch
-// profile, so it contacts no provider.
+// profile: it proves credential-free invocation, not offline execution — a
+// real binary may still attempt telemetry/update/auth-discovery traffic, which
+// this test does not measure or block. The opt-in gate is what keeps such
+// traffic out of the normal suite.
 func requireClaude(t *testing.T) string {
 	t.Helper()
 	if os.Getenv("HOP_LIVE_HARNESS") != "1" {
@@ -56,10 +58,12 @@ func requireClaude(t *testing.T) string {
 //   - an unknown UUID fails with "No conversation found", proving the lookup
 //     is real and scoped to the profile.
 //
-// Progressing to the not-logged-in error is the success signal: the profile
-// is empty of credentials and no provider is ever contacted. The exact claude
-// version is recorded; this result is evidence for that version only and
-// carries version-drift risk.
+// Progressing to the not-logged-in error is the success signal: the profile is
+// empty of credentials, so the invocation is credential-free. That is not a
+// proof of zero network traffic — a real binary may still emit telemetry or
+// update/auth-discovery requests — which is why S4 is opt-in and never runs in
+// the normal suite. The exact claude version is recorded; this result is
+// evidence for that version only and carries version-drift risk.
 func TestSpikeClaudePreassignedSessionID(t *testing.T) {
 	claude := requireClaude(t)
 
@@ -124,19 +128,16 @@ func TestSpikeClaudePreassignedSessionID(t *testing.T) {
 }
 
 // runClaude runs the installed claude with the sanitized environment and cwd,
-// returning combined output. A non-zero exit (print-mode not-logged-in exits
-// 0 on the probed version, but this stays tolerant) is not itself a failure;
-// the assertions read the output.
+// returning combined output. It runs the harness as its own process group with
+// a bounded lifecycle (runInOwnedGroup), so a stray child cannot outlive the
+// probe or hold its output open. A non-zero exit (print-mode not-logged-in
+// exits 0 or 1 depending on flags) is not itself a failure; the assertions
+// read the output. A timeout is fatal.
 func runClaude(t *testing.T, claude string, env []string, dir string, args ...string) string {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, claude, args...) //nolint:gosec // G204: the installed claude under test, with arguments chosen by this suite.
-	cmd.Env = env
-	cmd.Dir = dir
-	out, err := cmd.CombinedOutput()
-	if ctx.Err() != nil {
-		t.Fatalf("claude %v timed out: %v\n%s", args, ctx.Err(), out)
+	out, timedOut, err := runInOwnedGroup(t, 60*time.Second, claude, env, dir, args...)
+	if timedOut {
+		t.Fatalf("claude %v timed out\n%s", args, out)
 	}
 	if err != nil {
 		// Record but do not fail: the not-logged-in path is the expected

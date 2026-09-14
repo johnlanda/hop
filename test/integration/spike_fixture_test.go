@@ -3,40 +3,45 @@ package integration
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
 
 // The TestSpike* tests are the Phase 2 capability spike: they establish, with
 // executed evidence against a disposable server, the Herdr capabilities the
-// Phase 2 design depends on but nobody had verified. Each test states the
-// spike item it answers; the verdicts are collected in FINDINGS.md at the
-// repository root while the spike branch is under review.
+// Phase 2 design depends on. Each test states the spike item it answers; the
+// verdicts and evidence index live in FINDINGS.md at the repository root.
 
 // spikeFixtureSource is the fixture program the spike compiles. One binary
 // serves every role, switching on its own basename:
 //
-//   - launch-standin: the stand-in for the future `hop launch` sanitizing
+//   - launch-standin: stands in for the future `hop launch` sanitizing
 //     launcher. It takes --harness <path> and replaces itself with that
-//     program via execve, passing the remaining arguments through, exactly
-//     as the real launcher will replace itself with the harness.
-//   - any other name (the spike installs it as `claude` and as
-//     `standin-harness`): the stand-in for a native harness process. It
-//     prints marker lines carrying its name, pid, argv and the HOP_*
-//     variables it inherited, optionally dumps its complete environment to
-//     the file named by HOP_SPIKE_ENV_FILE, and then reads stdin line by
-//     line until the line SPIKE-QUIT or end of input, so it stays the pane's
-//     live foreground process until the test ends it.
+//     program via execve, passing the remaining arguments through.
+//   - any other name (installed as `claude` and as `standin-harness`): stands
+//     in for a native harness process. It prints marker lines carrying its
+//     name, pid, argv and the HOP_* variables it inherited, then writes its
+//     complete environment atomically (write-temp-then-rename) to a pid-named
+//     file in its working directory and to HOP_SPIKE_ENV_FILE when set, prints
+//     SPIKE-ENV-WRITTEN once the dump is durably in place, and reads stdin
+//     until SPIKE-QUIT / SPIKE-QUIT-FAIL / EOF so it stays the pane's live
+//     foreground process until the test ends it. The rename makes a reader
+//     that keys on the marker see a complete file, never a partial write.
 //
-// A copy installed as `claude` matches Herdr's process-name detection for
-// the claude agent kind; the `standin-harness` copy is the control that no
-// unrecognized name is ever detected. Neither is the real harness and no
-// network or credential is involved.
+// A copy installed as `claude` matches Herdr's process-name detection for the
+// claude agent kind; `standin-harness` is the control that an unrecognized
+// name is never detected. Neither is a real harness; no network or credential
+// is involved. The recognized-name copy is invoked by absolute path, except
+// where a test deliberately puts its directory on a pane shell's PATH so a
+// bare `claude` (as agent.start or Herdr's own resume command types it)
+// resolves to the fixture.
 const spikeFixtureSource = `package main
 
 import (
@@ -80,6 +85,14 @@ func launchStandin() {
 	}
 }
 
+func writeEnvDumpAtomic(path string, dump []byte) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, dump, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
 func harness() {
 	name := filepath.Base(os.Args[0])
 	fmt.Printf("SPIKE-HARNESS-STARTED name=[%s] pid=[%d]\n", name, os.Getpid())
@@ -90,16 +103,23 @@ func harness() {
 	environ := os.Environ()
 	sort.Strings(environ)
 	dump := []byte(strings.Join(environ, "\n") + "\n")
-	// Always dump the environment to a pid-named file in the working
-	// directory, so a test can inspect the environment of a process it did
-	// not itself launch (the restore path relaunches the harness). Also honor
-	// an explicit path when set.
+	// Dump the environment atomically to a pid-named file in the working
+	// directory, so a test can inspect the environment of a process it did not
+	// itself launch (the restore path relaunches the harness) and correlate it
+	// by pid. Honor an explicit path too. The SPIKE-ENV-WRITTEN marker is
+	// printed only after the rename, so a reader that waits for it sees the
+	// complete dump.
 	if cwd, err := os.Getwd(); err == nil {
-		_ = os.WriteFile(filepath.Join(cwd, fmt.Sprintf("spike-env-%d.txt", os.Getpid())), dump, 0o600)
+		if err := writeEnvDumpAtomic(filepath.Join(cwd, fmt.Sprintf("spike-env-%d.txt", os.Getpid())), dump); err != nil {
+			fmt.Printf("SPIKE-ENV-ERROR=[%v]\n", err)
+		}
 	}
 	if envFile := os.Getenv("HOP_SPIKE_ENV_FILE"); envFile != "" {
-		_ = os.WriteFile(envFile, dump, 0o600)
+		if err := writeEnvDumpAtomic(envFile, dump); err != nil {
+			fmt.Printf("SPIKE-ENV-ERROR=[%v]\n", err)
+		}
 	}
+	fmt.Printf("SPIKE-ENV-WRITTEN pid=[%d]\n", os.Getpid())
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
 		switch strings.TrimSpace(scanner.Text()) {
@@ -120,9 +140,10 @@ type spikeFixtures struct {
 }
 
 // buildSpikeFixtures compiles the fixture program once into a temporary
-// module and installs the binary under each fixture name. The binaries are
-// invoked by absolute path only; the recognized-name copy is never placed on
-// any PATH.
+// module and installs the binary under each fixture name. Tests invoke the
+// binaries by absolute path; a test that needs a bare `claude` to resolve to
+// the fixture (S3's Herdr resume command, S5's agent.start) puts the fixture
+// directory on that pane shell's PATH through the test's own scratch rc files.
 func buildSpikeFixtures(t *testing.T) spikeFixtures {
 	t.Helper()
 	dir, err := os.MkdirTemp("", "hop-spike")
@@ -175,6 +196,62 @@ func copyExecutable(t *testing.T, from, to string) {
 	}
 }
 
+// runInOwnedGroup runs a command as its own process-group leader with a
+// bounded lifecycle, and after it returns confirms the whole group is gone. It
+// gives a real external binary (S4's claude, and the self-test's fixture
+// leader) an owned teardown: on the context deadline cmd.Cancel SIGKILLs the
+// whole group so a descendant cannot outlive the leader or hold the output
+// pipe open, and WaitDelay bounds pipe draining so CombinedOutput cannot block
+// indefinitely. It returns the combined output, the run error, and whether the
+// deadline fired.
+func runInOwnedGroup(t *testing.T, timeout time.Duration, name string, env []string, dir string, args ...string) (out []byte, timedOut bool, err error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...) //nolint:gosec // G204: the binary and arguments are chosen by this suite.
+	cmd.Env = env
+	cmd.Dir = dir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.WaitDelay = 10 * time.Second
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		// Setpgid made the child a group leader (pgid == pid); signal the whole
+		// group so descendants die with it. The leader is still unreaped here
+		// (Wait has not returned), so the pgid cannot have been recycled.
+		if killErr := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); killErr != nil && !errors.Is(killErr, syscall.ESRCH) {
+			return killErr
+		}
+		return nil
+	}
+	out, err = cmd.CombinedOutput()
+	timedOut = ctx.Err() != nil
+	// After CombinedOutput the leader is reaped; confirm no descendant (which
+	// would have been reparented to init) survives holding the group open.
+	if cmd.Process != nil {
+		pgid := cmd.Process.Pid
+		if safeToSignalGroup(pgid, syscall.Getpgrp()) {
+			if !waitUntil(func() bool { return errors.Is(syscall.Kill(-pgid, 0), syscall.ESRCH) }) {
+				t.Errorf("owned process group %d still had members after teardown", pgid)
+			}
+		}
+	}
+	return out, timedOut, err
+}
+
+// requireShell skips the calling test with an explicit reason when the given
+// shell is not an executable file on this host, so a capability case for a
+// shell that is not installed (for example /bin/zsh on a minimal Linux runner)
+// is reported as not-run rather than failing.
+func requireShell(t *testing.T, shell string) {
+	t.Helper()
+	info, err := os.Stat(shell)
+	if err != nil || info.IsDir() || info.Mode().Perm()&0o111 == 0 {
+		t.Skipf("shell capability skipped, not run: %s is not an executable shell on this host (%v)", shell, err)
+	}
+}
+
 // newSpikeUUID returns a random canonical UUIDv4 string, so spike launches
 // carry unique run/attempt identities without any new dependency.
 func newSpikeUUID(t *testing.T) string {
@@ -220,6 +297,81 @@ func (s *testServer) processInfo(t *testing.T, paneID string) spikeProcessInfo {
 	return result.ProcessInfo
 }
 
+// tryProcessInfo reads pane.process_info without failing the test, so a caller
+// can inspect a pane that may have no live runtime yet (the delayed-restore
+// window, where the pane exists in the snapshot but its shell is not spawned).
+func (s *testServer) tryProcessInfo(t *testing.T, paneID string) (spikeProcessInfo, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), callTimeout)
+	defer cancel()
+	var result struct {
+		ProcessInfo spikeProcessInfo `json:"process_info"`
+	}
+	err := s.client.Call(ctx, "pane.process_info", map[string]any{"pane_id": paneID}, &result)
+	return result.ProcessInfo, err
+}
+
+// envDumpForPID reads and parses one fixture env dump (spike-env-<pid>.txt)
+// into a name→value map, reporting whether the file exists. The fixture writes
+// the file atomically, so a present file is complete.
+func envDumpForPID(t *testing.T, dir string, pid uint32) (map[string]string, bool) {
+	t.Helper()
+	content, err := os.ReadFile(filepath.Join(dir, fmt.Sprintf("spike-env-%d.txt", pid))) //nolint:gosec // G304: a pid-named file under this test's own worktree.
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, false
+		}
+		t.Fatalf("read env dump for pid %d: %v", pid, err)
+	}
+	env := map[string]string{}
+	for _, line := range strings.Split(string(content), "\n") {
+		if name, value, ok := strings.Cut(line, "="); ok {
+			env[name] = value
+		}
+	}
+	return env, true
+}
+
+// waitForEnvDump waits until the fixture's atomic env dump for pid exists and
+// returns its parsed contents.
+func (*testServer) waitForEnvDump(t *testing.T, dir string, pid uint32) map[string]string {
+	t.Helper()
+	var env map[string]string
+	if !waitUntil(func() bool {
+		var ok bool
+		env, ok = envDumpForPID(t, dir, pid)
+		return ok
+	}) {
+		t.Fatalf("fixture env dump for pid %d never appeared in %s", pid, dir)
+	}
+	return env
+}
+
+// snapshotAgentPane returns the pane id that session.snapshot lists with the
+// given agent label, and whether exactly one such pane exists.
+func (s *testServer) snapshotAgentPane(t *testing.T, agent string) (string, bool) {
+	t.Helper()
+	var result struct {
+		Snapshot struct {
+			Agents []struct {
+				PaneID string `json:"pane_id"`
+				Agent  string `json:"agent"`
+			} `json:"agents"`
+		} `json:"snapshot"`
+	}
+	s.call(t, "session.snapshot", nil, &result)
+	found := ""
+	for _, a := range result.Snapshot.Agents {
+		if a.Agent == agent {
+			if found != "" {
+				return "", false
+			}
+			found = a.PaneID
+		}
+	}
+	return found, found != ""
+}
+
 // renderProcessInfo formats a process-info result for evidence files.
 func renderProcessInfo(info spikeProcessInfo) string {
 	var out strings.Builder
@@ -232,11 +384,12 @@ func renderProcessInfo(info spikeProcessInfo) string {
 	return out.String()
 }
 
-// foregroundProcessNamed returns the foreground process with the given name,
-// or nil.
-func foregroundProcessNamed(info spikeProcessInfo, name string) *spikeProcessDetails {
+// foregroundClaudeProcess returns the pane's foreground process whose name is
+// the recognized "claude" harness name, or nil. Every spike that inspects a
+// foreground process is looking for the fixture harness under that name.
+func foregroundClaudeProcess(info spikeProcessInfo) *spikeProcessDetails {
 	for i := range info.ForegroundProcesses {
-		if info.ForegroundProcesses[i].Name == name {
+		if info.ForegroundProcesses[i].Name == "claude" {
 			return &info.ForegroundProcesses[i]
 		}
 	}
@@ -284,10 +437,13 @@ func (s *testServer) waitForAgent(t *testing.T, paneID, agent string) spikeAgent
 }
 
 // waitForShellReady polls pane.process_info until the pane's own login shell
-// is the sole foreground process — its startup files have finished and no
-// child is running — which is the condition Herdr's agent.start requires to
-// treat the pane as an available shell (repos/herdr/src/platform/mod.rs:301
-// available_pane_shell_from_job). It fails on timeout with the last info.
+// is observed as the sole foreground process (nonzero shell pid, foreground
+// group equal to it, exactly one foreground process whose pid is the shell),
+// which is the condition Herdr's agent.start requires to treat the pane as an
+// available shell (repos/herdr/src/platform/mod.rs:301
+// available_pane_shell_from_job). Inspection is not atomic with the later
+// agent.start, so this is a readiness observation, not a guarantee. It fails
+// on timeout with the last info.
 func (s *testServer) waitForShellReady(t *testing.T, paneID string) {
 	t.Helper()
 	var last spikeProcessInfo

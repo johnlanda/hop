@@ -68,9 +68,9 @@ func TestSpikeLayoutApplyCommandPane(t *testing.T) {
 	// The pane process is the argv itself, carrying the additive env.
 	server.waitForPaneText(t, pane, "SPIKE-HARNESS-STARTED name=[claude]")
 	server.waitForPaneText(t, pane, "SPIKE-HOP_RUN_ID=["+runID+"]")
-	info := server.waitForForegroundProcess(t, pane, "claude")
+	info := server.waitForForegroundProcess(t, pane)
 	artifacts.save(t, "layout-pane-process-info.txt", renderProcessInfo(info))
-	process := foregroundProcessNamed(info, "claude")
+	process := foregroundClaudeProcess(info)
 	if got := strings.Join(process.Argv, " "); got != fixtures.claude+" --run "+runID {
 		t.Errorf("pane process argv = %q, want exactly the layout command", got)
 	}
@@ -123,14 +123,17 @@ func TestSpikeLayoutApplyCommandPane(t *testing.T) {
 
 // TestSpikeLayoutApplyAddsTabToExistingWorkspace is the S6 follow-up: on a
 // workspace that already holds tabs and panes, layout.apply with only a
-// workspace_id ADDS one new tab containing the command pane and leaves every
-// pre-existing tab and pane untouched — it does not replace the workspace
-// layout. (Replacement happens only when the request names a tab_id; the
-// handler closes exactly that tab — repos/herdr/src/app/api/layouts.rs.)
-// It also records what a non-zero command exit looks like: the pane closes
-// exactly as on a clean exit, pane.exited and pane.closed fire, and neither
-// event nor any snapshot field carries the exit status (the pane.exited
-// payload is only {pane_id} — repos/herdr/src/api/schema/events.rs:178-180).
+// workspace_id ADDS one new tab containing the command pane: after it, every
+// pre-existing tab and pane id still exists and exactly one tab and one pane
+// were added. This asserts id survival and the +1 counts, not that no field of
+// any pre-existing pane changed (a weaker, honest claim than "leaves every
+// pre-existing pane untouched"). Replacement happens only when the request
+// names a tab_id (the handler closes exactly that tab —
+// repos/herdr/src/app/api/layouts.rs). It also asserts the new pane runs the
+// exact command at the requested cwd, and records what a non-zero command exit
+// looks like: the pane closes exactly as on a clean exit and the pane.exited
+// payload carries no exit status (it is only {pane_id} —
+// repos/herdr/src/api/schema/events.rs:178-180).
 func TestSpikeLayoutApplyAddsTabToExistingWorkspace(t *testing.T) {
 	fixtures := buildSpikeFixtures(t)
 	artifacts := newArtifactDir(t)
@@ -187,6 +190,16 @@ func TestSpikeLayoutApplyAddsTabToExistingWorkspace(t *testing.T) {
 	}, &applied)
 	pane := applied.Layout.Root.PaneID
 	server.waitForPaneText(t, pane, "SPIKE-HARNESS-STARTED name=[claude]")
+
+	// The added pane runs exactly the requested command at the requested cwd.
+	added := server.waitForForegroundProcess(t, pane)
+	addedProcess := foregroundClaudeProcess(added)
+	if got := strings.Join(addedProcess.Argv, " "); got != fixtures.claude+" --run "+runID {
+		t.Errorf("added pane argv = %q, want exactly the layout command", got)
+	}
+	if !samePath(t, addedProcess.Cwd, server.workDir()) {
+		t.Errorf("added pane cwd = %q, want the requested %q", addedProcess.Cwd, server.workDir())
+	}
 
 	afterTabs, afterPanes := server.snapshotIDs(t)
 	artifacts.save(t, "snapshot-after-apply.txt", renderIDs(afterTabs, afterPanes))

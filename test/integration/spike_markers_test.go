@@ -31,14 +31,17 @@ func TestSpikeCreationMarkerTabLabel(t *testing.T) {
 	}
 	server.call(t, "workspace.create", map[string]any{"cwd": server.workDir(), "focus": true}, &workspace)
 
-	marker := "hop-spike-tab-" + newSpikeUUID(t)[:8]
+	runID := newSpikeUUID(t)
+	marker := "hop-spike-tab-" + runID[:8]
 	// The marker is chosen before creation; the response is deliberately
-	// discarded to model a controller that crashed before recording it.
+	// discarded to model a controller that crashed before recording it. The
+	// run id is retained so the rebind below can wait for output that the
+	// injected command line does not itself contain.
 	server.call(t, "tab.create", map[string]any{
 		"workspace_id": workspace.Workspace.WorkspaceID,
 		"label":        marker,
 		"focus":        true,
-		"env":          map[string]string{"HOP_RUN_ID": newSpikeUUID(t)},
+		"env":          map[string]string{"HOP_RUN_ID": runID},
 	}, &struct{}{})
 
 	// Recovery path 1: tab.list finds exactly one tab by the marker.
@@ -97,11 +100,14 @@ func TestSpikeCreationMarkerTabLabel(t *testing.T) {
 	}
 
 	// The recovered pane is live and addressable: the controller can now
-	// rebind to it.
+	// rebind to it. Wait for RECOVERED=[<runID>], the expanded output; the
+	// echoed command line contains RECOVERED=[%s] and $HOP_RUN_ID, never the
+	// run id itself, so terminal echo cannot satisfy this wait — only the
+	// shell actually running the printf can.
 	server.call(t, "pane.send_text", map[string]any{
 		"pane_id": panes[0],
 		"text":    "printf 'RECOVERED=[%s]\\n' \"$HOP_RUN_ID\"\n",
 	}, nil)
-	server.waitForPaneText(t, panes[0], "RECOVERED=[")
+	server.waitForPaneText(t, panes[0], "RECOVERED=["+runID+"]")
 	artifacts.save(t, "recovered-pane.txt", server.readPane(t, panes[0]))
 }

@@ -144,7 +144,7 @@ func sanitizeName(name string) string {
 // save writes one evidence file.
 func (a *artifactDir) save(t *testing.T, name, content string) {
 	t.Helper()
-	if err := os.WriteFile(filepath.Join(a.path, name), []byte(content), 0o600); err != nil { //nolint:gosec // G703: the path is inside this test's own artifact directory and the name is a fixed literal.
+	if err := os.WriteFile(filepath.Join(a.path, name), []byte(content), 0o600); err != nil {
 		t.Logf("save artifact %s: %v", name, err)
 	}
 }
@@ -184,12 +184,16 @@ type testServer struct {
 // process-group id captured while it was certainly alive (Setpgid made it the
 // group leader, so pgid == pid), its open log files, and whether it has been
 // reaped. pgid is never re-resolved after the reap, so a recycled pid can
-// never map this back to an unrelated group.
+// never map this back to an unrelated group. A single goroutine started at
+// launch owns the one `cmd.Wait`; it closes `exited` when the leader has
+// actually terminated, which both the graceful restart barrier and the forced
+// reap read instead of calling Wait themselves.
 type serverProcess struct {
 	cmd            *exec.Cmd
 	pgid           int
 	stdout, stderr *os.File
 	reaped         bool
+	exited         chan struct{} // closed once the wait goroutine has reaped the leader
 }
 
 // testConfig is the test-only configuration: no onboarding, fixed headless
@@ -322,13 +326,17 @@ func (s *testServer) start(t *testing.T) {
 	// leave the artifact directory behind on cleanup.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
+		// The log files were created before the failed Start; close them here so
+		// a start failure does not leak descriptors (no cleanup is registered
+		// yet at this point).
+		closeLogs(t, stdout, stderr)
 		t.Fatalf("start herdr server: %v", err)
 	}
 	// Capture the process-group id once, now, while the pid is certainly the
-	// live server. Setpgid made it a group leader, so its pgid equals its
-	// pid. The leader is never reaped until reapServer's final Wait, so this
-	// pgid cannot be reused before it is signaled.
-	sp := &serverProcess{cmd: cmd, pgid: cmd.Process.Pid, stdout: stdout, stderr: stderr}
+	// live server. Setpgid made it a group leader, so its pgid equals its pid,
+	// captured before any reap so a recycled pid can never map back to it. One
+	// goroutine owns the sole cmd.Wait and closes exited when the leader dies.
+	sp := newServerProcess(cmd, stdout, stderr)
 	s.running = append(s.running, sp)
 	t.Cleanup(func() { s.reapServer(t, sp) })
 	deadline := time.Now().Add(30 * time.Second)
@@ -349,47 +357,96 @@ func (s *testServer) start(t *testing.T) {
 	}
 }
 
+// gracefulStopTimeout bounds how long a graceful restart waits for the server
+// to actually exit after server.stop. The shutdown save of a small session is
+// fast; a server that has not exited by this deadline is treated as an
+// inconclusive restart, not a successful one.
+const gracefulStopTimeout = 20 * time.Second
+
+// newServerProcess wraps an already-started server command and launches the
+// single goroutine that owns its cmd.Wait, closing exited when the leader has
+// terminated. Both the graceful barrier and the forced reap read exited rather
+// than calling Wait, so the leader is waited on exactly once.
+func newServerProcess(cmd *exec.Cmd, stdout, stderr *os.File) *serverProcess {
+	sp := &serverProcess{cmd: cmd, pgid: cmd.Process.Pid, stdout: stdout, stderr: stderr, exited: make(chan struct{})}
+	go func() {
+		// A SIGKILLed or non-zero server exit is expected; the reap (not the
+		// error) is the point, so the Wait result is intentionally discarded.
+		_ = sp.cmd.Wait() //nolint:errcheck // the wait reaps the leader; its exit status is expected and unused
+		close(sp.exited)
+	}()
+	return sp
+}
+
+// closeLogs closes a server's log files, tolerating nil (a failed start).
+func closeLogs(t *testing.T, stdout, stderr *os.File) {
+	t.Helper()
+	if stdout != nil {
+		if err := stdout.Close(); err != nil {
+			t.Logf("close server stdout: %v", err)
+		}
+	}
+	if stderr != nil {
+		if err := stderr.Close(); err != nil {
+			t.Logf("close server stderr: %v", err)
+		}
+	}
+}
+
 // restart gracefully stops the current server and launches a fresh one on the
-// same roots, so persisted session state survives across the restart. It is
-// the S3 auto-restore scenario's setup and leaves no stray server: the old
-// leader's whole process group is reaped before the new one starts.
+// same roots, so persisted session state survives across the restart. The
+// graceful save runs only as the run loop exits (save_session_on_shutdown), so
+// restart waits for the leader to ACTUALLY exit — never merely for ping to
+// fail, which Herdr returns while it is still shutting down and before it
+// saves. If the server does not exit within the deadline the restart is
+// inconclusive: the old server is force-killed and the test fails rather than
+// treating a truncated save as restored state.
 func (s *testServer) restart(t *testing.T) {
 	t.Helper()
 	if len(s.running) == 0 {
 		t.Fatal("restart called before start")
 	}
 	current := s.running[len(s.running)-1]
-	// Ask for a graceful stop and let the server's run loop exit on its own,
-	// which is what runs save_session_on_shutdown and persists the full
-	// current state for restore. Only then reap the group. A SIGKILL before
-	// the run loop reached its shutdown save would truncate the session and
-	// restore stale state, so the graceful wait here is load-bearing, not a
-	// convenience.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	if err := s.client.Call(ctx, "server.stop", nil, nil); err != nil {
 		t.Logf("server.stop before restart: %v", err)
 	}
 	cancel()
-	if !waitUntil(func() bool {
-		pingCtx, pingCancel := context.WithTimeout(context.Background(), time.Second)
-		defer pingCancel()
-		return s.client.Call(pingCtx, "ping", nil, &struct{}{}) != nil
-	}) {
-		t.Fatal("previous server socket still answered ping after graceful stop")
+	if !awaitProcessExit(current, gracefulStopTimeout) {
+		// The server did not shut down on its own; its save may be incomplete.
+		// Force-kill and fail — restore evidence from here would be timing
+		// dependent.
+		current.reaped = true
+		s.forceReap(t, current)
+		closeLogs(t, current.stdout, current.stderr)
+		t.Fatal("herdr did not exit within the graceful-stop deadline; restore evidence would be inconclusive")
 	}
-	// The leader has exited (and saved) on its own; reap it and any lingering
-	// pane-shell descendants. server.stop is idempotent, so reapServer's own
-	// call is harmless.
-	s.reapServer(t, current)
+	// The leader exited on its own, so the shutdown save completed. It is
+	// already reaped by the wait goroutine; do not signal its (now possibly
+	// recycled) pgid. Its pane shells lose their PTY on the server's exit and
+	// terminate on their own; wait for the group to empty.
+	current.reaped = true
+	s.awaitGroupGone(t, current.pgid)
+	closeLogs(t, current.stdout, current.stderr)
 	s.start(t)
 }
 
-// reapServer asks one server for a graceful stop, then kills its whole
-// process group (reaping every pane-shell descendant that might hold artifact
-// files open) and finally reaps the leader. No goroutine reaps the leader
-// earlier, so its group is signaled while the leader is still alive or a
-// zombie — never after the pid could have been reused. It is idempotent per
-// server, so restart and the stacked cleanups never signal a group twice.
+// awaitProcessExit reports whether the server's leader terminated within the
+// timeout, observed through the wait goroutine rather than by reaping here.
+func awaitProcessExit(sp *serverProcess, timeout time.Duration) bool {
+	select {
+	case <-sp.exited:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
+// reapServer is the forced teardown used by cleanup: a best-effort graceful
+// stop, then a group SIGKILL (only while the leader is still unreaped, so the
+// pgid cannot have been recycled) and a wait for the whole group to be gone.
+// It is idempotent per server, so restart and the stacked cleanups never tear
+// one down twice.
 func (s *testServer) reapServer(t *testing.T, sp *serverProcess) {
 	t.Helper()
 	if sp.reaped {
@@ -397,16 +454,47 @@ func (s *testServer) reapServer(t *testing.T, sp *serverProcess) {
 	}
 	sp.reaped = true
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
 	if err := s.client.Call(ctx, "server.stop", nil, nil); err != nil {
 		t.Logf("server.stop: %v (falling back to the process group)", err)
 	}
-	killProcessGroupThenReap(t, sp.cmd, sp.pgid, syscall.Getpgrp())
-	if closeErr := sp.stdout.Close(); closeErr != nil {
-		t.Logf("close server stdout: %v", closeErr)
+	cancel()
+	s.forceReap(t, sp)
+	closeLogs(t, sp.stdout, sp.stderr)
+}
+
+// forceReap ensures the server and its whole process group are gone. If the
+// leader has not yet exited it SIGKILLs the group while the leader is still
+// unreaped (so the pgid cannot have been recycled), then waits for the wait
+// goroutine to reap it; if the leader already exited on its own it does not
+// signal the pgid at all (it could have been recycled), and only waits for the
+// group to drain. Either way it then confirms the group is empty.
+func (s *testServer) forceReap(t *testing.T, sp *serverProcess) {
+	t.Helper()
+	select {
+	case <-sp.exited:
+		// Already reaped by the wait goroutine; do not signal a possibly
+		// recycled pgid. Reparented descendants are drained below.
+	default:
+		if safeToSignalGroup(sp.pgid, syscall.Getpgrp()) {
+			if err := syscall.Kill(-sp.pgid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+				t.Logf("kill process group %d: %v", sp.pgid, err)
+			}
+		} else {
+			t.Errorf("refusing to signal unsafe process group %d", sp.pgid)
+		}
+		<-sp.exited
 	}
-	if closeErr := sp.stderr.Close(); closeErr != nil {
-		t.Logf("close server stderr: %v", closeErr)
+	s.awaitGroupGone(t, sp.pgid)
+}
+
+// awaitGroupGone waits until no process remains in the group: signal 0 returns
+// ESRCH only once every member, including reparented descendants, has exited
+// and been reaped. A timeout means a lingering writer could still hold artifact
+// files, so it fails the test rather than leaving that unguaranteed.
+func (*testServer) awaitGroupGone(t *testing.T, pgid int) {
+	t.Helper()
+	if !waitUntil(func() bool { return errors.Is(syscall.Kill(-pgid, 0), syscall.ESRCH) }) {
+		t.Errorf("process group %d still had members after the deadline; a descendant may still hold artifact files", pgid)
 	}
 }
 

@@ -22,14 +22,13 @@ import (
 func TestSpikeAgentStartArgvCapability(t *testing.T) {
 	artifacts := newArtifactDir(t)
 	server := prepareServer(t, artifacts)
-	// agent.start types a bare executable name into the pane shell, so the
-	// PANE SHELL's PATH decides which binary runs — and a macOS login shell
-	// runs /etc/profile's path_helper, which reorders PATH and moved the
-	// harness-stub directory behind the system directories in an earlier run
-	// of this probe (a bare `claude` resolved the system binary, which
-	// exited on an argv parse error). The test-owned .profile re-prepends
-	// the stub directory so only the stub can answer; the reordering itself
-	// is a recorded S5 finding: agent.start cannot pin WHICH binary runs.
+	// agent.start types a bare executable name into the pane shell, so the pane
+	// shell's PATH decides which binary runs. A macOS login shell's path_helper
+	// can reorder PATH so the stub directory is not first, so the test-owned
+	// .profile re-prepends it to make resolution deterministic here. That PATH
+	// resolution is not fixed by agent.start is recorded as an S5 finding in
+	// FINDINGS.md; this test only needs a deterministic resolution to assert
+	// the composed argv.
 	stubFirst := "PATH=\"" + filepath.Join(server.base, "bin") + ":$PATH\"\nexport PATH\n"
 	if err := os.WriteFile(filepath.Join(server.homeDir(), ".profile"), []byte(stubFirst), 0o600); err != nil {
 		t.Fatal(err)

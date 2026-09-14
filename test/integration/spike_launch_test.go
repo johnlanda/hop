@@ -17,19 +17,21 @@ import (
 //	exec '<launch-standin>' --harness '<fixture harness>' --run <uuid> --attempt <uuid>
 //
 // where launch-standin execve's the fixture harness, must (a) be consumed by
-// the shell even when injected immediately after pane creation, before the
-// login shell's startup files have finished, (b) survive rc startup noise,
-// (c) leave the exec'd process detected as an agent when its process name is
-// a recognized harness name, observable through both agent.list and a
-// pane.agent_status_changed event, and (d) carry the pane-creation env map
-// through the shell and both execs into the final process.
+// the shell — the injected line launches successfully despite the login
+// shell's noisy startup files, (b) leave the exec'd process detected as an
+// agent when its process name is a recognized harness name, observable through
+// both agent.list and a pane.agent_status_changed event, (c) carry the
+// pane-creation env map through the shell and both execs into the final
+// process, and (d) leave the exec'd harness holding the pane shell's own pid
+// (pid == shell_pid == foreground process group), which agent.start does not.
 //
-// Consumed versus lost is distinguished by the fixture's own marker output:
-// a consumed line replaces the shell with the harness stand-in, which prints
-// SPIKE-HARNESS-STARTED and its inherited HOP_* variables; a lost line never
-// produces the marker and pane.process_info keeps reporting the shell, and
-// the bounded wait fails with the pane snapshot as evidence. The injected
-// line is never retyped.
+// This does not claim the line arrives strictly before rc completion; a slow
+// runner could inject after the rc sleep. The claim is the weaker, sufficient
+// one: injection into a fresh pane succeeds even with noisy startup. Consumed
+// versus lost is distinguished by the fixture's own marker output: a consumed
+// line execs the harness stand-in, which prints SPIKE-HARNESS-STARTED; a lost
+// line never produces the marker and the bounded wait fails with the pane
+// snapshot. The injected line is never retyped.
 func TestSpikeLaunchLineDetection(t *testing.T) {
 	fixtures := buildSpikeFixtures(t)
 
@@ -38,11 +40,10 @@ func TestSpikeLaunchLineDetection(t *testing.T) {
 		// shell is the SHELL every pane login shell uses.
 		shell string
 		// rcFiles maps home-relative startup files to contents written
-		// before the server starts, to make rc startup noisy and slow. The
-		// sleep inside the rc file is scenario construction — it widens the
-		// window in which the injected line arrives before the prompt — not
-		// test synchronization; every assertion still polls bounded
-		// conditions.
+		// before the server starts, to make rc startup noisy and slow, so the
+		// launch is exercised against a shell that is not instantly idle. The
+		// sleep is scenario construction, not a synchronization barrier; every
+		// assertion still polls a bounded condition.
 		rcFiles map[string]string
 		// rcMarkers must all appear in the pane, proving the noisy rc files
 		// really ran in this pane's shell.
@@ -64,6 +65,7 @@ func TestSpikeLaunchLineDetection(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			requireShell(t, tc.shell)
 			artifacts := newArtifactDir(t)
 			server := prepareServer(t, artifacts)
 			server.shell = tc.shell
@@ -130,7 +132,7 @@ func TestSpikeLaunchLineDetection(t *testing.T) {
 			// visible.
 			info := server.processInfo(t, pane)
 			artifacts.save(t, "process-info-after-launch.txt", renderProcessInfo(info))
-			process := foregroundProcessNamed(info, "claude")
+			process := foregroundClaudeProcess(info)
 			if process == nil {
 				t.Fatalf("no foreground process named claude after the launch:\n%s", renderProcessInfo(info))
 			}
@@ -138,16 +140,23 @@ func TestSpikeLaunchLineDetection(t *testing.T) {
 				t.Errorf("foreground argv %q does not carry the launch identity --run %s", process.Argv, runID)
 			}
 
-			// Record the pid relationship the RuntimeBinding design needs:
-			// how the reported shell_pid, the foreground process group and
-			// the pid of a process that execve'd inside the pane shell
-			// relate under this shell.
+			// The pid relationship the RuntimeBinding design depends on: a
+			// process that execve'd inside the top-level pane shell keeps the
+			// shell's own pid, so pid == shell_pid == foreground process group.
+			// This is asserted, not merely logged, because the design relies on
+			// it (an exec'd launcher is indistinguishable from the pane shell by
+			// pid; only its argv identifies it).
 			relationship := fmt.Sprintf(
-				"shell=%s shell_pid=%d foreground_pgid=%d harness_pid=%d shell_pid_equals_harness_pid=%t harness_pid_equals_foreground_pgid=%t\n",
-				tc.shell, info.ShellPID, info.ForegroundProcessGroup, process.PID,
-				info.ShellPID == process.PID, process.PID == info.ForegroundProcessGroup)
+				"shell=%s shell_pid=%d foreground_pgid=%d harness_pid=%d\n",
+				tc.shell, info.ShellPID, info.ForegroundProcessGroup, process.PID)
 			t.Log(relationship)
 			artifacts.save(t, "pid-relationship.txt", relationship)
+			if process.PID != info.ShellPID {
+				t.Errorf("exec'd harness pid %d != shell_pid %d; an exec in the pane shell should keep the shell pid", process.PID, info.ShellPID)
+			}
+			if process.PID != info.ForegroundProcessGroup {
+				t.Errorf("exec'd harness pid %d != foreground process group %d", process.PID, info.ForegroundProcessGroup)
+			}
 		})
 	}
 }

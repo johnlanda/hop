@@ -31,10 +31,10 @@ func TestSpikePaneProcessIdentity(t *testing.T) {
 		"text":    "'" + fixtures.claude + "' --attempt " + firstAttempt + "\n",
 	}, nil)
 	server.waitForPaneText(t, pane, "SPIKE-ARGS=[--attempt "+firstAttempt+"]")
-	first := server.waitForForegroundProcess(t, pane, "claude")
+	first := server.waitForForegroundProcess(t, pane)
 	artifacts.save(t, "process-info-first-occupant.txt", renderProcessInfo(first))
 
-	firstProcess := foregroundProcessNamed(first, "claude")
+	firstProcess := foregroundClaudeProcess(first)
 	if firstProcess == nil {
 		t.Fatalf("no foreground claude process for the first occupant:\n%s", renderProcessInfo(first))
 	}
@@ -65,7 +65,7 @@ func TestSpikePaneProcessIdentity(t *testing.T) {
 	// shell is the foreground again.
 	server.call(t, "pane.send_text", map[string]any{"pane_id": pane, "text": "SPIKE-QUIT\n"}, nil)
 	if !waitUntil(func() bool {
-		return foregroundProcessNamed(server.processInfo(t, pane), "claude") == nil
+		return foregroundClaudeProcess(server.processInfo(t, pane)) == nil
 	}) {
 		t.Fatal("first occupant never exited after SPIKE-QUIT")
 	}
@@ -76,10 +76,10 @@ func TestSpikePaneProcessIdentity(t *testing.T) {
 		"text":    "'" + fixtures.claude + "' --attempt " + secondAttempt + "\n",
 	}, nil)
 	server.waitForPaneText(t, pane, "SPIKE-ARGS=[--attempt "+secondAttempt+"]")
-	second := server.waitForForegroundProcess(t, pane, "claude")
+	second := server.waitForForegroundProcess(t, pane)
 	artifacts.save(t, "process-info-second-occupant.txt", renderProcessInfo(second))
 
-	secondProcess := foregroundProcessNamed(second, "claude")
+	secondProcess := foregroundClaudeProcess(second)
 	if secondProcess == nil {
 		t.Fatalf("no foreground claude process for the second occupant:\n%s", renderProcessInfo(second))
 	}
@@ -101,22 +101,22 @@ func TestSpikePaneProcessIdentity(t *testing.T) {
 	}
 }
 
-// waitForForegroundProcess polls pane.process_info until a foreground
-// process with the given name is reported with a populated argv, then
-// returns the full info; it fails on timeout with the last state. Waiting on
-// the marker text alone is not enough: the process table sampling is
-// asynchronous to the pane output.
-func (s *testServer) waitForForegroundProcess(t *testing.T, paneID, name string) spikeProcessInfo {
+// waitForForegroundProcess polls pane.process_info until the fixture harness
+// (the recognized "claude" process name) is a foreground process with a
+// populated argv, then returns the full info; it fails on timeout with the
+// last state. Waiting on the marker text alone is not enough: the process
+// table sampling is asynchronous to the pane output.
+func (s *testServer) waitForForegroundProcess(t *testing.T, paneID string) spikeProcessInfo {
 	t.Helper()
 	var last spikeProcessInfo
 	found := waitUntil(func() bool {
 		last = s.processInfo(t, paneID)
-		process := foregroundProcessNamed(last, name)
+		process := foregroundClaudeProcess(last)
 		return process != nil && len(process.Argv) > 0
 	})
 	if !found {
-		t.Fatalf("pane %s never reported a foreground process named %q with argv; last:\n%s",
-			paneID, name, renderProcessInfo(last))
+		t.Fatalf("pane %s never reported a foreground claude process with argv; last:\n%s",
+			paneID, renderProcessInfo(last))
 	}
 	return last
 }
