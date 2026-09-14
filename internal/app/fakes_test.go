@@ -329,6 +329,30 @@ func (s *fakeStore) LoadRunStatus(_ context.Context, runID identity.RunID) (app.
 			detail.Artifacts = append(detail.Artifacts, artifact)
 		}
 	}
+	var newestCheck *app.Operation
+	for id := range s.Operations {
+		op := s.Operations[id]
+		if op.RunID != runID || op.Kind != app.OpCheckRun {
+			continue
+		}
+		if newestCheck == nil || op.CreatedAt.After(newestCheck.CreatedAt) {
+			c := op
+			newestCheck = &c
+		}
+	}
+	if newestCheck != nil {
+		summary := app.CheckExecutionSummary{OperationID: newestCheck.ID, State: newestCheck.State}
+		if outcome, ok := decodeCheckOutcome(newestCheck.Outcome); ok {
+			summary.Unknown = outcome.Unknown
+			summary.Detail = outcome.Detail
+		}
+		for _, artifact := range detail.Artifacts {
+			if artifact.Kind == run.ArtifactCheckStdout || artifact.Kind == run.ArtifactCheckStderr || artifact.Kind == run.ArtifactPaneSnapshot {
+				summary.EvidencePaths = append(summary.EvidencePaths, artifact.Path)
+			}
+		}
+		detail.LastCheck = &summary
+	}
 	if len(s.Submissions) > 0 {
 		last := s.Submissions[len(s.Submissions)-1]
 		detail.LastSubmission = &last
@@ -460,6 +484,29 @@ func (s *fakeStore) pendingIntentLocked(attemptID identity.AttemptID) (identity.
 		}
 	}
 	return newestInc, newestSess, found
+}
+
+// checkOutcomeFields are the check outcome JSON keys the fake's status
+// read model surfaces.
+type checkOutcomeFields struct {
+	Unknown bool   `json:"unknown"`
+	Detail  string `json:"detail"`
+}
+
+// decodeCheckOutcome reads a persisted check outcome payload generically.
+func decodeCheckOutcome(payload any) (checkOutcomeFields, bool) {
+	if payload == nil {
+		return checkOutcomeFields{}, false
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return checkOutcomeFields{}, false
+	}
+	var fields checkOutcomeFields
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return checkOutcomeFields{}, false
+	}
+	return fields, true
 }
 
 // paneOpenIntentFields are the stable pane.open intent JSON keys the store

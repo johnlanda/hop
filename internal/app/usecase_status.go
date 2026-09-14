@@ -37,6 +37,16 @@ type RunDetailView struct {
 	PendingOps     int
 	LastSubmission string // the last submission outcome's kind; "" when none
 	Artifacts      []string
+	// LastCheckOperation names the newest check execution; "" when none ran.
+	LastCheckOperation string
+	LastCheckState     string
+	LastCheckUnknown   bool
+	LastCheckDetail    string
+	LastCheckEvidence  []string
+	// LastCheckOptions spells the human's options for an unknown outcome
+	// (docs/plan/phase-2-design.md sections 7-8): rerun after inspection is
+	// a human decision, never an automatic one.
+	LastCheckOptions string
 }
 
 // StatusResult is Status's success value: exactly one of Runs (the -run-less
@@ -95,6 +105,16 @@ func runDetailView(d RunDetail) RunDetailView { //nolint:gocritic // hugeParam: 
 	}
 	if d.LastSubmission != nil {
 		view.LastSubmission = string(d.LastSubmission.Kind)
+	}
+	if d.LastCheck != nil {
+		view.LastCheckOperation = d.LastCheck.OperationID.String()
+		view.LastCheckState = string(d.LastCheck.State)
+		view.LastCheckUnknown = d.LastCheck.Unknown
+		view.LastCheckDetail = d.LastCheck.Detail
+		view.LastCheckEvidence = d.LastCheck.EvidencePaths
+		if d.LastCheck.Unknown {
+			view.LastCheckOptions = "inspect the retained evidence, then rerun the check through hop resume (a human decision, never automatic), or hop stop the run"
+		}
 	}
 	for _, a := range d.Artifacts {
 		view.Artifacts = append(view.Artifacts, a.Path)

@@ -63,13 +63,15 @@ func TestClaimAndRunCheck(t *testing.T) {
 		}
 	})
 
-	t.Run("failing check fails Run, Task and Attempt, never completes", func(t *testing.T) {
+	t.Run("failing check fails Run, Task and Attempt, never completes, and retains its evidence", func(t *testing.T) {
 		tc := newTestController(defaultPolicy())
 		handle, detail := runningRun(t, tc)
 		if _, err := tc.Controller.SubmitResult(context.Background(), defaultSubmitRequest(detail)); err != nil {
 			t.Fatalf("SubmitResult() error = %v", err)
 		}
-		tc.Commands.CheckExecExitCode = 1
+		tc.Commands.CheckExecFn = func(_ context.Context, _ app.Command) (app.CommandResult, error) {
+			return app.CommandResult{ExitCode: 1, Stdout: []byte("check output"), Stderr: []byte("check failure")}, nil
+		}
 
 		report, err := tc.Controller.ClaimAndRunCheck(context.Background(), handle, "/usr/local/bin/hop", nil)
 		if err != nil {
@@ -85,6 +87,72 @@ func TestClaimAndRunCheck(t *testing.T) {
 		}
 		if updated.State != run.RunFailed || updated.TaskState != run.TaskFailed || updated.AttemptState != run.AttemptFailed {
 			t.Fatalf("Run/Task/Attempt = %s/%s/%s, want all failed", updated.State, updated.TaskState, updated.AttemptState)
+		}
+
+		// The stdout/stderr evidence outlives the failure: files written
+		// through the ArtifactStore, result-linked rows with digests, and a
+		// status summary naming the execution and its evidence.
+		var stdoutRows, stderrRows int
+		for _, artifact := range updated.Artifacts {
+			switch artifact.Kind {
+			case run.ArtifactCheckStdout:
+				stdoutRows++
+				if artifact.ResultID == nil || artifact.Digest == "" {
+					t.Fatalf("stdout artifact is not result-linked with a digest: %+v", artifact)
+				}
+				content, readErr := tc.Artifacts.ReadArtifact(context.Background(), artifact.Path)
+				if readErr != nil || string(content) != "check output" {
+					t.Fatalf("stdout evidence = %q (err %v), want the captured output", content, readErr)
+				}
+			case run.ArtifactCheckStderr:
+				stderrRows++
+			}
+		}
+		if stdoutRows != 1 || stderrRows != 1 {
+			t.Fatalf("stdout/stderr artifact rows = %d/%d, want 1/1", stdoutRows, stderrRows)
+		}
+		if updated.LastCheck == nil || updated.LastCheck.OperationID.String() != report.OperationID {
+			t.Fatalf("status does not name the check execution: %+v", updated.LastCheck)
+		}
+		if len(updated.LastCheck.EvidencePaths) < 2 {
+			t.Fatalf("status names %d evidence paths, want the retained stdout and stderr", len(updated.LastCheck.EvidencePaths))
+		}
+
+		view, err := tc.Controller.Status(context.Background(), app.StatusRequest{RepositoryRoot: "/repo", RunID: detail.RunID.String()})
+		if err != nil {
+			t.Fatalf("Status() error = %v", err)
+		}
+		if view.Detail == nil || view.Detail.LastCheckOperation != report.OperationID {
+			t.Fatalf("status view does not name the check execution")
+		}
+	})
+
+	t.Run("the tree object id is frozen into the check intent", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		handle, detail := runningRun(t, tc)
+		if _, err := tc.Controller.SubmitResult(context.Background(), defaultSubmitRequest(detail)); err != nil {
+			t.Fatalf("SubmitResult() error = %v", err)
+		}
+		if _, err := tc.Controller.ClaimAndRunCheck(context.Background(), handle, "/usr/local/bin/hop", nil); err != nil {
+			t.Fatalf("ClaimAndRunCheck() error = %v", err)
+		}
+		found := false
+		for id := range tc.Store.Operations {
+			op := tc.Store.Operations[id]
+			if op.Kind != app.OpCheckRun {
+				continue
+			}
+			intent, isMap := op.Intent.(map[string]any)
+			if !isMap {
+				t.Fatalf("check intent shape = %T, want a JSON object", op.Intent)
+			}
+			if tree, isString := intent["tree_oid"].(string); !isString || tree != "tttttttttttttttttttttttttttttttttttttttt" {
+				t.Fatalf("intent tree_oid = %v, want the resolved candidate tree", intent["tree_oid"])
+			}
+			found = true
+		}
+		if !found {
+			t.Fatalf("no check operation was journaled")
 		}
 	})
 

@@ -33,7 +33,10 @@ func (c *Controller) RequestStop(ctx context.Context, runIDStr string) error {
 type CheckRunIntent struct {
 	// ResultID ties the execution to the accepted result whose check
 	// request it settles, so recovery can requeue or settle that request.
-	ResultID     string   `json:"result_id"`
+	ResultID string `json:"result_id"`
+	// TreeOID is the materialized tree object id of the candidate commit,
+	// resolved before the intent committed.
+	TreeOID      string   `json:"tree_oid"`
 	CheckoutPath string   `json:"checkout_path"`
 	CheckArgv    []string `json:"check_argv"`
 	SpawnArgv    []string `json:"spawn_argv"`

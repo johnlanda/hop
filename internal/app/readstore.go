@@ -41,6 +41,10 @@ type RunDetail struct {
 	PendingOperations []Operation
 	LastSubmission    *SubmissionOutcome
 	Artifacts         []run.Artifact
+	// LastCheck names the newest check execution, if any: its identity,
+	// journal state and outcome, and the retained evidence artifacts — so
+	// an unknown outcome stays actionable through hop status.
+	LastCheck *CheckExecutionSummary
 }
 
 // LaunchContext is what the launch exec boundary (`hop launch`) needs,
@@ -72,6 +76,19 @@ type CheckExecutionContext struct {
 	StateRoot    string
 	CheckoutPath string
 	CheckArgv    []string
+}
+
+// CheckExecutionSummary is the read model of one check execution: what
+// hop status names so a human can act on it — especially an unrepeatable
+// unknown outcome, which never completes the run automatically.
+type CheckExecutionSummary struct {
+	OperationID identity.OperationID
+	State       OperationState
+	Unknown     bool
+	Detail      string
+	// EvidencePaths are the retained artifact paths tied to the checked
+	// result (stdout, stderr) plus any pane-snapshot evidence.
+	EvidencePaths []string
 }
 
 // FrozenRun is the lease-free read model of a run's frozen execution

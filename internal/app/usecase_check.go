@@ -65,7 +65,22 @@ func (c *Controller) ClaimAndRunCheck(ctx context.Context, handle RunHandle, hop
 		return CheckReport{Blocked: blocked}, nil
 	}
 
-	claimed, checkRequest, commitOID, opID, err := c.claimCheckRequest(ctx, handle, &frozen, hopPath)
+	commitOID, hasResult, err := c.acceptedCommit(ctx, handle)
+	if err != nil {
+		return CheckReport{}, err
+	}
+	if !hasResult {
+		return CheckReport{}, nil
+	}
+	// The materialized tree object id is resolved before the intent
+	// commits and frozen into it: takeover validation and evidence both
+	// name exactly the tree the check ran against.
+	treeOID, err := c.runGit(ctx, frozen.RepositoryRoot, "rev-parse", commitOID+"^{tree}")
+	if err != nil {
+		return CheckReport{}, fmt.Errorf("app: resolve candidate tree: %w", err)
+	}
+
+	claimed, checkRequest, opID, err := c.claimCheckRequest(ctx, handle, &frozen, hopPath, commitOID, treeOID)
 	if err != nil {
 		return CheckReport{}, err
 	}
@@ -112,8 +127,65 @@ func (c *Controller) ClaimAndRunCheck(ctx context.Context, handle RunHandle, hop
 		return CheckReport{Ran: true, OperationID: opID.String()}, fmt.Errorf("app: check execution ambiguous: %w", runErr)
 	}
 
+	// Evidence retention before any cleanup: stdout and stderr are written
+	// under the execution's own directory and recorded as result-linked
+	// artifact rows with digests in the outcome transaction.
+	evidence := c.captureCheckOutputs(ctx, handle, &frozen, opID, checkRequest.ResultID, cmdResult)
+
 	outcome := checkRunOutcome{ExitCode: cmdResult.ExitCode}
-	return c.recordCheckOutcome(ctx, handle, opID, checkRequest, outcome, frozen.Snapshot.CheckRepeatable, nil)
+	return c.recordCheckOutcome(ctx, handle, opID, checkRequest, outcome, frozen.Snapshot.CheckRepeatable, nil, evidence...)
+}
+
+// acceptedCommit reads the run's accepted result commit, if one exists.
+func (c *Controller) acceptedCommit(ctx context.Context, handle RunHandle) (string, bool, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per check round.
+	var (
+		commit string
+		has    bool
+	)
+	err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		detail, loadErr := c.Read.LoadRunStatus(ctx, handle.runID)
+		if loadErr != nil {
+			return loadErr
+		}
+		result, getErr := uow.Results().Accepted(ctx, detail.AttemptID)
+		if getErr != nil || result == nil {
+			return getErr
+		}
+		commit = result.CommitOID
+		has = true
+		return nil
+	})
+	return commit, has, err
+}
+
+// captureCheckOutputs writes the execution's stdout and stderr through the
+// ArtifactStore under the execution's own directory and returns the
+// result-linked artifact rows to persist in the outcome transaction.
+// Capture is evidence: a failed write drops that stream's row but never
+// blocks the outcome.
+func (c *Controller) captureCheckOutputs(ctx context.Context, handle RunHandle, frozen *FrozenRun, opID identity.OperationID, resultID identity.ResultID, cmdResult CommandResult) []run.Artifact { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per execution.
+	base := filepath.Join(frozen.Snapshot.StateRoot, "runs", handle.runID.String(), "checks", opID.String())
+	var rows []run.Artifact
+	streams := []struct {
+		name    string
+		kind    run.ArtifactKind
+		content []byte
+	}{
+		{"stdout", run.ArtifactCheckStdout, cmdResult.Stdout},
+		{"stderr", run.ArtifactCheckStderr, cmdResult.Stderr},
+	}
+	for _, stream := range streams {
+		path := filepath.Join(base, stream.name)
+		if err := c.Artifacts.WriteArtifact(ctx, path, stream.content); err != nil {
+			continue
+		}
+		artifactID, err := identity.ParseArtifactID(c.IDs.NewID())
+		if err != nil {
+			continue
+		}
+		rows = append(rows, run.NewResultArtifact(artifactID, handle.runID, resultID, stream.kind, path, sha256Hex(stream.content)))
+	}
+	return rows
 }
 
 // checkExecutionCheckoutPath is the per-execution detached checkout path.
@@ -347,15 +419,14 @@ func (c *Controller) reopenOrphanedCheckRequest(ctx context.Context, handle RunH
 // request together with its execution intent and the lifecycle
 // transitions it implies — one transaction, so no crash window can leave
 // a claimed request without a recoverable operation.
-func (c *Controller) claimCheckRequest(ctx context.Context, handle RunHandle, frozen *FrozenRun, hopPath string) (bool, CheckRequest, string, identity.OperationID, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per claim attempt.
+func (c *Controller) claimCheckRequest(ctx context.Context, handle RunHandle, frozen *FrozenRun, hopPath, commitOID, treeOID string) (bool, CheckRequest, identity.OperationID, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per claim attempt.
 	opID, err := c.newOperationID()
 	if err != nil {
-		return false, CheckRequest{}, "", "", err
+		return false, CheckRequest{}, "", err
 	}
 	var (
-		claimed   bool
-		request   CheckRequest
-		commitOID string
+		claimed bool
+		request CheckRequest
 	)
 	now := c.Clock.Now()
 	err = c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
@@ -382,7 +453,9 @@ func (c *Controller) claimCheckRequest(ctx context.Context, handle RunHandle, fr
 		if result == nil {
 			return fmt.Errorf("app: attempt %s has no accepted result", pending.AttemptID)
 		}
-		commitOID = result.CommitOID
+		if result.CommitOID != commitOID {
+			return fmt.Errorf("app: accepted result commit changed between read and claim (%s != %s)", result.CommitOID, commitOID)
+		}
 
 		generation := handle.lease.Generation
 		pending.State = CheckRequestClaimed
@@ -429,6 +502,7 @@ func (c *Controller) claimCheckRequest(ctx context.Context, handle RunHandle, fr
 		checkoutPath := checkExecutionCheckoutPath(frozen.Snapshot.StateRoot, handle.runID, opID)
 		intent := CheckRunIntent{
 			ResultID:     result.ID.String(),
+			TreeOID:      treeOID,
 			CheckoutPath: checkoutPath,
 			CheckArgv:    frozen.Snapshot.CheckArgv,
 			SpawnArgv:    checkSpawnArgv(hopPath, opID, frozen.Snapshot.CheckArgv),
@@ -445,9 +519,9 @@ func (c *Controller) claimCheckRequest(ctx context.Context, handle RunHandle, fr
 		return nil
 	})
 	if err != nil {
-		return false, CheckRequest{}, "", "", fmt.Errorf("app: claim check request: %w", err)
+		return false, CheckRequest{}, "", fmt.Errorf("app: claim check request: %w", err)
 	}
-	return claimed, request, commitOID, opID, nil
+	return claimed, request, opID, nil
 }
 
 // rejectSubmoduleCandidate scans the candidate commit's tree for gitlink
@@ -495,11 +569,16 @@ func (c *Controller) removeCheckout(ctx context.Context, repositoryRoot, checkou
 // or the unknown-outcome rule, settling the check request accordingly —
 // settled on every final outcome, requested again on an authorized
 // repetition.
-func (c *Controller) recordCheckOutcome(ctx context.Context, handle RunHandle, opID identity.OperationID, request CheckRequest, outcome checkRunOutcome, repeatable bool, actErr error) (CheckReport, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per check execution.
+func (c *Controller) recordCheckOutcome(ctx context.Context, handle RunHandle, opID identity.OperationID, request CheckRequest, outcome checkRunOutcome, repeatable bool, actErr error, evidence ...run.Artifact) (CheckReport, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per check execution.
 	now := c.Clock.Now()
 	report := CheckReport{Ran: true, OperationID: opID.String()}
 
 	err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		for i := range evidence {
+			if saveErr := uow.Artifacts().Save(ctx, evidence[i]); saveErr != nil {
+				return saveErr
+			}
+		}
 		op, getErr := uow.Operations().Get(ctx, opID)
 		if getErr != nil {
 			return getErr
