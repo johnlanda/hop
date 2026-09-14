@@ -187,7 +187,7 @@ func (c *fakeCommands) Run(ctx context.Context, cmd app.Command) (app.CommandRes
 		return result, nil
 	}
 	switch {
-	case strings.Contains(k, "rev-parse --git-common-dir"):
+	case strings.Contains(k, "--git-common-dir"):
 		// Real git resolves a worktree's common dir to the *main*
 		// repository's .git, not the worktree's own directory; tests use
 		// "/repo" as the default repository root (defaultStartRunRequest),

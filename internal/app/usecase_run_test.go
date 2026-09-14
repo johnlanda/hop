@@ -141,7 +141,7 @@ func TestStartRun(t *testing.T) {
 		}
 	})
 
-	t.Run("crash between worktree.create's intent and act leaves no worktree row on failure", func(t *testing.T) {
+	t.Run("worktree.create transport error is ambiguous: the operation stays reconciling, never failed", func(t *testing.T) {
 		tc := newTestController(defaultPolicy())
 		tc.Runtime.CreateWorktreeErr = context.DeadlineExceeded
 		_, _, err := tc.Controller.StartRun(context.Background(), defaultStartRunRequest())
@@ -162,8 +162,64 @@ func TestStartRun(t *testing.T) {
 				op = o
 			}
 		}
+		if op.State != app.OperationReconciling {
+			t.Fatalf("worktree.create operation state = %s, want %s (creation could have happened)", op.State, app.OperationReconciling)
+		}
+	})
+
+	t.Run("worktree provenance: a checkout of a different repository is rejected, path prefixes never adopt", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		// The candidate's common directory is a lexical PREFIX-extension of
+		// the intended repository ("/repo-other" vs "/repo"): the old
+		// prefix comparison would adopt it; equality must reject it.
+		tc.Commands.Results["git -C /worktrees/w rev-parse --path-format=absolute --git-common-dir"] = app.CommandResult{ExitCode: 0, Stdout: []byte("/repo-other/.git\n")}
+		_, _, err := tc.Controller.StartRun(context.Background(), defaultStartRunRequest())
+		if err == nil {
+			t.Fatalf("StartRun() adopted a checkout of a different repository")
+		}
+		if len(tc.Store.Worktrees) != 0 {
+			t.Fatalf("a worktree row was recorded for an unrelated checkout")
+		}
+		var op app.Operation
+		for _, o := range tc.Store.Operations {
+			if o.Kind == app.OpWorktreeCreate {
+				op = o
+			}
+		}
 		if op.State != app.OperationFailed {
-			t.Fatalf("worktree.create operation state = %s, want %s", op.State, app.OperationFailed)
+			t.Fatalf("worktree.create operation state = %s, want %s (unrelated checkout is a failure)", op.State, app.OperationFailed)
+		}
+	})
+
+	t.Run("worktree provenance: a candidate at the wrong base commit is rejected", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		tc.Commands.Results["git -C /worktrees/w rev-parse HEAD^{commit}"] = app.CommandResult{ExitCode: 0, Stdout: []byte("dddddddddddddddddddddddddddddddddddddddd\n")}
+		_, _, err := tc.Controller.StartRun(context.Background(), defaultStartRunRequest())
+		if err == nil {
+			t.Fatalf("StartRun() adopted a checkout at the wrong base commit")
+		}
+		if len(tc.Store.Worktrees) != 0 {
+			t.Fatalf("a worktree row was recorded for a wrong-base checkout")
+		}
+	})
+
+	t.Run("worktree intent freezes the resolved base object id, never a mutable ref", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		if _, _, err := tc.Controller.StartRun(context.Background(), defaultStartRunRequest()); err != nil {
+			t.Fatalf("StartRun() error = %v", err)
+		}
+		for _, o := range tc.Store.Operations {
+			if o.Kind != app.OpWorktreeCreate {
+				continue
+			}
+			intent, ok := o.Intent.(map[string]any)
+			if !ok {
+				t.Fatalf("worktree.create intent shape = %T, want a JSON object", o.Intent)
+			}
+			base, isString := intent["base_ref"].(string)
+			if !isString || base != "cccccccccccccccccccccccccccccccccccccccc" {
+				t.Fatalf("intent base_ref = %q, want the resolved base commit object id", base)
+			}
 		}
 	})
 

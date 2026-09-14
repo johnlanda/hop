@@ -38,6 +38,9 @@ type StartRunResult struct {
 }
 
 // worktreeCreateIntent is the OpWorktreeCreate operation's intent payload.
+// BaseRef is the intended base commit resolved to an immutable object ID
+// BEFORE the intent commits — never a mutable ref name — so takeover
+// validation compares the candidate against exactly what was intended.
 type worktreeCreateIntent struct {
 	RepositoryRoot string `json:"repository_root"`
 	Branch         string `json:"branch"`
@@ -190,35 +193,103 @@ func (c *Controller) StartRun(ctx context.Context, req StartRunRequest) (StartRu
 	return result, handle, nil
 }
 
-// resolveWorktreeProvenance resolves the base commit a freshly created
-// worktree checked out, and validates it shares the repository at
-// repositoryRoot: Herdr's worktree.create response carries no commit, so
-// this is the provenance an adoption decision later validates against
-// (docs/plan/phase-2-design.md section 4). git-common-dir ties the
-// worktree back to its repository regardless of the worktree's own path.
-func (c *Controller) resolveWorktreeProvenance(ctx context.Context, worktreePath, repositoryRoot string) (string, error) {
-	commonDir, err := c.runGit(ctx, worktreePath, "rev-parse", "--git-common-dir")
-	if err != nil {
-		return "", fmt.Errorf("resolve worktree repository: %w", err)
+// worktreeProvenance classifies a candidate checkout against the intended
+// repository and frozen base commit (docs/plan/phase-2-design.md
+// section 4, worktree.create adoption rule).
+type worktreeProvenance int
+
+const (
+	// worktreeValid: the candidate shares the intended repository's
+	// canonical common directory and its HEAD is the frozen base commit.
+	worktreeValid worktreeProvenance = iota
+	// worktreeAbsent: no git checkout answers at the candidate path.
+	worktreeAbsent
+	// worktreeUnrelated: a checkout of a different repository, or of the
+	// intended repository at a different commit — a failure, not adoption.
+	worktreeUnrelated
+	// worktreeAmbiguous: the inspection itself could not be made; never
+	// treated as absence or as failure.
+	worktreeAmbiguous
+)
+
+// classifyWorktreeProvenance establishes whether the checkout at
+// candidatePath is the intended one: canonical absolute git common
+// directories of the intended repository and the candidate must be EQUAL
+// (a path prefix is never provenance), and the candidate's HEAD commit
+// must equal the frozen base object ID.
+func (c *Controller) classifyWorktreeProvenance(ctx context.Context, candidatePath, repositoryRoot, expectedBaseOID string) (provenance worktreeProvenance, detail string) {
+	repoCommon, repoStatus := c.gitCommonDir(ctx, repositoryRoot)
+	if repoStatus != gitOK {
+		return worktreeAmbiguous, fmt.Sprintf("intended repository %q common directory could not be resolved", repositoryRoot)
 	}
-	if !strings.HasPrefix(commonDir, repositoryRoot) {
-		return "", fmt.Errorf("worktree at %q shares repository %q, not %q", worktreePath, commonDir, repositoryRoot)
+	candCommon, candStatus := c.gitCommonDir(ctx, candidatePath)
+	switch candStatus {
+	case gitTransportError:
+		return worktreeAmbiguous, fmt.Sprintf("candidate %q could not be inspected", candidatePath)
+	case gitNonZero:
+		return worktreeAbsent, fmt.Sprintf("no git checkout answers at %q", candidatePath)
+	case gitOK:
 	}
-	commit, err := c.runGit(ctx, worktreePath, "rev-parse", "HEAD")
-	if err != nil {
-		return "", fmt.Errorf("resolve worktree base commit: %w", err)
+	if repoCommon != candCommon {
+		return worktreeUnrelated, fmt.Sprintf("candidate at %q shares repository %q, not %q", candidatePath, candCommon, repoCommon)
 	}
-	return commit, nil
+
+	head, headStatus := c.gitOutput(ctx, candidatePath, "rev-parse", "HEAD^{commit}")
+	if headStatus != gitOK {
+		return worktreeAmbiguous, fmt.Sprintf("candidate %q HEAD could not be resolved", candidatePath)
+	}
+	if head != expectedBaseOID {
+		return worktreeUnrelated, fmt.Sprintf("candidate at %q is at commit %s, not the frozen base %s", candidatePath, head, expectedBaseOID)
+	}
+	return worktreeValid, ""
 }
 
-// runGit runs one git subcommand in dir and returns its trimmed stdout.
+// gitStatus classifies one git invocation's result.
+type gitStatus int
+
+const (
+	gitOK gitStatus = iota
+	gitNonZero
+	gitTransportError
+)
+
+// gitOutput runs one git subcommand against dir (via `git -C`, so the
+// invocation is fully identified by its argv) and returns its trimmed
+// stdout with a typed status.
+func (c *Controller) gitOutput(ctx context.Context, dir string, args ...string) (string, gitStatus) {
+	result, err := c.Commands.Run(ctx, Command{Argv: append([]string{"git", "-C", dir}, args...)})
+	if err != nil {
+		return "", gitTransportError
+	}
+	if result.ExitCode != 0 {
+		return "", gitNonZero
+	}
+	return strings.TrimSpace(string(result.Stdout)), gitOK
+}
+
+// gitCommonDir resolves dir's canonical absolute git common directory. A
+// relative answer (an older git ignoring --path-format) is resolved
+// against dir before comparison.
+func (c *Controller) gitCommonDir(ctx context.Context, dir string) (string, gitStatus) {
+	out, status := c.gitOutput(ctx, dir, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if status != gitOK {
+		return "", status
+	}
+	if !filepath.IsAbs(out) {
+		out = filepath.Join(dir, out)
+	}
+	return filepath.Clean(out), gitOK
+}
+
+// runGit runs one git subcommand against dir and returns its trimmed
+// stdout, folding a non-zero exit into the error.
 func (c *Controller) runGit(ctx context.Context, dir string, args ...string) (string, error) {
-	result, err := c.Commands.Run(ctx, Command{Argv: append([]string{"git"}, args...), Dir: dir})
+	result, err := c.Commands.Run(ctx, Command{Argv: append([]string{"git", "-C", dir}, args...)})
 	if err != nil {
 		return "", err
 	}
 	if result.ExitCode != 0 {
-		return "", fmt.Errorf("git %s: exit %d: %s", strings.Join(args, " "), result.ExitCode, string(result.Stderr))
+		return "", fmt.Errorf("git -C %s %s: exit %d: %s", dir, strings.Join(args, " "), result.ExitCode, string(result.Stderr))
 	}
 	return strings.TrimSpace(string(result.Stdout)), nil
 }
@@ -254,7 +325,11 @@ func (c *Controller) createWorktree(ctx context.Context, handle RunHandle, ids g
 	if err != nil {
 		return WorktreeInfo{}, err
 	}
-	intent := worktreeCreateIntent{RepositoryRoot: repositoryRoot, Branch: branch, BaseRef: "HEAD"}
+	baseOID, err := c.runGit(ctx, repositoryRoot, "rev-parse", "HEAD^{commit}")
+	if err != nil {
+		return WorktreeInfo{}, fmt.Errorf("app: resolve intended base commit: %w", err)
+	}
+	intent := worktreeCreateIntent{RepositoryRoot: repositoryRoot, Branch: branch, BaseRef: baseOID}
 	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 		return uow.Operations().Create(ctx, Operation{
 			ID: opID, RunID: handle.runID, Generation: handle.lease.Generation,
@@ -270,11 +345,12 @@ func (c *Controller) createWorktree(ctx context.Context, handle RunHandle, ids g
 	}
 	actCtx, release := handle.actContext(ctx)
 	info, actErr := c.Runtime.CreateWorktree(actCtx, WorktreeRequest{
-		RepositoryRoot: repositoryRoot, Branch: branch, BaseRef: intent.BaseRef,
+		RepositoryRoot: repositoryRoot, Branch: branch, BaseRef: baseOID,
 	})
-	var baseCommit string
+	provenance := worktreeAmbiguous
+	provenanceDetail := ""
 	if actErr == nil {
-		baseCommit, actErr = c.resolveWorktreeProvenance(actCtx, info.Path, repositoryRoot)
+		provenance, provenanceDetail = c.classifyWorktreeProvenance(actCtx, info.Path, repositoryRoot, baseOID)
 	}
 	release()
 
@@ -284,29 +360,52 @@ func (c *Controller) createWorktree(ctx context.Context, handle RunHandle, ids g
 			return getErr
 		}
 		op.UpdatedAt = c.Clock.Now()
-		if actErr != nil {
-			op.State = OperationFailed
+		switch {
+		case actErr != nil:
+			// A transport error is ambiguous, never failure: the creation
+			// may still have happened, and recovery validates provenance.
+			op.State = OperationReconciling
 			op.Outcome = actErr.Error()
 			return uow.Operations().Save(ctx, op)
+		case provenance == worktreeValid:
+			r, _, runErr := uow.Runs().Get(ctx, handle.runID)
+			if runErr != nil {
+				return runErr
+			}
+			if _, createErr := uow.Worktrees().Create(ctx, run.NewWorktree(ids.Worktree, r.RepositoryID, handle.runID, info.Path, info.Branch)); createErr != nil {
+				return createErr
+			}
+			op.State = OperationSucceeded
+			op.ActEvidence = worktreeCreateOutcome{Info: info, BaseCommit: baseOID}
+			return uow.Operations().Save(ctx, op)
+		case provenance == worktreeUnrelated:
+			op.State = OperationFailed
+			op.Outcome = provenanceDetail
+			return uow.Operations().Save(ctx, op)
+		default:
+			// Absent or ambiguous immediately after a successful create
+			// response: reconciling, never a second create.
+			op.State = OperationReconciling
+			op.Outcome = provenanceDetail
+			return uow.Operations().Save(ctx, op)
 		}
-		r, _, runErr := uow.Runs().Get(ctx, handle.runID)
-		if runErr != nil {
-			return runErr
-		}
-		if _, createErr := uow.Worktrees().Create(ctx, run.NewWorktree(ids.Worktree, r.RepositoryID, handle.runID, info.Path, info.Branch)); createErr != nil {
-			return createErr
-		}
-		op.State = OperationSucceeded
-		op.ActEvidence = worktreeCreateOutcome{Info: info, BaseCommit: baseCommit}
-		return uow.Operations().Save(ctx, op)
 	})
+	var resultErr error
 	switch {
-	case actErr != nil && outcomeErr != nil:
-		return WorktreeInfo{}, fmt.Errorf("app: worktree.create failed (%w) and recording the outcome failed (%w)", actErr, outcomeErr)
 	case actErr != nil:
-		return WorktreeInfo{}, fmt.Errorf("app: worktree.create: %w", actErr)
+		resultErr = fmt.Errorf("app: worktree.create: %w (operation %s is reconciling)", actErr, opID)
+	case provenance == worktreeUnrelated:
+		resultErr = fmt.Errorf("app: worktree.create provenance: %s", provenanceDetail)
+	case provenance != worktreeValid:
+		resultErr = fmt.Errorf("app: worktree.create provenance ambiguous: %s (operation %s is reconciling)", provenanceDetail, opID)
+	}
+	switch {
+	case resultErr != nil && outcomeErr != nil:
+		return WorktreeInfo{}, fmt.Errorf("%w; recording the outcome also failed: %w", resultErr, outcomeErr)
 	case outcomeErr != nil:
 		return WorktreeInfo{}, fmt.Errorf("app: record worktree.create outcome: %w", outcomeErr)
+	case resultErr != nil:
+		return WorktreeInfo{}, resultErr
 	}
 	return info, nil
 }
