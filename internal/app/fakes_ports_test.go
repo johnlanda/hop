@@ -143,6 +143,13 @@ type fakeCommands struct {
 	Results map[string]app.CommandResult
 	Errs    map[string]error
 	Calls   []app.Command
+
+	// CheckExecExitCode and CheckExecErr script the hop check-exec spawn
+	// specifically, matched by argv[1] == "check-exec" rather than by exact
+	// argv text, since its argv always includes a freshly generated
+	// operation id no test can predict.
+	CheckExecExitCode int
+	CheckExecErr      error
 }
 
 func newFakeCommands() *fakeCommands {
@@ -155,6 +162,12 @@ func (c *fakeCommands) Run(_ context.Context, cmd app.Command) (app.CommandResul
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.Calls = append(c.Calls, cmd)
+	if len(cmd.Argv) >= 2 && cmd.Argv[1] == "check-exec" {
+		if c.CheckExecErr != nil {
+			return app.CommandResult{}, c.CheckExecErr
+		}
+		return app.CommandResult{ExitCode: c.CheckExecExitCode}, nil
+	}
 	k := c.key(cmd)
 	if err, ok := c.Errs[k]; ok {
 		return app.CommandResult{}, err

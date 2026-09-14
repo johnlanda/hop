@@ -57,22 +57,46 @@ func (c *Controller) ClaimAndRunCheck(ctx context.Context, handle RunHandle, hop
 	now := c.Clock.Now()
 
 	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		generation := gen(handle.lease.Generation)
+
 		r, rRev, getErr := uow.Runs().Get(ctx, handle.runID)
 		if getErr != nil {
 			return getErr
 		}
-		rFrom := r.State
-		r, completeErr := r.EnterCompleting(now)
-		if completeErr != nil {
-			return completeErr
+		if r.State == run.RunRunning {
+			rFrom := r.State
+			nextRun, completeErr := r.EnterCompleting(now)
+			if completeErr != nil {
+				return completeErr
+			}
+			if _, saveErr := uow.Runs().Save(ctx, nextRun, rRev); saveErr != nil {
+				return saveErr
+			}
+			if transErr := recordTransition(ctx, uow, EntityRun, handle.runID.String(), string(rFrom), string(nextRun.State), "accepted result's check claimed", generation, now); transErr != nil {
+				return transErr
+			}
 		}
-		if _, saveErr := uow.Runs().Save(ctx, r, rRev); saveErr != nil {
+		// A run already stopping is left alone here: the check still runs
+		// (the outcome transaction re-reads the stop request and applies
+		// precedence), but forcing it through completing would be invalid
+		// from any state but running.
+
+		a, aRev, getErr := uow.Attempts().Get(ctx, checkRequest.AttemptID)
+		if getErr != nil {
+			return getErr
+		}
+		aFrom := a.State
+		a, checkingErr := a.EnterChecking(now)
+		if checkingErr != nil {
+			return checkingErr
+		}
+		if _, saveErr := uow.Attempts().Save(ctx, a, aRev); saveErr != nil {
 			return saveErr
 		}
-		generation := gen(handle.lease.Generation)
-		if transErr := recordTransition(ctx, uow, EntityRun, handle.runID.String(), string(rFrom), string(r.State), "accepted result's check claimed", generation, now); transErr != nil {
+		if transErr := recordTransition(ctx, uow, EntityAttempt, checkRequest.AttemptID.String(), string(aFrom), string(a.State), "check execution started", generation, now); transErr != nil {
 			return transErr
 		}
+
 		return uow.Operations().Create(ctx, Operation{
 			ID: opID, RunID: handle.runID, Generation: handle.lease.Generation,
 			Kind: OpCheckRun, State: OperationPending, Intent: intent,
