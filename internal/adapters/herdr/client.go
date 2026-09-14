@@ -7,6 +7,7 @@ package herdr
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -113,6 +114,7 @@ type EventStream struct {
 	conn   net.Conn
 	stop   func() bool
 	events chan RawEvent
+	done   chan struct{} // closed by Close to release a pump blocked on a full events channel
 
 	mu     sync.Mutex
 	closed bool
@@ -151,7 +153,7 @@ func (c *Client) Subscribe(ctx context.Context, subscriptions []EventSubscriptio
 		abort()
 		return nil, err
 	}
-	stream := &EventStream{conn: conn, stop: stop, events: make(chan RawEvent, eventBufferSize)}
+	stream := &EventStream{conn: conn, stop: stop, events: make(chan RawEvent, eventBufferSize), done: make(chan struct{})}
 	go stream.read(ctx, reader)
 	return stream, nil
 }
@@ -169,10 +171,15 @@ func (s *EventStream) Err() error {
 	return s.err
 }
 
-// Close ends the stream. The Events channel closes shortly after.
+// Close ends the stream. The Events channel closes shortly after. Closing the
+// done channel releases a pump goroutine blocked on a full events channel so
+// it cannot leak.
 func (s *EventStream) Close() error {
 	s.mu.Lock()
-	s.closed = true
+	if !s.closed {
+		s.closed = true
+		close(s.done)
+	}
 	s.mu.Unlock()
 	s.stop()
 	return s.conn.Close()
@@ -196,7 +203,9 @@ func (s *EventStream) read(ctx context.Context, reader *bufio.Reader) {
 		}
 		switch {
 		case resp.Event != "":
-			s.events <- RawEvent{Name: resp.Event, Data: resp.Data}
+			if !s.send(ctx, RawEvent{Name: resp.Event, Data: resp.Data}) {
+				return
+			}
 		case resp.ID != "" || resp.Error != nil:
 			s.finish(ctx, &ProtocolError{Reason: "unexpected response frame on a subscription connection"})
 			return
@@ -204,6 +213,23 @@ func (s *EventStream) read(ctx context.Context, reader *bufio.Reader) {
 			s.finish(ctx, &ProtocolError{Reason: "frame is neither a response nor an event"})
 			return
 		}
+	}
+}
+
+// send delivers one event, but abandons the delivery when the stream is
+// closed or the context is canceled, so a consumer that stops reading cannot
+// leave this goroutine blocked on a full channel. It reports whether the read
+// loop should continue.
+func (s *EventStream) send(ctx context.Context, event RawEvent) bool {
+	select {
+	case s.events <- event:
+		return true
+	case <-s.done:
+		s.finish(ctx, nil)
+		return false
+	case <-ctx.Done():
+		s.finish(ctx, ctx.Err())
+		return false
 	}
 }
 
@@ -295,13 +321,18 @@ func readResponse(reader *bufio.Reader) (*response, error) {
 
 // checkResponse validates correlation and maps an error body to APIError.
 // The ID is checked first so a mislabeled error cannot be attributed to the
-// wrong request.
+// wrong request. A frame that carries neither a result nor an error is
+// malformed: every Herdr success response carries a typed result object, so
+// an id-only frame is not a successful empty mutation.
 func checkResponse(resp *response, id string) error {
 	if resp.ID != id {
 		return &ProtocolError{Reason: fmt.Sprintf("response id %q does not match request id %q", resp.ID, id)}
 	}
 	if resp.Error != nil {
 		return &APIError{Code: resp.Error.Code, Message: resp.Error.Message}
+	}
+	if len(resp.Result) == 0 || bytes.Equal(bytes.TrimSpace(resp.Result), []byte("null")) {
+		return &ProtocolError{Reason: "response carries neither a result nor an error"}
 	}
 	return nil
 }

@@ -89,6 +89,18 @@ func newFakeStream(events []app.StatusEvent) *fakeStream {
 	return &fakeStream{events: channel}
 }
 
+// newOpenBufferedStream buffers events in an OPEN channel: the events are
+// deliverable but the stream never ends on its own, so a reader must stop on
+// cancellation. This exercises the cancellation-drain path rather than the
+// clean end-of-stream path.
+func newOpenBufferedStream(events []app.StatusEvent) *fakeStream {
+	channel := make(chan app.StatusEvent, len(events))
+	for _, event := range events {
+		channel <- event
+	}
+	return &fakeStream{events: channel}
+}
+
 func (s *fakeStream) Events() <-chan app.StatusEvent { return s.events }
 func (s *fakeStream) Err() error                     { return s.err }
 func (s *fakeStream) Close() error {
@@ -174,6 +186,38 @@ func TestReconcileAppliesBufferedEventsOverSnapshot(t *testing.T) {
 	}
 	if !observer.stream.closed {
 		t.Error("Reconcile did not close the stream")
+	}
+}
+
+func TestReconcileDrainsBufferedEventsBeforeCancellation(t *testing.T) {
+	// A large batch of events is already buffered when the context is
+	// canceled. Reconcile must fold every one of them, not drop them because
+	// select happened to pick cancellation.
+	const count = 1000
+	events := make([]app.StatusEvent, count)
+	for i := range events {
+		status := app.StatusWorking
+		if i == count-1 {
+			status = app.StatusDone // the final state to observe
+		}
+		events[i] = app.StatusEvent{PaneID: "w1:p1", WorkspaceID: "w1", Status: status}
+	}
+	// The stream stays open, so Reconcile can only stop on cancellation; the
+	// buffered events must still all be folded first.
+	observer := &fakeObserver{stream: newOpenBufferedStream(events), snapshot: []app.PaneObservation{{PaneID: "w1:p1", Status: app.StatusIdle}}}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel() // cancel up front; every event is already buffered
+
+	result, err := app.Reconcile(ctx, observer)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if len(result.Events) != count {
+		t.Errorf("folded %d events, want all %d buffered before cancellation", len(result.Events), count)
+	}
+	if got := result.State["w1:p1"].Status; got != app.StatusDone {
+		t.Errorf("final status = %s, want the last buffered transition done", got)
 	}
 }
 

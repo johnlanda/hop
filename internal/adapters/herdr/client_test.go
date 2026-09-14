@@ -100,6 +100,23 @@ func holdUntilPeerCloses(conn net.Conn) {
 	}
 }
 
+// assertStreamEnds runs a drain and fails if it does not finish within the
+// timeout, which is how a leaked pump goroutine that never closes its channel
+// manifests.
+func assertStreamEnds(t *testing.T, drain func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		drain()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(protocolTimeout):
+		t.Fatal("the event stream did not end; the pump goroutine leaked")
+	}
+}
+
 // readRequestLine decodes the next request the client sent.
 func readRequestLine(t *testing.T, reader *bufio.Reader) map[string]any {
 	t.Helper()
@@ -139,6 +156,17 @@ func writeLine(t *testing.T, conn net.Conn, line string) {
 	t.Helper()
 	if _, err := conn.Write([]byte(line + "\n")); err != nil {
 		t.Errorf("fake endpoint: write line: %v", err)
+	}
+}
+
+// floodLines writes count copies of line and stops silently once the peer
+// closes the connection, so a fake that deliberately floods a stream never
+// fails the test when the client closes early.
+func floodLines(conn net.Conn, line string, count int) {
+	for i := 0; i < count; i++ {
+		if _, err := conn.Write([]byte(line + "\n")); err != nil {
+			return
+		}
 	}
 }
 
@@ -221,6 +249,33 @@ func TestClientCall(t *testing.T) {
 				var protocolErr *herdr.ProtocolError
 				if !errors.As(err, &protocolErr) {
 					t.Fatalf("Call error = %v, want a ProtocolError", err)
+				}
+			},
+		},
+		{
+			name: "id-only frame with neither result nor error is malformed",
+			respond: func(id string) []string {
+				return []string{fmt.Sprintf(`{"id":%q}`, id)}
+			},
+			check: func(t *testing.T, _ map[string]any, err error) {
+				var protocolErr *herdr.ProtocolError
+				if !errors.As(err, &protocolErr) {
+					t.Fatalf("Call error = %v, want a ProtocolError for a resultless frame", err)
+				}
+				if !strings.Contains(protocolErr.Reason, "neither a result nor an error") {
+					t.Errorf("reason = %q, want it to name the missing result", protocolErr.Reason)
+				}
+			},
+		},
+		{
+			name: "null result with no error is malformed",
+			respond: func(id string) []string {
+				return []string{fmt.Sprintf(`{"id":%q,"result":null}`, id)}
+			},
+			check: func(t *testing.T, _ map[string]any, err error) {
+				var protocolErr *herdr.ProtocolError
+				if !errors.As(err, &protocolErr) {
+					t.Fatalf("Call error = %v, want a ProtocolError for a null result", err)
 				}
 			},
 		},
@@ -477,6 +532,25 @@ func TestClientSubscribe(t *testing.T) {
 		}
 	})
 
+	t.Run("resultless acknowledgement fails the subscribe", func(t *testing.T) {
+		endpoint := startFakeEndpoint(t, func(t *testing.T, conn net.Conn) {
+			request := readRequestLine(t, bufio.NewReader(conn))
+			if request == nil {
+				return
+			}
+			// An id-only frame is not a valid subscription acknowledgement.
+			writeLine(t, conn, fmt.Sprintf(`{"id":%q}`, requestID(t, request)))
+		})
+		client := herdr.NewClient(endpoint.socketPath)
+
+		_, err := client.Subscribe(testContext(t), nil)
+
+		var protocolErr *herdr.ProtocolError
+		if !errors.As(err, &protocolErr) {
+			t.Fatalf("Subscribe error = %v, want a ProtocolError for a resultless ack", err)
+		}
+	})
+
 	t.Run("error response fails the subscribe", func(t *testing.T) {
 		endpoint := startFakeEndpoint(t, func(t *testing.T, conn net.Conn) {
 			request := readRequestLine(t, bufio.NewReader(conn))
@@ -546,6 +620,56 @@ func TestClientSubscribe(t *testing.T) {
 		if stream.Err() == nil {
 			t.Fatal("stream.Err() = nil, want the disconnect reported")
 		}
+	})
+
+	t.Run("close releases a pump blocked on a full events channel", func(t *testing.T) {
+		// The fake floods the stream with more events than the buffer holds,
+		// then keeps the connection open. With no consumer draining, the pump
+		// blocks on a full channel; Close must still release it so the stream
+		// ends rather than leaking the goroutine.
+		endpoint := startFakeEndpoint(t, func(t *testing.T, conn net.Conn) {
+			request := readRequestLine(t, bufio.NewReader(conn))
+			if request == nil {
+				return
+			}
+			writeLine(t, conn, fmt.Sprintf(`{"id":%q,"result":{"type":"subscription_started"}}`, requestID(t, request)))
+			floodLines(conn, `{"event":"pane_created","data":{"type":"pane_created"}}`, 400)
+			holdUntilPeerCloses(conn) // keep the connection open; no EOF
+		})
+		client := herdr.NewClient(endpoint.socketPath)
+
+		stream, err := client.Subscribe(testContext(t), nil)
+		if err != nil {
+			t.Fatalf("Subscribe: %v", err)
+		}
+		if err := stream.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+
+		assertStreamEnds(t, func() { drainEvents(stream) })
+	})
+
+	t.Run("cancellation releases a pump blocked on a full events channel", func(t *testing.T) {
+		endpoint := startFakeEndpoint(t, func(t *testing.T, conn net.Conn) {
+			request := readRequestLine(t, bufio.NewReader(conn))
+			if request == nil {
+				return
+			}
+			writeLine(t, conn, fmt.Sprintf(`{"id":%q,"result":{"type":"subscription_started"}}`, requestID(t, request)))
+			floodLines(conn, `{"event":"pane_created","data":{"type":"pane_created"}}`, 400)
+			holdUntilPeerCloses(conn)
+		})
+		client := herdr.NewClient(endpoint.socketPath)
+		ctx, cancel := context.WithCancel(testContext(t))
+
+		stream, err := client.Subscribe(ctx, nil)
+		if err != nil {
+			t.Fatalf("Subscribe: %v", err)
+		}
+		defer closeQuietly(stream)
+		cancel()
+
+		assertStreamEnds(t, func() { drainEvents(stream) })
 	})
 
 	t.Run("close ends the stream without an error", func(t *testing.T) {

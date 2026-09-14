@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/johnlanda/hop/internal/adapters/herdr"
 	"github.com/johnlanda/hop/internal/app"
@@ -104,6 +105,44 @@ func TestObserverSubscribeRequestsEachPane(t *testing.T) {
 	subscriptions, ok := params["subscriptions"].([]any)
 	if !ok || len(subscriptions) != 2 {
 		t.Fatalf("subscriptions = %v, want one per watched pane", params["subscriptions"])
+	}
+}
+
+func TestObserverCloseReleasesBlockedPump(t *testing.T) {
+	// The normalized pump uses an unbuffered channel, so it blocks on its
+	// first event when no one reads. Close must release it so the stream ends
+	// rather than leaking the goroutine.
+	endpoint := startFakeEndpoint(t, func(t *testing.T, conn net.Conn) {
+		request := readRequestLine(t, bufio.NewReader(conn))
+		if request == nil {
+			return
+		}
+		writeLine(t, conn, fmt.Sprintf(`{"id":%q,"result":{"type":"subscription_started"}}`, requestID(t, request)))
+		floodLines(conn, `{"event":"pane.agent_status_changed","data":{"pane_id":"w1:p1","workspace_id":"w1","agent_status":"working"}}`, 8)
+		holdUntilPeerCloses(conn)
+	})
+	observer := herdr.NewObserver(endpoint.socketPath, "w1:p1")
+
+	stream, err := observer.Subscribe(testContext(t))
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	// Start the pump but never drain it, then close.
+	events := stream.Events()
+	if err := stream.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		for range events { //nolint:revive // draining to completion; the point is that the channel closes
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the normalized status stream did not end after Close; the pump leaked")
 	}
 }
 

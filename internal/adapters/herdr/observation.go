@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 
 	"github.com/johnlanda/hop/internal/app"
 )
@@ -38,26 +39,31 @@ func (o *Observer) Subscribe(ctx context.Context) (app.StatusStream, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &statusStream{stream: stream}, nil
+	return &statusStream{stream: stream, closed: make(chan struct{})}, nil
 }
 
 // statusStream adapts a raw event stream into an app.StatusStream, decoding
 // each agent-status event and dropping any other pushed frame.
 type statusStream struct {
-	stream *EventStream
-	events chan app.StatusEvent
+	stream    *EventStream
+	events    chan app.StatusEvent
+	start     sync.Once
+	closeOnce sync.Once
+	closed    chan struct{} // closed by Close to release a pump blocked on a full events channel
 }
 
 // Events lazily starts the decode pump and returns the normalized channel.
 func (s *statusStream) Events() <-chan app.StatusEvent {
-	if s.events == nil {
+	s.start.Do(func() {
 		s.events = make(chan app.StatusEvent)
 		go s.pump()
-	}
+	})
 	return s.events
 }
 
-// pump decodes raw events into status events until the raw stream ends.
+// pump decodes raw events into status events until the raw stream ends,
+// abandoning a delivery when Close is called so a consumer that stops reading
+// cannot leave this goroutine blocked on the channel.
 func (s *statusStream) pump() {
 	defer close(s.events)
 	for raw := range s.stream.Events() {
@@ -65,8 +71,13 @@ func (s *statusStream) pump() {
 			continue
 		}
 		event, ok := decodeStatusEvent(raw.Data)
-		if ok {
-			s.events <- event
+		if !ok {
+			continue
+		}
+		select {
+		case s.events <- event:
+		case <-s.closed:
+			return
 		}
 	}
 }
@@ -76,8 +87,9 @@ func (s *statusStream) Err() error {
 	return s.stream.Err()
 }
 
-// Close ends the underlying stream.
+// Close ends the underlying stream and releases a blocked pump.
 func (s *statusStream) Close() error {
+	s.closeOnce.Do(func() { close(s.closed) })
 	return s.stream.Close()
 }
 
