@@ -404,6 +404,16 @@ func waitUntil(timeout time.Duration, condition func() bool) bool {
 	}
 }
 
+// testContext returns a bounded context for adapter calls a test drives
+// directly (the presentation and observer adapters take a context). It is
+// canceled when the test ends.
+func testContext(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), callTimeout)
+	t.Cleanup(cancel)
+	return ctx
+}
+
 // call issues one request against the test server, each with its own
 // bounded deadline, and fails the test on any error.
 func (s *testServer) call(t *testing.T, method string, params, result any) {

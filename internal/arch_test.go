@@ -175,7 +175,7 @@ func productionRules() ruleTable {
 		"internal":                {category: categoryArchitectureTest},
 		"internal/app":            {category: categoryApplication},
 		"internal/adapters/herdr": {category: categoryDrivenAdapter, firstParty: []string{"internal/app"}},
-		"test/integration":        {category: categoryIntegrationTest, firstParty: []string{"internal/adapters/herdr"}},
+		"test/integration":        {category: categoryIntegrationTest, firstParty: []string{"internal/app", "internal/adapters/herdr"}},
 	}
 }
 

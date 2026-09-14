@@ -116,6 +116,24 @@ func readRequestLine(t *testing.T, reader *bufio.Reader) map[string]any {
 	return request
 }
 
+// readRequestLoop decodes the next request on a long-lived connection,
+// returning nil when the peer has closed it. Unlike readRequestLine it does
+// not fail the test on a clean EOF, so a handler can loop over the several
+// connections and requests a multi-call client sends.
+func readRequestLoop(t *testing.T, reader *bufio.Reader) map[string]any {
+	t.Helper()
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return nil
+	}
+	var request map[string]any
+	if err := json.Unmarshal([]byte(line), &request); err != nil {
+		t.Errorf("fake endpoint: decode request %q: %v", line, err)
+		return nil
+	}
+	return request
+}
+
 // writeLine writes one raw protocol line.
 func writeLine(t *testing.T, conn net.Conn, line string) {
 	t.Helper()

@@ -14,6 +14,8 @@ this tree, and drives everything through HOP's own protocol client.
 | --- | --- | --- |
 | [harness_test.go](harness_test.go) | `requireHerdr`, `prepareServer`, `testServer`, `stagePlugin`, `newArtifactDir`, `registrySnapshot`, `assertNoRegistryLeak`, `waitForLog`, `waitUntil`, `mustCall` | Disposable server lifecycle (spawn, bounded socket-readiness wait, API stop then process-handle kill), hermetic subprocess environment built from scratch, plugin staging (`go build` + manifest copy), failure-retained evidence, user-global registry leak checks and bounded polling |
 | [plugin_test.go](plugin_test.go) | `TestRealProcessPluginLifecycle`, `TestRealProcessStartupHookRunsOnServerStart` | Link → action list → invoke → completed log records with real output → workspace/pane open and rendered evidence → unlink; and the startup hook proven to run on server start, not on link |
+| [presentation_test.go](presentation_test.go) | `TestRealProcessAgentPresentationAndView`, `createRunFixture` | A deterministic manager+workers fixture (custom agent identity/state via `pane.report_agent`), HOP metadata published through the presentation adapter, tokens round-tripped through `agent.list`, manager-first ordering, HOP's owned view select/clear, and another owner's view surviving HOP's owned clear |
+| [observation_test.go](observation_test.go) | `TestRealProcessEventObservationReconcile`, `TestRealProcessLaunchEnvironment`, `TestRealProcessContextInjection` | Subscribe-before-snapshot reconciliation over a real status transition; an explicit launch environment injected into a launched pane and read back; and context injected into a live pane through `pane.send_text` |
 
 ## Invariants
 
@@ -42,9 +44,12 @@ this tree, and drives everything through HOP's own protocol client.
 
 ## Dependencies and ports
 
-- Allowed inward imports: [internal/adapters/herdr](../../internal/adapters/herdr/AGENTS.md)
-  (rule `test/integration`, category `integration-test`); wire-shape structs
-  the assertions need are declared locally in the tests.
+- Allowed inward imports: [internal/app](../../internal/app/AGENTS.md) and
+  [internal/adapters/herdr](../../internal/adapters/herdr/AGENTS.md)
+  (rule `test/integration`, category `integration-test`); the presentation
+  and observation tests drive the `app` use cases through the real adapters,
+  and wire-shape structs the assertions need are declared locally in the
+  tests.
 - Consumed/implemented ports: none; the suite drives `herdr.Client` directly.
 - External binaries: `herdr` (skipped when absent) and the `go` tool to
   build the staged plugin.
