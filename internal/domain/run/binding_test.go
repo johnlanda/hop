@@ -28,12 +28,14 @@ func TestNewRuntimeBinding(t *testing.T) {
 	}
 }
 
-// TestRuntimeBindingObserve proves that a current binding accepts fresh
-// occupant evidence, and that a superseded binding never accepts one:
-// "observations, closes and retirements are valid only against a current
-// (non-superseded) binding" (section 2).
+// TestRuntimeBindingObserve proves that a current binding accepts a
+// complete occupant evidence triple, that a superseded binding never
+// accepts one ("observations, closes and retirements are valid only
+// against a current (non-superseded) binding", section 2), and that
+// incomplete evidence is rejected: occupant identity is "label + argv
+// marker + pid" together, and "a pid is never evidence alone" (section 2).
 func TestRuntimeBindingObserve(t *testing.T) {
-	t.Run("current binding accepts an observation", func(t *testing.T) {
+	t.Run("current binding accepts a complete evidence triple", func(t *testing.T) {
 		b := newBinding()
 		evidence := run.OccupantEvidence{Label: "label-1", ArgvMarker: testAttemptID.String(), PID: 4242}
 
@@ -54,10 +56,38 @@ func TestRuntimeBindingObserve(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Supersede: unexpected error: %v", err)
 		}
+		complete := run.OccupantEvidence{Label: "label-1", ArgvMarker: testAttemptID.String(), PID: 4242}
 
-		_, err = b.Observe(run.OccupantEvidence{Label: "label-1", PID: 1}, later())
+		_, err = b.Observe(complete, later())
 		if !errors.Is(err, run.ErrInvalidTransition) {
 			t.Fatalf("Observe on a superseded binding: error = %v, want ErrInvalidTransition", err)
+		}
+	})
+
+	t.Run("rejects incomplete evidence", func(t *testing.T) {
+		cases := []struct {
+			name     string
+			evidence run.OccupantEvidence
+		}{
+			{name: "empty label", evidence: run.OccupantEvidence{Label: "", ArgvMarker: "marker", PID: 1}},
+			{name: "empty argv marker", evidence: run.OccupantEvidence{Label: "label-1", ArgvMarker: "", PID: 1}},
+			{name: "zero pid", evidence: run.OccupantEvidence{Label: "label-1", ArgvMarker: "marker", PID: 0}},
+			{name: "negative pid", evidence: run.OccupantEvidence{Label: "label-1", ArgvMarker: "marker", PID: -1}},
+			{name: "empty everything", evidence: run.OccupantEvidence{}},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				b := newBinding()
+
+				got, err := b.Observe(tc.evidence, later())
+
+				if !errors.Is(err, run.ErrInvalidTransition) {
+					t.Fatalf("Observe(%+v): error = %v, want ErrInvalidTransition", tc.evidence, err)
+				}
+				if got != b {
+					t.Fatalf("Observe(%+v) changed the binding despite the error: %+v", tc.evidence, got)
+				}
+			})
 		}
 	})
 }

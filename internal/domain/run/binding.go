@@ -76,6 +76,9 @@ func (b RuntimeBinding) Observe(evidence OccupantEvidence, now time.Time) (Runti
 	if b.Superseded {
 		return b, fmt.Errorf("%w: binding %s/%s: cannot observe a superseded binding", ErrInvalidTransition, b.SessionID, b.IncarnationID)
 	}
+	if evidence.Label == "" || evidence.ArgvMarker == "" || evidence.PID <= 0 {
+		return b, fmt.Errorf("%w: binding %s/%s: occupant evidence requires a label, an argv marker and a positive pid — a pid is never evidence alone", ErrInvalidTransition, b.SessionID, b.IncarnationID)
+	}
 	b.Occupant = &evidence
 	b.ObservedAt = now
 	return b, nil

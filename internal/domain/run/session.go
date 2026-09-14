@@ -93,10 +93,17 @@ func NewSession(id identity.SessionID, runID identity.RunID, attemptID identity.
 
 // AssignNativeRef records the session's native reference and its source.
 // The reference is immutable once assigned: a session that already carries
-// one refuses to record another, even an identical one.
+// one refuses to record another, even an identical one. ref must be
+// non-empty and source must be NativeRefAssigned or NativeRefCaptured.
 func (s Session) AssignNativeRef(ref string, source NativeRefSource, now time.Time) (Session, error) { //nolint:gocritic // hugeParam: Session is an immutable domain value returned by every transition; a pointer receiver would let a caller's original be mutated through it, breaking the pure-transition contract.
 	if s.NativeSessionRef != "" {
 		return s, fmt.Errorf("%w: session %s: native reference is already assigned", ErrInvalidTransition, s.ID)
+	}
+	if ref == "" {
+		return s, fmt.Errorf("%w: session %s: native reference must not be empty", ErrInvalidTransition, s.ID)
+	}
+	if source != NativeRefAssigned && source != NativeRefCaptured {
+		return s, fmt.Errorf("%w: session %s: %q is not a valid native reference source", ErrInvalidTransition, s.ID, source)
 	}
 	s.NativeSessionRef = ref
 	s.NativeRefSource = source

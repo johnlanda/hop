@@ -135,3 +135,48 @@ func TestSessionAssignNativeRefIsImmutable(t *testing.T) {
 		t.Fatalf("AssignNativeRef mutated the reference: %+v", assigned)
 	}
 }
+
+// TestSessionAssignNativeRefRejectsInvalidInput proves that an empty
+// reference and a source other than NativeRefAssigned/NativeRefCaptured are
+// both rejected, without recording anything and without opening a route to
+// a later valid-looking assignment on top of an invalid one.
+func TestSessionAssignNativeRefRejectsInvalidInput(t *testing.T) {
+	session := run.NewSession(testSessionID, testRunID, testAttemptID, run.HarnessClaude, epoch())
+
+	cases := []struct {
+		name   string
+		ref    string
+		source run.NativeRefSource
+	}{
+		{name: "empty reference, valid source", ref: "", source: run.NativeRefAssigned},
+		{name: "empty reference, unknown source", ref: "", source: run.NativeRefSource("")},
+		{name: "non-empty reference, unknown source", ref: "native-ref-1", source: run.NativeRefSource("bogus")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := session.AssignNativeRef(tc.ref, tc.source, later())
+
+			if !errors.Is(err, run.ErrInvalidTransition) {
+				t.Fatalf("AssignNativeRef(%q, %q): error = %v, want ErrInvalidTransition", tc.ref, tc.source, err)
+			}
+			if got != session {
+				t.Fatalf("AssignNativeRef(%q, %q) changed the session despite the error: %+v", tc.ref, tc.source, got)
+			}
+		})
+	}
+
+	t.Run("rejected empty reference never opens the door to a later assignment", func(t *testing.T) {
+		afterRejection, err := session.AssignNativeRef("", run.NativeRefAssigned, later())
+		if !errors.Is(err, run.ErrInvalidTransition) {
+			t.Fatalf("AssignNativeRef(\"\"): error = %v, want ErrInvalidTransition", err)
+		}
+
+		got, err := afterRejection.AssignNativeRef("native-ref-1", run.NativeRefAssigned, later())
+		if err != nil {
+			t.Fatalf("AssignNativeRef after a rejected empty reference: unexpected error: %v", err)
+		}
+		if got.NativeSessionRef != "native-ref-1" {
+			t.Fatalf("AssignNativeRef after a rejected empty reference = %+v, want native-ref-1 recorded", got)
+		}
+	})
+}

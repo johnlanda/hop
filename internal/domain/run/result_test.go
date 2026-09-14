@@ -216,6 +216,69 @@ func TestAcceptResultDuplicateIsIdempotentInEveryState(t *testing.T) {
 	}
 }
 
+// TestAcceptResultDuplicateOrderingIsAdversarial proves that duplicate
+// resolution genuinely happens before any eligibility precondition, not
+// merely alongside states where eligibility would also have passed: an
+// identical digest is still ErrDuplicateResult when the incarnation is not
+// current (including on a terminal attempt, where eligibility would in any
+// case be denied by state) and when the run has an active stop request.
+func TestAcceptResultDuplicateOrderingIsAdversarial(t *testing.T) {
+	prior := run.Result{ID: testResultID, AttemptID: testAttemptID, ContentDigest: "digest-v1", Accepted: true, CommitOID: "deadbeef"}
+	resubmission := run.ResultSubmission{ID: identityOtherResultID, CommitOID: "deadbeef", Summary: "resubmit", Digest: "digest-v1"}
+
+	cases := []struct {
+		name    string
+		run     run.Run
+		task    run.Task
+		attempt run.Attempt
+		ctx     run.AcceptanceContext
+	}{
+		{
+			name:    "non-current incarnation, running attempt",
+			run:     baseRun(run.RunRunning, false),
+			task:    baseTask(run.TaskChecking),
+			attempt: baseAttempt(run.AttemptRunning),
+			ctx:     run.AcceptanceContext{IncarnationCurrent: false},
+		},
+		{
+			name:    "non-current incarnation, terminal completed attempt",
+			run:     baseRun(run.RunCompleted, false),
+			task:    baseTask(run.TaskCompleted),
+			attempt: baseAttempt(run.AttemptCompleted),
+			ctx:     run.AcceptanceContext{IncarnationCurrent: false},
+		},
+		{
+			name:    "non-current incarnation, terminal failed attempt",
+			run:     baseRun(run.RunFailed, false),
+			task:    baseTask(run.TaskFailed),
+			attempt: baseAttempt(run.AttemptFailed),
+			ctx:     run.AcceptanceContext{IncarnationCurrent: false},
+		},
+		{
+			name:    "run stopping with an active stop request",
+			run:     baseRun(run.RunStopping, true),
+			task:    baseTask(run.TaskChecking),
+			attempt: baseAttempt(run.AttemptChecking),
+			ctx:     run.AcceptanceContext{IncarnationCurrent: true},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			outcome, err := run.AcceptResult(tc.run, tc.task, tc.attempt, &prior, tc.ctx, resubmission, later())
+
+			if !errors.Is(err, run.ErrDuplicateResult) {
+				t.Fatalf("AcceptResult: error = %v, want ErrDuplicateResult", err)
+			}
+			if outcome.Result != prior {
+				t.Fatalf("Result = %+v, want the unchanged prior %+v", outcome.Result, prior)
+			}
+			if outcome.Run != tc.run || outcome.Task != tc.task || outcome.Attempt != tc.attempt {
+				t.Fatalf("AcceptResult mutated its inputs on a duplicate outcome: %+v", outcome)
+			}
+		})
+	}
+}
+
 // TestAcceptResultConflictingNeverDisturbsAcceptedResult proves that a
 // resubmission with a different digest is rejected as conflicting in every
 // attempt state and never replaces or alters the accepted result.
