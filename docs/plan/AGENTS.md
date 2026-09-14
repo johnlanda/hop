@@ -8,6 +8,9 @@ testable exit criteria. These are implementation proposals, not completed work.
 ## Map
 
 - [Phased implementation](phases.md): build sequence, milestones and first backlog.
+- [Phase 2 design](phase-2-design.md): the durable single-worker run — domain
+  slice, ports, SQLite persistence, state machines, sanitizing launcher,
+  result protocol, CLI surface, test plan and work breakdown.
 - [Architecture](../architecture/AGENTS.md): boundaries, entities and engineering contracts.
 - [Terminal UX](../ux/AGENTS.md): native Herdr and optional board interactions.
 

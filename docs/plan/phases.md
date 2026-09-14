@@ -88,6 +88,10 @@ each claimed launch/restore mode; unsupported modes remain unavailable.
 
 ## Phase 2 — Durable single-worker run
 
+The concrete design for this phase — domain slice, ports, persistence, state
+machines, launcher, result protocol and work breakdown — is
+[phase-2-design.md](phase-2-design.md).
+
 Deliver `hop run`, `hop status`, `hop stop` and a scoped `hop resume`. Accept one
 brief, freeze its effective instructions, create one task/attempt, and launch one
 native worker in a worktree. Initially use an explicitly selected existing native
