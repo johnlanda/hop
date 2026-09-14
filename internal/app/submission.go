@@ -72,6 +72,24 @@ type SubmissionOutcome struct {
 	Detail   string
 }
 
+// ClaimedSubmissionFieldLimit bounds every ClaimedSubmission field the
+// receipt stores: a malformed claim is recorded as evidence, never as an
+// unbounded copy of arbitrary worker input.
+const ClaimedSubmissionFieldLimit = 4096
+
+// ClaimedSubmission is the as-received values of one submission that failed
+// application-side parsing or bounds checks (section 7 step 1) before a
+// typed ResultSubmission could be constructed: recorded with no foreign
+// keys required, so a malformed retry still leaves evidence. Every field is
+// truncated to ClaimedSubmissionFieldLimit bytes before recording; Detail
+// names the failed check only and never echoes a secret.
+type ClaimedSubmission struct {
+	RunID, TaskID, AttemptID, IncarnationID string
+	CommitOID                               string
+	Summary                                 string
+	Detail                                  string
+}
+
 // SubmissionStore holds worker-side and third-party writes: transactions
 // that never carry a controller generation and must survive controller
 // takeover. Each method is one internal transaction with its own contract
@@ -92,8 +110,15 @@ type SubmissionStore interface {
 	// not a pending check execution of the current generation.
 	ClaimCheckExec(ctx context.Context, op identity.OperationID, pid int) error
 	// SubmitResult applies the section 7 validation order atomically,
-	// including the attempt and task transitions on acceptance.
+	// including the attempt and task transitions on acceptance. submission
+	// is already parsed and bounds-checked (step 1); SubmitResult performs
+	// existence and agreement (step 2 — attempt belongs to task, task to
+	// run) internally and returns SubmissionMalformed for disagreement.
 	SubmitResult(ctx context.Context, submission ResultSubmission) (SubmissionOutcome, error)
+	// RecordMalformed records a submission that failed step 1 parsing or
+	// bounds checks before any typed identity could be constructed, with
+	// the claimed values truncated to ClaimedSubmissionFieldLimit bytes.
+	RecordMalformed(ctx context.Context, claimed ClaimedSubmission) (SubmissionOutcome, error)
 	// RequestStop sets the run's monotonic stop request without a lease.
 	RequestStop(ctx context.Context, run identity.RunID) error
 }

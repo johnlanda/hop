@@ -59,7 +59,14 @@ type CheckExecutionContext struct {
 // boundaries load their context this way, never through a controller unit
 // of work.
 type ReadStore interface {
-	ListRuns(ctx context.Context, repository identity.RepositoryID) ([]RunStatus, error)
+	// ListRuns lists the repository's runs. repositoryRoot is the
+	// symlink-resolved absolute repository root — the design's repository
+	// identity — exactly as cmd/hop's single resolver canonicalizes it;
+	// composition never holds a RepositoryID, so the adapter resolves
+	// repositoryRoot to its internal repository row itself (the same
+	// get-or-create lookup InitializeRun uses). An unknown root returns no
+	// runs, never an error: a repository with no run yet has none to list.
+	ListRuns(ctx context.Context, repositoryRoot string) ([]RunStatus, error)
 	LoadRunStatus(ctx context.Context, run identity.RunID) (RunDetail, error)
 	LoadLaunchContext(ctx context.Context, run identity.RunID, attempt identity.AttemptID) (LaunchContext, error)
 	LoadCheckExecutionContext(ctx context.Context, op identity.OperationID) (CheckExecutionContext, error)

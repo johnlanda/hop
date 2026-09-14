@@ -71,7 +71,11 @@ type RunSnapshot struct {
 // file through ArtifactStore afterward, as a separate act — no external
 // call, including a local file write, happens inside this transaction.
 type NewRunSpec struct {
-	RepositoryRoot string // symlink-resolved absolute path
+	// RepositoryRoot is the symlink-resolved absolute repository root — the
+	// design's repository identity — canonicalized by cmd/hop's single
+	// resolver. The adapter resolves it to its internal repository row
+	// through the same get-or-create lookup ReadStore.ListRuns uses.
+	RepositoryRoot string
 
 	RunID         identity.RunID
 	TaskID        identity.TaskID
