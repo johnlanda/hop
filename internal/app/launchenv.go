@@ -87,10 +87,12 @@ type EnvPolicy struct {
 // applies and returns the validated value the exec-boundary commands pass to
 // it, validating once at load. It rejects a version this build has no strip
 // matrix for, a harness outside the supported set, a strip or passthrough
-// entry that cannot name an environment variable (empty, containing "=", or
-// containing a control byte, which no native environment name can carry),
-// and a profile directory that contains a control byte or is not an
-// absolute path — profile paths arrive already resolved by the
+// entry HOP does not accept as an environment variable name (empty,
+// containing "=", or containing a control byte — NUL cannot appear in a
+// native environment string, and HOP policy disallows the other bytes
+// below 0x20 in names as well), and a profile directory that contains a
+// control byte or is not an absolute path — profile paths arrive already
+// resolved by the
 // configuration loader, and a relative one must never select a
 // working-directory-dependent profile. Errors identify a rejected list
 // entry by list, position and name portion only: nothing after an entry's
@@ -117,7 +119,7 @@ func (p EnvPolicy) Validate() (ValidatedEnvPolicy, error) { //nolint:gocritic //
 	}
 	if p.ProfileDir != "" {
 		if containsControlByte(p.ProfileDir) {
-			return ValidatedEnvPolicy{}, fmt.Errorf("profile directory contains a control byte and cannot be a native path")
+			return ValidatedEnvPolicy{}, fmt.Errorf("profile directory contains a control byte, which HOP does not permit in a profile path")
 		}
 		if !strings.HasPrefix(p.ProfileDir, "/") {
 			return ValidatedEnvPolicy{}, fmt.Errorf("profile directory %q is not an absolute path; the configuration loader resolves profile paths before the policy is frozen", p.ProfileDir)
@@ -132,8 +134,9 @@ func (p EnvPolicy) Validate() (ValidatedEnvPolicy, error) { //nolint:gocritic //
 	}, nil
 }
 
-// validateVariableName rejects a strip or passthrough entry that can never
-// name an environment variable. Errors carry the list, the entry's position
+// validateVariableName rejects a strip or passthrough entry that HOP does
+// not accept as an environment variable name. Errors carry the list, the
+// entry's position
 // and at most the portion of the entry before its first "=" — never a
 // value, so a mistaken NAME=value assignment stays out of stderr and logs —
 // and a fixed message when the name portion itself is not printable.
@@ -142,7 +145,7 @@ func validateVariableName(list string, index int, name string) error {
 	case name == "":
 		return fmt.Errorf("%s entry %d is empty; entries name environment variables", list, index)
 	case containsControlByte(name):
-		return fmt.Errorf("%s entry %d contains a control byte and cannot name an environment variable", list, index)
+		return fmt.Errorf("%s entry %d contains a control byte, which HOP does not permit in an environment variable name", list, index)
 	case strings.Contains(name, "="):
 		prefix, _, _ := strings.Cut(name, "=")
 		return fmt.Errorf("%s entry %d (name %q) is an assignment, not a variable name; entries never carry values", list, index, prefix)
@@ -150,8 +153,10 @@ func validateVariableName(list string, index int, name string) error {
 	return nil
 }
 
-// containsControlByte reports whether s carries any byte below 0x20, which
-// no native environment name or path can represent.
+// containsControlByte reports whether s carries any byte below 0x20. NUL
+// cannot appear in a native environment string or path; HOP policy
+// disallows the remaining bytes below 0x20 in policy names and profile
+// paths as well.
 func containsControlByte(s string) bool {
 	for i := range len(s) {
 		if s[i] < 0x20 {
@@ -196,8 +201,9 @@ type ValidatedEnvPolicy struct {
 // duplicate-name resolution undefined, so the choice is HOP's, not an
 // operating-system guarantee). environ is expected in the native os.Environ
 // shape, which cannot carry an embedded NUL; a synthetic NUL-bearing entry
-// is outside that precondition and passes through byte-for-byte for the
-// exec boundary to reject, never truncated. env holds the surviving entries
+// is outside that precondition, and any such entry that survives
+// sanitization passes through byte-for-byte for the exec boundary to
+// reject, never truncated. env holds the surviving entries
 // in inherited order with the profile assignments appended; removed holds
 // the names — never the values — of the stripped variables, in that same
 // order.

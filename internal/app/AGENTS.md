@@ -122,10 +122,12 @@ task 6a; controller use-case code never calls it.
 - Parse-don't-validate: `SanitizeEnvironment` accepts only
   `ValidatedEnvPolicy`, constructible (non-zero) solely through
   `Validate`, which rejects an unknown matrix revision, an unsupported
-  harness, entries that cannot name an environment variable (empty,
-  containing `=`, or containing a control byte), and a profile directory
-  that carries a control byte or is not absolute (the config adapter
-  resolves profile paths before freezing). Validation errors identify a
+  harness, entries HOP does not accept as variable names (empty,
+  containing `=`, or containing a control byte — NUL cannot appear in a
+  native environment string; the other bytes below 0x20 are disallowed by
+  HOP policy), and a profile directory that carries a control byte or is
+  not absolute (the config adapter resolves profile paths before
+  freezing). Validation errors identify a
   rejected entry by list, position and name portion only — never anything
   after an entry's first `=`. The zero `ValidatedEnvPolicy` sanitizes as
   the strictest policy: full union stripped, no passthrough, no profile.
