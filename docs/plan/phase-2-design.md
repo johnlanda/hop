@@ -346,7 +346,11 @@ a pure application function
 `SanitizeEnvironment(environ []string, policy EnvPolicy) (env []string, removed []string)`
 in `internal/app` that the command, the controller (check environments) and
 the tests share. `EnvPolicy` is a versioned value frozen into the run
-snapshot; precedence within it is defined in section 6.
+snapshot; precedence within it is defined in section 6. The policy value,
+the version-scoped strip matrix and `SanitizeEnvironment` are
+credential-handling code: they live in their own file in `internal/app`
+(`launchenv.go`) authored and owned by task 4 (section 10); task 2 declares
+only the `EnvPolicy` type shape and the function signature it consumes.
 
 ## 4. Persistence
 
@@ -939,16 +943,17 @@ Makefile is edited only in task 6b; `cmd/hop` only in task 6a.
 | --- | --- | --- | --- | --- | --- | --- |
 | 0 | Spike: the six bounded real-process probes (S1–S6); findings reported before task 2 freezes ports | `test/integration` (probe tests + retained evidence) | the probes themselves | — | with 1 | Sonnet |
 | 1 | Domain slice: identity types, run-module entities, pure transitions per the section 5 tables, typed errors; `internal/domain` index guide; domain rules in the checker handed to the integrator | `internal/domain/identity`, `internal/domain/run` | Domain tables, parser fuzz | — | with 0 | Sonnet |
-| 2 | Application ports and controller logic: all section 3 ports (shapes finalized against S1/S2 findings), `SanitizeEnvironment`, canonical digest, run/status/stop/resume/submit/check use cases against handwritten fakes, the operation decision table as behavior, DTOs for composition | `internal/app` | App scenario + table tests incl. the takeover barrier | 0, 1 | — | Sonnet |
+| 2 | Application ports and controller logic: all section 3 ports (shapes finalized against S1/S2 findings), canonical digest, run/status/stop/resume/submit/check use cases against handwritten fakes, the operation decision table as behavior, DTOs for composition. Declares only the `EnvPolicy` type shape and the `SanitizeEnvironment` signature it consumes; their implementation is task 4's file | `internal/app` | App scenario + table tests incl. the takeover barrier | 0, 1 | — | Sonnet |
 | — | Integrator dependency pin: one commit adding both third-party pins to `go.mod` | `go.mod` | build | 2 | — | integrator |
 | 3 | SQLite store: schema migration 001, typed repositories, unit of work, revisions, journal, lease/fencing, submission-store contracts, store-path resolver | `internal/adapters/sqlite` | Real temp-DB suite of section 9 | 2, pin | with 4, 5 | Fable |
-| 4 | Launcher core and local adapters: `Exec` + process-group `CommandRunner` (`internal/adapters/process`), `Clock`/`IDGenerator` (`internal/adapters/system`), strict TOML policy loading (`internal/adapters/config`). Scope call: task 4 tests only the adapters and `app.SanitizeEnvironment` directly (fixture binaries through `Exec`); the `hop launch` command surface itself is built and tested in 6a/6b, keeping all `cmd/hop` edits in one task | `internal/adapters/process`, `internal/adapters/system`, `internal/adapters/config` | Section 9 adapter rows | 2, pin | with 3, 5 | Fable |
+| 4 | Launcher core and local adapters: the credential-handling core in `internal/app/launchenv.go` (the `EnvPolicy` value, the version-scoped strip matrix, `SanitizeEnvironment` and its precedence tables — this file is task 4's alone), `Exec` + process-group `CommandRunner` (`internal/adapters/process`), `Clock`/`IDGenerator` (`internal/adapters/system`), strict TOML policy loading (`internal/adapters/config`). Scope call: task 4 tests the launchenv core and the adapters directly (fixture binaries through `Exec`); the `hop launch` command surface itself is built and tested in 6a/6b, keeping all `cmd/hop` edits in one task | `internal/app/launchenv.go`, `internal/adapters/process`, `internal/adapters/system`, `internal/adapters/config` | Section 9 adapter rows plus the `SanitizeEnvironment` precedence tables | 2, pin | with 3, 5 | Fable |
 | 5 | Herdr runtime extension: `Runtime` over `Client` with the S2-verified `PaneProcess` fields and guarded-close support | `internal/adapters/herdr` (`runtime.go`) | Fake-endpoint protocol tests | 2, pin | with 3, 4 | Sonnet |
 | 6a | Command wiring (integrator): `hop run`/`status`/`stop`/`resume`/`result submit`/`launch` in `cmd/hop`, launch-line rendering and path rules, doctor store-path line via the shared resolver, merges of 3–5 | `cmd/hop` | Command tables: dispatch, exit codes, flag surfaces, signal handling | 3, 4, 5 | — | Sonnet |
 | 6b | Scenario integration: fixture repository generator, fixture worker, the full real-process suite of section 9, the opt-in live test, Makefile target for it | `test/integration`, `Makefile` | Section 9 real-process rows | 6a | — | Sonnet |
 
 Fable implements the two correctness-critical cores: the SQLite
 atomicity/recovery/fencing store (task 3) and the launcher/process boundary
+including the credential-handling environment policy in `internal/app`
 (task 4).
 
 ## 11. Decisions assumed, spike dependencies, open questions, risks
