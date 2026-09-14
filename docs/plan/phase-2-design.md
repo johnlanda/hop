@@ -244,11 +244,18 @@ Status rendering, `hop launch` and `hop check-exec` read without any lease:
 type ReadStore interface {
     ListRuns(ctx context.Context, repository RepositoryID) ([]RunStatus, error)
     LoadRunStatus(ctx context.Context, run RunID) (RunDetail, error)
-    // LoadLaunchContext returns what the exec boundaries need: the frozen
-    // snapshot (policy, harness, assignment path, native reference), the
-    // session's current binding and incarnation, the launch-claim state and
-    // the stop state.
+    // LoadLaunchContext returns what the launch exec boundary needs: the
+    // frozen snapshot (policy, harness, assignment path, native reference),
+    // the session's current binding and incarnation, the launch-claim state
+    // and the stop state.
     LoadLaunchContext(ctx context.Context, run RunID, attempt AttemptID) (LaunchContext, error)
+    // LoadCheckExecutionContext returns what the check exec boundary needs,
+    // addressed by the check execution's operation ID: the frozen env
+    // policy, the absolute state root, the candidate checkout path and the
+    // frozen check argv. hop check-exec additionally receives its absolute
+    // HOP_STATE_DIR from the controller in the spawned environment, so it
+    // resolves the same store without any fallback.
+    LoadCheckExecutionContext(ctx context.Context, op OperationID) (CheckExecutionContext, error)
 }
 ```
 
@@ -261,7 +268,8 @@ transaction with its own contract (section 4, "Transaction authorities"):
 ```go
 type SubmissionStore interface {
     // ClaimLaunch is written by hop launch BEFORE exec: run, attempt,
-    // incarnation, argv digest, own pid, state exec_pending. It fails —
+    // incarnation, the expected executable's resolved absolute path, argv
+    // digest, own pid, state exec_pending. It fails —
     // and the caller must not exec — when the run
     // is stopping or stopped, the incarnation is not current, or a claim
     // for this incarnation already exists with a different pid. A rewrite
@@ -290,6 +298,7 @@ corroborating observation, section 6), not a launcher write.
 type Runtime interface {
     CreateWorktree(ctx context.Context, req WorktreeRequest) (WorktreeInfo, error) // worktree.create; no env — see launch-environment.md
     OpenWorkerPane(ctx context.Context, req WorkerPaneRequest) (PaneHandle, error) // layout.apply: one pane whose command IS the launch argv, with env, cwd and creation label
+    FindPaneByLabel(ctx context.Context, label string) (PaneRef, bool, error)       // recovery lookup when the create response was lost (S7: labels round-trip through tab.list/session.snapshot); returns the pane/tab/workspace IDs the ownership policy needs
     SendText(ctx context.Context, paneID, text string) error                        // fallback transport ONLY: the fixed-grammar launch line (section 6)
     ReadPane(ctx context.Context, paneID string, lines int) (string, error)         // evidence snapshots; captured periodically — scrollback vanishes with the pane
     InspectPane(ctx context.Context, paneID string) (PaneProcess, error)            // occupant identity for launch/stop/adoption decisions
@@ -363,12 +372,33 @@ Implemented in `internal/adapters/process`; used for the git operations and
 for spawning `hop check-exec`. The same package provides
 `Exec(argv []string, env []string) error` (a `syscall.Exec` wrapper that
 only returns on failure), used by the `hop launch` and `hop check-exec`
-commands, and a local process-table inspection
-`GroupProcesses(pgid int) ([]LocalProcess, error)` (pid and argv per
-member, via the platform process listing) that check-group retirement uses
-to verify a recorded group before signaling it (section 7) — Herdr's pane
-surface has no process start time, so identity is always corroborated by
-argv, never by pid alone.
+commands.
+
+### ProcessGroupInspector
+
+Group retirement after takeover has no surviving `CommandRunner` context to
+cancel, so it is a consumer-owned port injected into the stop and resume
+use cases (testable against fakes in task 2), implemented in
+`internal/adapters/process`:
+
+```go
+type ProcessGroupInspector interface {
+    // GroupProcesses lists the group's members (pid and argv each) via the
+    // platform process table; a listing that cannot be made is an error,
+    // never an empty result.
+    GroupProcesses(ctx context.Context, pgid int) ([]GroupProcess, error)
+    // SignalGroup kills the whole group.
+    SignalGroup(ctx context.Context, pgid int) error
+}
+```
+
+Ownership decisions stay in `internal/app`: the retirement function
+classifies the listing against the expected argv and returns a typed
+outcome — `empty` (already gone, no signal), `matched` (signal, then await
+absence), `mismatched` (never signaled; `reconciling` with the listing as
+evidence) or `inspection failed` (fail closed) — per the group-retirement
+rule of section 7. Herdr's pane surface has no process start time, so group
+identity is always corroborated by argv, never by pid or pgid alone.
 
 ### ConfigurationSource
 
@@ -486,7 +516,7 @@ updates run `... WHERE id = ? AND revision = ?` and zero affected rows is
 | `attempts` | id PK, task_id FK, number, state, revision, … | UNIQUE(task_id, number); partial UNIQUE(task_id) WHERE state in active set |
 | `sessions` | id PK, run_id FK, attempt_id FK, role, harness, native_session_ref NULL, native_ref_source NULL (assigned, captured), state, revision, … | reference immutable once set; a cold relaunch inserts a new session for the same attempt |
 | `runtime_bindings` | id PK, session_id FK, incarnation_id, server_socket_path, server_instance NULL (pending S3), workspace_id, tab_id, pane_id, creation_label, occupant_evidence JSON NULL (label + argv marker + pid; never pid alone), launch_kind (initial, resume, restored-observed), observed_at, superseded, superseded_evidence NULL | append-only; UNIQUE(session_id, incarnation_id) |
-| `launch_claims` | incarnation_id PK, run_id, attempt_id, argv_digest, pid, state (exec_pending, execed, exec_failed), error NULL, claimed_at, settled_at NULL, settlement_evidence NULL | claimed by hop launch before exec; settled to execed only by the controller on corroboration; a claim with a different pid for an existing incarnation is rejected |
+| `launch_claims` | incarnation_id PK, run_id, attempt_id, executable (expected absolute harness/fixture path, for the section 6 predicate), argv_digest, pid, state (exec_pending, execed, exec_failed), error NULL, claimed_at, settled_at NULL, settlement_evidence NULL | claimed by hop launch before exec; settled to execed only by the controller on corroboration; a claim with a different pid for an existing incarnation is rejected |
 | `worktrees` | id PK, repository_id FK, run_id FK, path, branch, base_commit, state, created_at | UNIQUE(path); adoption validates repository and base, not path existence (decision table) |
 | `results` | id PK, attempt_id FK, commit_oid, summary, content_digest, accepted, submitted_at | partial UNIQUE(attempt_id) WHERE accepted = 1; UNIQUE(attempt_id, content_digest) |
 | `result_submissions` | id PK, claimed_run_id, claimed_task_id, claimed_attempt_id, claimed_incarnation_id, content_digest NULL, outcome (accepted, duplicate, stale, conflicting, transient, malformed), detail, submitted_at | claimed ids are plain TEXT, no FKs, so malformed submissions still leave evidence |
@@ -602,7 +632,7 @@ condition alongside the state.
 | From | To | Cause |
 | --- | --- | --- |
 | created | launching | launch intent journaled |
-| launching | running | launch claim settled `execed` + agent detection |
+| launching | running | launch claim settled `execed` by the section 6 corroboration predicate (agent detection only triggers the inspection, it never settles), or atomically within an early-acceptance transaction (section 7) |
 | launching | failed | exec_failed claim, or launch-window expiry with a conclusively retired incarnation and no resume path |
 | running | completing | accepted result's check claimed |
 | completing | completed | passing check receipt, no stop requested |
@@ -630,8 +660,8 @@ condition alongside the state.
 | --- | --- | --- |
 | reserved | launching | launch intent |
 | reserved | interrupted | stop before launch (no act performed) |
-| launching | running | claim settled `execed` + detection |
-| launching | submitted | early submission accepted: settled claim for the current incarnation (section 7) |
+| launching | running | claim settled `execed` (section 6 predicate) |
+| launching | submitted | early submission accepted: settled claim for the current incarnation (section 7 atomic handoff) |
 | launching | failed | exec_failed claim, unrecoverable |
 | launching | interrupted | stop during launch; pre-exec claimed process retired |
 | launching | reconciling | ambiguous launch (no claim, or unsettled claim) |
@@ -644,7 +674,9 @@ condition alongside the state.
 | reconciling | running, submitted, checking | warm reattach verified (returns to its prior state) |
 | reconciling | relaunching | cold relaunch authorized: absence established (positive retirement evidence or recorded human attestation) and supported resume semantics exist |
 | reconciling | interrupted | retirement established with no resume path, or stop |
-| relaunching | running | new incarnation's claim settled + detection |
+| relaunching | running | new incarnation's claim settled `execed` (section 6 predicate) |
+| relaunching | submitted | early submission accepted: settled claim for the new incarnation (section 7 atomic handoff) |
+| relaunching | failed | settled exec_failed claim on the new incarnation, unrecoverable |
 | relaunching | reconciling | new launch ambiguous |
 | relaunching | interrupted | stop during relaunch |
 
@@ -657,7 +689,8 @@ session ends `lost` or `terminated` and is never revived.
 | From | To | Cause |
 | --- | --- | --- |
 | reserved | launching | launch intent |
-| launching | active | claim settled `execed` + detection |
+| launching | active | claim settled `execed` (section 6 predicate) |
+| launching | stopping | stop with a corroborated live process before the active transition; termination is then observed, never declared |
 | launching, active | reconciling | ambiguity or takeover |
 | reconciling | active | occupant verified against the current binding's claim evidence |
 | reconciling | lost | absence conclusively established (positive evidence or attestation) |
@@ -665,7 +698,7 @@ session ends `lost` or `terminated` and is never revived.
 | reconciling | terminated | stop requested with no live process established, or retirement completed |
 | active | stopping | interrupt dispatched |
 | stopping | terminated | termination observed |
-| reserved, launching | terminated | stopped, or exec failure, before/without a running harness |
+| reserved, launching | terminated | stopped, or exec failure, with no corroborated live process (a stop against a corroborated live process goes through launching → stopping above) |
 
 A session's settling evidence must come from a current runtime binding; an
 observation from a superseded binding is ignored.
@@ -678,6 +711,38 @@ every stop or retirement action — scrollback vanishes with the pane. A
 worker exit and a human closing the pane produce the same observable
 evidence; HOP distinguishes them only as far as the evidence allows and
 reports the ambiguity honestly rather than guessing.
+
+### Reference traces
+
+The domain test suite proves these four exact event orders as complete
+four-entity traces (each line: event → Run / Task / Attempt / Session);
+they are the orders two implementers could otherwise resolve differently:
+
+1. Fixture worker (name never detected) submits before running: intent →
+   launching/active/launching/launching; claim exec_pending → unchanged;
+   submission with a still-unsettled claim → `transient` (no transitions);
+   claim settled `execed` via the inspection predicate → Run running,
+   Attempt running, Session active; resubmission accepted → Run running
+   (idempotent — already there), Task checking, Attempt submitted; check
+   claimed → Run completing, Attempt checking. Alternative inside the same
+   trace: if the claim settles and acceptance wins before the controller
+   applies the lifecycle transitions, the acceptance transaction itself
+   moves Run launching→running, Task active→checking, Attempt
+   launching→submitted atomically, and the controller's later observation
+   of the settled claim is a no-op.
+2. Cold relaunch, submit before running: relaunch authorized → Run
+   resuming→launching, Attempt reconciling→relaunching, new Session'
+   reserved→launching (new incarnation); claim settles; submission
+   accepted → the same atomic handoff with Attempt relaunching→submitted,
+   Run launching→running, Task active→checking; Session'
+   launching→active on the settled claim.
+3. Exec failure after relaunch: as trace 2 up to the claim, which settles
+   `exec_failed` → Attempt relaunching→failed, Session'
+   launching→terminated, Task active→failed, Run launching→failed.
+4. Stop during launching with a corroborated live process: stop requested
+   → Run launching→stopping; Session launching→stopping (interrupt under
+   the close rule); termination observed → Session terminated, Attempt
+   launching→interrupted, Task active→interrupted, Run stopping→stopped.
 
 ### Stop
 
@@ -723,19 +788,19 @@ Pending or ambiguous operations from the previous generation are resolved
 per the decision table (section 4) before any new act.
 
 1. Surviving worker (warm reattach — supported): the current binding's pane
-   exists (found by pane ID or creation label) and its occupant observation
-   matches the settled launch claim on pid AND argv marker. S1 established
-   the process relations: under the fallback transport an `exec` in the
+   exists (found by pane ID or `FindPaneByLabel`) and its occupant
+   observation satisfies the section 6 corroboration predicate against the
+   settled launch claim — the same predicate as settlement and adoption,
+   with no separate warm-reattach rule. S1 established the supported
+   process relations: under the fallback transport an `exec` in the
    top-level pane shell leaves harness pid = shell pid = foreground process
    group; under the primary transport the command process is the pane's
-   process directly. A harness wrapper that forks after exec can still make
-   the foreground pid differ from the claim pid, which is why the argv
-   marker (the native session UUID or run identities in the S2-verified
-   full argv) is required alongside the pid, never the pid alone. Rebind
-   observations, keep the incarnation (the worker's submissions stay
-   valid), republish presentation tokens (token metadata is not
-   cold-restored, see [herdr-surface.md](../architecture/herdr-surface.md)),
-   continue.
+   process directly. An occupant matching on executable identity, marker
+   and binding but not on pid is the unsupported forking-wrapper topology
+   and fails closed exactly as in section 6. Rebind observations, keep the
+   incarnation (the worker's submissions stay valid), republish
+   presentation tokens (token metadata is not cold-restored, see
+   [herdr-surface.md](../architecture/herdr-surface.md)), continue.
 2. Restored or replaced occupant — no negative-evidence ownership: a
    restored process was not started through the sanitizing launcher (the
    audited restore path replays no pane env and inherits the server
@@ -783,13 +848,27 @@ per the decision table (section 4) before any new act.
    relaunches only through item 2 (positive-evidence retirement) or the
    attestation below.
 5. Finite exit from a stuck reconciliation: `hop resume --confirm-absent`
-   records a human attestation — the user asserts no worker for this run
-   is running anywhere — as an `absence.attested` journal entry with the
-   reported evidence, retires the outstanding launch claims and bindings
-   with that attestation as the supersession evidence, and enables the
-   item-3 cold relaunch path. It is the retirement evidence, not a bypass:
-   there is no force-relaunch that skips prior-intent retirement. `hop
-   stop` is always available as the other finite exit.
+   records a human attestation as an `absence.attested` journal entry with
+   the reported evidence. The attestation must cover BOTH facts: no worker
+   for this run is currently running anywhere, AND every outstanding
+   mechanism that could still start one has been retired — for HOP's own
+   side that is the launch claims and intents the claim table retires;
+   for Herdr it would require canceling or settling a deferred native
+   restore, and no verified route for that exists yet (pending S3). A
+   truthful present-tense "no worker is running" cannot retire a restore
+   Herdr may still fire on a later client attachment, so:
+   `--confirm-absent` does not authorize relaunch while a prior Herdr
+   restore or launch request may still execute; those pending mechanisms
+   must first be retired independently. Concretely, the flag enables the
+   item-3 cold relaunch only in the non-restart cases (a controller crash
+   with the server up, where the outstanding launch intents are HOP's own
+   and the claim table retires them); the post-server-restart case stays
+   `resuming` with the item-2 report until S3 supplies a verified
+   cancellation or settlement route for deferred restore, or the restored
+   occupant appears and is retired by positive evidence. It is retirement
+   evidence, not a bypass: there is no force-relaunch that skips
+   prior-intent retirement. `hop stop` is always available as the other
+   finite exit.
 
 Resume tests cover: delayed restore (restore fires after resume's first
 snapshot), an inherited key or profile override present on a restored
@@ -882,13 +961,7 @@ and never-resend rule apply.
    not stopping or stopped, and no launch claim exists for this incarnation
    with a different pid. Any failure: no claim, no exec, exit 1 with one
    stderr line.
-2. Records the launch claim (`exec_pending`): run, attempt, incarnation,
-   argv digest, its own pid. execve preserves the pid, so the claim's pid
-   is the harness's pid on success. A second
-   `hop launch` for the same incarnation is rejected by the claim's
-   different-pid rule and never execs — a duplicate launcher invocation
-   cannot mint a second worker.
-3. Computes the sanitized environment: `app.SanitizeEnvironment` over its
+2. Computes the sanitized environment: `app.SanitizeEnvironment` over its
    own inherited environment with the snapshot's frozen, versioned
    `EnvPolicy`. Precedence, applied in order: start from the inherited
    environment; remove the harness strip matrix plus policy `strip`
@@ -896,7 +969,7 @@ and never-resend rule apply.
    (passthrough beats strip — it is the opt-in); apply profile assignments
    (profile beats passthrough for the same variable); the Herdr-managed
    `HERDR_*` and the pane's `HOP_*` additions pass through untouched.
-4. Composes the harness argv from the snapshot's harness field — for
+3. Composes the harness argv from the snapshot's harness field — for
    Claude, first launch:
    `claude --session-id <native-ref> "<fixed initial prompt>"`; cold
    resume: `claude --resume <native-ref>`. The native reference is a
@@ -909,23 +982,45 @@ and never-resend rule apply.
    including the retry instruction for a `transient` response (section 7).
    Argv is passed via execve — no shell parses it, so multiline or quoted
    brief content never needs escaping.
-5. Resolves the harness executable to an absolute path using the sanitized
-   environment's PATH, then `Exec`s. A failed exec settles the claim to
-   `exec_failed` with the error and exits 1; if that settlement write is
-   itself lost, the claim stays `exec_pending` and recovery treats it as
-   ambiguous (decision table) — a pre-exec write is never read as proof of
-   exec.
+4. Resolves the harness executable to an absolute path using the sanitized
+   environment's PATH.
+5. Records the launch claim (`exec_pending`): run, attempt, incarnation,
+   the resolved expected executable path, the argv digest, and its own
+   pid. execve preserves the pid, so the claim's pid is the harness's pid
+   on success. A second `hop launch` for the same incarnation is rejected
+   by the claim's different-pid rule and never execs — a duplicate
+   launcher invocation cannot mint a second worker.
+6. `Exec`s. A failed exec settles the claim to `exec_failed` with the
+   error and exits 1; if that settlement write is itself lost, the claim
+   stays `exec_pending` and recovery treats it as ambiguous (decision
+   table) — a pre-exec write is never read as proof of exec.
 
-Claim settlement: the claim is an intent acknowledgment, not proof the
-harness ran. The controller settles it to `execed` only with corroborating
-observation — Herdr agent detection on the pane (recognized harness names
-only, per S1), or an `InspectPane` observation whose foreground process
-matches the claim pid AND carries the claim's argv marker (the S2-verified
-full argv; this is the settlement path for the test fixture worker, whose
-binary name is not a recognized agent). A valid `transient`-rejected early
-submission also wakes the controller to attempt corroboration. Warm
-reattach and the decision table adopt only settled claims; an
-`exec_pending` claim is always ambiguous.
+Claim settlement — one corroboration predicate, used identically by
+settlement, adoption and warm reattach: the claim is an intent
+acknowledgment, not proof the harness ran. The controller settles it to
+`execed` only when an `InspectPane` observation satisfies ALL of:
+
+- the pane matches the claim's current creation binding (pane ID, or
+  recovery by creation label);
+- the foreground process's executable identity (name/argv0 resolved path,
+  from the S2-verified surface) equals the expected harness or fixture
+  executable recorded in the claim — which explicitly excludes a
+  still-running `hop launch` (argv0 = the HOP binary, subcommand
+  `launch`), so a paused pre-exec launcher can never satisfy the
+  predicate;
+- the process argv carries the claim's marker;
+- the foreground pid equals the claim pid (execve preserves it).
+
+Herdr agent detection (recognized harness names only, per S1) and a valid
+`transient`-rejected early submission are wakeups that TRIGGER this
+inspection; neither ever settles a claim by itself. An observation that
+matches on executable identity, marker and binding but differs on pid is
+the forking-wrapper topology, which Phase 2 does not support: it fails
+closed — the claim stays `exec_pending` and the run surfaces `needs
+interaction` with the observed identity, so the human decides. This is the
+settlement path for the test fixture worker too, whose binary name is
+never agent-detected. The decision table and warm reattach adopt only
+settled claims; an `exec_pending` claim is always ambiguous.
 
 ### Assignment artifact
 
@@ -992,11 +1087,13 @@ suppressed (still ambiguous, never `execed`); a duplicate `hop launch`
 invocation for the same incarnation (rejected, no second exec); on the
 fallback transport, a shell that forks before starting hop (the claim's
 self-recorded pid stays valid even when it differs from Herdr's shell pid —
-relation per S1); a wrapper that forks the real harness after exec (the
-foreground pid then differs from the claim pid, and settlement and warm
-reattach must still hold through the argv marker). Process-only tests (no
-Herdr) cover `app.SanitizeEnvironment` tables and `adapters/process.Exec`
-directly.
+relation per S1); a paused pre-exec launcher whose own argv carries the
+run/attempt UUIDs (must NOT settle the claim — the executable-identity
+conjunct excludes it); and a wrapper that forks the real harness after
+exec (fail-closed: the claim stays `exec_pending`, the run surfaces `needs
+interaction` with the observed identity, and no lifecycle transition
+fires). Process-only tests (no Herdr) cover `app.SanitizeEnvironment`
+tables and `adapters/process.Exec` directly.
 
 ## 7. Result protocol and deterministic check
 
@@ -1047,21 +1144,27 @@ transaction is normative:
 4. First acceptance only — eligibility: the submission's incarnation must
    be the session's current, non-superseded binding (else `stale`); the run
    must not be stopping/stopped (stop precedence, else `stale`); the
-   attempt must be `running`, or `launching` with a settled (`execed`)
-   launch claim for that incarnation — the early-submission case, where a
-   fast worker submits before the controller's detection transition.
-   `launching` with an unsettled claim returns `transient`: recorded, exit
-   1 with first output line `transient: attempt not yet running; retry` —
-   the assignment template instructs the worker to retry after a short
-   delay, and the controller treats the observed transient submission as a
-   wakeup to attempt claim corroboration. Any other state is `stale`.
-5. Accept, atomically with the receipt: insert the result (partial unique
-   index enforces one accepted result per attempt), record the `accepted`
-   submission, insert the unique `check_requests` row, and apply
-   Attempt→`submitted` (from `running` or `launching`) and Task→`checking`
-   with their transition-evidence rows, all in this same transaction. Exit
-   0. The controller's later detection of a worker whose attempt is already
-   `submitted` is a no-op.
+   attempt must be `running`, or `launching` or `relaunching` with a
+   settled (`execed`) launch claim for that incarnation — the
+   early-submission case, where a fast initial or cold-relaunched worker
+   submits before the controller's lifecycle transition. `launching` or
+   `relaunching` with an unsettled claim returns `transient`: recorded,
+   exit 1 with first output line `transient: attempt not yet running;
+   retry` — the assignment template instructs the worker to retry after a
+   short delay, and the controller treats the observed transient
+   submission as a wakeup to attempt claim corroboration under the
+   section 6 predicate. Any other state is `stale`.
+5. Accept, atomically with the receipt — the atomic handoff: insert the
+   result (partial unique index enforces one accepted result per attempt),
+   record the `accepted` submission, insert the unique `check_requests`
+   row, and apply Attempt→`submitted` (from `running`, `launching` or
+   `relaunching`), Task→`checking`, and — when the run has not yet reached
+   it — Run `launching`→`running`, with their transition-evidence rows,
+   all in this same transaction. Exit 0. Subsequent lifecycle observation
+   is idempotent: the controller's later corroboration of a claim whose
+   attempt is already `submitted` (and run already `running`) is a no-op,
+   and check claiming then proceeds through the ordinary
+   `running`→`completing` row.
 
 The controller consumes durable pending check requests by polling the store
 (2s interval) while using status events only as wakeups; a notification is
@@ -1115,8 +1218,9 @@ and namespaces all its files.
    alive still leaves the recorded group id as the retirement handle.
    Group-retirement rule (no process start time exists anywhere in the
    observable surface, so a pgid is never trusted alone): before signaling
-   a recorded group, the retirer lists it with
-   `process.GroupProcesses(pgid)` and requires at least one member whose
+   a recorded group, the retirer lists it through the
+   `ProcessGroupInspector` port (section 3, typed outcomes) and requires at
+   least one member whose
    argv matches the frozen check argv or the check-exec invocation; an
    empty group is already gone (no signal), and a non-empty group with no
    matching member is never signaled — the operation goes `reconciling`
@@ -1163,7 +1267,7 @@ single state-root resolver (section 4).
 | `hop run "<brief>"` | `-C dir` (repository, default cwd), `-env-passthrough VAR` (repeatable, merged into the frozen policy), `-socket` / `-herdr` (as doctor) | Foreground controller. Prints `run <seq-label> <uuid> started`, then one line per transition. Exit 0 only on `completed`; 1 on `failed`/`stopped`/detach/error; 2 on usage — including a missing or check-less `.herdr-orchestrator/config.toml`, an unsupported repository object format, and a HOP executable path failing the launch-line character rules, all refused before any side effect |
 | `hop status` | `-C dir`, `-run ID`, `-all` | Without `-run`: one line per run of the repository. With `-run`: the full detail block — states, worktree path, current binding and incarnation, launch-claim state, pending/`reconciling` operations, `blocked, needs interaction` condition, last submission outcome, artifact paths, and for an unrepeatable unknown check outcome the human's options. Exit 0 when rendering succeeds; state is data, not an exit code |
 | `hop stop <run-id>` | `-C dir`, `-timeout` (default 30s) | Requests stop; drives it directly when the lease is free (section 5). Reports `stopping` until termination observed, then `stopped`. Exit 0 when `stopped` was reached, 1 when the deadline left it `stopping` (rerunnable) |
-| `hop resume <run-id>` | `-C dir`, `--confirm-absent` | Acquires the lease, reconciles per section 5, continues as the foreground controller. Prints what it established (warm reattach, positive-evidence retirement + cold relaunch, or the fail-closed report naming the pane, the observed occupant and the exact human action). `--confirm-absent` records the human's absence attestation and enables the cold relaunch path. Exit codes as `hop run` |
+| `hop resume <run-id>` | `-C dir`, `--confirm-absent` | Acquires the lease, reconciles per section 5, continues as the foreground controller. Prints what it established (warm reattach, positive-evidence retirement + cold relaunch, or the fail-closed report naming the pane, the observed occupant and the exact human action). `--confirm-absent` records the human's absence attestation; it enables cold relaunch only in the non-restart cases — after a server restart the run stays reconciling until pending restore is retired (section 5, item 5). Exit codes as `hop run` |
 | `hop result submit` | section 7 | Worker-facing; `transient` first line signals retry |
 | `hop launch` | `--run`, `--attempt` only (section 6) | Worker exec boundary; listed in usage under a "worker plumbing" heading |
 | `hop check-exec` | `--op`, then `--` and the check argv (section 7) | Check exec boundary, spawned only by the controller; same usage heading |
@@ -1186,11 +1290,11 @@ ships with its interruption/retry tests in the same change, per
 | --- | --- |
 | Spike (`test/integration`, task 0) | Established with executed evidence on herdr 0.9.0: S1 launch-line detection and shell readiness (`TestSpikeLaunchLineDetection`, `TestSpikeUnrecognizedProcessNameIsNotDetected`); S2 pane process identity surface (`TestSpikePaneProcessIdentity`); S5 `agent.start` cannot wrap (NO); S6 layout.apply command panes (`TestSpikeLayoutApplyCommandPane`); S7 creation labels round-trip (`TestSpikeCreationMarkerTabLabel`). In progress: S3 restore behavior/timing, settled-signal search, restored argv shape; S4 `claude --session-id`/`--resume` with a preassigned UUID in a scratch profile, unauthenticated; plus the S6 follow-up (layout.apply adding one tab to an existing workspace without disturbing it) |
 | Domain (`internal/domain/...`) | Table-driven transitions matching the section 5 tables plus complete traces (initial launch to completion; stop injected at every step; exec failure; warm takeover; cold replacement through relaunching), stop monotonicity and precedence, result acceptance context (duplicate in every state incl. terminal, conflicting never disturbing the accepted result, transient for unsettled-claim launching, stale by incarnation and by state), binding supersession evidence, ID parsing (with fuzz) |
-| Application (`internal/app`) | Handwritten fakes for every port. Scenarios: intent/act/outcome ordering with revalidation before dispatch; every row and column of the operation decision table, including the takeover barrier (A resumes after B took over), never-resend, claim-state adoption (exec_pending ambiguous, execed adopt, exec_failed dead), non-adoption of cwd-matching panes, worktree provenance validation; stop while launching/running/checking, stop retiring a pre-exec claim, stop cancels the check group, stop precedence in the outcome transaction; detach vs stop; resume cases 1–5 of section 5 including delayed restore, positive-evidence retirement, same-kind replacement failing closed, and the attestation path; lease CAS (stale release, stale heartbeat, post-release commit rejection, expiry at commit); raced InitializeRun; `SanitizeEnvironment` precedence tables (task 4); canonical digest vectors; submission validation order (receipt-before-state proven by a duplicate against a `completed` run; conflicting-before-eligibility proven by a changed-content retry against a `checking` attempt; early submission in all three orders relative to detection and check claiming) |
+| Application (`internal/app`) | Handwritten fakes for every port. Scenarios: intent/act/outcome ordering with revalidation before dispatch; every row and column of the operation decision table, including the takeover barrier (A resumes after B took over), never-resend, claim-state adoption (exec_pending ambiguous, execed adopt, exec_failed dead), non-adoption of cwd-matching panes, worktree provenance validation; stop while launching/running/checking, stop retiring a pre-exec claim, stop cancels the check group, stop precedence in the outcome transaction; detach vs stop; resume cases 1–5 of section 5 including delayed restore, positive-evidence retirement, same-kind replacement failing closed, and the attestation path; lease CAS (stale release, stale heartbeat, post-release commit rejection, expiry at commit); raced InitializeRun; group-retirement classification against a fake `ProcessGroupInspector` (all four typed outcomes); the section 5 reference traces as app-level scenarios; `SanitizeEnvironment` precedence tables (task 4); canonical digest vectors; submission validation order (receipt-before-state proven by a duplicate against a `completed` run; conflicting-before-eligibility proven by a changed-content retry against a `checking` attempt; early submission in all three orders relative to detection and check claiming) |
 | SQLite (`internal/adapters/sqlite`) | Real temporary database, separate `*sql.DB` handles for cross-process claims: atomic attempt reservation raced from two connections; revision conflicts; lease CAS matrix raced from two connections (acquire on held/released/expired, stale heartbeat, stale release, generation monotonic across release); InitializeRun raced (repository get-or-create through the unique constraint); launch-claim different-pid rejection raced; concurrent open+migrate from two processes; connection-churn PRAGMA verification; immediate-transaction busy retry with act-after-commit ordering; reopen mid-operation and journal recovery; fixed-width timestamp round-trips; constraint coverage (one accepted result, unique (attempt, digest), unique check request, unique worktree path) |
 | Herdr adapter | Fake NDJSON endpoint tests for the new `Runtime` methods (request shapes, error mapping, cancellation), same style as the existing client tests; `PaneProcess` decoding matches the S2-verified fields |
 | Process/config/system adapters | `Exec` and process-group `CommandRunner` behavior (cancellation reaps the group; leader-exit-with-children retirement by group); TOML decoding tables: comments, escaped strings, multiline arrays, duplicate keys, unknown keys, invalid timeout/harness, `check.repeatable`, relative profile dir resolved absolute |
-| Real process (`test/integration`) | Extends the Phase 1 harness (`prepareServer`, `stagePlugin`, `waitUntil`, artifact retention). CI-safe deterministic run: fixture repository + fixture worker driven end to end — run → worktree → launch pane (env, label, argv) → claim → corroborated settlement → sanitized exec (section 6 assertions) → assignment content validated by the fixture → result submit → detached-checkout check → completed; the send-text fallback exercised as its own scenario; duplicate submission after completion; transient early submission; stale submission from a retired incarnation; the launcher claim-protocol tests of section 6; stop with termination observed including a running check group and a pre-exec claim; controller kill + resume warm reattach; server restart + positive-evidence retirement and the fail-closed same-kind replacement (as far as S3 findings allow); `--confirm-absent` cold relaunch; detach distinct from stop; failed-check run ends `failed` with retained artifacts; check death after spawn before the claim write, leader exit with live children, claim-write failure refusing to run, and unknown outcome under both `check.repeatable` settings; git-dependent check succeeding in the detached checkout; submodule repository failing clearly |
+| Real process (`test/integration`) | Extends the Phase 1 harness (`prepareServer`, `stagePlugin`, `waitUntil`, artifact retention). CI-safe deterministic run: fixture repository + fixture worker driven end to end — run → worktree → launch pane (env, label, argv) → claim → corroborated settlement → sanitized exec (section 6 assertions) → assignment content validated by the fixture → result submit → detached-checkout check → completed; the send-text fallback exercised as its own scenario; duplicate submission after completion; transient early submission; stale submission from a retired incarnation; the launcher claim-protocol tests of section 6; stop with termination observed including a running check group and a pre-exec claim; controller kill + resume warm reattach; server restart + positive-evidence retirement and the fail-closed same-kind replacement (as far as S3 findings allow); `--confirm-absent` cold relaunch in the non-restart case and its refusal after a server restart; detach distinct from stop; failed-check run ends `failed` with retained artifacts; check death after spawn before the claim write, leader exit with live children, claim-write failure refusing to run, and unknown outcome under both `check.repeatable` settings; git-dependent check succeeding in the detached checkout; submodule repository failing clearly |
 | Live (opt-in) | One named test, `TestLiveClaudeDefaultProfileRun`, gated on `HOP_LIVE_HARNESS=1` and skipped otherwise with an explicit reason: real Claude Code in the user's default profile against the fixture repository, one small brief to a passing check, plus one `--resume <preassigned-uuid>` continuation. Never runs in CI or `make check` |
 
 Fixture repository generator (test helper in `test/integration`): a
@@ -1228,8 +1332,8 @@ path.
 | 4a | Credential-handling core: `internal/app/launchenv.go` — the versioned `EnvPolicy` value, the version-scoped strip matrix, `SanitizeEnvironment` and its precedence tables. Self-contained file with its own tests; no dependency on task 2 (its consumers are the exec-boundary commands in 6a) | `internal/app/launchenv.go` | Precedence and matrix tables | — | with 0, 1 | Fable |
 | 2 | Application ports and controller logic: all section 3 ports (shapes finalized against S1/S2/S7 findings), canonical digest, run/status/stop/resume/submit/check use cases against handwritten fakes, the operation decision table as behavior, DTOs for composition. Does not consume `SanitizeEnvironment` | `internal/app` | App scenario + table tests incl. the takeover barrier | 0, 1 | — | Sonnet |
 | 3 | SQLite store: schema migration 001, typed repositories, unit of work, revisions, journal, lease CAS + InitializeRun, claim contracts, ReadStore; adds the pinned `modernc.org/sqlite` requirement as its first importer; receives the state root as an absolute path (no resolver here) | `internal/adapters/sqlite`, `go.mod` | Real temp-DB suite of section 9 | 2 | with 4b, 5 | Fable |
-| 4b | Local adapters: `Exec` + process-group `CommandRunner` (`internal/adapters/process`), `Clock`/`IDGenerator` (`internal/adapters/system`), strict TOML policy loading (`internal/adapters/config`, adding the pinned `github.com/pelletier/go-toml/v2` requirement as its first importer) | `internal/adapters/process`, `internal/adapters/system`, `internal/adapters/config`, `go.mod` | Section 9 adapter rows | 2 | with 3, 5 | Fable |
-| 5 | Herdr runtime extension: `Runtime` over `Client` with the S2-verified `PaneProcess` fields, guarded-close support and the S7 creation-marker mechanics | `internal/adapters/herdr` (`runtime.go`) | Fake-endpoint protocol tests | 2 | with 3, 4b | Sonnet |
+| 4b | Local adapters: `Exec`, process-group `CommandRunner` and the `ProcessGroupInspector` implementation (`internal/adapters/process`), `Clock`/`IDGenerator` (`internal/adapters/system`), strict TOML policy loading (`internal/adapters/config`, adding the pinned `github.com/pelletier/go-toml/v2` requirement as its first importer) | `internal/adapters/process`, `internal/adapters/system`, `internal/adapters/config`, `go.mod` | Section 9 adapter rows | 2 | with 3, 5 | Fable |
+| 5 | Herdr runtime extension: `Runtime` over `Client` with the S2-verified `PaneProcess` fields, `FindPaneByLabel`, close-rule support and the S7 creation-marker mechanics | `internal/adapters/herdr` (`runtime.go`) | Fake-endpoint protocol tests | 2 | with 3, 4b | Sonnet |
 | 6a | Command wiring (integrator): `hop run`/`status`/`stop`/`resume`/`result submit`/`launch`/`check-exec` in `cmd/hop`, launch-line rendering and path rules, the state-root resolver, doctor store-path line, merges of 3/4b/5 | `cmd/hop` | Command tables: dispatch, exit codes, flag surfaces, signal handling | 3, 4a, 4b, 5 | — | Sonnet |
 | 6b | Scenario integration: fixture repository generator, fixture worker, the full real-process suite of section 9, the opt-in live test, Makefile target for it | `test/integration`, `Makefile` | Section 9 real-process rows | 6a | — | Sonnet |
 
@@ -1285,4 +1389,4 @@ Risks and mitigations:
 | Claude version drift invalidates `--session-id`/strip-matrix assumptions | S4 records the probed version; the strip matrix is version-scoped and named; the live test exercises the real binary |
 | Unsupported login shells mangle the fallback launch line | Primary transport involves no shell at all; the fallback grammar is restricted to a single-quoted path plus UUID flags, valid in sh/bash/zsh (S1-verified for sh and zsh); other shells documented as unsupported for worker panes in Phase 2 |
 | pid or pgid reuse defeats process identity (no start time observable) | Occupant identity always pairs the pid with the creation label and argv marker; group retirement lists and argv-matches members before signaling and never signals blindly; documented residual limitation |
-| A run with no restore occupant and no S3 signal stays in recovery | Finite exits exist by design: `hop resume --confirm-absent` (attested retirement, then cold relaunch) and `hop stop`; documented as a support limitation, not silent relaunch |
+| A run with no restore occupant and no S3 signal stays in recovery | Finite exits exist by design: `hop stop` always, and `hop resume --confirm-absent` in the non-restart cases; the post-server-restart case deliberately stays reconciling until pending restore is retired (a deferred Herdr restore firing after a truthful absence attestation would otherwise duplicate the native lineage) — documented as a support limitation, not silent relaunch |
