@@ -158,12 +158,13 @@ func floodLines(conn net.Conn, line string, count int) {
 // read pump fills its buffer and parks blocked in its send.
 func subscribeToFlood(t *testing.T) *herdr.EventStream {
 	t.Helper()
-	return subscribeToFloodCtx(t, testContext(t))
+	return subscribeToFloodCtx(testContext(t), t)
 }
 
 // subscribeToFloodCtx is subscribeToFlood with an explicit context.
-func subscribeToFloodCtx(t *testing.T, ctx context.Context) *herdr.EventStream {
+func subscribeToFloodCtx(ctx context.Context, t *testing.T) *herdr.EventStream {
 	t.Helper()
+	//nolint:contextcheck // the fake endpoint's lifetime is bound to t.Cleanup, not to the subscription context passed to Subscribe below.
 	endpoint := startFakeEndpoint(t, func(t *testing.T, conn net.Conn) {
 		request := readRequestLine(t, bufio.NewReader(conn))
 		if request == nil {
@@ -656,7 +657,7 @@ func TestClientSubscribe(t *testing.T) {
 	t.Run("cancellation alone releases a pump blocked on a full events channel", func(t *testing.T) {
 		// Cancellation WITHOUT Close must also release the blocked send.
 		ctx, cancel := context.WithCancel(testContext(t))
-		stream := subscribeToFloodCtx(t, ctx)
+		stream := subscribeToFloodCtx(ctx, t)
 		defer closeQuietly(stream)
 		waitParkedInSelect(t, "(*EventStream).send")
 

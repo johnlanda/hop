@@ -41,7 +41,7 @@ func TestKillProcessGroupThenReapKillsDescendants(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "grandchild.pid")
 	// The leader backgrounds a long-lived grandchild in the same group,
 	// records its pid, and waits. Nothing kills them but the teardown.
-	cmd := exec.Command("/bin/sh", "-c", "sleep 300 & printf '%s' \"$!\" > "+pidFile+"; wait") //nolint:gosec // G204: a fixed shell fixture with a test-owned path.
+	cmd := exec.CommandContext(t.Context(), "/bin/sh", "-c", "sleep 300 & printf '%s' \"$!\" > "+pidFile+"; wait") //nolint:gosec // G204: a fixed shell fixture with a test-owned path.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start fixture leader: %v", err)
@@ -50,7 +50,7 @@ func TestKillProcessGroupThenReapKillsDescendants(t *testing.T) {
 
 	var grandchild int
 	if !waitUntil(func() bool {
-		contents, err := os.ReadFile(pidFile)
+		contents, err := os.ReadFile(pidFile) //nolint:gosec // G304: pidFile is under this test's own t.TempDir.
 		if err != nil {
 			return false
 		}

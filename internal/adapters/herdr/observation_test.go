@@ -115,8 +115,9 @@ const normalizedPumpSymbol = "(*statusStream).pump"
 
 // subscribeAndStartPump subscribes and starts the decode pump without reading
 // it, so the pump parks blocked on its first delivery.
-func subscribeAndStartPump(t *testing.T, ctx context.Context) app.StatusStream {
+func subscribeAndStartPump(ctx context.Context, t *testing.T) app.StatusStream {
 	t.Helper()
+	//nolint:contextcheck // the fake endpoint's lifetime is bound to t.Cleanup, not to the subscription context passed to Subscribe below.
 	endpoint := startFakeEndpoint(t, func(t *testing.T, conn net.Conn) {
 		request := readRequestLine(t, bufio.NewReader(conn))
 		if request == nil {
@@ -147,10 +148,10 @@ func pumpDone(t *testing.T, stream app.StatusStream) <-chan struct{} {
 }
 
 func TestObserverCloseReleasesBlockedPump(t *testing.T) {
-	// The normalized pump uses an unbuffered channel and parks blocked in its
-	// delivery select when no one reads. Close must release it. The test
-	// never reads the events channel, so it cannot itself release the leak.
-	stream := subscribeAndStartPump(t, testContext(t))
+	// With no consumer the normalized pump fills its buffer and parks blocked
+	// in its delivery select. Close must release it. The test never reads the
+	// events channel, so it cannot itself release the leak.
+	stream := subscribeAndStartPump(testContext(t), t)
 	waitParkedInSelect(t, normalizedPumpSymbol)
 
 	if err := stream.Close(); err != nil {
@@ -170,7 +171,7 @@ func TestObserverCancellationReleasesBlockedPump(t *testing.T) {
 	// pump, so its send select honors the subscription context, not only the
 	// Close signal.
 	ctx, cancel := context.WithCancel(testContext(t))
-	stream := subscribeAndStartPump(t, ctx)
+	stream := subscribeAndStartPump(ctx, t)
 	defer closeQuietly(stream)
 	waitParkedInSelect(t, normalizedPumpSymbol)
 
