@@ -137,7 +137,7 @@ func relaunchedRun(t *testing.T, tc *testController) (app.RunHandle, app.RunDeta
 	_, detail := startedRun(t, tc)
 	claimLaunch(t, tc, detail, 4242)
 	tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-		return app.PaneProcess{}, nil // genuinely absent
+		return app.PaneProcess{}, app.ErrPaneNotFound // positively gone by id
 	}
 	req := defaultResumeRequest(detail.RunID.String())
 	req.ConfirmAbsent = true
@@ -263,7 +263,7 @@ func TestReferenceTraceStopDuringLaunching(t *testing.T) {
 
 	// Termination observed on a later round.
 	tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-		return app.PaneProcess{}, nil
+		return app.PaneProcess{}, app.ErrPaneNotFound
 	}
 	final, err := tc.Controller.DriveStop(context.Background(), handle)
 	if err != nil {

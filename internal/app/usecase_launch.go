@@ -208,7 +208,6 @@ func (c *Controller) recoverBindingByLabel(ctx context.Context, handle RunHandle
 	if err != nil || !paneFound {
 		return nil //nolint:nilerr // a failed or empty label lookup leaves the operation pending; recovery retries on a later round.
 	}
-	instance := c.observeServerInstance(ctx)
 	now := c.Clock.Now()
 	return c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 		latest, getErr := uow.Operations().Get(ctx, op.ID)
@@ -218,7 +217,9 @@ func (c *Controller) recoverBindingByLabel(ctx context.Context, handle RunHandle
 		if latest.State != OperationPending && latest.State != OperationReconciling {
 			return nil
 		}
-		binding := run.NewRuntimeBinding(intent.SessionID, intent.IncarnationID, "", instance, ref.WorkspaceID, ref.TabID, ref.PaneID, intent.Label, run.LaunchInitial, now)
+		// Creation evidence only: the server instance frozen into the
+		// intent before the pane was created, never a fresh observation.
+		binding := run.NewRuntimeBinding(intent.SessionID, intent.IncarnationID, "", intent.ServerInstance, ref.WorkspaceID, ref.TabID, ref.PaneID, intent.Label, run.LaunchInitial, now)
 		if bindErr := uow.Bindings().Create(ctx, binding); bindErr != nil {
 			return bindErr
 		}

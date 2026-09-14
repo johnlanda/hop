@@ -271,9 +271,12 @@ func (c *Controller) retireWorker(ctx context.Context, handle RunHandle, detail 
 		// A binding with no claim: the pane may hold a pre-claim launcher.
 		// There is no recorded identity to close against, so nothing is
 		// acted on; only observed absence clears it.
-		_, absent, observed := c.observePane(ctx, detail.Binding)
-		if observed && absent {
+		_, absent, ambiguous := c.observePaneAbsence(ctx, detail.Binding.PaneID, detail.Binding.CreationLabel)
+		if ambiguous == "" && absent {
 			return "", nil
+		}
+		if ambiguous != "" {
+			return "worker pane has no launch claim to retire against; " + ambiguous, nil
 		}
 		return "worker pane has no launch claim to retire against; failing closed", nil
 	}
@@ -332,20 +335,12 @@ func (c *Controller) closePaneOperation(ctx context.Context, handle RunHandle, d
 		return false, "", err
 	}
 
-	pane, inspectErr := c.Runtime.InspectPane(ctx, target.PaneID)
-	if inspectErr != nil {
-		if target.Label != "" {
-			if _, found, findErr := c.Runtime.FindPaneByLabel(ctx, target.Label); findErr == nil && !found {
-				if err := c.recordCloseOutcome(ctx, handle, opID, target, "pane absent by id and by label"); err != nil {
-					return false, "", err
-				}
-				return true, "", nil
-			}
-		}
-		return false, "pane inspection failed; absence is never assumed", nil
+	pane, absent, ambiguous := c.observePaneAbsence(ctx, target.PaneID, target.Label)
+	if ambiguous != "" {
+		return false, ambiguous, nil
 	}
-	if len(pane.Foreground) == 0 {
-		if err := c.recordCloseOutcome(ctx, handle, opID, target, "pane has no foreground occupant"); err != nil {
+	if absent {
+		if err := c.recordCloseOutcome(ctx, handle, opID, target, "pane absent: no foreground occupant and no pane answers for the creation label"); err != nil {
 			return false, "", err
 		}
 		return true, "", nil
@@ -367,9 +362,10 @@ func (c *Controller) closePaneOperation(ctx context.Context, handle RunHandle, d
 		return false, "", err
 	}
 
-	// One immediate re-observation: the pane may already be gone.
-	after, afterErr := c.Runtime.InspectPane(ctx, target.PaneID)
-	if afterErr == nil && len(after.Foreground) == 0 {
+	// One immediate re-observation: the pane may already be gone. The same
+	// absence rule applies — anything short of established absence stays
+	// dispatched-but-unobserved.
+	if _, absentAfter, ambiguousAfter := c.observePaneAbsence(ctx, target.PaneID, target.Label); ambiguousAfter == "" && absentAfter {
 		if err := c.recordCloseOutcome(ctx, handle, opID, target, "occupant absent after close"); err != nil {
 			return false, "", err
 		}

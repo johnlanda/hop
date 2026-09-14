@@ -2,6 +2,7 @@ package app_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -129,7 +130,7 @@ func TestResume(t *testing.T) {
 		handle, detail := startedRun(t, tc)
 		claimLaunch(t, tc, detail, 4242)
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-			return app.PaneProcess{}, nil // no live process: genuinely absent
+			return app.PaneProcess{}, app.ErrPaneNotFound // positively gone by id
 		}
 
 		// Simulate the previous incarnation's pane.open operation left
@@ -197,7 +198,7 @@ func TestResume(t *testing.T) {
 		_, detail := startedRun(t, tc)
 		claimLaunch(t, tc, detail, 4242)
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-			return app.PaneProcess{}, nil
+			return app.PaneProcess{}, app.ErrPaneNotFound
 		}
 
 		req := defaultResumeRequest(detail.RunID.String())
@@ -570,7 +571,7 @@ func TestResumePositiveEvidenceRetirement(t *testing.T) {
 	// The occupant is observed gone on the next round: the retirement
 	// completes and authorizes the cold relaunch — no attestation needed.
 	tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-		return app.PaneProcess{}, nil
+		return app.PaneProcess{}, app.ErrPaneNotFound
 	}
 	tc.Clock.Advance(leaseTTL + time.Second)
 	second, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String()))
@@ -635,7 +636,7 @@ func TestResumeAttestation(t *testing.T) {
 		_, detail := startedRun(t, tc)
 		claimLaunch(t, tc, detail, 4242)
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-			return app.PaneProcess{}, nil
+			return app.PaneProcess{}, app.ErrPaneNotFound
 		}
 
 		req := defaultResumeRequest(detail.RunID.String())
@@ -669,7 +670,7 @@ func TestResumeAttestation(t *testing.T) {
 		_, detail := startedRun(t, tc)
 		claimLaunch(t, tc, detail, 4242)
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-			return app.PaneProcess{}, nil
+			return app.PaneProcess{}, app.ErrPaneNotFound
 		}
 		// The server restarted between the launch and this resume.
 		tc.Runtime.ServerInstanceValue = "peer-pid:2"
@@ -698,7 +699,7 @@ func TestResumeAttestation(t *testing.T) {
 		_, detail := startedRun(t, tc)
 		claimLaunch(t, tc, detail, 4242)
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-			return app.PaneProcess{}, nil
+			return app.PaneProcess{}, app.ErrPaneNotFound
 		}
 
 		req := defaultResumeRequest(detail.RunID.String())
@@ -721,7 +722,7 @@ func TestResumeAttestation(t *testing.T) {
 		// Round 1: post-restart, pane empty, attestation refused.
 		tc.Runtime.ServerInstanceValue = "peer-pid:2"
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-			return app.PaneProcess{}, nil
+			return app.PaneProcess{}, app.ErrPaneNotFound
 		}
 		req := defaultResumeRequest(detail.RunID.String())
 		req.ConfirmAbsent = true
@@ -751,7 +752,7 @@ func TestResumeAttestation(t *testing.T) {
 		// Once the retired occupant is observed gone, the relaunch proceeds
 		// on the positive retirement evidence — no further attestation.
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-			return app.PaneProcess{}, nil
+			return app.PaneProcess{}, app.ErrPaneNotFound
 		}
 		tc.Clock.Advance(leaseTTL + time.Second)
 		third, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String()))
@@ -760,6 +761,238 @@ func TestResumeAttestation(t *testing.T) {
 		}
 		if third.Outcome != app.ResumeColdRelaunched {
 			t.Fatalf("third Outcome = %s, want %s", third.Outcome, app.ResumeColdRelaunched)
+		}
+	})
+}
+
+// TestPaneAbsenceRule proves absence is established only by a successful
+// inspection showing no occupant AND no pane answering for the creation
+// label: an inspection error is ambiguous with the error named, and an
+// empty foreground with the label still answering never authorizes an
+// attested relaunch or a stop's termination.
+func TestPaneAbsenceRule(t *testing.T) {
+	t.Run("inspection error is ambiguous: attestation refused, error named", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		_, detail := runningRun(t, tc)
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			return app.PaneProcess{}, context.DeadlineExceeded
+		}
+		// The label lookup would report no pane — irrelevant: an inspection
+		// error alone keeps the observation ambiguous.
+		tc.Runtime.FindPaneByLabelFn = func(string) (app.PaneRef, bool, error) {
+			return app.PaneRef{}, false, nil
+		}
+
+		req := defaultResumeRequest(detail.RunID.String())
+		req.ConfirmAbsent = true
+		tc.Clock.Advance(leaseTTL + time.Second)
+		result, _, err := tc.Controller.Resume(context.Background(), req)
+		if err != nil {
+			t.Fatalf("Resume() error = %v", err)
+		}
+		if result.Outcome != app.ResumeReconciling {
+			t.Fatalf("Outcome = %s, want %s (inspection error is never absence)", result.Outcome, app.ResumeReconciling)
+		}
+		if !strings.Contains(result.Detail, "pane inspection failed") || !strings.Contains(result.Detail, "context deadline exceeded") {
+			t.Fatalf("Detail = %q, want the inspection error named", result.Detail)
+		}
+		if got := tc.Store.Sessions[detail.SessionID].value.State; got == run.SessionLost {
+			t.Fatalf("the session was retired on an ambiguous observation")
+		}
+	})
+
+	t.Run("a pane still answering by id with an empty foreground is not absence", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		_, detail := runningRun(t, tc)
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			return app.PaneProcess{}, nil // successful inspection: pane exists, no occupant
+		}
+
+		req := defaultResumeRequest(detail.RunID.String())
+		req.ConfirmAbsent = true
+		tc.Clock.Advance(leaseTTL + time.Second)
+		result, _, err := tc.Controller.Resume(context.Background(), req)
+		if err != nil {
+			t.Fatalf("Resume() error = %v", err)
+		}
+		if result.Outcome != app.ResumeReconciling {
+			t.Fatalf("Outcome = %s, want %s (an empty foreground is never absence)", result.Outcome, app.ResumeReconciling)
+		}
+		if !strings.Contains(result.Detail, "still answers by id") {
+			t.Fatalf("Detail = %q, want the pane-answers-by-id reason named", result.Detail)
+		}
+	})
+
+	t.Run("gone by id but the label still answering is not absence", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		_, detail := runningRun(t, tc)
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			return app.PaneProcess{}, app.ErrPaneNotFound
+		}
+		tc.Runtime.FindPaneByLabelFn = func(string) (app.PaneRef, bool, error) {
+			return app.PaneRef{WorkspaceID: "workspace-1", TabID: "tab-1", PaneID: detail.Binding.PaneID}, true, nil
+		}
+
+		req := defaultResumeRequest(detail.RunID.String())
+		req.ConfirmAbsent = true
+		tc.Clock.Advance(leaseTTL + time.Second)
+		result, _, err := tc.Controller.Resume(context.Background(), req)
+		if err != nil {
+			t.Fatalf("Resume() error = %v", err)
+		}
+		if result.Outcome != app.ResumeReconciling {
+			t.Fatalf("Outcome = %s, want %s (a pane still answering for the label is never absence)", result.Outcome, app.ResumeReconciling)
+		}
+		if !strings.Contains(result.Detail, "still answers for the creation label") {
+			t.Fatalf("Detail = %q, want the label-presence reason named", result.Detail)
+		}
+	})
+}
+
+// TestCreationInstanceProvenance proves a binding recovered by label
+// carries the server identity frozen into the pane.open intent at
+// creation — never a recovery-time observation — so continuity across a
+// server restart can never be fabricated by recovery.
+func TestCreationInstanceProvenance(t *testing.T) {
+	loseBinding := func(t *testing.T, tc *testController) {
+		t.Helper()
+		tc.Store.Bindings = map[identity.SessionID][]run.RuntimeBinding{}
+		for id, op := range tc.Store.Operations {
+			if op.Kind == app.OpPaneOpen {
+				op.State = app.OperationPending
+				op.ActEvidence = nil
+				tc.Store.Operations[id] = op
+			}
+		}
+	}
+
+	t.Run("binding lost across a restart: recovery keeps the creation identity and attestation refuses", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		_, detail := startedRun(t, tc) // creation observed peer-pid:1 into the intent
+		claimLaunch(t, tc, detail, 4242)
+		loseBinding(t, tc)
+
+		// Herdr restarted before the takeover; the restored pane still
+		// carries its creation label.
+		tc.Runtime.ServerInstanceValue = "peer-pid:2"
+		var label string
+		for id, op := range tc.Store.Operations {
+			if op.Kind == app.OpPaneOpen {
+				label = id.String()
+			}
+		}
+		tc.Runtime.FindPaneByLabelFn = func(l string) (app.PaneRef, bool, error) {
+			if l == label {
+				return app.PaneRef{WorkspaceID: "workspace-1", TabID: "tab-9", PaneID: "pane-9"}, true, nil
+			}
+			return app.PaneRef{}, false, nil
+		}
+
+		tc.Clock.Advance(leaseTTL + time.Second)
+		if _, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String())); err != nil {
+			t.Fatalf("Resume() error = %v", err)
+		}
+		recovered, err := tc.Store.LoadRunStatus(context.Background(), detail.RunID)
+		if err != nil {
+			t.Fatalf("LoadRunStatus() error = %v", err)
+		}
+		if recovered.Binding == nil {
+			t.Fatalf("the binding was not recovered by label")
+		}
+		if recovered.Binding.ServerInstance != "peer-pid:1" {
+			t.Fatalf("recovered binding ServerInstance = %q, want the creation-time %q, never the recovery-time observation", recovered.Binding.ServerInstance, "peer-pid:1")
+		}
+
+		// The pane is later positively gone; the attestation must refuse
+		// the relaunch because creation and current identities differ.
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			return app.PaneProcess{}, app.ErrPaneNotFound
+		}
+		tc.Runtime.FindPaneByLabelFn = func(string) (app.PaneRef, bool, error) {
+			return app.PaneRef{}, false, nil
+		}
+		req := defaultResumeRequest(detail.RunID.String())
+		req.ConfirmAbsent = true
+		tc.Clock.Advance(leaseTTL + time.Second)
+		result, _, err := tc.Controller.Resume(context.Background(), req)
+		if err != nil {
+			t.Fatalf("attesting Resume() error = %v", err)
+		}
+		if result.Outcome != app.ResumeReconciling {
+			t.Fatalf("Outcome = %s, want %s (recovered creation identity differs from the current server)", result.Outcome, app.ResumeReconciling)
+		}
+	})
+
+	t.Run("binding lost with the server unchanged: recovery preserves continuity and attestation authorizes", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		_, detail := startedRun(t, tc)
+		claimLaunch(t, tc, detail, 4242)
+		loseBinding(t, tc)
+		var label string
+		for id, op := range tc.Store.Operations {
+			if op.Kind == app.OpPaneOpen {
+				label = id.String()
+			}
+		}
+		tc.Runtime.FindPaneByLabelFn = func(l string) (app.PaneRef, bool, error) {
+			if l == label {
+				return app.PaneRef{WorkspaceID: "workspace-1", TabID: "tab-9", PaneID: "pane-9"}, true, nil
+			}
+			return app.PaneRef{}, false, nil
+		}
+		tc.Clock.Advance(leaseTTL + time.Second)
+		if _, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String())); err != nil {
+			t.Fatalf("Resume() error = %v", err)
+		}
+
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			return app.PaneProcess{}, app.ErrPaneNotFound
+		}
+		tc.Runtime.FindPaneByLabelFn = func(string) (app.PaneRef, bool, error) {
+			return app.PaneRef{}, false, nil
+		}
+		req := defaultResumeRequest(detail.RunID.String())
+		req.ConfirmAbsent = true
+		tc.Clock.Advance(leaseTTL + time.Second)
+		result, _, err := tc.Controller.Resume(context.Background(), req)
+		if err != nil {
+			t.Fatalf("attesting Resume() error = %v", err)
+		}
+		if result.Outcome != app.ResumeColdRelaunched {
+			t.Fatalf("Outcome = %s, want %s (creation identity equals the current server)", result.Outcome, app.ResumeColdRelaunched)
+		}
+	})
+
+	t.Run("an undecodable pending launch payload blocks retirement", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		_, detail := startedRun(t, tc)
+		claimLaunch(t, tc, detail, 4242)
+		opID, err := identity.ParseOperationID(tc.IDs.NewID())
+		if err != nil {
+			t.Fatalf("parse operation id: %v", err)
+		}
+		tc.Store.Operations[opID] = app.Operation{
+			ID: opID, RunID: detail.RunID, Generation: tc.Store.Leases[detail.RunID].lease.Generation,
+			Kind: app.OpPaneOpen, State: app.OperationPending, Intent: "garbage, not an object",
+			CreatedAt: tc.Clock.Now(), UpdatedAt: tc.Clock.Now(),
+		}
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			return app.PaneProcess{}, app.ErrPaneNotFound
+		}
+
+		req := defaultResumeRequest(detail.RunID.String())
+		req.ConfirmAbsent = true
+		tc.Clock.Advance(leaseTTL + time.Second)
+		result, _, resumeErr := tc.Controller.Resume(context.Background(), req)
+		if resumeErr == nil && result.Outcome == app.ResumeColdRelaunched {
+			t.Fatalf("Resume() relaunched despite an undecodable pending launch payload")
+		}
+		updated, err := tc.Store.LoadRunStatus(context.Background(), detail.RunID)
+		if err != nil {
+			t.Fatalf("LoadRunStatus() error = %v", err)
+		}
+		if updated.AttemptState == run.AttemptRelaunching {
+			t.Fatalf("Attempt relaunched despite the blocked retirement")
 		}
 	})
 }

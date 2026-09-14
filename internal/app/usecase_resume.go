@@ -330,10 +330,6 @@ func (c *Controller) recoverPaneOpen(ctx context.Context, handle RunHandle, op *
 		return c.markOperationReconciling(ctx, handle, op.ID, "no pane surfaced for the creation label within the launch deadline; never re-created")
 	}
 
-	// The server instance is observed before the transaction opens: an
-	// external call never happens inside a store transaction (the
-	// section 4 transaction rule).
-	serverInstance := c.observeServerInstance(ctx)
 	now := c.Clock.Now()
 	return c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 		latest, getErr := uow.Operations().Get(ctx, op.ID)
@@ -350,7 +346,13 @@ func (c *Controller) recoverPaneOpen(ctx context.Context, handle RunHandle, op *
 			if op.Kind == OpLaunchSend {
 				kind = run.LaunchResume
 			}
-			binding := run.NewRuntimeBinding(intent.SessionID, intent.IncarnationID, "", serverInstance, ref.WorkspaceID, ref.TabID, ref.PaneID, intent.Label, kind, now)
+			// The binding's server instance is CREATION evidence: it comes
+			// from the value frozen into the pane.open intent before the
+			// pane was created, never from a fresh observation — a binding
+			// recovered after a server restart must not masquerade as
+			// continuous. An intent without one records unknown, which
+			// fails the continuity check closed.
+			binding := run.NewRuntimeBinding(intent.SessionID, intent.IncarnationID, "", intent.ServerInstance, ref.WorkspaceID, ref.TabID, ref.PaneID, intent.Label, kind, now)
 			if bindErr := uow.Bindings().Create(ctx, binding); bindErr != nil {
 				return bindErr
 			}
@@ -570,11 +572,11 @@ func (c *Controller) reconcileActive(ctx context.Context, handle RunHandle, deta
 	if detail.Binding == nil || detail.Binding.PaneID == "" {
 		return ResumeResult{Outcome: ResumeReconciling, Detail: "no runtime binding recorded yet"}, nil
 	}
-	pane, occupantAbsent, observed := c.observePane(ctx, detail.Binding)
-	if !observed {
-		// Inspection failed with no positive absence evidence: ambiguous,
-		// never absence (docs/plan/phase-2-design.md section 5).
-		return ResumeResult{Outcome: ResumeReconciling, Detail: "pane inspection failed; absence is never assumed from an inspection error"}, nil
+	pane, occupantAbsent, ambiguous := c.observePaneAbsence(ctx, detail.Binding.PaneID, detail.Binding.CreationLabel)
+	if ambiguous != "" {
+		// Ambiguous observation: never absence, never adoption
+		// (docs/plan/phase-2-design.md section 5).
+		return ResumeResult{Outcome: ResumeReconciling, Detail: ambiguous}, nil
 	}
 
 	if !occupantAbsent {
@@ -649,11 +651,11 @@ type absenceAttestationRecord struct {
 // restart a deferred native restore may still fire, and a truthful
 // present-tense attestation cannot retire it.
 func (c *Controller) attestAbsence(ctx context.Context, handle RunHandle, detail RunDetail, req ResumeRequest) (ResumeResult, error) { //nolint:gocritic // hugeParam: RunHandle, RunDetail and ResumeRequest are per-call DTOs; this runs once per attestation.
-	recorded := ServerEvidence{}
+	recorded := ""
 	if detail.Binding != nil {
-		recorded = ServerEvidence{SocketPath: detail.Binding.ServerSocketPath, Instance: detail.Binding.ServerInstance}
+		recorded = detail.Binding.ServerInstance
 	}
-	observed := ServerEvidence{SocketPath: recorded.SocketPath, Instance: c.observeServerInstance(ctx)}
+	observed := c.observeServerInstance(ctx)
 	continuity := ServerContinuityEstablished(recorded, observed)
 
 	record := absenceAttestationRecord{
@@ -661,9 +663,9 @@ func (c *Controller) attestAbsence(ctx context.Context, handle RunHandle, detail
 			"no worker for this run is currently running anywhere",
 			"every outstanding mechanism that could still start one has been retired",
 		},
-		ObservedEvidence:      "recorded pane observed absent by inspection and by creation label",
-		RecordedInstance:      recorded.Instance,
-		ObservedInstance:      observed.Instance,
+		ObservedEvidence:      "recorded pane positively absent by id (pane not found) and by creation label, each a successful observation",
+		RecordedInstance:      recorded,
+		ObservedInstance:      observed,
 		ContinuityEstablished: continuity,
 	}
 	opID, err := c.newOperationID()
@@ -683,8 +685,8 @@ func (c *Controller) attestAbsence(ctx context.Context, handle RunHandle, detail
 
 	if !continuity {
 		reason := "the server-process identity at pane creation is unknown"
-		if recorded.Instance != "" && observed.Instance != "" {
-			reason = fmt.Sprintf("the server process changed (recorded %q, observed %q): a deferred native restore may still fire", recorded.Instance, observed.Instance)
+		if recorded != "" && observed != "" {
+			reason = fmt.Sprintf("the server process changed (recorded %q, observed %q): a deferred native restore may still fire", recorded, observed)
 		}
 		return ResumeResult{
 			Outcome: ResumeReconciling,
@@ -722,22 +724,40 @@ func (c *Controller) completePendingRetirement(ctx context.Context, handle RunHa
 	return false, nil
 }
 
-// observePane inspects a binding's pane and classifies the observation.
-// absent is true only on positive evidence: the pane exists with no
-// foreground occupant, or no pane carries the binding's creation label.
-// observed is false when inspection failed and no positive absence could
-// be established — ambiguous, never absence.
-func (c *Controller) observePane(ctx context.Context, binding *run.RuntimeBinding) (pane PaneProcess, absent, observed bool) {
-	inspected, err := c.Runtime.InspectPane(ctx, binding.PaneID)
-	if err == nil {
-		return inspected, len(inspected.Foreground) == 0, true
-	}
-	if binding.CreationLabel != "" {
-		if _, found, findErr := c.Runtime.FindPaneByLabel(ctx, binding.CreationLabel); findErr == nil && !found {
-			return PaneProcess{}, true, true
+// observePaneAbsence applies the one absence rule shared by resume and
+// the pane.close procedure: absence is established ONLY by the pane being
+// POSITIVELY absent by id (InspectPane reporting the typed
+// ErrPaneNotFound result) AND positively absent by creation label (a
+// successful lookup finding no pane). Each conjunct must be a successful
+// observation: any other inspection or lookup error is ambiguous — never
+// absence — with the error named in ambiguous, and a pane that still
+// answers by id (even with an empty foreground) or by label keeps the
+// observation ambiguous (a restored pane keeps its label; S3's phantom
+// rule). ambiguous is "" exactly when the observation is conclusive: an
+// occupant was observed (absent false) or absence was established
+// (absent true).
+func (c *Controller) observePaneAbsence(ctx context.Context, paneID, label string) (pane PaneProcess, absent bool, ambiguous string) {
+	inspected, err := c.Runtime.InspectPane(ctx, paneID)
+	switch {
+	case err == nil:
+		if len(inspected.Foreground) > 0 {
+			return inspected, false, ""
 		}
+		return inspected, false, "the pane still answers by id with no foreground occupant; absence not established"
+	case errors.Is(err, ErrPaneNotFound):
+		// Positively absent by id; the label conjunct decides below.
+	default:
+		return PaneProcess{}, false, fmt.Sprintf("pane inspection failed (%v); absence is never assumed from an inspection error", err)
 	}
-	return PaneProcess{}, false, false
+	if label == "" {
+		return PaneProcess{}, false, "pane absent by id, but the binding has no creation label to confirm absence independently"
+	}
+	if _, found, findErr := c.Runtime.FindPaneByLabel(ctx, label); findErr != nil {
+		return PaneProcess{}, false, fmt.Sprintf("pane label lookup failed (%v); absence is never assumed from an inspection error", findErr)
+	} else if found {
+		return PaneProcess{}, false, "pane absent by id, but a pane still answers for the creation label; absence not established"
+	}
+	return PaneProcess{}, true, ""
 }
 
 // warmReattach adopts a verified occupant: the attempt returns to its
@@ -1193,7 +1213,12 @@ func retirePendingLaunchIntents(ctx context.Context, uow UnitOfWork, runID ident
 			continue
 		}
 		intent, ok := decodeOperationPayload[paneOpenIntent](op.Intent)
-		if !ok || intent.SessionID != previousSession {
+		if !ok {
+			// An undecodable launch payload cannot be proven retired: it
+			// blocks the relaunch rather than being silently skipped.
+			return fmt.Errorf("app: pending launch operation %s has an undecodable intent; retirement blocked", op.ID)
+		}
+		if intent.SessionID != previousSession {
 			continue
 		}
 		op.State = OperationReconciling

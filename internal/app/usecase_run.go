@@ -70,6 +70,12 @@ type paneOpenIntent struct {
 	// to both, before falling back to the binding once one exists.
 	IncarnationID identity.IncarnationID `json:"incarnation_id"`
 	SessionID     identity.SessionID     `json:"session_id"`
+	// ServerInstance is the server-process identity observed immediately
+	// before the pane was created — creation evidence frozen into the
+	// durable intent so a recovery after the outcome commit was lost can
+	// restore it instead of stamping a recovery-time observation. Empty
+	// means unknown, which fails the continuity check closed.
+	ServerInstance string `json:"server_instance"`
 }
 
 // StartRun freezes a new run and drives it through worktree creation and
@@ -452,7 +458,12 @@ func (c *Controller) openPane(ctx context.Context, handle RunHandle, ids generat
 		"HOP_ATTEMPT_ID":     ids.Attempt.String(),
 		"HOP_INCARNATION_ID": ids.Incarnation.String(),
 	}
-	intent := paneOpenIntent{Command: argv, Cwd: worktree.Path, WorkspaceID: worktree.WorkspaceID, Label: opID.String(), IncarnationID: ids.Incarnation, SessionID: ids.Session}
+	// The server-process identity is observed before the intent commits
+	// and frozen into it as creation evidence; the same value lands in the
+	// creation binding at the outcome, and recovery copies it from the
+	// intent rather than observing anew.
+	serverInstance := c.observeServerInstance(ctx)
+	intent := paneOpenIntent{Command: argv, Cwd: worktree.Path, WorkspaceID: worktree.WorkspaceID, Label: opID.String(), IncarnationID: ids.Incarnation, SessionID: ids.Session, ServerInstance: serverInstance}
 	now := c.Clock.Now()
 
 	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
@@ -471,10 +482,6 @@ func (c *Controller) openPane(ctx context.Context, handle RunHandle, ids generat
 	if err := c.revalidateForDispatch(ctx, handle, false); err != nil {
 		return fmt.Errorf("app: revalidate before pane.open: %w", err)
 	}
-	// The server-process identity is observed immediately before the pane
-	// is created and recorded in the creation binding: resume compares it
-	// against a fresh observation to establish server continuity.
-	serverInstance := c.observeServerInstance(ctx)
 	actCtx, release := handle.actContext(ctx)
 	paneHandle, actErr := c.Runtime.OpenWorkerPane(actCtx, WorkerPaneRequest{
 		WorkspaceID: worktree.WorkspaceID, Cwd: worktree.Path, Command: argv, Env: env, Label: opID.String(),

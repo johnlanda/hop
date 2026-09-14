@@ -80,7 +80,7 @@ func TestDriveStop(t *testing.T) {
 		// The launcher is observed gone on a later round: the pending
 		// pane.close operation resolves and the stop completes.
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-			return app.PaneProcess{}, nil
+			return app.PaneProcess{}, app.ErrPaneNotFound
 		}
 		final, err := tc.Controller.DriveStop(context.Background(), handle)
 		if err != nil {
@@ -146,7 +146,7 @@ func TestDriveStop(t *testing.T) {
 
 		// A later round observes the pane gone and finalizes.
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-			return app.PaneProcess{}, nil
+			return app.PaneProcess{}, app.ErrPaneNotFound
 		}
 		final, err := tc.Controller.DriveStop(context.Background(), handle)
 		if err != nil {
@@ -188,7 +188,7 @@ func TestDriveStop(t *testing.T) {
 		// A later round observes both the group and the worker gone.
 		tc.Groups.Processes[5150] = nil
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-			return app.PaneProcess{}, nil
+			return app.PaneProcess{}, app.ErrPaneNotFound
 		}
 		final, err := tc.Controller.DriveStop(context.Background(), handle)
 		if err != nil {
@@ -212,7 +212,7 @@ func TestDriveStop(t *testing.T) {
 		}
 		tc.Groups.Processes[5150] = []app.GroupProcess{{PID: 6000, Argv: []string{"unrelated"}}}
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-			return app.PaneProcess{}, nil
+			return app.PaneProcess{}, app.ErrPaneNotFound
 		}
 
 		if err := tc.Controller.RequestStop(context.Background(), detail.RunID.String()); err != nil {
@@ -317,7 +317,7 @@ func TestPaneCloseInterruption(t *testing.T) {
 		handle, detail := runningRun(t, tc)
 		seedPendingClose(t, tc, detail, 4242)
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-			return app.PaneProcess{}, nil // the crashed controller's close already landed
+			return app.PaneProcess{}, app.ErrPaneNotFound // the crashed controller's close already landed
 		}
 
 		if err := tc.Controller.RequestStop(context.Background(), detail.RunID.String()); err != nil {
@@ -360,4 +360,67 @@ func TestPaneCloseInterruption(t *testing.T) {
 			t.Fatalf("pane.close operation state = %s, want reconciling", got)
 		}
 	})
+}
+
+// TestStopAbsenceRule proves the pane.close procedure never counts an
+// empty-foreground pane that still answers for its creation label — or an
+// inspection error — as observed termination.
+func TestStopAbsenceRule(t *testing.T) {
+	tc := newTestController(defaultPolicy())
+	handle, detail := runningRun(t, tc)
+	if err := tc.Controller.RequestStop(context.Background(), detail.RunID.String()); err != nil {
+		t.Fatalf("RequestStop() error = %v", err)
+	}
+	tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+		return app.PaneProcess{}, nil // the pane still answers by id, foreground empty
+	}
+
+	report, err := tc.Controller.DriveStop(context.Background(), handle)
+	if err != nil {
+		t.Fatalf("DriveStop() error = %v", err)
+	}
+	if report.Terminated {
+		t.Fatalf("report = %+v; a pane still answering by id is never observed termination", report)
+	}
+
+	// Positively gone by id, but a pane still answers for the label.
+	tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+		return app.PaneProcess{}, app.ErrPaneNotFound
+	}
+	tc.Runtime.FindPaneByLabelFn = func(string) (app.PaneRef, bool, error) {
+		return app.PaneRef{WorkspaceID: "workspace-1", TabID: "tab-1", PaneID: detail.Binding.PaneID}, true, nil
+	}
+	report, err = tc.Controller.DriveStop(context.Background(), handle)
+	if err != nil {
+		t.Fatalf("label-present DriveStop() error = %v", err)
+	}
+	if report.Terminated {
+		t.Fatalf("report = %+v; a pane still answering for its label is never observed termination", report)
+	}
+
+	tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+		return app.PaneProcess{}, context.DeadlineExceeded
+	}
+	report, err = tc.Controller.DriveStop(context.Background(), handle)
+	if err != nil {
+		t.Fatalf("second DriveStop() error = %v", err)
+	}
+	if report.Terminated {
+		t.Fatalf("report = %+v; an inspection error is never observed termination", report)
+	}
+
+	// Established absence: positively gone by id and by label.
+	tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+		return app.PaneProcess{}, app.ErrPaneNotFound
+	}
+	tc.Runtime.FindPaneByLabelFn = func(string) (app.PaneRef, bool, error) {
+		return app.PaneRef{}, false, nil
+	}
+	final, err := tc.Controller.DriveStop(context.Background(), handle)
+	if err != nil {
+		t.Fatalf("final DriveStop() error = %v", err)
+	}
+	if !final.Terminated {
+		t.Fatalf("final report = %+v, want terminated once absence is established", final)
+	}
 }

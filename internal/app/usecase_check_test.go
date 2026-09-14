@@ -369,7 +369,7 @@ func TestClaimAndRunCheck(t *testing.T) {
 
 		// DriveStop then observes the worker gone and completes the stop.
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-			return app.PaneProcess{}, nil
+			return app.PaneProcess{}, app.ErrPaneNotFound
 		}
 		final, err := tc.Controller.DriveStop(context.Background(), handle)
 		if err != nil {

@@ -884,15 +884,20 @@ per the decision table (section 4) before any new act.
    item-3 cold relaunch only when the non-restart case is POSITIVELY
    established by the server-continuity check: the creation binding
    records the server-process identity observed through the configured
-   socket (`Runtime.ServerInstance`, an opaque adapter-formatted value
-   such as the socket peer pid), resume observes it again, and continuity
-   is established iff the recorded and observed socket paths are equal
-   AND both instance strings are non-empty and equal
+   socket immediately before pane creation (`Runtime.ServerInstance`, an
+   opaque adapter-formatted token scoped to both the configured socket
+   and the server process behind it — equality of non-empty tokens
+   implies the same socket and server; the token is frozen into the
+   pane.open intent so recovery restores creation evidence, never a
+   recovery-time observation), resume observes it again, and continuity
+   is established iff both tokens are non-empty and equal
    (`app.ServerContinuityEstablished`). A deferred native restore fires
    only after a server restart, so an unchanged server process with the
-   pane gone (absent by id and by label, or its occupant observed absent
-   by inspection) cannot have a restore pending; a restart or live
-   handoff changes the peer identity and fails closed. With continuity
+   pane gone (positively absent by pane id AND by creation label, each a
+   successful observation — an inspection error or an empty-foreground
+   pane that still answers is never absence) cannot have a restore
+   pending; a restart or live handoff changes the identity and fails
+   closed. With continuity
    established, HOP's own pending launch claims/intents are retired by
    the relaunch itself. Unknown continuity, inspection errors and any
    post-restart indication keep the run `resuming` with the item-2
