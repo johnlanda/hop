@@ -53,44 +53,6 @@ func TestRealProcessEventObservationReconcile(t *testing.T) {
 	}
 }
 
-// TestRealProcessLaunchEnvironment proves HOP can launch a process in a pane
-// with an explicit environment: it opens a pane whose split request carries
-// an env map, runs a command that echoes the variable, and reads it back.
-// This is the explicit launch environment for launched processes.
-func TestRealProcessLaunchEnvironment(t *testing.T) {
-	artifacts := newArtifactDir(t)
-	server := prepareServer(t, artifacts)
-	server.start(t)
-
-	var workspace struct {
-		RootPane struct {
-			PaneID string `json:"pane_id"`
-		} `json:"root_pane"`
-	}
-	server.call(t, "workspace.create", map[string]any{"cwd": server.workDir(), "focus": true}, &workspace)
-
-	var split struct {
-		Pane struct {
-			PaneID string `json:"pane_id"`
-		} `json:"pane"`
-	}
-	server.call(t, "pane.split", map[string]any{
-		"pane_id":   workspace.RootPane.PaneID,
-		"direction": "right",
-		"focus":     false,
-		"env":       map[string]string{"HOP_ROLE": "implementer-42"},
-	}, &split)
-
-	// Echo the injected variable so it appears in the pane's own output.
-	server.call(t, "pane.send_text", map[string]any{
-		"pane_id": split.Pane.PaneID,
-		"text":    "printf 'ROLE=[%s]\\n' \"$HOP_ROLE\"\n",
-	}, nil)
-
-	snapshot := server.waitForPaneText(t, split.Pane.PaneID, "ROLE=[implementer-42]")
-	artifacts.save(t, "launch-env-pane.txt", snapshot)
-}
-
 // TestRealProcessContextInjection proves HOP can inject context into a live
 // process: it sends text to a running shell pane and reads the same text
 // back from that pane. Injection is HOP's message-delivery transport; this

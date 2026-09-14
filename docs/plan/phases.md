@@ -11,8 +11,13 @@ subscribe-before-snapshot reconciliation, proven against a deterministic
 fixture: metadata round-trip, owned view clear with another owner intact,
 event reconciliation, explicit launch environment, context injection, and a
 PTY-attached rendering smoke at fixed 100x30 dimensions showing manager-first
-rows) are implemented; item 7 is not started. Commands below otherwise
-describe the intended interface.
+rows) are implemented, and the launch-environment slice of item 7 (verified
+compatibility results for each launch surface that carries a worker
+environment and the additive-only limitation, recorded in
+[launch-environment.md](../architecture/launch-environment.md)) is done; the
+native profile/restore compatibility part of item 7 is recorded separately in
+[native-harness-compat.md](../architecture/native-harness-compat.md). Commands
+below otherwise describe the intended interface.
 
 ## Delivery strategy
 

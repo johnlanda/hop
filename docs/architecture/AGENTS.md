@@ -17,6 +17,9 @@ user requirements; the concrete package and entity designs remain proposals.
   metadata/configuration and integration limitations.
 - [Plugin testing](plugin-testing.md): upstream testing patterns and proposed
   HOP real-process, protocol and UI test layers.
+- [Launch environment](launch-environment.md): which Herdr launch surfaces
+  carry an explicit worker environment, the unsupported ones, and the
+  additive-only limitation, with verified compatibility results.
 - [Package guide template](package-guide-template.md): format for package guides.
 
 Maintain consistency across these documents. Do not describe planned tests or
