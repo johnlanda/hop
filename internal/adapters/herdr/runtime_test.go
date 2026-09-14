@@ -285,7 +285,9 @@ func TestRuntimeFindPaneByLabel(t *testing.T) {
 	})
 
 	t.Run("no panes at all is a legitimate not-found", func(t *testing.T) {
-		runtime, _ := startFakeRuntime(t, `{"type":"session_snapshot","snapshot":{}}`)
+		// panes is schema-required on SessionSnapshot, so the legitimate
+		// "no panes" state is an explicit empty array, not an absent key.
+		runtime, _ := startFakeRuntime(t, `{"type":"session_snapshot","snapshot":{"panes":[]}}`)
 
 		_, found, err := runtime.FindPaneByLabel(testContext(t), "missing")
 		if err != nil {
@@ -349,6 +351,23 @@ func TestRuntimeFindPaneByLabel(t *testing.T) {
 		}
 		if found {
 			t.Error("found = true although the snapshot wrapper is missing")
+		}
+	})
+
+	t.Run("missing panes", func(t *testing.T) {
+		// panes is schema-required on SessionSnapshot; an absent key (as
+		// opposed to an explicit empty array) is a protocol violation, not
+		// a legitimate "no panes" state.
+		runtime, _ := startFakeRuntime(t, `{"type":"session_snapshot","snapshot":{}}`)
+
+		ref, found, err := runtime.FindPaneByLabel(testContext(t), "any")
+
+		var protocolErr *herdr.ProtocolError
+		if !errors.As(err, &protocolErr) {
+			t.Fatalf("FindPaneByLabel error = %v, want a ProtocolError for a missing panes field", err)
+		}
+		if found || ref != (app.PaneRef{}) {
+			t.Errorf("found = %v, ref = %+v, want the zero value and false alongside the error", found, ref)
 		}
 	})
 

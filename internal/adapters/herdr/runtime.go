@@ -219,12 +219,15 @@ type snapshotPaneByLabel struct {
 
 // findPaneByLabelResult is the session.snapshot result reduced to its pane
 // records. Snapshot is a pointer so an entirely absent "snapshot" wrapper
-// (a protocol violation: SessionSnapshot's own field is required) is
-// distinguishable from a snapshot that legitimately has no panes yet.
+// is distinguishable from a snapshot that legitimately has no panes yet;
+// Panes is itself a pointer for the same reason one level down — panes is
+// schema-required on SessionSnapshot, so an absent key is a protocol
+// violation, while an explicit empty array is the legitimate "no panes"
+// state.
 type findPaneByLabelResult struct {
 	Type     string `json:"type"`
 	Snapshot *struct {
-		Panes []snapshotPaneByLabel `json:"panes"`
+		Panes *[]snapshotPaneByLabel `json:"panes"`
 	} `json:"snapshot"`
 }
 
@@ -246,9 +249,12 @@ func (r *Runtime) FindPaneByLabel(ctx context.Context, label string) (app.PaneRe
 	if result.Snapshot == nil {
 		return app.PaneRef{}, false, protocolErrorf("session.snapshot result missing required field %q", "snapshot")
 	}
+	if result.Snapshot.Panes == nil {
+		return app.PaneRef{}, false, protocolErrorf("session.snapshot result missing required field %q", "snapshot.panes")
+	}
 	var found snapshotPaneByLabel
 	matches := 0
-	for _, pane := range result.Snapshot.Panes {
+	for _, pane := range *result.Snapshot.Panes {
 		if pane.Label == label {
 			matches++
 			found = pane

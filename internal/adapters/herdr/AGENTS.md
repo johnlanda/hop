@@ -75,7 +75,10 @@ worker-launch use case.
   `OpenWorkerPane`'s creation label is a `layout.apply` pane-node label, and
   `session.snapshot` pane records already carry the workspace, tab and pane
   ids alongside it (S7). Zero matches is `(zero value, false, nil)`; two or
-  more is an error, since creation labels are assumed unique.
+  more is an error, since creation labels are assumed unique. `panes` is
+  schema-required on the snapshot, so an absent `panes` key is a
+  `ProtocolError`, distinct from an explicit empty array — the legitimate
+  "no panes yet" state — which is a genuine not-found.
 - `Runtime.CreateWorktree` reports exactly what `worktree.create` returns
   (workspace, path, branch); it runs no git itself. Herdr's response has no
   base-commit field, so that provenance is resolved by application code
