@@ -1,0 +1,99 @@
+package app
+
+import (
+	"context"
+	"time"
+
+	"github.com/johnlanda/hop/internal/domain/identity"
+)
+
+// LaunchClaimState is a launch claim's own small lifecycle.
+type LaunchClaimState string
+
+// Launch claim states.
+const (
+	LaunchClaimExecPending LaunchClaimState = "exec_pending"
+	LaunchClaimExeced      LaunchClaimState = "execed"
+	LaunchClaimExecFailed  LaunchClaimState = "exec_failed"
+)
+
+// LaunchClaim is the durable record `hop launch` writes before it execs:
+// the launcher's own pid and the harness executable it is about to become,
+// so a later inspection can corroborate — or fail to corroborate — that the
+// exec happened as claimed.
+type LaunchClaim struct {
+	IncarnationID      identity.IncarnationID
+	RunID              identity.RunID
+	AttemptID          identity.AttemptID
+	Executable         string
+	ArgvDigest         string
+	PID                int
+	State              LaunchClaimState
+	Error              string
+	ClaimedAt          time.Time
+	SettledAt          time.Time
+	SettlementEvidence string
+}
+
+// SubmissionOutcomeKind is the section 7 outcome of one result submission.
+type SubmissionOutcomeKind string
+
+// Submission outcome kinds.
+const (
+	SubmissionAccepted    SubmissionOutcomeKind = "accepted"
+	SubmissionDuplicate   SubmissionOutcomeKind = "duplicate"
+	SubmissionStale       SubmissionOutcomeKind = "stale"
+	SubmissionConflicting SubmissionOutcomeKind = "conflicting"
+	SubmissionTransient   SubmissionOutcomeKind = "transient"
+	SubmissionMalformed   SubmissionOutcomeKind = "malformed"
+)
+
+// ResultSubmission is the application-validated content of one result
+// submission handed to SubmissionStore.SubmitResult: identities already
+// parsed and confirmed to agree (attempt belongs to task, task to run), and
+// Digest already computed by ComputeResultDigest. SubmissionStore never
+// hashes.
+type ResultSubmission struct {
+	ID            identity.ResultID
+	RunID         identity.RunID
+	TaskID        identity.TaskID
+	AttemptID     identity.AttemptID
+	IncarnationID identity.IncarnationID
+	CommitOID     string
+	Summary       string
+	Digest        string
+}
+
+// SubmissionOutcome is the recorded result of one submission attempt.
+// ResultID is set for Accepted and Duplicate.
+type SubmissionOutcome struct {
+	Kind     SubmissionOutcomeKind
+	ResultID identity.ResultID
+	Detail   string
+}
+
+// SubmissionStore holds worker-side and third-party writes: transactions
+// that never carry a controller generation and must survive controller
+// takeover. Each method is one internal transaction with its own contract
+// (docs/plan/phase-2-design.md section 4, "Transaction authorities", and
+// section 7 for SubmitResult's validation order).
+type SubmissionStore interface {
+	// ClaimLaunch is written by hop launch BEFORE exec: run, attempt,
+	// incarnation, the expected executable's resolved absolute path, argv
+	// digest, own pid, state exec_pending. It fails — and the caller must
+	// not exec — when the run is stopping or stopped, the incarnation is
+	// not current, or a claim for this incarnation already exists with a
+	// different pid. A rewrite by the same pid is idempotent.
+	ClaimLaunch(ctx context.Context, claim LaunchClaim) error
+	// SettleLaunchFailure records exec_failed on the launcher's error path.
+	SettleLaunchFailure(ctx context.Context, incarnation identity.IncarnationID, reason string) error
+	// ClaimCheckExec is written by hop check-exec BEFORE exec: operation id
+	// and own pid (its process-group id). It fails when the operation is
+	// not a pending check execution of the current generation.
+	ClaimCheckExec(ctx context.Context, op identity.OperationID, pid int) error
+	// SubmitResult applies the section 7 validation order atomically,
+	// including the attempt and task transitions on acceptance.
+	SubmitResult(ctx context.Context, submission ResultSubmission) (SubmissionOutcome, error)
+	// RequestStop sets the run's monotonic stop request without a lease.
+	RequestStop(ctx context.Context, run identity.RunID) error
+}
