@@ -21,10 +21,8 @@ and adapter packages, and of every future domain package.
 - [internal/app](app/AGENTS.md): use cases and consumer-owned ports.
 - [internal/adapters](adapters/AGENTS.md): adapter index; currently the
   Herdr adapter.
-
-The remaining grouping directory the architecture proposes
-(`internal/domain`) receives an index guide, and its packages receive leaf
-guides, in the change that creates them.
+- [internal/domain](domain/AGENTS.md): domain module index; currently the
+  shared identity values and the run domain module.
 
 ## Invariants
 
