@@ -317,7 +317,7 @@ func (c *Controller) recoverPaneOpen(ctx context.Context, handle RunHandle, op *
 			if op.Kind == OpLaunchSend {
 				kind = run.LaunchResume
 			}
-			binding := run.NewRuntimeBinding(intent.SessionID, intent.IncarnationID, "", ref.WorkspaceID, ref.TabID, ref.PaneID, intent.Label, kind, now)
+			binding := run.NewRuntimeBinding(intent.SessionID, intent.IncarnationID, "", c.observeServerInstance(ctx), ref.WorkspaceID, ref.TabID, ref.PaneID, intent.Label, kind, now)
 			if bindErr := uow.Bindings().Create(ctx, binding); bindErr != nil {
 				return bindErr
 			}
@@ -583,10 +583,82 @@ func (c *Controller) reconcileActive(ctx context.Context, handle RunHandle, deta
 		return c.coldRelaunch(ctx, handle, detail, req)
 	}
 
-	if execFailed || req.ConfirmAbsent {
+	if execFailed {
+		// A settled exec_failed claim is conclusive: the incarnation is
+		// dead and never started a native transcript a restore could replay.
 		return c.coldRelaunch(ctx, handle, detail, req)
 	}
+	if req.ConfirmAbsent {
+		return c.attestAbsence(ctx, handle, detail, req)
+	}
 	return ResumeResult{Outcome: ResumeReconciling, Detail: "no live process observed; rerun with --confirm-absent once no worker for this run is running anywhere"}, nil
+}
+
+// absenceAttestationRecord is the absence.attested journal entry's payload:
+// the two assertions the human's attestation covers, the observed absence
+// evidence, and the server-continuity observation that decides whether the
+// attestation may authorize a cold relaunch (section 5, item 5).
+type absenceAttestationRecord struct {
+	Assertions            []string `json:"assertions"`
+	ObservedEvidence      string   `json:"observed_evidence"`
+	RecordedInstance      string   `json:"recorded_instance"`
+	ObservedInstance      string   `json:"observed_instance"`
+	ContinuityEstablished bool     `json:"continuity_established"`
+}
+
+// attestAbsence records the human's --confirm-absent attestation as an
+// absence.attested journal entry and decides whether it authorizes the
+// item-3 cold relaunch: only in the established non-restart case — the
+// recorded and observed server instances prove continuity — with the pane
+// already observed absent and HOP's own pending launch claims and intents
+// retired by the relaunch itself. Unknown continuity or a changed
+// instance keeps the run resuming with the item-2 report: after a server
+// restart a deferred native restore may still fire, and a truthful
+// present-tense attestation cannot retire it.
+func (c *Controller) attestAbsence(ctx context.Context, handle RunHandle, detail RunDetail, req ResumeRequest) (ResumeResult, error) { //nolint:gocritic // hugeParam: RunHandle, RunDetail and ResumeRequest are per-call DTOs; this runs once per attestation.
+	recorded := ServerEvidence{}
+	if detail.Binding != nil {
+		recorded = ServerEvidence{SocketPath: detail.Binding.ServerSocketPath, Instance: detail.Binding.ServerInstance}
+	}
+	observed := ServerEvidence{SocketPath: recorded.SocketPath, Instance: c.observeServerInstance(ctx)}
+	continuity := ServerContinuityEstablished(recorded, observed)
+
+	record := absenceAttestationRecord{
+		Assertions: []string{
+			"no worker for this run is currently running anywhere",
+			"every outstanding mechanism that could still start one has been retired",
+		},
+		ObservedEvidence:      "recorded pane observed absent by inspection and by creation label",
+		RecordedInstance:      recorded.Instance,
+		ObservedInstance:      observed.Instance,
+		ContinuityEstablished: continuity,
+	}
+	opID, err := c.newOperationID()
+	if err != nil {
+		return ResumeResult{}, err
+	}
+	now := c.Clock.Now()
+	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		return uow.Operations().Create(ctx, Operation{
+			ID: opID, RunID: handle.runID, Generation: handle.lease.Generation,
+			Kind: OpAbsenceAttested, State: OperationSucceeded, Intent: record, Outcome: record,
+			CreatedAt: now, UpdatedAt: now,
+		})
+	}); err != nil {
+		return ResumeResult{}, fmt.Errorf("app: journal absence attestation: %w", err)
+	}
+
+	if !continuity {
+		reason := "the server-process identity at pane creation is unknown"
+		if recorded.Instance != "" && observed.Instance != "" {
+			reason = fmt.Sprintf("the server process changed (recorded %q, observed %q): a deferred native restore may still fire", recorded.Instance, observed.Instance)
+		}
+		return ResumeResult{
+			Outcome: ResumeReconciling,
+			Detail:  "attestation recorded, but cold relaunch is refused: " + reason + "; the run stays reconciling until the restored occupant appears and is retired by positive evidence, or hop stop ends the run",
+		}, nil
+	}
+	return c.coldRelaunch(ctx, handle, detail, req)
 }
 
 // completePendingRetirement finds an unresolved positive-evidence
@@ -796,6 +868,7 @@ func restoreRunForAttemptState(ctx context.Context, uow UnitOfWork, handle RunHa
 func (c *Controller) retireAndRelaunch(ctx context.Context, handle RunHandle, detail RunDetail, req ResumeRequest, pane PaneProcess, nativeRef string) (ResumeResult, error) { //nolint:gocritic // hugeParam: RunHandle, RunDetail, ResumeRequest and PaneProcess are per-call values; this runs once per resume round.
 	now := c.Clock.Now()
 	evidence := fmt.Sprintf("observed process argv carries native session reference %s", nativeRef)
+	observedInstance := c.observeServerInstance(ctx)
 	observationIncarnation, err := identity.ParseIncarnationID(c.IDs.NewID())
 	if err != nil {
 		return ResumeResult{}, fmt.Errorf("app: generate observation incarnation id: %w", err)
@@ -828,7 +901,7 @@ func (c *Controller) retireAndRelaunch(ctx context.Context, handle RunHandle, de
 		if saveErr := uow.Bindings().Save(ctx, nextBinding); saveErr != nil {
 			return saveErr
 		}
-		observed := run.NewRuntimeBinding(detail.SessionID, observationIncarnation, binding.ServerSocketPath, binding.WorkspaceID, binding.TabID, binding.PaneID, binding.CreationLabel, run.LaunchRestoredObserved, now)
+		observed := run.NewRuntimeBinding(detail.SessionID, observationIncarnation, binding.ServerSocketPath, observedInstance, binding.WorkspaceID, binding.TabID, binding.PaneID, binding.CreationLabel, run.LaunchRestoredObserved, now)
 		observedEvidence := run.OccupantEvidence{Label: binding.CreationLabel, ArgvMarker: nativeRef, PID: firstForeground(pane).PID}
 		observed, observeErr := observed.Observe(observedEvidence, now)
 		if observeErr != nil {

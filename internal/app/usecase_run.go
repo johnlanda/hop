@@ -461,6 +461,10 @@ func (c *Controller) openPane(ctx context.Context, handle RunHandle, ids generat
 	if err := c.revalidateForDispatch(ctx, handle, false); err != nil {
 		return fmt.Errorf("app: revalidate before pane.open: %w", err)
 	}
+	// The server-process identity is observed immediately before the pane
+	// is created and recorded in the creation binding: resume compares it
+	// against a fresh observation to establish server continuity.
+	serverInstance := c.observeServerInstance(ctx)
 	actCtx, release := handle.actContext(ctx)
 	paneHandle, actErr := c.Runtime.OpenWorkerPane(actCtx, WorkerPaneRequest{
 		WorkspaceID: worktree.WorkspaceID, Cwd: worktree.Path, Command: argv, Env: env, Label: opID.String(),
@@ -488,7 +492,7 @@ func (c *Controller) openPane(ctx context.Context, handle RunHandle, ids generat
 			op.Outcome = actErr.Error()
 			return uow.Operations().Save(ctx, op)
 		}
-		binding := run.NewRuntimeBinding(ids.Session, ids.Incarnation, "", paneHandle.WorkspaceID, paneHandle.TabID, paneHandle.PaneID, opID.String(), kind, op.UpdatedAt)
+		binding := run.NewRuntimeBinding(ids.Session, ids.Incarnation, "", serverInstance, paneHandle.WorkspaceID, paneHandle.TabID, paneHandle.PaneID, opID.String(), kind, op.UpdatedAt)
 		if bindErr := uow.Bindings().Create(ctx, binding); bindErr != nil {
 			return bindErr
 		}

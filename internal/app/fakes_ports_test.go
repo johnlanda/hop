@@ -32,9 +32,25 @@ type fakeRuntime struct {
 
 	SentText     []string
 	PaneContents map[string]string
+
+	// ServerInstanceValue is what ServerInstance reports; "" means the
+	// server process identity could not be established (unknown).
+	ServerInstanceValue string
+	ServerInstanceErr   error
 }
 
-func newFakeRuntime() *fakeRuntime { return &fakeRuntime{PaneContents: map[string]string{}} }
+func newFakeRuntime() *fakeRuntime {
+	return &fakeRuntime{PaneContents: map[string]string{}, ServerInstanceValue: "peer-pid:1"}
+}
+
+func (r *fakeRuntime) ServerInstance(context.Context) (string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.ServerInstanceErr != nil {
+		return "", r.ServerInstanceErr
+	}
+	return r.ServerInstanceValue, nil
+}
 
 func (r *fakeRuntime) CreateWorktree(_ context.Context, req app.WorktreeRequest) (app.WorktreeInfo, error) {
 	r.mu.Lock()

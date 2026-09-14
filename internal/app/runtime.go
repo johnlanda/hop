@@ -109,4 +109,14 @@ type Runtime interface {
 	InspectPane(ctx context.Context, paneID string) (PaneProcess, error)
 	// ClosePane requests pane closure; callers apply the close rule above.
 	ClosePane(ctx context.Context, paneID string) error
+	// ServerInstance returns an opaque, adapter-formatted identity of the
+	// server process behind the configured socket (for example a socket
+	// peer pid). An empty string means unknown and is not an error; the
+	// application compares the value by equality only. It is captured
+	// immediately before pane creation and recorded in the creation
+	// binding, and observed again on resume to establish server
+	// continuity: a deferred native restore fires only after a server
+	// restart, so an unchanged server process with the pane gone cannot
+	// have a restore pending.
+	ServerInstance(ctx context.Context) (string, error)
 }

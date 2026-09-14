@@ -514,7 +514,7 @@ updates run `... WHERE id = ? AND revision = ?` and zero affected rows is
 | `tasks` | id PK, run_id FK, state, revision, … | one row per run in this phase |
 | `attempts` | id PK, task_id FK, number, state, revision, … | UNIQUE(task_id, number); partial UNIQUE(task_id) WHERE state in active set |
 | `sessions` | id PK, run_id FK, attempt_id FK, role, harness, native_session_ref NULL, native_ref_source NULL (assigned, captured), state, revision, … | reference immutable once set; a cold relaunch inserts a new session for the same attempt |
-| `runtime_bindings` | id PK, session_id FK, incarnation_id, server_socket_path, server_instance NULL (reserved; the spike surfaced no verified server-instance identifier), workspace_id, tab_id, pane_id, creation_label, occupant_evidence JSON NULL (label + argv marker + pid; never pid alone), launch_kind (initial, resume, restored-observed), observed_at, superseded, superseded_evidence NULL | append-only; UNIQUE(session_id, incarnation_id) |
+| `runtime_bindings` | id PK, session_id FK, incarnation_id, server_socket_path, server_instance NULL (the opaque, adapter-formatted identity of the server process behind the configured socket at binding creation — the herdr adapter formats it from the socket peer pid, e.g. `peer-pid:42111`; NULL/empty means unknown; compared by equality only for the resume continuity check; peer-pid recycling is a documented residual limitation, start-time hardening is a Phase 7 recovery item), workspace_id, tab_id, pane_id, creation_label, occupant_evidence JSON NULL (label + argv marker + pid; never pid alone), launch_kind (initial, resume, restored-observed), observed_at, superseded, superseded_evidence NULL | append-only; UNIQUE(session_id, incarnation_id) |
 | `launch_claims` | incarnation_id PK, run_id, attempt_id, executable (expected absolute harness/fixture path, for the section 6 predicate), argv_digest, pid, state (exec_pending, execed, exec_failed), error NULL, claimed_at, settled_at NULL, settlement_evidence NULL | claimed by hop launch before exec; settled to execed only by the controller on corroboration; a claim with a different pid for an existing incarnation is rejected |
 | `worktrees` | id PK, repository_id FK, run_id FK, path, branch, base_commit, state, created_at | UNIQUE(path); adoption validates repository and base, not path existence (decision table) |
 | `results` | id PK, attempt_id FK, commit_oid, summary, content_digest, accepted, submitted_at | partial UNIQUE(attempt_id) WHERE accepted = 1; UNIQUE(attempt_id, content_digest) |
@@ -881,15 +881,29 @@ per the decision table (section 4) before any new act.
    `--confirm-absent` does not authorize relaunch while a prior Herdr
    restore or launch request may still execute; those pending mechanisms
    must first be retired independently. Concretely, the flag enables the
-   item-3 cold relaunch only in the non-restart cases (a controller crash
-   with the server up, where the outstanding launch intents are HOP's own
-   and the claim table retires them); the post-server-restart case stays
-   `resuming` with the item-2 report until the restored occupant appears
-   and is retired by positive evidence — S3 established there is no
-   cancellation or settlement route for a deferred restore. It is retirement
-   evidence, not a bypass: there is no force-relaunch that skips
-   prior-intent retirement. `hop stop` is always available as the other
-   finite exit.
+   item-3 cold relaunch only when the non-restart case is POSITIVELY
+   established by the server-continuity check: the creation binding
+   records the server-process identity observed through the configured
+   socket (`Runtime.ServerInstance`, an opaque adapter-formatted value
+   such as the socket peer pid), resume observes it again, and continuity
+   is established iff the recorded and observed socket paths are equal
+   AND both instance strings are non-empty and equal
+   (`app.ServerContinuityEstablished`). A deferred native restore fires
+   only after a server restart, so an unchanged server process with the
+   pane gone (absent by id and by label, or its occupant observed absent
+   by inspection) cannot have a restore pending; a restart or live
+   handoff changes the peer identity and fails closed. With continuity
+   established, HOP's own pending launch claims/intents are retired by
+   the relaunch itself. Unknown continuity, inspection errors and any
+   post-restart indication keep the run `resuming` with the item-2
+   report naming the observed mismatch or unknown; the case stays there
+   until the restored occupant appears and is retired by positive
+   evidence — S3 established there is no cancellation or settlement
+   route for a deferred restore. The attestation is journaled as an
+   `absence.attested` entry with both assertions and the observed
+   continuity evidence either way. It is retirement evidence, not a
+   bypass: there is no force-relaunch that skips prior-intent
+   retirement. `hop stop` is always available as the other finite exit.
 
 Resume tests cover: delayed restore (restore fires after resume's first
 snapshot), an inherited key or profile override present on a restored

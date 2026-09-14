@@ -613,3 +613,153 @@ func TestResumePositiveEvidenceRetirement(t *testing.T) {
 		t.Fatalf("relaunch pane workspace = %+v, want the recorded placement %q", updated.Binding, originalWorkspace)
 	}
 }
+
+// TestResumeAttestation covers section 5 item 5: --confirm-absent journals
+// an absence.attested entry with the observed evidence, and authorizes a
+// cold relaunch only in the positively established non-restart case —
+// server continuity by recorded-vs-observed instance equality — never
+// after a restart or on unknown continuity.
+func TestResumeAttestation(t *testing.T) {
+	attestations := func(tc *testController) []app.Operation {
+		var out []app.Operation
+		for id := range tc.Store.Operations {
+			if tc.Store.Operations[id].Kind == app.OpAbsenceAttested {
+				out = append(out, tc.Store.Operations[id])
+			}
+		}
+		return out
+	}
+
+	t.Run("same server instance: attestation authorizes the cold relaunch", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		_, detail := startedRun(t, tc)
+		claimLaunch(t, tc, detail, 4242)
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			return app.PaneProcess{}, nil
+		}
+
+		req := defaultResumeRequest(detail.RunID.String())
+		req.ConfirmAbsent = true
+		tc.Clock.Advance(leaseTTL + time.Second)
+		result, _, err := tc.Controller.Resume(context.Background(), req)
+		if err != nil {
+			t.Fatalf("Resume() error = %v", err)
+		}
+		if result.Outcome != app.ResumeColdRelaunched {
+			t.Fatalf("Outcome = %s, want %s", result.Outcome, app.ResumeColdRelaunched)
+		}
+		recorded := attestations(tc)
+		if len(recorded) != 1 {
+			t.Fatalf("absence.attested operations = %d, want 1", len(recorded))
+		}
+		outcome, ok := recorded[0].Outcome.(map[string]any)
+		if !ok {
+			t.Fatalf("attestation outcome shape = %T, want a JSON object", recorded[0].Outcome)
+		}
+		if established, isBool := outcome["continuity_established"].(bool); !isBool || !established {
+			t.Fatalf("attestation records continuity_established = %v, want true", outcome["continuity_established"])
+		}
+		if assertions, isList := outcome["assertions"].([]any); !isList || len(assertions) != 2 {
+			t.Fatalf("attestation assertions = %v, want both required assertions", outcome["assertions"])
+		}
+	})
+
+	t.Run("changed server instance: attestation is journaled but relaunch refused", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		_, detail := startedRun(t, tc)
+		claimLaunch(t, tc, detail, 4242)
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			return app.PaneProcess{}, nil
+		}
+		// The server restarted between the launch and this resume.
+		tc.Runtime.ServerInstanceValue = "peer-pid:2"
+
+		req := defaultResumeRequest(detail.RunID.String())
+		req.ConfirmAbsent = true
+		tc.Clock.Advance(leaseTTL + time.Second)
+		result, _, err := tc.Controller.Resume(context.Background(), req)
+		if err != nil {
+			t.Fatalf("Resume() error = %v", err)
+		}
+		if result.Outcome != app.ResumeReconciling {
+			t.Fatalf("Outcome = %s, want %s (post-restart attestation must refuse relaunch)", result.Outcome, app.ResumeReconciling)
+		}
+		if len(attestations(tc)) != 1 {
+			t.Fatalf("the attestation was not journaled durably")
+		}
+		if updated := tc.Store.Sessions[detail.SessionID].value; updated.State == run.SessionLost {
+			t.Fatalf("the session was retired despite the refused relaunch")
+		}
+	})
+
+	t.Run("unknown server instance: attestation refused as ambiguous", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		tc.Runtime.ServerInstanceValue = "" // never observable
+		_, detail := startedRun(t, tc)
+		claimLaunch(t, tc, detail, 4242)
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			return app.PaneProcess{}, nil
+		}
+
+		req := defaultResumeRequest(detail.RunID.String())
+		req.ConfirmAbsent = true
+		tc.Clock.Advance(leaseTTL + time.Second)
+		result, _, err := tc.Controller.Resume(context.Background(), req)
+		if err != nil {
+			t.Fatalf("Resume() error = %v", err)
+		}
+		if result.Outcome != app.ResumeReconciling {
+			t.Fatalf("Outcome = %s, want %s (unknown continuity is ambiguous)", result.Outcome, app.ResumeReconciling)
+		}
+	})
+
+	t.Run("delayed restore after a refused attestation is retired by positive evidence", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		_, detail := runningRun(t, tc)
+		nativeRef := tc.Store.Sessions[detail.SessionID].value.NativeSessionRef
+
+		// Round 1: post-restart, pane empty, attestation refused.
+		tc.Runtime.ServerInstanceValue = "peer-pid:2"
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			return app.PaneProcess{}, nil
+		}
+		req := defaultResumeRequest(detail.RunID.String())
+		req.ConfirmAbsent = true
+		tc.Clock.Advance(leaseTTL + time.Second)
+		first, _, err := tc.Controller.Resume(context.Background(), req)
+		if err != nil {
+			t.Fatalf("first Resume() error = %v", err)
+		}
+		if first.Outcome != app.ResumeReconciling {
+			t.Fatalf("first Outcome = %s, want %s", first.Outcome, app.ResumeReconciling)
+		}
+
+		// The deferred restore then fires: the restored occupant carries the
+		// native reference and is retired by positive evidence (item 2).
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 8888, Argv0: "/usr/bin/claude", Argv: []string{"claude", "--resume", nativeRef}}}}, nil
+		}
+		tc.Clock.Advance(leaseTTL + time.Second)
+		second, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String()))
+		if err != nil {
+			t.Fatalf("second Resume() error = %v", err)
+		}
+		if second.Outcome != app.ResumeReconciling {
+			t.Fatalf("second Outcome = %s, want %s (retirement close dispatched)", second.Outcome, app.ResumeReconciling)
+		}
+
+		// Once the retired occupant is observed gone, the relaunch proceeds
+		// on the positive retirement evidence — no further attestation.
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			return app.PaneProcess{}, nil
+		}
+		tc.Clock.Advance(leaseTTL + time.Second)
+		third, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String()))
+		if err != nil {
+			t.Fatalf("third Resume() error = %v", err)
+		}
+		if third.Outcome != app.ResumeColdRelaunched {
+			t.Fatalf("third Outcome = %s, want %s", third.Outcome, app.ResumeColdRelaunched)
+		}
+	})
+}

@@ -142,6 +142,18 @@ func (c *Controller) revalidateForDispatch(ctx context.Context, handle RunHandle
 	})
 }
 
+// observeServerInstance reads the server-process identity behind the
+// configured socket, folding an observation failure into "" (unknown):
+// unknown continuity is ambiguous evidence, never an error that blocks
+// the surrounding flow.
+func (c *Controller) observeServerInstance(ctx context.Context) string {
+	instance, err := c.Runtime.ServerInstance(ctx)
+	if err != nil {
+		return ""
+	}
+	return instance
+}
+
 // generatedIdentities are every identity a use case mints through
 // IDGenerator before a store call that expects them already parsed.
 type generatedIdentities struct {

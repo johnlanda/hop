@@ -101,6 +101,27 @@ func isLauncherInvocation(argv []string) bool {
 	return len(argv) >= 2 && argv[1] == "launch" && (slices.Contains(argv, "--run") || slices.Contains(argv, "--attempt"))
 }
 
+// ServerEvidence is one observation of the server behind the configured
+// socket: the socket path and the opaque server-process instance identity
+// (empty when unknown).
+type ServerEvidence struct {
+	SocketPath string
+	Instance   string
+}
+
+// ServerContinuityEstablished is the replaceable continuity predicate: the
+// recorded and observed socket paths are equal AND both instance strings
+// are non-empty and equal. Anything else — either instance unknown, or
+// any inequality — is NOT continuity: ambiguous, never absence. A
+// deferred native restore fires only after a server restart, so an
+// unchanged server process with the pane gone cannot have a restore
+// pending; a restart or live-handoff changes the peer identity and fails
+// closed here.
+func ServerContinuityEstablished(recorded, observed ServerEvidence) bool {
+	return recorded.SocketPath == observed.SocketPath &&
+		recorded.Instance != "" && recorded.Instance == observed.Instance
+}
+
 // OccupantMatches reports whether an inspected pane's foreground process
 // matches recorded occupant evidence: the foreground process's argv or
 // cmdline carries the marker and its pid equals the recorded pid. It is
