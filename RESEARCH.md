@@ -58,17 +58,23 @@ flowchart TD
     C --> P[Playbook runner and gates]
     C <--> H[Herdr CLI and event API]
     H --> W[Worker agents in terminals and worktrees]
-    C --> X[Account manager and pool selector]
-    X --> H
-    W --> A[Native provider connections using assigned accounts]
+    C --> L[Sanitizing launcher: default profile, or configured pointer]
+    L --> H
+    W --> N[Harness-owned authentication]
 ```
 
 Herdr owns terminal processes, layouts, worktrees, agent detection and transport.
 The custom plugin owns task identity, dependencies, scheduling, messages, policy,
 workflow transitions and history. The manager proposes plans and handles ambiguous
 failures; the controller applies deterministic rules and wakes the manager only
-when needed. The account manager selects an account before launch; native harnesses retain their
-provider connections. CLIProxyAPI is an implementation reference, not a runtime dependency.
+when needed. The sanitizing launcher resolves each worker's harness profile
+(the harness's default, or the optional configured pointer) before launch and
+strips provider credential variables by default; native harnesses own their
+own authentication and provider connections, and HOP performs no logins. An
+account manager and pool selector are a later, optional Phase 8 (see
+[Account management](#account-management-delegated-to-harnesses-now-pools-later)
+and [phases](docs/plan/phases.md)), not part of this diagram today. CLIProxyAPI
+is an implementation reference, not a runtime dependency.
 
 Use one plugin executable with subcommands, initially with a foreground controller
 for each active run. The optional board connects to the controller and can close
@@ -88,11 +94,14 @@ Keep policy in the target repository, for example:
   tasks/example.md            # optional reusable task briefs
 ```
 
-Put user-specific account/pool configuration and credential references in the plugin config directory.
+Put the optional alternate-profile pointer configuration in the plugin config
+directory; HOP stores no credentials or credential references itself — see
+[Account management](#account-management-delegated-to-harnesses-now-pools-later).
 Put SQLite state and artifacts under `HERDR_PLUGIN_STATE_DIR`, keyed by repository
 identity and run UUID. Snapshot the effective policy, role instructions, workflow,
-brief and account-pool configuration at run creation. A policy change must not silently
-alter a running workflow. Continue honoring the repository's existing AGENTS.md.
+brief and resolved profile source (default, or the configured pointer) at run
+creation. A policy change must not silently alter a running workflow. Continue
+honoring the repository's existing AGENTS.md.
 
 The brief describes this run's objective, constraints and acceptance criteria.
 Mutable state records task graph, assignments, attempts, messages, decisions and
@@ -201,9 +210,12 @@ that profile beyond reporting the harness's own login status in
 for the adopted policy and evidence, and [phases](docs/plan/phases.md) for
 where this lands in the build sequence.
 
-Multi-account pools, round-robin assignment, leases and cross-account resume
-are deferred to a later, optional phase — kept below as a future option, not
-deleted. Users who need multiple accounts today run separate harness
+No account entities, account pools or account-capacity leases exist in the
+current phase; controller run leases (see [architecture](docs/architecture/architecture.md))
+are a distinct concept and remain required. Multi-account pools, round-robin
+assignment, account-capacity leases and cross-account resume are deferred to
+a later, optional phase — kept below as a future option, not deleted. Users
+who need multiple accounts today run separate harness
 profiles, or a tool such as CLIProxyAPI, outside HOP. A second account, a
 one-time scratch login and the opencode provider choice discussed below are
 moot while HOP delegates authentication; they apply only if that later phase

@@ -79,30 +79,30 @@ These paths and symbols are planned. Every row gains an AGENTS.md when implement
 
 | Path | Responsibility and key entities | Proposed file/symbol anchors |
 | --- | --- | --- |
-| `cmd/hop` | Construct adapters, inject dependencies, handle process signals | `main.go`, `wire.go`, `main`, `buildApplication` |
-| `internal/domain/identity` | Shared typed identities and parsing | `id.go`, `RunID`, `TaskID`, `SessionID`, `AccountID` |
+| `cmd/hop` | Construct adapters, inject dependencies, handle process signals; host the worker-facing `hop launch` command | `main.go`, `wire.go`, `main`, `buildApplication`, `launch.go` |
+| `internal/domain/identity` | Shared typed identities and parsing | `id.go`, `RunID`, `TaskID`, `SessionID`; `AccountID` is Phase 8 |
 | `internal/domain/run` | Runs, task graph, attempts, sessions, messages, results | `run.go`, `task.go`, `session.go`, `message.go`; `Run`, `Task`, `Attempt`, `Session`, `Message` |
 | `internal/domain/workflow` | Immutable playbooks, execution state, gate validity | `playbook.go`, `execution.go`, `gate.go`; `PlaybookRevision`, `Execution`, `GateEvaluation` |
-| `internal/domain/account` | Accounts, pool membership, selection, leases | `account.go`, `pool.go`, `lease.go`; `Account`, `Pool`, `Lease`, `SelectNext` |
-| `internal/app` | Use cases, ports, durable operations, recovery | `run_service.go`, `account_service.go`, `workflow_service.go`, `ports.go`, `reconcile.go` |
+| `internal/domain/account` (Phase 8, deferred) | Accounts, pool membership, selection, leases | `account.go`, `pool.go`, `lease.go`; `Account`, `Pool`, `Lease`, `SelectNext` |
+| `internal/app` | Use cases, ports, durable operations, recovery, pure environment sanitization | `run_service.go`, `workflow_service.go`, `ports.go`, `reconcile.go`, `sanitize.go`; `SanitizeEnvironment`; `account_service.go` is Phase 8 |
 | `internal/adapters/cli` | Parse commands, call use cases, render output | `commands.go`, `output.go`, `Execute` |
 | `internal/adapters/herdr` | Runtime/worktree operations and event normalization | `client.go`, `runtime.go`, `events.go` |
 | `internal/adapters/sqlite` | Repositories, transactions, durable operation journal | `store.go`, `transaction.go`, `migrations/` |
 | `internal/adapters/config` | Load repository policy, role and playbook files | `load.go`, `decode.go`; `LoadConfiguration` |
-| `internal/adapters/claude` | Claude login-status probe and profile env passthrough (default profile, or the configured alternate-profile pointer); no login, no credential storage | `status.go`, `profile.go`, `LoginStatus`, `ProfileEnv` |
-| `internal/adapters/codex` | Codex login-status probe and profile env passthrough (default profile, or the configured alternate-profile pointer); no login, no credential storage | `status.go`, `profile.go`, `LoginStatus`, `ProfileEnv` |
-| `internal/adapters/opencode` | opencode login-status probe and profile env passthrough (default profile, or the configured alternate-profile pointer); no login, no credential storage | `status.go`, `profile.go`, `LoginStatus`, `ProfileEnv` |
-| `internal/adapters/launch` | Sanitizing launcher applied at the harness exec boundary: strips provider credential variables by default, applies the resolved profile env, execs the harness | `launcher.go`, `Exec` |
-| `internal/adapters/process` | Execute deterministic playbook commands | `runner.go`, `RunCommand` |
+| `internal/adapters/claude` (Phase 5) | Claude login-status probe; no login, no credential storage | `status.go`; `LoginStatus` |
+| `internal/adapters/codex` (Phase 5) | Codex login-status probe; no login, no credential storage | `status.go`; `LoginStatus` |
+| `internal/adapters/opencode` (Phase 5) | opencode login-status probe; no login, no credential storage | `status.go`; `LoginStatus` |
+| `internal/adapters/process` | Execute deterministic playbook commands; `Exec` wraps the worker-launch command that execs the sanitized harness | `runner.go`, `RunCommand`, `exec.go`, `Exec` |
 | `internal/adapters/system` | Concrete clock and ID generation | `clock.go`, `id.go` |
 | `internal` | Import and guide-coverage tests only | `arch_test.go`, `guides_test.go` |
 | `test/integration` | Explicit cross-adapter contract scenarios | Scenario files named by behavior |
 
 Optional later packages: `adapters/board`, `adapters/gemini`, `adapters/grok` and,
 only for the deferred multi-account-pools phase, a credential-store adapter — HOP
-stores no credentials before then. Login-status probing and profile env
-passthrough are initially one adapter per harness to avoid another layer of
-abstractions before compatibility is established.
+stores no credentials before then. The claude/codex/opencode login-status
+adapters are a Phase 5 addition: Phase 2's first launch reads the
+default/alternate-profile choice as plain application configuration and does
+not need them.
 
 `app` is one Go package initially, with focused service types, not one controller
 object containing all behavior. Split only along proven use-case boundaries and
@@ -114,35 +114,41 @@ such as `internal/domain` or `internal/adapters`; those directories have index g
 | Consumer-owned port | Driven implementation | Boundary contract |
 | --- | --- | --- |
 | `StateStore` / `UnitOfWork` | SQLite | Typed repositories, atomic writes, optimistic revisions, operation journal |
-| `Runtime` | Herdr | Create worktree/session, prompt, inspect and normalize observations |
+| `Runtime` | Herdr | Create worktree/session, start the worker-launch command inside the pane, prompt, inspect and normalize observations |
 | `AgentPresentation` | Herdr | Publish display metadata and select/clear native Agent views without changing domain state |
-| `HarnessProfiles` | Claude/Codex/opencode adapters | Report the harness's own login status and resolve its default or configured-pointer profile environment; passthrough only — no login, no credential storage |
-| `LaunchSanitizer` | Sanitizing launcher adapter (harness exec boundary) | Strip provider credential variables by default immediately before exec'ing the harness, with explicit opt-in passthrough per run or role; the only boundary that can unset an inherited variable, since Herdr's pane/workspace env map is additive-only |
+| `HarnessProfiles` (Phase 5) | Claude/Codex/opencode adapters | Report the harness's own verified login status; passthrough only — no login, no credential storage. Not involved in Phase 2's profile-env resolution, which is plain application configuration |
 | `ConfigurationSource` | Config adapter | Decode and validate policy/role/playbook input into application values |
-| `CommandRunner` | Process adapter | Execute argv with explicit cwd/env, cancellation and structured result |
+| `CommandRunner` | Process adapter | Execute argv with explicit cwd/env, cancellation and structured result; also wraps (`Exec`) the sanitized worker-launch exec |
 | `Clock`, `IDGenerator` | System adapter | Explicit time and identity generation |
 
 Application service methods are the driving API: examples include `StartRun`,
-`AssignTask`, `SubmitResult`, `EvaluateGate`, `LoginAccount` and `ReserveAccount`.
-CLI parsing does not implement those rules. A future control socket is a driving
-adapter; its transport should not move business logic out of `app`.
+`AssignTask`, `SubmitResult` and `EvaluateGate`; `LoginAccount` and
+`ReserveAccount` belong to the deferred Phase 8 pools work. CLI parsing does
+not implement those rules. A future control socket is a driving adapter; its
+transport should not move business logic out of `app`.
 
-To launch a worker, `app` obtains a launch specification from `HarnessProfiles`
-— the harness's default profile, or the configured alternate-profile pointer,
-passed through unmodified — and hands it to `LaunchSanitizer` together with the
-credential variables to strip. `Runtime` (Herdr) launches the sanitizing
-launcher argv, never the harness binary directly, because Herdr's pane/workspace
-env map can only add variables, not remove inherited ones (see
-[launch environment](launch-environment.md)). The Claude/Codex/opencode
-adapters do not call the Herdr adapter and do not log in or store credentials.
-Wiring supplies a registry of profile ports keyed by supported harness. Model
-choice remains a harness option independent of profile selection.
+To launch a worker, `app` resolves the profile choice — the harness's default
+profile, or the configured alternate-profile pointer — as plain application
+configuration, and calls a pure `SanitizeEnvironment` function (`internal/app`)
+that computes the credential variables to strip and the profile variables to
+set. `cmd/hop` exposes this as a worker-facing `hop launch` command; `Runtime`
+(Herdr) starts `hop launch` inside the worker pane rather than the harness
+binary directly, because Herdr's pane/workspace env map can only add
+variables, not remove inherited ones (see
+[launch environment](launch-environment.md)). `hop launch` execs the harness
+through the `Exec` wrapper in `internal/adapters/process`; there is no
+separate launcher port or package. The Phase 5 `HarnessProfiles` adapters
+(Claude/Codex/opencode) report login status only, do not call the Herdr
+adapter, and do not log in or store credentials — Phase 2's first launch does
+not require them. Model choice remains a harness option independent of
+profile selection.
 
 ## Atomicity, side effects and recovery
 
 Use one user-scoped SQLite store, partitioned by repository/run; this shape also
 accommodates the deferred account-pools phase sharing pools across concurrent
-runs without a schema change. Independent foreground controllers access the same
+runs without changing the one-store topology — that phase adds its schema
+through migrations. Independent foreground controllers access the same
 store. A single-controller-per-run lease and fencing generation prevent stale
 controllers from committing new state. Lease expiry alone is not proof an
 external agent exited; reconcile its observed identity before reclaiming capacity.
@@ -182,11 +188,12 @@ only trigger for required work; the controller consumes durable pending operatio
    checker and package-guide checks before feature code.
 3. Implement the smallest domain slice and table-driven transition tests.
 4. Implement atomic SQLite reservations and recovery tests with fake runtime ports.
-5. Connect Herdr and the native harness login-status/profile adapters; validate
-   one complete workflow.
+5. Connect Herdr and validate one complete workflow; add the native harness
+   login-status adapters in Phase 5.
 
 The module path (`github.com/johnlanda/hop`), the Go toolchain (1.27.1) and the
 linter (golangci-lint v2.13.2) are fixed by the Phase 0 bootstrap. The SQLite
-driver and CLI/TUI libraries remain implementation selections; they do not need
-to be chosen to review the inward dependency contracts. Confirm native harness credential isolation before
-claiming cross-account resume or automatic account failover.
+driver is `modernc.org/sqlite` (pure Go); the CLI uses the standard library
+`flag` package; a TUI library selection is deferred to Phase 6. Confirm native
+harness credential isolation before claiming cross-account resume or automatic
+account failover.

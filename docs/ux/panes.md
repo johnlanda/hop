@@ -16,7 +16,7 @@ agent tree. It can keep relationships visible while the HOP board is closed.
 | --- | --- | --- |
 | Workspace/sidebar, tabs and terminal splits | Herdr | Navigate repositories, worktrees and processes |
 | Native Agents view with HOP metadata and sort/filter | Herdr, configured by HOP | Run-scoped manager/worker navigation across workspaces |
-| HOP board terminal | HOP | Task progress, dependencies, checks, decisions and account bindings |
+| HOP board terminal | HOP | Task progress, dependencies, checks, decisions and harness/profile bindings |
 | Manager/worker terminal | Native harness inside Herdr | Direct conversation and real tool output |
 | Check output terminal | Command runner inside Herdr where configured | Inspect deterministic validation output |
 | Temporary board/details view | HOP in a Herdr overlay or popup | Inspect run state without keeping a permanent split |
@@ -82,9 +82,9 @@ Herdr's existing repository/worktree grouping, not a custom HOP task tree.
 | > payments         | HOP / r18  Add retry support                        |
 |   retry-policy     | Workers: 2 / 2                     No input needed  |
 |   retry-tests      |                                                     |
-|                    | TASK             STATE       ACCOUNT      CHECKOUT  |
-|                    | > retry policy   working     claude-a     policy    |
-|                    |   retry tests    working     codex-b      tests     |
+|                    | TASK             STATE       HARNESS      CHECKOUT  |
+|                    | > retry policy   working     claude       policy    |
+|                    |   retry tests    working     codex        tests     |
 |                    |   review         waiting     --           --        |
 |                    |                                                     |
 |                    | Latest: tests worker requested retry error shape.   |
@@ -190,9 +190,10 @@ or `Completed` according to the playbook's terminal state.
 
 HOP delegates authentication to each harness; it performs no logins and stores
 no credentials. Login status details can be a board screen or a user-opened
-transient popup. `[l]` opens that harness's own dedicated login flow (for
-example `claude` then `/login`, or `codex login`) in a normal terminal; a
-session-modal popup should not own a long login.
+transient popup. `[l]` shows the exact native login command for the selected
+profile (for example `CLAUDE_CONFIG_DIR=<dir> claude` then `/login`, or
+`CODEX_HOME=<dir> codex login`) for the human to type themselves in their own
+terminal; HOP does not execute it, inject a prompt, or touch credentials.
 
 ```text
 +-----------------------------------------------------------------------+
@@ -204,9 +205,9 @@ session-modal popup should not own a long login.
 | opencode      alt: ~/.hop/op-b     login required                     |
 |                                                                       |
 | HOP performs no logins and stores no credentials; it only reports     |
-| each harness's own status. Login opens that harness's normal flow.   |
+| each harness's own status.                                            |
 |                                                                       |
-| [Enter] details  [l] login  [Esc] back                                |
+| [Enter] details  [l] show login command  [Esc] back                   |
 +-----------------------------------------------------------------------+
 ```
 
@@ -218,11 +219,16 @@ and never bootstraps or verifies its contents beyond this status report.
 Multi-account pools and round-robin assignment are a later, optional phase —
 see [RESEARCH.md](../../RESEARCH.md).
 
+A convenience action that opens a terminal and runs the login command for the
+user is a separate, optional UX proposal, not part of this decision: it would
+need to be explicitly initiated by the human each time, with no HOP prompt
+injection, credential handling or profile preparation.
+
 ## Layout and interaction rules
 
 - Wide terminal: optional board/manager split. Small terminal: full-pane board;
   opening an agent switches focus, and details replace the list until Back.
-- Keep visible task columns to task, state and account; reveal attempts, message
+- Keep visible task columns to task, state and harness/profile source; reveal attempts, message
   history, checkout provenance and gate fingerprints in details.
 - Display conceptual states distinctly: task waiting on a dependency, agent
   working, native permission blocked, gate failed, controller disconnected.

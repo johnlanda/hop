@@ -87,14 +87,16 @@ HOP-launched worker still passes through the sanitizing launcher described
 above at the harness exec boundary, stripping provider credential variables
 by default with explicit opt-in passthrough per run or role.
 
-With default profiles, HOP sets no per-pane profile override at launch, so
-Herdr's own auto-restore relaunches the worker under the correct account
-with no HOP coordination; the unsupported-restore finding below applies only
-to the optional alternate-profile configuration (see the restore policy
-table). The evidence and per-harness recipes below were gathered before this
-decision and remain the technical basis for both the default-profile launch
-path and any future alternate-profile/pools work; they are not re-verified
-here.
+HOP still runs on the user's normal Herdr server with no configuration
+change — that half of the decision stands on its own. It is a choice about
+where HOP runs, not a claim about restore: native auto-restore's
+account/profile correctness for HOP's sanitized launch/result contract is
+not established for either the default profile or the optional
+alternate-profile pointer — see the restore policy table below and
+[Herdr cold-restore interaction](#herdr-cold-restore-interaction). The
+evidence and per-harness recipes below were gathered before this decision
+and remain the technical basis for the launch path and any future
+alternate-profile/pools work; they are not re-verified here.
 
 ## Claude Code
 
@@ -417,30 +419,44 @@ installed `herdr 0.9.0` documentation):
   (integration ≥ 5); stale or invalid references restore
   as normal shells
   ([session state](../../repos/herdr/docs/versions/0.9.0/website/src/content/docs/session-state.mdx)).
+- That resume plan is a bare argv with no environment of its own —
+  `["claude", "--resume", <id>]` or `["codex", "resume", <id>]`
+  ([`agent_resume::plan`](../../repos/herdr/src/agent_resume.rs)) — so
+  nothing in the plan itself re-runs a sanitizing launcher or reselects a
+  profile.
 - The cold-restore path constructs its launch environment as
   `PaneLaunchEnv::from_extra(Vec::new())`
   ([restore implementation](../../repos/herdr/src/persist/restore.rs)), as
-  already noted by the [Herdr surface audit](herdr-surface.md). Precisely:
+  already noted by the [Herdr surface audit](herdr-surface.md); a resume
+  that stays pending until a terminal attaches takes the same empty-extra
+  path when it finally starts
+  ([deferred resume](../../repos/herdr/src/app/agent_resume.rs)). Precisely:
   the per-pane env overrides HOP supplied at creation are not replayed. The
   restored pane still inherits the Herdr server's own environment, so this
-  is not a claim that all variables are absent — only that the
-  profile-selecting overrides are.
+  is not a claim that all variables are absent — only that HOP's overrides
+  are.
+- The function that applies pane launch env, restore included, removes only
+  `CODEX_THREAD_ID` and `OMPCODE` before adding whatever `extra` entries it
+  receives ([`apply_pane_launch_env`](../../repos/herdr/src/pane.rs)); it
+  never strips provider credential variables, and restore hands it no
+  `extra` entries at all.
 
-Combined with the profile-scoped resume lookups verified above for all three
-harnesses, Herdr auto-resume of a session that was launched against an
-overridden profile runs without the overrides that selected that profile: the
-resume command resolves against whatever profile the inherited server/shell
-environment implies. If that inherited profile differs from the recorded
-one, the transcript may be missing or a session may run with unintended
-credentials (for opencode, with whatever provider key that environment
-carries). The binding is not restored reliably; auto-resume of a worker
-launched against the configured alternate-profile pointer is unsupported.
-This applies only when a profile override was set at launch — the optional
-alternate-profile pointer (see [Adopted policy](#adopted-policy)). A
-default-profile worker sets no such override, so there is nothing for the
-additive-only restore path to fail to replay: the restored pane inherits the
-same default profile the worker used originally, and Herdr auto-restore is
-supported for it.
+Together these mean native auto-restore never re-runs the sanitizing
+launcher HOP used at the original launch: whatever that launcher stripped —
+a stray provider key, or a profile-selecting variable — is present again on
+the restored pane, because restore inherits the server's own environment
+rather than replaying HOP's. For a worker launched against the configured
+alternate-profile pointer, the resume command additionally resolves against
+whatever profile the inherited environment implies, which may differ from
+the recorded one, so the transcript may be missing or the session may run
+with unintended credentials (for opencode, with whatever provider key that
+environment carries) — this path is unsupported. For a default-profile
+worker no profile-selecting override was set, so that specific failure mode
+does not apply, but the sanitizing step itself is still not repeated on
+restore, and HOP's own launch context (session identifiers, state-root
+bindings) is application state that a native resume command does not
+restore either way. Neither case is established for HOP's sanitized
+launch/result contract; see the restore policy table below.
 
 ## Proposed supported restore policy
 
@@ -448,7 +464,7 @@ supported for it.
 | --- | --- | --- |
 | Warm reattach: Herdr server and agent process survived; HOP reconciles bindings | Supported | No relaunch occurs; Herdr keeps live processes ([session state](../../repos/herdr/docs/versions/0.9.0/website/src/content/docs/session-state.mdx)) |
 | Cold resume by HOP: relaunch with the recorded profile env, same account, recorded cwd | Pending, per harness, on the account-identity smoke below | Resume lookup verified unauthenticated for Claude Code and Codex; full unauthenticated resume round-trip verified for opencode on its free model — which proves nothing about accounts; authenticated, account-verified continuation untested everywhere |
-| Cold resume via Herdr auto-restore of a default-profile worker | Supported | No per-pane profile override was recorded at launch, so the additive-only restore path (nothing to replay) is not a gap: the restored pane inherits the same default profile the worker used originally (restore path above; [Adopted policy](#adopted-policy)) |
+| Cold resume via Herdr auto-restore of a default-profile worker | Not established for HOP's sanitized launch/result contract | No profile-selecting override was set, so the alternate-profile binding failure below does not apply, but restore does not re-run the sanitizing launcher or restore HOP's own launch context; a same-profile relaunch is plausible but unverified (restore path above; [Herdr cold-restore interaction](#herdr-cold-restore-interaction)) |
 | Cold resume via Herdr auto-restore of a worker launched against the configured alternate-profile pointer | Unsupported | Original per-pane profile overrides are not replayed; resume uses the inherited server/shell environment, so the recorded profile binding is not guaranteed (restore path above; resume lookup profile-scoped, verified) |
 | Cold resume where the resuming profile's account differs from the original | Needs opt-in evidence | Transcript portability verified (file copy for Claude Code/Codex, export/import for opencode); provider-side acceptance and account semantics unknown; requires a second account |
 | Automatic account failover during restore | Unsupported | No evidence; [architecture](architecture.md) requires confirmed credential isolation before claiming it |
@@ -456,13 +472,19 @@ supported for it.
 Consequences HOP must implement: for a worker launched against the optional
 alternate-profile pointer, verify on resume that the recorded profile
 directory still resolves and still matches the environment before
-relaunching, and return an actionable unsupported state instead of silently
+relaunching — a path/identity check, not an inspection of the profile's
+contents — and return an actionable unsupported state instead of silently
 launching on default credentials; a dedicated Herdr server/session with
 `resume_agents_on_restore = false` is available as a later opt-in for that
-case, not the default ([phases](../plan/phases.md), phase 1). Default-profile
-workers need no such coordination: nothing was overridden at launch, so
-Herdr's own auto-restore already relaunches under the correct account on the
-user's normal Herdr server.
+case, not the default ([phases](../plan/phases.md), phase 1). A
+default-profile worker still needs restore coordination even though no
+profile binding is at risk: before treating a native resume as continuing
+the same HOP-managed attempt, HOP must re-apply the sanitizing launcher's
+stripped variables and restore its own launch context (session identifiers,
+state-root bindings), or otherwise mark the attempt `reconciling` rather
+than assume continuity. HOP runs on the user's normal Herdr server either
+way — a dedicated server is not required to satisfy this coordination, and
+none is proposed here as the fix.
 
 ## Opt-in live smoke test (described, not implemented)
 
@@ -567,10 +589,13 @@ Code-inspection facts cite `strings` output of the named installed binaries
    a workflow that intentionally relies on them?
 
 Resolved by the 2026-09-14 decision (see [Adopted policy](#adopted-policy)):
-question 3 is moot — HOP never pre-seeds or bootstraps a profile, so first
-launches always stay interactive; question 4 is no — a dedicated Herdr
-server/session is a later opt-in, not the default, since a default-profile
-worker sets no override for Herdr's own auto-restore to fail to replay;
+question 3 is moot — HOP never pre-seeds or bootstraps a profile; HOP does
+not answer or pre-seed onboarding or trust, and any required interactive
+preparation is performed by the human; question 4 is no — a dedicated Herdr
+server/session is a later opt-in, not the default. That server choice is
+separate from whether native restore is account/profile-correct for HOP's
+sanitized launch/result contract, which remains not established either way
+(see [Herdr cold-restore interaction](#herdr-cold-restore-interaction));
 question 5 is yes — strip provider credential variables by default, with
 explicit opt-in passthrough per run or role. Questions 1 and 2 stay open only
 for the deferred multi-account-pools phase.
@@ -588,11 +613,17 @@ The `HarnessProfiles` port ([architecture](architecture.md)) must:
   map is additive and `agent.start` accepts no env, so neither can perform
   the removal; HOP does not create, own or bootstrap the alternate-profile
   directory itself, only pass its variables through;
-- report launch readiness, not establish it: `hop doctor` surfaces each
-  harness's own login/onboarding/trust state (a not-launch-ready state for a
-  profile that would block on login, onboarding or trust) without HOP
-  performing any bootstrap, pre-seeding or trust decision itself — the human
-  runs the harness's normal interactive first-launch for the specific
+- report verified native login status only, with `unknown`/`unavailable`
+  where a harness exposes no such signal — Codex's own `login status` and
+  opencode's own `auth list` are confirmed here; Claude Code has no
+  equivalent verified in this document. Login status is not onboarding or
+  trust readiness: trust is workspace-specific (a fresh worktree can be
+  untrusted even under a logged-in profile) and neither harness's onboarding
+  state has a verified cross-harness readiness probe, so `hop doctor` does
+  not infer either from login status. A separately versioned readiness
+  capability could add that later; this phase does not claim it;
+- perform no bootstrap, pre-seeding or trust decision itself: the human runs
+  the harness's own normal interactive first-launch for the specific
   workspace, exactly as they would without HOP;
 - record session/thread id, profile source (default, or the configured
   alternate-profile directory) and working directory at launch, and refuse a

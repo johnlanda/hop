@@ -216,6 +216,15 @@ Investigate a dedicated HOP Herdr session with native auto-resume disabled, or
 verified profile-aware resume support. Do not change unrelated sessions' restore
 settings as a shortcut. This is a compatibility finding, not a live reproduction.
 
+Current policy (2026-09-14, see
+[native harness compatibility](native-harness-compat.md#adopted-policy)): HOP
+runs on the user's normal Herdr server with no configuration change; a
+dedicated session with `resume_agents_on_restore` disabled is a later,
+optional opt-in for the alternate-profile pointer case, not the default. This
+does not resolve the restore-coordination question above, which remains open
+regardless of server choice — see
+[native harness compatibility](native-harness-compat.md#herdr-cold-restore-interaction).
+
 Sources: [launch schema](../../repos/herdr/src/api/schema/agents.rs),
 [workspace env](../../repos/herdr/src/api/schema/workspaces.rs),
 [pane env](../../repos/herdr/src/api/schema/panes.rs),

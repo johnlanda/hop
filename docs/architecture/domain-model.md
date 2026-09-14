@@ -22,9 +22,9 @@ Cardinality describes retained history, including failed launch reservations.
 | Execution | One invocation of a playbook revision | `domain/workflow` |
 | Step execution | A concrete attempt at executing a defined step | `domain/workflow` |
 | Gate evaluation | Evidence for or against a particular transition and input fingerprint | `domain/workflow` |
-| Account (deferred) | An authenticated provider identity and non-secret operational metadata | `domain/account` |
-| Pool (deferred) | Explicit provider-specific account membership and selection policy | `domain/account` |
-| Lease (deferred) | Reserved account capacity for a session lifecycle | `domain/account` |
+| Account (Phase 8, deferred) | An authenticated provider identity and non-secret operational metadata | `domain/account` |
+| Pool (Phase 8, deferred) | Explicit provider-specific account membership and selection policy | `domain/account` |
+| Lease (Phase 8, deferred; distinct from the current controller run lease) | Reserved account capacity for a session lifecycle | `domain/account` |
 | Runtime profile | Harness settings/tools/history-isolation configuration | Application configuration snapshot |
 
 The manager is a session with a manager role, not a special provider or another
@@ -32,11 +32,15 @@ orchestrator service. A task is not a session: the task can outlive a failed
 process. A HOP run is not a Herdr server session. A pool is not a model router.
 
 Account, Pool and Lease are deferred, not removed: the current delegated-
-authentication phase (see [RESEARCH.md](../../RESEARCH.md)) stores no accounts,
-pools or leases. Workers run in a harness's own default profile, or an optional
-user-configured alternate-profile pointer that HOP only passes through. The
-`domain/account` package, the entities below and their relationships describe a
-later, optional multi-account-pools phase, retained here for continuity.
+authentication phase (see [RESEARCH.md](../../RESEARCH.md)) creates no account
+entities, account pools or account-capacity leases. Controller run leases
+(the single-controller-per-run lease and fencing generation; see
+[architecture](architecture.md)) are a distinct concept and remain required —
+this deferral does not touch them. Workers run in a harness's own default
+profile, or an optional user-configured alternate-profile pointer that HOP
+only passes through. The `domain/account` package, the entities below and
+their relationships describe Phase 8, a later and optional multi-account-pools
+phase (see [phases](../plan/phases.md)), retained here for continuity.
 
 ## Orchestration relationships
 
@@ -127,9 +131,10 @@ details are omitted from the conceptual diagram for readability.
 
 ## Workflow and account relationships
 
-The `ACCOUNT`, `POOL` and `ACCOUNT_LEASE` entities below are deferred to the
-later, optional multi-account-pools phase (see the vocabulary table above);
-the playbook/execution/gate portion of this diagram is current design.
+The `ACCOUNT`, `POOL` and `ACCOUNT_LEASE` entities below are deferred to
+Phase 8, the later and optional multi-account-pools phase (see the
+vocabulary table above and [phases](../plan/phases.md)); the
+playbook/execution/gate portion of this diagram is current design.
 
 ```mermaid
 erDiagram
@@ -215,9 +220,9 @@ member after membership changes.
 | `Message` aggregate | Envelope and delivery/ack lifecycle | Idempotent receipt; retain uncertain delivery for reconciliation |
 | `PlaybookRevision` immutable definition | Step/gate keys and valid workflow structure | Existing executions keep their original revision |
 | `Execution` aggregate | Step progress, retries and gate evaluation history | Transition eligibility uses matching revision and input fingerprint |
-| `Account` aggregate (deferred) | Provider identity, credential reference, enabled/health state and capacity policy | Capacity checks include all outstanding leases |
-| `Pool` aggregate (deferred) | Membership, policy and selection cursor | Cursor movement and account/session reservation commit together |
-| `Lease` aggregate (deferred) | Account/session binding and reserved/active/released lifecycle | Retains capacity while runtime outcome is uncertain |
+| `Account` aggregate (Phase 8, deferred) | Provider identity, credential reference, enabled/health state and capacity policy | Capacity checks include all outstanding leases |
+| `Pool` aggregate (Phase 8, deferred) | Membership, policy and selection cursor | Cursor movement and account/session reservation commit together |
+| `Lease` aggregate (Phase 8, deferred; distinct from the current controller run lease) | Account/session binding and reserved/active/released lifecycle | Retains capacity while runtime outcome is uncertain |
 
 Repositories return aggregates/value objects, not mutable database rows. Aggregates
 refer to each other by ID; the ERD does not imply nested in-memory object graphs.
@@ -263,9 +268,11 @@ snapshots, event payloads and general account rows.
 
 ## Review points before schema implementation
 
-Recommended initial choices are one worker session per task attempt, one account
-lease per managed session, one store shared across local runs, immutable playbook
-revisions and no nested playbooks. Confirm these before designing migrations.
-Also settle retention for messages/results, what exact evidence accepts a task,
-and native profile isolation constraints. These are narrower decisions than the
-already confirmed Go architecture and engineering standards.
+Recommended initial choices are one worker session per task attempt, one store
+shared across local runs, immutable playbook revisions and no nested
+playbooks. Confirm these before designing migrations. If Phase 8's deferred
+multi-account-pools work is undertaken, its recommended starting choice is
+one account lease per managed session. Also settle retention for
+messages/results, what exact evidence accepts a task, and native profile
+isolation constraints. These are narrower decisions than the already
+confirmed Go architecture and engineering standards.

@@ -94,7 +94,10 @@ brief, freeze its effective instructions, create one task/attempt, and launch on
 native worker in a worktree. Launch in the harness's own default profile; an
 optional configuration value may point at a user-prepared alternate profile
 directory, passed through unmodified (see
-[native harness compatibility](../architecture/native-harness-compat.md)). Add
+[native harness compatibility](../architecture/native-harness-compat.md)). This
+is plain application configuration read at launch, not a harness adapter; Phase
+5 later extends this same alternate-profile pointer with login-status
+reporting and configuration UX — the capability is not implemented twice. Add
 the minimum SQLite schema and application-owned storage/runtime ports.
 
 Record launch intent before calling Herdr, then reconcile the result. Workers
@@ -153,22 +156,28 @@ commands so users can understand execution without opening a board.
 
 ## Phase 5 — Harness login status and profile configuration
 
-Deliver harness login status reporting and an optional alternate-profile
-pointer, starting with Claude Code, Codex and opencode. HOP performs no
-logins, stores no credentials and owns no keychain items: extend
-`hop doctor` to report each configured harness's own login state, and accept
-an optional per-run/per-role configuration value pointing at a
-user-prepared alternate profile directory. HOP only passes the harness's own
-profile variables through (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `HOME` plus
-the four `XDG_*_HOME` variables for opencode); it never bootstraps, seeds or
-verifies that profile beyond the login-status report above. Install Herdr
-integrations in the correct profile where supported.
+Deliver harness login status reporting and per-run/per-role configuration UX
+for the alternate-profile pointer Phase 2 already passes through, starting
+with Claude Code, Codex and opencode. HOP performs no logins, stores no
+credentials and owns no keychain items: extend `hop doctor` to report each
+configured harness's own verified login state — `unknown`/`unavailable`
+where a harness exposes no such signal — without inferring onboarding or
+trust readiness from it, since trust is workspace-specific and neither
+dimension has a verified cross-harness readiness probe. HOP does not answer
+or pre-seed onboarding or trust; any required interactive preparation
+(including any Herdr integration install into a profile) is a step the human
+performs themselves with the harness's and Herdr's own commands, not a HOP
+mutation of the profile. HOP only passes the harness's own profile variables
+through (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `HOME` plus the four
+`XDG_*_HOME` variables for opencode); it never bootstraps, seeds or verifies
+that profile beyond the login-status report above.
 
-Exit: `hop doctor` reports each configured harness's login status without
-reading, writing or storing credentials; an alternate-profile pointer's
-variables round-trip through the sanitizing launcher established in phases
-1–2; omitting the pointer launches in the harness's own default profile with
-no further HOP involvement.
+Exit: `hop doctor` reports each configured harness's verified login status
+(or `unknown`/`unavailable`) without reading, writing or storing
+credentials, and without claiming onboarding or trust readiness; an
+alternate-profile pointer's variables round-trip through the sanitizing
+launcher established in phases 1–2; omitting the pointer launches in the
+harness's own default profile with no further HOP involvement.
 
 Multi-account pools, round-robin selection, leases and cross-account resume
 remain a later, optional phase — see phase 8 below and
