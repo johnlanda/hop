@@ -212,6 +212,34 @@ func TestLoadLaunchContext(t *testing.T) {
 	}
 }
 
+// TestLoadLaunchContextBeforeBinding proves the launcher's load succeeds
+// as soon as InitializeRun's rows exist: hop launch is the pane's own
+// command and can run before the controller records the binding row, so a
+// missing binding yields the zero Binding and a nil Claim, never an error.
+func TestLoadLaunchContextBeforeBinding(t *testing.T) {
+	f := newFixture(t)
+
+	launchContext, err := f.store.LoadLaunchContext(t.Context(), f.spec.RunID, f.spec.AttemptID)
+	if err != nil {
+		t.Fatalf("LoadLaunchContext before the binding row: %v", err)
+	}
+	if launchContext.Snapshot.StateRoot != "/state/root" || launchContext.Snapshot.AssignmentDigest != "assignment-digest" {
+		t.Fatalf("snapshot = %+v, want the frozen fixture snapshot", launchContext.Snapshot)
+	}
+	if launchContext.Session.ID != f.spec.SessionID || launchContext.Session.NativeSessionRef != f.spec.NativeSessionRef {
+		t.Fatalf("session = %+v, want the fixture session with its native reference", launchContext.Session)
+	}
+	if launchContext.Binding != (run.RuntimeBinding{}) {
+		t.Fatalf("binding before the row is committed = %+v, want the zero value", launchContext.Binding)
+	}
+	if launchContext.Claim != nil {
+		t.Fatalf("claim before any binding = %+v, want nil", launchContext.Claim)
+	}
+	if launchContext.StopRequested {
+		t.Fatal("stop requested = true on a run with no stop request")
+	}
+}
+
 // TestLoadLaunchContextAttemptOfOtherRun proves the agreement check: an
 // attempt that does not belong to the run is ErrNotFound.
 func TestLoadLaunchContextAttemptOfOtherRun(t *testing.T) {

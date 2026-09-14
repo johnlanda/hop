@@ -285,8 +285,12 @@ func loadSnapshot(ctx context.Context, q querier, runID identity.RunID) (app.Run
 }
 
 // LoadLaunchContext loads what the launch exec boundary needs, without any
-// lease: the frozen snapshot, the attempt, the session and its current
-// binding and incarnation, the launch-claim state and the stop state.
+// lease: the frozen snapshot, the attempt, the session, the stop state,
+// and — when the controller has already recorded them — the session's
+// current binding and that incarnation's launch-claim state. It succeeds
+// as soon as InitializeRun's rows exist: the launcher starts as the pane's
+// own command and may load before the binding row is committed, in which
+// case Binding is the zero value and Claim is nil.
 func (s *Store) LoadLaunchContext(ctx context.Context, runID identity.RunID, attemptID identity.AttemptID) (app.LaunchContext, error) {
 	var launchContext app.LaunchContext
 	err := s.inReadTx(ctx, func(tx *sql.Tx) error {
@@ -316,16 +320,20 @@ func (s *Store) LoadLaunchContext(ctx context.Context, runID identity.RunID, att
 		if !ok {
 			return fmt.Errorf("sqlite: current session of attempt %s: %w", attemptID, app.ErrNotFound)
 		}
+		// The launcher is the pane's own command, so it can run before the
+		// controller has recorded the binding row as the pane.open outcome.
+		// A missing binding therefore never fails this load: Binding stays
+		// its zero value and Claim nil — the launcher does not need pane
+		// identifiers, and a claim is keyed by the binding's incarnation.
 		binding, hasBinding, err := currentBinding(ctx, tx, session.ID)
 		if err != nil {
 			return err
 		}
-		if !hasBinding {
-			return fmt.Errorf("sqlite: current binding of session %s: %w", session.ID, app.ErrNotFound)
-		}
-		claim, err := getLaunchClaim(ctx, tx, binding.IncarnationID)
-		if err != nil {
-			return err
+		var claim *app.LaunchClaim
+		if hasBinding {
+			if claim, err = getLaunchClaim(ctx, tx, binding.IncarnationID); err != nil {
+				return err
+			}
 		}
 		launchContext = app.LaunchContext{
 			Snapshot:      snapshot,
