@@ -171,11 +171,13 @@ type ruleTable map[string]rule
 // A new package fails the architecture check until it has an entry here.
 func productionRules() ruleTable {
 	return ruleTable{
-		"cmd/hop":                 {category: categoryComposition, firstParty: []string{"internal/app", "internal/adapters/herdr"}},
-		"internal":                {category: categoryArchitectureTest},
-		"internal/app":            {category: categoryApplication},
-		"internal/adapters/herdr": {category: categoryDrivenAdapter, firstParty: []string{"internal/app"}},
-		"test/integration":        {category: categoryIntegrationTest, firstParty: []string{"internal/app", "internal/adapters/herdr"}, testThirdParty: []string{"github.com/creack/pty"}},
+		"cmd/hop":                  {category: categoryComposition, firstParty: []string{"internal/app", "internal/adapters/herdr"}},
+		"internal":                 {category: categoryArchitectureTest},
+		"internal/app":             {category: categoryApplication},
+		"internal/adapters/herdr":  {category: categoryDrivenAdapter, firstParty: []string{"internal/app"}},
+		"internal/domain/identity": {category: categoryDomainShared, standard: []string{"errors", "fmt", "strconv", "strings"}, testStandard: []string{"testing"}},
+		"internal/domain/run":      {category: categoryDomain, firstParty: []string{"internal/domain/identity"}, standard: []string{"errors", "fmt", "time"}, testStandard: []string{"testing"}},
+		"test/integration":         {category: categoryIntegrationTest, firstParty: []string{"internal/app", "internal/adapters/herdr"}, testThirdParty: []string{"github.com/creack/pty"}},
 	}
 }
 
