@@ -149,8 +149,23 @@ func TestClaimAndRunCheck(t *testing.T) {
 		if err != nil {
 			t.Fatalf("LoadRunStatus() error = %v", err)
 		}
-		if updated.State != run.RunStopped {
-			t.Fatalf("Run.State = %s, want %s", updated.State, run.RunStopped)
+		if updated.State != run.RunStopping {
+			t.Fatalf("Run.State = %s, want %s: the check outcome never declares stopped while the worker may be live", updated.State, run.RunStopping)
+		}
+		if updated.AttemptState != run.AttemptInterrupted || updated.TaskState != run.TaskInterrupted {
+			t.Fatalf("Attempt/Task = %s/%s, want both interrupted", updated.AttemptState, updated.TaskState)
+		}
+
+		// DriveStop then observes the worker gone and completes the stop.
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			return app.PaneProcess{}, nil
+		}
+		final, err := tc.Controller.DriveStop(context.Background(), handle)
+		if err != nil {
+			t.Fatalf("DriveStop() error = %v", err)
+		}
+		if !final.Terminated || final.RunState != string(run.RunStopped) {
+			t.Fatalf("final report = %+v, want terminated/stopped", final)
 		}
 	})
 

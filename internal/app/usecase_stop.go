@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"time"
 
 	"github.com/johnlanda/hop/internal/domain/identity"
@@ -26,25 +27,81 @@ func (c *Controller) RequestStop(ctx context.Context, runIDStr string) error {
 // CheckRunIntent is the OpCheckRun operation's intent payload: what the
 // check use case recorded before spawning hop check-exec, and what stop
 // and resume's group-retirement classification matches an inspected
-// process group's argv against.
+// process group's argv against — both the frozen check argv and the
+// check-exec invocation that execs it, so a paused pre-exec boundary is
+// retirable too.
 type CheckRunIntent struct {
 	CheckoutPath string   `json:"checkout_path"`
 	CheckArgv    []string `json:"check_argv"`
+	SpawnArgv    []string `json:"spawn_argv"`
+}
+
+// paneCloseIntent is the OpPaneClose operation's intent payload: the exact
+// target the close was authorized against — pane placement, creation
+// label, occupant pid and the durable argv markers — plus the reason the
+// close was requested. A recovery round re-acts only against this same,
+// positively re-matched target.
+type paneCloseIntent struct {
+	PaneID        string                 `json:"pane_id"`
+	Label         string                 `json:"label"`
+	SessionID     identity.SessionID     `json:"close_session_id"`
+	IncarnationID identity.IncarnationID `json:"close_incarnation_id"`
+	PID           int                    `json:"pid"`
+	ArgvMarkers   []string               `json:"argv_markers"`
+	Reason        string                 `json:"reason"`
+}
+
+// paneCloseOutcome is the OpPaneClose operation's outcome payload.
+type paneCloseOutcome struct {
+	// AbsenceObserved is true when the target was observed absent — the
+	// retirement is complete — whether the close acted or the target was
+	// already gone.
+	AbsenceObserved bool   `json:"absence_observed"`
+	Detail          string `json:"detail"`
+}
+
+// paneCloseTarget is the recorded evidence one pane close is authorized
+// against; it is frozen into the operation intent before any act.
+type paneCloseTarget struct {
+	PaneID        string
+	Label         string
+	SessionID     identity.SessionID
+	IncarnationID identity.IncarnationID
+	PID           int
+	Markers       []string
+	Reason        string
+}
+
+// matchesCloseTarget applies the close rule's occupant match: the observed
+// foreground pid equals the recorded pid AND the argv carries one of the
+// recorded durable markers. A pid is never evidence alone.
+func matchesCloseTarget(target *paneCloseTarget, pane PaneProcess) bool {
+	if len(pane.Foreground) == 0 {
+		return false
+	}
+	return pane.Foreground[0].PID == target.PID && FirstMarkerMatch(pane, target.Markers) != ""
 }
 
 // StopReport is one DriveStop round's outcome.
 type StopReport struct {
 	RunState   string
 	Terminated bool
+	// Outstanding names the owned work not yet observed terminated:
+	// dispatched closes/signals awaiting absence, or ambiguous targets the
+	// round refused to act on.
+	Outstanding []string
 }
 
 // DriveStop performs one round of stop interruption against handle: it
-// interrupts not-yet-acted work directly, retires a pre-exec launch claim
-// or a running worker under the Runtime close rule, retires an orphaned
-// check process group, and — once every piece of owned work is confirmed
-// terminated — marks the run stopped. It is safe to call repeatedly: it
-// never resends or recreates anything, and once the run is stopped every
-// later call is a no-op reporting Terminated.
+// interrupts not-yet-acted work directly, retires the recorded worker
+// under the pane.close operation procedure and every check execution's
+// process group under the group-retirement rule, and marks the run
+// stopped ONLY once the worker and every check group have been observed
+// absent — a dispatched close or signal is never itself termination.
+// Mismatched occupants and failed inspections stay outstanding
+// (reconciling), never absent. It is safe to call repeatedly: it never
+// resends or recreates anything, and once the run is stopped every later
+// call is a no-op reporting Terminated.
 func (c *Controller) DriveStop(ctx context.Context, handle RunHandle) (StopReport, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; stop polling calls this method, never a hot inner loop.
 	detail, err := c.Read.LoadRunStatus(ctx, handle.runID)
 	if err != nil {
@@ -60,20 +117,388 @@ func (c *Controller) DriveStop(ctx context.Context, handle RunHandle) (StopRepor
 		return StopReport{RunState: string(detail.State)}, nil
 	}
 
-	switch detail.AttemptState {
-	case run.AttemptReserved:
+	if detail.AttemptState == run.AttemptReserved {
 		return c.stopReserved(ctx, handle, detail)
-	case run.AttemptLaunching, run.AttemptRelaunching:
-		return c.stopLaunching(ctx, handle, detail)
-	case run.AttemptRunning, run.AttemptSubmitted:
-		return c.stopRunning(ctx, handle, detail)
-	case run.AttemptChecking:
-		return c.stopChecking(ctx, handle, detail)
-	default:
-		// interrupted, completed, failed or reconciling: nothing owned is
-		// left to interrupt; only Run's own transition remains.
-		return c.finishStop(ctx, handle, detail, "owned work already settled")
 	}
+
+	outstanding, err := c.retireOwnedWork(ctx, handle, detail)
+	if err != nil {
+		return StopReport{RunState: string(run.RunStopping)}, err
+	}
+	if len(outstanding) > 0 {
+		return StopReport{RunState: string(run.RunStopping), Outstanding: outstanding}, nil
+	}
+	return c.finishStop(ctx, handle, detail, "termination of owned work observed")
+}
+
+// retireOwnedWork drives one retirement round over everything the run
+// owns: every check execution's process group, then the recorded worker.
+// It returns the pieces still outstanding — dispatched but not yet
+// observed absent, or ambiguous.
+func (c *Controller) retireOwnedWork(ctx context.Context, handle RunHandle, detail RunDetail) ([]string, error) { //nolint:gocritic // hugeParam: RunHandle and RunDetail are per-call DTOs; this runs once per stop round.
+	var outstanding []string
+	for i := range detail.PendingOperations {
+		if detail.PendingOperations[i].Kind != OpCheckRun {
+			continue
+		}
+		still, err := c.retireCheckOperation(ctx, handle, &detail.PendingOperations[i])
+		if err != nil {
+			return nil, err
+		}
+		if still != "" {
+			outstanding = append(outstanding, still)
+		}
+	}
+
+	still, err := c.retireWorker(ctx, handle, detail)
+	if err != nil {
+		return nil, err
+	}
+	if still != "" {
+		outstanding = append(outstanding, still)
+	}
+	return outstanding, nil
+}
+
+// retireCheckOperation retires one pending check execution's process group
+// under the section 7 group-retirement rule. An observed-empty group
+// settles the operation (outcome unknown, interrupted by stop); a
+// signaled or unmatched group stays outstanding.
+func (c *Controller) retireCheckOperation(ctx context.Context, handle RunHandle, checkOp *Operation) (string, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per pending check operation per round.
+	var (
+		claim CheckExecClaim
+		found bool
+	)
+	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		var err error
+		claim, found, err = uow.CheckExecClaims().Get(ctx, checkOp.ID)
+		return err
+	}); err != nil {
+		return "", fmt.Errorf("app: load check-exec claim: %w", err)
+	}
+	if !found {
+		// No claim: nothing spawned, or the child died before its pre-exec
+		// write. Ambiguous, never absence (the decision table's bounded
+		// wait); the run stays stopping and this round reports it.
+		return fmt.Sprintf("check execution %s has no claim yet; ambiguous, never absence", checkOp.ID), nil
+	}
+
+	intent, _ := decodeOperationPayload[CheckRunIntent](checkOp.Intent) // a decode failure leaves both argvs nil, which ClassifyGroupRetirement treats as never matching — fails closed, not a panic.
+	outcome, retireErr := c.retireGroup(ctx, handle, claim.PID, [][]string{intent.CheckArgv, intent.SpawnArgv})
+	if retireErr != nil {
+		return "", retireErr
+	}
+	switch outcome {
+	case GroupEmpty:
+		if err := c.settleInterruptedCheck(ctx, handle, checkOp.ID); err != nil {
+			return "", err
+		}
+		return "", nil
+	case GroupMatched:
+		return fmt.Sprintf("check group %d signaled; awaiting observed absence", claim.PID), nil
+	case GroupMismatched:
+		if err := c.markOperationReconciling(ctx, handle, checkOp.ID, "check group members do not match the recorded argv; failing closed"); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("check group %d does not match the recorded argv; failing closed", claim.PID), nil
+	default: // GroupInspectionFailed
+		return fmt.Sprintf("check group %d could not be inspected; failing closed", claim.PID), nil
+	}
+}
+
+// settleInterruptedCheck records a stop-retired check execution's outcome:
+// the operation failed with an unknown result after its group was observed
+// absent under a stop.
+func (c *Controller) settleInterruptedCheck(ctx context.Context, handle RunHandle, opID identity.OperationID) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per retired check execution.
+	now := c.Clock.Now()
+	return c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		op, err := uow.Operations().Get(ctx, opID)
+		if err != nil {
+			return err
+		}
+		if op.State != OperationPending && op.State != OperationReconciling {
+			return nil
+		}
+		op.State = OperationFailed
+		op.Outcome = checkRunOutcome{Unknown: true}
+		op.UpdatedAt = now
+		return uow.Operations().Save(ctx, op)
+	})
+}
+
+// markOperationReconciling moves an operation to reconciling with detail
+// as its outcome evidence, idempotently.
+func (c *Controller) markOperationReconciling(ctx context.Context, handle RunHandle, opID identity.OperationID, detail string) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per escalation.
+	now := c.Clock.Now()
+	return c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		op, err := uow.Operations().Get(ctx, opID)
+		if err != nil {
+			return err
+		}
+		if op.State != OperationPending && op.State != OperationReconciling {
+			return nil
+		}
+		op.State = OperationReconciling
+		op.Outcome = detail
+		op.UpdatedAt = now
+		return uow.Operations().Save(ctx, op)
+	})
+}
+
+// retireWorker retires the run's recorded worker through the pane.close
+// operation procedure. It returns "" once the worker is observed absent
+// (or there is provably nothing to retire), or the outstanding detail.
+func (c *Controller) retireWorker(ctx context.Context, handle RunHandle, detail RunDetail) (string, error) { //nolint:gocritic // hugeParam: RunHandle and RunDetail are per-call DTOs; this runs once per stop round.
+	if detail.Binding == nil || detail.Binding.PaneID == "" {
+		return "", nil
+	}
+	if detail.Claim == nil {
+		// A binding with no claim: the pane may hold a pre-claim launcher.
+		// There is no recorded identity to close against, so nothing is
+		// acted on; only observed absence clears it.
+		_, absent, observed := c.observePane(ctx, detail.Binding)
+		if observed && absent {
+			return "", nil
+		}
+		return "worker pane has no launch claim to retire against; failing closed", nil
+	}
+	if detail.Claim.State == LaunchClaimExecFailed {
+		// The exec failed and the launcher exited; there is no process to
+		// retire for this incarnation.
+		return "", nil
+	}
+
+	markers, err := c.launchMarkers(ctx, handle, detail)
+	if err != nil {
+		return "", err
+	}
+	if detail.Binding.Occupant != nil && detail.Binding.Occupant.ArgvMarker != "" {
+		markers = append(markers, detail.Binding.Occupant.ArgvMarker)
+	}
+	target := paneCloseTarget{
+		PaneID:        detail.Binding.PaneID,
+		Label:         detail.Binding.CreationLabel,
+		SessionID:     detail.SessionID,
+		IncarnationID: detail.Binding.IncarnationID,
+		PID:           detail.Claim.PID,
+		Markers:       markers,
+		Reason:        "stop",
+	}
+	retired, outstanding, err := c.closePaneOperation(ctx, handle, detail, &target)
+	if err != nil {
+		return "", err
+	}
+	if retired {
+		return "", nil
+	}
+	return outstanding, nil
+}
+
+// paneScrollbackLines bounds the ReadPane evidence captured before a close.
+const paneScrollbackLines = 500
+
+// closePaneOperation drives one OpPaneClose operation: commit the intent
+// naming the exact target evidence, revalidate, re-inspect and match under
+// the close rule, capture pane scrollback into the ArtifactStore, close
+// outside any transaction, then persist the observed outcome. A recovery
+// round (a pending OpPaneClose already journaled for the same target)
+// adopts an already-gone target, re-acts only against the same positively
+// matched target, and stays reconciling on mismatch. retired is true only
+// once the target has been OBSERVED absent; a dispatched close is not
+// termination. On confirmed retirement the target's current binding is
+// superseded with the observed evidence.
+func (c *Controller) closePaneOperation(ctx context.Context, handle RunHandle, detail RunDetail, target *paneCloseTarget) (retired bool, outstanding string, err error) { //nolint:gocritic // hugeParam: RunHandle and RunDetail are per-call DTOs; this runs once per close round.
+	opID, err := c.findOrCreateCloseOperation(ctx, handle, detail, target)
+	if err != nil {
+		return false, "", err
+	}
+
+	if err := c.revalidateForDispatch(ctx, handle, true); err != nil {
+		return false, "", err
+	}
+
+	pane, inspectErr := c.Runtime.InspectPane(ctx, target.PaneID)
+	if inspectErr != nil {
+		if target.Label != "" {
+			if _, found, findErr := c.Runtime.FindPaneByLabel(ctx, target.Label); findErr == nil && !found {
+				if err := c.recordCloseOutcome(ctx, handle, opID, target, "pane absent by id and by label"); err != nil {
+					return false, "", err
+				}
+				return true, "", nil
+			}
+		}
+		return false, "pane inspection failed; absence is never assumed", nil
+	}
+	if len(pane.Foreground) == 0 {
+		if err := c.recordCloseOutcome(ctx, handle, opID, target, "pane has no foreground occupant"); err != nil {
+			return false, "", err
+		}
+		return true, "", nil
+	}
+	if !matchesCloseTarget(target, pane) {
+		if err := c.markOperationReconciling(ctx, handle, opID, "occupant does not match the recorded close target; failing closed"); err != nil {
+			return false, "", err
+		}
+		return false, "pane occupant does not match the recorded close target; failing closed", nil
+	}
+
+	// The occupant is the recorded target: capture scrollback evidence (it
+	// vanishes with the pane), then close, then record the dispatch.
+	c.capturePaneScrollback(ctx, handle, detail, opID, target.PaneID)
+	if closeErr := c.Runtime.ClosePane(ctx, target.PaneID); closeErr != nil {
+		return false, "", fmt.Errorf("app: close pane %s: %w", target.PaneID, closeErr)
+	}
+	if err := c.recordCloseDispatched(ctx, handle, opID, target); err != nil {
+		return false, "", err
+	}
+
+	// One immediate re-observation: the pane may already be gone.
+	after, afterErr := c.Runtime.InspectPane(ctx, target.PaneID)
+	if afterErr == nil && len(after.Foreground) == 0 {
+		if err := c.recordCloseOutcome(ctx, handle, opID, target, "occupant absent after close"); err != nil {
+			return false, "", err
+		}
+		return true, "", nil
+	}
+	return false, "close dispatched; awaiting observed termination", nil
+}
+
+// findOrCreateCloseOperation reuses the pending OpPaneClose operation for
+// the same target when one exists — a close is never re-journaled while
+// unresolved — and otherwise commits a fresh intent.
+func (c *Controller) findOrCreateCloseOperation(ctx context.Context, handle RunHandle, detail RunDetail, target *paneCloseTarget) (identity.OperationID, error) { //nolint:gocritic // hugeParam: RunHandle and RunDetail are per-call DTOs; this runs once per close round.
+	for i := range detail.PendingOperations {
+		op := &detail.PendingOperations[i]
+		if op.Kind != OpPaneClose {
+			continue
+		}
+		intent, ok := decodeOperationPayload[paneCloseIntent](op.Intent)
+		if !ok {
+			continue
+		}
+		if intent.PaneID == target.PaneID && intent.IncarnationID == target.IncarnationID {
+			return op.ID, nil
+		}
+	}
+
+	opID, err := c.newOperationID()
+	if err != nil {
+		return "", err
+	}
+	now := c.Clock.Now()
+	intent := paneCloseIntent{
+		PaneID: target.PaneID, Label: target.Label,
+		SessionID: target.SessionID, IncarnationID: target.IncarnationID,
+		PID: target.PID, ArgvMarkers: target.Markers, Reason: target.Reason,
+	}
+	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		return uow.Operations().Create(ctx, Operation{
+			ID: opID, RunID: handle.runID, Generation: handle.lease.Generation,
+			Kind: OpPaneClose, State: OperationPending, Intent: intent,
+			CreatedAt: now, UpdatedAt: now,
+		})
+	}); err != nil {
+		return "", fmt.Errorf("app: record pane.close intent: %w", err)
+	}
+	return opID, nil
+}
+
+// capturePaneScrollback reads the pane's scrollback and stores it as a run
+// artifact before a close: scrollback vanishes with the pane. Capture is
+// evidence, not a gate — a failed read or write never blocks the close,
+// which the stop still owes the run.
+func (c *Controller) capturePaneScrollback(ctx context.Context, handle RunHandle, detail RunDetail, opID identity.OperationID, paneID string) { //nolint:gocritic // hugeParam: RunHandle and RunDetail are per-call DTOs; called once per close.
+	content, readErr := c.Runtime.ReadPane(ctx, paneID, paneScrollbackLines)
+	if readErr != nil || detail.StateRoot == "" {
+		return
+	}
+	path := filepath.Join(detail.StateRoot, "runs", handle.runID.String(), "artifacts", fmt.Sprintf("pane-scrollback-%s.txt", opID))
+	if writeErr := c.Artifacts.WriteArtifact(ctx, path, []byte(content)); writeErr != nil {
+		return
+	}
+	_ = c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error { //nolint:errcheck // best-effort evidence row; the capture itself succeeded and the close proceeds either way.
+		artifactID, err := identity.ParseArtifactID(c.IDs.NewID())
+		if err != nil {
+			return err
+		}
+		return uow.Artifacts().Save(ctx, run.NewArtifact(artifactID, handle.runID, run.ArtifactPaneSnapshot, path, sha256Hex(content)))
+	})
+}
+
+// recordCloseDispatched journals the close dispatch as act evidence and
+// moves the target's session to stopping when it was still live: the
+// interrupt has been dispatched; termination is observed later, never
+// declared here.
+func (c *Controller) recordCloseDispatched(ctx context.Context, handle RunHandle, opID identity.OperationID, target *paneCloseTarget) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per dispatched close.
+	now := c.Clock.Now()
+	return c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		op, err := uow.Operations().Get(ctx, opID)
+		if err != nil {
+			return err
+		}
+		op.ActEvidence = fmt.Sprintf("close dispatched at %s against pid %d", now.UTC().Format(time.RFC3339Nano), target.PID)
+		op.UpdatedAt = now
+		if saveErr := uow.Operations().Save(ctx, op); saveErr != nil {
+			return saveErr
+		}
+
+		if target.SessionID == "" {
+			return nil
+		}
+		s, sRev, err := uow.Sessions().Get(ctx, target.SessionID)
+		if err != nil {
+			return err
+		}
+		if s.State != run.SessionActive && s.State != run.SessionLaunching && s.State != run.SessionReconciling {
+			return nil
+		}
+		sFrom := s.State
+		next, stopErr := s.Stop(now)
+		if stopErr != nil {
+			return stopErr
+		}
+		if _, saveErr := uow.Sessions().Save(ctx, next, sRev); saveErr != nil {
+			return saveErr
+		}
+		return recordTransition(ctx, uow, EntitySession, target.SessionID.String(), string(sFrom), string(next.State), "interrupt dispatched", gen(handle.lease.Generation), now)
+	})
+}
+
+// recordCloseOutcome settles an OpPaneClose operation once the target has
+// been observed absent, and supersedes the target's current binding with
+// the observed retirement evidence.
+func (c *Controller) recordCloseOutcome(ctx context.Context, handle RunHandle, opID identity.OperationID, target *paneCloseTarget, detail string) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per confirmed retirement.
+	now := c.Clock.Now()
+	return c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		op, err := uow.Operations().Get(ctx, opID)
+		if err != nil {
+			return err
+		}
+		if op.State == OperationPending || op.State == OperationReconciling {
+			op.State = OperationSucceeded
+			op.Outcome = paneCloseOutcome{AbsenceObserved: true, Detail: detail}
+			op.UpdatedAt = now
+			if saveErr := uow.Operations().Save(ctx, op); saveErr != nil {
+				return saveErr
+			}
+		}
+
+		if target.SessionID == "" {
+			return nil
+		}
+		binding, found, err := uow.Bindings().Current(ctx, target.SessionID)
+		if err != nil {
+			return err
+		}
+		if !found || binding.IncarnationID != target.IncarnationID {
+			return nil
+		}
+		superseded, supersedeErr := binding.Supersede("pane close retirement: "+detail, now)
+		if supersedeErr != nil {
+			return supersedeErr
+		}
+		return uow.Bindings().Save(ctx, superseded)
+	})
 }
 
 // stopReserved interrupts an attempt that never launched: a reserved
@@ -129,128 +554,13 @@ func (c *Controller) stopReserved(ctx context.Context, handle RunHandle, detail 
 	return StopReport{RunState: string(run.RunStopped), Terminated: true}, nil
 }
 
-// stopLaunching retires a pre-exec (or already-failed) launch claim under
-// the close rule, then interrupts the attempt once retirement is
-// confirmed. A nil claim, or one whose evidence fails to match, leaves the
-// run reconciling rather than closing blindly.
-func (c *Controller) stopLaunching(ctx context.Context, handle RunHandle, detail RunDetail) (StopReport, error) { //nolint:gocritic // hugeParam: RunHandle and RunDetail are per-call DTOs; this runs once per stop round, never a hot loop.
-	if detail.Claim == nil {
-		return StopReport{RunState: string(run.RunStopping)}, nil
-	}
-	switch detail.Claim.State {
-	case LaunchClaimExecFailed:
-		return c.finishStop(ctx, handle, detail, "exec_failed claim; nothing to retire")
-	case LaunchClaimExeced:
-		return c.stopRunning(ctx, handle, detail)
-	case LaunchClaimExecPending:
-	}
-	if detail.Binding == nil || detail.Binding.PaneID == "" {
-		return StopReport{RunState: string(run.RunStopping)}, nil
-	}
-	evidence := run.OccupantEvidence{Label: detail.Binding.CreationLabel, ArgvMarker: detail.AttemptID.String(), PID: detail.Claim.PID}
-	closed, err := c.closeUnderCloseRule(ctx, handle, detail.Binding.PaneID, evidence)
-	if err != nil {
-		return StopReport{RunState: string(run.RunStopping)}, fmt.Errorf("app: close launching pane: %w", err)
-	}
-	if !closed {
-		return StopReport{RunState: string(run.RunStopping)}, nil
-	}
-	return c.finishStop(ctx, handle, detail, "stop during launch")
-}
-
-// stopRunning closes a running worker's pane under the close rule against
-// the current binding's occupant evidence, or — when the occupant is
-// already gone — treats absence as observed termination.
-func (c *Controller) stopRunning(ctx context.Context, handle RunHandle, detail RunDetail) (StopReport, error) { //nolint:gocritic // hugeParam: RunHandle and RunDetail are per-call DTOs; this runs once per stop round, never a hot loop.
-	if detail.Binding == nil || detail.Binding.PaneID == "" || detail.Binding.Occupant == nil {
-		return StopReport{RunState: string(run.RunStopping)}, nil
-	}
-	pane, err := c.Runtime.InspectPane(ctx, detail.Binding.PaneID)
-	if err != nil {
-		return StopReport{RunState: string(run.RunStopping)}, nil //nolint:nilerr // inspection failure fails closed: stays stopping, never closes blindly.
-	}
-	if !OccupantMatches(*detail.Binding.Occupant, pane) {
-		return c.finishStop(ctx, handle, detail, "worker termination observed")
-	}
-	if err := c.revalidateForDispatch(ctx, handle, true); err != nil {
-		return StopReport{RunState: string(run.RunStopping)}, err
-	}
-	if err := c.Runtime.ClosePane(ctx, detail.Binding.PaneID); err != nil {
-		return StopReport{RunState: string(run.RunStopping)}, fmt.Errorf("app: close running pane: %w", err)
-	}
-	return StopReport{RunState: string(run.RunStopping)}, nil
-}
-
-// stopChecking retires the run's check-exec process group under the
-// group-retirement rule and interrupts once retirement is confirmed.
-func (c *Controller) stopChecking(ctx context.Context, handle RunHandle, detail RunDetail) (StopReport, error) { //nolint:gocritic // hugeParam: RunHandle and RunDetail are per-call DTOs; this runs once per stop round, never a hot loop.
-	var checkOp *Operation
-	for i := range detail.PendingOperations {
-		if detail.PendingOperations[i].Kind == OpCheckRun {
-			checkOp = &detail.PendingOperations[i]
-			break
-		}
-	}
-	if checkOp == nil {
-		return StopReport{RunState: string(run.RunStopping)}, nil
-	}
-
-	var claim CheckExecClaim
-	var found bool
-	getErr := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
-		var err error
-		claim, found, err = uow.CheckExecClaims().Get(ctx, checkOp.ID)
-		return err
-	})
-	if getErr != nil {
-		return StopReport{RunState: string(run.RunStopping)}, fmt.Errorf("app: load check-exec claim: %w", getErr)
-	}
-	if !found {
-		return StopReport{RunState: string(run.RunStopping)}, nil
-	}
-
-	intent, _ := decodeOperationPayload[CheckRunIntent](checkOp.Intent) // a decode failure leaves expectedArgv nil, which ClassifyGroupRetirement treats as never matching — fails closed, not a panic.
-	outcome, retireErr := c.retireGroup(ctx, handle, claim.PID, intent.CheckArgv)
-	if retireErr != nil {
-		return StopReport{RunState: string(run.RunStopping)}, retireErr
-	}
-	switch outcome {
-	case GroupEmpty, GroupMatched:
-		return c.finishStop(ctx, handle, detail, "check process group retired")
-	default:
-		return StopReport{RunState: string(run.RunStopping)}, nil
-	}
-}
-
-// closeUnderCloseRule applies the Runtime close rule: it revalidates the
-// dispatch (heartbeat, generation), re-inspects the pane and matches the
-// occupant against evidence immediately before closing; on mismatch,
-// missing identity or inspection failure it fails closed (no close) and
-// returns false.
-func (c *Controller) closeUnderCloseRule(ctx context.Context, handle RunHandle, paneID string, evidence run.OccupantEvidence) (bool, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per close attempt.
-	if err := c.revalidateForDispatch(ctx, handle, true); err != nil {
-		return false, err
-	}
-	pane, err := c.Runtime.InspectPane(ctx, paneID)
-	if err != nil {
-		return false, nil //nolint:nilerr // inspection failure fails closed: no close, caller stays ambiguous.
-	}
-	if !OccupantMatches(evidence, pane) {
-		return false, nil
-	}
-	if err := c.Runtime.ClosePane(ctx, paneID); err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
 // retireGroup lists pgid through ProcessGroupInspector and classifies it
-// against expectedArgv, signaling the group only when matched, after
+// against the expected argvs, signaling the group only when matched, after
 // pre-dispatch revalidation. A signal failure is returned, never
 // discarded: the caller records it as reconciliation evidence.
-func (c *Controller) retireGroup(ctx context.Context, handle RunHandle, pgid int, expectedArgv []string) (GroupRetirementOutcome, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per retirement round.
+func (c *Controller) retireGroup(ctx context.Context, handle RunHandle, pgid int, expectedArgvs [][]string) (GroupRetirementOutcome, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per retirement round.
 	processes, err := c.Groups.GroupProcesses(ctx, pgid)
-	outcome := ClassifyGroupRetirement(processes, err, expectedArgv)
+	outcome := ClassifyGroupRetirement(processes, err, expectedArgvs)
 	if outcome != GroupMatched {
 		return outcome, nil
 	}

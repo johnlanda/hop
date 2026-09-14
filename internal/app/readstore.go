@@ -27,12 +27,15 @@ type RunStatus struct {
 // possible mid-reconciliation, between a lost session and its replacement).
 type RunDetail struct {
 	RunStatus
-	TaskID            identity.TaskID
-	AttemptID         identity.AttemptID
-	SessionID         identity.SessionID
-	TaskState         run.TaskState
-	AttemptState      run.AttemptState
-	WorktreePath      string
+	TaskID       identity.TaskID
+	AttemptID    identity.AttemptID
+	SessionID    identity.SessionID
+	TaskState    run.TaskState
+	AttemptState run.AttemptState
+	WorktreePath string
+	// StateRoot is the run snapshot's frozen absolute state root: where the
+	// run's artifact directories live, needed by evidence capture.
+	StateRoot         string
 	Binding           *run.RuntimeBinding
 	Claim             *LaunchClaim
 	PendingOperations []Operation

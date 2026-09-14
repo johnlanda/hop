@@ -318,18 +318,39 @@ func (c *Controller) reattachTarget(ctx context.Context, handle RunHandle, detai
 	return target, nil
 }
 
-// retireAndRelaunch supersedes the current binding with the positive
-// evidence, closes the occupant it names, and proceeds to cold relaunch.
+// retireAndRelaunch records the positively identified restored occupant as
+// an observed-restoration binding under a freshly minted observation
+// incarnation — the store's UNIQUE(session_id, incarnation_id) binding key
+// is never reused — supersedes the launch binding with that evidence,
+// retires the occupant through the shared pane.close operation procedure,
+// and proceeds to cold relaunch only once its termination was observed.
 func (c *Controller) retireAndRelaunch(ctx context.Context, handle RunHandle, detail RunDetail, req ResumeRequest, pane PaneProcess, nativeRef string) (ResumeResult, error) { //nolint:gocritic // hugeParam: RunHandle, RunDetail, ResumeRequest and PaneProcess are per-call values; this runs once per resume round.
 	now := c.Clock.Now()
 	evidence := fmt.Sprintf("observed process argv carries native session reference %s", nativeRef)
-	err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+	observationIncarnation, err := identity.ParseIncarnationID(c.IDs.NewID())
+	if err != nil {
+		return ResumeResult{}, fmt.Errorf("app: generate observation incarnation id: %w", err)
+	}
+
+	// The current binding may already be the recorded observation from a
+	// previous round; only a launch binding is superseded and re-recorded.
+	var target paneCloseTarget
+	uowErr := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 		binding, found, getErr := uow.Bindings().Current(ctx, detail.SessionID)
 		if getErr != nil {
 			return getErr
 		}
 		if !found {
 			return fmt.Errorf("app: no current binding to supersede for session %s", detail.SessionID)
+		}
+		target = paneCloseTarget{
+			PaneID: binding.PaneID, Label: binding.CreationLabel,
+			SessionID: detail.SessionID, IncarnationID: binding.IncarnationID,
+			PID: firstForeground(pane).PID, Markers: []string{nativeRef},
+			Reason: "positive-evidence retirement",
+		}
+		if binding.LaunchKind == run.LaunchRestoredObserved {
+			return nil
 		}
 		nextBinding, supersedeErr := binding.Supersede(evidence, now)
 		if supersedeErr != nil {
@@ -338,20 +359,25 @@ func (c *Controller) retireAndRelaunch(ctx context.Context, handle RunHandle, de
 		if saveErr := uow.Bindings().Save(ctx, nextBinding); saveErr != nil {
 			return saveErr
 		}
-		observed := run.NewRuntimeBinding(detail.SessionID, binding.IncarnationID, binding.ServerSocketPath, binding.WorkspaceID, binding.TabID, binding.PaneID, binding.CreationLabel, run.LaunchRestoredObserved, now)
+		observed := run.NewRuntimeBinding(detail.SessionID, observationIncarnation, binding.ServerSocketPath, binding.WorkspaceID, binding.TabID, binding.PaneID, binding.CreationLabel, run.LaunchRestoredObserved, now)
 		observedEvidence := run.OccupantEvidence{Label: binding.CreationLabel, ArgvMarker: nativeRef, PID: firstForeground(pane).PID}
 		observed, observeErr := observed.Observe(observedEvidence, now)
 		if observeErr != nil {
 			return observeErr
 		}
+		target.IncarnationID = observationIncarnation
 		return uow.Bindings().Create(ctx, observed)
 	})
-	if err != nil {
-		return ResumeResult{}, fmt.Errorf("app: record restored-observed binding: %w", err)
+	if uowErr != nil {
+		return ResumeResult{}, fmt.Errorf("app: record restored-observed binding: %w", uowErr)
 	}
 
-	if closed, closeErr := c.closeUnderCloseRule(ctx, handle, detail.Binding.PaneID, run.OccupantEvidence{Label: detail.Binding.CreationLabel, ArgvMarker: nativeRef, PID: firstForeground(pane).PID}); closeErr != nil || !closed {
-		return ResumeResult{Outcome: ResumeReconciling, Detail: "positive-evidence occupant recorded; retirement close did not complete"}, closeErr
+	retired, outstanding, closeErr := c.closePaneOperation(ctx, handle, detail, &target)
+	if closeErr != nil {
+		return ResumeResult{}, closeErr
+	}
+	if !retired {
+		return ResumeResult{Outcome: ResumeReconciling, Detail: "positive-evidence occupant recorded; " + outstanding}, nil
 	}
 	return c.coldRelaunch(ctx, handle, detail, req)
 }

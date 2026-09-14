@@ -147,7 +147,9 @@ const (
 const ArgvUnavailable = "<argv unavailable>"
 
 // ClassifyGroupRetirement classifies a ProcessGroupInspector.GroupProcesses
-// listing against expectedArgv. listErr is the error GroupProcesses
+// listing against the expected argvs — the frozen check argv AND the
+// `hop check-exec` invocation that execs it, so a paused pre-exec boundary
+// still classifies as owned work. listErr is the error GroupProcesses
 // returned, if any; a non-nil listErr always classifies as
 // GroupInspectionFailed regardless of processes. An empty, error-free
 // listing is GroupEmpty. Every group the process adapter runs (including
@@ -158,14 +160,14 @@ const ArgvUnavailable = "<argv unavailable>"
 // GroupMatched too — the caller signals the anchor and treats the group as
 // already gone, rather than waiting out the anchor's own ~27.8-hour sleep.
 // Otherwise, a listing classifies as GroupMatched when any member's argv
-// exactly equals expectedArgv; GroupInspectionFailed when no member matches
+// exactly equals one of the expected argvs; GroupInspectionFailed when no member matches
 // but at least one member's argv could not be read (ArgvUnavailable is
 // ambiguous, never proof of mismatch, and is never signaled on); and
 // GroupMismatched only when every member's argv was read and none matches.
 // Group identity is always corroborated by argv, never by pid or pgid
 // alone: there is no process start time anywhere in the observable
 // surface, so a recycled pgid is never trusted on its own.
-func ClassifyGroupRetirement(processes []GroupProcess, listErr error, expectedArgv []string) GroupRetirementOutcome {
+func ClassifyGroupRetirement(processes []GroupProcess, listErr error, expectedArgvs [][]string) GroupRetirementOutcome {
 	if listErr != nil {
 		return GroupInspectionFailed
 	}
@@ -180,7 +182,7 @@ func ClassifyGroupRetirement(processes []GroupProcess, listErr error, expectedAr
 			onlyAnchors = false
 			continue
 		}
-		if slices.Equal(p.Argv, expectedArgv) {
+		if matchesAnyArgv(p.Argv, expectedArgvs) {
 			return GroupMatched
 		}
 		if !isSleepAnchor(p.Argv) {
@@ -194,6 +196,17 @@ func ClassifyGroupRetirement(processes []GroupProcess, listErr error, expectedAr
 		return GroupInspectionFailed
 	}
 	return GroupMismatched
+}
+
+// matchesAnyArgv reports whether argv exactly equals one of the non-empty
+// expected argvs.
+func matchesAnyArgv(argv []string, expected [][]string) bool {
+	for _, want := range expected {
+		if len(want) > 0 && slices.Equal(argv, want) {
+			return true
+		}
+	}
+	return false
 }
 
 // isSleepAnchor reports whether argv is the process adapter's supervisory

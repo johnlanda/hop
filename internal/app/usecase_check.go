@@ -53,7 +53,8 @@ func (c *Controller) ClaimAndRunCheck(ctx context.Context, handle RunHandle, hop
 		return CheckReport{}, err
 	}
 	checkoutPath := filepath.Join(stateRoot, "runs", handle.runID.String(), "checks", opID.String(), "tree")
-	intent := CheckRunIntent{CheckoutPath: checkoutPath, CheckArgv: checkArgv}
+	spawnArgv := append([]string{hopPath, "check-exec", "--op", opID.String(), "--"}, checkArgv...)
+	intent := CheckRunIntent{CheckoutPath: checkoutPath, CheckArgv: checkArgv, SpawnArgv: spawnArgv}
 	now := c.Clock.Now()
 
 	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
@@ -115,7 +116,6 @@ func (c *Controller) ClaimAndRunCheck(ctx context.Context, handle RunHandle, hop
 	defer c.removeCheckout(ctx, repositoryRoot, checkoutPath)
 
 	spawnEnv = withHOPStateDir(spawnEnv, stateRoot)
-	spawnArgv := append([]string{hopPath, "check-exec", "--op", opID.String(), "--"}, checkArgv...)
 	if err := c.revalidateForDispatch(ctx, handle, false); err != nil {
 		return CheckReport{}, fmt.Errorf("app: revalidate before check spawn: %w", err)
 	}
@@ -325,10 +325,13 @@ func finishCheckOutcome(ctx context.Context, uow UnitOfWork, args *checkOutcomeA
 			}
 		}
 	case entityInterrupt:
-		if rNext, err = args.Run.MarkStopped(args.Now); err == nil {
-			if tNext, err = args.Task.Interrupt(args.Now); err == nil {
-				aNext, err = args.Attempt.Interrupt(args.Now)
-			}
+		// Stop precedence records the interruption but never declares the
+		// run stopped here: the worker may still be live, and only DriveStop
+		// marks stopped once termination of every piece of owned work has
+		// been observed.
+		rNext = args.Run
+		if tNext, err = args.Task.Interrupt(args.Now); err == nil {
+			aNext, err = args.Attempt.Interrupt(args.Now)
 		}
 	}
 	if err != nil {

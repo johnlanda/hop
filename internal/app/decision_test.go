@@ -121,6 +121,7 @@ func TestOccupantMatches(t *testing.T) {
 
 func TestClassifyGroupRetirement(t *testing.T) {
 	expected := []string{"sh", "check.sh"}
+	spawn := []string{"/usr/local/bin/hop", "check-exec", "--op", "op-1", "--", "sh", "check.sh"}
 	listErr := errors.New("boom")
 
 	tests := map[string]struct {
@@ -155,11 +156,15 @@ func TestClassifyGroupRetirement(t *testing.T) {
 			processes: []app.GroupProcess{{PID: 1, Argv: []string{app.ArgvUnavailable}}, {PID: 2, Argv: expected}},
 			want:      app.GroupMatched,
 		},
+		"matched: a paused pre-exec check-exec invocation is owned work": {
+			processes: []app.GroupProcess{{PID: 1, Argv: spawn}},
+			want:      app.GroupMatched,
+		},
 	}
 
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
-			got := app.ClassifyGroupRetirement(tc.processes, tc.err, expected)
+			got := app.ClassifyGroupRetirement(tc.processes, tc.err, [][]string{expected, spawn})
 			if got != tc.want {
 				t.Fatalf("ClassifyGroupRetirement() = %s, want %s", got, tc.want)
 			}

@@ -279,6 +279,7 @@ func (s *fakeStore) LoadRunStatus(_ context.Context, runID identity.RunID) (app.
 		RunStatus: s.runStatusLocked(runID),
 		TaskID:    taskID,
 		AttemptID: attemptID,
+		StateRoot: s.Snapshots[runID].StateRoot,
 	}
 	if t, ok := s.Tasks[taskID]; ok {
 		detail.TaskState = t.value.State
