@@ -14,26 +14,32 @@ import (
 // ArtifactStore implements app.ArtifactStore with temp-file-then-rename
 // writes under the run's artifact directories, so a reader never observes a
 // partial artifact.
-type ArtifactStore struct{}
+type ArtifactStore struct {
+	// dirSyncer overrides the directory fsync for tests (recording the
+	// synced directories or injecting failures); nil uses the real fsync.
+	dirSyncer func(dir string) error
+}
 
 var _ app.ArtifactStore = ArtifactStore{}
 
-// WriteArtifact durably writes content at path: missing parent directories
-// are created (0700) with each new entry fsynced into the directory that
-// holds it, the bytes land in a temp file inside the destination
-// directory, the file is pinned to mode 0600 and then fsynced (data and
-// mode inside one file sync), one atomic rename publishes it, and the
-// destination directory is fsynced so the rename survives a crash after
-// return. Every failure path removes the temp file. A failure before the
-// rename leaves the destination exactly as it was; a failure after it (the
-// directory fsync) leaves the complete new content whose durability is not
-// yet established — the destination is never anything partial.
-func (ArtifactStore) WriteArtifact(ctx context.Context, path string, content []byte) error {
+// WriteArtifact durably writes content at path: every directory on the
+// destination's parent chain is created if missing (0700) and fsynced —
+// pre-existing directories included, because existence does not establish
+// that an entry a previous, failed attempt created is durable — then the
+// bytes land in a temp file inside the destination directory, the file is
+// pinned to mode 0600 and then fsynced (data and mode inside one file
+// sync), one atomic rename publishes it, and the destination directory is
+// fsynced so the rename survives a crash after return. Every failure path
+// removes the temp file. A failure before the rename leaves the
+// destination exactly as it was; a failure after it (the directory fsync)
+// leaves the complete new content whose durability is not yet established —
+// the destination is never anything partial.
+func (s ArtifactStore) WriteArtifact(ctx context.Context, path string, content []byte) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	dir := filepath.Dir(path)
-	if err := ensureDirDurable(dir); err != nil {
+	if err := s.establishDirDurable(dir); err != nil {
 		return fmt.Errorf("create artifact directory: %w", err)
 	}
 	tmp, err := os.CreateTemp(dir, ".hop-artifact-*")
@@ -46,7 +52,7 @@ func (ArtifactStore) WriteArtifact(ctx context.Context, path string, content []b
 	if err := os.Rename(tmp.Name(), path); err != nil {
 		return errors.Join(fmt.Errorf("publish artifact: %w", err), removeTemp(tmp.Name()))
 	}
-	return syncDir(dir)
+	return s.syncDirectory(dir)
 }
 
 // ReadArtifact returns the artifact's complete content.
@@ -81,33 +87,58 @@ func fillTemp(tmp *os.File, content []byte) error {
 	return nil
 }
 
-// ensureDirDurable creates any missing directories on the chain down to
-// dir (0700) and fsyncs, for each directory it creates, the parent that
-// received the new entry — walking from the deepest ancestor that already
-// exists — so a first write into a fresh hierarchy is durably reachable
-// once WriteArtifact returns, not dependent on the filesystem flushing the
-// intermediate entries on its own.
-func ensureDirDurable(dir string) error {
-	info, err := os.Stat(dir)
-	switch {
-	case err == nil:
-		if !info.IsDir() {
-			return fmt.Errorf("%s exists and is not a directory", dir)
+// establishDirDurable creates any missing directory on the chain down to
+// dir (0700) and fsyncs the parent of every directory on that chain —
+// pre-existing directories included. No caller state proves which entries
+// an earlier, failed attempt left undurable (a directory's existence
+// establishes nothing about its entry's durability), so every write
+// re-establishes the whole chain: a retry after a failed parent sync
+// re-syncs exactly the directory whose sync failed. dir itself receives
+// its content sync after the publishing rename.
+func (s ArtifactStore) establishDirDurable(dir string) error {
+	for _, component := range parentChain(dir) {
+		if err := os.Mkdir(component, 0o700); err != nil {
+			if !errors.Is(err, fs.ErrExist) {
+				return err
+			}
+			info, statErr := os.Stat(component)
+			if statErr != nil {
+				return statErr
+			}
+			if !info.IsDir() {
+				return fmt.Errorf("%s exists and is not a directory", component)
+			}
 		}
-		return nil
-	case !errors.Is(err, fs.ErrNotExist):
-		return err
-	}
-	parent := filepath.Dir(dir)
-	if parent != dir {
-		if err := ensureDirDurable(parent); err != nil {
+		if err := s.syncDirectory(filepath.Dir(component)); err != nil {
 			return err
 		}
 	}
-	if err := os.Mkdir(dir, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
-		return err
+	return nil
+}
+
+// parentChain lists dir and its ancestors from the top down, excluding the
+// terminal root ("/" or "."), which is not a creatable entry.
+func parentChain(dir string) []string {
+	var chain []string
+	for current := filepath.Clean(dir); ; current = filepath.Dir(current) {
+		if filepath.Dir(current) == current {
+			break
+		}
+		chain = append(chain, current)
 	}
-	return syncDir(parent)
+	for i, j := 0, len(chain)-1; i < j; i, j = i+1, j-1 {
+		chain[i], chain[j] = chain[j], chain[i]
+	}
+	return chain
+}
+
+// syncDirectory fsyncs one directory through the test seam or the real
+// filesystem.
+func (s ArtifactStore) syncDirectory(dir string) error {
+	if s.dirSyncer != nil {
+		return s.dirSyncer(dir)
+	}
+	return fsyncDir(dir)
 }
 
 // removeTemp deletes a temp file that will not be published; a file already
@@ -119,10 +150,9 @@ func removeTemp(name string) error {
 	return nil
 }
 
-// syncDir fsyncs the directory holding a just-renamed artifact so the new
-// directory entry is durable.
-func syncDir(dir string) error {
-	handle, err := os.Open(dir) //nolint:gosec // G304: the directory of the application-chosen artifact path, opened read-only for fsync alone.
+// fsyncDir fsyncs one directory so the entries it holds are durable.
+func fsyncDir(dir string) error {
+	handle, err := os.Open(dir) //nolint:gosec // G304: a directory on the application-chosen artifact path's chain, opened read-only for fsync alone.
 	if err != nil {
 		return fmt.Errorf("open artifact directory for fsync: %w", err)
 	}

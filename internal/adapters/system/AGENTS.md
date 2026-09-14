@@ -36,12 +36,14 @@ filesystem ambiently; it consumes these ports.
   content whose durability is not yet established, and the caller must
   treat such an outcome as uncertain durability, never as a rollback.
   The destination is never anything partial.
-- Missing parent directories are created (0700) with each new entry
-  fsynced into the directory that holds it, walking from the deepest
-  already-existing ancestor, so a first write into a fresh hierarchy is
-  durably reachable when WriteArtifact returns. Paths are chosen by the
-  application from the run's frozen artifact directories, never by this
-  adapter.
+- Every write establishes the whole parent chain's durability, not only
+  what it created: each directory on the destination's parent chain is
+  created if missing (0700) and fsynced — pre-existing directories
+  included, because a directory's existence proves nothing about the
+  durability of an entry an earlier, failed attempt created — so a retry
+  after a failed parent fsync re-syncs exactly the directory whose sync
+  failed. Paths are chosen by the application from the run's frozen
+  artifact directories, never by this adapter.
 - `WriteArtifact` is never called from inside a store transaction (the
   port's contract): the use case commits intent first, writes as the
   external act, then records the outcome.
@@ -64,9 +66,12 @@ filesystem ambiently; it consumes these ports.
   replacing content completely; a failed publish (rename onto a directory)
   leaving no temp file; deep-hierarchy creation with every new directory
   0700; a file occupying the directory chain rejected by name; a
-  missing-artifact read wrapping fs.ErrNotExist. Crash-ordering itself
-  (what survives power loss mid-sequence) is not provable by these tests;
-  the sequence above is the documented mechanism.
+  missing-artifact read wrapping fs.ErrNotExist; and, through the
+  directory-sync recording seam, a retry after an injected parent-sync
+  failure re-fsyncing that same parent and every chain directory even
+  though they already exist. Crash-ordering itself (what survives power
+  loss mid-sequence) is not provable by these tests; the sequence above is
+  the documented mechanism.
 - Test fixtures: none on disk; paths live under t.TempDir.
 
 ## Related guides
