@@ -147,15 +147,31 @@ func TestEnvPolicyValidate(t *testing.T) {
 				Version: app.EnvPolicyVersion1, Harness: app.HarnessClaude,
 				Strip: []string{""},
 			},
-			wantErr: "strip entry is empty",
+			wantErr: "strip entry 0 is empty",
 		},
 		{
-			name: "strip entry containing an equals sign",
+			name: "strip entry that is an assignment",
 			policy: app.EnvPolicy{
 				Version: app.EnvPolicyVersion1, Harness: app.HarnessClaude,
-				Strip: []string{"FOO=bar"},
+				Strip: []string{"GOOD", "FOO=bar"},
 			},
-			wantErr: "cannot name an environment variable",
+			wantErr: `strip entry 1 (name "FOO") is an assignment, not a variable name`,
+		},
+		{
+			name: "strip entry containing a NUL byte",
+			policy: app.EnvPolicy{
+				Version: app.EnvPolicyVersion1, Harness: app.HarnessClaude,
+				Strip: []string{"KEY\x00"},
+			},
+			wantErr: "strip entry 0 contains a control byte",
+		},
+		{
+			name: "strip entry containing a tab",
+			policy: app.EnvPolicy{
+				Version: app.EnvPolicyVersion1, Harness: app.HarnessClaude,
+				Strip: []string{"KE\tY"},
+			},
+			wantErr: "strip entry 0 contains a control byte",
 		},
 		{
 			name: "empty passthrough entry",
@@ -163,15 +179,31 @@ func TestEnvPolicyValidate(t *testing.T) {
 				Version: app.EnvPolicyVersion1, Harness: app.HarnessClaude,
 				Passthrough: []string{""},
 			},
-			wantErr: "passthrough entry is empty",
+			wantErr: "passthrough entry 0 is empty",
 		},
 		{
-			name: "passthrough entry containing an equals sign",
+			name: "passthrough entry that is an assignment",
 			policy: app.EnvPolicy{
 				Version: app.EnvPolicyVersion1, Harness: app.HarnessClaude,
 				Passthrough: []string{"FOO=bar"},
 			},
-			wantErr: "cannot name an environment variable",
+			wantErr: `passthrough entry 0 (name "FOO") is an assignment, not a variable name`,
+		},
+		{
+			name: "passthrough entry containing a NUL byte",
+			policy: app.EnvPolicy{
+				Version: app.EnvPolicyVersion1, Harness: app.HarnessClaude,
+				Passthrough: []string{"KEY\x00"},
+			},
+			wantErr: "passthrough entry 0 contains a control byte",
+		},
+		{
+			name: "profile directory containing a NUL byte",
+			policy: app.EnvPolicy{
+				Version: app.EnvPolicyVersion1, Harness: app.HarnessClaude,
+				ProfileDir: "/profiles/alt\x00suffix",
+			},
+			wantErr: "profile directory contains a control byte",
 		},
 	}
 	for _, tc := range cases {
@@ -502,6 +534,104 @@ func TestSanitizeEnvironmentRemovedCarriesNamesNotValues(t *testing.T) {
 		if strings.Contains(name, "secret") {
 			t.Errorf("removed entry %q carries a value; removed must list names only", name)
 		}
+	}
+}
+
+func TestEnvPolicyValidateErrorsNeverEchoValues(t *testing.T) {
+	const secret = "synthetic-secret"
+	cases := []struct {
+		name   string
+		policy app.EnvPolicy
+	}{
+		{
+			name: "strip assignment entry",
+			policy: app.EnvPolicy{
+				Version: app.EnvPolicyVersion1, Harness: app.HarnessClaude,
+				Strip: []string{"OPENAI_API_KEY=" + secret},
+			},
+		},
+		{
+			name: "passthrough assignment entry",
+			policy: app.EnvPolicy{
+				Version: app.EnvPolicyVersion1, Harness: app.HarnessClaude,
+				Passthrough: []string{"OPENAI_API_KEY=" + secret},
+			},
+		},
+		{
+			name: "assignment entry with a control byte in its value",
+			policy: app.EnvPolicy{
+				Version: app.EnvPolicyVersion1, Harness: app.HarnessClaude,
+				Strip: []string{"OPENAI_API_KEY=\x00" + secret},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := tc.policy.Validate()
+
+			if err == nil {
+				t.Fatal("Validate() = nil, want a rejection")
+			}
+			if strings.Contains(err.Error(), secret) {
+				t.Errorf("Validate() error %q echoes the entry's value; errors carry list, position and name portion only", err)
+			}
+		})
+	}
+}
+
+func TestValidatedEnvPolicyDoesNotAliasTheCallersSlices(t *testing.T) {
+	policy := app.EnvPolicy{
+		Version: app.EnvPolicyVersion1, Harness: app.HarnessClaude,
+		Strip:       []string{"CUSTOM"},
+		Passthrough: []string{"OPENAI_API_KEY"},
+	}
+	validated := mustValidate(t, policy)
+
+	policy.Strip[0] = "SAFE"
+	policy.Passthrough[0] = "ANTHROPIC_API_KEY"
+
+	environ := []string{"CUSTOM=x", "SAFE=x", "OPENAI_API_KEY=opt-in", "ANTHROPIC_API_KEY=x"}
+	env, removed := app.SanitizeEnvironment(environ, validated)
+
+	if want := []string{"SAFE=x", "OPENAI_API_KEY=opt-in"}; !slices.Equal(env, want) {
+		t.Errorf("env = %q, want %q: mutating the caller's slices after Validate must not alter the validated policy", env, want)
+	}
+	if want := []string{"CUSTOM", "ANTHROPIC_API_KEY"}; !slices.Equal(removed, want) {
+		t.Errorf("removed = %q, want %q: mutating the caller's slices after Validate must not alter the validated policy", removed, want)
+	}
+}
+
+func TestSanitizeEnvironmentOutputsOwnTheirStorage(t *testing.T) {
+	environ := []string{"HOME=/Users/dev", "ANTHROPIC_API_KEY=secret", "PATH=/usr/bin"}
+	original := slices.Clone(environ)
+	policy := mustValidate(t, app.EnvPolicy{
+		Version: app.EnvPolicyVersion1, Harness: app.HarnessOpencode,
+		ProfileDir: "/profiles/oc-alt",
+	})
+	wantEnv := []string{
+		"PATH=/usr/bin",
+		"HOME=/profiles/oc-alt",
+		"XDG_DATA_HOME=/profiles/oc-alt/.local/share",
+		"XDG_CONFIG_HOME=/profiles/oc-alt/.config",
+		"XDG_STATE_HOME=/profiles/oc-alt/.local/state",
+		"XDG_CACHE_HOME=/profiles/oc-alt/.cache",
+	}
+	wantRemoved := []string{"ANTHROPIC_API_KEY"}
+
+	env, removed := app.SanitizeEnvironment(environ, policy)
+	if !slices.Equal(env, wantEnv) || !slices.Equal(removed, wantRemoved) {
+		t.Fatalf("SanitizeEnvironment() = (%q, %q), want (%q, %q)", env, removed, wantEnv, wantRemoved)
+	}
+
+	env[0] = "changed"
+	removed[0] = "changed"
+
+	if !slices.Equal(environ, original) {
+		t.Errorf("mutating the outputs changed the input: %q, want %q", environ, original)
+	}
+	againEnv, againRemoved := app.SanitizeEnvironment(environ, policy)
+	if !slices.Equal(againEnv, wantEnv) || !slices.Equal(againRemoved, wantRemoved) {
+		t.Errorf("second call = (%q, %q), want (%q, %q): outputs must not share storage across calls", againEnv, againRemoved, wantEnv, wantRemoved)
 	}
 }
 

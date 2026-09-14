@@ -87,10 +87,15 @@ type EnvPolicy struct {
 // applies and returns the validated value the exec-boundary commands pass to
 // it, validating once at load. It rejects a version this build has no strip
 // matrix for, a harness outside the supported set, a strip or passthrough
-// entry that cannot name an environment variable (empty, or containing "="),
-// and a profile directory that is not an absolute path — profile paths
-// arrive already resolved by the configuration loader, and a relative one
-// must never select a working-directory-dependent profile.
+// entry that cannot name an environment variable (empty, containing "=", or
+// containing a control byte, which no native environment name can carry),
+// and a profile directory that contains a control byte or is not an
+// absolute path — profile paths arrive already resolved by the
+// configuration loader, and a relative one must never select a
+// working-directory-dependent profile. Errors identify a rejected list
+// entry by list, position and name portion only: nothing after an entry's
+// first "=" is ever echoed, so a mistaken NAME=value assignment cannot
+// leak its value through a rendered error.
 func (p EnvPolicy) Validate() (ValidatedEnvPolicy, error) { //nolint:gocritic // hugeParam: validation reads a frozen policy value once per command start; by-value keeps it immutable and aliasing-free.
 	if p.Version != EnvPolicyVersion1 {
 		return ValidatedEnvPolicy{}, fmt.Errorf("environment policy version %q is not a strip-matrix revision this build knows; the only revision is %q", p.Version, EnvPolicyVersion1)
@@ -100,18 +105,23 @@ func (p EnvPolicy) Validate() (ValidatedEnvPolicy, error) { //nolint:gocritic //
 	default:
 		return ValidatedEnvPolicy{}, fmt.Errorf("harness %q has no environment policy; supported harnesses are %q, %q and %q", p.Harness, HarnessClaude, HarnessCodex, HarnessOpencode)
 	}
-	for _, name := range p.Strip {
-		if err := validateVariableName("strip", name); err != nil {
+	for i, name := range p.Strip {
+		if err := validateVariableName("strip", i, name); err != nil {
 			return ValidatedEnvPolicy{}, err
 		}
 	}
-	for _, name := range p.Passthrough {
-		if err := validateVariableName("passthrough", name); err != nil {
+	for i, name := range p.Passthrough {
+		if err := validateVariableName("passthrough", i, name); err != nil {
 			return ValidatedEnvPolicy{}, err
 		}
 	}
-	if p.ProfileDir != "" && !strings.HasPrefix(p.ProfileDir, "/") {
-		return ValidatedEnvPolicy{}, fmt.Errorf("profile directory %q is not an absolute path; the configuration loader resolves profile paths before the policy is frozen", p.ProfileDir)
+	if p.ProfileDir != "" {
+		if containsControlByte(p.ProfileDir) {
+			return ValidatedEnvPolicy{}, fmt.Errorf("profile directory contains a control byte and cannot be a native path")
+		}
+		if !strings.HasPrefix(p.ProfileDir, "/") {
+			return ValidatedEnvPolicy{}, fmt.Errorf("profile directory %q is not an absolute path; the configuration loader resolves profile paths before the policy is frozen", p.ProfileDir)
+		}
 	}
 	return ValidatedEnvPolicy{
 		version:     p.Version,
@@ -123,15 +133,32 @@ func (p EnvPolicy) Validate() (ValidatedEnvPolicy, error) { //nolint:gocritic //
 }
 
 // validateVariableName rejects a strip or passthrough entry that can never
-// name an environment variable.
-func validateVariableName(list, name string) error {
-	if name == "" {
-		return fmt.Errorf("%s entry is empty; entries name environment variables", list)
-	}
-	if strings.Contains(name, "=") {
-		return fmt.Errorf("%s entry %q contains %q and cannot name an environment variable", list, name, "=")
+// name an environment variable. Errors carry the list, the entry's position
+// and at most the portion of the entry before its first "=" — never a
+// value, so a mistaken NAME=value assignment stays out of stderr and logs —
+// and a fixed message when the name portion itself is not printable.
+func validateVariableName(list string, index int, name string) error {
+	switch {
+	case name == "":
+		return fmt.Errorf("%s entry %d is empty; entries name environment variables", list, index)
+	case containsControlByte(name):
+		return fmt.Errorf("%s entry %d contains a control byte and cannot name an environment variable", list, index)
+	case strings.Contains(name, "="):
+		prefix, _, _ := strings.Cut(name, "=")
+		return fmt.Errorf("%s entry %d (name %q) is an assignment, not a variable name; entries never carry values", list, index, prefix)
 	}
 	return nil
+}
+
+// containsControlByte reports whether s carries any byte below 0x20, which
+// no native environment name or path can represent.
+func containsControlByte(s string) bool {
+	for i := range len(s) {
+		if s[i] < 0x20 {
+			return true
+		}
+	}
+	return false
 }
 
 // ValidatedEnvPolicy is an EnvPolicy that passed Validate. Its fields are
@@ -161,12 +188,19 @@ type ValidatedEnvPolicy struct {
 // passthrough). A variable named HERDR_* or HOP_* is never stripped, custom
 // strip entries included.
 //
-// Entries resolve by name: each splits at its first "=", an entry without
-// one is a name with no value and is rendered back verbatim, and when a name
-// appears more than once the last entry wins (the operating system's own
-// resolution) and keeps its position. env holds the surviving entries in
-// inherited order with the profile assignments appended; removed holds the
-// names — never the values — of the stripped variables, in that same order.
+// Entries resolve by name: each splits at its first "=", and an entry
+// without one is a name with no value, rendered back verbatim. Matching is
+// exact and case-sensitive with no trimming or normalization. When a name
+// appears more than once, HOP's documented policy is that the last entry
+// wins and keeps that occurrence's inherited position (POSIX leaves
+// duplicate-name resolution undefined, so the choice is HOP's, not an
+// operating-system guarantee). environ is expected in the native os.Environ
+// shape, which cannot carry an embedded NUL; a synthetic NUL-bearing entry
+// is outside that precondition and passes through byte-for-byte for the
+// exec boundary to reject, never truncated. env holds the surviving entries
+// in inherited order with the profile assignments appended; removed holds
+// the names — never the values — of the stripped variables, in that same
+// order.
 func SanitizeEnvironment(environ []string, policy ValidatedEnvPolicy) (env, removed []string) { //nolint:gocritic // hugeParam: the design fixes a by-value policy parameter; sanitization runs once per exec boundary and the value must stay immutable.
 	stripped := stripUnionV1()
 	for _, name := range policy.strip {

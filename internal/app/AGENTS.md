@@ -105,9 +105,9 @@ ProfileDir), `EnvPolicy.Validate() (ValidatedEnvPolicy, error)`,
 `ValidatedEnvPolicy`, `SanitizeEnvironment(environ, policy) (env, removed)`,
 the version constant `EnvPolicyVersion1`, the harness constants
 `HarnessClaude`/`HarnessCodex`/`HarnessOpencode`, and `StripMatrixV1()`.
-Its only consumers are the exec-boundary commands (`hop launch`,
-`hop check-exec`) wired in `cmd/hop`; controller use-case code never calls
-it.
+Nothing imports it yet: its intended consumers are the exec-boundary
+commands (`hop launch`, `hop check-exec`), to be wired in `cmd/hop` by
+task 6a; controller use-case code never calls it.
 
 - `StripMatrixV1` is the design's version-scoped default strip matrix,
   per harness family; `SanitizeEnvironment` removes the union of every
@@ -122,14 +122,19 @@ it.
 - Parse-don't-validate: `SanitizeEnvironment` accepts only
   `ValidatedEnvPolicy`, constructible (non-zero) solely through
   `Validate`, which rejects an unknown matrix revision, an unsupported
-  harness, entries that cannot name an environment variable, and a
-  non-absolute profile directory (the config adapter resolves profile
-  paths before freezing). The zero `ValidatedEnvPolicy` sanitizes as the
-  strictest policy: full union stripped, no passthrough, no profile.
+  harness, entries that cannot name an environment variable (empty,
+  containing `=`, or containing a control byte), and a profile directory
+  that carries a control byte or is not absolute (the config adapter
+  resolves profile paths before freezing). Validation errors identify a
+  rejected entry by list, position and name portion only — never anything
+  after an entry's first `=`. The zero `ValidatedEnvPolicy` sanitizes as
+  the strictest policy: full union stripped, no passthrough, no profile.
 - The function is pure and deterministic: entries resolve by name (split
   at the first `=`; a name-only entry is legal and rendered verbatim),
-  the last duplicate wins as the operating system resolves it, input is
-  never mutated, and `removed` carries variable names only, never values.
+  matching is exact and case-sensitive with no trimming, the last
+  duplicate wins at its inherited position by HOP's documented policy
+  (POSIX leaves duplicate resolution undefined), input is never mutated,
+  and `removed` carries variable names only, never values.
 - Verification: `go test ./internal/app -run 'TestEnvPolicy|TestStripMatrix|TestSanitizeEnvironment'` —
   matrix-equality, validation, precedence, per-harness profile-mapping,
   environ-shape and strictest-zero-policy tables in
