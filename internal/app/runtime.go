@@ -11,24 +11,24 @@ type WorktreeRequest struct {
 }
 
 // WorktreeInfo is what Herdr created: the workspace it lives in, the
-// absolute checkout path, the branch and the resolved base commit — the
-// provenance an adoption decision validates against
-// (docs/plan/phase-2-design.md section 4). The worker pane is opened inside
-// WorkspaceID so it shares the worktree's workspace rather than creating a
-// second one.
+// absolute checkout path and the branch. Herdr's worktree.create response
+// carries no commit — the Herdr adapter runs no git — so the base commit an
+// adoption decision validates against (docs/plan/phase-2-design.md
+// section 4) is resolved separately, through CommandRunner. The worker
+// pane is opened inside WorkspaceID so it shares the worktree's workspace
+// rather than creating a second one.
 type WorktreeInfo struct {
 	WorkspaceID string
 	Path        string
 	Branch      string
-	BaseCommit  string
 }
 
 // WorkerPaneRequest is OpenWorkerPane's input: a layout.apply pane node
 // whose command IS the launch argv (absolute executable path first), the
 // worktree cwd, the additive env map and a unique creation label (the
-// launch operation ID). WorkspaceID, when set, targets an existing
-// workspace (adding one tab and leaving every other tab and pane
-// untouched); empty creates a new workspace.
+// launch operation ID). WorkspaceID is required: it is the workspace
+// Runtime.CreateWorktree already created, so the pane joins it as one
+// added tab, leaving every other tab and pane in that workspace untouched.
 type WorkerPaneRequest struct {
 	WorkspaceID string
 	Cwd         string

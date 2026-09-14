@@ -18,9 +18,18 @@ type RunStatus struct {
 	UpdatedAt   time.Time
 }
 
-// RunDetail is the full detail block `hop status -run` renders.
+// RunDetail is the full detail block `hop status -run` renders, and the
+// identities the controller use cases (stop, resume) need to load and
+// mutate the run's task, attempt and session directly. Phase 2 gives every
+// run exactly one task and one attempt, so TaskID and AttemptID are always
+// well-defined once the run exists; SessionID is the attempt's current
+// non-terminated session and is the zero value when none exists (briefly
+// possible mid-reconciliation, between a lost session and its replacement).
 type RunDetail struct {
 	RunStatus
+	TaskID            identity.TaskID
+	AttemptID         identity.AttemptID
+	SessionID         identity.SessionID
 	TaskState         run.TaskState
 	AttemptState      run.AttemptState
 	WorktreePath      string
