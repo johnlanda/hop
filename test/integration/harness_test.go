@@ -144,7 +144,7 @@ func sanitizeName(name string) string {
 // save writes one evidence file.
 func (a *artifactDir) save(t *testing.T, name, content string) {
 	t.Helper()
-	if err := os.WriteFile(filepath.Join(a.path, name), []byte(content), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(a.path, name), []byte(content), 0o600); err != nil { //nolint:gosec // G703: the path is inside this test's own artifact directory and the name is a fixed literal.
 		t.Logf("save artifact %s: %v", name, err)
 	}
 }
@@ -167,14 +167,29 @@ type testServer struct {
 	configHome string
 	socketPath string
 	config     string
-	cmd        *exec.Cmd
-	// pgid is the server's process-group id, captured once at start. Setpgid
-	// makes the child a group leader so pgid == pid; it is recorded here and
-	// never re-resolved after the process is reaped, so a recycled pid can
-	// never map this back to an unrelated group.
-	pgid      int
+	// shell overrides the SHELL every subprocess (and therefore every pane
+	// login shell) uses; empty means the default /bin/sh. The spike tests set
+	// it to exercise zsh login-shell behavior.
+	shell string
+	// running holds every server process the suite has launched on these
+	// roots, newest last. A restart (S3) launches a second one; each is
+	// reaped exactly once, by restart or by cleanup, so a graceful restart
+	// never leaves a stray server or a doubly-signaled group.
+	running   []*serverProcess
 	client    *herdr.Client
 	artifacts *artifactDir
+}
+
+// serverProcess is one launched herdr server: its process handle, the
+// process-group id captured while it was certainly alive (Setpgid made it the
+// group leader, so pgid == pid), its open log files, and whether it has been
+// reaped. pgid is never re-resolved after the reap, so a recycled pid can
+// never map this back to an unrelated group.
+type serverProcess struct {
+	cmd            *exec.Cmd
+	pgid           int
+	stdout, stderr *os.File
+	reaped         bool
 }
 
 // testConfig is the test-only configuration: no onboarding, fixed headless
@@ -242,11 +257,15 @@ func (s *testServer) environ() []string {
 	// opencode resolves the harmless stubs, never the developer's real
 	// harness binaries; herdr, go and the shell resolve from the inherited
 	// PATH after it.
+	shell := s.shell
+	if shell == "" {
+		shell = "/bin/sh"
+	}
 	return []string{
 		"PATH=" + filepath.Join(s.base, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"),
 		"HOME=" + s.homeDir(),
 		"TMPDIR=" + os.Getenv("TMPDIR"),
-		"SHELL=/bin/sh",
+		"SHELL=" + shell,
 		"XDG_CONFIG_HOME=" + filepath.Join(s.base, "c"),
 		"XDG_STATE_HOME=" + filepath.Join(s.base, "st"),
 		"XDG_RUNTIME_DIR=" + filepath.Join(s.base, "r"),
@@ -284,8 +303,13 @@ func prepareServer(t *testing.T, artifacts *artifactDir) *testServer {
 // to answer ping, with a bounded deadline and no fixed sleeps.
 func (s *testServer) start(t *testing.T) {
 	t.Helper()
-	stdout := s.artifacts.create(t, "server-stdout.log")
-	stderr := s.artifacts.create(t, "server-stderr.log")
+	stdoutName, stderrName := "server-stdout.log", "server-stderr.log"
+	if len(s.running) > 0 {
+		stdoutName = fmt.Sprintf("server-stdout-%d.log", len(s.running))
+		stderrName = fmt.Sprintf("server-stderr-%d.log", len(s.running))
+	}
+	stdout := s.artifacts.create(t, stdoutName)
+	stderr := s.artifacts.create(t, stderrName)
 	cmd := exec.CommandContext(context.Background(), s.herdrBin, "--session", sessionName, "server") //nolint:gosec // G204: the binary is the pinned or PATH-resolved herdr under test. The context is deliberately unbounded: stop owns the shutdown through the API and the process handle.
 	cmd.Env = s.environ()
 	cmd.Stdout = stdout
@@ -300,21 +324,13 @@ func (s *testServer) start(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start herdr server: %v", err)
 	}
-	s.cmd = cmd
 	// Capture the process-group id once, now, while the pid is certainly the
 	// live server. Setpgid made it a group leader, so its pgid equals its
-	// pid. The leader is never reaped until stop's final Wait, so this pgid
-	// cannot be reused before it is signaled.
-	s.pgid = cmd.Process.Pid
-	t.Cleanup(func() {
-		s.stop(t)
-		if closeErr := stdout.Close(); closeErr != nil {
-			t.Logf("close server stdout: %v", closeErr)
-		}
-		if closeErr := stderr.Close(); closeErr != nil {
-			t.Logf("close server stderr: %v", closeErr)
-		}
-	})
+	// pid. The leader is never reaped until reapServer's final Wait, so this
+	// pgid cannot be reused before it is signaled.
+	sp := &serverProcess{cmd: cmd, pgid: cmd.Process.Pid, stdout: stdout, stderr: stderr}
+	s.running = append(s.running, sp)
+	t.Cleanup(func() { s.reapServer(t, sp) })
 	deadline := time.Now().Add(30 * time.Second)
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -333,19 +349,65 @@ func (s *testServer) start(t *testing.T) {
 	}
 }
 
-// stop shuts the server down: it asks for a graceful stop, then kills the
-// server's whole process group (reaping every pane-shell descendant that
-// might hold artifact files open) and finally reaps the leader. No goroutine
-// reaps the leader earlier, so its group is signaled while the leader is
-// still alive or a zombie — never after the pid could have been reused.
-func (s *testServer) stop(t *testing.T) {
+// restart gracefully stops the current server and launches a fresh one on the
+// same roots, so persisted session state survives across the restart. It is
+// the S3 auto-restore scenario's setup and leaves no stray server: the old
+// leader's whole process group is reaped before the new one starts.
+func (s *testServer) restart(t *testing.T) {
 	t.Helper()
+	if len(s.running) == 0 {
+		t.Fatal("restart called before start")
+	}
+	current := s.running[len(s.running)-1]
+	// Ask for a graceful stop and let the server's run loop exit on its own,
+	// which is what runs save_session_on_shutdown and persists the full
+	// current state for restore. Only then reap the group. A SIGKILL before
+	// the run loop reached its shutdown save would truncate the session and
+	// restore stale state, so the graceful wait here is load-bearing, not a
+	// convenience.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := s.client.Call(ctx, "server.stop", nil, nil); err != nil {
+		t.Logf("server.stop before restart: %v", err)
+	}
+	cancel()
+	if !waitUntil(func() bool {
+		pingCtx, pingCancel := context.WithTimeout(context.Background(), time.Second)
+		defer pingCancel()
+		return s.client.Call(pingCtx, "ping", nil, &struct{}{}) != nil
+	}) {
+		t.Fatal("previous server socket still answered ping after graceful stop")
+	}
+	// The leader has exited (and saved) on its own; reap it and any lingering
+	// pane-shell descendants. server.stop is idempotent, so reapServer's own
+	// call is harmless.
+	s.reapServer(t, current)
+	s.start(t)
+}
+
+// reapServer asks one server for a graceful stop, then kills its whole
+// process group (reaping every pane-shell descendant that might hold artifact
+// files open) and finally reaps the leader. No goroutine reaps the leader
+// earlier, so its group is signaled while the leader is still alive or a
+// zombie — never after the pid could have been reused. It is idempotent per
+// server, so restart and the stacked cleanups never signal a group twice.
+func (s *testServer) reapServer(t *testing.T, sp *serverProcess) {
+	t.Helper()
+	if sp.reaped {
+		return
+	}
+	sp.reaped = true
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := s.client.Call(ctx, "server.stop", nil, nil); err != nil {
 		t.Logf("server.stop: %v (falling back to the process group)", err)
 	}
-	killProcessGroupThenReap(t, s.cmd, s.pgid, syscall.Getpgrp())
+	killProcessGroupThenReap(t, sp.cmd, sp.pgid, syscall.Getpgrp())
+	if closeErr := sp.stdout.Close(); closeErr != nil {
+		t.Logf("close server stdout: %v", closeErr)
+	}
+	if closeErr := sp.stderr.Close(); closeErr != nil {
+		t.Logf("close server stderr: %v", closeErr)
+	}
 }
 
 // killProcessGroupThenReap SIGKILLs the process group identified by pgid,
