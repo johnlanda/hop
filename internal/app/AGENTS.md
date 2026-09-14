@@ -97,6 +97,51 @@ packages.
 - Test fixtures: none on disk; the fakes and environ slices live in the
   test files.
 
+## Launch-environment sanitization ([launchenv.go](launchenv.go))
+
+Credential-handling core of the sanitizing launcher (Phase 2 design,
+section 6). Symbols: `EnvPolicy` (Version, Harness, Strip, Passthrough,
+ProfileDir), `EnvPolicy.Validate() (ValidatedEnvPolicy, error)`,
+`ValidatedEnvPolicy`, `SanitizeEnvironment(environ, policy) (env, removed)`,
+the version constant `EnvPolicyVersion1`, the harness constants
+`HarnessClaude`/`HarnessCodex`/`HarnessOpencode`, and `StripMatrixV1()`.
+Nothing imports it yet: its intended consumers are the exec-boundary
+commands (`hop launch`, `hop check-exec`), to be wired in `cmd/hop` by
+task 6a; controller use-case code never calls it.
+
+- `StripMatrixV1` is the design's version-scoped default strip matrix,
+  per harness family; `SanitizeEnvironment` removes the union of every
+  family regardless of the launched harness. A harness version drift needs
+  a re-verified new revision, never an edit to revision 1.
+- Precedence is strip < passthrough < profile: custom strip entries extend
+  the matrix, passthrough entries keep their inherited values, and a
+  configured profile directory assigns the launched harness's documented
+  profile shape last (`CLAUDE_CONFIG_DIR`; `CODEX_HOME`; for opencode
+  `HOME` plus all four `XDG_*_HOME` variables — never a flat directory).
+  `HERDR_*` and `HOP_*` variables are never stripped.
+- Parse-don't-validate: `SanitizeEnvironment` accepts only
+  `ValidatedEnvPolicy`, constructible (non-zero) solely through
+  `Validate`, which rejects an unknown matrix revision, an unsupported
+  harness, entries HOP does not accept as variable names (empty,
+  containing `=`, or containing a control byte — NUL cannot appear in a
+  native environment string; the other bytes below 0x20 are disallowed by
+  HOP policy), and a profile directory that carries a control byte or is
+  not absolute (the config adapter resolves profile paths before
+  freezing). Validation errors identify a
+  rejected entry by list, position and name portion only — never anything
+  after an entry's first `=`. The zero `ValidatedEnvPolicy` sanitizes as
+  the strictest policy: full union stripped, no passthrough, no profile.
+- The function is pure and deterministic: entries resolve by name (split
+  at the first `=`; a name-only entry is legal and rendered verbatim),
+  matching is exact and case-sensitive with no trimming, the last
+  duplicate wins at its inherited position by HOP's documented policy
+  (POSIX leaves duplicate resolution undefined), input is never mutated,
+  and `removed` carries variable names only, never values.
+- Verification: `go test ./internal/app -run 'TestEnvPolicy|TestStripMatrix|TestSanitizeEnvironment'` —
+  matrix-equality, validation, precedence, per-harness profile-mapping,
+  environ-shape and strictest-zero-policy tables in
+  [launchenv_test.go](launchenv_test.go).
+
 ## Related guides
 
 - [Parent index](../AGENTS.md)
