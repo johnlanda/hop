@@ -4,8 +4,10 @@
 
 HOP's narrow client of the Herdr boundary. It speaks newline-delimited JSON
 over the server's local Unix socket with response-ID correlation and typed
-error mapping, and probes the installed binary (version, bundled API schema,
-harness executables) for the application's doctor use case.
+error mapping, probes the installed binary (version, bundled API schema,
+harness executables) for the application's doctor use case, and drives
+worktree creation, worker-pane lifecycle and occupant inspection for the
+worker-launch use case.
 
 ## Quick reference
 
@@ -16,6 +18,7 @@ harness executables) for the application's doctor use case.
 | [probe.go](probe.go) | `InstallationProbe`, `parseSchema` | Implements `app.Probe`: resolves executables, reads `--version` lines, extracts protocol and method constants from `herdr api schema --json`, pings the configured socket |
 | [presentation.go](presentation.go) | `Presentation`, `NewPresentation` | Implements `app.AgentPresentation`: `pane.report_metadata` token patches, `agent.view.set` with a manager-first token sort and `agent.view.clear` — all under HOP's fixed source so its view is owned and clearable |
 | [observation.go](observation.go) | `Observer`, `NewObserver`, `statusStream`, `DrainRemaining`, `flushBacklog` | Implements `app.Observer`: one `pane.agent_status_changed` subscription per watched pane, normalized into `app.StatusEvent`, and a `session.snapshot` reduced to `app.PaneObservation`; on stop-intake, the decode pump moves its pending event and the rest of the raw backlog into an overflow slice that `DrainRemaining` exposes |
+| [runtime.go](runtime.go) | `Runtime`, `NewRuntime`, `ErrPaneNotFound`, `ErrWorkspaceIDRequired` | Implements `app.Runtime`: `worktree.create`, `layout.apply` worker-pane creation, pane recovery by creation label via `session.snapshot`, the `pane.send_text` fallback transport, `pane.read` scrollback capture, `pane.process_info` occupant inspection and `pane.close` |
 
 ## Invariants
 
@@ -59,12 +62,43 @@ harness executables) for the application's doctor use case.
   watches a fixed pane set chosen at construction; the snapshot still covers
   every pane. Non-status pushed frames are dropped, and both the dot and
   underscore spellings of the status event are accepted.
+- `Runtime.OpenWorkerPane` never sends `layout.apply`'s `tab_id`: naming one
+  replaces that tab, where omitting it (with `workspace_id` only) adds
+  exactly one tab and leaves every other tab and pane in that workspace
+  untouched (Phase 2 capability spike, S6). `focus` is always `false`, so
+  opening a worker pane never steals attention. `WorkspaceID` is required —
+  `layout.apply` has no way to create a workspace on its own, so an empty
+  `WorkspaceID` fails closed with `ErrWorkspaceIDRequired` before any
+  request is sent, rather than silently addressing whichever workspace is
+  active.
+- `Runtime.FindPaneByLabel` reads only `session.snapshot`, never `tab.list`:
+  `OpenWorkerPane`'s creation label is a `layout.apply` pane-node label, and
+  `session.snapshot` pane records already carry the workspace, tab and pane
+  ids alongside it (S7). Zero matches is `(zero value, false, nil)`; two or
+  more is an error, since creation labels are assumed unique.
+- `Runtime.CreateWorktree` reports exactly what `worktree.create` returns
+  (workspace, path, branch); it runs no git itself. Herdr's response has no
+  base-commit field, so that provenance is resolved by application code
+  through `CommandRunner`, never by this adapter.
+- `ErrPaneNotFound` is a typed, `errors.Is`-checkable sentinel every
+  pane-addressed `Runtime` method (`SendText`, `ReadPane`, `InspectPane`,
+  `ClosePane`) maps Herdr's `pane_not_found` API error onto, through the
+  shared `wrapPaneError` helper; every other error keeps its own type under
+  the added pane-address context. For `InspectPane` specifically, Herdr
+  returns this same code both for no such pane and for a pane that exists
+  but has no live runtime yet (the delayed-restore window), so the caller
+  reads it as "no runtime," not strictly "no such pane."
+- `Runtime.ClosePane` only issues `pane.close`; there is no
+  occupant-conditioned or compare-and-swap close upstream (S2), so the close
+  rule (re-inspect and match occupant evidence immediately before closing)
+  is enforced by application code around this method, never inside it.
 
 ## Dependencies and ports
 
 - Allowed inward imports: [internal/app](../../app/AGENTS.md).
 - Implemented ports: `app.Probe` by `InstallationProbe`,
-  `app.AgentPresentation` by `Presentation`, `app.Observer` by `Observer`.
+  `app.AgentPresentation` by `Presentation`, `app.Observer` by `Observer`,
+  `app.Runtime` by `Runtime`.
 - External libraries: none; standard library only.
 
 ## Verification
@@ -82,6 +116,13 @@ harness executables) for the application's doctor use case.
   `TestObserverCancellationReleasesBlockedPump` prove a pump blocked on a full
   channel is released, and that `Close`/cancellation report success rather
   than racing the pump's own connection close.
+- `TestRuntime*` in [runtime_test.go](runtime_test.go) cover every `Runtime`
+  method against a fake NDJSON endpoint: byte-exact request shapes,
+  response decoding, `ErrPaneNotFound`/`ErrWorkspaceIDRequired` mapping, an
+  unrelated API error code passing through unwrapped, a malformed response
+  surfacing as the `Client`'s own `ProtocolError`, context cancellation
+  across every method, and `FindPaneByLabel`'s not-found/ambiguous/transport-
+  error cases.
 - Test fixtures: none on disk; stubs and wire lines are written by the tests.
 
 ## Related guides
