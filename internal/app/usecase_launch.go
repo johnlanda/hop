@@ -227,7 +227,10 @@ func (c *Controller) settleExeced(ctx context.Context, handle RunHandle, claim L
 		if getErr != nil {
 			return getErr
 		}
-		if r.State == run.RunLaunching {
+		// A settlement reached through hop resume finds the run resuming
+		// rather than launching; both restore to running atomically with
+		// the attempt transition.
+		if r.State == run.RunLaunching || r.State == run.RunResuming {
 			nextRun, launchErr := r.MarkRunning(now)
 			if launchErr != nil {
 				return launchErr

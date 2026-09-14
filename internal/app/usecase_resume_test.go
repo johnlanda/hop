@@ -414,3 +414,93 @@ func TestResumeOperationRecovery(t *testing.T) {
 		}
 	})
 }
+
+// TestResumeRounds proves resume is re-runnable and leaves the run usable
+// (docs/plan/phase-2-design.md section 5): a fail-closed round followed by
+// a warm round restores every entity, and a warm-reattached run carries a
+// submission through a passing check to completion.
+func TestResumeRounds(t *testing.T) {
+	t.Run("fail-closed round then warm round restores Run, Task, Attempt and Session", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		_, detail := runningRun(t, tc)
+
+		// Round 1: the pane cannot be inspected conclusively and no
+		// positive evidence exists; the run stays resuming/reconciling.
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 9999, Argv0: "/bin/bash", Argv: []string{"bash"}}}}, nil
+		}
+		tc.Clock.Advance(leaseTTL + time.Second)
+		first, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String()))
+		if err != nil {
+			t.Fatalf("first Resume() error = %v", err)
+		}
+		if first.Outcome != app.ResumeFailedClosed {
+			t.Fatalf("first Outcome = %s, want %s", first.Outcome, app.ResumeFailedClosed)
+		}
+
+		// Round 2: the true worker is observable again.
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "/usr/bin/claude", Argv: []string{"claude", detail.AttemptID.String()}}}}, nil
+		}
+		tc.Clock.Advance(leaseTTL + time.Second)
+		second, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String()))
+		if err != nil {
+			t.Fatalf("second Resume() error = %v", err)
+		}
+		if second.Outcome != app.ResumeWarmReattached {
+			t.Fatalf("second Outcome = %s, want %s", second.Outcome, app.ResumeWarmReattached)
+		}
+
+		updated, err := tc.Store.LoadRunStatus(context.Background(), detail.RunID)
+		if err != nil {
+			t.Fatalf("LoadRunStatus() error = %v", err)
+		}
+		if updated.State != run.RunRunning {
+			t.Fatalf("Run.State = %s, want %s (restored from resuming)", updated.State, run.RunRunning)
+		}
+		if updated.TaskState != run.TaskActive {
+			t.Fatalf("Task.State = %s, want %s", updated.TaskState, run.TaskActive)
+		}
+		if updated.AttemptState != run.AttemptRunning {
+			t.Fatalf("Attempt.State = %s, want %s", updated.AttemptState, run.AttemptRunning)
+		}
+		if got := tc.Store.Sessions[detail.SessionID].value.State; got != run.SessionActive {
+			t.Fatalf("Session.State = %s, want %s", got, run.SessionActive)
+		}
+	})
+
+	t.Run("warm reattach, then submission and passing check complete the run", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		_, detail := runningRun(t, tc)
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "/usr/bin/claude", Argv: []string{"claude", detail.AttemptID.String()}}}}, nil
+		}
+		tc.Clock.Advance(leaseTTL + time.Second)
+		result, handle, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String()))
+		if err != nil {
+			t.Fatalf("Resume() error = %v", err)
+		}
+		if result.Outcome != app.ResumeWarmReattached {
+			t.Fatalf("Outcome = %s, want %s", result.Outcome, app.ResumeWarmReattached)
+		}
+
+		if submitted, submitErr := tc.Controller.SubmitResult(context.Background(), defaultSubmitRequest(detail)); submitErr != nil || submitted.Kind != string(app.SubmissionAccepted) {
+			t.Fatalf("SubmitResult() = %+v, err %v; want accepted after warm reattach", submitted, submitErr)
+		}
+		report, err := tc.Controller.ClaimAndRunCheck(context.Background(), handle, "/usr/local/bin/hop", "/repo", "/state", []string{"sh", "check.sh"}, false, nil)
+		if err != nil {
+			t.Fatalf("ClaimAndRunCheck() error = %v", err)
+		}
+		if !report.Ran || !report.Passed {
+			t.Fatalf("report = %+v, want Ran/Passed after warm reattach", report)
+		}
+
+		updated, err := tc.Store.LoadRunStatus(context.Background(), detail.RunID)
+		if err != nil {
+			t.Fatalf("LoadRunStatus() error = %v", err)
+		}
+		if updated.State != run.RunCompleted || updated.TaskState != run.TaskCompleted || updated.AttemptState != run.AttemptCompleted {
+			t.Fatalf("Run/Task/Attempt = %s/%s/%s, want all completed", updated.State, updated.TaskState, updated.AttemptState)
+		}
+	})
+}

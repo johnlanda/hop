@@ -506,6 +506,9 @@ func (c *Controller) reconcileActive(ctx context.Context, handle RunHandle, deta
 		}
 		switch progress {
 		case LaunchSettled, LaunchAlreadySettled:
+			if restoreErr := c.restoreRunAfterAdoption(ctx, handle); restoreErr != nil {
+				return ResumeResult{}, restoreErr
+			}
 			return ResumeResult{Outcome: ResumeWarmReattached, Detail: "launch claim corroborated on resume"}, nil
 		case LaunchNeedsInteraction:
 			paneID := ""
@@ -622,6 +625,10 @@ func (c *Controller) warmReattach(ctx context.Context, handle RunHandle, detail 
 			return saveErr
 		}
 
+		if restoreErr := restoreRunForAttemptState(ctx, uow, handle, target, now); restoreErr != nil {
+			return restoreErr
+		}
+
 		s, sRev, getErr := uow.Sessions().Get(ctx, detail.SessionID)
 		if getErr != nil {
 			return getErr
@@ -693,6 +700,52 @@ func (c *Controller) reattachTarget(ctx context.Context, handle RunHandle, detai
 		return "", fmt.Errorf("app: derive reattach target: %w", err)
 	}
 	return target, nil
+}
+
+// restoreRunAfterAdoption restores a resuming run to the state its
+// attempt implies after a verified adoption: checking implies completing,
+// every other adopted state implies running. A run not resuming is left
+// untouched (the settlement transaction already moved it).
+func (c *Controller) restoreRunAfterAdoption(ctx context.Context, handle RunHandle) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per adoption.
+	detail, err := c.Read.LoadRunStatus(ctx, handle.runID)
+	if err != nil {
+		return fmt.Errorf("app: load run status: %w", err)
+	}
+	if detail.State != run.RunResuming {
+		return nil
+	}
+	now := c.Clock.Now()
+	return c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		return restoreRunForAttemptState(ctx, uow, handle, detail.AttemptState, now)
+	})
+}
+
+// restoreRunForAttemptState moves a resuming run to running (or, for a
+// checking attempt, completing) with its transition evidence, within the
+// caller's transaction; any other run state is left untouched.
+func restoreRunForAttemptState(ctx context.Context, uow UnitOfWork, handle RunHandle, attemptState run.AttemptState, now time.Time) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per adoption.
+	r, rRev, err := uow.Runs().Get(ctx, handle.runID)
+	if err != nil {
+		return err
+	}
+	if r.State != run.RunResuming {
+		return nil
+	}
+	rFrom := r.State
+	var next run.Run
+	if attemptState == run.AttemptChecking {
+		if next, err = r.EnterCompleting(now); err != nil {
+			return err
+		}
+	} else {
+		if next, err = r.MarkRunning(now); err != nil {
+			return err
+		}
+	}
+	if _, err := uow.Runs().Save(ctx, next, rRev); err != nil {
+		return err
+	}
+	return recordTransition(ctx, uow, EntityRun, handle.runID.String(), string(rFrom), string(next.State), "warm reattach verified", gen(handle.lease.Generation), now)
 }
 
 // retireAndRelaunch records the positively identified restored occupant as
