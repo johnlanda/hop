@@ -297,6 +297,16 @@ func (s *fakeStore) LoadRunStatus(_ context.Context, runID identity.RunID) (app.
 			c := claim
 			detail.Claim = &c
 		}
+	} else if incarnation, sessionID, ok := s.pendingIntentLocked(attemptID); ok {
+		// Pre-binding: the pane.open outcome (and so the binding) has not
+		// committed yet, but the launcher may already have claimed against
+		// the pending intent's incarnation — surface that claim so the
+		// controller never needs a binding to see it.
+		detail.SessionID = sessionID
+		if claim, ok := s.LaunchClaims[incarnation]; ok {
+			c := claim
+			detail.Claim = &c
+		}
 	}
 	for _, op := range s.Operations { //nolint:gocritic // rangeValCopy: test fake; the domain snapshot is small and read-only here, and indexing would only obscure the loop.
 		if op.RunID == runID && (op.State == app.OperationPending || op.State == app.OperationReconciling) {
@@ -390,10 +400,18 @@ func (s *fakeStore) incarnationCurrentLocked(attemptID identity.AttemptID, incar
 	if _, binding, ok := s.currentBindingByAttemptLocked(attemptID); ok {
 		return binding.IncarnationID == incarnation
 	}
+	current, _, found := s.pendingIntentLocked(attemptID)
+	return found && current == incarnation
+}
+
+// pendingIntentLocked resolves the newest pending pane.open/launch.send
+// operation intent for the attempt: the incarnation and session it named.
+func (s *fakeStore) pendingIntentLocked(attemptID identity.AttemptID) (identity.IncarnationID, identity.SessionID, bool) {
 	var (
-		newest    time.Time
-		newestInc identity.IncarnationID
-		found     bool
+		newest     time.Time
+		newestInc  identity.IncarnationID
+		newestSess identity.SessionID
+		found      bool
 	)
 	for _, op := range s.Operations { //nolint:gocritic // rangeValCopy: test fake; the journal is small and read-only here.
 		if op.State != app.OperationPending || (op.Kind != app.OpPaneOpen && op.Kind != app.OpLaunchSend) {
@@ -410,10 +428,11 @@ func (s *fakeStore) incarnationCurrentLocked(attemptID identity.AttemptID, incar
 		if !found || op.CreatedAt.After(newest) {
 			newest = op.CreatedAt
 			newestInc = identity.IncarnationID(intent.IncarnationID)
+			newestSess = identity.SessionID(intent.SessionID)
 			found = true
 		}
 	}
-	return found && newestInc == incarnation
+	return newestInc, newestSess, found
 }
 
 // paneOpenIntentFields are the stable pane.open intent JSON keys the store

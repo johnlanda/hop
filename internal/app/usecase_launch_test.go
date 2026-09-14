@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/johnlanda/hop/internal/app"
+	"github.com/johnlanda/hop/internal/domain/identity"
 	"github.com/johnlanda/hop/internal/domain/run"
 )
 
@@ -40,12 +41,10 @@ func claimLaunch(t *testing.T, tc *testController, detail app.RunDetail, pid int
 }
 
 func TestCorroborateLaunch(t *testing.T) {
-	const marker = "attempt-marker"
-
 	t.Run("pending: no claim written yet", func(t *testing.T) {
 		tc := newTestController(defaultPolicy())
 		handle, _ := startedRun(t, tc)
-		progress, err := tc.Controller.CorroborateLaunch(context.Background(), handle, "/usr/bin/claude", marker)
+		progress, err := tc.Controller.CorroborateLaunch(context.Background(), handle)
 		if err != nil {
 			t.Fatalf("CorroborateLaunch() error = %v", err)
 		}
@@ -59,10 +58,10 @@ func TestCorroborateLaunch(t *testing.T) {
 		handle, detail := startedRun(t, tc)
 		claimLaunch(t, tc, detail, 4242)
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "/usr/bin/claude", Argv: []string{"claude", marker}}}}, nil
+			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "/usr/bin/claude", Argv: []string{"claude", detail.AttemptID.String()}}}}, nil
 		}
 
-		progress, err := tc.Controller.CorroborateLaunch(context.Background(), handle, "/usr/bin/claude", marker)
+		progress, err := tc.Controller.CorroborateLaunch(context.Background(), handle)
 		if err != nil {
 			t.Fatalf("CorroborateLaunch() error = %v", err)
 		}
@@ -90,10 +89,10 @@ func TestCorroborateLaunch(t *testing.T) {
 		handle, detail := startedRun(t, tc)
 		claimLaunch(t, tc, detail, 4242)
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 9999, Argv0: "/usr/bin/claude", Argv: []string{"claude", marker}}}}, nil
+			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 9999, Argv0: "/usr/bin/claude", Argv: []string{"claude", detail.AttemptID.String()}}}}, nil
 		}
 
-		progress, err := tc.Controller.CorroborateLaunch(context.Background(), handle, "/usr/bin/claude", marker)
+		progress, err := tc.Controller.CorroborateLaunch(context.Background(), handle)
 		if err != nil {
 			t.Fatalf("CorroborateLaunch() error = %v", err)
 		}
@@ -113,7 +112,7 @@ func TestCorroborateLaunch(t *testing.T) {
 			t.Fatalf("SettleLaunchFailure() error = %v", err)
 		}
 
-		progress, err := tc.Controller.CorroborateLaunch(context.Background(), handle, "/usr/bin/claude", marker)
+		progress, err := tc.Controller.CorroborateLaunch(context.Background(), handle)
 		if err != nil {
 			t.Fatalf("CorroborateLaunch() error = %v", err)
 		}
@@ -127,6 +126,102 @@ func TestCorroborateLaunch(t *testing.T) {
 		}
 		if updated.State != run.RunFailed || updated.TaskState != run.TaskFailed || updated.AttemptState != run.AttemptFailed {
 			t.Fatalf("Run/Task/Attempt = %s/%s/%s, want all failed", updated.State, updated.TaskState, updated.AttemptState)
+		}
+		session := tc.Store.Sessions[detail.SessionID]
+		if session.value.State != run.SessionTerminated {
+			t.Fatalf("Session.State = %s, want %s (reference trace 3 terminates the session)", session.value.State, run.SessionTerminated)
+		}
+	})
+
+	t.Run("settled: the native session reference marker corroborates a resume-shaped argv", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		handle, detail := startedRun(t, tc)
+		claimLaunch(t, tc, detail, 4242)
+		nativeRef := tc.Store.Sessions[detail.SessionID].value.NativeSessionRef
+		if nativeRef == "" {
+			t.Fatalf("no native session reference was pre-assigned for the claude harness")
+		}
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "/usr/bin/claude", Argv: []string{"claude", "--resume", nativeRef}}}}, nil
+		}
+
+		progress, err := tc.Controller.CorroborateLaunch(context.Background(), handle)
+		if err != nil {
+			t.Fatalf("CorroborateLaunch() error = %v", err)
+		}
+		if progress != app.LaunchSettled {
+			t.Fatalf("progress = %s, want %s (native reference is a durable marker)", progress, app.LaunchSettled)
+		}
+	})
+
+	t.Run("pre-binding claim: a lost pane.open outcome is recovered by label, never dereferenced nil", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		handle, detail := startedRun(t, tc)
+		claimLaunch(t, tc, detail, 4242)
+
+		// Simulate the pane.open outcome transaction having been lost: the
+		// binding is gone and the operation is pending again, while the
+		// launcher's claim (written against the intent) survives.
+		tc.Store.Bindings = map[identity.SessionID][]run.RuntimeBinding{}
+		var label string
+		for id, op := range tc.Store.Operations {
+			if op.Kind == app.OpPaneOpen {
+				op.State = app.OperationPending
+				op.ActEvidence = nil
+				tc.Store.Operations[id] = op
+				label = id.String()
+			}
+		}
+		tc.Runtime.FindPaneByLabelFn = func(l string) (app.PaneRef, bool, error) {
+			if l != label {
+				t.Errorf("FindPaneByLabel(%q), want the pane.open operation label %q", l, label)
+			}
+			return app.PaneRef{WorkspaceID: "workspace-1", TabID: "tab-9", PaneID: "pane-9"}, true, nil
+		}
+
+		progress, err := tc.Controller.CorroborateLaunch(context.Background(), handle)
+		if err != nil {
+			t.Fatalf("CorroborateLaunch() error = %v", err)
+		}
+		if progress != app.LaunchPending {
+			t.Fatalf("progress = %s, want %s (binding recovered; settlement is a later round)", progress, app.LaunchPending)
+		}
+		updated, err := tc.Store.LoadRunStatus(context.Background(), tc.onlyRunID(t))
+		if err != nil {
+			t.Fatalf("LoadRunStatus() error = %v", err)
+		}
+		if updated.Binding == nil || updated.Binding.PaneID != "pane-9" {
+			t.Fatalf("binding was not recovered by label: %+v", updated.Binding)
+		}
+	})
+
+	t.Run("early acceptance: corroboration activates a still-launching session and is otherwise a no-op", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		handle, detail := startedRun(t, tc)
+		claimLaunch(t, tc, detail, 4242)
+		// A prior generation settled the claim; its lifecycle landed, but the
+		// worker submitted first (early acceptance), so run/task/attempt come
+		// from the acceptance transaction while the session never activated.
+		claim := tc.Store.LaunchClaims[detail.Binding.IncarnationID]
+		claim.State = app.LaunchClaimExeced
+		tc.Store.LaunchClaims[detail.Binding.IncarnationID] = claim
+
+		if result, err := tc.Controller.SubmitResult(context.Background(), defaultSubmitRequest(detail)); err != nil || result.Kind != string(app.SubmissionAccepted) {
+			t.Fatalf("SubmitResult() = %+v, err %v; want early acceptance", result, err)
+		}
+		if got := tc.Store.Sessions[detail.SessionID].value.State; got != run.SessionLaunching {
+			t.Fatalf("Session.State = %s before corroboration, want %s", got, run.SessionLaunching)
+		}
+
+		progress, err := tc.Controller.CorroborateLaunch(context.Background(), handle)
+		if err != nil {
+			t.Fatalf("CorroborateLaunch() error = %v", err)
+		}
+		if progress != app.LaunchAlreadySettled {
+			t.Fatalf("progress = %s, want %s", progress, app.LaunchAlreadySettled)
+		}
+		if got := tc.Store.Sessions[detail.SessionID].value.State; got != run.SessionActive {
+			t.Fatalf("Session.State = %s after corroboration, want %s (early-accepted session activated)", got, run.SessionActive)
 		}
 	})
 }

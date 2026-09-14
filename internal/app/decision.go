@@ -40,28 +40,65 @@ const (
 	SettlementUnresolved LaunchSettlement = "unresolved"
 )
 
-// CorroborateSettlement applies the section 6 corroboration predicate, used
-// identically by settlement, adoption and warm reattach. paneMatches
-// reports whether the inspected pane is the claim's current creation
-// binding (pane ID, or recovered by creation label) — a false paneMatches
-// is always unresolved, since the predicate is meaningless off-target.
-// expectedExecutable is the resolved executable identity (name or argv0)
-// the claim recorded; marker is the run/attempt/incarnation or native
-// session identifier expected in the process's full argv.
-func CorroborateSettlement(paneMatches bool, pane PaneProcess, expectedExecutable, marker string, claim LaunchClaim) LaunchSettlement { //nolint:gocritic // hugeParam: claim is an immutable snapshot read once by this pure decision function; callers pass a local value, so a pointer would only invite aliasing.
+// CorroborateSettlement applies the section 6 corroboration predicate, the
+// ONLY corroboration rule, used identically by settlement, adoption and
+// warm reattach. paneMatches reports whether the inspected pane is the
+// claim's current creation binding (pane ID, or recovered by creation
+// label) — a false paneMatches is always unresolved, since the predicate
+// is meaningless off-target. The expected executable identity is the one
+// the claim itself recorded, never a caller-selected value. markers are
+// the run/attempt/incarnation or native session identifiers derived from
+// durable launch/binding context; the observed argv must carry at least
+// one. A still-running `hop launch` invocation is explicitly excluded: a
+// paused pre-exec launcher can never satisfy the predicate even when the
+// recorded executable is the HOP binary itself. Missing identity — an
+// empty claim executable or an empty marker set — is unresolved, never
+// settled: the predicate fails closed.
+func CorroborateSettlement(paneMatches bool, pane PaneProcess, markers []string, claim LaunchClaim) LaunchSettlement { //nolint:gocritic // hugeParam: claim is an immutable snapshot read once by this pure decision function; callers pass a local value, so a pointer would only invite aliasing.
 	if !paneMatches || len(pane.Foreground) == 0 {
 		return SettlementUnresolved
 	}
+	if claim.Executable == "" {
+		return SettlementUnresolved
+	}
 	fg := pane.Foreground[0]
-	identityMatches := fg.Argv0 == expectedExecutable || fg.Name == expectedExecutable
-	markerMatches := slices.Contains(fg.Argv, marker) || strings.Contains(fg.Cmdline, marker)
-	if !identityMatches || !markerMatches {
+	if isLauncherInvocation(fg.Argv) {
+		return SettlementUnresolved
+	}
+	identityMatches := fg.Argv0 == claim.Executable || fg.Name == claim.Executable
+	if !identityMatches || FirstMarkerMatch(pane, markers) == "" {
 		return SettlementUnresolved
 	}
 	if fg.PID == claim.PID {
 		return SettlementSettled
 	}
 	return SettlementForkingWrapper
+}
+
+// FirstMarkerMatch returns the first non-empty marker the pane's foreground
+// process argv or cmdline carries, or "" when none matches.
+func FirstMarkerMatch(pane PaneProcess, markers []string) string {
+	if len(pane.Foreground) == 0 {
+		return ""
+	}
+	fg := pane.Foreground[0]
+	for _, marker := range markers {
+		if marker == "" {
+			continue
+		}
+		if slices.Contains(fg.Argv, marker) || strings.Contains(fg.Cmdline, marker) {
+			return marker
+		}
+	}
+	return ""
+}
+
+// isLauncherInvocation reports whether argv is a `hop launch` invocation:
+// the launch subcommand with its run/attempt flags. The corroboration
+// predicate excludes it so a paused pre-exec launcher never settles a
+// claim, regardless of which executable the claim recorded.
+func isLauncherInvocation(argv []string) bool {
+	return len(argv) >= 2 && argv[1] == "launch" && (slices.Contains(argv, "--run") || slices.Contains(argv, "--attempt"))
 }
 
 // OccupantMatches reports whether an inspected pane's foreground process

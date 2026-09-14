@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -111,13 +112,40 @@ func (c *Controller) reconcile(ctx context.Context, handle RunHandle, detail Run
 }
 
 // reconcileActive handles every attempt state a live worker could still
-// occupy a pane for: it moves the attempt/session into reconciling first
-// (unless already there), then decides warm reattach, positive-evidence
-// retirement plus cold relaunch, or fail-closed.
+// occupy a pane for. A launching/relaunching attempt corroborates through
+// the ordinary fenced settlement path first — its state is never hidden
+// from CorroborateLaunch — and only an ambiguous round moves it to
+// reconciling. The reconciling decision is then: warm adoption of a
+// settled claim under the one corroboration predicate, positive-evidence
+// retirement plus cold relaunch, fail-closed on an unidentified occupant,
+// or — with conclusively established absence — cold relaunch.
 func (c *Controller) reconcileActive(ctx context.Context, handle RunHandle, detail RunDetail, req ResumeRequest) (ResumeResult, error) { //nolint:gocritic // hugeParam: RunHandle, RunDetail and ResumeRequest are per-call DTOs; this runs once per resume round.
+	launchingState := detail.AttemptState == run.AttemptLaunching || detail.AttemptState == run.AttemptRelaunching
+	execFailed := detail.Claim != nil && detail.Claim.State == LaunchClaimExecFailed
+	if launchingState && !execFailed {
+		progress, err := c.CorroborateLaunch(ctx, handle)
+		if err != nil {
+			return ResumeResult{}, err
+		}
+		switch progress {
+		case LaunchSettled, LaunchAlreadySettled:
+			return ResumeResult{Outcome: ResumeWarmReattached, Detail: "launch claim corroborated on resume"}, nil
+		case LaunchNeedsInteraction:
+			paneID := ""
+			if detail.Binding != nil {
+				paneID = detail.Binding.PaneID
+			}
+			return ResumeResult{
+				Outcome: ResumeFailedClosed, ObservedPaneID: paneID,
+				Detail: "the occupant matches the claim's executable identity and marker but not its pid: the unsupported forking-wrapper topology; inspect the pane, then close it or hop stop the run",
+			}, nil
+		case LaunchFailed, LaunchPending:
+			// LaunchPending: still ambiguous — enter reconciling below.
+		}
+	}
+
 	now := c.Clock.Now()
 	priorAttemptState := detail.AttemptState
-
 	if detail.AttemptState != run.AttemptReconciling {
 		if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 			return enterReconciling(ctx, uow, detail, gen(handle.lease.Generation), now)
@@ -129,19 +157,28 @@ func (c *Controller) reconcileActive(ctx context.Context, handle RunHandle, deta
 	if detail.Binding == nil || detail.Binding.PaneID == "" {
 		return ResumeResult{Outcome: ResumeReconciling, Detail: "no runtime binding recorded yet"}, nil
 	}
-	pane, inspectErr := c.Runtime.InspectPane(ctx, detail.Binding.PaneID)
-	absent := inspectErr != nil || len(pane.Foreground) == 0
-
-	if !absent && detail.Binding.Occupant != nil && OccupantMatches(*detail.Binding.Occupant, pane) {
-		return c.warmReattach(ctx, handle, detail, priorAttemptState, pane)
+	pane, occupantAbsent, observed := c.observePane(ctx, detail.Binding)
+	if !observed {
+		// Inspection failed with no positive absence evidence: ambiguous,
+		// never absence (docs/plan/phase-2-design.md section 5).
+		return ResumeResult{Outcome: ResumeReconciling, Detail: "pane inspection failed; absence is never assumed from an inspection error"}, nil
 	}
-	if !absent && detail.Claim != nil {
-		if settlement := CorroborateSettlement(true, pane, detail.Claim.Executable, detail.AttemptID.String(), *detail.Claim); settlement == SettlementSettled {
-			return c.warmReattach(ctx, handle, detail, priorAttemptState, pane)
+
+	if !occupantAbsent {
+		// Warm adoption goes through the one corroboration predicate,
+		// against a settled claim only; an exec_pending claim was already
+		// routed through the ordinary settlement path above.
+		if detail.Claim != nil && detail.Claim.State == LaunchClaimExeced {
+			markers, markerErr := c.launchMarkers(ctx, handle, detail)
+			if markerErr != nil {
+				return ResumeResult{}, markerErr
+			}
+			paneMatches := detail.Binding.IncarnationID == detail.Claim.IncarnationID && !detail.Binding.Superseded
+			if CorroborateSettlement(paneMatches, pane, markers, *detail.Claim) == SettlementSettled {
+				return c.warmReattach(ctx, handle, detail, priorAttemptState, pane, FirstMarkerMatch(pane, markers))
+			}
 		}
-	}
 
-	if !absent {
 		// A different, present occupant. Positive evidence (the run's
 		// pre-assigned native session reference in its argv) authorizes
 		// guarded retirement and cold relaunch; anything else fails closed.
@@ -155,28 +192,43 @@ func (c *Controller) reconcileActive(ctx context.Context, handle RunHandle, deta
 		}, nil
 	}
 
-	execFailed := detail.Claim != nil && detail.Claim.State == LaunchClaimExecFailed
 	if execFailed || req.ConfirmAbsent {
 		return c.coldRelaunch(ctx, handle, detail, req)
 	}
 	return ResumeResult{Outcome: ResumeReconciling, Detail: "no live process observed; rerun with --confirm-absent once no worker for this run is running anywhere"}, nil
 }
 
-// warmReattach verifies the occupant against the current binding's claim
-// evidence and returns the attempt to its prior state.
-func (c *Controller) warmReattach(ctx context.Context, handle RunHandle, detail RunDetail, priorState run.AttemptState, pane PaneProcess) (ResumeResult, error) { //nolint:gocritic // hugeParam: RunHandle, RunDetail and PaneProcess are per-call values; this runs once per resume round.
-	if priorState == run.AttemptLaunching || priorState == run.AttemptRelaunching {
-		// The claim never left launching/relaunching; corroboration (not
-		// reattach) is the right domain call, and CorroborateLaunch already
-		// implements it against the current, still-ambiguous claim.
-		progress, err := c.CorroborateLaunch(ctx, handle, detail.Claim.Executable, detail.AttemptID.String())
-		if err != nil {
-			return ResumeResult{}, err
+// observePane inspects a binding's pane and classifies the observation.
+// absent is true only on positive evidence: the pane exists with no
+// foreground occupant, or no pane carries the binding's creation label.
+// observed is false when inspection failed and no positive absence could
+// be established — ambiguous, never absence.
+func (c *Controller) observePane(ctx context.Context, binding *run.RuntimeBinding) (pane PaneProcess, absent, observed bool) {
+	inspected, err := c.Runtime.InspectPane(ctx, binding.PaneID)
+	if err == nil {
+		return inspected, len(inspected.Foreground) == 0, true
+	}
+	if binding.CreationLabel != "" {
+		if _, found, findErr := c.Runtime.FindPaneByLabel(ctx, binding.CreationLabel); findErr == nil && !found {
+			return PaneProcess{}, true, true
 		}
-		if progress == LaunchSettled {
-			return ResumeResult{Outcome: ResumeWarmReattached, Detail: "launch claim corroborated on resume"}, nil
+	}
+	return PaneProcess{}, false, false
+}
+
+// warmReattach adopts a verified occupant: the attempt returns to its
+// prior state (derived from durable evidence when the attempt entered this
+// round already reconciling), the session is confirmed active, and the
+// binding's occupant evidence is refreshed with the marker that actually
+// corroborated — never a synthesized one.
+func (c *Controller) warmReattach(ctx context.Context, handle RunHandle, detail RunDetail, priorState run.AttemptState, pane PaneProcess, marker string) (ResumeResult, error) { //nolint:gocritic // hugeParam: RunHandle, RunDetail and PaneProcess are per-call values; this runs once per resume round.
+	target := priorState
+	if target == run.AttemptReconciling {
+		derived, deriveErr := c.reattachTarget(ctx, handle, detail)
+		if deriveErr != nil {
+			return ResumeResult{}, deriveErr
 		}
-		return ResumeResult{Outcome: ResumeReconciling, Detail: "launch claim not yet corroborated"}, nil
+		target = derived
 	}
 
 	now := c.Clock.Now()
@@ -185,7 +237,7 @@ func (c *Controller) warmReattach(ctx context.Context, handle RunHandle, detail 
 		if getErr != nil {
 			return getErr
 		}
-		nextAttempt, reattachErr := a.Reattach(priorState, now)
+		nextAttempt, reattachErr := a.Reattach(target, now)
 		if reattachErr != nil {
 			return reattachErr
 		}
@@ -210,8 +262,8 @@ func (c *Controller) warmReattach(ctx context.Context, handle RunHandle, detail 
 		if getErr != nil {
 			return getErr
 		}
-		if found {
-			evidence := run.OccupantEvidence{Label: binding.CreationLabel, ArgvMarker: detail.AttemptID.String(), PID: firstForeground(pane).PID}
+		if found && marker != "" {
+			evidence := run.OccupantEvidence{Label: binding.CreationLabel, ArgvMarker: marker, PID: firstForeground(pane).PID}
 			nextBinding, observeErr := binding.Observe(evidence, now)
 			if observeErr != nil {
 				return observeErr
@@ -231,6 +283,39 @@ func (c *Controller) warmReattach(ctx context.Context, handle RunHandle, detail 
 		return ResumeResult{}, fmt.Errorf("app: warm reattach: %w", err)
 	}
 	return ResumeResult{Outcome: ResumeWarmReattached}, nil
+}
+
+// reattachTarget derives, from durable evidence, the state a reconciling
+// attempt returns to on verified warm reattach: an accepted result whose
+// check request is claimed means checking, an accepted result otherwise
+// means submitted, and no accepted result means running.
+func (c *Controller) reattachTarget(ctx context.Context, handle RunHandle, detail RunDetail) (run.AttemptState, error) { //nolint:gocritic // hugeParam: RunHandle and RunDetail are per-call values; called once per warm reattach.
+	target := run.AttemptRunning
+	err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		result, getErr := uow.Results().Accepted(ctx, detail.AttemptID)
+		if getErr != nil {
+			return getErr
+		}
+		if result == nil {
+			return nil
+		}
+		target = run.AttemptSubmitted
+		request, getErr := uow.CheckRequests().Get(ctx, result.ID)
+		if getErr != nil {
+			if errors.Is(getErr, ErrNotFound) {
+				return nil
+			}
+			return getErr
+		}
+		if request.State == CheckRequestClaimed {
+			target = run.AttemptChecking
+		}
+		return nil
+	})
+	if err != nil {
+		return "", fmt.Errorf("app: derive reattach target: %w", err)
+	}
+	return target, nil
 }
 
 // retireAndRelaunch supersedes the current binding with the positive
@@ -493,6 +578,5 @@ func enterReconciling(ctx context.Context, uow UnitOfWork, detail RunDetail, gen
 // paneCarriesMarker reports whether pane's foreground process argv or
 // cmdline carries marker.
 func paneCarriesMarker(pane PaneProcess, marker string) bool {
-	fg := firstForeground(pane)
-	return OccupantMatches(run.OccupantEvidence{Label: "-", ArgvMarker: marker, PID: fg.PID}, pane)
+	return FirstMarkerMatch(pane, []string{marker}) != ""
 }

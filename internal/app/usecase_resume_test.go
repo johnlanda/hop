@@ -39,6 +39,70 @@ func TestResume(t *testing.T) {
 		}
 	})
 
+	t.Run("fail closed: an occupant that execed another executable keeping pid and marker is never adopted", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		_, detail := runningRun(t, tc)
+		// The recorded pid and the attempt marker both still match, but the
+		// executable identity no longer equals the claim's: the pid+marker
+		// shortcut must not adopt this occupant.
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "/bin/bash", Name: "bash", Argv: []string{"bash", detail.AttemptID.String()}}}}, nil
+		}
+
+		tc.Clock.Advance(leaseTTL + time.Second)
+		result, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String()))
+		if err != nil {
+			t.Fatalf("Resume() error = %v", err)
+		}
+		if result.Outcome != app.ResumeFailedClosed {
+			t.Fatalf("Outcome = %s, want %s (executable replacement must fail closed)", result.Outcome, app.ResumeFailedClosed)
+		}
+		if got := tc.Store.Attempts[detail.AttemptID].value.State; got != run.AttemptReconciling {
+			t.Fatalf("Attempt.State = %s, want %s", got, run.AttemptReconciling)
+		}
+	})
+
+	t.Run("fail closed: a present occupant with no launch claim at all is never adopted", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		_, detail := startedRun(t, tc)
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "/usr/bin/claude", Argv: []string{"claude", detail.AttemptID.String()}}}}, nil
+		}
+
+		tc.Clock.Advance(leaseTTL + time.Second)
+		result, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String()))
+		if err != nil {
+			t.Fatalf("Resume() error = %v", err)
+		}
+		if result.Outcome != app.ResumeFailedClosed {
+			t.Fatalf("Outcome = %s, want %s (no claim: adoption requires a settled claim)", result.Outcome, app.ResumeFailedClosed)
+		}
+	})
+
+	t.Run("warm reattach settles an exec_pending claim through the ordinary fenced path", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		_, detail := startedRun(t, tc)
+		claimLaunch(t, tc, detail, 4242)
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "/usr/bin/claude", Argv: []string{"claude", detail.AttemptID.String()}}}}, nil
+		}
+
+		tc.Clock.Advance(leaseTTL + time.Second)
+		result, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String()))
+		if err != nil {
+			t.Fatalf("Resume() error = %v", err)
+		}
+		if result.Outcome != app.ResumeWarmReattached {
+			t.Fatalf("Outcome = %s, want %s", result.Outcome, app.ResumeWarmReattached)
+		}
+		if got := tc.Store.LaunchClaims[detail.Binding.IncarnationID].State; got != app.LaunchClaimExeced {
+			t.Fatalf("claim state = %s, want %s (settled through the ordinary path)", got, app.LaunchClaimExeced)
+		}
+		if got := tc.Store.Attempts[detail.AttemptID].value.State; got != run.AttemptRunning {
+			t.Fatalf("Attempt.State = %s, want %s", got, run.AttemptRunning)
+		}
+	})
+
 	t.Run("fail closed: a present, non-matching occupant with no positive evidence", func(t *testing.T) {
 		tc := newTestController(defaultPolicy())
 		_, detail := runningRun(t, tc)
