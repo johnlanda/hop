@@ -319,6 +319,28 @@ func (c *Controller) coldRelaunch(ctx context.Context, handle RunHandle, detail 
 			return saveErr
 		}
 
+		if retireErr := retirePendingLaunchIntents(ctx, uow, handle.runID, detail.SessionID, now); retireErr != nil {
+			return retireErr
+		}
+
+		// The old session is never revived: a cold relaunch binds a new
+		// session and incarnation to the same attempt (section 5).
+		oldSession, oldRev, getErr := uow.Sessions().Get(ctx, detail.SessionID)
+		if getErr != nil {
+			return getErr
+		}
+		oldFrom := oldSession.State
+		oldSession, lostErr := oldSession.MarkLost(now)
+		if lostErr != nil {
+			return lostErr
+		}
+		if _, saveErr := uow.Sessions().Save(ctx, oldSession, oldRev); saveErr != nil {
+			return saveErr
+		}
+		if transErr := recordTransition(ctx, uow, EntitySession, detail.SessionID.String(), string(oldFrom), string(oldSession.State), "cold relaunch authorized", gen(handle.lease.Generation), now); transErr != nil {
+			return transErr
+		}
+
 		newSession := run.NewSession(sessionID, handle.runID, detail.AttemptID, harness, now)
 		newSession, launchSessErr := newSession.Launch(now)
 		if launchSessErr != nil {
@@ -349,7 +371,7 @@ func (c *Controller) coldRelaunch(ctx context.Context, handle RunHandle, detail 
 		return ResumeResult{}, fmt.Errorf("app: resume requires HOPPath and StateRoot to open the relaunch pane")
 	}
 	ids := generatedIdentities{Run: handle.runID, Task: detail.TaskID, Attempt: detail.AttemptID, Session: sessionID, Incarnation: incarnationID}
-	if err := c.openWorkerPane(ctx, handle, ids, worktree, req.HOPPath, req.StateRoot); err != nil {
+	if err := c.openRelaunchPane(ctx, handle, ids, worktree, req.HOPPath, req.StateRoot); err != nil {
 		return ResumeResult{}, err
 	}
 	return ResumeResult{Outcome: ResumeColdRelaunched}, nil
@@ -399,6 +421,37 @@ func (c *Controller) sessionNativeRef(ctx context.Context, handle RunHandle, ses
 
 // enterReconciling moves Attempt and, when it exists, the attempt's current
 // Session into reconciling, recording both transitions.
+// retirePendingLaunchIntents marks every still-pending pane.open operation
+// whose intent named previousSession as superseded, in the same
+// transaction that creates a cold relaunch's replacement session — before
+// that new session's own intent is committed — so a retired incarnation's
+// launcher can never claim against a stale intent (SubmissionStore's
+// pre-binding fallback matches ClaimLaunch against the newest pending
+// pane.open intent for the attempt; an old one left pending would still be
+// "newest" until this runs).
+func retirePendingLaunchIntents(ctx context.Context, uow UnitOfWork, runID identity.RunID, previousSession identity.SessionID, now time.Time) error {
+	pending, err := uow.Operations().Pending(ctx, runID)
+	if err != nil {
+		return err
+	}
+	for _, op := range pending { //nolint:gocritic // rangeValCopy: Operation is a small per-run journal row; copying it to classify and possibly resave is clearer than indexing.
+		if op.Kind != OpPaneOpen && op.Kind != OpLaunchSend {
+			continue
+		}
+		intent, ok := op.Intent.(paneOpenIntent)
+		if !ok || intent.SessionID != previousSession {
+			continue
+		}
+		op.State = OperationReconciling
+		op.Outcome = "superseded: retired for a cold relaunch"
+		op.UpdatedAt = now
+		if saveErr := uow.Operations().Save(ctx, op); saveErr != nil {
+			return saveErr
+		}
+	}
+	return nil
+}
+
 func enterReconciling(ctx context.Context, uow UnitOfWork, detail RunDetail, generation *int64, now time.Time) error { //nolint:gocritic // hugeParam: RunDetail is a per-call DTO; this runs once per resume round.
 	a, aRev, err := uow.Attempts().Get(ctx, detail.AttemptID)
 	if err != nil {

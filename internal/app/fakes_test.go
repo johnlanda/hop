@@ -321,6 +321,13 @@ func (s *fakeStore) currentBindingByAttemptLocked(attemptID identity.AttemptID) 
 		if !ok || sess.value.AttemptID != attemptID {
 			continue
 		}
+		// Phase 2: at most one non-terminated session per attempt at any
+		// instant; a lost or terminated session's binding is history, not
+		// the attempt's current one, even though the binding row itself
+		// was never marked superseded (only the session ended).
+		if sess.value.State == run.SessionLost || sess.value.State == run.SessionTerminated {
+			continue
+		}
 		for i := len(history) - 1; i >= 0; i-- {
 			if !history[i].Superseded {
 				return sessionID, history[i], true

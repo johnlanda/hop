@@ -61,11 +61,12 @@ type paneOpenIntent struct {
 	WorkspaceID string `json:"workspace_id"`
 	// Label is the pane's unique creation label (the operation ID).
 	Label string `json:"label"`
-	// IncarnationID is what SubmissionStore.ClaimLaunch validates a
-	// pre-binding launcher against: json_extract on the newest pending
-	// pane.open operation for the current attempt, before falling back to
-	// the binding once one exists.
+	// IncarnationID and SessionID are what SubmissionStore.ClaimLaunch
+	// validates a pre-binding launcher against: json_extract on the newest
+	// pending pane.open operation for the current attempt binds the claim
+	// to both, before falling back to the binding once one exists.
 	IncarnationID identity.IncarnationID `json:"incarnation_id"`
+	SessionID     identity.SessionID     `json:"session_id"`
 }
 
 // StartRun freezes a new run and drives it through worktree creation and
@@ -305,12 +306,26 @@ func (c *Controller) createWorktree(ctx context.Context, handle RunHandle, ids g
 	return info, nil
 }
 
-// openWorkerPane drives the OpPaneOpen operation, which is also the single
-// "launch intent" moment: Run, Task, Attempt and Session all transition
-// together in the intent transaction (the section 5 reference traces'
-// "intent → launching/active/launching/launching" line), before the pane is
-// actually created.
+// openWorkerPane drives the OpPaneOpen operation for a run's first launch,
+// which is also the single "launch intent" moment: Run, Task, Attempt and
+// Session all transition together in the intent transaction (the section 5
+// reference traces' "intent → launching/active/launching/launching" line),
+// before the pane is actually created.
 func (c *Controller) openWorkerPane(ctx context.Context, handle RunHandle, ids generatedIdentities, worktree WorktreeInfo, hopPath, stateRoot string) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; this path runs once per run start, never in a hot loop.
+	return c.openPane(ctx, handle, ids, worktree, hopPath, stateRoot, run.LaunchInitial)
+}
+
+// openRelaunchPane drives the OpPaneOpen operation for a cold relaunch. The
+// resume use case's own transaction already applied the Run/Attempt/Session
+// transitions the relaunch needs (Run.Launch, Attempt.Relaunch, the new
+// Session's own Launch), so this only journals the operation intent —
+// applying them again here would be a second, invalid transition on values
+// already at their target state.
+func (c *Controller) openRelaunchPane(ctx context.Context, handle RunHandle, ids generatedIdentities, worktree WorktreeInfo, hopPath, stateRoot string) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; this path runs once per relaunch.
+	return c.openPane(ctx, handle, ids, worktree, hopPath, stateRoot, run.LaunchResume)
+}
+
+func (c *Controller) openPane(ctx context.Context, handle RunHandle, ids generatedIdentities, worktree WorktreeInfo, hopPath, stateRoot string, kind run.LaunchKind) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; this path runs once per launch or relaunch.
 	opID, err := c.newOperationID()
 	if err != nil {
 		return err
@@ -323,11 +338,18 @@ func (c *Controller) openWorkerPane(ctx context.Context, handle RunHandle, ids g
 		"HOP_ATTEMPT_ID":     ids.Attempt.String(),
 		"HOP_INCARNATION_ID": ids.Incarnation.String(),
 	}
-	intent := paneOpenIntent{Command: argv, Cwd: worktree.Path, WorkspaceID: worktree.WorkspaceID, Label: opID.String(), IncarnationID: ids.Incarnation}
+	intent := paneOpenIntent{Command: argv, Cwd: worktree.Path, WorkspaceID: worktree.WorkspaceID, Label: opID.String(), IncarnationID: ids.Incarnation, SessionID: ids.Session}
 	now := c.Clock.Now()
 
 	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
-		return applyLaunchIntent(ctx, uow, handle, ids, opID, intent, now)
+		if kind == run.LaunchInitial {
+			return applyLaunchIntent(ctx, uow, handle, ids, opID, intent, now)
+		}
+		return uow.Operations().Create(ctx, Operation{
+			ID: opID, RunID: handle.runID, Generation: handle.lease.Generation,
+			Kind: OpPaneOpen, State: OperationPending, Intent: intent,
+			CreatedAt: now, UpdatedAt: now,
+		})
 	}); err != nil {
 		return fmt.Errorf("app: record pane.open intent: %w", err)
 	}
@@ -357,7 +379,7 @@ func (c *Controller) openWorkerPane(ctx context.Context, handle RunHandle, ids g
 			op.Outcome = actErr.Error()
 			return uow.Operations().Save(ctx, op)
 		}
-		binding := run.NewRuntimeBinding(ids.Session, ids.Incarnation, "", paneHandle.WorkspaceID, paneHandle.TabID, paneHandle.PaneID, opID.String(), run.LaunchInitial, op.UpdatedAt)
+		binding := run.NewRuntimeBinding(ids.Session, ids.Incarnation, "", paneHandle.WorkspaceID, paneHandle.TabID, paneHandle.PaneID, opID.String(), kind, op.UpdatedAt)
 		if bindErr := uow.Bindings().Create(ctx, binding); bindErr != nil {
 			return bindErr
 		}
