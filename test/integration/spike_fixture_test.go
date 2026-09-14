@@ -291,8 +291,8 @@ func runInOwnedGroup(t *testing.T, timeout time.Duration, name string, env []str
 		}
 	}
 	// Bounded anchor reap: after the SIGKILL the anchor exits promptly.
-	if !reapCmdBounded(t, anchor, ownedGroupDrainTimeout) {
-		t.Errorf("owned-group anchor %d was not reaped within the teardown deadline (inconclusive)", pgid)
+	if reapErr := reapCmdBounded(anchor, ownedGroupDrainTimeout); reapErr != nil {
+		t.Errorf("reap owned-group anchor %d: %v", pgid, reapErr)
 	}
 	// Bounded output drain: a descendant that escaped the group could still hold
 	// the write end open, so the reader is joined against a deadline; on expiry
@@ -314,14 +314,17 @@ func runInOwnedGroup(t *testing.T, timeout time.Duration, name string, env []str
 // output drain) in runInOwnedGroup, so no failure path can hang.
 const ownedGroupDrainTimeout = 10 * time.Second
 
-// joinReader waits for the reader goroutine (readDone) up to the timeout. On
-// expiry it closes r to unblock a reader stuck on a write end held outside the
-// group, then joins the reader. It returns whether the reader finished before
-// the deadline.
+// joinReader waits for the reader goroutine (readDone) up to the timeout, then
+// closes the read end r on BOTH paths so the descriptor is deterministically
+// retired: on normal EOF the copy goroutine has already returned, so the close
+// cannot race it; on expiry the close unblocks a reader stuck on a write end
+// held outside the group before it is joined. It returns whether the reader
+// finished before the deadline.
 func joinReader(t *testing.T, readDone <-chan struct{}, r io.Closer, timeout time.Duration) bool {
 	t.Helper()
 	select {
 	case <-readDone:
+		closeOrLog(t, "owned-group pipe read end", r)
 		return true
 	case <-time.After(timeout):
 		closeOrLog(t, "owned-group pipe read end (drain deadline)", r)
@@ -330,22 +333,23 @@ func joinReader(t *testing.T, readDone <-chan struct{}, r io.Closer, timeout tim
 	}
 }
 
-// reapCmdBounded reaps cmd in its own goroutine, bounded by timeout; it reports
-// whether the reap completed in time. A SIGKILLed process reports an ExitError,
-// which is expected and not logged.
-func reapCmdBounded(t *testing.T, cmd *exec.Cmd, timeout time.Duration) bool {
-	t.Helper()
+// reapCmdBounded starts the sole Wait for cmd and observes it up to timeout. It
+// returns nil on a clean or expected-signal (SIGKILLed) exit, a wrapped error
+// on an unexpected wait error, or a timeout error if the process did not exit
+// in time. On timeout the Wait goroutine — the sole owner — is left in place
+// (no second waiter); the caller treats the error as inconclusive.
+func reapCmdBounded(cmd *exec.Cmd, timeout time.Duration) error {
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 	select {
 	case err := <-done:
 		var exitErr *exec.ExitError
 		if err != nil && !errors.As(err, &exitErr) {
-			t.Logf("reap %v: %v", cmd.Args, err)
+			return fmt.Errorf("reap %v: %w", cmd.Args, err)
 		}
-		return true
+		return nil
 	case <-time.After(timeout):
-		return false
+		return fmt.Errorf("reap %v: not reaped within %s (inconclusive)", cmd.Args, timeout)
 	}
 }
 

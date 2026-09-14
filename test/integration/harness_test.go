@@ -196,6 +196,18 @@ type testServer struct {
 // recycled-pgid window, because the anchor holds the group. The anchor is
 // reaped exactly once, by retireGroup, and only after the group's single
 // SIGKILL has been sent.
+//
+// Documented limitations:
+//
+// Cleanup targets the owned process group. A descendant that deliberately
+// leaves that group is outside this harness's retirement guarantee; a retained
+// output descriptor causes bounded capture failure, not proof that the escaped
+// process was retired.
+//
+// A teardown deadline reports retirement as inconclusive. If the operating
+// system does not complete a signaled process's exit, its sole Wait owner may
+// remain pending; the harness neither claims successful cleanup nor signals a
+// potentially recycled group to force completion.
 type serverProcess struct {
 	leaderCmd      *exec.Cmd
 	anchorCmd      *exec.Cmd
@@ -566,14 +578,18 @@ func (sp *serverProcess) retireGroup() error {
 	} else {
 		record(fmt.Errorf("refusing to signal unsafe process group %d", sp.pgid))
 	}
-	// Reap the leader (its single owning goroutine) and the anchor (here, its
-	// single owner). No group signal is sent after this point.
-	<-sp.leaderExited
-	if err := sp.anchorCmd.Wait(); err != nil {
-		var exitErr *exec.ExitError
-		if !errors.As(err, &exitErr) { // a SIGKILLed anchor reports an ExitError; anything else is unexpected
-			record(fmt.Errorf("reap group anchor %d: %w", sp.pgid, err))
-		}
+	// Observe the leader's exit (reaped by its single owning goroutine) and reap
+	// the anchor (its single owner here), each bounded so a stuck reap cannot
+	// hang teardown. On a timeout the sole Wait owner is left in place — no
+	// second waiter, no post-anchor-reap group signal — and retirement is
+	// reported inconclusive. No group signal is sent after this point.
+	select {
+	case <-sp.leaderExited:
+	case <-time.After(ownedGroupDrainTimeout):
+		record(fmt.Errorf("leader %d did not exit within the teardown deadline (inconclusive)", sp.pgid))
+	}
+	if err := reapCmdBounded(sp.anchorCmd, ownedGroupDrainTimeout); err != nil {
+		record(fmt.Errorf("reap group anchor %d: %w", sp.pgid, err))
 	}
 	// Confirm the group is empty: signal 0 only reads existence, so even if the
 	// now-unpinned pgid were recycled this cannot signal an unrelated process;
@@ -587,7 +603,8 @@ func (sp *serverProcess) retireGroup() error {
 // retireUnanchoredLeader kills and reaps a just-started leader whose group
 // could not be anchored. The leader has no Wait owner yet and is still
 // unreaped, so signaling its own pgid is safe; this leaves no live process and
-// no unreaped pid before the caller fails.
+// no unreaped pid before the caller fails. Its single Wait is bounded, so this
+// cleanup path cannot hang either.
 func retireUnanchoredLeader(t *testing.T, cmd *exec.Cmd) {
 	t.Helper()
 	pgid := cmd.Process.Pid
@@ -598,11 +615,8 @@ func retireUnanchoredLeader(t *testing.T, cmd *exec.Cmd) {
 	} else {
 		t.Errorf("refusing to signal unsafe process group %d", pgid)
 	}
-	if err := cmd.Wait(); err != nil {
-		var exitErr *exec.ExitError
-		if !errors.As(err, &exitErr) {
-			t.Logf("reap unanchored leader %d: %v", pgid, err)
-		}
+	if err := reapCmdBounded(cmd, ownedGroupDrainTimeout); err != nil {
+		t.Errorf("retire unanchored leader %d: %v", pgid, err)
 	}
 	if !groupIsGone(pgid) {
 		t.Errorf("unanchored leader group %d still had members after teardown", pgid)

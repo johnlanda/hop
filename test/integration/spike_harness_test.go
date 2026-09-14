@@ -163,39 +163,66 @@ func TestSpikeOwnedGroupTeardown(t *testing.T) {
 	}
 }
 
-// TestSpikeOwnedGroupDrainDeadline proves the output-drain deadline: a write
-// descriptor held OUTSIDE any killed group keeps the reader from reaching EOF,
-// so joinReader must fire its deadline, close the read end to unblock the
-// reader, and join it rather than hang. The write end is owned and cleaned up
-// by this test, so nothing leaks.
+// TestSpikeOwnedGroupDrainDeadline proves joinReader's two behaviors with
+// test-owned pipes (no processes): on a write descriptor held open outside any
+// killed group the drain deadline fires, closes the read end to unblock the
+// reader, and joins it rather than hanging; and on normal EOF it still closes
+// the read end deterministically rather than leaking it to GC.
 func TestSpikeOwnedGroupDrainDeadline(t *testing.T) {
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { closeOrLog(t, "test-owned write end", w) }) // this test owns and retires w
+	t.Run("a retained write descriptor fires the drain deadline", func(t *testing.T) {
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { closeOrLog(t, "test-owned write end", w) }) // this test owns and retires w
 
-	var cerr error
-	readDone := make(chan struct{})
-	go func() {
-		_, cerr = io.Copy(io.Discard, r)
-		close(readDone)
-	}()
+		var cerr error
+		readDone := make(chan struct{})
+		go func() {
+			_, cerr = io.Copy(io.Discard, r)
+			close(readDone)
+		}()
 
-	// w is still open, so the reader cannot reach EOF on its own; the deadline
-	// must fire.
-	if joinReader(t, readDone, r, 200*time.Millisecond) {
-		t.Error("joinReader reported the drain finished, but the write end was still held open")
-	}
-	// joinReader closed r and joined the reader; the goroutine has returned.
-	select {
-	case <-readDone:
-	default:
-		t.Error("the reader was not joined after the drain deadline")
-	}
-	if cerr != nil && !errors.Is(cerr, os.ErrClosed) {
-		t.Logf("drain copy after deadline: %v", cerr)
-	}
+		// w is still open, so the reader cannot reach EOF on its own; the deadline
+		// must fire.
+		if joinReader(t, readDone, r, 200*time.Millisecond) {
+			t.Error("joinReader reported the drain finished, but the write end was still held open")
+		}
+		select {
+		case <-readDone:
+		default:
+			t.Error("the reader was not joined after the drain deadline")
+		}
+		if cerr != nil && !errors.Is(cerr, os.ErrClosed) {
+			t.Logf("drain copy after deadline: %v", cerr)
+		}
+	})
+
+	t.Run("normal EOF closes the read end", func(t *testing.T) {
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var cerr error
+		readDone := make(chan struct{})
+		go func() {
+			_, cerr = io.Copy(io.Discard, r)
+			close(readDone)
+		}()
+
+		closeOrLog(t, "test write end", w) // EOF the reader
+		if !joinReader(t, readDone, r, conditionTimeout) {
+			t.Error("joinReader did not report a normal EOF drain as finished")
+		}
+		// joinReader must have closed the read end; a second close therefore
+		// errors with the already-closed sentinel.
+		if err := r.Close(); err == nil {
+			t.Error("joinReader left the read end open after a normal EOF drain")
+		}
+		if cerr != nil && !errors.Is(cerr, os.ErrClosed) {
+			t.Logf("drain copy: %v", cerr)
+		}
+	})
 }
 
 // startFixtureLeader starts a /bin/sh leader in its own process group, anchors
