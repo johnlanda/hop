@@ -95,6 +95,7 @@ type fakeStore struct {
 
 	Runs      map[identity.RunID]*entityRow[run.Run]
 	Snapshots map[identity.RunID]app.RunSnapshot
+	Briefs    map[identity.RunID]string
 	Tasks     map[identity.TaskID]*entityRow[run.Task]
 	Attempts  map[identity.AttemptID]*entityRow[run.Attempt]
 	Sessions  map[identity.SessionID]*entityRow[run.Session]
@@ -130,6 +131,7 @@ func newFakeStore(clock interface{ Now() time.Time }) *fakeStore {
 		seqByRepo:       map[identity.RepositoryID]int{},
 		Runs:            map[identity.RunID]*entityRow[run.Run]{},
 		Snapshots:       map[identity.RunID]app.RunSnapshot{},
+		Briefs:          map[identity.RunID]string{},
 		Tasks:           map[identity.TaskID]*entityRow[run.Task]{},
 		Attempts:        map[identity.AttemptID]*entityRow[run.Attempt]{},
 		Sessions:        map[identity.SessionID]*entityRow[run.Session]{},
@@ -163,6 +165,7 @@ func (s *fakeStore) InitializeRun(_ context.Context, spec app.NewRunSpec) (ident
 	r := run.NewRun(spec.RunID, repoID, seq, spec.BriefDigest, spec.Now)
 	s.Runs[spec.RunID] = &entityRow[run.Run]{value: r, revision: 1}
 	s.Snapshots[spec.RunID] = spec.Snapshot
+	s.Briefs[spec.RunID] = spec.Brief
 
 	t := run.NewTask(spec.TaskID, spec.RunID, spec.InstructionsDigest, spec.Now)
 	s.Tasks[spec.TaskID] = &entityRow[run.Task]{value: t, revision: 1}
@@ -429,7 +432,7 @@ func (s *fakeStore) LoadFrozenRun(_ context.Context, runID identity.RunID) (app.
 			root = candidate
 		}
 	}
-	return app.FrozenRun{Snapshot: s.Snapshots[runID], RepositoryRoot: root}, nil
+	return app.FrozenRun{Snapshot: s.Snapshots[runID], RepositoryRoot: root, Brief: s.Briefs[runID]}, nil
 }
 
 func (*fakeStore) LoadLaunchContext(context.Context, identity.RunID, identity.AttemptID) (app.LaunchContext, error) {

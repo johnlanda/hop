@@ -99,6 +99,9 @@ type CheckExecutionSummary struct {
 type FrozenRun struct {
 	Snapshot       RunSnapshot
 	RepositoryRoot string
+	// Brief is the run's frozen brief text, needed to recreate the
+	// assignment artifact byte-identically when its file is lost.
+	Brief string
 }
 
 // ReadStore serves lease-free reads: status rendering and both exec

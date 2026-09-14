@@ -1050,3 +1050,137 @@ func TestSettledClaimIsNotLiveAdoption(t *testing.T) {
 		}
 	})
 }
+
+// TestRecoveryBlockingDispositions covers the remaining M1 sequences:
+// unknown unresolved work blocks new acts; a durably completed retirement
+// finishes cold recovery on a later round even after its binding was
+// superseded; and startup after a crash immediately following
+// InitializeRun rebuilds worktree and assignment from the frozen run.
+func TestRecoveryBlockingDispositions(t *testing.T) {
+	t.Run("an unknown unresolved operation blocks the attested relaunch", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		_, detail := startedRun(t, tc)
+		claimLaunch(t, tc, detail, 4242)
+		opID, err := identity.ParseOperationID(tc.IDs.NewID())
+		if err != nil {
+			t.Fatalf("parse operation id: %v", err)
+		}
+		tc.Store.Operations[opID] = app.Operation{
+			ID: opID, RunID: detail.RunID, Generation: tc.Store.Leases[detail.RunID].lease.Generation,
+			Kind: app.OperationKind("bogus.kind"), State: app.OperationPending,
+			CreatedAt: tc.Clock.Now(), UpdatedAt: tc.Clock.Now(),
+		}
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			return app.PaneProcess{}, app.ErrPaneNotFound
+		}
+
+		req := defaultResumeRequest(detail.RunID.String())
+		req.ConfirmAbsent = true
+		tc.Clock.Advance(leaseTTL + time.Second)
+		result, _, err := tc.Controller.Resume(context.Background(), req)
+		if err != nil {
+			t.Fatalf("Resume() error = %v", err)
+		}
+		if result.Outcome != app.ResumeReconciling {
+			t.Fatalf("Outcome = %s, want %s (unknown unresolved work blocks new acts)", result.Outcome, app.ResumeReconciling)
+		}
+		if !strings.Contains(result.Detail, "bogus.kind") {
+			t.Fatalf("Detail = %q, want the blocking operation named", result.Detail)
+		}
+		if got := tc.Store.Operations[opID].State; got != app.OperationReconciling {
+			t.Fatalf("unknown operation state = %s, want reconciling", got)
+		}
+	})
+
+	t.Run("a completed retirement finishes cold recovery after binding supersession", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		_, detail := runningRun(t, tc)
+		nativeRef := tc.Store.Sessions[detail.SessionID].value.NativeSessionRef
+
+		// Round 1 records the observed restoration and dispatches the
+		// guarded close.
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 7777, Argv0: "/usr/bin/claude", Argv: []string{"claude", "--resume", nativeRef}}}}, nil
+		}
+		tc.Clock.Advance(leaseTTL + time.Second)
+		if _, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String())); err != nil {
+			t.Fatalf("first Resume() error = %v", err)
+		}
+
+		// The crashed controller had already committed the close outcome
+		// and superseded the observation binding, but died before the
+		// relaunch it authorized.
+		now := tc.Clock.Now()
+		for id, op := range tc.Store.Operations {
+			if op.Kind != app.OpPaneClose {
+				continue
+			}
+			op.State = app.OperationSucceeded
+			op.Outcome = map[string]any{"absence_observed": true, "detail": "occupant absent after close"}
+			tc.Store.Operations[id] = op
+		}
+		history := tc.Store.Bindings[detail.SessionID]
+		for i := range history {
+			if !history[i].Superseded {
+				superseded, err := history[i].Supersede("pane close retirement: occupant absent after close", now)
+				if err != nil {
+					t.Fatalf("Supersede() error = %v", err)
+				}
+				history[i] = superseded
+			}
+		}
+		tc.Store.Bindings[detail.SessionID] = history
+
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			return app.PaneProcess{}, app.ErrPaneNotFound
+		}
+		tc.Clock.Advance(leaseTTL + time.Second)
+		result, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String()))
+		if err != nil {
+			t.Fatalf("second Resume() error = %v", err)
+		}
+		if result.Outcome != app.ResumeColdRelaunched {
+			t.Fatalf("Outcome = %s, want %s (the durable retirement outcome finishes the recovery)", result.Outcome, app.ResumeColdRelaunched)
+		}
+	})
+
+	t.Run("crash right after InitializeRun: startup rebuilds from the frozen run, assignment recreated", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		_, _, err := tc.Controller.StartRun(context.Background(), defaultStartRunRequest())
+		if err != nil {
+			t.Fatalf("StartRun() error = %v", err)
+		}
+		runID := tc.onlyRunID(t)
+		forceAttemptReserved(t, tc, runID)
+		// Erase everything the crash would have prevented: operations,
+		// worktree rows, bindings and the assignment file itself.
+		tc.Store.Operations = map[identity.OperationID]app.Operation{}
+		tc.Store.Worktrees = map[identity.WorktreeID]*entityRow[run.Worktree]{}
+		tc.Store.Bindings = map[identity.SessionID][]run.RuntimeBinding{}
+		assignmentPath := tc.Store.Snapshots[runID].AssignmentPath
+		delete(tc.Artifacts.files, assignmentPath)
+
+		tc.Clock.Advance(leaseTTL + time.Second)
+		result, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(runID.String()))
+		if err != nil {
+			t.Fatalf("Resume() error = %v", err)
+		}
+		if result.Outcome != app.ResumeStartupContinued {
+			t.Fatalf("Outcome = %s, want %s", result.Outcome, app.ResumeStartupContinued)
+		}
+		content, readErr := tc.Artifacts.ReadArtifact(context.Background(), assignmentPath)
+		if readErr != nil {
+			t.Fatalf("the assignment artifact was not recreated: %v", readErr)
+		}
+		if got := len(content); got == 0 {
+			t.Fatalf("recreated assignment is empty")
+		}
+		updated, err := tc.Store.LoadRunStatus(context.Background(), runID)
+		if err != nil {
+			t.Fatalf("LoadRunStatus() error = %v", err)
+		}
+		if updated.WorktreePath == "" || updated.Binding == nil {
+			t.Fatalf("startup did not rebuild worktree and worker pane: path=%q binding=%v", updated.WorktreePath, updated.Binding)
+		}
+	})
+}

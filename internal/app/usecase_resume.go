@@ -113,7 +113,8 @@ func (c *Controller) Resume(ctx context.Context, req ResumeRequest) (ResumeResul
 		return ResumeResult{}, handle, fmt.Errorf("app: run %s is in unknown state %q; failing closed", runID, entry.State)
 	}
 
-	if recoverErr := c.recoverPendingOperations(ctx, handle, entry); recoverErr != nil {
+	blocked, recoverErr := c.recoverPendingOperations(ctx, handle, entry)
+	if recoverErr != nil {
 		return ResumeResult{}, handle, recoverErr
 	}
 
@@ -122,18 +123,18 @@ func (c *Controller) Resume(ctx context.Context, req ResumeRequest) (ResumeResul
 		return ResumeResult{}, handle, fmt.Errorf("app: load run status: %w", err)
 	}
 
-	result, err := c.reconcile(ctx, handle, detail, req)
+	result, err := c.reconcile(ctx, handle, detail, req, blocked)
 	return result, handle, err
 }
 
 // reconcile dispatches by the attempt's state, per the section 5 tables.
 // An unknown attempt state fails closed rather than passing as terminal.
-func (c *Controller) reconcile(ctx context.Context, handle RunHandle, detail RunDetail, req ResumeRequest) (ResumeResult, error) { //nolint:gocritic // hugeParam: RunHandle, RunDetail and ResumeRequest are per-call DTOs; this runs once per resume round.
+func (c *Controller) reconcile(ctx context.Context, handle RunHandle, detail RunDetail, req ResumeRequest, blocked []string) (ResumeResult, error) { //nolint:gocritic // hugeParam: RunHandle, RunDetail and ResumeRequest are per-call DTOs; this runs once per resume round.
 	switch detail.AttemptState {
 	case run.AttemptReserved:
-		return c.continueStartup(ctx, handle, detail, req)
+		return c.continueStartup(ctx, handle, detail, req, blocked)
 	case run.AttemptRunning, run.AttemptSubmitted, run.AttemptChecking, run.AttemptReconciling, run.AttemptLaunching, run.AttemptRelaunching:
-		return c.reconcileActive(ctx, handle, detail, req)
+		return c.reconcileActive(ctx, handle, detail, req, blocked)
 	case run.AttemptCompleted, run.AttemptFailed, run.AttemptInterrupted:
 		return ResumeResult{Outcome: ResumeNothingToDo, Detail: "attempt is already terminal"}, nil
 	default:
@@ -165,21 +166,34 @@ type boundedWaitEvidence struct {
 // operations are resolved by the shared close procedure their own drivers
 // re-enter (DriveStop and positive-evidence retirement), and attestations
 // are journal-only.
-func (c *Controller) recoverPendingOperations(ctx context.Context, handle RunHandle, detail RunDetail) error { //nolint:gocritic // hugeParam: RunHandle and RunDetail are per-call DTOs; this runs once per resume.
-	var frozen *FrozenRun
+func (c *Controller) recoverPendingOperations(ctx context.Context, handle RunHandle, detail RunDetail) ([]string, error) { //nolint:gocritic // hugeParam: RunHandle and RunDetail are per-call DTOs; this runs once per resume.
+	var (
+		frozen  *FrozenRun
+		blocked []string
+	)
 	for i := range detail.PendingOperations {
 		op := &detail.PendingOperations[i]
 		var err error
 		switch op.Kind {
 		case OpWorktreeCreate:
+			if _, ok := decodeOperationPayload[worktreeCreateIntent](op.Intent); !ok {
+				err = c.markOperationReconciling(ctx, handle, op.ID, "worktree.create intent could not be decoded; failing closed")
+				blocked = append(blocked, fmt.Sprintf("operation %s (worktree.create) has an undecodable intent", op.ID))
+				break
+			}
 			err = c.recoverWorktreeCreate(ctx, handle, op)
 		case OpPaneOpen, OpLaunchSend:
+			if _, ok := decodeOperationPayload[paneOpenIntent](op.Intent); !ok {
+				err = c.markOperationReconciling(ctx, handle, op.ID, "pane.open intent could not be decoded; failing closed")
+				blocked = append(blocked, fmt.Sprintf("operation %s (%s) has an undecodable intent", op.ID, op.Kind))
+				break
+			}
 			err = c.recoverPaneOpen(ctx, handle, op)
 		case OpCheckRun:
 			if frozen == nil {
 				loaded, loadErr := c.Read.LoadFrozenRun(ctx, handle.runID)
 				if loadErr != nil {
-					return fmt.Errorf("app: load frozen run: %w", loadErr)
+					return nil, fmt.Errorf("app: load frozen run: %w", loadErr)
 				}
 				frozen = &loaded
 			}
@@ -190,12 +204,13 @@ func (c *Controller) recoverPendingOperations(ctx context.Context, handle RunHan
 			// Resolved by their own drivers; attestations are journal-only.
 		default:
 			err = c.markOperationReconciling(ctx, handle, op.ID, fmt.Sprintf("unknown operation kind %q; failing closed", op.Kind))
+			blocked = append(blocked, fmt.Sprintf("operation %s has unknown kind %q", op.ID, op.Kind))
 		}
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
-	return nil
+	return blocked, nil
 }
 
 // recoverWorktreeCreate resolves a pending worktree.create operation: the
@@ -410,15 +425,22 @@ func (c *Controller) settleOperation(ctx context.Context, handle RunHandle, opID
 
 // continueStartup resumes a run whose attempt is still reserved: the
 // crash happened during (or before) worktree creation, before the launch
-// intent. Once a provenance-valid worktree exists — adopted by recovery
-// or freshly created here — the original startup continues by opening the
-// worker pane with a fresh incarnation. The pane joins the workspace the
-// worktree.create outcome recorded; without that recorded placement the
-// run stays reconciling rather than opening a pane in an unknown
-// workspace.
-func (c *Controller) continueStartup(ctx context.Context, handle RunHandle, detail RunDetail, req ResumeRequest) (ResumeResult, error) { //nolint:gocritic // hugeParam: RunHandle, RunDetail and ResumeRequest are per-call DTOs; this runs once per resume round.
+// intent. Startup identity comes from the frozen run — repository root,
+// state root and brief — never from journal archeology, so even a crash
+// immediately after InitializeRun is recoverable. Once a provenance-valid
+// worktree exists — adopted by recovery or freshly created here — the
+// assignment artifact is verified (and recreated byte-identically from
+// the frozen inputs when its file is lost) and the original startup
+// continues by opening the worker pane with a fresh incarnation. The pane
+// joins the workspace the worktree.create outcome recorded; without that
+// recorded placement the run stays reconciling rather than opening a pane
+// in an unknown workspace. Unresolved blocking work refuses the new acts.
+func (c *Controller) continueStartup(ctx context.Context, handle RunHandle, detail RunDetail, req ResumeRequest, blocked []string) (ResumeResult, error) { //nolint:gocritic // hugeParam: RunHandle, RunDetail and ResumeRequest are per-call DTOs; this runs once per resume round.
 	if req.HOPPath == "" || req.StateRoot == "" {
 		return ResumeResult{}, errors.New("app: resume requires HOPPath and StateRoot to continue startup")
+	}
+	if len(blocked) > 0 {
+		return ResumeResult{Outcome: ResumeReconciling, Detail: "unresolved work blocks the startup continuation: " + strings.Join(blocked, "; ")}, nil
 	}
 	for i := range detail.PendingOperations {
 		if detail.PendingOperations[i].Kind == OpWorktreeCreate {
@@ -426,13 +448,17 @@ func (c *Controller) continueStartup(ctx context.Context, handle RunHandle, deta
 		}
 	}
 
+	frozen, err := c.Read.LoadFrozenRun(ctx, handle.runID)
+	if err != nil {
+		return ResumeResult{}, fmt.Errorf("app: load frozen run: %w", err)
+	}
+
 	var (
 		worktree  run.Worktree
 		hasRow    bool
-		snapshot  RunSnapshot
 		workspace string
 	)
-	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+	if uowErr := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 		w, _, getErr := uow.Worktrees().ByRun(ctx, handle.runID)
 		if getErr == nil {
 			worktree = w
@@ -455,21 +481,15 @@ func (c *Controller) continueStartup(ctx context.Context, handle RunHandle, deta
 			}
 		}
 		return nil
-	}); err != nil {
-		return ResumeResult{}, err
-	}
-	_ = snapshot
-
-	repositoryRoot, err := c.runRepositoryRoot(ctx, handle)
-	if err != nil {
-		return ResumeResult{}, err
+	}); uowErr != nil {
+		return ResumeResult{}, uowErr
 	}
 
 	info := WorktreeInfo{WorkspaceID: workspace, Path: worktree.Path, Branch: worktree.Branch}
 	if !hasRow {
 		// Nothing exists yet (the pre-act crash window, past its bounded
-		// wait): re-drive creation itself; the settled prior intent no
-		// longer blocks it.
+		// wait, or a crash before the first worktree intent): re-drive
+		// creation from the frozen repository root.
 		var seq int
 		if statusDetail, statusErr := c.Read.LoadRunStatus(ctx, handle.runID); statusErr == nil {
 			seq = statusDetail.Sequence
@@ -481,7 +501,7 @@ func (c *Controller) continueStartup(ctx context.Context, handle RunHandle, deta
 			return ResumeResult{}, fmt.Errorf("app: generate worktree id: %w", err)
 		}
 		ids.Worktree = worktreeID
-		created, createErr := c.createWorktree(ctx, handle, ids, repositoryRoot, branch, c.Clock.Now())
+		created, createErr := c.createWorktree(ctx, handle, ids, frozen.RepositoryRoot, branch, c.Clock.Now())
 		if createErr != nil {
 			return ResumeResult{}, createErr
 		}
@@ -489,6 +509,10 @@ func (c *Controller) continueStartup(ctx context.Context, handle RunHandle, deta
 	}
 	if info.WorkspaceID == "" {
 		return ResumeResult{Outcome: ResumeReconciling, Detail: "worktree adopted but its workspace placement is unrecorded; the worker pane cannot be opened safely"}, nil
+	}
+
+	if assignErr := c.ensureAssignment(ctx, handle, &frozen, detail, req.HOPPath); assignErr != nil {
+		return ResumeResult{}, assignErr
 	}
 
 	incarnationID, err := identity.ParseIncarnationID(c.IDs.NewID())
@@ -502,25 +526,40 @@ func (c *Controller) continueStartup(ctx context.Context, handle RunHandle, deta
 	return ResumeResult{Outcome: ResumeStartupContinued, Detail: "startup continued: worker pane opened"}, nil
 }
 
-// runRepositoryRoot resolves the run's repository root through ReadStore's
-// run listing scope: the worktree.create intent recorded it durably, so it
-// is read back from the newest such operation.
-func (c *Controller) runRepositoryRoot(ctx context.Context, handle RunHandle) (string, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per startup continuation.
-	var root string
-	err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
-		ops, opErr := uow.Operations().ByKind(ctx, handle.runID, OpWorktreeCreate)
-		if opErr != nil {
-			return opErr
+// ensureAssignment verifies the frozen assignment artifact before a worker
+// is launched against it: an existing file must match the frozen digest,
+// and a missing file is recreated byte-identically from the frozen inputs
+// (brief, identities, paths). A recreation whose digest does not match the
+// freeze — a moved hop executable, for example — fails closed rather than
+// launching a worker against unverified instructions.
+func (c *Controller) ensureAssignment(ctx context.Context, handle RunHandle, frozen *FrozenRun, detail RunDetail, hopPath string) error { //nolint:gocritic // hugeParam: RunHandle and RunDetail are per-call DTOs; called once per startup continuation.
+	path := frozen.Snapshot.AssignmentPath
+	if path == "" {
+		return errors.New("app: the frozen snapshot records no assignment path")
+	}
+	if content, readErr := c.Artifacts.ReadArtifact(ctx, path); readErr == nil {
+		if sha256Hex(content) != frozen.Snapshot.AssignmentDigest {
+			return fmt.Errorf("app: assignment artifact at %s does not match its frozen digest; failing closed", path)
 		}
-		for i := range ops {
-			if intent, ok := decodeOperationPayload[worktreeCreateIntent](ops[i].Intent); ok && intent.RepositoryRoot != "" {
-				root = intent.RepositoryRoot
-				return nil
-			}
-		}
-		return fmt.Errorf("%w: no worktree.create intent records the repository root for run %s", ErrNotFound, handle.runID)
-	})
-	return root, err
+		return nil
+	}
+
+	fields := assignmentFields{
+		RunID:          handle.runID.String(),
+		TaskID:         detail.TaskID.String(),
+		AttemptID:      detail.AttemptID.String(),
+		Brief:          frozen.Brief,
+		AssignmentPath: path,
+		HOPPath:        hopPath,
+	}
+	content := renderAssignment(&fields)
+	if sha256Hex(content) != frozen.Snapshot.AssignmentDigest {
+		return fmt.Errorf("app: the assignment artifact could not be recreated identically from the frozen inputs (digest mismatch; has the hop executable path changed?); failing closed")
+	}
+	if err := c.Artifacts.WriteArtifact(ctx, path, content); err != nil {
+		return fmt.Errorf("app: recreate assignment artifact: %w", err)
+	}
+	return c.recordAssignmentArtifact(ctx, handle.lease, handle.runID, path, frozen.Snapshot.AssignmentDigest)
 }
 
 // reconcileActive handles every attempt state a live worker could still
@@ -531,7 +570,7 @@ func (c *Controller) runRepositoryRoot(ctx context.Context, handle RunHandle) (s
 // settled claim under the one corroboration predicate, positive-evidence
 // retirement plus cold relaunch, fail-closed on an unidentified occupant,
 // or — with conclusively established absence — cold relaunch.
-func (c *Controller) reconcileActive(ctx context.Context, handle RunHandle, detail RunDetail, req ResumeRequest) (ResumeResult, error) { //nolint:gocritic // hugeParam: RunHandle, RunDetail and ResumeRequest are per-call DTOs; this runs once per resume round.
+func (c *Controller) reconcileActive(ctx context.Context, handle RunHandle, detail RunDetail, req ResumeRequest, blocked []string) (ResumeResult, error) { //nolint:gocritic // hugeParam: RunHandle, RunDetail and ResumeRequest are per-call DTOs; this runs once per resume round.
 	launchingState := detail.AttemptState == run.AttemptLaunching || detail.AttemptState == run.AttemptRelaunching
 	execFailed := detail.Claim != nil && detail.Claim.State == LaunchClaimExecFailed
 	if launchingState && !execFailed {
@@ -554,7 +593,7 @@ func (c *Controller) reconcileActive(ctx context.Context, handle RunHandle, deta
 			if loadErr != nil {
 				return ResumeResult{}, fmt.Errorf("app: load run status: %w", loadErr)
 			}
-			return c.reconcileActive(ctx, handle, reloaded, req)
+			return c.reconcileActive(ctx, handle, reloaded, req, blocked)
 		case LaunchNeedsInteraction:
 			paneID := ""
 			if detail.Binding != nil {
@@ -580,6 +619,20 @@ func (c *Controller) reconcileActive(ctx context.Context, handle RunHandle, deta
 	}
 
 	if detail.Binding == nil || detail.Binding.PaneID == "" {
+		// A crash between a confirmed positive-evidence retirement (close
+		// succeeded, observation binding superseded) and the relaunch it
+		// authorized leaves no current binding; the durable close outcome
+		// still finishes the recovery.
+		done, doneErr := c.completedRetirement(ctx, handle, detail)
+		if doneErr != nil {
+			return ResumeResult{}, doneErr
+		}
+		if done {
+			if len(blocked) > 0 {
+				return ResumeResult{Outcome: ResumeReconciling, Detail: "unresolved work blocks the relaunch: " + strings.Join(blocked, "; ")}, nil
+			}
+			return c.coldRelaunch(ctx, handle, detail, req)
+		}
 		return ResumeResult{Outcome: ResumeReconciling, Detail: "no runtime binding recorded yet"}, nil
 	}
 	pane, occupantAbsent, ambiguous := c.observePaneAbsence(ctx, detail.Binding.PaneID, detail.Binding.CreationLabel)
@@ -609,6 +662,9 @@ func (c *Controller) reconcileActive(ctx context.Context, handle RunHandle, deta
 		// guarded retirement and cold relaunch; anything else fails closed.
 		nativeRef, nativeErr := c.sessionNativeRef(ctx, handle, detail.SessionID)
 		if nativeErr == nil && nativeRef != "" && paneCarriesMarker(pane, nativeRef) {
+			if len(blocked) > 0 {
+				return ResumeResult{Outcome: ResumeReconciling, Detail: "unresolved work blocks the retirement: " + strings.Join(blocked, "; ")}, nil
+			}
 			return c.retireAndRelaunch(ctx, handle, detail, req, pane, nativeRef)
 		}
 		return ResumeResult{
@@ -623,6 +679,11 @@ func (c *Controller) reconcileActive(ctx context.Context, handle RunHandle, deta
 	retired, retireErr := c.completePendingRetirement(ctx, handle, detail)
 	if retireErr != nil {
 		return ResumeResult{}, retireErr
+	}
+	if retired || execFailed || req.ConfirmAbsent {
+		if len(blocked) > 0 {
+			return ResumeResult{Outcome: ResumeReconciling, Detail: "unresolved work blocks the relaunch: " + strings.Join(blocked, "; ")}, nil
+		}
 	}
 	if retired {
 		return c.coldRelaunch(ctx, handle, detail, req)
@@ -920,6 +981,40 @@ func restoreRunForAttemptState(ctx context.Context, uow UnitOfWork, handle RunHa
 		return err
 	}
 	return recordTransition(ctx, uow, EntityRun, handle.runID.String(), string(rFrom), string(next.State), "warm reattach verified", gen(handle.lease.Generation), now)
+}
+
+// completedRetirement reports whether a positive-evidence retirement for
+// the session already completed durably — its pane.close operation
+// succeeded with observed absence — even though the binding it superseded
+// is no longer current: the recorded outcome, not a live binding, is the
+// recovery evidence.
+func (c *Controller) completedRetirement(ctx context.Context, handle RunHandle, detail RunDetail) (bool, error) { //nolint:gocritic // hugeParam: RunHandle and RunDetail are per-call DTOs; this runs once per resume round.
+	if detail.SessionID == "" {
+		return false, nil
+	}
+	done := false
+	err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		ops, opErr := uow.Operations().ByKind(ctx, handle.runID, OpPaneClose)
+		if opErr != nil {
+			return opErr
+		}
+		for i := range ops {
+			if ops[i].State != OperationSucceeded {
+				continue
+			}
+			intent, ok := decodeOperationPayload[paneCloseIntent](ops[i].Intent)
+			if !ok || intent.Reason != closeReasonRetirement || intent.SessionID != detail.SessionID {
+				continue
+			}
+			outcome, ok := decodeOperationPayload[paneCloseOutcome](ops[i].Outcome)
+			if ok && outcome.AbsenceObserved {
+				done = true
+				return nil
+			}
+		}
+		return nil
+	})
+	return done, err
 }
 
 // retireAndRelaunch records the positively identified restored occupant as
