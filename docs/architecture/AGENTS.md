@@ -15,6 +15,9 @@ user requirements; the concrete package and entity designs remain proposals.
 - [Domain model](domain-model.md): conceptual ERDs, aggregates and invariants.
 - [Herdr surface audit](herdr-surface.md): API capabilities, native Agents view,
   metadata/configuration and integration limitations.
+- [Native harness compatibility](native-harness-compat.md): verified Claude
+  Code, Codex and opencode profile isolation and cold-resume evidence, launch
+  recipes and the proposed supported restore policy.
 - [Plugin testing](plugin-testing.md): upstream testing patterns and proposed
   HOP real-process, protocol and UI test layers.
 - [Launch environment](launch-environment.md): which Herdr launch surfaces

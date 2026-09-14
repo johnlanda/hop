@@ -248,7 +248,7 @@ separate recovery operation whose transcript compatibility must be tested. Do no
 rewrite shared live credentials to force switching. Request-level rotation would
 need request interception or a harness-native mechanism and is outside this scope.
 
-Start with Claude Code and Codex account bindings. Keep Gemini and Grok in the
+Start with Claude Code, Codex and opencode account bindings. Keep Gemini and Grok in the
 adapter scope, but validate their native login/profile isolation and quota signals
 before claiming parity. The proxy's provider support alone does not prove native
 CLI profile support. Let the native harness own token refresh wherever possible;

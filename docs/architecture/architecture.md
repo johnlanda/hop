@@ -85,6 +85,7 @@ These paths and symbols are planned. Every row gains an AGENTS.md when implement
 | `internal/adapters/config` | Load repository policy, role and playbook files | `load.go`, `decode.go`; `LoadConfiguration` |
 | `internal/adapters/claude` | Claude native authentication/profile preparation | `login.go`, `profile.go`, `PrepareSession` |
 | `internal/adapters/codex` | Codex native authentication/profile preparation | `login.go`, `profile.go`, `PrepareSession` |
+| `internal/adapters/opencode` | opencode native authentication/profile preparation | `login.go`, `profile.go`, `PrepareSession` |
 | `internal/adapters/process` | Execute deterministic playbook commands | `runner.go`, `RunCommand` |
 | `internal/adapters/system` | Concrete clock and ID generation | `clock.go`, `id.go` |
 | `internal` | Import and guide-coverage tests only | `arch_test.go`, `guides_test.go` |
@@ -107,7 +108,7 @@ such as `internal/domain` or `internal/adapters`; those directories have index g
 | `StateStore` / `UnitOfWork` | SQLite | Typed repositories, atomic writes, optimistic revisions, operation journal |
 | `Runtime` | Herdr | Create worktree/session, prompt, inspect and normalize observations |
 | `AgentPresentation` | Herdr | Publish display metadata and select/clear native Agent views without changing domain state |
-| `HarnessProfiles` | Claude/Codex adapters | Login, inspect identity, prepare isolated launch configuration |
+| `HarnessProfiles` | Claude/Codex/opencode adapters | Login, inspect identity, prepare isolated launch configuration |
 | `ConfigurationSource` | Config adapter | Decode and validate policy/role/playbook input into application values |
 | `CommandRunner` | Process adapter | Execute argv with explicit cwd/env, cancellation and structured result |
 | `Clock`, `IDGenerator` | System adapter | Explicit time and identity generation |
