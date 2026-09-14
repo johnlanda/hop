@@ -1,6 +1,7 @@
 package integration
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -10,74 +11,96 @@ import (
 	"time"
 )
 
-// TestSpikeRestartWaitsForGracefulExit proves the S3 restart barrier waits for
-// the server's leader to ACTUALLY exit before treating a graceful stop as
-// complete — the guarantee the restore evidence depends on — and that a leader
-// which never exits is force-killed rather than silently accepted. It uses
-// fixture leaders, not a real herdr binary, so it exercises the barrier
-// mechanism directly.
-func TestSpikeRestartWaitsForGracefulExit(t *testing.T) {
-	t.Run("waits for the release-gated exit, and the delayed save survives", func(t *testing.T) {
+// TestSpikeRestartBarrier proves the S3 restart barrier waits for the server
+// leader to ACTUALLY exit before treating a graceful stop as complete — the
+// guarantee the restore evidence depends on — and that a leader which never
+// exits is force-killed rather than silently accepted. It exercises the
+// barrier's building blocks (the leaderExited channel and retireGroup) against
+// fixture leaders, with no real herdr binary.
+func TestSpikeRestartBarrier(t *testing.T) {
+	t.Run("leaderExited closes only after a release-gated exit, and the save survives", func(t *testing.T) {
 		dir := t.TempDir()
 		releaseFile := filepath.Join(dir, "release")
 		saveFile := filepath.Join(dir, "delayed-save")
 		// The leader blocks until the test releases it, then writes its save file
 		// and exits — modeling Herdr saving only as its run loop exits. The
-		// barrier must return only after that exit, so the save file must exist
-		// when it returns; this is a release barrier, not a timing assertion.
+		// barrier (leaderExited) must close only after that exit, so the save
+		// file must exist when it closes; this is a release barrier, not a timing
+		// assertion.
 		leader := startFixtureLeader(t, "while [ ! -f '"+releaseFile+"' ]; do sleep 0.02; done; : > '"+saveFile+"'; exit 0")
 
-		done := make(chan bool, 1)
-		go func() { done <- awaitGracefulExit(leader, conditionTimeout) }()
-
-		// The barrier must not have returned while the leader is still gated.
 		select {
-		case <-done:
-			t.Fatal("the barrier returned before the leader was released")
+		case <-leader.leaderExited:
+			t.Fatal("the barrier closed before the leader was released")
 		default:
 		}
 
 		if err := os.WriteFile(releaseFile, nil, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if !<-done {
-			t.Fatal("the barrier reported no exit for a leader that exits on its own")
-		}
-		// The save the leader wrote just before exiting is present, proving the
-		// barrier waited for that exit rather than returning early.
+		<-leader.leaderExited
 		if _, err := os.Stat(saveFile); err != nil {
 			t.Errorf("the leader's release-gated save is missing after the barrier: %v", err)
 		}
+		if ps := leader.leaderCmd.ProcessState; ps == nil || !ps.Exited() || ps.ExitCode() != 0 {
+			t.Errorf("leader exit status = %v, want a clean exit(0)", ps)
+		}
+		if leader.takeTeardown() {
+			(&testServer{}).retireGroup(t, leader)
+		}
+		if !leader.groupGone(t) {
+			t.Error("group not gone after retiring a cleanly exited leader")
+		}
 	})
 
-	t.Run("a leader that never exits is force-killed", func(t *testing.T) {
+	t.Run("a leader that never exits is force-killed by retirement", func(t *testing.T) {
 		leader := startFixtureLeader(t, "sleep 300")
-		if awaitGracefulExit(leader, 300*time.Millisecond) {
-			t.Fatal("the barrier reported a graceful exit for a leader that never exits")
+		select {
+		case <-leader.leaderExited:
+			t.Fatal("leaderExited closed for a leader that never exits")
+		case <-time.After(300 * time.Millisecond):
 		}
-		// The forced path (what restart runs on the inconclusive branch) tears
-		// the group down; the leader was never reaped, so the signal is safe.
-		srv := &testServer{}
-		srv.forceReap(t, leader)
+		// retireGroup is what restart runs on the inconclusive branch: it kills
+		// the group while the anchor pins it, then reaps.
+		if leader.takeTeardown() {
+			(&testServer{}).retireGroup(t, leader)
+		}
 		if !leader.groupGone(t) {
 			t.Error("the force-killed leader's group is not gone")
 		}
 	})
+}
 
-	t.Run("a leader that exits as cleanup starts is reaped without an unsafe signal", func(t *testing.T) {
-		// The leader exits promptly on its own. By the time forceReap runs it may
-		// already be an unreaped zombie or already reaped by a prior tryReap;
-		// either way forceReap must retire it and its group without signaling a
-		// possibly recycled pgid.
+// TestSpikeGroupAnchor proves the anchor invariant: an unreaped anchor keeps
+// the group alive (and signal-safe) after the leader itself has been reaped,
+// retirement empties the group, and a leader that has already exited cannot be
+// anchored — the case start() and runInOwnedGroup report as inconclusive.
+func TestSpikeGroupAnchor(t *testing.T) {
+	t.Run("the anchor pins the group after the leader exits, then retirement empties it", func(t *testing.T) {
 		leader := startFixtureLeader(t, "exit 0")
-		// Race the reap: let it exit, then force-reap.
-		if !awaitGracefulExit(leader, conditionTimeout) {
-			t.Fatal("leader did not exit on its own")
+		<-leader.leaderExited // the leader is reaped by its owning goroutine
+		// The anchor, still unreaped, keeps the group non-empty even though the
+		// leader is gone — this is what makes a later group SIGKILL safe.
+		if errors.Is(syscall.Kill(-leader.pgid, 0), syscall.ESRCH) {
+			t.Fatal("group is already empty after the leader exited; the anchor did not pin it")
 		}
-		srv := &testServer{}
-		srv.forceReap(t, leader) // leader already reaped: must be a no-op signal + group drain
+		if leader.takeTeardown() {
+			(&testServer{}).retireGroup(t, leader)
+		}
 		if !leader.groupGone(t) {
-			t.Error("group not gone after a leader that exited on its own")
+			t.Error("retirement did not empty the anchored group")
+		}
+	})
+
+	t.Run("a leader that already exited cannot be anchored (inconclusive)", func(t *testing.T) {
+		// setpgid into pgid 1 (init, in another session) fails with EPERM — the
+		// same failure start()/runInOwnedGroup get when the leader's group is
+		// already gone, and which they report as an inconclusive launch rather
+		// than proceeding without a pinned group.
+		if _, err := startAnchor(1); err == nil {
+			t.Fatal("expected startAnchor to fail when it cannot join the target group")
+		} else {
+			t.Logf("startAnchor into an unjoinable group failed as expected: %v", err)
 		}
 	})
 }
@@ -96,9 +119,14 @@ func TestSpikeOwnedGroupTeardown(t *testing.T) {
 		wantTimedO bool
 	}{
 		{
+			name:       "leader exits normally, no descendants",
+			script:     "exit 0",
+			timeout:    30 * time.Second,
+			wantTimedO: false,
+		},
+		{
 			// Never-exiting leader with a child holding the output pipe: the
-			// deadline cancellation kills the group. A short timeout hits the
-			// deadline quickly.
+			// deadline cancellation kills the group. A short timeout hits it fast.
 			name:       "never-exiting leader, pipe-holding child",
 			script:     "sleep 300 & wait",
 			timeout:    time.Second,
@@ -106,9 +134,7 @@ func TestSpikeOwnedGroupTeardown(t *testing.T) {
 		},
 		{
 			// Leader exits normally while a backgrounded child keeps the output
-			// pipe open: WaitDelay (5s) bounds draining, then the post-exit
-			// retirement kills the surviving child. The timeout must exceed
-			// WaitDelay so the deadline does not fire first.
+			// pipe open: the reader drains after the child is retired.
 			name:       "leader exits normally, child holds stdout open",
 			script:     "sleep 300 & exit 0",
 			timeout:    30 * time.Second,
@@ -116,8 +142,8 @@ func TestSpikeOwnedGroupTeardown(t *testing.T) {
 		},
 		{
 			// Leader exits normally while a backgrounded child has closed the
-			// output pipe but stays alive: CombinedOutput returns at once and the
-			// post-exit retirement kills the surviving child.
+			// output pipe but stays alive: output ends at once and the post-exit
+			// retirement kills the surviving child.
 			name:       "leader exits normally, child closed stdout but alive",
 			script:     "sleep 300 >/dev/null 2>&1 & exit 0",
 			timeout:    30 * time.Second,
@@ -136,25 +162,33 @@ func TestSpikeOwnedGroupTeardown(t *testing.T) {
 	}
 }
 
-// startFixtureLeader starts a /bin/sh leader in its own process group and wraps
-// it as a serverProcess, so the ownership helpers can be exercised without a
-// herdr binary. It has no log files. Its cleanup retires the group at most once
-// via the same lock-serialized path.
+// startFixtureLeader starts a /bin/sh leader in its own process group, anchors
+// that group, and wraps both as a serverProcess, so the ownership helpers can
+// be exercised without a herdr binary. It has no log files. Its cleanup retires
+// the group at most once.
 func startFixtureLeader(t *testing.T, script string) *serverProcess {
 	t.Helper()
-	cmd := exec.CommandContext(t.Context(), "/bin/sh", "-c", script) //nolint:gosec // G204: a fixed shell fixture chosen by this test.
+	// context.Background, not t.Context: the leader is owned by its single Wait
+	// goroutine and retired explicitly, with no CommandContext watcher.
+	cmd := exec.CommandContext(context.Background(), "/bin/sh", "-c", script) //nolint:gosec // G204: a fixed shell fixture chosen by this test.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start fixture leader: %v", err)
 	}
-	sp := newServerProcess(cmd, nil, nil)
-	t.Cleanup(func() {
-		if !sp.takeTeardown() {
-			return
+	anchor, err := startAnchor(cmd.Process.Pid)
+	if err != nil {
+		if killErr := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); killErr != nil && !errors.Is(killErr, syscall.ESRCH) {
+			t.Logf("kill unanchored fixture leader: %v", killErr)
 		}
-		sp.killGroupIfUnreaped(t)
-		if !sp.reapLeader() {
-			t.Errorf("fixture leader %d was not reaped", sp.pgid)
+		if werr := cmd.Wait(); werr != nil {
+			t.Logf("reap unanchored fixture leader: %v", werr)
+		}
+		t.Fatalf("anchor could not join fixture leader group: %v", err)
+	}
+	sp := newServerProcess(cmd, anchor, nil, nil)
+	t.Cleanup(func() {
+		if sp.takeTeardown() {
+			(&testServer{}).retireGroup(t, sp)
 		}
 	})
 	return sp

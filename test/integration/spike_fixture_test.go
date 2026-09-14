@@ -1,10 +1,12 @@
 package integration
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -198,55 +200,121 @@ func copyExecutable(t *testing.T, from, to string) {
 	}
 }
 
-// runInOwnedGroup runs a command as its own process-group leader with a
-// bounded lifecycle, and after it returns retires the whole group. It gives a
-// real external binary (S4's claude, and the self-test's fixture leader) an
-// owned teardown: on the context deadline cmd.Cancel SIGKILLs the whole group,
-// and WaitDelay bounds pipe draining so CombinedOutput cannot block
-// indefinitely. Crucially it also retires the group after a NORMAL leader exit
-// — a backgrounded child can outlive the leader whether or not it still holds
-// the output pipe — by signaling the group and waiting for it to drain, since
-// cmd.Cancel fires only on the deadline. It returns the combined output,
-// whether the deadline fired, and the run error.
+// runInOwnedGroup runs a command as its own process-group leader with an
+// anchored, bounded lifecycle, and retires the whole group before returning. It
+// gives a real external binary (S4's claude, and the self-test's fixture
+// leader) an owned teardown with the same anchor discipline as the server:
+//
+//   - The leader is started in its own group; an anchor is launched into that
+//     group so an unreaped member of ours pins the pgid until retirement. If
+//     the anchor cannot join (the command exited at once), the launch is
+//     inconclusive and the test fails.
+//   - Output is captured through an explicit pipe (not CombinedOutput), and the
+//     leader is reaped by exactly one Wait, so there is no second waiter and no
+//     independent CommandContext watcher signaling the pid.
+//   - The single group SIGKILL (on the deadline or during post-exit retirement)
+//     is issued while the anchor is unreaped, so it always targets this group
+//     and never a recycled pgid, retiring any backgrounded child that outlived
+//     the leader whether or not it still holds the output pipe.
+//
+// It returns the combined output, whether the deadline fired, and the leader's
+// run error.
 func runInOwnedGroup(t *testing.T, timeout time.Duration, name string, env []string, dir string, args ...string) (out []byte, timedOut bool, err error) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(t.Context(), timeout)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, name, args...) //nolint:gosec // G204: the binary and arguments are chosen by this suite.
-	cmd.Env = env
-	cmd.Dir = dir
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.WaitDelay = 5 * time.Second
-	cmd.Cancel = func() error {
-		if cmd.Process == nil {
-			return nil
-		}
-		// Setpgid made the child a group leader (pgid == pid); signal the whole
-		// group so descendants die with it. The leader is still unreaped here
-		// (Wait has not returned), so the pgid cannot have been recycled.
-		if killErr := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); killErr != nil && !errors.Is(killErr, syscall.ESRCH) {
-			return killErr
-		}
-		return nil
+	// context.Background, not a cancel context: this owner manages the whole
+	// lifecycle itself, so no CommandContext watcher can signal the pid outside
+	// it (C2-M1).
+	leader := exec.CommandContext(context.Background(), name, args...) //nolint:gosec // G204: the binary and arguments are chosen by this suite.
+	leader.Env = env
+	leader.Dir = dir
+	leader.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	pipeR, pipeW, pipeErr := os.Pipe()
+	if pipeErr != nil {
+		t.Fatalf("owned-group pipe: %v", pipeErr)
 	}
-	out, err = cmd.CombinedOutput()
-	timedOut = ctx.Err() != nil
-	// Retire the owned group unconditionally: after a normal leader exit a
-	// backgrounded child may survive, and cmd.Cancel did not fire, so signal the
-	// group (it is non-empty exactly when such a child survives; ESRCH when
-	// already empty) and wait for it to drain within the poll bound.
-	if cmd.Process != nil {
-		pgid := cmd.Process.Pid
-		if safeToSignalGroup(pgid, syscall.Getpgrp()) {
-			if killErr := syscall.Kill(-pgid, syscall.SIGKILL); killErr != nil && !errors.Is(killErr, syscall.ESRCH) {
-				t.Logf("retire owned process group %d: %v", pgid, killErr)
-			}
-			if !waitUntil(func() bool { return errors.Is(syscall.Kill(-pgid, 0), syscall.ESRCH) }) {
-				t.Errorf("owned process group %d still had members after teardown", pgid)
-			}
+	leader.Stdout = pipeW
+	leader.Stderr = pipeW
+	if startErr := leader.Start(); startErr != nil {
+		closeOrLog(t, "owned-group pipe read end", pipeR)
+		closeOrLog(t, "owned-group pipe write end", pipeW)
+		t.Fatalf("start owned-group leader: %v", startErr)
+	}
+	pgid := leader.Process.Pid
+	closeOrLog(t, "owned-group pipe write end", pipeW) // our copy; the leader and its children hold the write end now
+
+	var buf bytes.Buffer
+	var copyErr error
+	readDone := make(chan struct{})
+	go func() {
+		_, copyErr = io.Copy(&buf, pipeR)
+		close(readDone)
+	}()
+
+	anchor, anchorErr := startAnchor(pgid)
+	if anchorErr != nil {
+		// The command exited before the anchor could join its group; retire the
+		// leader (still ours and unreaped) and report inconclusive.
+		if killErr := syscall.Kill(-pgid, syscall.SIGKILL); killErr != nil && !errors.Is(killErr, syscall.ESRCH) {
+			t.Logf("kill unanchored owned-group leader %d: %v", pgid, killErr)
+		}
+		if werr := leader.Wait(); werr != nil {
+			t.Logf("reap unanchored owned-group leader %d: %v", pgid, werr)
+		}
+		<-readDone // the dead leader closed the write end, so the reader drains
+		closeOrLog(t, "owned-group pipe read end", pipeR)
+		t.Fatalf("anchor could not join the owned group %d (command exited at once?): %v", pgid, anchorErr)
+	}
+
+	leaderExited := make(chan error, 1)
+	go func() { leaderExited <- leader.Wait() }() // the single owner of the leader reap
+
+	select {
+	case err = <-leaderExited:
+		// Normal exit; the leader is reaped. The anchor still pins the group.
+	case <-time.After(timeout):
+		timedOut = true
+		// Leave the leader for the single SIGKILL below to terminate and its
+		// owning goroutine to reap.
+	}
+
+	// Exactly one group SIGKILL, issued while the anchor is unreaped so it is
+	// pinned to this group: it terminates a still-running leader (timeout path)
+	// and any backgrounded child that outlived the leader (normal-exit path).
+	if safeToSignalGroup(pgid, syscall.Getpgrp()) {
+		if killErr := syscall.Kill(-pgid, syscall.SIGKILL); killErr != nil && !errors.Is(killErr, syscall.ESRCH) {
+			t.Logf("retire owned group %d: %v", pgid, killErr)
+		}
+	} else {
+		t.Errorf("refusing to signal unsafe process group %d", pgid)
+	}
+	if timedOut {
+		err = <-leaderExited // the SIGKILL unblocked the leader's Wait
+	}
+	if awErr := anchor.Wait(); awErr != nil {
+		var exitErr *exec.ExitError
+		if !errors.As(awErr, &exitErr) {
+			t.Logf("reap owned-group anchor %d: %v", pgid, awErr)
 		}
 	}
-	return out, timedOut, err
+	// All group members are dead, so the pipe's write ends are closed and the
+	// reader reaches EOF; drain it, then close the read end.
+	<-readDone
+	if copyErr != nil {
+		t.Logf("owned-group output copy: %v", copyErr)
+	}
+	closeOrLog(t, "owned-group pipe read end", pipeR)
+	if !waitUntil(func() bool { return errors.Is(syscall.Kill(-pgid, 0), syscall.ESRCH) }) {
+		t.Errorf("owned process group %d still had members after teardown", pgid)
+	}
+	return buf.Bytes(), timedOut, err
+}
+
+// closeOrLog closes c, logging a non-nil error against name.
+func closeOrLog(t *testing.T, name string, c io.Closer) {
+	t.Helper()
+	if err := c.Close(); err != nil {
+		t.Logf("close %s: %v", name, err)
+	}
 }
 
 // requireShell skips the calling test with an explicit reason when the given
