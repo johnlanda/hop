@@ -353,9 +353,20 @@ func (c *Controller) closePaneOperation(ctx context.Context, handle RunHandle, d
 	}
 
 	// The occupant is the recorded target: capture scrollback evidence (it
-	// vanishes with the pane), then close, then record the dispatch.
-	c.capturePaneScrollback(ctx, handle, detail, opID, target.PaneID)
-	if closeErr := c.Runtime.ClosePane(ctx, target.PaneID); closeErr != nil {
+	// vanishes with the pane), revalidate once more immediately before the
+	// mutation — capture takes time, and a controller fenced or stopped
+	// during it must not go on to close — then close under the cancelable
+	// act context and record the dispatch.
+	if err := c.capturePaneScrollback(ctx, handle, detail, opID, target.PaneID); err != nil {
+		return false, "", err
+	}
+	if err := c.revalidateForDispatch(ctx, handle, true); err != nil {
+		return false, "", err
+	}
+	actCtx, release := handle.actContext(ctx)
+	closeErr := c.Runtime.ClosePane(actCtx, target.PaneID)
+	release()
+	if closeErr != nil {
 		return false, "", fmt.Errorf("app: close pane %s: %w", target.PaneID, closeErr)
 	}
 	if err := c.recordCloseDispatched(ctx, handle, opID, target); err != nil {
@@ -414,26 +425,33 @@ func (c *Controller) findOrCreateCloseOperation(ctx context.Context, handle RunH
 	return opID, nil
 }
 
-// capturePaneScrollback reads the pane's scrollback and stores it as a run
-// artifact before a close: scrollback vanishes with the pane. Capture is
-// evidence, not a gate — a failed read or write never blocks the close,
-// which the stop still owes the run.
-func (c *Controller) capturePaneScrollback(ctx context.Context, handle RunHandle, detail RunDetail, opID identity.OperationID, paneID string) { //nolint:gocritic // hugeParam: RunHandle and RunDetail are per-call DTOs; called once per close.
-	content, readErr := c.Runtime.ReadPane(ctx, paneID, paneScrollbackLines)
+// capturePaneScrollback reads the pane's scrollback under the cancelable
+// act context and stores it as a run artifact before a close: scrollback
+// vanishes with the pane. A failed read or write is evidence lost, not a
+// gate — the close the stop owes the run still proceeds — but a REFUSED
+// evidence commit (a fenced or expired lease) is returned: a superseded
+// controller must not go on to dispatch the close.
+func (c *Controller) capturePaneScrollback(ctx context.Context, handle RunHandle, detail RunDetail, opID identity.OperationID, paneID string) error { //nolint:gocritic // hugeParam: RunHandle and RunDetail are per-call DTOs; called once per close.
+	actCtx, release := handle.actContext(ctx)
+	content, readErr := c.Runtime.ReadPane(actCtx, paneID, paneScrollbackLines)
+	release()
 	if readErr != nil || detail.StateRoot == "" {
-		return
+		return nil //nolint:nilerr // a lost scrollback read is missing evidence, never a reason to leave the worker running.
 	}
 	path := filepath.Join(detail.StateRoot, "runs", handle.runID.String(), "artifacts", fmt.Sprintf("pane-scrollback-%s.txt", opID))
 	if writeErr := c.Artifacts.WriteArtifact(ctx, path, []byte(content)); writeErr != nil {
-		return
+		return nil //nolint:nilerr // a lost scrollback write is missing evidence, never a reason to leave the worker running.
 	}
-	_ = c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error { //nolint:errcheck // best-effort evidence row; the capture itself succeeded and the close proceeds either way.
+	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 		artifactID, err := identity.ParseArtifactID(c.IDs.NewID())
 		if err != nil {
 			return err
 		}
 		return uow.Artifacts().Save(ctx, run.NewArtifact(artifactID, handle.runID, run.ArtifactPaneSnapshot, path, sha256Hex(content)))
-	})
+	}); err != nil {
+		return fmt.Errorf("app: record scrollback evidence: %w", err)
+	}
+	return nil
 }
 
 // recordCloseDispatched journals the close dispatch as act evidence and —

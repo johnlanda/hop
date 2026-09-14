@@ -176,3 +176,86 @@ func TestDetach(t *testing.T) {
 		t.Fatalf("generation after reacquire = %d, want %d", resumed.Generation, releasedGeneration+1)
 	}
 }
+
+// TestDispatchCancellationDuringEvidenceWork proves the remaining B-side
+// dispatch windows: a takeover during scrollback capture aborts the close
+// before it is dispatched, and a failed heartbeat cancels an in-flight
+// checkout materialization — no mutation continues after cancellation or
+// fencing.
+func TestDispatchCancellationDuringEvidenceWork(t *testing.T) {
+	t.Run("takeover during scrollback capture: the close is never dispatched", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		handle, detail := runningRun(t, tc)
+		if err := tc.Controller.RequestStop(context.Background(), detail.RunID.String()); err != nil {
+			t.Fatalf("RequestStop() error = %v", err)
+		}
+		// B takes the lease over while A is blocked reading the pane's
+		// scrollback, after A's pre-close revalidation already passed once.
+		tc.Runtime.ReadPaneFn = func(string, int) (string, error) {
+			tc.Clock.Advance(leaseTTL + time.Second)
+			if _, err := tc.Store.AcquireLease(context.Background(), detail.RunID, "controller-B"); err != nil {
+				t.Errorf("AcquireLease() (B) error = %v", err)
+			}
+			return "captured scrollback", nil
+		}
+
+		_, err := tc.Controller.DriveStop(context.Background(), handle)
+		if !errors.Is(err, app.ErrFenced) {
+			t.Fatalf("DriveStop() error = %v, want ErrFenced from the post-capture revalidation", err)
+		}
+		if len(tc.Runtime.ClosedPanes) != 0 {
+			t.Fatalf("ClosePane was dispatched by the superseded controller: %v", tc.Runtime.ClosedPanes)
+		}
+	})
+
+	t.Run("heartbeat failure cancels an in-flight checkout materialization", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		handle, detail := runningRun(t, tc)
+		if _, err := tc.Controller.SubmitResult(context.Background(), defaultSubmitRequest(detail)); err != nil {
+			t.Fatalf("SubmitResult() error = %v", err)
+		}
+
+		started := make(chan struct{})
+		canceled := make(chan struct{})
+		tc.Commands.RunHook = func(ctx context.Context, cmd app.Command) (app.CommandResult, bool, error) {
+			for _, tok := range cmd.Argv {
+				if tok == "add" {
+					close(started)
+					<-ctx.Done()
+					close(canceled)
+					return app.CommandResult{}, true, ctx.Err()
+				}
+			}
+			return app.CommandResult{}, false, nil
+		}
+
+		done := make(chan error, 1)
+		go func() {
+			_, err := tc.Controller.ClaimAndRunCheck(context.Background(), handle, "/usr/local/bin/hop", nil)
+			done <- err
+		}()
+		<-started
+
+		tc.Clock.Advance(leaseTTL + time.Second)
+		if _, err := tc.Store.AcquireLease(context.Background(), detail.RunID, "controller-B"); err != nil {
+			t.Fatalf("AcquireLease() (B) error = %v", err)
+		}
+		if err := tc.Controller.Heartbeat(context.Background(), handle); !errors.Is(err, app.ErrFenced) {
+			t.Fatalf("Heartbeat() error = %v, want ErrFenced", err)
+		}
+
+		select {
+		case <-canceled:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("in-flight materialization was not canceled by the failed heartbeat")
+		}
+		if err := <-done; err == nil {
+			t.Fatalf("ClaimAndRunCheck() succeeded despite the canceled materialization and fenced lease")
+		}
+		for _, cmd := range tc.Commands.Calls {
+			if len(cmd.Argv) >= 2 && cmd.Argv[1] == "check-exec" {
+				t.Fatalf("hop check-exec was spawned after the canceled materialization")
+			}
+		}
+	})
+}

@@ -31,6 +31,10 @@ type fakeRuntime struct {
 
 	InspectPaneFn func(paneID string) (app.PaneProcess, error)
 
+	// ReadPaneFn, when set, handles ReadPane; a test can take the lease
+	// over mid-capture through it.
+	ReadPaneFn func(paneID string, lines int) (string, error)
+
 	ClosePaneErr error
 	ClosedPanes  []string
 
@@ -119,9 +123,15 @@ func (r *fakeRuntime) SendText(_ context.Context, paneID, text string) error {
 	return nil
 }
 
-func (r *fakeRuntime) ReadPane(_ context.Context, paneID string, _ int) (string, error) {
+func (r *fakeRuntime) ReadPane(_ context.Context, paneID string, lines int) (string, error) {
 	if err := r.store.refuseInsideTransaction("Runtime.ReadPane"); err != nil {
 		return "", err
+	}
+	r.mu.Lock()
+	fn := r.ReadPaneFn
+	r.mu.Unlock()
+	if fn != nil {
+		return fn(paneID, lines)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -206,6 +216,10 @@ type fakeCommands struct {
 	// commands keep their scripted defaults.
 	CheckExecFn func(ctx context.Context, cmd app.Command) (app.CommandResult, error)
 
+	// RunHook, when set, is consulted first for every command with the act
+	// context; handled=false falls through to the scripted defaults.
+	RunHook func(ctx context.Context, cmd app.Command) (result app.CommandResult, handled bool, err error)
+
 	// CheckExecExitCode and CheckExecErr script the hop check-exec spawn
 	// specifically, matched by argv[1] == "check-exec" rather than by exact
 	// argv text, since its argv always includes a freshly generated
@@ -223,6 +237,17 @@ func (*fakeCommands) key(cmd app.Command) string { return strings.Join(cmd.Argv,
 func (c *fakeCommands) Run(ctx context.Context, cmd app.Command) (app.CommandResult, error) {
 	if err := c.store.refuseInsideTransaction("CommandRunner.Run"); err != nil {
 		return app.CommandResult{}, err
+	}
+	c.mu.Lock()
+	hook := c.RunHook
+	c.mu.Unlock()
+	if hook != nil {
+		if result, handled, err := hook(ctx, cmd); handled {
+			c.mu.Lock()
+			c.Calls = append(c.Calls, cmd)
+			c.mu.Unlock()
+			return result, err
+		}
 	}
 	c.mu.Lock()
 	c.Calls = append(c.Calls, cmd)

@@ -89,25 +89,30 @@ func (c *Controller) ClaimAndRunCheck(ctx context.Context, handle RunHandle, hop
 	}
 	checkoutPath := checkExecutionCheckoutPath(frozen.Snapshot.StateRoot, handle.runID, opID)
 
+	// Every external act from here on — candidate inspection, checkout
+	// materialization, the spawn and any cleanup — runs under the handle's
+	// cancelable act context, so a failed heartbeat or detach cancels it,
+	// with revalidation immediately before each mutation.
+	actCtx, release := handle.actContext(ctx)
+	defer release()
 	if err := c.revalidateForDispatch(ctx, handle, false); err != nil {
 		return CheckReport{}, fmt.Errorf("app: revalidate before check checkout: %w", err)
 	}
-	if rejectDetail, rejectErr := c.rejectSubmoduleCandidate(ctx, frozen.RepositoryRoot, commitOID); rejectErr != nil {
+	if rejectDetail, rejectErr := c.rejectSubmoduleCandidate(actCtx, frozen.RepositoryRoot, commitOID); rejectErr != nil {
 		return c.recordCheckOutcome(ctx, handle, opID, checkRequest, checkRunOutcome{Unknown: true, Detail: rejectErr.Error()}, false, rejectErr)
 	} else if rejectDetail != "" {
 		return c.recordCheckOutcome(ctx, handle, opID, checkRequest, checkRunOutcome{ExitCode: 1, Detail: rejectDetail}, false, nil)
 	}
-	if err := c.materializeCheckout(ctx, frozen.RepositoryRoot, checkoutPath, commitOID); err != nil {
+	if err := c.materializeCheckout(actCtx, frozen.RepositoryRoot, checkoutPath, commitOID); err != nil {
 		return c.recordCheckOutcome(ctx, handle, opID, checkRequest, checkRunOutcome{Unknown: true, Detail: err.Error()}, false, fmt.Errorf("materialize checkout: %w", err))
 	}
-	defer c.removeCheckout(ctx, frozen.RepositoryRoot, checkoutPath)
+	defer c.removeCheckout(ctx, handle, frozen.RepositoryRoot, checkoutPath)
 
 	spawnEnv = withHOPStateDir(spawnEnv, frozen.Snapshot.StateRoot)
 	spawnArgv := checkSpawnArgv(hopPath, opID, frozen.Snapshot.CheckArgv)
 	if err := c.revalidateForDispatch(ctx, handle, false); err != nil {
 		return CheckReport{}, fmt.Errorf("app: revalidate before check spawn: %w", err)
 	}
-	actCtx, release := handle.actContext(ctx)
 	timeout := frozen.Snapshot.CheckTimeout
 	if timeout <= 0 {
 		timeout = 10 * time.Minute
@@ -115,7 +120,6 @@ func (c *Controller) ClaimAndRunCheck(ctx context.Context, handle RunHandle, hop
 	boundedCtx, cancel := context.WithTimeout(actCtx, timeout)
 	cmdResult, runErr := c.Commands.Run(boundedCtx, Command{Argv: spawnArgv, Dir: checkoutPath, Env: spawnEnv})
 	cancel()
-	release()
 	if runErr != nil {
 		// The spawn's result is unknowable here: the child may never have
 		// started, or may have started and been lost. Ambiguous — the
@@ -559,9 +563,17 @@ func (c *Controller) materializeCheckout(ctx context.Context, repositoryRoot, ch
 }
 
 // removeCheckout removes the detached checkout after evidence capture;
-// outputs under the operation's own directory stay.
-func (c *Controller) removeCheckout(ctx context.Context, repositoryRoot, checkoutPath string) {
-	_, _ = c.runGit(ctx, repositoryRoot, "worktree", "remove", "--force", checkoutPath) //nolint:errcheck // best-effort cleanup; a leaked checkout is evidence, not corruption, since executions never share paths.
+// outputs under the operation's own directory stay. Cleanup is itself a
+// mutation: it revalidates the dispatch first and never runs after a
+// fenced, expired or stop-requested lease — a leaked checkout is
+// evidence-safe, an unauthorized mutation is not.
+func (c *Controller) removeCheckout(ctx context.Context, handle RunHandle, repositoryRoot, checkoutPath string) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per execution.
+	if err := c.revalidateForDispatch(ctx, handle, false); err != nil {
+		return
+	}
+	actCtx, release := handle.actContext(ctx)
+	defer release()
+	_, _ = c.runGit(actCtx, repositoryRoot, "worktree", "remove", "--force", checkoutPath) //nolint:errcheck // best-effort cleanup; a leaked checkout is evidence, not corruption, since executions never share paths.
 }
 
 // recordCheckOutcome applies the section 7 outcome transaction: it
