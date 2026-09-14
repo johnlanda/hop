@@ -1184,3 +1184,54 @@ func TestRecoveryBlockingDispositions(t *testing.T) {
 		}
 	})
 }
+
+// TestRetirementTargetImmutability is the M2 second-round scenario: an
+// unresolved positive-evidence close is never retargeted — a restored
+// occupant whose pid changed while it still carries the native marker is
+// not closed under the old row.
+func TestRetirementTargetImmutability(t *testing.T) {
+	tc := newTestController(defaultPolicy())
+	_, detail := runningRun(t, tc)
+	nativeRef := tc.Store.Sessions[detail.SessionID].value.NativeSessionRef
+
+	// Round 1: the restored occupant (pid 7777) is recorded and its
+	// guarded close dispatched; it stays unresolved.
+	tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+		return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 7777, Argv0: "/usr/bin/claude", Argv: []string{"claude", "--resume", nativeRef}}}}, nil
+	}
+	tc.Clock.Advance(leaseTTL + time.Second)
+	if _, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String())); err != nil {
+		t.Fatalf("first Resume() error = %v", err)
+	}
+	if len(tc.Runtime.ClosedPanes) != 1 {
+		t.Fatalf("ClosePane calls after round 1 = %d, want 1", len(tc.Runtime.ClosedPanes))
+	}
+
+	// Round 2: a DIFFERENT process (pid 8888) now occupies the pane, still
+	// carrying the native marker. The persisted target names 7777; the new
+	// occupant must not be closed under that row.
+	tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+		return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 8888, Argv0: "/usr/bin/claude", Argv: []string{"claude", "--resume", nativeRef}}}}, nil
+	}
+	tc.Clock.Advance(leaseTTL + time.Second)
+	result, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String()))
+	if err != nil {
+		t.Fatalf("second Resume() error = %v", err)
+	}
+	if result.Outcome == app.ResumeColdRelaunched {
+		t.Fatalf("Outcome = %s; the changed-pid occupant must not be retired under the old intent", result.Outcome)
+	}
+	if len(tc.Runtime.ClosedPanes) != 1 {
+		t.Fatalf("ClosePane calls after round 2 = %d, want still 1 (no close against the new pid under the old row)", len(tc.Runtime.ClosedPanes))
+	}
+	reconciling := false
+	for id := range tc.Store.Operations {
+		op := tc.Store.Operations[id]
+		if op.Kind == app.OpPaneClose && op.State == app.OperationReconciling {
+			reconciling = true
+		}
+	}
+	if !reconciling {
+		t.Fatalf("the unresolved close was not marked reconciling on the occupant mismatch")
+	}
+}

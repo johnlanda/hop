@@ -402,10 +402,16 @@ const paneScrollbackLines = 500
 // termination. On confirmed retirement the target's current binding is
 // superseded with the observed evidence.
 func (c *Controller) closePaneOperation(ctx context.Context, handle RunHandle, detail RunDetail, target *paneCloseTarget) (retired bool, outstanding string, err error) { //nolint:gocritic // hugeParam: RunHandle and RunDetail are per-call DTOs; this runs once per close round.
-	opID, err := c.findOrCreateCloseOperation(ctx, handle, detail, target)
+	opID, effective, malformed, err := c.findOrCreateCloseOperation(ctx, handle, detail, target)
 	if err != nil {
 		return false, "", err
 	}
+	if malformed != "" {
+		return false, malformed, nil
+	}
+	// The persisted intent's target is authoritative on reuse: an
+	// unresolved close is never retargeted at a newly observed occupant.
+	target = effective
 
 	if err := c.revalidateForDispatch(ctx, handle, true); err != nil {
 		return false, "", err
@@ -461,10 +467,15 @@ func (c *Controller) closePaneOperation(ctx context.Context, handle RunHandle, d
 	return false, "close dispatched; awaiting observed termination", nil
 }
 
-// findOrCreateCloseOperation reuses the pending OpPaneClose operation for
-// the same target when one exists — a close is never re-journaled while
-// unresolved — and otherwise commits a fresh intent.
-func (c *Controller) findOrCreateCloseOperation(ctx context.Context, handle RunHandle, detail RunDetail, target *paneCloseTarget) (identity.OperationID, error) { //nolint:gocritic // hugeParam: RunHandle and RunDetail are per-call DTOs; this runs once per close round.
+// findOrCreateCloseOperation reuses the unresolved OpPaneClose operation
+// for the same pane and incarnation when one exists — a close is never
+// re-journaled while unresolved — and otherwise commits a fresh intent.
+// On reuse the DECODED, VALIDATED persisted target is returned and used
+// in full: the recorded pid, markers, label and reason, never a value
+// derived from the current occupant, so an unresolved close can never be
+// retargeted. A persisted intent that fails validation goes reconciling
+// and is reported as malformed rather than acted on.
+func (c *Controller) findOrCreateCloseOperation(ctx context.Context, handle RunHandle, detail RunDetail, target *paneCloseTarget) (identity.OperationID, *paneCloseTarget, string, error) { //nolint:gocritic // hugeParam: RunHandle and RunDetail are per-call DTOs; this runs once per close round.
 	for i := range detail.PendingOperations {
 		op := &detail.PendingOperations[i]
 		if op.Kind != OpPaneClose {
@@ -472,16 +483,31 @@ func (c *Controller) findOrCreateCloseOperation(ctx context.Context, handle RunH
 		}
 		intent, ok := decodeOperationPayload[paneCloseIntent](op.Intent)
 		if !ok {
+			if markErr := c.markOperationReconciling(ctx, handle, op.ID, "pane.close intent could not be decoded; failing closed"); markErr != nil {
+				return "", nil, "", markErr
+			}
+			return op.ID, nil, fmt.Sprintf("pane.close operation %s has an undecodable intent; failing closed", op.ID), nil
+		}
+		if intent.PaneID != target.PaneID || intent.IncarnationID != target.IncarnationID {
 			continue
 		}
-		if intent.PaneID == target.PaneID && intent.IncarnationID == target.IncarnationID {
-			return op.ID, nil
+		if intent.PID <= 0 || len(intent.ArgvMarkers) == 0 {
+			if markErr := c.markOperationReconciling(ctx, handle, op.ID, "persisted pane.close target is missing its pid or markers; failing closed"); markErr != nil {
+				return "", nil, "", markErr
+			}
+			return op.ID, nil, fmt.Sprintf("pane.close operation %s records an incomplete target; failing closed", op.ID), nil
 		}
+		persisted := &paneCloseTarget{
+			PaneID: intent.PaneID, Label: intent.Label,
+			SessionID: intent.SessionID, IncarnationID: intent.IncarnationID,
+			PID: intent.PID, Markers: intent.ArgvMarkers, Reason: intent.Reason,
+		}
+		return op.ID, persisted, "", nil
 	}
 
 	opID, err := c.newOperationID()
 	if err != nil {
-		return "", err
+		return "", nil, "", err
 	}
 	now := c.Clock.Now()
 	intent := paneCloseIntent{
@@ -496,9 +522,9 @@ func (c *Controller) findOrCreateCloseOperation(ctx context.Context, handle RunH
 			CreatedAt: now, UpdatedAt: now,
 		})
 	}); err != nil {
-		return "", fmt.Errorf("app: record pane.close intent: %w", err)
+		return "", nil, "", fmt.Errorf("app: record pane.close intent: %w", err)
 	}
-	return opID, nil
+	return opID, target, "", nil
 }
 
 // capturePaneScrollback reads the pane's scrollback under the cancelable
