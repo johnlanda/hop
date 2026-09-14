@@ -32,13 +32,15 @@ launched process.
 | `tab.create` | Yes | Supported: the new tab's root pane shell sees the env. Verified. |
 | `pane.split` | Yes | Supported: the new pane's shell sees the env. Verified. |
 | `layout.apply` pane nodes | Yes (per pane node) | Supported by schema; a declarative tab can set per-pane env. Not exercised in the current suite. |
-| `worktree.create` | No | Unsupported at the request: it has no env field. Open a tab or pane **inside** the worktree with env, then `agent.start` there. |
+| `worktree.create` | No | Unsupported at the request: it has no env field. Open a tab or pane **inside** the worktree with env, then run `hop launch` there through the pane text transport (see [Current policy](#current-policy)). |
 | `agent.start` | No | Unsupported: it has no env field. The env must already be on the shell before the harness starts. |
 
-For a worker in a new worktree, the supported path is therefore:
-`worktree.create` (no env) → open a tab or split a pane in that worktree with
-the launch env → `agent.start` in that pane. Each of the env-carrying steps is
-one of the supported rows above.
+For a worker in a new worktree, the env-carrying part of the path is
+therefore: `worktree.create` (no env) → open a tab or split a pane in that
+worktree with the launch env. Each of those steps is one of the supported
+rows above. What runs inside that pane is not `agent.start` — see
+[Current policy](#current-policy) below, which the additive-only limitation
+in the next section motivates.
 
 ## The additive-only limitation
 
@@ -62,6 +64,17 @@ that fixes the environment immediately before exec'ing the harness. The
 as a precondition for account-correct launches and marks recipes that rely
 only on the additive env map as conditional until such a launcher is verified
 end to end.
+
+## Current policy
+
+HOP's actual worker-launch path does not call `agent.start`. It opens a tab
+or pane with the launch env (one of the supported rows above), then runs the
+sanitizing launcher there as a plain command — not through `agent.start`'s
+harness-kind launch — which strips credential variables, applies the
+resolved profile env, and execs the harness. `agent.start` is not part of
+this path; see [architecture](architecture.md) and
+[native harness compatibility](native-harness-compat.md) for the launcher
+and the profile decision it applies.
 
 ## What this does not cover
 
