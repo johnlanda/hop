@@ -175,25 +175,6 @@ func (s *testServer) agentTokens(t *testing.T) map[string]map[string]string {
 	return tokens
 }
 
-// agentStatus returns the effective agent status Herdr reports for one pane,
-// or "" when the pane is not a recognized agent.
-func (s *testServer) agentStatus(t *testing.T, paneID string) app.AgentStatus {
-	t.Helper()
-	var result struct {
-		Agents []struct {
-			PaneID      string `json:"pane_id"`
-			AgentStatus string `json:"agent_status"`
-		} `json:"agents"`
-	}
-	s.call(t, "agent.list", nil, &result)
-	for _, agent := range result.Agents {
-		if agent.PaneID == paneID {
-			return app.AgentStatus(agent.AgentStatus)
-		}
-	}
-	return ""
-}
-
 // viewInfo is the agent view state Herdr reports.
 type viewInfo struct {
 	Active bool   `json:"active"`

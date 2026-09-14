@@ -1,7 +1,6 @@
 package integration
 
 import (
-	"context"
 	"strings"
 	"testing"
 	"time"
@@ -54,50 +53,12 @@ func TestRealProcessEventObservationReconcile(t *testing.T) {
 	}
 }
 
-// TestRealProcessReconcileLoop exercises app.Reconcile end to end against the
-// real normalized adapter: it subscribes, snapshots, drains and returns the
-// reconciled state on a bounded-deadline cancellation, with no error and the
-// fixture's implementer present with a real observed status. This drives the
-// whole Reconcile loop through the real Herdr subscription and snapshot; the
-// drain-on-cancel folding of buffered events is proven deterministically by
-// the unit test with a controlled observer, which no live timing can
-// reproduce reliably here. The exact status is not asserted, since a live
-// server's snapshot and agent.list can report a transient status differently.
-func TestRealProcessReconcileLoop(t *testing.T) {
-	server := prepareServer(t, newArtifactDir(t))
-	server.start(t)
-	fixture := server.createRunFixture(t)
-	if !waitUntil(func() bool { return server.agentStatus(t, fixture.implementer) != "" }) {
-		t.Fatal("fixture implementer never became a recognized agent")
-	}
-	observer := herdr.NewObserver(server.socketPath, fixture.implementer)
-
-	// A short deadline ends the drain; Reconcile subscribes and snapshots
-	// first, so it returns the reconciled snapshot state.
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
-	defer cancel()
-
-	result, err := app.Reconcile(ctx, observer)
-	if err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-	observation, present := result.State[fixture.implementer]
-	if !present {
-		t.Fatalf("reconciled state has no entry for the implementer pane %s", fixture.implementer)
-	}
-	if !validStatus(observation.Status) {
-		t.Errorf("reconciled implementer status = %q, want a real observed status", observation.Status)
-	}
-}
-
-// validStatus reports whether s is one of Herdr's effective agent statuses.
-func validStatus(s app.AgentStatus) bool {
-	switch s {
-	case app.StatusIdle, app.StatusWorking, app.StatusBlocked, app.StatusDone, app.StatusUnknown:
-		return true
-	}
-	return false
-}
+// The Reconcile loop is exercised end to end against the REAL Observer, Client
+// and Reconcile — with a controlled fake endpoint and an exact cancellation
+// cutoff — in internal/adapters/herdr's TestReconcileFoldsRawBufferedEventsOnCancellation.
+// A live-server variant was removed: with a real socket its bounded deadline
+// races the socket read deadline, and it asserted nothing a mutation could
+// fail, so it was not evidence.
 
 // TestRealProcessOptionalMetadataClears proves that publishing a display with
 // an optional field now unset removes that token in Herdr, rather than

@@ -348,23 +348,33 @@ func (s *testServer) stop(t *testing.T) {
 	killProcessGroupThenReap(t, s.cmd, s.pgid, syscall.Getpgrp())
 }
 
-// killProcessGroupThenReap SIGKILLs the process group identified by pgid and
-// then reaps the leader with Wait. The order matters: the leader is signaled
-// while it is still unreaped, so pgid cannot have been recycled onto an
-// unrelated process, and only the group the suite owns is ever signaled.
+// killProcessGroupThenReap SIGKILLs the process group identified by pgid,
+// reaps the leader with Wait, and then waits until the whole group is gone.
+// The order matters: the leader is signaled while it is still unreaped, so
+// pgid cannot have been recycled onto an unrelated process, and only the group
+// the suite owns is ever signaled. Waiting for the group to empty matters for
+// cleanup: a pane-shell descendant, reparented to init after its SIGKILL,
+// still holds inherited file descriptors on the server logs in the artifact
+// directory until init reaps it, so removing that directory before the group
+// is empty could race those writers.
 func killProcessGroupThenReap(t *testing.T, cmd *exec.Cmd, pgid, ownGroup int) {
 	t.Helper()
-	if safeToSignalGroup(pgid, ownGroup) {
-		if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-			t.Logf("kill process group %d: %v", pgid, err)
-		}
-	} else {
+	if !safeToSignalGroup(pgid, ownGroup) {
 		t.Errorf("refusing to signal unsafe process group %d", pgid)
+		return
 	}
-	// Reap the leader last. A SIGKILLed process reports a signal error, which
-	// is expected here.
+	if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		t.Logf("kill process group %d: %v", pgid, err)
+	}
+	// Reap the leader. A SIGKILLed process reports a signal error, expected.
 	if err := cmd.Wait(); err != nil {
 		t.Logf("herdr server exited: %v", err)
+	}
+	// Wait until no process remains in the group: signal 0 to the group
+	// returns ESRCH only once every member, including reparented descendants,
+	// has exited and been reaped.
+	if !waitUntil(func() bool { return errors.Is(syscall.Kill(-pgid, 0), syscall.ESRCH) }) {
+		t.Logf("process group %d still had members after the deadline", pgid)
 	}
 }
 
