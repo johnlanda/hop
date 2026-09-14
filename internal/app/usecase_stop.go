@@ -265,7 +265,7 @@ func (c *Controller) markOperationReconciling(ctx context.Context, handle RunHan
 // (or there is provably nothing to retire), or the outstanding detail.
 func (c *Controller) retireWorker(ctx context.Context, handle RunHandle, detail RunDetail) (string, error) { //nolint:gocritic // hugeParam: RunHandle and RunDetail are per-call DTOs; this runs once per stop round.
 	if detail.Binding == nil || detail.Binding.PaneID == "" {
-		return "", nil
+		return c.retireUnboundLaunch(ctx, handle, detail)
 	}
 	if detail.Claim == nil {
 		// A binding with no claim: the pane may hold a pre-claim launcher.
@@ -301,6 +301,82 @@ func (c *Controller) retireWorker(ctx context.Context, handle RunHandle, detail 
 		PID:           detail.Claim.PID,
 		Markers:       markers,
 		Reason:        closeReasonStop,
+	}
+	retired, outstanding, err := c.closePaneOperation(ctx, handle, detail, &target)
+	if err != nil {
+		return "", err
+	}
+	if retired {
+		return "", nil
+	}
+	return outstanding, nil
+}
+
+// retireUnboundLaunch retires a launch whose pane act may have happened
+// but whose binding was never committed: the pending pane.open (or
+// launch.send) intent and any pre-binding claim decide, per the
+// decision table's launch row. The pane is recovered by its unique
+// creation label and closed under the shared procedure; an unobserved
+// pre-claim window — or a claimed process with no observable pane — stays
+// outstanding, because a launch that may still be in flight is never
+// absence and a stop must not report stopped over it.
+func (c *Controller) retireUnboundLaunch(ctx context.Context, handle RunHandle, detail RunDetail) (string, error) { //nolint:gocritic // hugeParam: RunHandle and RunDetail are per-call DTOs; this runs once per stop round.
+	op, intent, found := newestPendingPaneOpen(detail.PendingOperations)
+	if !found {
+		return "", nil
+	}
+	if detail.Claim == nil {
+		return fmt.Sprintf("launch operation %s is unresolved with no claim; the launch may still be in flight — failing closed", op.ID), nil
+	}
+	if detail.Claim.State == LaunchClaimExecFailed {
+		// The exec failed and the launcher exited; nothing is live for
+		// this incarnation.
+		return "", nil
+	}
+
+	// A close already journaled for this incarnation is re-driven against
+	// its persisted target — never re-derived — and completes on the
+	// strict absence rule even when no pane answers for the label any
+	// more.
+	for i := range detail.PendingOperations {
+		pendingClose := &detail.PendingOperations[i]
+		if pendingClose.Kind != OpPaneClose {
+			continue
+		}
+		persisted, ok := decodeOperationPayload[paneCloseIntent](pendingClose.Intent)
+		if !ok || persisted.IncarnationID != intent.IncarnationID {
+			continue
+		}
+		target := paneCloseTarget{
+			PaneID: persisted.PaneID, Label: persisted.Label,
+			SessionID: persisted.SessionID, IncarnationID: persisted.IncarnationID,
+			PID: persisted.PID, Markers: persisted.ArgvMarkers, Reason: persisted.Reason,
+		}
+		retired, outstanding, closeErr := c.closePaneOperation(ctx, handle, detail, &target)
+		if closeErr != nil {
+			return "", closeErr
+		}
+		if retired {
+			return "", nil
+		}
+		return outstanding, nil
+	}
+
+	ref, foundPane, err := c.Runtime.FindPaneByLabel(ctx, intent.Label)
+	if err != nil {
+		return fmt.Sprintf("pane label lookup failed (%v); failing closed", err), nil
+	}
+	if !foundPane {
+		return fmt.Sprintf("no pane answers for launch label %s while claim pid %d is unobserved; failing closed", intent.Label, detail.Claim.PID), nil
+	}
+	markers, err := c.launchMarkers(ctx, handle, detail)
+	if err != nil {
+		return "", err
+	}
+	target := paneCloseTarget{
+		PaneID: ref.PaneID, Label: intent.Label,
+		SessionID: intent.SessionID, IncarnationID: intent.IncarnationID,
+		PID: detail.Claim.PID, Markers: markers, Reason: closeReasonStop,
 	}
 	retired, outstanding, err := c.closePaneOperation(ctx, handle, detail, &target)
 	if err != nil {

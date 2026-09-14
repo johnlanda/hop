@@ -424,3 +424,99 @@ func TestStopAbsenceRule(t *testing.T) {
 		t.Fatalf("final report = %+v, want terminated once absence is established", final)
 	}
 }
+
+// TestStopUnboundLaunch covers the crash window where OpenWorkerPane
+// created a worker pane but the binding commit was lost: stop must
+// recover the pane by its creation label and retire the claimed process,
+// never reporting stopped while it lives; without a claim the unresolved
+// launch window stays outstanding.
+func TestStopUnboundLaunch(t *testing.T) {
+	loseBinding := func(t *testing.T, tc *testController) string {
+		t.Helper()
+		tc.Store.Bindings = map[identity.SessionID][]run.RuntimeBinding{}
+		label := ""
+		for id, op := range tc.Store.Operations {
+			if op.Kind == app.OpPaneOpen {
+				op.State = app.OperationPending
+				op.ActEvidence = nil
+				tc.Store.Operations[id] = op
+				label = id.String()
+			}
+		}
+		return label
+	}
+
+	t.Run("live pre-binding claim: recovered by label, closed, stopped only on observed absence", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		handle, started := startedRun(t, tc)
+		claimLaunch(t, tc, started, 4242)
+		label := loseBinding(t, tc)
+		detail, err := tc.Store.LoadRunStatus(context.Background(), started.RunID)
+		if err != nil {
+			t.Fatalf("LoadRunStatus() error = %v", err)
+		}
+		if detail.Binding != nil || detail.Claim == nil {
+			t.Fatalf("fixture: want a pre-binding claim with no binding, got binding=%v claim=%v", detail.Binding, detail.Claim)
+		}
+		tc.Runtime.FindPaneByLabelFn = func(l string) (app.PaneRef, bool, error) {
+			if l == label {
+				return app.PaneRef{WorkspaceID: "workspace-1", TabID: "tab-9", PaneID: "pane-9"}, true, nil
+			}
+			return app.PaneRef{}, false, nil
+		}
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "/usr/bin/hop", Argv: []string{"hop", "launch", "--attempt", started.AttemptID.String()}}}}, nil
+		}
+
+		if stopErr := tc.Controller.RequestStop(context.Background(), started.RunID.String()); stopErr != nil {
+			t.Fatalf("RequestStop() error = %v", stopErr)
+		}
+		report, err := tc.Controller.DriveStop(context.Background(), handle)
+		if err != nil {
+			t.Fatalf("DriveStop() error = %v", err)
+		}
+		if report.Terminated {
+			t.Fatalf("report = %+v; the run must not report stopped while the unbound worker lives", report)
+		}
+		if len(tc.Runtime.ClosedPanes) != 1 || tc.Runtime.ClosedPanes[0] != "pane-9" {
+			t.Fatalf("ClosedPanes = %v, want the label-recovered pane closed once", tc.Runtime.ClosedPanes)
+		}
+
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			return app.PaneProcess{}, app.ErrPaneNotFound
+		}
+		tc.Runtime.FindPaneByLabelFn = func(string) (app.PaneRef, bool, error) {
+			return app.PaneRef{}, false, nil
+		}
+		final, err := tc.Controller.DriveStop(context.Background(), handle)
+		if err != nil {
+			t.Fatalf("second DriveStop() error = %v", err)
+		}
+		if !final.Terminated || final.RunState != string(run.RunStopped) {
+			t.Fatalf("final report = %+v, want terminated/stopped after observed absence", final)
+		}
+	})
+
+	t.Run("unresolved launch with no claim: outstanding, never closed, never stopped", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		handle, started := startedRun(t, tc)
+		loseBinding(t, tc)
+
+		if stopErr := tc.Controller.RequestStop(context.Background(), started.RunID.String()); stopErr != nil {
+			t.Fatalf("RequestStop() error = %v", stopErr)
+		}
+		report, driveErr := tc.Controller.DriveStop(context.Background(), handle)
+		if driveErr != nil {
+			t.Fatalf("DriveStop() error = %v", driveErr)
+		}
+		if report.Terminated {
+			t.Fatalf("report = %+v; an unobserved pre-claim launch window is never absence", report)
+		}
+		if len(report.Outstanding) == 0 {
+			t.Fatalf("report = %+v, want the unresolved launch named outstanding", report)
+		}
+		if len(tc.Runtime.ClosedPanes) != 0 {
+			t.Fatalf("ClosePane was dispatched with no recorded identity: %v", tc.Runtime.ClosedPanes)
+		}
+	})
+}
