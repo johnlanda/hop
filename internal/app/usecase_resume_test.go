@@ -487,7 +487,7 @@ func TestResumeRounds(t *testing.T) {
 		if submitted, submitErr := tc.Controller.SubmitResult(context.Background(), defaultSubmitRequest(detail)); submitErr != nil || submitted.Kind != string(app.SubmissionAccepted) {
 			t.Fatalf("SubmitResult() = %+v, err %v; want accepted after warm reattach", submitted, submitErr)
 		}
-		report, err := tc.Controller.ClaimAndRunCheck(context.Background(), handle, "/usr/local/bin/hop", "/repo", "/state", []string{"sh", "check.sh"}, false, nil)
+		report, err := tc.Controller.ClaimAndRunCheck(context.Background(), handle, "/usr/local/bin/hop", nil)
 		if err != nil {
 			t.Fatalf("ClaimAndRunCheck() error = %v", err)
 		}

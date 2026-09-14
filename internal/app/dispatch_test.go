@@ -75,7 +75,7 @@ func TestDispatchRevalidation(t *testing.T) {
 
 		done := make(chan error, 1)
 		go func() {
-			_, err := tc.Controller.ClaimAndRunCheck(context.Background(), handle, "/usr/local/bin/hop", "/repo", "/state", []string{"sh", "check.sh"}, false, nil)
+			_, err := tc.Controller.ClaimAndRunCheck(context.Background(), handle, "/usr/local/bin/hop", nil)
 			done <- err
 		}()
 		<-started

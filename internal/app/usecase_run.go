@@ -96,6 +96,16 @@ func (c *Controller) StartRun(ctx context.Context, req StartRunRequest) (StartRu
 	if err != nil {
 		return StartRunResult{}, RunHandle{}, err
 	}
+	// SHA-256-object-format repositories are out of Phase 2 scope and are
+	// refused here, before any side effect: result submission validates
+	// 40-hex object ids and the check pipeline assumes them.
+	objectFormat, err := c.runGit(ctx, req.RepositoryRoot, "rev-parse", "--show-object-format")
+	if err != nil {
+		return StartRunResult{}, RunHandle{}, fmt.Errorf("app: resolve repository object format: %w", err)
+	}
+	if objectFormat != "sha1" {
+		return StartRunResult{}, RunHandle{}, fmt.Errorf("app: repository object format %q is unsupported in Phase 2 (sha1 only)", objectFormat)
+	}
 
 	ids, err := c.generateRunIdentities()
 	if err != nil {

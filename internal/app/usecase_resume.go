@@ -164,6 +164,7 @@ type boundedWaitEvidence struct {
 // pane.close and check.run operations are resolved by their own drivers
 // (DriveStop, retirement and the check use case), never here.
 func (c *Controller) recoverPendingOperations(ctx context.Context, handle RunHandle, detail RunDetail) error { //nolint:gocritic // hugeParam: RunHandle and RunDetail are per-call DTOs; this runs once per resume.
+	var frozen *FrozenRun
 	for i := range detail.PendingOperations {
 		op := &detail.PendingOperations[i]
 		var err error
@@ -172,7 +173,18 @@ func (c *Controller) recoverPendingOperations(ctx context.Context, handle RunHan
 			err = c.recoverWorktreeCreate(ctx, handle, op)
 		case OpPaneOpen, OpLaunchSend:
 			err = c.recoverPaneOpen(ctx, handle, op)
-		case OpPaneClose, OpCheckRun, OpAbsenceAttested:
+		case OpCheckRun:
+			if frozen == nil {
+				loaded, loadErr := c.Read.LoadFrozenRun(ctx, handle.runID)
+				if loadErr != nil {
+					return fmt.Errorf("app: load frozen run: %w", loadErr)
+				}
+				frozen = &loaded
+			}
+			// Takeover reads the check-exec claim and retires its process
+			// group; confirmed absence applies the unknown-outcome rule.
+			_, err = c.recoverCheckExecution(ctx, handle, op, frozen)
+		case OpPaneClose, OpAbsenceAttested:
 			// Resolved by their own drivers; attestations are journal-only.
 		default:
 			err = c.markOperationReconciling(ctx, handle, op.ID, fmt.Sprintf("unknown operation kind %q; failing closed", op.Kind))

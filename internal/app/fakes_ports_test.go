@@ -215,6 +215,8 @@ func (c *fakeCommands) Run(ctx context.Context, cmd app.Command) (app.CommandRes
 		// "/repo" as the default repository root (defaultStartRunRequest),
 		// so the default stub matches that regardless of cmd.Dir.
 		return app.CommandResult{ExitCode: 0, Stdout: []byte("/repo/.git\n")}, nil
+	case strings.Contains(k, "--show-object-format"):
+		return app.CommandResult{ExitCode: 0, Stdout: []byte("sha1\n")}, nil
 	case strings.Contains(k, "rev-parse HEAD"):
 		return app.CommandResult{ExitCode: 0, Stdout: []byte("cccccccccccccccccccccccccccccccccccccccc\n")}, nil
 	case strings.Contains(k, "cat-file -t"):

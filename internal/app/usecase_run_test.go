@@ -128,6 +128,18 @@ func TestStartRun(t *testing.T) {
 		}
 	})
 
+	t.Run("refuses a SHA-256-object-format repository before any side effect", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		tc.Commands.Results["git -C /repo rev-parse --show-object-format"] = app.CommandResult{ExitCode: 0, Stdout: []byte("sha256\n")}
+		_, _, err := tc.Controller.StartRun(context.Background(), defaultStartRunRequest())
+		if err == nil {
+			t.Fatalf("StartRun() accepted an unsupported object format")
+		}
+		if len(tc.Store.Runs) != 0 {
+			t.Fatalf("StartRun() created a run despite the unsupported object format")
+		}
+	})
+
 	t.Run("refuses a HOP path containing a single quote before any side effect", func(t *testing.T) {
 		tc := newTestController(defaultPolicy())
 		req := defaultStartRunRequest()

@@ -367,6 +367,22 @@ func (s *fakeStore) currentBindingByAttemptLocked(attemptID identity.AttemptID) 
 	return "", run.RuntimeBinding{}, false
 }
 
+func (s *fakeStore) LoadFrozenRun(_ context.Context, runID identity.RunID) (app.FrozenRun, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	row, ok := s.Runs[runID]
+	if !ok {
+		return app.FrozenRun{}, fmt.Errorf("%w: run %s", app.ErrNotFound, runID)
+	}
+	root := ""
+	for candidate, id := range s.repoByRoot {
+		if id == row.value.RepositoryID {
+			root = candidate
+		}
+	}
+	return app.FrozenRun{Snapshot: s.Snapshots[runID], RepositoryRoot: root}, nil
+}
+
 func (*fakeStore) LoadLaunchContext(context.Context, identity.RunID, identity.AttemptID) (app.LaunchContext, error) {
 	return app.LaunchContext{}, fmt.Errorf("app_test: LoadLaunchContext is not exercised by the controller (hop launch's own port)")
 }

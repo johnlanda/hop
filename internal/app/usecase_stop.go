@@ -31,6 +31,9 @@ func (c *Controller) RequestStop(ctx context.Context, runIDStr string) error {
 // check-exec invocation that execs it, so a paused pre-exec boundary is
 // retirable too.
 type CheckRunIntent struct {
+	// ResultID ties the execution to the accepted result whose check
+	// request it settles, so recovery can requeue or settle that request.
+	ResultID     string   `json:"result_id"`
 	CheckoutPath string   `json:"checkout_path"`
 	CheckArgv    []string `json:"check_argv"`
 	SpawnArgv    []string `json:"spawn_argv"`

@@ -74,6 +74,16 @@ type CheckExecutionContext struct {
 	CheckArgv    []string
 }
 
+// FrozenRun is the lease-free read model of a run's frozen execution
+// inputs: the immutable snapshot InitializeRun committed and the
+// repository identity it belongs to. The check use case loads its argv,
+// timeout, repeatability and state root from here — never from caller
+// arguments — so no caller-supplied policy can drift from the freeze.
+type FrozenRun struct {
+	Snapshot       RunSnapshot
+	RepositoryRoot string
+}
+
 // ReadStore serves lease-free reads: status rendering and both exec
 // boundaries load their context this way, never through a controller unit
 // of work.
@@ -87,6 +97,8 @@ type ReadStore interface {
 	// runs, never an error: a repository with no run yet has none to list.
 	ListRuns(ctx context.Context, repositoryRoot string) ([]RunStatus, error)
 	LoadRunStatus(ctx context.Context, run identity.RunID) (RunDetail, error)
+	// LoadFrozenRun returns the run's frozen snapshot and repository root.
+	LoadFrozenRun(ctx context.Context, run identity.RunID) (FrozenRun, error)
 	LoadLaunchContext(ctx context.Context, run identity.RunID, attempt identity.AttemptID) (LaunchContext, error)
 	LoadCheckExecutionContext(ctx context.Context, op identity.OperationID) (CheckExecutionContext, error)
 }
