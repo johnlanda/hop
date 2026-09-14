@@ -41,14 +41,21 @@ type RunDetail struct {
 }
 
 // LaunchContext is what the launch exec boundary (`hop launch`) needs,
-// loaded without a lease: the frozen snapshot, the session's current
-// binding and incarnation, the launch-claim state and the run's stop state.
+// loaded without a lease. hop launch's own argv IS the pane's command
+// (docs/plan/phase-2-design.md section 6): it starts the instant
+// layout.apply creates the pane, which can be before the controller's
+// pane.open outcome transaction — the one that records the runtime binding
+// — has even committed. LoadLaunchContext is therefore satisfiable from
+// the run snapshot and the recorded launch intent alone and never depends
+// on a binding existing yet: IncarnationID is the incarnation the pending
+// pane.open (or launch.send) operation's intent recorded, which
+// HOP_INCARNATION_ID must match.
 type LaunchContext struct {
 	Snapshot      RunSnapshot
 	Harness       run.Harness
 	Attempt       run.Attempt
 	Session       run.Session
-	Binding       run.RuntimeBinding
+	IncarnationID identity.IncarnationID
 	Claim         *LaunchClaim
 	StopRequested bool
 }
