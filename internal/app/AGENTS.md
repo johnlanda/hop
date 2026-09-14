@@ -3,10 +3,15 @@
 ## Purpose
 
 Application layer: HOP's use cases and the ports they consume. This slice
-carries the doctor use case (is the local Herdr installation usable?) and the
-plugin-invocation use case (what did Herdr inject into a plugin command?).
-Ports are declared here and implemented by adapters; only `cmd/hop` and tests
-wire the two sides together.
+carries the Phase 1 doctor, plugin-invocation, presentation and observation
+use cases, plus the Phase 2 durable single-worker run controller: run,
+status, stop, resume, result submission and the deterministic check, driven
+through consumer-owned ports against a lease-fenced store, Herdr's runtime
+surface, local processes and repository configuration. Ports are declared
+here and implemented by adapters; only `cmd/hop` and tests wire the two
+sides together. `cmd/hop` never imports domain or identity types: every
+`Controller` method takes and returns primitives or `app`-defined DTOs
+(`docs/plan/phase-2-design.md` section 8).
 
 ## Quick reference
 
@@ -17,6 +22,25 @@ wire the two sides together.
 | [invocation.go](invocation.go) | `Invocation`, `InvocationFromEnviron`, `Trigger`, `Validate`, `Describe`, `ErrNotPluginInvocation` | Reads the `HERDR_*` plugin environment into a value, names the trigger, validates it and renders deterministic report lines |
 | [presentation.go](presentation.go) | `AgentPresentation`, `Presenter`, `AgentDisplay`, `PaneMetadata`, `ViewSelection`, `Role`, `SortDisplays`, token constants | Consumer-owned presentation port and its ordering: a display's manager-first `hop_order` key and padded token map, and the view selection HOP installs |
 | [observation.go](observation.go) | `Observer`, `StatusStream`, `PaneObservation`, `StatusEvent`, `Reconcile`, `ReconcileState`, `AgentStatus` | Consumer-owned observation port and the no-replay reconciliation: subscribe first, snapshot second, fold buffered events plus `StatusStream.DrainRemaining()`'s accepted backlog onto the snapshot |
+| [store.go](store.go) | `StateStore`, `UnitOfWork`, `Lease`, `NewRunSpec`, `RunSnapshot`, `<Entity>Repository` (Runs, Tasks, Attempts, Sessions, Worktrees, Results, Artifacts, Bindings, LaunchClaims, CheckExecClaims, Operations, Transitions, CheckRequests), `Operation`, `OperationKind`/`OperationState`, `Transition`, `CheckRequest`, `CheckExecClaim`, `ErrRevisionConflict`, `ErrFenced`, `ErrNotFound`, `ErrLeaseHeld` | The controller's authority: lease lifecycle (`InitializeRun`, `AcquireLease`, `Heartbeat`, `ReleaseLease`, CAS-fenced) and fenced units of work over typed repositories; the operation journal's shapes |
+| [readstore.go](readstore.go) | `ReadStore`, `RunStatus`, `RunDetail`, `LaunchContext`, `CheckExecutionContext` | Lease-free reads for `hop status` and both exec boundaries; `RunDetail` carries the identities (`TaskID`, `AttemptID`, `SessionID`) stop and resume need, and `LaunchContext` is resolvable from the run snapshot and the recorded launch intent alone, never from a binding that may not exist yet |
+| [submission.go](submission.go) | `SubmissionStore`, `LaunchClaim`, `LaunchClaimState`, `LaunchClaimSettlement`, `LaunchClaimRepository`, `ResultSubmission`, `SubmissionOutcome`, `SubmissionOutcomeKind`, `ClaimedSubmission`, `ClaimedSubmissionFieldLimit` | Worker-authority writes with no controller lease: launch/check-exec claims, `SubmitResult`'s atomic section 7 handoff, `RecordMalformed` for a submission that failed parsing before any typed identity existed, monotonic stop requests |
+| [runtime.go](runtime.go) | `Runtime`, `WorktreeRequest`/`WorktreeInfo`, `WorkerPaneRequest`, `PaneHandle`/`PaneRef`, `ProcessInfo`, `PaneProcess` | Herdr's pane and worktree surface: `CreateWorktree`, `OpenWorkerPane` (a `layout.apply` command pane), `FindPaneByLabel` recovery, `SendText` fallback, `ReadPane` evidence, `InspectPane` occupant identity, `ClosePane` |
+| [artifactstore.go](artifactstore.go) | `ArtifactStore` | Durable local file writes/reads under the run's artifact directories (assignment, pane snapshots, check stdout/stderr), temp-file-then-rename, never called from inside a `StateStore` transaction |
+| [system.go](system.go) | `Clock`, `IDGenerator` | Explicit time and identity generation; the worker-launch use case is their first consumer |
+| [process.go](process.go) | `CommandRunner`, `Command`, `CommandResult`, `ProcessGroupInspector`, `GroupProcess` | Process-group-leader execution with cancellation (git operations, spawning `hop check-exec`) and local process-table listing/signaling for group retirement |
+| [configuration.go](configuration.go) | `ConfigurationSource`, `RunPolicy` | Loads and validates one repository's `.herdr-orchestrator/config.toml`-decoded policy: check contract, env strip/passthrough, profile dir, harness |
+| [digest.go](digest.go) | `ResultDigestTag`, `ComputeResultDigest` | The canonical `"hop-result-v1"` result digest: length-prefixed fields, SHA-256 hex, computed only here — the domain receives it as an opaque validated string |
+| [decision.go](decision.go) | `LaunchClaimDeadline`, `LaunchDeadlineExpired`, `LaunchSettlement`, `CorroborateSettlement`, `OccupantMatches`, `GroupRetirementOutcome`, `ClassifyGroupRetirement`, `ArgvUnavailable` | The section 6 claim-corroboration predicate, close-rule occupant matching, and the four-outcome process-group-retirement classifier (including the process adapter's sleep-anchor and unreadable-argv cases) |
+| [controller.go](controller.go) | `Controller`, `RunHandle` | The driving service composition calls; ports as fields. `RunHandle` is an opaque per-run token (run identity plus the held lease) so composition never touches identity types |
+| [assignment.go](assignment.go) | `renderAssignment` | Deterministic assignment-artifact content: brief, identities and absolute paths only, referenced by the launch argv, never typed into a dialog |
+| [usecase_run.go](usecase_run.go) | `StartRun`, `StartRunRequest`, `StartRunResult` | Freezes the run snapshot, calls `InitializeRun`, writes/records the assignment artifact, then drives `worktree.create` and `pane.open` as separate record-intent/act/record-outcome units; `pane.open`'s intent is also the run's single "launch intent" moment |
+| [usecase_launch.go](usecase_launch.go) | `CorroborateLaunch`, `LaunchProgress` | One inspection round toward settling a launch claim under the section 6 predicate: settled, needs-interaction (forking wrapper), failed (`exec_failed`), or still pending — never sleeps or resends |
+| [usecase_stop.go](usecase_stop.go) | `RequestStop`, `DriveStop`, `StopReport`, `CheckRunIntent` | One round of stop interruption per attempt state (reserved, launching, running/submitted, checking), each idempotent and fail-closed on any identity mismatch or inspection failure |
+| [usecase_resume.go](usecase_resume.go) | `Resume`, `ResumeRequest`, `ResumeResult`, `ResumeOutcome` | Acquires a new fencing generation and performs one section 5 reconciliation round: warm reattach, positive-evidence retirement into cold relaunch, fail-closed, or `--confirm-absent`-gated cold relaunch; retires the prior session's pending launch intents and marks it lost before the replacement session's own intent commits |
+| [usecase_submit.go](usecase_submit.go) | `SubmitResult`, `SubmitResultRequest`, `SubmitResultResult` | Section 7 step 1 (parse and bound the inputs) and the canonical digest, computed here; steps 2-5 are `SubmissionStore.SubmitResult`'s contract |
+| [usecase_check.go](usecase_check.go) | `ClaimAndRunCheck`, `CheckReport` | Claims the oldest pending check request, materializes and validates a detached checkout via `CommandRunner`, spawns `hop check-exec`, and applies the section 7 outcome transaction including stop precedence and the unknown-outcome rule |
+| [usecase_status.go](usecase_status.go) | `Status`, `StatusRequest`, `StatusResult`, `RunSummaryView`, `RunDetailView` | Renders `ReadStore` into string-only view DTOs for `hop status` |
 
 ## Invariants
 
@@ -57,23 +81,65 @@ wire the two sides together.
   it ended but could not deliver through `Events`; it is meaningful only
   after `Events` has closed, and implementations return nothing when every
   accepted event was already delivered.
+- The run controller follows the section 4 transaction rule throughout:
+  every controller-side effect is record-intent (one `UnitOfWork`,
+  committed), then act (the external call, never inside a transaction), then
+  record-outcome (a second `UnitOfWork`). A unit of work's closure always
+  returns nil on a successful write even when the write records a failure
+  or ambiguous outcome (`OperationFailed`, `OperationReconciling`); returning
+  a non-nil error from the closure rolls back everything the closure staged,
+  including that outcome, so the causal error is surfaced to the caller only
+  after `Commit` succeeds.
+- `pane.open`'s intent transaction carries `IncarnationID` and `SessionID` in
+  its JSON payload under the stable keys `incarnation_id` and `session_id`:
+  `SubmissionStore.ClaimLaunch`'s pre-binding fallback (a launcher claiming
+  before the pane.open outcome — and therefore the runtime binding — has
+  committed) matches against these fields on the newest pending `pane.open`
+  operation for the attempt, since the binding a launcher would otherwise be
+  validated against need not exist yet.
+- `openWorkerPane` (initial launch) and `openRelaunchPane` (cold relaunch)
+  share one core parameterized by `run.LaunchKind`: the initial launch's
+  intent transaction performs the Run/Task/Attempt/Session transitions
+  (`applyLaunchIntent`), while a relaunch's equivalent transitions already
+  happened in `coldRelaunch`'s own transaction, so its intent step only
+  journals the operation — applying them twice is an invalid second
+  transition on values already at their target state.
+- A cold relaunch never revives the prior session: in the same transaction
+  that creates the replacement session, it marks the prior session `Lost`
+  and retires (`OperationReconciling`) every still-pending `pane.open`
+  intent that named it, so a retired incarnation's launcher can never claim
+  against a stale intent.
+- The close rule (immediately before `ClosePane`, re-inspect and match
+  occupant argv/pid against recorded evidence) and the group-retirement rule
+  (list, classify, signal only on `GroupMatched`, never blindly) are applied
+  identically by stop and resume; both fail closed on any mismatch, missing
+  identity or inspection failure rather than acting on ambiguity.
+- `Session.Terminate` is invalid directly from `active` (a stop against a
+  corroborated live process goes through `stopping` first); the shared
+  `terminateSession` helper transitions through `Stop` first when needed and
+  is idempotent once a session is already `Terminated`.
 
-## Intentionally deferred
+## Not yet implemented
 
-The `Runtime`, `Clock` and `IDGenerator` ports the architecture proposes are
-not declared here, and the `internal/adapters/system` and `internal/adapters/cli`
-packages are not created, because this slice has no consumer for them: there
-is no worker-launch use case or domain yet, commands stay thin in `cmd/hop`,
-and request IDs are an adapter-internal counter. They arrive with their first
-consumer, per the engineering standard of not adding speculative ports or
-packages.
+Every port here is a consumer-owned interface with no adapter behind it yet:
+`internal/adapters/sqlite` (`StateStore`/`ReadStore`/`SubmissionStore`),
+`internal/adapters/system` (`Clock`/`IDGenerator`/`ArtifactStore`),
+`internal/adapters/process` (`CommandRunner`/`ProcessGroupInspector`),
+`internal/adapters/config` (`ConfigurationSource`) and the `Runtime`
+extension to `internal/adapters/herdr` are separate tasks. `cmd/hop`'s
+command wiring, the state-root resolver and the launch-line/HOP-path
+validation the CLI surface needs are also separate (composition, task 6a).
 
 ## Dependencies and ports
 
-- Allowed inward imports: none (application code; standard library only, no
-  third-party dependencies).
-- Consumed ports: `Probe`, `AgentPresentation` and `Observer`, declared here
-  and implemented by [internal/adapters/herdr](../adapters/herdr/AGENTS.md).
+- Allowed inward imports: [internal/domain/identity](../domain/identity/AGENTS.md),
+  [internal/domain/run](../domain/run/AGENTS.md) (application code;
+  standard library only beyond these, no third-party dependencies).
+- Consumed ports: `Probe`, `AgentPresentation` and `Observer` (Phase 1),
+  implemented by [internal/adapters/herdr](../adapters/herdr/AGENTS.md); the
+  Phase 2 ports above (`StateStore`, `ReadStore`, `SubmissionStore`,
+  `Runtime`, `ArtifactStore`, `Clock`, `IDGenerator`, `CommandRunner`,
+  `ProcessGroupInspector`, `ConfigurationSource`) have no adapter yet.
 - External libraries: none.
 
 ## Verification
@@ -94,8 +160,31 @@ packages.
   transition for a pane the channel never mentioned still appears. It is also
   proven end-to-end against the real adapter; see
   [internal/adapters/herdr/AGENTS.md](../adapters/herdr/AGENTS.md).
+- `go test ./internal/app -run 'TestStartRun|TestCorroborateLaunch|TestDriveStop|TestResume|TestSubmitResult|TestClaimAndRunCheck|TestLeaseFencing'` —
+  the Phase 2 run-controller scenario suite, against `fakeStore` (one
+  handwritten `StateStore`/`ReadStore`/`SubmissionStore` over shared
+  in-memory state with a real optimistic-concurrency, lease-fenced unit of
+  work), `fakeRuntime`, `fakeArtifacts`, `fakeCommands`, `fakeGroups` and
+  `fakeConfig` (`fakes_test.go`, `fakes_uow_test.go`, `fakes_ports_test.go`).
+  Covers: effect ordering (intent committed before the external act) and
+  the crash windows on both sides of an act (intent-committed-act-unknown;
+  act-done-outcome-unrecorded, left `reconciling`, never resent); worktree
+  and pane-open recovery by creation label; the four launch-settlement
+  outcomes; stop for every attempt state (reserved, launching, running,
+  checking), each idempotent and fail-closed on mismatch; submission order
+  (accepted, duplicate, conflicting, transient, the early-acceptance
+  handoff, malformed via `RecordMalformed`); check gating (passing, failing,
+  the repeatable and unrepeatable unknown-outcome rules, stop precedence);
+  resume's warm-reattach, fail-closed, cold-relaunch and unsupported-harness
+  cases; and `TestLeaseFencing`'s takeover barrier (a unit of work opened
+  under a lease a later `AcquireLease` has superseded cannot commit even
+  though its writes already ran) plus heartbeat/release CAS refusals.
+- `go test ./internal/app -run 'TestComputeResultDigest|TestCorroborateSettlement|TestOccupantMatches|TestClassifyGroupRetirement'` —
+  the pure decision-function tables in `digest_test.go` and
+  `decision_test.go`.
 - Test fixtures: none on disk; the fakes and environ slices live in the
-  test files.
+  test files. No real process, file, socket or SQLite access anywhere in
+  this package's tests.
 
 ## Launch-environment sanitization ([launchenv.go](launchenv.go))
 
@@ -145,6 +234,9 @@ task 6a; controller use-case code never calls it.
 ## Related guides
 
 - [Parent index](../AGENTS.md)
+- [internal/domain/identity](../domain/identity/AGENTS.md)
+- [internal/domain/run](../domain/run/AGENTS.md)
 - [Herdr adapter](../adapters/herdr/AGENTS.md)
 - [Composition root](../../cmd/hop/AGENTS.md)
 - [Architecture and package catalog](../../docs/architecture/architecture.md)
+- [Phase 2 design](../../docs/plan/phase-2-design.md)
