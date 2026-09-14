@@ -28,10 +28,14 @@ func newTestController(policy app.RunPolicy) *testController { //nolint:gocritic
 	clock := newFakeClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
 	store := newFakeStore(clock)
 	runtime := newFakeRuntime()
+	runtime.store = store
 	artifacts := newFakeArtifacts()
+	artifacts.store = store
 	ids := newFakeIDs()
 	commands := newFakeCommands()
+	commands.store = store
 	groups := newFakeGroups()
+	groups.store = store
 	config := &fakeConfig{Policy: policy}
 
 	return &testController{

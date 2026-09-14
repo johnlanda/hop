@@ -203,3 +203,55 @@ func TestFakeStoreContracts(t *testing.T) {
 		}
 	})
 }
+
+// TestFakePortsRefuseCallsInsideTransactions proves the fakes enforce the
+// section 4 transaction rule mechanically: any Runtime, CommandRunner,
+// ProcessGroupInspector or ArtifactStore call made while a unit of work is
+// open fails, so a use case that leaks an external call into a store
+// transaction cannot stay green.
+func TestFakePortsRefuseCallsInsideTransactions(t *testing.T) {
+	tc := newTestController(defaultPolicy())
+	_, detail := startedRun(t, tc)
+	lease := tc.Store.Leases[detail.RunID].lease
+
+	uow, err := tc.Store.Begin(context.Background(), lease)
+	if err != nil {
+		t.Fatalf("Begin() error = %v", err)
+	}
+
+	if _, err := tc.Runtime.ServerInstance(context.Background()); err == nil {
+		t.Fatalf("Runtime.ServerInstance succeeded inside an open transaction")
+	}
+	if _, err := tc.Runtime.InspectPane(context.Background(), detail.Binding.PaneID); err == nil {
+		t.Fatalf("Runtime.InspectPane succeeded inside an open transaction")
+	}
+	if _, _, err := tc.Runtime.FindPaneByLabel(context.Background(), "label"); err == nil {
+		t.Fatalf("Runtime.FindPaneByLabel succeeded inside an open transaction")
+	}
+	if err := tc.Runtime.ClosePane(context.Background(), detail.Binding.PaneID); err == nil {
+		t.Fatalf("Runtime.ClosePane succeeded inside an open transaction")
+	}
+	if _, err := tc.Commands.Run(context.Background(), app.Command{Argv: []string{"git", "-C", "/repo", "status"}}); err == nil {
+		t.Fatalf("CommandRunner.Run succeeded inside an open transaction")
+	}
+	if _, err := tc.Groups.GroupProcesses(context.Background(), 1); err == nil {
+		t.Fatalf("ProcessGroupInspector.GroupProcesses succeeded inside an open transaction")
+	}
+	if err := tc.Groups.SignalGroup(context.Background(), 1); err == nil {
+		t.Fatalf("ProcessGroupInspector.SignalGroup succeeded inside an open transaction")
+	}
+	if err := tc.Artifacts.WriteArtifact(context.Background(), "/state/x", []byte("y")); err == nil {
+		t.Fatalf("ArtifactStore.WriteArtifact succeeded inside an open transaction")
+	}
+
+	if err := uow.Commit(); err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+	// With the transaction closed, the same calls run again.
+	if _, err := tc.Runtime.ServerInstance(context.Background()); err != nil {
+		t.Fatalf("Runtime.ServerInstance after commit error = %v", err)
+	}
+	if _, err := tc.Commands.Run(context.Background(), app.Command{Argv: []string{"git", "-C", "/repo", "status"}}); err != nil {
+		t.Fatalf("CommandRunner.Run after commit error = %v", err)
+	}
+}

@@ -330,6 +330,10 @@ func (c *Controller) recoverPaneOpen(ctx context.Context, handle RunHandle, op *
 		return c.markOperationReconciling(ctx, handle, op.ID, "no pane surfaced for the creation label within the launch deadline; never re-created")
 	}
 
+	// The server instance is observed before the transaction opens: an
+	// external call never happens inside a store transaction (the
+	// section 4 transaction rule).
+	serverInstance := c.observeServerInstance(ctx)
 	now := c.Clock.Now()
 	return c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 		latest, getErr := uow.Operations().Get(ctx, op.ID)
@@ -346,7 +350,7 @@ func (c *Controller) recoverPaneOpen(ctx context.Context, handle RunHandle, op *
 			if op.Kind == OpLaunchSend {
 				kind = run.LaunchResume
 			}
-			binding := run.NewRuntimeBinding(intent.SessionID, intent.IncarnationID, "", c.observeServerInstance(ctx), ref.WorkspaceID, ref.TabID, ref.PaneID, intent.Label, kind, now)
+			binding := run.NewRuntimeBinding(intent.SessionID, intent.IncarnationID, "", serverInstance, ref.WorkspaceID, ref.TabID, ref.PaneID, intent.Label, kind, now)
 			if bindErr := uow.Bindings().Create(ctx, binding); bindErr != nil {
 				return bindErr
 			}

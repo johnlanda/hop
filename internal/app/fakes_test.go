@@ -83,6 +83,13 @@ type fakeStore struct {
 	// controller at exactly the pre-dispatch revalidation point.
 	HeartbeatHook func()
 
+	// openUnitsOfWork counts units of work begun but not yet committed or
+	// rolled back. The port fakes consult it through
+	// refuseInsideTransaction: an external call made while a store
+	// transaction is open violates the section 4 transaction rule and
+	// fails the call.
+	openUnitsOfWork int
+
 	repoByRoot map[string]identity.RepositoryID
 	seqByRepo  map[identity.RepositoryID]int
 
@@ -233,7 +240,25 @@ func (s *fakeStore) ReleaseLease(_ context.Context, lease app.Lease) error {
 }
 
 func (s *fakeStore) Begin(_ context.Context, lease app.Lease) (app.UnitOfWork, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.openUnitsOfWork++
 	return &fakeUnitOfWork{store: s, lease: lease}, nil
+}
+
+// refuseInsideTransaction fails a port call made while any unit of work is
+// open: external calls never happen inside a store transaction
+// (docs/plan/phase-2-design.md section 4, the transaction rule).
+func (s *fakeStore) refuseInsideTransaction(port string) error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.openUnitsOfWork > 0 {
+		return fmt.Errorf("app_test: %s called while a unit of work is open; external calls are forbidden inside store transactions", port)
+	}
+	return nil
 }
 
 // --- ReadStore ---

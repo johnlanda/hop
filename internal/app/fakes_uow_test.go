@@ -165,6 +165,7 @@ func (u *fakeUnitOfWork) Commit() error {
 	s := u.store
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.openUnitsOfWork--
 
 	if !s.matchesHeldLease(u.lease) {
 		return app.ErrFenced
@@ -242,6 +243,11 @@ func (u *fakeUnitOfWork) Commit() error {
 }
 
 func (u *fakeUnitOfWork) Rollback() error {
+	if !u.done {
+		u.store.mu.Lock()
+		u.store.openUnitsOfWork--
+		u.store.mu.Unlock()
+	}
 	u.done = true
 	return nil
 }

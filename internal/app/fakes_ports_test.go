@@ -11,9 +11,13 @@ import (
 
 // fakeRuntime is a handwritten Runtime: it records every call and returns
 // scripted responses/errors, letting a test drive exactly the sequence of
-// pane states a scenario needs.
+// pane states a scenario needs. Every call refuses to run while a store
+// unit of work is open (the section 4 transaction rule).
 type fakeRuntime struct {
 	mu sync.Mutex
+
+	// store, when set, rejects any call made inside an open transaction.
+	store *fakeStore
 
 	nextPaneN int
 
@@ -44,6 +48,9 @@ func newFakeRuntime() *fakeRuntime {
 }
 
 func (r *fakeRuntime) ServerInstance(context.Context) (string, error) {
+	if err := r.store.refuseInsideTransaction("Runtime.ServerInstance"); err != nil {
+		return "", err
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.ServerInstanceErr != nil {
@@ -53,6 +60,9 @@ func (r *fakeRuntime) ServerInstance(context.Context) (string, error) {
 }
 
 func (r *fakeRuntime) CreateWorktree(_ context.Context, req app.WorktreeRequest) (app.WorktreeInfo, error) {
+	if err := r.store.refuseInsideTransaction("Runtime.CreateWorktree"); err != nil {
+		return app.WorktreeInfo{}, err
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.CreateWorktreeFn != nil {
@@ -66,6 +76,9 @@ func (r *fakeRuntime) CreateWorktree(_ context.Context, req app.WorktreeRequest)
 }
 
 func (r *fakeRuntime) OpenWorkerPane(_ context.Context, req app.WorkerPaneRequest) (app.PaneHandle, error) { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
+	if err := r.store.refuseInsideTransaction("Runtime.OpenWorkerPane"); err != nil {
+		return app.PaneHandle{}, err
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.OpenWorkerPaneFn != nil {
@@ -85,6 +98,9 @@ func (r *fakeRuntime) OpenWorkerPane(_ context.Context, req app.WorkerPaneReques
 }
 
 func (r *fakeRuntime) FindPaneByLabel(_ context.Context, label string) (app.PaneRef, bool, error) {
+	if err := r.store.refuseInsideTransaction("Runtime.FindPaneByLabel"); err != nil {
+		return app.PaneRef{}, false, err
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.FindPaneByLabelFn != nil {
@@ -94,6 +110,9 @@ func (r *fakeRuntime) FindPaneByLabel(_ context.Context, label string) (app.Pane
 }
 
 func (r *fakeRuntime) SendText(_ context.Context, paneID, text string) error {
+	if err := r.store.refuseInsideTransaction("Runtime.SendText"); err != nil {
+		return err
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.SentText = append(r.SentText, paneID+": "+text)
@@ -101,12 +120,18 @@ func (r *fakeRuntime) SendText(_ context.Context, paneID, text string) error {
 }
 
 func (r *fakeRuntime) ReadPane(_ context.Context, paneID string, _ int) (string, error) {
+	if err := r.store.refuseInsideTransaction("Runtime.ReadPane"); err != nil {
+		return "", err
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.PaneContents[paneID], nil
 }
 
 func (r *fakeRuntime) InspectPane(_ context.Context, paneID string) (app.PaneProcess, error) {
+	if err := r.store.refuseInsideTransaction("Runtime.InspectPane"); err != nil {
+		return app.PaneProcess{}, err
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.InspectPaneFn != nil {
@@ -116,6 +141,9 @@ func (r *fakeRuntime) InspectPane(_ context.Context, paneID string) (app.PanePro
 }
 
 func (r *fakeRuntime) ClosePane(_ context.Context, paneID string) error {
+	if err := r.store.refuseInsideTransaction("Runtime.ClosePane"); err != nil {
+		return err
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.ClosePaneErr != nil {
@@ -126,8 +154,10 @@ func (r *fakeRuntime) ClosePane(_ context.Context, paneID string) error {
 }
 
 // fakeArtifacts is a handwritten ArtifactStore: an in-memory file map.
+// Writes and reads refuse to run while a store unit of work is open.
 type fakeArtifacts struct {
 	mu       sync.Mutex
+	store    *fakeStore
 	files    map[string][]byte
 	WriteErr error
 }
@@ -135,6 +165,9 @@ type fakeArtifacts struct {
 func newFakeArtifacts() *fakeArtifacts { return &fakeArtifacts{files: map[string][]byte{}} }
 
 func (a *fakeArtifacts) WriteArtifact(_ context.Context, path string, content []byte) error {
+	if err := a.store.refuseInsideTransaction("ArtifactStore.WriteArtifact"); err != nil {
+		return err
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.WriteErr != nil {
@@ -162,6 +195,7 @@ func (a *fakeArtifacts) ReadArtifact(_ context.Context, path string) ([]byte, er
 // script the commands they care about.
 type fakeCommands struct {
 	mu      sync.Mutex
+	store   *fakeStore
 	Results map[string]app.CommandResult
 	Errs    map[string]error
 	Calls   []app.Command
@@ -187,6 +221,9 @@ func newFakeCommands() *fakeCommands {
 func (*fakeCommands) key(cmd app.Command) string { return strings.Join(cmd.Argv, " ") }
 
 func (c *fakeCommands) Run(ctx context.Context, cmd app.Command) (app.CommandResult, error) {
+	if err := c.store.refuseInsideTransaction("CommandRunner.Run"); err != nil {
+		return app.CommandResult{}, err
+	}
 	c.mu.Lock()
 	c.Calls = append(c.Calls, cmd)
 	if len(cmd.Argv) >= 2 && cmd.Argv[1] == "check-exec" {
@@ -231,9 +268,11 @@ func (c *fakeCommands) Run(ctx context.Context, cmd app.Command) (app.CommandRes
 	return app.CommandResult{ExitCode: 0}, nil
 }
 
-// fakeGroups is a handwritten ProcessGroupInspector.
+// fakeGroups is a handwritten ProcessGroupInspector. Calls refuse to run
+// while a store unit of work is open.
 type fakeGroups struct {
 	mu        sync.Mutex
+	store     *fakeStore
 	Processes map[int][]app.GroupProcess
 	ListErr   map[int]error
 	Signaled  []int
@@ -244,6 +283,9 @@ func newFakeGroups() *fakeGroups {
 }
 
 func (g *fakeGroups) GroupProcesses(_ context.Context, pgid int) ([]app.GroupProcess, error) {
+	if err := g.store.refuseInsideTransaction("ProcessGroupInspector.GroupProcesses"); err != nil {
+		return nil, err
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if err, ok := g.ListErr[pgid]; ok {
@@ -253,6 +295,9 @@ func (g *fakeGroups) GroupProcesses(_ context.Context, pgid int) ([]app.GroupPro
 }
 
 func (g *fakeGroups) SignalGroup(_ context.Context, pgid int) error {
+	if err := g.store.refuseInsideTransaction("ProcessGroupInspector.SignalGroup"); err != nil {
+		return err
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.Signaled = append(g.Signaled, pgid)
