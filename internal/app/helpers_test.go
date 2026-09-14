@@ -42,7 +42,8 @@ func seedPendingCheckOperation(t *testing.T, tc *testController, runID identity.
 		t.Fatalf("parse operation id: %v", err)
 	}
 	tc.Store.Operations[opID] = app.Operation{
-		ID: opID, RunID: runID, Kind: app.OpCheckRun, State: app.OperationPending,
+		ID: opID, RunID: runID, Generation: tc.Store.Leases[runID].lease.Generation,
+		Kind: app.OpCheckRun, State: app.OperationPending,
 		Intent: app.CheckRunIntent{CheckArgv: checkArgv},
 	}
 	return opID

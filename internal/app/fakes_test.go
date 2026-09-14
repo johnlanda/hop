@@ -2,6 +2,7 @@ package app_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -350,11 +351,83 @@ func (*fakeStore) LoadCheckExecutionContext(context.Context, identity.OperationI
 func (s *fakeStore) ClaimLaunch(_ context.Context, claim app.LaunchClaim) error { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if existing, ok := s.LaunchClaims[claim.IncarnationID]; ok && existing.PID != claim.PID {
-		return fmt.Errorf("app_test: launch claim for incarnation %s already exists with a different pid", claim.IncarnationID)
+	if existing, ok := s.LaunchClaims[claim.IncarnationID]; ok {
+		if existing.PID != claim.PID {
+			return fmt.Errorf("app_test: launch claim for incarnation %s already exists with a different pid", claim.IncarnationID)
+		}
+		// A rewrite by the same pid is idempotent.
+		s.LaunchClaims[claim.IncarnationID] = claim
+		return nil
+	}
+	rRow, ok := s.Runs[claim.RunID]
+	if !ok {
+		return fmt.Errorf("%w: run %s", app.ErrNotFound, claim.RunID)
+	}
+	if rRow.value.StopRequested || rRow.value.State == run.RunStopping || rRow.value.State == run.RunStopped {
+		return fmt.Errorf("app_test: run %s is stopping or stopped; launch claim refused", claim.RunID)
+	}
+	if !s.incarnationCurrentLocked(claim.AttemptID, claim.IncarnationID) {
+		return fmt.Errorf("app_test: incarnation %s is not current for attempt %s; launch claim refused", claim.IncarnationID, claim.AttemptID)
 	}
 	s.LaunchClaims[claim.IncarnationID] = claim
 	return nil
+}
+
+// incarnationCurrentLocked reports whether incarnation is the attempt's
+// current one: the current (non-superseded) binding names it, or — before
+// any binding exists — the newest pending pane.open/launch.send operation
+// intent for the attempt names it (the SQLite store's documented
+// pre-binding json_extract fallback for ClaimLaunch).
+func (s *fakeStore) incarnationCurrentLocked(attemptID identity.AttemptID, incarnation identity.IncarnationID) bool {
+	if _, binding, ok := s.currentBindingByAttemptLocked(attemptID); ok {
+		return binding.IncarnationID == incarnation
+	}
+	var (
+		newest    time.Time
+		newestInc identity.IncarnationID
+		found     bool
+	)
+	for _, op := range s.Operations { //nolint:gocritic // rangeValCopy: test fake; the journal is small and read-only here.
+		if op.State != app.OperationPending || (op.Kind != app.OpPaneOpen && op.Kind != app.OpLaunchSend) {
+			continue
+		}
+		intent, ok := decodePaneOpenIntent(op.Intent)
+		if !ok || intent.SessionID == "" {
+			continue
+		}
+		sess, ok := s.Sessions[identity.SessionID(intent.SessionID)]
+		if !ok || sess.value.AttemptID != attemptID {
+			continue
+		}
+		if !found || op.CreatedAt.After(newest) {
+			newest = op.CreatedAt
+			newestInc = identity.IncarnationID(intent.IncarnationID)
+			found = true
+		}
+	}
+	return found && newestInc == incarnation
+}
+
+// paneOpenIntentFields are the stable pane.open intent JSON keys the store
+// contract reads (`incarnation_id`, `session_id`).
+type paneOpenIntentFields struct {
+	IncarnationID string `json:"incarnation_id"`
+	SessionID     string `json:"session_id"`
+}
+
+// decodePaneOpenIntent reads the stable pane.open intent keys from a
+// persisted payload, which after the fake's commit-time JSON round trip is
+// a map[string]any, never the original Go struct.
+func decodePaneOpenIntent(payload any) (paneOpenIntentFields, bool) {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return paneOpenIntentFields{}, false
+	}
+	var fields paneOpenIntentFields
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return paneOpenIntentFields{}, false
+	}
+	return fields, true
 }
 
 func (s *fakeStore) SettleLaunchFailure(_ context.Context, incarnation identity.IncarnationID, reason string) error {
@@ -373,6 +446,13 @@ func (s *fakeStore) SettleLaunchFailure(_ context.Context, incarnation identity.
 func (s *fakeStore) ClaimCheckExec(_ context.Context, op identity.OperationID, pid int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	operation, ok := s.Operations[op]
+	if !ok || operation.Kind != app.OpCheckRun || operation.State != app.OperationPending {
+		return fmt.Errorf("app_test: operation %s is not a pending check execution; check-exec claim refused", op)
+	}
+	if row, ok := s.Leases[operation.RunID]; !ok || operation.Generation != row.lease.Generation {
+		return fmt.Errorf("app_test: operation %s is not of the current generation; check-exec claim refused", op)
+	}
 	s.CheckExecClaims[op] = app.CheckExecClaim{OperationID: op, PID: pid, ClaimedAt: s.clock.Now()}
 	return nil
 }
@@ -393,39 +473,40 @@ func (s *fakeStore) SubmitResult(_ context.Context, submission app.ResultSubmiss
 	defer s.mu.Unlock()
 	now := s.clock.Now()
 
-	if prior, ok := s.Results[submission.AttemptID]; ok {
-		outcome := app.SubmissionOutcome{ResultID: prior.ID}
-		if prior.ContentDigest == submission.Digest {
-			outcome.Kind = app.SubmissionDuplicate
-		} else {
-			outcome.Kind = app.SubmissionConflicting
-		}
-		s.Submissions = append(s.Submissions, outcome)
-		return outcome, nil
-	}
-
+	// Section 7 step 2 first: existence and agreement (attempt belongs to
+	// the claimed task, task to the claimed run) precede everything,
+	// including duplicate-receipt resolution — a receipt is resolved only
+	// for a submission whose identities actually agree.
 	aRow, ok := s.Attempts[submission.AttemptID]
 	if !ok {
 		outcome := app.SubmissionOutcome{Kind: app.SubmissionMalformed, Detail: "unknown attempt"}
 		s.Submissions = append(s.Submissions, outcome)
 		return outcome, nil
 	}
-	tRow := s.Tasks[aRow.value.TaskID]
+	tRow := s.Tasks[submission.TaskID]
 	rRow := s.Runs[submission.RunID]
-	if tRow == nil || rRow == nil || tRow.value.RunID != submission.RunID {
+	if tRow == nil || rRow == nil || aRow.value.TaskID != submission.TaskID || tRow.value.RunID != submission.RunID {
 		outcome := app.SubmissionOutcome{Kind: app.SubmissionMalformed, Detail: "attempt/task/run do not agree"}
 		s.Submissions = append(s.Submissions, outcome)
 		return outcome, nil
 	}
 
-	sessionID, binding, hasBinding := s.currentBindingByAttemptLocked(submission.AttemptID)
-	_ = sessionID
+	// Step 3 onward is the domain's AcceptResult, handed any prior
+	// accepted result so receipts resolve before state or incarnation
+	// preconditions.
+	var prior *run.Result
+	if existing, ok := s.Results[submission.AttemptID]; ok {
+		p := existing
+		prior = &p
+	}
+
+	_, binding, hasBinding := s.currentBindingByAttemptLocked(submission.AttemptID)
 	incarnationCurrent := hasBinding && binding.IncarnationID == submission.IncarnationID && !binding.Superseded
 	claim, hasClaim := s.LaunchClaims[submission.IncarnationID]
 	launchClaimSettled := hasClaim && claim.State == app.LaunchClaimExeced
 
 	ctx := run.AcceptanceContext{IncarnationCurrent: incarnationCurrent, LaunchClaimSettled: launchClaimSettled}
-	outcomeVal, err := run.AcceptResult(rRow.value, tRow.value, aRow.value, nil, ctx, run.ResultSubmission{
+	outcomeVal, err := run.AcceptResult(rRow.value, tRow.value, aRow.value, prior, ctx, run.ResultSubmission{
 		ID: submission.ID, CommitOID: submission.CommitOID, Summary: submission.Summary, Digest: submission.Digest,
 	}, now)
 
@@ -441,6 +522,10 @@ func (s *fakeStore) SubmitResult(_ context.Context, submission app.ResultSubmiss
 			State: app.CheckRequestRequested, CreatedAt: now,
 		}
 		outcome = app.SubmissionOutcome{Kind: app.SubmissionAccepted, ResultID: submission.ID}
+	case errors.Is(err, run.ErrDuplicateResult):
+		outcome = app.SubmissionOutcome{Kind: app.SubmissionDuplicate, ResultID: outcomeVal.Result.ID}
+	case errors.Is(err, run.ErrConflictingResult):
+		outcome = app.SubmissionOutcome{Kind: app.SubmissionConflicting, ResultID: outcomeVal.Result.ID}
 	case errors.Is(err, run.ErrTransientNotRunning):
 		outcome = app.SubmissionOutcome{Kind: app.SubmissionTransient, Detail: "attempt not yet running; retry"}
 	default:

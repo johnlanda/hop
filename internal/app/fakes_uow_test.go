@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 
 	"github.com/johnlanda/hop/internal/app"
 	"github.com/johnlanda/hop/internal/domain/identity"
@@ -59,6 +60,38 @@ type bindingKey struct {
 	incarnation identity.IncarnationID
 }
 
+// stagedRow is one transaction-local entity write: the value and revision
+// it will hold after commit, plus the base revision the transaction first
+// read. Commit re-checks baseRevision against the store so a concurrent
+// writer's committed change is never silently overwritten, mirroring the
+// SQLite adapter's `WHERE revision = ?` update contract.
+type stagedRow[T any] struct {
+	value        T
+	revision     int64
+	baseRevision int64
+}
+
+// stageSave applies one Save against a staged map plus its base map: a
+// value already staged in this transaction re-saves against the staged
+// revision; a first save validates expectedRevision against the base row.
+func stageSave[K comparable, T any](staged map[K]stagedRow[T], base map[K]*entityRow[T], key K, v T, expectedRevision int64) (updated map[K]stagedRow[T], next int64, err error) {
+	if prior, ok := staged[key]; ok {
+		if prior.revision != expectedRevision {
+			return staged, 0, app.ErrRevisionConflict
+		}
+		staged[key] = stagedRow[T]{value: v, revision: expectedRevision + 1, baseRevision: prior.baseRevision}
+		return staged, expectedRevision + 1, nil
+	}
+	if baseRow, ok := base[key]; ok && baseRow.revision != expectedRevision {
+		return staged, 0, app.ErrRevisionConflict
+	}
+	if staged == nil {
+		staged = map[K]stagedRow[T]{}
+	}
+	staged[key] = stagedRow[T]{value: v, revision: expectedRevision + 1, baseRevision: expectedRevision}
+	return staged, expectedRevision + 1, nil
+}
+
 // fakeUnitOfWork is a handwritten UnitOfWork: every read merges base state
 // with this transaction's own staged writes, and Commit re-validates the
 // lease before merging the overlay into the store atomically. This makes
@@ -70,11 +103,11 @@ type fakeUnitOfWork struct {
 	store *fakeStore
 	lease app.Lease
 
-	runs      map[identity.RunID]entityRow[run.Run]
-	tasks     map[identity.TaskID]entityRow[run.Task]
-	attempts  map[identity.AttemptID]entityRow[run.Attempt]
-	sessions  map[identity.SessionID]entityRow[run.Session]
-	worktrees map[identity.WorktreeID]entityRow[run.Worktree]
+	runs      map[identity.RunID]stagedRow[run.Run]
+	tasks     map[identity.TaskID]stagedRow[run.Task]
+	attempts  map[identity.AttemptID]stagedRow[run.Attempt]
+	sessions  map[identity.SessionID]stagedRow[run.Session]
+	worktrees map[identity.WorktreeID]stagedRow[run.Worktree]
 
 	worktreeCreated []run.Worktree
 	sessionCreated  []run.Session
@@ -120,9 +153,11 @@ func (u *fakeUnitOfWork) Operations() app.OperationRepository       { return fak
 func (u *fakeUnitOfWork) Transitions() app.TransitionRepository     { return fakeTransitionRepo{u} }
 func (u *fakeUnitOfWork) CheckRequests() app.CheckRequestRepository { return fakeCheckRequestRepo{u} }
 
-// Commit re-validates the lease against the store's current lease row and,
-// only if it still matches and is unexpired, merges every staged write
-// into the store in one critical section.
+// Commit re-validates the lease against the store's current lease row and
+// every staged write's preconditions, and only then merges the staged
+// writes into the store in one critical section. Validation is complete
+// before the first write is applied: a failed commit leaves base state
+// exactly as it was, the way a real transaction's rollback would.
 func (u *fakeUnitOfWork) Commit() error {
 	u.ensureOpen()
 	u.done = true
@@ -133,8 +168,15 @@ func (u *fakeUnitOfWork) Commit() error {
 	if !s.matchesHeldLease(u.lease) {
 		return app.ErrFenced
 	}
-	if row := s.Leases[u.lease.Run]; row.lease.ExpiresAt.Before(s.clock.Now()) {
+	// Strict expiry: the lease is valid only while its expiry is strictly
+	// after the transaction clock's reading; a commit at the expiry instant
+	// is fenced, matching AcquireLease's takeover condition so an expiring
+	// lease can never both commit and be taken over at the same instant.
+	if row := s.Leases[u.lease.Run]; !row.lease.ExpiresAt.After(s.clock.Now()) {
 		return app.ErrFenced
+	}
+	if err := u.validateStagedLocked(); err != nil {
+		return err
 	}
 
 	for id, row := range u.runs {
@@ -177,10 +219,7 @@ func (u *fakeUnitOfWork) Commit() error {
 		s.Bindings[key.session] = history
 	}
 	for incarnation, settlement := range u.launchClaimSettled {
-		claim, ok := s.LaunchClaims[incarnation]
-		if !ok {
-			return fmt.Errorf("%w: launch claim %s", app.ErrNotFound, incarnation)
-		}
+		claim := s.LaunchClaims[incarnation]
 		claim.State = settlement.State
 		claim.SettledAt = settlement.At
 		claim.SettlementEvidence = fmt.Sprintf("pane=%s pid=%d exe=%s marker=%s", settlement.PaneID, settlement.PID, settlement.Executable, settlement.ArgvMarker)
@@ -195,9 +234,7 @@ func (u *fakeUnitOfWork) Commit() error {
 	for id, op := range u.opSaved { //nolint:gocritic // rangeValCopy: test fake; the domain snapshot is small and read-only here, and indexing would only obscure the loop.
 		s.Operations[id] = jsonRoundtripOperation(op)
 	}
-	for id, cr := range u.checkRequestSaved {
-		s.CheckRequests[id] = cr
-	}
+	maps.Copy(s.CheckRequests, u.checkRequestSaved)
 	s.Artifacts = append(s.Artifacts, u.artifactsSaved...)
 	s.Transitions = append(s.Transitions, u.transitions...)
 	return nil
@@ -205,6 +242,67 @@ func (u *fakeUnitOfWork) Commit() error {
 
 func (u *fakeUnitOfWork) Rollback() error {
 	u.done = true
+	return nil
+}
+
+// validateStagedLocked checks every staged write's precondition against the
+// store's current base state, with no mutation: entity revisions still
+// match what this transaction first read, created bindings respect
+// UNIQUE(session_id, incarnation_id), and launch-claim settlements are
+// legal from the claim's current state.
+func (u *fakeUnitOfWork) validateStagedLocked() error {
+	s := u.store
+	for id, row := range u.runs {
+		if base, ok := s.Runs[id]; ok && base.revision != row.baseRevision {
+			return app.ErrRevisionConflict
+		}
+	}
+	for id, row := range u.tasks {
+		if base, ok := s.Tasks[id]; ok && base.revision != row.baseRevision {
+			return app.ErrRevisionConflict
+		}
+	}
+	for id, row := range u.attempts {
+		if base, ok := s.Attempts[id]; ok && base.revision != row.baseRevision {
+			return app.ErrRevisionConflict
+		}
+	}
+	for id, row := range u.sessions {
+		if base, ok := s.Sessions[id]; ok && base.revision != row.baseRevision {
+			return app.ErrRevisionConflict
+		}
+	}
+	for id, row := range u.worktrees {
+		if base, ok := s.Worktrees[id]; ok && base.revision != row.baseRevision {
+			return app.ErrRevisionConflict
+		}
+	}
+
+	stagedKeys := map[bindingKey]bool{}
+	for i := range u.bindingCreated {
+		key := bindingKey{session: u.bindingCreated[i].SessionID, incarnation: u.bindingCreated[i].IncarnationID}
+		if stagedKeys[key] {
+			return fmt.Errorf("app_test: binding key %s/%s staged twice in one transaction", key.session, key.incarnation)
+		}
+		stagedKeys[key] = true
+		for _, existing := range s.Bindings[key.session] { //nolint:gocritic // rangeValCopy: test fake; the base history is small and read-only here.
+			if existing.IncarnationID == key.incarnation {
+				return fmt.Errorf("app_test: UNIQUE(session_id, incarnation_id) violated for binding %s/%s", key.session, key.incarnation)
+			}
+		}
+	}
+
+	for incarnation, settlement := range u.launchClaimSettled {
+		claim, ok := s.LaunchClaims[incarnation]
+		if !ok {
+			return fmt.Errorf("%w: launch claim %s", app.ErrNotFound, incarnation)
+		}
+		// Settle is legal only from exec_pending; resettling to the same
+		// state is idempotent (LaunchClaimRepository's documented contract).
+		if claim.State != app.LaunchClaimExecPending && claim.State != settlement.State {
+			return fmt.Errorf("app_test: launch claim %s cannot settle from %s to %s", incarnation, claim.State, settlement.State)
+		}
+	}
 	return nil
 }
 
@@ -224,17 +322,9 @@ func (r fakeRunRepo) Get(_ context.Context, id identity.RunID) (run.Run, int64, 
 }
 
 func (r fakeRunRepo) Save(_ context.Context, v run.Run, expectedRevision int64) (int64, error) { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
-	if base, ok := r.u.store.Runs[v.ID]; ok {
-		if _, staged := r.u.runs[v.ID]; !staged && base.revision != expectedRevision {
-			return 0, app.ErrRevisionConflict
-		}
-	}
-	if r.u.runs == nil {
-		r.u.runs = map[identity.RunID]entityRow[run.Run]{}
-	}
-	next := expectedRevision + 1
-	r.u.runs[v.ID] = entityRow[run.Run]{value: v, revision: next}
-	return next, nil
+	staged, next, err := stageSave(r.u.runs, r.u.store.Runs, v.ID, v, expectedRevision)
+	r.u.runs = staged
+	return next, err
 }
 
 // --- Tasks ---
@@ -253,17 +343,9 @@ func (r fakeTaskRepo) Get(_ context.Context, id identity.TaskID) (run.Task, int6
 }
 
 func (r fakeTaskRepo) Save(_ context.Context, v run.Task, expectedRevision int64) (int64, error) { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
-	if base, ok := r.u.store.Tasks[v.ID]; ok {
-		if _, staged := r.u.tasks[v.ID]; !staged && base.revision != expectedRevision {
-			return 0, app.ErrRevisionConflict
-		}
-	}
-	if r.u.tasks == nil {
-		r.u.tasks = map[identity.TaskID]entityRow[run.Task]{}
-	}
-	next := expectedRevision + 1
-	r.u.tasks[v.ID] = entityRow[run.Task]{value: v, revision: next}
-	return next, nil
+	staged, next, err := stageSave(r.u.tasks, r.u.store.Tasks, v.ID, v, expectedRevision)
+	r.u.tasks = staged
+	return next, err
 }
 
 // --- Attempts ---
@@ -282,17 +364,9 @@ func (r fakeAttemptRepo) Get(_ context.Context, id identity.AttemptID) (run.Atte
 }
 
 func (r fakeAttemptRepo) Save(_ context.Context, v run.Attempt, expectedRevision int64) (int64, error) { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
-	if base, ok := r.u.store.Attempts[v.ID]; ok {
-		if _, staged := r.u.attempts[v.ID]; !staged && base.revision != expectedRevision {
-			return 0, app.ErrRevisionConflict
-		}
-	}
-	if r.u.attempts == nil {
-		r.u.attempts = map[identity.AttemptID]entityRow[run.Attempt]{}
-	}
-	next := expectedRevision + 1
-	r.u.attempts[v.ID] = entityRow[run.Attempt]{value: v, revision: next}
-	return next, nil
+	staged, next, err := stageSave(r.u.attempts, r.u.store.Attempts, v.ID, v, expectedRevision)
+	r.u.attempts = staged
+	return next, err
 }
 
 // --- Sessions ---
@@ -333,17 +407,9 @@ func (r fakeSessionRepo) Current(_ context.Context, attempt identity.AttemptID) 
 }
 
 func (r fakeSessionRepo) Save(_ context.Context, v run.Session, expectedRevision int64) (int64, error) { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
-	if base, ok := r.u.store.Sessions[v.ID]; ok {
-		if _, staged := r.u.sessions[v.ID]; !staged && base.revision != expectedRevision {
-			return 0, app.ErrRevisionConflict
-		}
-	}
-	if r.u.sessions == nil {
-		r.u.sessions = map[identity.SessionID]entityRow[run.Session]{}
-	}
-	next := expectedRevision + 1
-	r.u.sessions[v.ID] = entityRow[run.Session]{value: v, revision: next}
-	return next, nil
+	staged, next, err := stageSave(r.u.sessions, r.u.store.Sessions, v.ID, v, expectedRevision)
+	r.u.sessions = staged
+	return next, err
 }
 
 func (r fakeSessionRepo) Create(_ context.Context, v run.Session) (int64, error) { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
@@ -387,13 +453,9 @@ func (r fakeWorktreeRepo) Create(_ context.Context, v run.Worktree) (int64, erro
 }
 
 func (r fakeWorktreeRepo) Save(_ context.Context, v run.Worktree, expectedRevision int64) (int64, error) { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
-
-	if r.u.worktrees == nil {
-		r.u.worktrees = map[identity.WorktreeID]entityRow[run.Worktree]{}
-	}
-	next := expectedRevision + 1
-	r.u.worktrees[v.ID] = entityRow[run.Worktree]{value: v, revision: next}
-	return next, nil
+	staged, next, err := stageSave(r.u.worktrees, r.u.store.Worktrees, v.ID, v, expectedRevision)
+	r.u.worktrees = staged
+	return next, err
 }
 
 // --- Results (read-only) ---

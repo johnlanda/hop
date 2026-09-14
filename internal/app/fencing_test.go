@@ -29,6 +29,16 @@ func TestLeaseFencing(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Begin() (A) error = %v", err)
 		}
+		// A stages a real write so the rejected commit provably discards
+		// staged state rather than committing an empty transaction.
+		rA, revA, err := uowA.Runs().Get(context.Background(), runID)
+		if err != nil {
+			t.Fatalf("Get() (A) error = %v", err)
+		}
+		stopped := rA.RequestStop(tc.Clock.Now())
+		if _, saveErr := uowA.Runs().Save(context.Background(), stopped, revA); saveErr != nil {
+			t.Fatalf("Save() (A) error = %v", saveErr)
+		}
 
 		// A crashed; its lease expires, and B takes over with a new
 		// generation while A's unit of work is still open.
@@ -46,6 +56,9 @@ func TestLeaseFencing(t *testing.T) {
 		// commit does not fence the act), but the commit itself must fail.
 		if commitErr := uowA.Commit(); !errors.Is(commitErr, app.ErrFenced) {
 			t.Fatalf("A's Commit() error = %v, want ErrFenced", commitErr)
+		}
+		if tc.Store.Runs[runID].value.StopRequested {
+			t.Fatalf("A's staged write reached the store despite the fenced commit")
 		}
 
 		// B, the legitimate holder, can still open and commit its own work.
