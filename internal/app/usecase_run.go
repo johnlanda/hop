@@ -44,6 +44,15 @@ type worktreeCreateIntent struct {
 	BaseRef        string
 }
 
+// worktreeCreateOutcome is the OpWorktreeCreate operation's outcome
+// evidence: what Herdr created plus the provenance CommandRunner resolved
+// afterward — Herdr's response carries no commit, so the base commit an
+// adoption decision validates against is resolved separately.
+type worktreeCreateOutcome struct {
+	Info       WorktreeInfo
+	BaseCommit string
+}
+
 // paneOpenIntent is the OpPaneOpen operation's intent payload.
 type paneOpenIntent struct {
 	Command     []string
@@ -173,6 +182,39 @@ func (c *Controller) StartRun(ctx context.Context, req StartRunRequest) (StartRu
 	return result, handle, nil
 }
 
+// resolveWorktreeProvenance resolves the base commit a freshly created
+// worktree checked out, and validates it shares the repository at
+// repositoryRoot: Herdr's worktree.create response carries no commit, so
+// this is the provenance an adoption decision later validates against
+// (docs/plan/phase-2-design.md section 4). git-common-dir ties the
+// worktree back to its repository regardless of the worktree's own path.
+func (c *Controller) resolveWorktreeProvenance(ctx context.Context, worktreePath, repositoryRoot string) (string, error) {
+	commonDir, err := c.runGit(ctx, worktreePath, "rev-parse", "--git-common-dir")
+	if err != nil {
+		return "", fmt.Errorf("resolve worktree repository: %w", err)
+	}
+	if !strings.HasPrefix(commonDir, repositoryRoot) {
+		return "", fmt.Errorf("worktree at %q shares repository %q, not %q", worktreePath, commonDir, repositoryRoot)
+	}
+	commit, err := c.runGit(ctx, worktreePath, "rev-parse", "HEAD")
+	if err != nil {
+		return "", fmt.Errorf("resolve worktree base commit: %w", err)
+	}
+	return commit, nil
+}
+
+// runGit runs one git subcommand in dir and returns its trimmed stdout.
+func (c *Controller) runGit(ctx context.Context, dir string, args ...string) (string, error) {
+	result, err := c.Commands.Run(ctx, Command{Argv: append([]string{"git"}, args...), Dir: dir})
+	if err != nil {
+		return "", err
+	}
+	if result.ExitCode != 0 {
+		return "", fmt.Errorf("git %s: exit %d: %s", strings.Join(args, " "), result.ExitCode, string(result.Stderr))
+	}
+	return strings.TrimSpace(string(result.Stdout)), nil
+}
+
 // abortStart releases the lease on a StartRun failure that happens after
 // InitializeRun already committed: the calling process is about to exit,
 // and an un-released lease would otherwise sit held until its heartbeat
@@ -218,6 +260,10 @@ func (c *Controller) createWorktree(ctx context.Context, handle RunHandle, ids g
 	info, actErr := c.Runtime.CreateWorktree(ctx, WorktreeRequest{
 		RepositoryRoot: repositoryRoot, Branch: branch, BaseRef: intent.BaseRef,
 	})
+	var baseCommit string
+	if actErr == nil {
+		baseCommit, actErr = c.resolveWorktreeProvenance(ctx, info.Path, repositoryRoot)
+	}
 
 	outcomeErr := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 		op, getErr := uow.Operations().Get(ctx, opID)
@@ -238,7 +284,7 @@ func (c *Controller) createWorktree(ctx context.Context, handle RunHandle, ids g
 			return createErr
 		}
 		op.State = OperationSucceeded
-		op.ActEvidence = info
+		op.ActEvidence = worktreeCreateOutcome{Info: info, BaseCommit: baseCommit}
 		return uow.Operations().Save(ctx, op)
 	})
 	switch {
