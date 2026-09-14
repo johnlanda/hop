@@ -37,9 +37,10 @@ the optional board extend that workflow after its execution semantics work.
 | 2. Durable single-worker run | Run/status/stop/resume for one scoped task | 1 |
 | 3. Manager and workers | Bounded delegation, messages and independent review | 2 |
 | 4. Repeatable playbooks and gates | Versioned workflows with enforced transitions | 3 |
-| 5. Account profiles and pools | Native logins and session-level balancing | 4; compatibility explored in 1 |
+| 5. Harness login status and profile configuration | `hop doctor` reports each harness's own login state; optional alternate-profile pointer | 4; compatibility explored in 1 |
 | 6. Optional terminal board | Progressive task/decision/check inspection | 4–5 |
 | 7. Release hardening | Installable, documented and recovery-tested release | 0–6; board may be omitted from a CLI release |
+| 8. Multi-account pools (optional, deferred) | Named account pools and round-robin session assignment | 5; no committed schedule |
 
 Do not postpone recovery tests to phase 7. Every side effect gains its interruption
 and retry tests when introduced. Every package gains an AGENTS.md and exact import
@@ -88,10 +89,20 @@ each claimed launch/restore mode; unsupported modes remain unavailable.
 
 ## Phase 2 — Durable single-worker run
 
+The concrete design for this phase — domain slice, ports, persistence, state
+machines, launcher, result protocol and work breakdown — is
+[phase-2-design.md](phase-2-design.md).
+
 Deliver `hop run`, `hop status`, `hop stop` and a scoped `hop resume`. Accept one
 brief, freeze its effective instructions, create one task/attempt, and launch one
-native worker in a worktree. Initially use an explicitly selected existing native
-profile. Add the minimum SQLite schema and application-owned storage/runtime ports.
+native worker in a worktree. Launch in the harness's own default profile; an
+optional configuration value may point at a user-prepared alternate profile
+directory, passed through unmodified (see
+[native harness compatibility](../architecture/native-harness-compat.md)). This
+is plain application configuration read at launch, not a harness adapter; Phase
+5 later extends this same alternate-profile pointer with login-status
+reporting and configuration UX — the capability is not implemented twice. Add
+the minimum SQLite schema and application-owned storage/runtime ports.
 
 Record launch intent before calling Herdr, then reconcile the result. Workers
 submit explicit attempt-tagged results; Herdr idle/Done never completes the task.
@@ -147,29 +158,40 @@ worker launch, failed/stale gates prevent progress, retry does not repeat unsafe
 effects, and stop/resume preserves step outcomes. Include inspection/validation
 commands so users can understand execution without opening a board.
 
-## Phase 5 — Account profiles and pools
+## Phase 5 — Harness login status and profile configuration
 
-Deliver common account login/list/status and pool management, starting with Claude
-Code, Codex and opencode. Prefer native login/refresh and isolate harness profiles. Store
-non-secret account metadata and credential references; preserve user settings.
-Install Herdr integrations in the correct profile where supported.
+Deliver harness login status reporting and per-run/per-role configuration UX
+for the alternate-profile pointer Phase 2 already passes through, starting
+with Claude Code, Codex and opencode. HOP performs no logins, stores no
+credentials and owns no keychain items: extend `hop doctor` to report each
+configured harness's own verified login state — `unknown`/`unavailable`
+where a harness exposes no such signal — without inferring onboarding or
+trust readiness from it, since trust is workspace-specific and neither
+dimension has a verified cross-harness readiness probe. HOP does not answer
+or pre-seed onboarding or trust; any required interactive preparation
+(including any Herdr integration install into a profile) is a step the human
+performs themselves with the harness's and Herdr's own commands, not a HOP
+mutation of the profile. HOP only passes the harness's own profile variables
+through (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `HOME` plus the four
+`XDG_*_HOME` variables for opencode); it never bootstraps, seeds or verifies
+that profile beyond the login-status report above.
 
-Implement provider-specific membership, stable account identity, eligibility,
-round-robin selection and account/session leases. Cursor movement, task claim,
-account capacity and launch reservation commit atomically across concurrent runs.
-Explicit account selection remains available. Live sessions keep their assigned
-account; this is not request-level routing or automatic in-session account swapping.
+Exit: `hop doctor` reports each configured harness's verified login status
+(or `unknown`/`unavailable`) without reading, writing or storing
+credentials, and without claiming onboarding or trust readiness; an
+alternate-profile pointer's variables round-trip through the sanitizing
+launcher established in phases 1–2; omitting the pointer launches in the
+harness's own default profile with no further HOP involvement.
 
-Exit: simultaneous launches cannot overbook accounts; pool exhaustion queues work
-with a reason; disabled/cooling-down accounts stop receiving new assignments;
-lease release waits for runtime reconciliation; credentials/history do not bleed
-between profiles. Account-correct restore follows the policy verified earlier.
-Gemini/Grok adapters follow when their native compatibility evidence is sufficient.
+Multi-account pools, round-robin selection, account-capacity leases and
+cross-account resume remain a later, optional phase — see phase 8 below and
+[RESEARCH.md](../../RESEARCH.md). Users who need multiple accounts today run
+separate harness profiles, or a tool such as CLIProxyAPI, outside HOP.
 
 ## Phase 6 — Optional terminal board
 
 Build a full-pane task list and open-agent action first, then details, questions,
-gate evidence and account inspection. Reuse application read models and commands;
+gate evidence and login-status inspection. Reuse application read models and commands;
 the board never imports sibling adapters. Native Agents view remains the lightweight
 default for day-to-day navigation. Add overlays/splits only after the basic view works.
 
@@ -196,6 +218,31 @@ package guides/install docs match the shipped binary. Add detached service manag
 only if foreground controller operation is inadequate; it is a separate lifecycle
 feature, not a prerequisite for basic orchestration.
 
+## Phase 8 — Multi-account pools (optional, deferred)
+
+Deferred by the 2026-09-14 delegated-accounts decision (see
+[RESEARCH.md](../../RESEARCH.md)): HOP does not manage logins or credentials
+in phases 0–7, so this phase has no committed schedule. It remains here as a
+future option for users who want HOP itself to spread sessions across
+several accounts of the same provider, rather than running separate harness
+profiles or an external tool such as CLIProxyAPI.
+
+If undertaken, deliver named account pools and round-robin session
+assignment, starting with Claude Code, Codex and opencode. Implement
+provider-specific membership, stable account identity, eligibility,
+round-robin selection and account/session leases. Cursor movement, task
+claim, account capacity and launch reservation commit atomically across
+concurrent runs. Explicit account selection remains available. Live sessions
+keep their assigned account; this is not request-level routing or automatic
+in-session account swapping.
+
+Exit: simultaneous launches cannot overbook accounts; pool exhaustion queues
+work with a reason; disabled/cooling-down accounts stop receiving new
+assignments; lease release waits for runtime reconciliation;
+credentials/history do not bleed between profiles. Account-correct restore
+follows the policy verified in phase 1. Gemini/Grok adapters follow when
+their native compatibility evidence is sufficient.
+
 ## First implementation backlog
 
 The initial work should cover phases 0 and 1 in this order:
@@ -214,8 +261,10 @@ exit criteria are executable checks, not extra approval ceremonies.
 
 ## Scope held outside the initial release
 
-Cross-client/team collaboration, model routing, request-level account balancing,
+Cross-client/team collaboration, model routing, multi-account pools,
+round-robin session assignment, request-level account balancing,
 browser/editor embedding, native collapsible Herdr agent trees, recursive delegation,
 nested playbooks, remote orchestration and a general integration marketplace remain
-outside the initial release. Existing CLI/MCP tools can supply workflow-specific
-capabilities without adding them to HOP's core.
+outside the initial release. Existing CLI/MCP tools, separate harness profiles or a
+tool such as CLIProxyAPI can supply multi-account workflows without adding them to
+HOP's core.
