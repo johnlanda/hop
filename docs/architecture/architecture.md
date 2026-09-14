@@ -12,7 +12,11 @@ import direction (see [internal/AGENTS.md](../../internal/AGENTS.md)), an
 event-observation use cases with the `Probe`, `AgentPresentation` and
 `Observer` ports) and the `internal/adapters/herdr` socket client,
 installation probe, presentation and observer; no domain package exists yet,
-and the other ports and adapters below remain proposals.
+and the other ports and adapters below remain proposals. The `Runtime`,
+`Clock` and `IDGenerator` ports and the `adapters/system` and `adapters/cli`
+packages are intentionally deferred until a consumer exists (no worker-launch
+use case or domain yet, thin commands in `cmd/hop`, adapter-internal request
+IDs); see [internal/app/AGENTS.md](../../internal/app/AGENTS.md).
 
 HOP is one local application with several domain modules, not a set of services.
 Herdr provides agent terminals and runtime observations. HOP provides durable

@@ -36,12 +36,30 @@ wire the two sides together.
   values are parsed from an environ slice the caller supplies.
 - Presentation is manager-first and deterministic: a manager's ordering key
   ranks before every other role, numeric keys are zero-padded so Herdr's
-  string sort orders them numerically, and empty optional tokens are omitted
-  so non-HOP agents stay readable. View selection is one server-wide action
-  under HOP's source; clearing is owned.
+  string sort orders them numerically, and an unset optional field is cleared
+  (published as a delete), so publishing a full display is a complete
+  replacement of HOP's optional tokens rather than a sparse patch that leaves
+  stale values. View selection is one server-wide action under HOP's source;
+  clearing is owned. `SortDisplays` mirrors the token sort and adds a pane-ID
+  tie-break for HOP-side determinism; Herdr's own view keeps incoming order
+  for equal keys, so the two agree only up to that tie-break. Ordering keys
+  assume run and worker sequences in `[0, 999999]`; larger or negative values
+  are out of the validated range.
 - Reconciliation assumes no event replay: a caller subscribes before it
   snapshots, and `ReconcileState` folds the buffered events onto the snapshot
-  with the last writer winning per pane.
+  with the last writer winning per pane. `Reconcile` prefers a buffered event
+  over cancellation and drains the buffer before returning, so a transition
+  observed before the cutoff is never dropped.
+
+## Intentionally deferred
+
+The `Runtime`, `Clock` and `IDGenerator` ports the architecture proposes are
+not declared here, and the `internal/adapters/system` and `internal/adapters/cli`
+packages are not created, because this slice has no consumer for them: there
+is no worker-launch use case or domain yet, commands stay thin in `cmd/hop`,
+and request IDs are an adapter-internal counter. They arrive with their first
+consumer, per the engineering standard of not adding speculative ports or
+packages.
 
 ## Dependencies and ports
 

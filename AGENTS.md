@@ -25,13 +25,18 @@ model-routing dependency.
 
 The repository contains the Phase 0 engineering foundation (the Go module
 `github.com/johnlanda/hop`, the `internal` checker package, the Makefile
-targets, pinned lint and format configuration, a CI workflow) and the first
-Phase 1 slice: the `cmd/hop` composition root with `version`, `doctor` and
-`plugin-context` commands, the application layer `internal/app` (doctor and
-plugin-invocation use cases with the `Probe` port), the Herdr adapter
-`internal/adapters/herdr` (NDJSON socket client and installation probe) and
-the linkable plugin manifest. Domain packages and the other adapters named in
-the planning documents are proposed, not existing code.
+targets, pinned lint and format configuration, a CI workflow) and the Phase 1
+slice: the `cmd/hop` composition root with `version`, `doctor` and
+`plugin-context` commands; the application layer `internal/app` (doctor,
+plugin-invocation, agent-presentation and event-observation use cases with the
+`Probe`, `AgentPresentation` and `Observer` ports); the Herdr adapter
+`internal/adapters/herdr` (NDJSON socket client, installation probe,
+presentation and observer); the `test/integration` real-process suite; and the
+linkable plugin manifest. Domain packages and the other adapters named in the
+planning documents are proposed, not existing code; the intentional deferral of
+the `Runtime`, `Clock` and `IDGenerator` ports and the `adapters/system` and
+`adapters/cli` packages until a consumer exists is recorded in
+[internal/app/AGENTS.md](internal/app/AGENTS.md).
 
 ## Toolchain and gate
 

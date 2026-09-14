@@ -202,7 +202,11 @@ func (p *Presenter) Clear(ctx context.Context) error {
 // SortDisplays returns the displays in the order the native view renders them
 // under HOP's projection: by run sequence, then manager-first within a run,
 // then pane id for stability. It mirrors the token sort so tests and callers
-// can predict the rendered order without a live server.
+// can predict the rendered order without a live server. The pane-id tie-break
+// is a HOP-side determinism choice for equal ordering keys; Herdr's own view
+// keeps incoming order for equal keys, so the two agree only up to that
+// tie-break. Ordering assumes run and worker sequences in [0, 999999]; the
+// six-digit padding does not order larger or negative values.
 func SortDisplays(displays []AgentDisplay) []AgentDisplay {
 	sorted := make([]AgentDisplay, len(displays))
 	copy(sorted, displays)

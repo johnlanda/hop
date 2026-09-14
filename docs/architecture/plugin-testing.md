@@ -106,10 +106,22 @@ Herdr's contributor commands are `just test`, `just check` and focused
 protocol tests live in `internal/adapters/herdr` and the first real-process
 suite lives in `test/integration` (see its guide), both running under the
 ordinary `make check`; the real-process suite skips with an explicit reason
-where no herdr binary is installed, and CI runners have none. Of the table
-above, the link-and-invoke, startup, worktree-event (covered by the launch
-environment and metadata tests), native-Agent-view and board rows are
-implemented, and the PTY-attached rendering evidence (layer 4) is a
+where no herdr binary is installed, and CI runners have none.
+
+Of the first-real-process-suite table above, these rows are implemented: link
+and invoke; startup (the hook runs on server start, proven offline-linked);
+native Agent view (metadata accepted, manager-first order, owned clear with
+another owner intact); and the registry-isolation check (the linked plugin
+stays in the temp roots and the user-global registry is unchanged). The suite
+also covers the explicit launch environment, event-observation reconciliation
+and context injection, and the PTY-attached rendering evidence (layer 4) is a
 separately named smoke, `TestRealProcessPTYRendering`, at fixed 100x30
-dimensions; the restart/registry/failure-cleanup rows and the live-harness
-tests (layer 5) are planned, not implemented.
+dimensions.
+
+Not yet implemented: the worktree-event row (identifying a hook's event target
+while another workspace is focused — the suite creates workspaces and panes
+but invokes no worktree event hook); the board row (closing a board without
+stopping the controller or workers — the suite only opens and closes the
+doctor pane, with no controller-liveness assertion); the restart and
+failure-cleanup rows; and the live-harness tests (layer 5). These remain
+planned.

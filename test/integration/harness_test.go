@@ -7,6 +7,7 @@
 package integration
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -469,21 +470,30 @@ func userGlobalRegistries() []string {
 	}
 }
 
-// registrySnapshot records each user-global registry's content, with absence
-// recorded distinctly from emptiness.
-func registrySnapshot(t *testing.T) map[string]string {
+// registryState is the observed state of one registry file. exists separates
+// an absent file from a present one, so absence cannot be confused with a file
+// whose contents happen to equal any sentinel string.
+type registryState struct {
+	exists  bool
+	content []byte
+}
+
+// registrySnapshot records each user-global registry's state, distinguishing
+// absence from emptiness with an explicit exists flag rather than a sentinel
+// string that file bytes could collide with.
+func registrySnapshot(t *testing.T) map[string]registryState {
 	t.Helper()
-	snapshot := map[string]string{}
+	snapshot := map[string]registryState{}
 	for _, path := range userGlobalRegistries() {
 		content, err := os.ReadFile(path) //nolint:gosec // G304: fixed well-known paths under the user's home, read-only.
 		if err != nil {
 			if !os.IsNotExist(err) {
 				t.Fatalf("read %s: %v", path, err)
 			}
-			snapshot[path] = "<absent>"
+			snapshot[path] = registryState{exists: false}
 			continue
 		}
-		snapshot[path] = string(content)
+		snapshot[path] = registryState{exists: true, content: content}
 	}
 	return snapshot
 }
@@ -491,11 +501,12 @@ func registrySnapshot(t *testing.T) map[string]string {
 // assertNoRegistryLeak fails when any user-global registry changed while the
 // test ran: registration is user-global by default in Herdr, so this is the
 // proof that temporary roots confined it.
-func assertNoRegistryLeak(t *testing.T, before map[string]string) {
+func assertNoRegistryLeak(t *testing.T, before map[string]registryState) {
 	t.Helper()
 	after := registrySnapshot(t)
 	for path, want := range before {
-		if after[path] != want {
+		got := after[path]
+		if got.exists != want.exists || !bytes.Equal(got.content, want.content) {
 			t.Errorf("user-global registry %s changed during the test; the test registration leaked", path)
 		}
 	}
