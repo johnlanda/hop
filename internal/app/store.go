@@ -282,6 +282,26 @@ type CheckRequestRepository interface {
 	Save(ctx context.Context, cr CheckRequest) error
 }
 
+// CheckExecClaim is the durable record hop check-exec writes before it
+// execs the check argv: its own pid, which IS the process-group id (it
+// verifies it leads its own group first). It is read-only from the
+// controller side — SubmissionStore.ClaimCheckExec is the only writer —
+// and is read inside a lease-fenced unit of work, like LaunchClaims,
+// because stop and resume decide process-group retirement against a
+// consistent snapshot within that same transaction.
+type CheckExecClaim struct {
+	OperationID identity.OperationID
+	PID         int
+	ClaimedAt   time.Time
+}
+
+// CheckExecClaimRepository reads check-exec claims. Used by stop and
+// resume to find the process group to retire when a check execution's
+// controller crashed or a stop was requested while it ran.
+type CheckExecClaimRepository interface {
+	Get(ctx context.Context, op identity.OperationID) (CheckExecClaim, bool, error)
+}
+
 // UnitOfWork is one controller transaction, fenced by the lease Begin was
 // called with. Commit re-reads the lease inside the transaction and fails
 // with ErrFenced unless it still matches (run, controller, generation,
@@ -296,6 +316,7 @@ type UnitOfWork interface {
 	Artifacts() ArtifactRepository
 	Bindings() BindingRepository
 	LaunchClaims() LaunchClaimRepository
+	CheckExecClaims() CheckExecClaimRepository
 	Operations() OperationRepository
 	Transitions() TransitionRepository
 	CheckRequests() CheckRequestRepository
