@@ -459,9 +459,12 @@ func incarnationCurrent(ctx context.Context, q querier, attemptID identity.Attem
 // exists yet for that session — a superseded row without a successor
 // retires the incarnation, so any row at all disables the fallback — and
 // the run's newest pending launch operation (kind pane.open or
-// launch.send) carries the claim's incarnation in its intent JSON under
-// the documented "incarnation_id" key, which the controller commits before
-// dispatching the pane request. Any other case is not current.
+// launch.send) carries BOTH the claim's incarnation and the current
+// session's id in its intent JSON under the documented "incarnation_id"
+// and "session_id" keys, which the controller commits before dispatching
+// the pane request. The session conjunct is what stops a retired
+// incarnation's still-pending old intent from authorizing a claim after a
+// cold relaunch replaces the session. Any other case is not current.
 func launchIncarnationCurrent(ctx context.Context, q querier, runID identity.RunID, attemptID identity.AttemptID, incarnationID identity.IncarnationID) (bool, error) {
 	session, _, ok, err := currentSession(ctx, q, attemptID)
 	if err != nil || !ok {
@@ -483,18 +486,69 @@ func launchIncarnationCurrent(ctx context.Context, q querier, runID identity.Run
 	if bindingRows > 0 {
 		return false, nil
 	}
-	var intentIncarnation sql.NullString
+	var intentIncarnation, intentSession sql.NullString
 	err = q.QueryRowContext(ctx,
-		`SELECT json_extract(intent, '$.incarnation_id') FROM operations
+		`SELECT json_extract(intent, '$.incarnation_id'), json_extract(intent, '$.session_id') FROM operations
 		 WHERE run_id = ? AND state = ? AND kind IN (?, ?)
 		 ORDER BY created_at DESC, rowid DESC LIMIT 1`,
 		runID.String(), string(app.OperationPending), string(app.OpPaneOpen), string(app.OpLaunchSend),
-	).Scan(&intentIncarnation)
+	).Scan(&intentIncarnation, &intentSession)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {
 		return false, fmt.Errorf("sqlite: read pending launch intent of run %s: %w", runID, err)
 	}
-	return intentIncarnation.Valid && intentIncarnation.String == incarnationID.String(), nil
+	return intentIncarnation.Valid && intentIncarnation.String == incarnationID.String() &&
+		intentSession.Valid && intentSession.String == session.ID.String(), nil
+}
+
+// runOfTask returns the persisted owning run of a task row.
+func runOfTask(ctx context.Context, q querier, id identity.TaskID) (identity.RunID, error) {
+	return ownerRun(ctx, q, `SELECT run_id FROM tasks WHERE id = ?`, "task", id.String())
+}
+
+// runOfAttempt returns the persisted owning run of an attempt row, through
+// its task.
+func runOfAttempt(ctx context.Context, q querier, id identity.AttemptID) (identity.RunID, error) {
+	return ownerRun(ctx, q, `SELECT t.run_id FROM attempts a JOIN tasks t ON a.task_id = t.id WHERE a.id = ?`, "attempt", id.String())
+}
+
+// runOfSession returns the persisted owning run of a session row.
+func runOfSession(ctx context.Context, q querier, id identity.SessionID) (identity.RunID, error) {
+	return ownerRun(ctx, q, `SELECT run_id FROM sessions WHERE id = ?`, "session", id.String())
+}
+
+// runOfWorktree returns the persisted owning run of a worktree row.
+func runOfWorktree(ctx context.Context, q querier, id identity.WorktreeID) (identity.RunID, error) {
+	return ownerRun(ctx, q, `SELECT run_id FROM worktrees WHERE id = ?`, "worktree", id.String())
+}
+
+// runOfResult returns the persisted owning run of a result row, through
+// its attempt and task.
+func runOfResult(ctx context.Context, q querier, id identity.ResultID) (identity.RunID, error) {
+	return ownerRun(ctx, q, `SELECT t.run_id FROM results r JOIN attempts a ON r.attempt_id = a.id JOIN tasks t ON a.task_id = t.id WHERE r.id = ?`, "result", id.String())
+}
+
+// runOfOperationRow returns the persisted owning run of an operation row.
+func runOfOperationRow(ctx context.Context, q querier, id identity.OperationID) (identity.RunID, error) {
+	return ownerRun(ctx, q, `SELECT run_id FROM operations WHERE id = ?`, "operation", id.String())
+}
+
+// ownerRun resolves one entity's persisted owning run through query, which
+// must select exactly the run id column for the given entity id.
+func ownerRun(ctx context.Context, q querier, query, kind, id string) (identity.RunID, error) {
+	var raw string
+	err := q.QueryRowContext(ctx, query, id).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("sqlite: %s %s: %w", kind, id, app.ErrNotFound)
+	}
+	if err != nil {
+		return "", fmt.Errorf("sqlite: resolve owning run of %s %s: %w", kind, id, err)
+	}
+	runID, err := identity.ParseRunID(raw)
+	if err != nil {
+		return "", fmt.Errorf("sqlite: owning run of %s %s: %w", kind, id, err)
+	}
+	return runID, nil
 }

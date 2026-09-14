@@ -16,8 +16,9 @@ import (
 // with ErrRevisionConflict and writes nothing, for every mutable entity.
 func TestSaveRevisionConflict(t *testing.T) {
 	cases := []struct {
-		name string
-		save func(t *testing.T, f *fixture, uow app.UnitOfWork, staleRevision int64) error
+		name  string
+		setup func(t *testing.T, f *fixture)
+		save  func(t *testing.T, f *fixture, uow app.UnitOfWork, staleRevision int64) error
 	}{
 		{
 			name: "run",
@@ -83,10 +84,26 @@ func TestSaveRevisionConflict(t *testing.T) {
 				return err
 			},
 		},
+		{
+			name:  "worktree",
+			setup: createWorktree,
+			save: func(t *testing.T, f *fixture, uow app.UnitOfWork, staleRevision int64) error {
+				t.Helper()
+				v, _, err := uow.Worktrees().ByRun(t.Context(), f.spec.RunID)
+				if err != nil {
+					t.Fatalf("get: %v", err)
+				}
+				_, err = uow.Worktrees().Save(t.Context(), v, staleRevision)
+				return err
+			},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFixture(t)
+			if tc.setup != nil {
+				tc.setup(t, f)
+			}
 			uow, err := f.store.Begin(t.Context(), f.lease)
 			if err != nil {
 				t.Fatalf("begin: %v", err)
@@ -198,6 +215,234 @@ func TestAttemptReservationRacedAcrossConnections(t *testing.T) {
 	if active != 1 {
 		t.Fatalf("active attempts after the race = %d, want 1", active)
 	}
+}
+
+// TestUnitOfWorkIsScopedToTheLeasedRun proves a unit of work is one run's
+// exclusive write authority: under run A's valid lease, every repository
+// mutation against run B or B's descendants is refused with ErrFenced
+// while B has its own live holder, and only a lease FOR B (here taken over
+// after expiry) can mutate B.
+func TestUnitOfWorkIsScopedToTheLeasedRun(t *testing.T) {
+	clock := newFakeClock()
+	store := openStoreAt(t, t.TempDir(), clock)
+	specA := newSpec("/repos/alpha", 1*specStride, clock.Now())
+	specB := newSpec("/repos/beta", 2*specStride, clock.Now())
+	_, leaseA, err := store.InitializeRun(t.Context(), specA)
+	if err != nil {
+		t.Fatalf("InitializeRun A: %v", err)
+	}
+	_, leaseB, err := store.InitializeRun(t.Context(), specB)
+	if err != nil {
+		t.Fatalf("InitializeRun B: %v", err)
+	}
+	// Drive B to an accepted result under its own lease, so a binding, a
+	// claim, a result and a check request all exist to aim A's lease at.
+	fB := &fixture{store: store, clock: clock, spec: specB, lease: leaseB}
+	fB.launchAttempt(t)
+	fB.createBinding(t)
+	fB.claimLaunch(t)
+	fB.settleClaimExeced(t)
+	fB.markRunning(t)
+	accepted, err := store.SubmitResult(t.Context(), fB.submission(8801, "digest-b"))
+	if err != nil || accepted.Kind != app.SubmissionAccepted {
+		t.Fatalf("SubmitResult on B = %+v, %v", accepted, err)
+	}
+	if err := store.Heartbeat(t.Context(), leaseB); err != nil {
+		t.Fatalf("heartbeat B's live holder: %v", err)
+	}
+
+	now := clock.Now()
+	cases := []struct {
+		name   string
+		mutate func(t *testing.T, uow app.UnitOfWork) error
+	}{
+		{
+			name: "run save",
+			mutate: func(t *testing.T, uow app.UnitOfWork) error {
+				t.Helper()
+				v, revision, err := uow.Runs().Get(t.Context(), specB.RunID)
+				if err != nil {
+					t.Fatalf("get B's run: %v", err)
+				}
+				next, err := v.EnterCompleting(now)
+				if err != nil {
+					t.Fatalf("transition: %v", err)
+				}
+				_, err = uow.Runs().Save(t.Context(), next, revision)
+				return err
+			},
+		},
+		{
+			name: "task save",
+			mutate: func(t *testing.T, uow app.UnitOfWork) error {
+				t.Helper()
+				v, revision, err := uow.Tasks().Get(t.Context(), specB.TaskID)
+				if err != nil {
+					t.Fatalf("get B's task: %v", err)
+				}
+				_, err = uow.Tasks().Save(t.Context(), v, revision)
+				return err
+			},
+		},
+		{
+			name: "attempt save",
+			mutate: func(t *testing.T, uow app.UnitOfWork) error {
+				t.Helper()
+				v, revision, err := uow.Attempts().Get(t.Context(), specB.AttemptID)
+				if err != nil {
+					t.Fatalf("get B's attempt: %v", err)
+				}
+				_, err = uow.Attempts().Save(t.Context(), v, revision)
+				return err
+			},
+		},
+		{
+			name: "session save",
+			mutate: func(t *testing.T, uow app.UnitOfWork) error {
+				t.Helper()
+				v, revision, err := uow.Sessions().Get(t.Context(), specB.SessionID)
+				if err != nil {
+					t.Fatalf("get B's session: %v", err)
+				}
+				_, err = uow.Sessions().Save(t.Context(), v, revision)
+				return err
+			},
+		},
+		{
+			name: "session create",
+			mutate: func(t *testing.T, uow app.UnitOfWork) error {
+				t.Helper()
+				_, err := uow.Sessions().Create(t.Context(), run.NewSession(identity.SessionID(uid(8850)), specB.RunID, specB.AttemptID, run.HarnessClaude, now))
+				return err
+			},
+		},
+		{
+			name: "worktree create",
+			mutate: func(t *testing.T, uow app.UnitOfWork) error {
+				t.Helper()
+				runB, _, err := uow.Runs().Get(t.Context(), specB.RunID)
+				if err != nil {
+					t.Fatalf("get B's run: %v", err)
+				}
+				_, err = uow.Worktrees().Create(t.Context(), run.NewWorktree(specB.WorktreeID, runB.RepositoryID, specB.RunID, "/worktrees/beta-r1", "hop/beta"))
+				return err
+			},
+		},
+		{
+			name: "artifact save",
+			mutate: func(t *testing.T, uow app.UnitOfWork) error {
+				t.Helper()
+				return uow.Artifacts().Save(t.Context(), run.NewArtifact(identity.ArtifactID(uid(8851)), specB.RunID, run.ArtifactPaneSnapshot, "/p", "d"))
+			},
+		},
+		{
+			name: "binding create",
+			mutate: func(t *testing.T, uow app.UnitOfWork) error {
+				t.Helper()
+				return uow.Bindings().Create(t.Context(), run.NewRuntimeBinding(specB.SessionID, identity.IncarnationID(uid(8852)), "/s", "w", "t", "p", "l", run.LaunchResume, now))
+			},
+		},
+		{
+			name: "binding save",
+			mutate: func(t *testing.T, uow app.UnitOfWork) error {
+				t.Helper()
+				binding, ok, err := uow.Bindings().Current(t.Context(), specB.SessionID)
+				if err != nil || !ok {
+					t.Fatalf("current B binding: %v (found %t)", err, ok)
+				}
+				superseded, err := binding.Supersede("cross-run attempt", now)
+				if err != nil {
+					t.Fatalf("supersede: %v", err)
+				}
+				return uow.Bindings().Save(t.Context(), superseded)
+			},
+		},
+		{
+			name: "launch claim settle",
+			mutate: func(t *testing.T, uow app.UnitOfWork) error {
+				t.Helper()
+				return uow.LaunchClaims().Settle(t.Context(), specB.IncarnationID, app.LaunchClaimSettlement{State: app.LaunchClaimExecFailed, Reason: "cross-run attempt", At: now})
+			},
+		},
+		{
+			name: "operation create",
+			mutate: func(t *testing.T, uow app.UnitOfWork) error {
+				t.Helper()
+				return uow.Operations().Create(t.Context(), app.Operation{
+					ID: identity.OperationID(uid(8853)), RunID: specB.RunID, Generation: leaseA.Generation,
+					Kind: app.OpCheckRun, State: app.OperationPending,
+					Intent: map[string]any{}, CreatedAt: now, UpdatedAt: now,
+				})
+			},
+		},
+		{
+			name: "transition record",
+			mutate: func(t *testing.T, uow app.UnitOfWork) error {
+				t.Helper()
+				return uow.Transitions().Record(t.Context(), app.Transition{
+					EntityKind: app.EntityRun, EntityID: specB.RunID.String(),
+					From: "running", To: "failed", Reason: "cross-run attempt", At: now,
+				})
+			},
+		},
+		{
+			name: "check request save",
+			mutate: func(t *testing.T, uow app.UnitOfWork) error {
+				t.Helper()
+				request, err := uow.CheckRequests().Get(t.Context(), accepted.ResultID)
+				if err != nil {
+					t.Fatalf("get B's check request: %v", err)
+				}
+				request.State = app.CheckRequestClaimed
+				return uow.CheckRequests().Save(t.Context(), request)
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			uow, err := store.Begin(t.Context(), leaseA)
+			if err != nil {
+				t.Fatalf("begin under A's lease: %v", err)
+			}
+			defer func() {
+				if rbErr := uow.Rollback(); rbErr != nil {
+					t.Errorf("rollback: %v", rbErr)
+				}
+			}()
+
+			err = tc.mutate(t, uow)
+
+			if !errors.Is(err, app.ErrFenced) {
+				t.Fatalf("cross-run %s under A's lease = %v, want ErrFenced", tc.name, err)
+			}
+		})
+	}
+
+	t.Run("takeover of B grants B", func(t *testing.T) {
+		clock.Advance(leaseTTL + time.Second)
+		takeover, err := store.AcquireLease(t.Context(), specB.RunID, "controller-a")
+		if err != nil {
+			t.Fatalf("take over B's lease: %v", err)
+		}
+		uow, err := store.Begin(t.Context(), takeover)
+		if err != nil {
+			t.Fatalf("begin under the takeover lease: %v", err)
+		}
+		v, revision, err := uow.Runs().Get(t.Context(), specB.RunID)
+		if err != nil {
+			t.Fatalf("get B's run: %v", err)
+		}
+		next, err := v.EnterCompleting(clock.Now())
+		if err != nil {
+			t.Fatalf("transition: %v", err)
+		}
+		if _, err := uow.Runs().Save(t.Context(), next, revision); err != nil {
+			t.Fatalf("save B under B's own takeover lease: %v", err)
+		}
+		if err := uow.Commit(); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+	})
 }
 
 // TestInitializeRunRacedOnSameRootPath proves repository get-or-create

@@ -2,6 +2,8 @@ package sqlite_test
 
 import (
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -37,9 +39,11 @@ func TestAcquireLeaseRefusedWhileHeld(t *testing.T) {
 	}
 }
 
-// TestLeaseTakeoverAfterExpiry proves a second controller, on its own
-// handle, takes over once the holder's lease expires, and that the stale
-// holder can then neither heartbeat, release nor begin.
+// TestLeaseTakeoverAfterExpiry proves a second controller takes over once
+// the holder's lease expires, and that the stale holder can then neither
+// heartbeat, release nor begin. Both controllers share one handle here;
+// TestStaleHeartbeatFromSecondHandle and TestAcquireLeaseRacedAcrossHandles
+// cover the distinct-handle cases.
 func TestLeaseTakeoverAfterExpiry(t *testing.T) {
 	f := newFixture(t)
 
@@ -190,6 +194,60 @@ func TestCommitSucceedsBeforeExpiry(t *testing.T) {
 
 	if err := uow.Commit(); err != nil {
 		t.Fatalf("commit before expiry: %v", err)
+	}
+}
+
+// TestAcquireLeaseRacedAcrossHandles proves the lease CAS raced from two
+// handles standing in for two processes: on an expired lease exactly one
+// contender acquires and the loser is refused with ErrLeaseHeld against
+// the winner's fresh generation.
+func TestAcquireLeaseRacedAcrossHandles(t *testing.T) {
+	clock := newFakeClock()
+	root := t.TempDir()
+	storeA := openStoreAt(t, root, clock)
+	storeB := openStoreAt(t, root, clock)
+	spec := newSpec("/repos/alpha", specStride, clock.Now())
+	if _, _, err := storeA.InitializeRun(t.Context(), spec); err != nil {
+		t.Fatalf("InitializeRun: %v", err)
+	}
+	clock.Advance(leaseTTL + time.Second)
+
+	var (
+		start sync.WaitGroup
+		done  sync.WaitGroup
+	)
+	start.Add(1)
+	leases := make([]app.Lease, 2)
+	errs := make([]error, 2)
+	done.Add(2)
+	for i, contender := range []*sqlite.Store{storeA, storeB} {
+		go func() {
+			defer done.Done()
+			start.Wait()
+			leases[i], errs[i] = contender.AcquireLease(t.Context(), spec.RunID, fmt.Sprintf("controller-%d", i))
+		}()
+	}
+	start.Done()
+	done.Wait()
+
+	winners, held := 0, 0
+	var winner app.Lease
+	for i, err := range errs {
+		switch {
+		case err == nil:
+			winners++
+			winner = leases[i]
+		case errors.Is(err, app.ErrLeaseHeld):
+			held++
+		default:
+			t.Fatalf("raced acquisition %d: %v", i, err)
+		}
+	}
+	if winners != 1 || held != 1 {
+		t.Fatalf("raced acquisition: %d winners, %d held refusals; want exactly 1 and 1 (errors: %v)", winners, held, errs)
+	}
+	if winner.Generation != 2 {
+		t.Fatalf("winner's generation = %d, want 2", winner.Generation)
 	}
 }
 

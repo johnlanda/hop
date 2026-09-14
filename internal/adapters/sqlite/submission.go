@@ -266,11 +266,15 @@ func persistAcceptance(ctx context.Context, tx *sql.Tx, acceptance run.Acceptanc
 	return nil
 }
 
-// ClaimLaunch records hop launch's durable pre-exec claim. It fails — and
-// the caller must not exec — when the run is stopping or stopped, the
-// incarnation is not the attempt's current identity, or a claim for this
-// incarnation already exists with a different pid; a rewrite by the same
-// pid is idempotent. Currency follows launchIncarnationCurrent: the
+// ClaimLaunch records hop launch's durable pre-exec claim. Agreement is
+// validated first — the claimed attempt's persisted owning run must be the
+// claimed run, so a mixed tuple can never have its stop or currency
+// questions answered against the wrong run. It then fails — and the caller
+// must not exec — when the run is stopping or stopped, the incarnation is
+// not the attempt's current identity, or a claim for this incarnation
+// already exists with a different run, attempt or pid; a rewrite by the
+// same pid on the same tuple is idempotent. Currency follows
+// launchIncarnationCurrent: the
 // current binding decides when one exists, and before any binding row the
 // authority is the newest pending launch operation's intent JSON
 // ("incarnation_id"), so a launcher racing the controller's pane.open
@@ -281,6 +285,16 @@ func (s *Store) ClaimLaunch(ctx context.Context, claim app.LaunchClaim) error { 
 		runV, _, err := getRun(ctx, tx, claim.RunID)
 		if err != nil {
 			return err
+		}
+		// Agreement precedes every other precondition: a mixed tuple must
+		// never have its stop or currency questions answered against the
+		// wrong run's state.
+		attemptOwner, err := runOfAttempt(ctx, tx, claim.AttemptID)
+		if err != nil {
+			return err
+		}
+		if attemptOwner != claim.RunID {
+			return fmt.Errorf("sqlite: attempt %s belongs to run %s, not the claimed run %s; launch claim refused", claim.AttemptID, attemptOwner, claim.RunID)
 		}
 		if runV.StopRequested || runV.State == run.RunStopping || runV.State == run.RunStopped {
 			return fmt.Errorf("sqlite: run %s is stopping or stopped; launch claim refused", claim.RunID)
@@ -297,6 +311,9 @@ func (s *Store) ClaimLaunch(ctx context.Context, claim app.LaunchClaim) error { 
 			return err
 		}
 		if existing != nil {
+			if existing.RunID != claim.RunID || existing.AttemptID != claim.AttemptID {
+				return fmt.Errorf("sqlite: incarnation %s's existing claim is for run %s attempt %s; a claim for run %s attempt %s is refused", claim.IncarnationID, existing.RunID, existing.AttemptID, claim.RunID, claim.AttemptID)
+			}
 			if existing.PID != claim.PID {
 				return fmt.Errorf("sqlite: incarnation %s already has a launch claim by pid %d; a claim by pid %d is refused", claim.IncarnationID, existing.PID, claim.PID)
 			}
@@ -352,7 +369,10 @@ func (s *Store) SettleLaunchFailure(ctx context.Context, incarnation identity.In
 // ClaimCheckExec records hop check-exec's durable pre-exec identity: its
 // own pid, which is its process-group id. It fails when the operation is
 // not a pending check execution of the run's current lease generation; a
-// rewrite by the same pid is idempotent.
+// rewrite by the same pid is idempotent. The operation ID is the only
+// claimed identity, so there is no cross-run tuple to disagree: the owning
+// run, its lease generation and the operation's kind and state all resolve
+// from the persisted operation row, never from caller input.
 func (s *Store) ClaimCheckExec(ctx context.Context, opID identity.OperationID, pid int) error {
 	return s.inWriteTx(ctx, func(tx *sql.Tx) error {
 		op, err := getOperation(ctx, tx, opID)

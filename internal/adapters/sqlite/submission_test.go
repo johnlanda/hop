@@ -470,7 +470,7 @@ func TestClaimLaunch(t *testing.T) {
 	t.Run("claim before binding with matching intent is accepted", func(t *testing.T) {
 		f := newFixture(t)
 		f.launchAttempt(t)
-		f.createLaunchIntent(t, f.spec.IncarnationID)
+		f.createLaunchIntent(t, f.spec.SessionID, f.spec.IncarnationID)
 		// No binding row yet: the launcher raced the controller's pane.open
 		// outcome write.
 
@@ -484,7 +484,7 @@ func TestClaimLaunch(t *testing.T) {
 	t.Run("stale incarnation before binding is refused", func(t *testing.T) {
 		f := newFixture(t)
 		f.launchAttempt(t)
-		f.createLaunchIntent(t, f.spec.IncarnationID)
+		f.createLaunchIntent(t, f.spec.SessionID, f.spec.IncarnationID)
 
 		err := f.store.ClaimLaunch(t.Context(), app.LaunchClaim{
 			IncarnationID: identity.IncarnationID(uid(6205)),
@@ -505,7 +505,7 @@ func TestClaimLaunch(t *testing.T) {
 		f.launchAttempt(t)
 		f.createBinding(t)
 		other := identity.IncarnationID(uid(6206))
-		f.createLaunchIntent(t, other)
+		f.createLaunchIntent(t, f.spec.SessionID, other)
 
 		err := f.store.ClaimLaunch(t.Context(), app.LaunchClaim{
 			IncarnationID: other,
@@ -530,7 +530,7 @@ func TestClaimLaunch(t *testing.T) {
 		f := newFixture(t)
 		f.launchAttempt(t)
 		f.createBinding(t)
-		f.createLaunchIntent(t, f.spec.IncarnationID)
+		f.createLaunchIntent(t, f.spec.SessionID, f.spec.IncarnationID)
 		f.inUOW(t, func(uow app.UnitOfWork) {
 			binding, ok, err := uow.Bindings().Current(t.Context(), f.spec.SessionID)
 			if err != nil || !ok {
@@ -556,6 +556,147 @@ func TestClaimLaunch(t *testing.T) {
 
 		if err == nil {
 			t.Fatal("a retired incarnation reclaimed through the intent fallback after supersession")
+		}
+	})
+
+	t.Run("attempt of another run is refused before and after the owner stops", func(t *testing.T) {
+		clock := newFakeClock()
+		store := openStoreAt(t, t.TempDir(), clock)
+		specA := newSpec("/repos/alpha", 1*specStride, clock.Now())
+		specB := newSpec("/repos/beta", 2*specStride, clock.Now())
+		_, leaseA, err := store.InitializeRun(t.Context(), specA)
+		if err != nil {
+			t.Fatalf("InitializeRun A: %v", err)
+		}
+		if _, _, err := store.InitializeRun(t.Context(), specB); err != nil {
+			t.Fatalf("InitializeRun B: %v", err)
+		}
+		fA := &fixture{store: store, clock: clock, spec: specA, lease: leaseA}
+		fA.launchAttempt(t)
+		fA.createBinding(t)
+		mixed := app.LaunchClaim{
+			RunID:         specB.RunID, // B's run with A's attempt and incarnation
+			AttemptID:     specA.AttemptID,
+			IncarnationID: specA.IncarnationID,
+			Executable:    "/opt/harness/claude",
+			ArgvDigest:    "argv-digest",
+			PID:           fixturePID,
+		}
+
+		if err := store.ClaimLaunch(t.Context(), mixed); err == nil {
+			t.Fatal("a mixed run/attempt tuple was accepted while the owner is unstopped")
+		}
+		if err := store.RequestStop(t.Context(), specA.RunID); err != nil {
+			t.Fatalf("RequestStop A: %v", err)
+		}
+		if err := store.ClaimLaunch(t.Context(), mixed); err == nil {
+			t.Fatal("a mixed run/attempt tuple bypassed the owning run's stop request")
+		}
+		if n := countRows(t, store, `SELECT COUNT(*) FROM launch_claims`); n != 0 {
+			t.Fatalf("launch claims after refused mixed tuples = %d, want 0", n)
+		}
+	})
+
+	t.Run("existing claim must agree on run and attempt", func(t *testing.T) {
+		clock := newFakeClock()
+		store := openStoreAt(t, t.TempDir(), clock)
+		specA := newSpec("/repos/alpha", 1*specStride, clock.Now())
+		specB := newSpec("/repos/alpha", 2*specStride, clock.Now())
+		_, leaseA, err := store.InitializeRun(t.Context(), specA)
+		if err != nil {
+			t.Fatalf("InitializeRun A: %v", err)
+		}
+		_, leaseB, err := store.InitializeRun(t.Context(), specB)
+		if err != nil {
+			t.Fatalf("InitializeRun B: %v", err)
+		}
+		fA := &fixture{store: store, clock: clock, spec: specA, lease: leaseA}
+		fA.launchAttempt(t)
+		fA.createBinding(t)
+		fA.claimLaunch(t)
+		// Same pid, same incarnation, but claiming B's run and attempt: the
+		// rewrite is not idempotent, it is a disagreement.
+		fB := &fixture{store: store, clock: clock, spec: specB, lease: leaseB}
+		fB.launchAttempt(t)
+		fB.createBinding(t)
+
+		err = store.ClaimLaunch(t.Context(), app.LaunchClaim{
+			RunID:         specB.RunID,
+			AttemptID:     specB.AttemptID,
+			IncarnationID: specA.IncarnationID, // A's already-claimed incarnation
+			Executable:    "/opt/harness/claude",
+			ArgvDigest:    "argv-digest",
+			PID:           fixturePID,
+		})
+
+		if err == nil {
+			t.Fatal("an existing claim was rewritten onto a different run and attempt")
+		}
+	})
+
+	t.Run("replacement session does not revive a retired incarnation", func(t *testing.T) {
+		f := newFixture(t)
+		f.launchAttempt(t)
+		f.createBinding(t)
+		f.createLaunchIntent(t, f.spec.SessionID, f.spec.IncarnationID) // old intent, still pending
+		newSessionID := identity.SessionID(uid(6301))
+		f.inUOW(t, func(uow app.UnitOfWork) {
+			binding, ok, err := uow.Bindings().Current(t.Context(), f.spec.SessionID)
+			if err != nil || !ok {
+				t.Fatalf("current binding: %v (found %t)", err, ok)
+			}
+			superseded, err := binding.Supersede("positive retirement evidence", f.clock.Now())
+			if err != nil {
+				t.Fatalf("supersede: %v", err)
+			}
+			if err := uow.Bindings().Save(t.Context(), superseded); err != nil {
+				t.Fatalf("save superseded binding: %v", err)
+			}
+			saveSession(t, uow, f.spec.SessionID, func(v run.Session) (run.Session, error) { return v.Reconcile(f.clock.Now()) })
+			saveSession(t, uow, f.spec.SessionID, func(v run.Session) (run.Session, error) { return v.Terminate(f.clock.Now()) })
+			if _, err := uow.Sessions().Create(t.Context(), run.NewSession(newSessionID, f.spec.RunID, f.spec.AttemptID, run.HarnessClaude, f.clock.Now())); err != nil {
+				t.Fatalf("create replacement session: %v", err)
+			}
+		})
+
+		// The replacement session has zero bindings and the OLD launch
+		// intent is still the run's newest pending one: the retired
+		// incarnation must not claim through it.
+		err := f.store.ClaimLaunch(t.Context(), app.LaunchClaim{
+			IncarnationID: f.spec.IncarnationID,
+			RunID:         f.spec.RunID,
+			AttemptID:     f.spec.AttemptID,
+			Executable:    "/opt/harness/claude",
+			ArgvDigest:    "argv-digest",
+			PID:           fixturePID,
+		})
+		if err == nil {
+			t.Fatal("a retired incarnation claimed through the old session's still-pending intent")
+		}
+
+		// Once the controller commits the NEW session's launch intent, only
+		// the new incarnation claims.
+		newIncarnation := identity.IncarnationID(uid(6302))
+		f.createLaunchIntent(t, newSessionID, newIncarnation)
+		if err := f.store.ClaimLaunch(t.Context(), app.LaunchClaim{
+			IncarnationID: f.spec.IncarnationID,
+			RunID:         f.spec.RunID,
+			AttemptID:     f.spec.AttemptID,
+			Executable:    "/opt/harness/claude",
+			ArgvDigest:    "argv-digest",
+			PID:           fixturePID,
+		}); err == nil {
+			t.Fatal("the retired incarnation claimed even after the new intent was committed")
+		}
+		if err := f.store.ClaimLaunch(t.Context(), app.LaunchClaim{
+			IncarnationID: newIncarnation,
+			RunID:         f.spec.RunID,
+			AttemptID:     f.spec.AttemptID,
+			Executable:    "/opt/harness/claude",
+			ArgvDigest:    "argv-digest",
+			PID:           fixturePID,
+		}); err != nil {
+			t.Fatalf("the new session's incarnation could not claim through its intent: %v", err)
 		}
 	})
 
@@ -699,6 +840,119 @@ func TestClaimCheckExec(t *testing.T) {
 			t.Fatal("a claim against a settled operation was accepted")
 		}
 	})
+}
+
+// TestWriteContentionWithHeldImmediateTransaction proves two writers
+// contending on the same database resolve through the busy handling: a
+// worker-authority write started while another connection holds an
+// immediate transaction still commits once that transaction ends. The
+// handshake only orders start-then-release; whether the contender actually
+// blocked or raced ahead, the outcome is the same committed stop request.
+func TestWriteContentionWithHeldImmediateTransaction(t *testing.T) {
+	clock := newFakeClock()
+	root := t.TempDir()
+	storeA := openStoreAt(t, root, clock)
+	storeB := openStoreAt(t, root, clock)
+	spec := newSpec("/repos/alpha", specStride, clock.Now())
+	if _, _, err := storeA.InitializeRun(t.Context(), spec); err != nil {
+		t.Fatalf("InitializeRun: %v", err)
+	}
+	heldTx, err := sqlite.WriteDB(storeA).BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatalf("hold immediate transaction: %v", err)
+	}
+
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		close(started)
+		done <- storeB.RequestStop(t.Context(), spec.RunID)
+	}()
+	<-started
+	if rbErr := heldTx.Rollback(); rbErr != nil {
+		t.Fatalf("release held transaction: %v", rbErr)
+	}
+
+	if stopErr := <-done; stopErr != nil {
+		t.Fatalf("contending RequestStop: %v", stopErr)
+	}
+	detail, err := storeA.LoadRunStatus(t.Context(), spec.RunID)
+	if err != nil {
+		t.Fatalf("LoadRunStatus: %v", err)
+	}
+	if detail.State != run.RunStopping {
+		t.Fatalf("run state after the contended stop = %s, want stopping", detail.State)
+	}
+}
+
+// TestSubmitResultRacedAcrossHandles proves the acceptance transaction
+// arbitration: two handles racing the same content commit exactly one
+// accepted result, one duplicate acknowledgment, two receipts and one
+// check request.
+func TestSubmitResultRacedAcrossHandles(t *testing.T) {
+	clock := newFakeClock()
+	root := t.TempDir()
+	storeA := openStoreAt(t, root, clock)
+	storeB := openStoreAt(t, root, clock)
+	spec := newSpec("/repos/alpha", specStride, clock.Now())
+	_, lease, err := storeA.InitializeRun(t.Context(), spec)
+	if err != nil {
+		t.Fatalf("InitializeRun: %v", err)
+	}
+	f := &fixture{store: storeA, clock: clock, spec: spec, lease: lease}
+	f.launchAttempt(t)
+	f.createBinding(t)
+	f.claimLaunch(t)
+	f.settleClaimExeced(t)
+	f.markRunning(t)
+
+	var (
+		start sync.WaitGroup
+		done  sync.WaitGroup
+	)
+	start.Add(1)
+	outcomes := make([]app.SubmissionOutcome, 2)
+	errs := make([]error, 2)
+	done.Add(2)
+	for i, submitter := range []*sqlite.Store{storeA, storeB} {
+		go func() {
+			defer done.Done()
+			start.Wait()
+			outcomes[i], errs[i] = submitter.SubmitResult(t.Context(), f.submission(8700+i, "digest-raced"))
+		}()
+	}
+	start.Done()
+	done.Wait()
+
+	accepted, duplicate := 0, 0
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("raced submission %d: %v", i, err)
+		}
+		switch outcomes[i].Kind {
+		case app.SubmissionAccepted:
+			accepted++
+		case app.SubmissionDuplicate:
+			duplicate++
+		default:
+			t.Fatalf("raced submission %d outcome = %s, want accepted or duplicate", i, outcomes[i].Kind)
+		}
+	}
+	if accepted != 1 || duplicate != 1 {
+		t.Fatalf("raced outcomes: %d accepted, %d duplicate; want exactly 1 and 1", accepted, duplicate)
+	}
+	if outcomes[0].ResultID != outcomes[1].ResultID {
+		t.Fatalf("raced outcomes name results %s and %s, want the same accepted result", outcomes[0].ResultID, outcomes[1].ResultID)
+	}
+	if n := countRows(t, storeA, `SELECT COUNT(*) FROM results`); n != 1 {
+		t.Fatalf("results after the race = %d, want 1", n)
+	}
+	if n := countRows(t, storeA, `SELECT COUNT(*) FROM result_submissions`); n != 2 {
+		t.Fatalf("receipts after the race = %d, want 2", n)
+	}
+	if n := countRows(t, storeA, `SELECT COUNT(*) FROM check_requests`); n != 1 {
+		t.Fatalf("check requests after the race = %d, want 1", n)
+	}
 }
 
 // TestRequestStopMonotonic proves the stop request is monotonic and

@@ -80,6 +80,19 @@ func (u *unitOfWork) Rollback() error {
 	return nil
 }
 
+// requireLeasedRun refuses a mutation whose target belongs to a run other
+// than the leased one: a unit of work is one run's exclusive write
+// authority, never a general database handle, so every repository write
+// resolves its target's persisted owning run and compares it to the
+// lease's run before any SQL executes. The refusal is ErrFenced — the
+// caller holds no authority over that run.
+func (u *unitOfWork) requireLeasedRun(owner identity.RunID, kind, id string) error {
+	if owner != u.lease.Run {
+		return fmt.Errorf("sqlite: %s %s belongs to run %s, not the leased run %s: %w", kind, id, owner, u.lease.Run, app.ErrFenced)
+	}
+	return nil
+}
+
 // saveEntity runs one optimistic-concurrency update: zero affected rows is
 // ErrRevisionConflict, and the entity's revision advances by one.
 func saveEntity(result sql.Result, execErr error, kind, id string, expectedRevision int64) (int64, error) {
@@ -107,6 +120,9 @@ func (r runRepository) Get(ctx context.Context, id identity.RunID) (run.Run, int
 // stop_requested_at is set once, to the run's update time, and never
 // cleared or moved by a later save.
 func (r runRepository) Save(ctx context.Context, v run.Run, expectedRevision int64) (int64, error) { //nolint:gocritic // hugeParam: the port passes domain values by value; the repository mirrors its signature.
+	if err := r.u.requireLeasedRun(v.ID, "run", v.ID.String()); err != nil {
+		return 0, err
+	}
 	at := formatTime(v.UpdatedAt)
 	result, err := r.u.tx.ExecContext(ctx,
 		`UPDATE runs SET state = ?, stop_requested_at = CASE WHEN ? = 1 THEN COALESCE(stop_requested_at, ?) ELSE stop_requested_at END, updated_at = ?, revision = revision + 1
@@ -124,6 +140,13 @@ func (r taskRepository) Get(ctx context.Context, id identity.TaskID) (run.Task, 
 }
 
 func (r taskRepository) Save(ctx context.Context, v run.Task, expectedRevision int64) (int64, error) { //nolint:gocritic // hugeParam: the port passes domain values by value; the repository mirrors its signature.
+	owner, err := runOfTask(ctx, r.u.tx, v.ID)
+	if err != nil {
+		return 0, err
+	}
+	if scopeErr := r.u.requireLeasedRun(owner, "task", v.ID.String()); scopeErr != nil {
+		return 0, scopeErr
+	}
 	result, err := r.u.tx.ExecContext(ctx,
 		`UPDATE tasks SET state = ?, updated_at = ?, revision = revision + 1 WHERE id = ? AND revision = ?`,
 		string(v.State), formatTime(v.UpdatedAt), v.ID.String(), expectedRevision,
@@ -139,6 +162,13 @@ func (r attemptRepository) Get(ctx context.Context, id identity.AttemptID) (run.
 }
 
 func (r attemptRepository) Save(ctx context.Context, v run.Attempt, expectedRevision int64) (int64, error) { //nolint:gocritic // hugeParam: the port passes domain values by value; the repository mirrors its signature.
+	owner, err := runOfAttempt(ctx, r.u.tx, v.ID)
+	if err != nil {
+		return 0, err
+	}
+	if scopeErr := r.u.requireLeasedRun(owner, "attempt", v.ID.String()); scopeErr != nil {
+		return 0, scopeErr
+	}
 	result, err := r.u.tx.ExecContext(ctx,
 		`UPDATE attempts SET state = ?, updated_at = ?, revision = revision + 1 WHERE id = ? AND revision = ?`,
 		string(v.State), formatTime(v.UpdatedAt), v.ID.String(), expectedRevision,
@@ -169,6 +199,13 @@ func (r sessionRepository) Current(ctx context.Context, attempt identity.Attempt
 // immutable once set: a stored reference and its source are never
 // overwritten, mirroring the domain's assignment rule.
 func (r sessionRepository) Save(ctx context.Context, v run.Session, expectedRevision int64) (int64, error) { //nolint:gocritic // hugeParam: the port passes domain values by value; the repository mirrors its signature.
+	owner, err := runOfSession(ctx, r.u.tx, v.ID)
+	if err != nil {
+		return 0, err
+	}
+	if scopeErr := r.u.requireLeasedRun(owner, "session", v.ID.String()); scopeErr != nil {
+		return 0, scopeErr
+	}
 	result, err := r.u.tx.ExecContext(ctx,
 		`UPDATE sessions SET state = ?, native_session_ref = COALESCE(native_session_ref, ?), native_ref_source = COALESCE(native_ref_source, ?), updated_at = ?, revision = revision + 1
 		 WHERE id = ? AND revision = ?`,
@@ -179,6 +216,16 @@ func (r sessionRepository) Save(ctx context.Context, v run.Session, expectedRevi
 }
 
 func (r sessionRepository) Create(ctx context.Context, v run.Session) (int64, error) { //nolint:gocritic // hugeParam: the port passes domain values by value; the repository mirrors its signature.
+	if err := r.u.requireLeasedRun(v.RunID, "session", v.ID.String()); err != nil {
+		return 0, err
+	}
+	attemptOwner, err := runOfAttempt(ctx, r.u.tx, v.AttemptID)
+	if err != nil {
+		return 0, err
+	}
+	if scopeErr := r.u.requireLeasedRun(attemptOwner, "session's attempt", v.AttemptID.String()); scopeErr != nil {
+		return 0, scopeErr
+	}
 	if _, err := r.u.tx.ExecContext(ctx,
 		`INSERT INTO sessions (id, run_id, attempt_id, role, harness, native_session_ref, native_ref_source, state, revision, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
@@ -203,6 +250,9 @@ func (r worktreeRepository) ByRun(ctx context.Context, runID identity.RunID) (ru
 }
 
 func (r worktreeRepository) Create(ctx context.Context, v run.Worktree) (int64, error) { //nolint:gocritic // hugeParam: the port passes domain values by value; the repository mirrors its signature.
+	if err := r.u.requireLeasedRun(v.RunID, "worktree", v.ID.String()); err != nil {
+		return 0, err
+	}
 	if _, err := r.u.tx.ExecContext(ctx,
 		`INSERT INTO worktrees (id, repository_id, run_id, path, branch, state, revision, created_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?)`,
 		v.ID.String(), v.RepositoryID.String(), v.RunID.String(), v.Path, v.Branch, string(v.State), formatTime(r.u.store.now()),
@@ -213,6 +263,13 @@ func (r worktreeRepository) Create(ctx context.Context, v run.Worktree) (int64, 
 }
 
 func (r worktreeRepository) Save(ctx context.Context, v run.Worktree, expectedRevision int64) (int64, error) { //nolint:gocritic // hugeParam: the port passes domain values by value; the repository mirrors its signature.
+	owner, err := runOfWorktree(ctx, r.u.tx, v.ID)
+	if err != nil {
+		return 0, err
+	}
+	if scopeErr := r.u.requireLeasedRun(owner, "worktree", v.ID.String()); scopeErr != nil {
+		return 0, scopeErr
+	}
 	result, err := r.u.tx.ExecContext(ctx,
 		`UPDATE worktrees SET state = ?, revision = revision + 1 WHERE id = ? AND revision = ?`,
 		string(v.State), v.ID.String(), expectedRevision,
@@ -232,8 +289,18 @@ func (r resultRepository) Accepted(ctx context.Context, attempt identity.Attempt
 type artifactRepository struct{ u *unitOfWork }
 
 func (r artifactRepository) Save(ctx context.Context, a run.Artifact) error { //nolint:gocritic // hugeParam: the port passes domain values by value; the repository mirrors its signature.
+	if err := r.u.requireLeasedRun(a.RunID, "artifact", a.ID.String()); err != nil {
+		return err
+	}
 	var resultID any
 	if a.ResultID != nil {
+		owner, err := runOfResult(ctx, r.u.tx, *a.ResultID)
+		if err != nil {
+			return err
+		}
+		if err := r.u.requireLeasedRun(owner, "artifact's result", a.ResultID.String()); err != nil {
+			return err
+		}
 		resultID = a.ResultID.String()
 	}
 	if _, err := r.u.tx.ExecContext(ctx,
@@ -254,6 +321,13 @@ func (r bindingRepository) Current(ctx context.Context, session identity.Session
 }
 
 func (r bindingRepository) Create(ctx context.Context, b run.RuntimeBinding) error { //nolint:gocritic // hugeParam: the port passes domain values by value; the repository mirrors its signature.
+	owner, err := runOfSession(ctx, r.u.tx, b.SessionID)
+	if err != nil {
+		return err
+	}
+	if scopeErr := r.u.requireLeasedRun(owner, "binding's session", b.SessionID.String()); scopeErr != nil {
+		return scopeErr
+	}
 	id, err := newUUID()
 	if err != nil {
 		return err
@@ -275,6 +349,13 @@ func (r bindingRepository) Create(ctx context.Context, b run.RuntimeBinding) err
 }
 
 func (r bindingRepository) Save(ctx context.Context, b run.RuntimeBinding) error { //nolint:gocritic // hugeParam: the port passes domain values by value; the repository mirrors its signature.
+	owner, err := runOfSession(ctx, r.u.tx, b.SessionID)
+	if err != nil {
+		return err
+	}
+	if scopeErr := r.u.requireLeasedRun(owner, "binding's session", b.SessionID.String()); scopeErr != nil {
+		return scopeErr
+	}
 	occupant, err := encodeOccupant(b.Occupant)
 	if err != nil {
 		return err
@@ -386,6 +467,9 @@ func (r launchClaimRepository) Settle(ctx context.Context, incarnation identity.
 	if claim == nil {
 		return fmt.Errorf("sqlite: launch claim of incarnation %s: %w", incarnation, app.ErrNotFound)
 	}
+	if scopeErr := r.u.requireLeasedRun(claim.RunID, "launch claim", incarnation.String()); scopeErr != nil {
+		return scopeErr
+	}
 	if claim.State == settlement.State {
 		return nil
 	}
@@ -441,6 +525,9 @@ func decodeJournalValue(v sql.NullString) (any, error) {
 }
 
 func (r operationRepository) Create(ctx context.Context, op app.Operation) error { //nolint:gocritic // hugeParam: the port passes journal rows by value; the repository mirrors its signature.
+	if err := r.u.requireLeasedRun(op.RunID, "operation", op.ID.String()); err != nil {
+		return err
+	}
 	intent, err := encodeJournalValue(op.Intent)
 	if err != nil {
 		return err
@@ -541,6 +628,13 @@ func (r operationRepository) Get(ctx context.Context, id identity.OperationID) (
 // evidence and outcome. Identity, generation, kind and intent are fixed at
 // Create.
 func (r operationRepository) Save(ctx context.Context, op app.Operation) error { //nolint:gocritic // hugeParam: the port passes journal rows by value; the repository mirrors its signature.
+	owner, err := runOfOperationRow(ctx, r.u.tx, op.ID)
+	if err != nil {
+		return err
+	}
+	if scopeErr := r.u.requireLeasedRun(owner, "operation", op.ID.String()); scopeErr != nil {
+		return scopeErr
+	}
 	actEvidence, err := encodeJournalValue(op.ActEvidence)
 	if err != nil {
 		return err
@@ -600,7 +694,47 @@ func (r operationRepository) Pending(ctx context.Context, runID identity.RunID) 
 type transitionRepository struct{ u *unitOfWork }
 
 func (r transitionRepository) Record(ctx context.Context, t app.Transition) error { //nolint:gocritic // hugeParam: the port passes evidence rows by value; the repository mirrors its signature.
+	owner, err := r.u.runOfTransitionTarget(ctx, &t)
+	if err != nil {
+		return err
+	}
+	if scopeErr := r.u.requireLeasedRun(owner, "transition target", t.EntityID); scopeErr != nil {
+		return scopeErr
+	}
 	return recordTransition(ctx, r.u.tx, &t)
+}
+
+// runOfTransitionTarget resolves the owning run of a transition's target
+// entity through its persisted ancestry.
+func (u *unitOfWork) runOfTransitionTarget(ctx context.Context, t *app.Transition) (identity.RunID, error) {
+	switch t.EntityKind {
+	case app.EntityRun:
+		runID, err := identity.ParseRunID(t.EntityID)
+		if err != nil {
+			return "", fmt.Errorf("sqlite: transition run id: %w", err)
+		}
+		return runID, nil
+	case app.EntityTask:
+		taskID, err := identity.ParseTaskID(t.EntityID)
+		if err != nil {
+			return "", fmt.Errorf("sqlite: transition task id: %w", err)
+		}
+		return runOfTask(ctx, u.tx, taskID)
+	case app.EntityAttempt:
+		attemptID, err := identity.ParseAttemptID(t.EntityID)
+		if err != nil {
+			return "", fmt.Errorf("sqlite: transition attempt id: %w", err)
+		}
+		return runOfAttempt(ctx, u.tx, attemptID)
+	case app.EntitySession:
+		sessionID, err := identity.ParseSessionID(t.EntityID)
+		if err != nil {
+			return "", fmt.Errorf("sqlite: transition session id: %w", err)
+		}
+		return runOfSession(ctx, u.tx, sessionID)
+	default:
+		return "", fmt.Errorf("sqlite: transition entity kind %q has no owning run", t.EntityKind)
+	}
 }
 
 // recordTransition appends one transition-evidence row through any querier.
@@ -690,6 +824,13 @@ func (r checkRequestRepository) Pending(ctx context.Context, runID identity.RunI
 }
 
 func (r checkRequestRepository) Save(ctx context.Context, cr app.CheckRequest) error { //nolint:gocritic // hugeParam: the port passes check requests by value; the repository mirrors its signature.
+	owner, err := runOfResult(ctx, r.u.tx, cr.ResultID)
+	if err != nil {
+		return err
+	}
+	if scopeErr := r.u.requireLeasedRun(owner, "check request", cr.ResultID.String()); scopeErr != nil {
+		return scopeErr
+	}
 	var claimedGeneration any
 	if cr.ClaimedGeneration != nil {
 		claimedGeneration = *cr.ClaimedGeneration

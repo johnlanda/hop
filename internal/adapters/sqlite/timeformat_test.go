@@ -82,6 +82,8 @@ func TestParseTimeRejectsNonCanonicalForms(t *testing.T) {
 		{name: "missing fractional digits", in: "2026-09-14T01:02:03Z"},
 		{name: "offset instead of Z", in: "2026-09-14T01:02:03.000000000+00:00"},
 		{name: "short fraction", in: "2026-09-14T01:02:03.123Z"},
+		{name: "comma fractional separator", in: "2026-09-14T10:00:00,000000000Z"},
+		{name: "unpadded hour", in: "2026-09-14T1:00:00.000000000Z"},
 		{name: "empty", in: ""},
 	}
 	for _, tc := range cases {

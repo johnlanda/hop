@@ -181,10 +181,10 @@ func (f *fixture) launchAttempt(t *testing.T) {
 const fixturePID = 111
 
 // createLaunchIntent commits a pending pane.open launch operation whose
-// intent JSON carries incarnation under the documented "incarnation_id"
-// key — the controller's pre-dispatch write that ClaimLaunch's pre-binding
-// currency rule reads.
-func (f *fixture) createLaunchIntent(t *testing.T, incarnation identity.IncarnationID) {
+// intent JSON carries the session and incarnation under the documented
+// "session_id" and "incarnation_id" keys — the controller's pre-dispatch
+// write that ClaimLaunch's pre-binding currency rule reads.
+func (f *fixture) createLaunchIntent(t *testing.T, session identity.SessionID, incarnation identity.IncarnationID) {
 	t.Helper()
 	f.opSeq++
 	opID := identity.OperationID(uid(9500 + f.opSeq))
@@ -196,6 +196,7 @@ func (f *fixture) createLaunchIntent(t *testing.T, incarnation identity.Incarnat
 			Kind:       app.OpPaneOpen,
 			State:      app.OperationPending,
 			Intent: map[string]any{
+				"session_id":     session.String(),
 				"incarnation_id": incarnation.String(),
 				"creation_label": uid(9001),
 			},

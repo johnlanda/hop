@@ -17,6 +17,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -127,13 +128,24 @@ func (s *Store) Close() error {
 // settings are DSN-applied so every physical connection in the pool gets
 // them, not only the first; immediateWrites additionally makes every
 // transaction on the pool begin immediate, which is how write transactions
-// take their lock up front instead of deadlocking on upgrade.
+// take their lock up front instead of deadlocking on upgrade. The path is
+// percent-encoded through net/url, so filesystem characters ('?', '#',
+// '%', spaces) are never read as URI syntax: the database always lands at
+// exactly the given path, and no root spelling can smuggle SQLite URI
+// options such as mode=memory into the connection.
 func dsn(path string, immediateWrites bool) string {
-	settings := "_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)"
+	query := url.Values{}
 	if immediateWrites {
-		settings = "_txlock=immediate&" + settings
+		query.Set("_txlock", "immediate")
 	}
-	return "file:" + path + "?" + settings
+	query["_pragma"] = []string{
+		"busy_timeout(5000)",
+		"foreign_keys(1)",
+		"journal_mode(WAL)",
+		"synchronous(FULL)",
+	}
+	u := url.URL{Scheme: "file", OmitHost: true, Path: path, RawQuery: query.Encode()}
+	return u.String()
 }
 
 // now reads the store's clock in UTC.
@@ -142,11 +154,18 @@ func (s *Store) now() time.Time { return s.clock.Now().UTC() }
 // formatTime renders t in the store's fixed-width canonical UTC form.
 func formatTime(t time.Time) string { return t.UTC().Format(timeLayout) }
 
-// parseTime parses a stored canonical timestamp.
+// parseTime parses a stored canonical timestamp. Go's layout parsing
+// accepts more spellings than the canonical form (a comma fraction, an
+// unpadded hour), so the parsed value is re-rendered and must reproduce
+// the input exactly: anything else breaks the equal-width lexical-order
+// property and is rejected.
 func parseTime(value string) (time.Time, error) {
 	t, err := time.Parse(timeLayout, value)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("sqlite: parse stored timestamp %q: %w", value, err)
+	}
+	if formatTime(t) != value {
+		return time.Time{}, fmt.Errorf("sqlite: stored timestamp %q is not in canonical form", value)
 	}
 	return t, nil
 }

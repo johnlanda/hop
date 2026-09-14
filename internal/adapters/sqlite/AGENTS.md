@@ -33,6 +33,17 @@ this package never resolves environment variables or defaults.
   `busy_timeout(5000)`; the write pool additionally begins every
   transaction immediate. A connection-churn test proves the settings on
   freshly created connections, not just the first.
+- The DSN percent-encodes the database path through net/url, so filesystem
+  characters (`?`, `#`, `%`, spaces) in a state root are never read as URI
+  syntax: the database always lands at exactly `<root>/hop.db`, and no
+  root spelling can smuggle SQLite URI options such as `mode=memory` into
+  the connection.
+- A unit of work is one run's exclusive write authority: every repository
+  mutation resolves its target's persisted owning run (directly, or
+  through its task/attempt/session/result ancestry) and refuses a target
+  of any other run with `app.ErrFenced` before any SQL executes. Only a
+  lease for that run — including one taken over after expiry — can mutate
+  it.
 - Write transactions are retried whole (bounded, with backoff) on
   SQLITE_BUSY/SQLITE_LOCKED. This is safe because no external act ever
   happens inside a transaction — the design's transaction rule, which this
@@ -40,7 +51,10 @@ this package never resolves environment variables or defaults.
 - All IDs are canonical lowercase UUID TEXT. All times are the fixed-width
   canonical UTC form `2006-01-02T15:04:05.000000000Z`; lexical order agrees
   with time order, but every lease and expiry decision compares parsed
-  times, never strings.
+  times, never strings. parseTime re-renders what it parsed and rejects
+  anything that does not reproduce the stored text exactly, so a
+  noncanonical spelling Go's layout parsing would tolerate (a comma
+  fraction, an unpadded hour) never enters a comparison.
 - Mutable entity tables (runs, tasks, attempts, sessions, worktrees) carry
   `revision`; every save runs `WHERE id = ? AND revision = ?` and zero
   affected rows is `app.ErrRevisionConflict`.
@@ -61,18 +75,24 @@ this package never resolves environment variables or defaults.
   result, the accepted receipt, the unique check request and the
   attempt/task (and, for an early submission, run) transitions with their
   generation-NULL evidence rows atomically.
-- `ClaimLaunch` refuses when the run is stopping or stopped, the
-  incarnation is not current, or a claim exists with a different pid; a
-  same-pid rewrite is idempotent. Currency: the attempt's current
-  session's current binding decides when one exists; before ANY binding
-  row exists for that session (the launcher is the pane's own command and
-  can claim before the controller records the pane.open outcome), the
-  authority is the run's newest pending launch operation (kind pane.open
-  or launch.send), whose intent JSON must carry the claim's incarnation
-  under the key `incarnation_id` — a documented contract between the
+- `ClaimLaunch` validates agreement first — the claimed attempt's
+  persisted owning run must be the claimed run, so a mixed tuple never has
+  its stop or currency questions answered against the wrong run — then
+  refuses when the run is stopping or stopped, the incarnation is not
+  current, or a claim exists with a different run, attempt or pid; a
+  same-pid rewrite on the same tuple is idempotent. Currency: the
+  attempt's current session's current binding decides when one exists;
+  before ANY binding row exists for that session (the launcher is the
+  pane's own command and can claim before the controller records the
+  pane.open outcome), the authority is the run's newest pending launch
+  operation (kind pane.open or launch.send), whose intent JSON must carry
+  BOTH the claim's incarnation and the current session's id under the keys
+  `incarnation_id` and `session_id` — a documented contract between the
   application (which commits the intent before dispatching the pane
-  request) and this store (which reads it with `json_extract`). A
-  superseded binding without a successor retires the incarnation: any
+  request) and this store (which reads them with `json_extract`). The
+  session conjunct keeps a retired incarnation's still-pending old intent
+  from authorizing a claim after a cold relaunch replaces the session, and
+  a superseded binding without a successor retires the incarnation: any
   existing binding row disables the intent fallback.
   `LaunchClaims().Settle` moves exec_pending to execed or exec_failed only,
   idempotent per target state. `ClaimCheckExec` requires a pending
@@ -100,20 +120,31 @@ this package never resolves environment variables or defaults.
 - `go test ./internal/adapters/sqlite` — the real-temporary-database suite:
   migrations from empty, reopen at the same version, refusal of a future
   version (`ErrFutureSchema`), concurrent open/migrate from two handles;
-  connection-churn PRAGMA checks on both pools; the lease CAS matrix
-  (initial lease, held refusal, takeover after expiry, stale heartbeat and
-  release across handles, release preserving the generation and the row,
+  DSN escaping (roots containing `#`, `?`, `%`, spaces, Unicode and a
+  mode=memory lookalike land at `<root>/hop.db` per `pragma_database_list`
+  and survive reopen); connection-churn PRAGMA checks on both pools; the
+  lease CAS matrix (initial lease, held refusal, takeover after expiry,
+  stale heartbeat and release across handles, raced acquisition across
+  handles with one winner, release preserving the generation and the row,
   post-release and post-expiry commit rejection); revision conflicts for
-  every mutable entity; the attempt-reservation and repository
-  get-or-create races across separate `*sql.DB` handles standing in for
-  separate processes; constraint coverage for every unique rule; reopen
-  mid-operation reading back pending operations and unsettled claims;
-  `SubmitResult` outcomes (accepted, early acceptance, transient,
-  duplicate including after the terminal state, conflicting, stale by
-  incarnation, superseded binding and stop precedence, malformed by
-  existence/agreement) with receipts asserted; `ClaimLaunch` idempotence,
-  different-pid rejection (raced), non-current incarnation and stop
-  refusals; `SettleLaunchFailure` and controller settlement transitions;
+  every mutable entity including worktrees; unit-of-work run scoping
+  (every cross-run mutation fenced; takeover of the other run grants it);
+  the bounded whole-transaction busy retry against a captured real
+  SQLITE_BUSY plus two-writer contention with a held immediate
+  transaction; the attempt-reservation and repository get-or-create races
+  across separate `*sql.DB` handles standing in for separate processes;
+  constraint coverage for every unique rule; reopen mid-operation reading
+  back pending operations and unsettled claims; `SubmitResult` outcomes
+  (accepted, early acceptance, transient, duplicate including after the
+  terminal state, conflicting, stale by incarnation, superseded binding
+  and stop precedence, malformed by existence/agreement) with receipts
+  asserted, plus the same-content two-handle race committing one result,
+  two receipts and one check request; `ClaimLaunch` idempotence,
+  different-pid rejection (raced), run/attempt agreement (mixed tuples
+  refused before and after the owner stops), the pre-binding intent
+  fallback (matching intent accepted, stale incarnation refused, binding
+  precedence, supersession retirement, replacement-session refusal);
+  `SettleLaunchFailure` and controller settlement transitions;
   `ClaimCheckExec` generation/kind/state matrix; monotonic `RequestStop`;
   the read-store loads. No sleeps: a shared hand-advanced fake clock
   decides every expiry.
