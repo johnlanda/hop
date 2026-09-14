@@ -3,8 +3,11 @@
 Status: proposed sequence. Phase 0 is implemented (module, `hop version`,
 `make check`, checkers, guides, CI). Phase 1 is in progress: backlog item 4
 (application ports, `hop doctor`, the Herdr adapter's protocol client and the
-linkable manifest) is implemented; items 5–7 are not started. Commands below
-otherwise describe the intended interface.
+linkable manifest) and item 5 (the isolated real-process fixture in
+`test/integration`: disposable server, link/invoke/log/pane/unlink, startup
+hook on server start, no user-global registry leak) are implemented; items 6
+and 7 are not started. Commands below otherwise describe the intended
+interface.
 
 ## Delivery strategy
 

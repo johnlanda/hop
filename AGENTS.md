@@ -17,6 +17,8 @@ model-routing dependency.
   composition root.
 - [Internal guide](internal/AGENTS.md): HOP packages and the architecture and
   guide checkers.
+- [Test guide](test/AGENTS.md): test-only packages; the real-process Herdr
+  suite lives at `test/integration` and skips where no herdr binary exists.
 - `herdr-plugin.toml`: the Herdr plugin manifest; the repository root is the
   linkable plugin directory and its commands run the built `.bin/hop`.
 - `repos/`: reference checkouts; HOP implementation belongs outside these trees.

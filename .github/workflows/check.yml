@@ -42,5 +42,11 @@ jobs:
         run: go version
       - name: make check
         run: make check
+      # GitHub-hosted runners have no herdr binary, so the real-process
+      # Herdr suite does not run in CI. This step prints its explicit skip
+      # lines so the gap is visible rather than implied coverage; the suite
+      # runs on developer machines with herdr installed.
+      - name: Real-process suite status (skips without a herdr binary)
+        run: go test -count=1 -run TestRealProcess -v ./test/integration
       - name: make build
         run: make build && .bin/hop version

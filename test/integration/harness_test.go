@@ -1,0 +1,461 @@
+// Package integration proves HOP against a real, disposable Herdr server.
+// Every test spawns its own named-session server on temporary config, state
+// and runtime roots with a test-only config path and no inherited HERDR_*
+// environment, so the developer's live session is never addressed. The suite
+// skips with an explicit reason when no herdr binary is installed; a skip is
+// never a pass, and CI runners without the binary do not run it.
+package integration
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/johnlanda/hop/internal/adapters/herdr"
+)
+
+// callTimeout bounds one request against the test server.
+const callTimeout = 30 * time.Second
+
+// pollInterval is the pace of bounded condition polls.
+const pollInterval = 25 * time.Millisecond
+
+// sessionName is the disposable server's named session. It stays one
+// character so the socket path fits the platform's Unix socket length cap.
+const sessionName = "s"
+
+// requireHerdr returns the herdr binary to test against, or skips: hosted CI
+// runners have no herdr installation, and the guide documents that the
+// real-process suite did not run there. HOP_TEST_HERDR_BIN pins a binary.
+func requireHerdr(t *testing.T) string {
+	t.Helper()
+	if pinned := os.Getenv("HOP_TEST_HERDR_BIN"); pinned != "" {
+		if _, err := os.Stat(pinned); err != nil { //nolint:gosec // G703: the operator chose this path to pin the binary under test.
+			t.Fatalf("HOP_TEST_HERDR_BIN: %v", err)
+		}
+		return pinned
+	}
+	path, err := exec.LookPath("herdr")
+	if err != nil {
+		t.Skipf("real-process suite skipped, not run: no herdr binary on PATH and HOP_TEST_HERDR_BIN is unset (%v)", err)
+	}
+	return path
+}
+
+// moduleRoot locates the repository root by walking up to go.mod.
+func moduleRoot(t *testing.T) string {
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Fatal("no go.mod above the test working directory")
+		}
+		dir = parent
+	}
+}
+
+// artifactDir collects evidence for one test: server output, plugin logs and
+// pane snapshots. It is deleted on success and retained on failure.
+type artifactDir struct {
+	path string
+}
+
+// newArtifactDir creates the evidence directory for one test.
+func newArtifactDir(t *testing.T) *artifactDir {
+	t.Helper()
+	base := filepath.Join(os.TempDir(), "hop-integration")
+	if err := os.MkdirAll(base, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path, err := os.MkdirTemp(base, sanitizeName(t.Name())+"-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifacts := &artifactDir{path: path}
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("artifacts retained at %s", path)
+			return
+		}
+		if err := os.RemoveAll(path); err != nil {
+			t.Logf("remove artifacts: %v", err)
+		}
+	})
+	return artifacts
+}
+
+// sanitizeName makes a test name usable as a directory component.
+func sanitizeName(name string) string {
+	sanitized := make([]rune, 0, len(name))
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			sanitized = append(sanitized, r)
+		default:
+			sanitized = append(sanitized, '_')
+		}
+	}
+	return string(sanitized)
+}
+
+// save writes one evidence file.
+func (a *artifactDir) save(t *testing.T, name, content string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(a.path, name), []byte(content), 0o600); err != nil {
+		t.Logf("save artifact %s: %v", name, err)
+	}
+}
+
+// create opens one evidence file for streaming writes.
+func (a *artifactDir) create(t *testing.T, name string) *os.File {
+	t.Helper()
+	file, err := os.Create(filepath.Join(a.path, name)) //nolint:gosec // G304: the path is inside this test's own artifact directory.
+	if err != nil {
+		t.Fatal(err)
+	}
+	return file
+}
+
+// testServer is one disposable named-session Herdr server on temporary
+// roots, plus the environment every subprocess addressing it must use.
+type testServer struct {
+	herdrBin   string
+	base       string
+	configHome string
+	socketPath string
+	config     string
+	cmd        *exec.Cmd
+	client     *herdr.Client
+	artifacts  *artifactDir
+}
+
+// testConfig is the test-only configuration: no onboarding, fixed headless
+// geometry for repeatable pane snapshots, and nesting allowed so a pane
+// inside the test server may attach a client to that same test server.
+const testConfig = "onboarding = false\n\n[server]\nheadless_cols = 100\nheadless_rows = 30\n\n[experimental]\nallow_nested = true\n"
+
+// newServerRoots prepares the temporary config/state/runtime roots and the
+// test-only config file. The base directory is created outside t.TempDir
+// because macOS caps Unix socket paths at 104 bytes.
+func newServerRoots(t *testing.T) (base string) {
+	t.Helper()
+	base, err := os.MkdirTemp("", "hop-it")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(base); err != nil {
+			t.Logf("remove server roots: %v", err)
+		}
+	})
+	for _, dir := range []string{"c/herdr", "r", "st", "work"} {
+		if err := os.MkdirAll(filepath.Join(base, dir), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(base, "c", "herdr", "config.toml"), []byte(testConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return base
+}
+
+// environ builds the hermetic environment for one subprocess: temporary
+// roots, the test-only config path, and no inherited HERDR_* values at all.
+// The allowlist is built from scratch, so socket, session and caller
+// variables from the developer's live session cannot leak in.
+func (s *testServer) environ() []string {
+	return []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOME=" + os.Getenv("HOME"),
+		"TMPDIR=" + os.Getenv("TMPDIR"),
+		"SHELL=/bin/sh",
+		"XDG_CONFIG_HOME=" + filepath.Join(s.base, "c"),
+		"XDG_STATE_HOME=" + filepath.Join(s.base, "st"),
+		"XDG_RUNTIME_DIR=" + filepath.Join(s.base, "r"),
+		"HERDR_CONFIG_PATH=" + s.config,
+	}
+}
+
+// prepareServer lays out roots and the command for one disposable server
+// without starting it, so registry writes can happen while it is down.
+func prepareServer(t *testing.T, artifacts *artifactDir) *testServer {
+	t.Helper()
+	herdrBin := requireHerdr(t)
+	base := newServerRoots(t)
+	configHome := filepath.Join(base, "c")
+	server := &testServer{
+		herdrBin:   herdrBin,
+		base:       base,
+		configHome: configHome,
+		socketPath: filepath.Join(configHome, "herdr", "sessions", sessionName, "herdr.sock"),
+		config:     filepath.Join(configHome, "herdr", "config.toml"),
+		artifacts:  artifacts,
+	}
+	server.client = herdr.NewClient(server.socketPath)
+	return server
+}
+
+// start launches the named-session server headless and waits for its socket
+// to answer ping, with a bounded deadline and no fixed sleeps.
+func (s *testServer) start(t *testing.T) {
+	t.Helper()
+	stdout := s.artifacts.create(t, "server-stdout.log")
+	stderr := s.artifacts.create(t, "server-stderr.log")
+	cmd := exec.CommandContext(context.Background(), s.herdrBin, "--session", sessionName, "server") //nolint:gosec // G204: the binary is the pinned or PATH-resolved herdr under test. The context is deliberately unbounded: stop owns the shutdown through the API and the process handle.
+	cmd.Env = s.environ()
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	cmd.Stdin = nil
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start herdr server: %v", err)
+	}
+	s.cmd = cmd
+	exited := make(chan error, 1)
+	go func() { exited <- cmd.Wait() }()
+	t.Cleanup(func() {
+		s.stop(t, exited)
+		if closeErr := stdout.Close(); closeErr != nil {
+			t.Logf("close server stdout: %v", closeErr)
+		}
+		if closeErr := stderr.Close(); closeErr != nil {
+			t.Logf("close server stderr: %v", closeErr)
+		}
+	})
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		var pong struct {
+			Version string `json:"version"`
+		}
+		err := s.client.Call(ctx, "ping", nil, &pong)
+		cancel()
+		if err == nil && pong.Version != "" {
+			return
+		}
+		select {
+		case waitErr := <-exited:
+			t.Fatalf("herdr server exited before its socket answered: %v", waitErr)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("herdr server socket %s did not answer ping before the deadline; last error: %v", s.socketPath, err)
+		}
+		time.Sleep(pollInterval)
+	}
+}
+
+// stop shuts the server down through its own API, then falls back to the
+// process handle. Only this test's spawned process is ever signaled.
+func (s *testServer) stop(t *testing.T, exited <-chan error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.client.Call(ctx, "server.stop", nil, nil); err != nil {
+		t.Logf("server.stop: %v (falling back to the process handle)", err)
+	}
+	select {
+	case <-exited:
+		return
+	case <-time.After(10 * time.Second):
+	}
+	if err := s.cmd.Process.Kill(); err != nil {
+		t.Logf("kill herdr server: %v", err)
+	}
+	select {
+	case <-exited:
+	case <-time.After(10 * time.Second):
+		t.Errorf("herdr server pid %d did not exit after kill", s.cmd.Process.Pid)
+	}
+}
+
+// runCLI runs one herdr CLI command against the test roots and returns its
+// combined output. The command addresses only the disposable session.
+func (s *testServer) runCLI(t *testing.T, args ...string) (string, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), callTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, s.herdrBin, append([]string{"--session", sessionName}, args...)...) //nolint:gosec // G204: the binary is the pinned or PATH-resolved herdr under test and the arguments are chosen by this suite.
+	cmd.Env = s.environ()
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+// stagePlugin builds the hop binary and copies the repository's manifest
+// into a temporary plugin directory shaped like the linked working tree:
+// the manifest at the root and the binary at .bin/hop.
+func stagePlugin(t *testing.T) string {
+	t.Helper()
+	root := moduleRoot(t)
+	stage, err := os.MkdirTemp("", "hop-plug")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if removeErr := os.RemoveAll(stage); removeErr != nil {
+			t.Logf("remove staged plugin: %v", removeErr)
+		}
+	})
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Fatalf("the go tool is required to build the plugin binary: %v", err)
+	}
+	buildCtx, cancelBuild := context.WithTimeout(t.Context(), 2*time.Minute)
+	defer cancelBuild()
+	build := exec.CommandContext(buildCtx, goBin, "build", "-o", filepath.Join(stage, ".bin", "hop"), "./cmd/hop") //nolint:gosec // G204: the go tool builds this repository's own command.
+	build.Dir = root
+	if out, buildErr := build.CombinedOutput(); buildErr != nil {
+		t.Fatalf("go build ./cmd/hop: %v\n%s", buildErr, out)
+	}
+	copyFile(t, filepath.Join(root, "herdr-plugin.toml"), filepath.Join(stage, "herdr-plugin.toml"))
+	return stage
+}
+
+// copyFile copies one regular file.
+func copyFile(t *testing.T, from, to string) {
+	t.Helper()
+	source, err := os.Open(from) //nolint:gosec // G304: both paths are chosen by this suite.
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if closeErr := source.Close(); closeErr != nil {
+			t.Errorf("close %s: %v", from, closeErr)
+		}
+	}()
+	destination, err := os.Create(to) //nolint:gosec // G304: both paths are chosen by this suite.
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(destination, source); err != nil {
+		t.Fatal(err)
+	}
+	if err := destination.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// userGlobalRegistries lists the real user-global plugin registry files the
+// suite must never touch. Reading them is the leak check; they are never
+// written.
+func userGlobalRegistries() []string {
+	home := os.Getenv("HOME")
+	return []string{
+		filepath.Join(home, ".config", "herdr", "plugins.json"),
+		filepath.Join(home, ".config", "herdr-dev", "plugins.json"),
+	}
+}
+
+// registrySnapshot records each user-global registry's content, with absence
+// recorded distinctly from emptiness.
+func registrySnapshot(t *testing.T) map[string]string {
+	t.Helper()
+	snapshot := map[string]string{}
+	for _, path := range userGlobalRegistries() {
+		content, err := os.ReadFile(path) //nolint:gosec // G304: fixed well-known paths under the user's home, read-only.
+		if err != nil {
+			if !os.IsNotExist(err) {
+				t.Fatalf("read %s: %v", path, err)
+			}
+			snapshot[path] = "<absent>"
+			continue
+		}
+		snapshot[path] = string(content)
+	}
+	return snapshot
+}
+
+// assertNoRegistryLeak fails when any user-global registry changed while the
+// test ran: registration is user-global by default in Herdr, so this is the
+// proof that temporary roots confined it.
+func assertNoRegistryLeak(t *testing.T, before map[string]string) {
+	t.Helper()
+	after := registrySnapshot(t)
+	for path, want := range before {
+		if after[path] != want {
+			t.Errorf("user-global registry %s changed during the test; the test registration leaked", path)
+		}
+	}
+}
+
+// waitUntil polls a condition with a bounded deadline and no fixed sleeps
+// beyond the poll interval. It reports whether the condition became true.
+func waitUntil(timeout time.Duration, condition func() bool) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if condition() {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(pollInterval)
+	}
+}
+
+// call issues one request against the test server, each with its own
+// bounded deadline, and fails the test on any error.
+func (s *testServer) call(t *testing.T, method string, params, result any) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), callTimeout)
+	defer cancel()
+	if err := s.client.Call(ctx, method, params, result); err != nil {
+		t.Fatalf("%s: %v", method, err)
+	}
+}
+
+// pluginLogs fetches the hop plugin's command log records.
+func (s *testServer) pluginLogs(t *testing.T) []pluginLogRecord {
+	t.Helper()
+	var result struct {
+		Logs []pluginLogRecord `json:"logs"`
+	}
+	s.call(t, "plugin.log.list", map[string]any{"plugin_id": "hop", "limit": 50}, &result)
+	return result.Logs
+}
+
+// pluginLogRecord is the subset of Herdr's plugin command log the suite
+// asserts on.
+type pluginLogRecord struct {
+	LogID    string `json:"log_id"`
+	PluginID string `json:"plugin_id"`
+	ActionID string `json:"action_id"`
+	Event    string `json:"event"`
+	Status   string `json:"status"`
+	ExitCode *int   `json:"exit_code"`
+	Stdout   string `json:"stdout"`
+	Stderr   string `json:"stderr"`
+}
+
+// waitForLog waits until the identified log record leaves the running state
+// and returns it, saving the full log set as evidence on failure.
+func (s *testServer) waitForLog(t *testing.T, match func(*pluginLogRecord) bool) pluginLogRecord {
+	t.Helper()
+	var found pluginLogRecord
+	completed := waitUntil(60*time.Second, func() bool {
+		for _, record := range s.pluginLogs(t) {
+			if match(&record) && record.Status != "running" {
+				found = record
+				return true
+			}
+		}
+		return false
+	})
+	if !completed {
+		logs := s.pluginLogs(t)
+		s.artifacts.save(t, "plugin-logs.txt", fmt.Sprintf("%+v", logs))
+		t.Fatalf("no matching plugin command completed before the deadline; %d records saved to artifacts", len(logs))
+	}
+	return found
+}

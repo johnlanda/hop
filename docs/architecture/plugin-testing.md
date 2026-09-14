@@ -102,6 +102,10 @@ snapshots. Pin both server/client versions for the UI suite; later run compatibi
 checks against HOP's minimum supported and current stable Herdr versions.
 
 Herdr's contributor commands are `just test`, `just check` and focused
-`just test-one <filter>`; those validate Herdr itself. HOP should expose its own Go
-targets for fake-adapter, real-Herdr and live-harness tests. Those targets remain
-planned, not implemented.
+`just test-one <filter>`; those validate Herdr itself. HOP's fake-endpoint
+protocol tests live in `internal/adapters/herdr` and the first real-process
+suite lives in `test/integration` (see its guide), both running under the
+ordinary `make check`; the real-process suite skips with an explicit reason
+where no herdr binary is installed, and CI runners have none. Of the table
+above, the link-and-invoke and startup rows are implemented; the remaining
+rows and the live-harness tests are planned, not implemented.
