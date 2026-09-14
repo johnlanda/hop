@@ -28,8 +28,8 @@ func (c *Controller) RequestStop(ctx context.Context, runIDStr string) error {
 // and resume's group-retirement classification matches an inspected
 // process group's argv against.
 type checkRunIntent struct {
-	CheckoutPath string
-	CheckArgv    []string
+	CheckoutPath string   `json:"checkout_path"`
+	CheckArgv    []string `json:"check_argv"`
 }
 
 // StopReport is one DriveStop round's outcome.

@@ -39,9 +39,9 @@ type StartRunResult struct {
 
 // worktreeCreateIntent is the OpWorktreeCreate operation's intent payload.
 type worktreeCreateIntent struct {
-	RepositoryRoot string
-	Branch         string
-	BaseRef        string
+	RepositoryRoot string `json:"repository_root"`
+	Branch         string `json:"branch"`
+	BaseRef        string `json:"base_ref"`
 }
 
 // worktreeCreateOutcome is the OpWorktreeCreate operation's outcome
@@ -49,16 +49,23 @@ type worktreeCreateIntent struct {
 // afterward — Herdr's response carries no commit, so the base commit an
 // adoption decision validates against is resolved separately.
 type worktreeCreateOutcome struct {
-	Info       WorktreeInfo
-	BaseCommit string
+	Info       WorktreeInfo `json:"info"`
+	BaseCommit string       `json:"base_commit"`
 }
 
 // paneOpenIntent is the OpPaneOpen operation's intent payload.
 type paneOpenIntent struct {
-	Command     []string
-	Cwd         string
-	WorkspaceID string
-	Label       string
+	Command []string `json:"command"`
+	Cwd     string   `json:"cwd"`
+	// WorkspaceID is the workspace the pane joins.
+	WorkspaceID string `json:"workspace_id"`
+	// Label is the pane's unique creation label (the operation ID).
+	Label string `json:"label"`
+	// IncarnationID is what SubmissionStore.ClaimLaunch validates a
+	// pre-binding launcher against: json_extract on the newest pending
+	// pane.open operation for the current attempt, before falling back to
+	// the binding once one exists.
+	IncarnationID identity.IncarnationID `json:"incarnation_id"`
 }
 
 // StartRun freezes a new run and drives it through worktree creation and
@@ -316,7 +323,7 @@ func (c *Controller) openWorkerPane(ctx context.Context, handle RunHandle, ids g
 		"HOP_ATTEMPT_ID":     ids.Attempt.String(),
 		"HOP_INCARNATION_ID": ids.Incarnation.String(),
 	}
-	intent := paneOpenIntent{Command: argv, Cwd: worktree.Path, WorkspaceID: worktree.WorkspaceID, Label: opID.String()}
+	intent := paneOpenIntent{Command: argv, Cwd: worktree.Path, WorkspaceID: worktree.WorkspaceID, Label: opID.String(), IncarnationID: ids.Incarnation}
 	now := c.Clock.Now()
 
 	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {

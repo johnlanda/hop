@@ -12,8 +12,8 @@ import (
 
 // checkRunOutcome is the OpCheckRun operation's outcome payload.
 type checkRunOutcome struct {
-	ExitCode int
-	Unknown  bool // the outcome could not be determined (crash recovery)
+	ExitCode int  `json:"exit_code"`
+	Unknown  bool `json:"unknown"` // the outcome could not be determined (crash recovery)
 }
 
 // CheckReport is one ClaimAndRunCheck round's outcome.
