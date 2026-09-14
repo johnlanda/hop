@@ -11,6 +11,7 @@ directory; it is a grouping directory.
 | Directory | Guide | External system |
 | --- | --- | --- |
 | `herdr/` | [internal/adapters/herdr](herdr/AGENTS.md) | Herdr CLI and socket API |
+| `sqlite/` | [internal/adapters/sqlite](sqlite/AGENTS.md) | SQLite state store (modernc.org/sqlite) |
 
 ## Rules for this subtree
 

@@ -175,6 +175,7 @@ func productionRules() ruleTable {
 		"internal":                 {category: categoryArchitectureTest},
 		"internal/app":             {category: categoryApplication, firstParty: []string{"internal/domain/identity", "internal/domain/run"}},
 		"internal/adapters/herdr":  {category: categoryDrivenAdapter, firstParty: []string{"internal/app"}},
+		"internal/adapters/sqlite": {category: categoryDrivenAdapter, firstParty: []string{"internal/app", "internal/domain/run", "internal/domain/identity"}, thirdParty: []string{"modernc.org/sqlite"}},
 		"internal/domain/identity": {category: categoryDomainShared, standard: []string{"errors", "fmt", "strconv", "strings"}, testStandard: []string{"testing"}},
 		"internal/domain/run":      {category: categoryDomain, firstParty: []string{"internal/domain/identity"}, standard: []string{"errors", "fmt", "time"}, testStandard: []string{"testing"}},
 		"test/integration":         {category: categoryIntegrationTest, firstParty: []string{"internal/app", "internal/adapters/herdr"}, testThirdParty: []string{"github.com/creack/pty"}},
