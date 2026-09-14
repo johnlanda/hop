@@ -403,11 +403,12 @@ installed `herdr 0.9.0` documentation):
 Combined with the profile-scoped resume lookups verified above for all three
 harnesses, Herdr auto-resume of a session that was launched in an isolated
 profile runs without the overrides that selected that profile: the resume
-command resolves against whatever profile the server environment implies
-(normally the global default), misses the isolated transcript, and any
-session it did start would use the wrong credentials (or, for opencode,
-whatever provider key the server environment carries). The binding is not
-restored reliably; auto-resume of isolated-profile sessions is unsupported.
+command resolves against whatever profile the inherited server/shell
+environment implies. If that inherited profile differs from the recorded
+one, the transcript may be missing or a session may run with unintended
+credentials (for opencode, with whatever provider key that environment
+carries). The binding is not restored reliably; auto-resume of
+isolated-profile sessions is unsupported.
 
 ## Proposed supported restore policy
 
@@ -415,7 +416,7 @@ restored reliably; auto-resume of isolated-profile sessions is unsupported.
 | --- | --- | --- |
 | Warm reattach: Herdr server and agent process survived; HOP reconciles bindings | Supported | No relaunch occurs; Herdr keeps live processes ([session state](../../repos/herdr/docs/versions/0.9.0/website/src/content/docs/session-state.mdx)) |
 | Cold resume by HOP: relaunch with the recorded profile env, same account, recorded cwd | Pending, per harness, on the account-identity smoke below | Resume lookup verified unauthenticated for Claude Code and Codex; full unauthenticated resume round-trip verified for opencode on its free model — which proves nothing about accounts; authenticated, account-verified continuation untested everywhere |
-| Cold resume via Herdr auto-restore of an isolated-profile session | Unsupported | Restore env carries no profile variables (restore path above); resume lookup is profile-scoped (verified), so the transcript is missed and the default account would be used |
+| Cold resume via Herdr auto-restore of an isolated-profile session | Unsupported | Original per-pane profile overrides are not replayed; resume uses the inherited server/shell environment, so the recorded profile/account binding is not guaranteed (restore path above; resume lookup profile-scoped, verified) |
 | Cold resume where the resuming profile's account differs from the original | Needs opt-in evidence | Transcript portability verified (file copy for Claude Code/Codex, export/import for opencode); provider-side acceptance and account semantics unknown; requires a second account |
 | Automatic account failover during restore | Unsupported | No evidence; [architecture](architecture.md) requires confirmed credential isolation before claiming it |
 
