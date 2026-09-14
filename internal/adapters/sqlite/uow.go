@@ -93,6 +93,18 @@ func (u *unitOfWork) requireLeasedRun(owner identity.RunID, kind, id string) err
 	return nil
 }
 
+// saveOwnerLookup adapts a revision-bearing Save's ownership lookup: a
+// missing row is reported as ErrRevisionConflict, exactly as the update's
+// zero affected rows would have reported it before the ownership check ran
+// first (design section 4's contract for revision-bearing updates). Every
+// other lookup error passes through unchanged.
+func saveOwnerLookup(err error, kind, id string, expectedRevision int64) error {
+	if errors.Is(err, app.ErrNotFound) {
+		return fmt.Errorf("sqlite: %s %s at revision %d: %w", kind, id, expectedRevision, app.ErrRevisionConflict)
+	}
+	return err
+}
+
 // saveEntity runs one optimistic-concurrency update: zero affected rows is
 // ErrRevisionConflict, and the entity's revision advances by one.
 func saveEntity(result sql.Result, execErr error, kind, id string, expectedRevision int64) (int64, error) {
@@ -142,7 +154,7 @@ func (r taskRepository) Get(ctx context.Context, id identity.TaskID) (run.Task, 
 func (r taskRepository) Save(ctx context.Context, v run.Task, expectedRevision int64) (int64, error) { //nolint:gocritic // hugeParam: the port passes domain values by value; the repository mirrors its signature.
 	owner, err := runOfTask(ctx, r.u.tx, v.ID)
 	if err != nil {
-		return 0, err
+		return 0, saveOwnerLookup(err, "task", v.ID.String(), expectedRevision)
 	}
 	if scopeErr := r.u.requireLeasedRun(owner, "task", v.ID.String()); scopeErr != nil {
 		return 0, scopeErr
@@ -164,7 +176,7 @@ func (r attemptRepository) Get(ctx context.Context, id identity.AttemptID) (run.
 func (r attemptRepository) Save(ctx context.Context, v run.Attempt, expectedRevision int64) (int64, error) { //nolint:gocritic // hugeParam: the port passes domain values by value; the repository mirrors its signature.
 	owner, err := runOfAttempt(ctx, r.u.tx, v.ID)
 	if err != nil {
-		return 0, err
+		return 0, saveOwnerLookup(err, "attempt", v.ID.String(), expectedRevision)
 	}
 	if scopeErr := r.u.requireLeasedRun(owner, "attempt", v.ID.String()); scopeErr != nil {
 		return 0, scopeErr
@@ -201,7 +213,7 @@ func (r sessionRepository) Current(ctx context.Context, attempt identity.Attempt
 func (r sessionRepository) Save(ctx context.Context, v run.Session, expectedRevision int64) (int64, error) { //nolint:gocritic // hugeParam: the port passes domain values by value; the repository mirrors its signature.
 	owner, err := runOfSession(ctx, r.u.tx, v.ID)
 	if err != nil {
-		return 0, err
+		return 0, saveOwnerLookup(err, "session", v.ID.String(), expectedRevision)
 	}
 	if scopeErr := r.u.requireLeasedRun(owner, "session", v.ID.String()); scopeErr != nil {
 		return 0, scopeErr
@@ -265,7 +277,7 @@ func (r worktreeRepository) Create(ctx context.Context, v run.Worktree) (int64, 
 func (r worktreeRepository) Save(ctx context.Context, v run.Worktree, expectedRevision int64) (int64, error) { //nolint:gocritic // hugeParam: the port passes domain values by value; the repository mirrors its signature.
 	owner, err := runOfWorktree(ctx, r.u.tx, v.ID)
 	if err != nil {
-		return 0, err
+		return 0, saveOwnerLookup(err, "worktree", v.ID.String(), expectedRevision)
 	}
 	if scopeErr := r.u.requireLeasedRun(owner, "worktree", v.ID.String()); scopeErr != nil {
 		return 0, scopeErr

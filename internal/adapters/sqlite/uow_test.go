@@ -97,6 +97,46 @@ func TestSaveRevisionConflict(t *testing.T) {
 				return err
 			},
 		},
+		{
+			name: "missing task id",
+			save: func(t *testing.T, f *fixture, uow app.UnitOfWork, staleRevision int64) error {
+				t.Helper()
+				missing := run.Task{ID: identity.TaskID(uid(6401)), RunID: f.spec.RunID, State: run.TaskPending, UpdatedAt: f.clock.Now()}
+				_, err := uow.Tasks().Save(t.Context(), missing, staleRevision)
+				return err
+			},
+		},
+		{
+			name: "missing attempt id",
+			save: func(t *testing.T, f *fixture, uow app.UnitOfWork, staleRevision int64) error {
+				t.Helper()
+				missing := run.Attempt{ID: identity.AttemptID(uid(6402)), TaskID: f.spec.TaskID, Number: 1, State: run.AttemptReserved, UpdatedAt: f.clock.Now()}
+				_, err := uow.Attempts().Save(t.Context(), missing, staleRevision)
+				return err
+			},
+		},
+		{
+			name: "missing session id",
+			save: func(t *testing.T, f *fixture, uow app.UnitOfWork, staleRevision int64) error {
+				t.Helper()
+				missing := run.NewSession(identity.SessionID(uid(6403)), f.spec.RunID, f.spec.AttemptID, run.HarnessClaude, f.clock.Now())
+				_, err := uow.Sessions().Save(t.Context(), missing, staleRevision)
+				return err
+			},
+		},
+		{
+			name: "missing worktree id",
+			save: func(t *testing.T, f *fixture, uow app.UnitOfWork, staleRevision int64) error {
+				t.Helper()
+				runV, _, err := uow.Runs().Get(t.Context(), f.spec.RunID)
+				if err != nil {
+					t.Fatalf("get run: %v", err)
+				}
+				missing := run.NewWorktree(identity.WorktreeID(uid(6404)), runV.RepositoryID, f.spec.RunID, "/worktrees/missing", "hop/missing")
+				_, err = uow.Worktrees().Save(t.Context(), missing, staleRevision)
+				return err
+			},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
