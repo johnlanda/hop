@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/johnlanda/hop/internal/domain/identity"
@@ -43,9 +44,13 @@ const (
 	// ResumeUnsupported means cold relaunch would be required but the
 	// harness has no supported resume semantics (Codex, opencode).
 	ResumeUnsupported ResumeOutcome = "unsupported"
-	// ResumeNothingToDo means the attempt was never launched, or is already
-	// terminal; resume only needed to acquire the lease.
+	// ResumeNothingToDo means the run is already terminal, or the attempt
+	// is; resume only needed to acquire the lease.
 	ResumeNothingToDo ResumeOutcome = "nothing-to-do"
+	// ResumeStartupContinued means a crash during initial startup was
+	// recovered: the worktree was adopted or re-created and the worker pane
+	// was opened, continuing the original launch.
+	ResumeStartupContinued ResumeOutcome = "startup-continued"
 )
 
 // ResumeResult is one Resume call's outcome.
@@ -55,11 +60,15 @@ type ResumeResult struct {
 	Detail         string
 }
 
-// Resume acquires run's controller lease (a new fencing generation) and
-// performs one round of the section 5 reconciliation. It never sleeps or
-// resends; the caller is responsible for driving the returned RunHandle
-// further (CorroborateLaunch, DriveStop, ClaimAndRunCheck) once
-// reconciliation lands on a continuable outcome.
+// Resume acquires run's controller lease (a new fencing generation),
+// resolves pending or ambiguous operations from previous generations per
+// the section 4 decision table, and performs one round of the section 5
+// reconciliation. It never sleeps or resends; the caller is responsible
+// for driving the returned RunHandle further (CorroborateLaunch,
+// DriveStop, ClaimAndRunCheck) once reconciliation lands on a continuable
+// outcome. Entry is idempotent: a run already resuming is not
+// re-transitioned, and a terminal run reports NothingToDo without any
+// state change.
 func (c *Controller) Resume(ctx context.Context, req ResumeRequest) (ResumeResult, RunHandle, error) {
 	runID, err := identity.ParseRunID(req.RunID)
 	if err != nil {
@@ -72,22 +81,40 @@ func (c *Controller) Resume(ctx context.Context, req ResumeRequest) (ResumeResul
 	handle := newRunHandle(runID, lease)
 	now := c.Clock.Now()
 
-	if enterErr := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
-		r, rRev, getErr := uow.Runs().Get(ctx, runID)
-		if getErr != nil {
-			return getErr
+	entry, err := c.Read.LoadRunStatus(ctx, runID)
+	if err != nil {
+		return ResumeResult{}, handle, fmt.Errorf("app: load run status: %w", err)
+	}
+	switch entry.State {
+	case run.RunCompleted, run.RunFailed, run.RunStopped:
+		return ResumeResult{Outcome: ResumeNothingToDo, Detail: fmt.Sprintf("run is already %s", entry.State)}, handle, nil
+	case run.RunResuming:
+		// A previous resume round already entered resuming; entry is
+		// idempotent and reconciliation just continues.
+	case run.RunCreated, run.RunLaunching, run.RunRunning, run.RunCompleting, run.RunStopping:
+		if enterErr := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+			r, rRev, getErr := uow.Runs().Get(ctx, runID)
+			if getErr != nil {
+				return getErr
+			}
+			rFrom := r.State
+			r, resumeErr := r.EnterResuming(now)
+			if resumeErr != nil {
+				return resumeErr
+			}
+			if _, saveErr := uow.Runs().Save(ctx, r, rRev); saveErr != nil {
+				return saveErr
+			}
+			return recordTransition(ctx, uow, EntityRun, runID.String(), string(rFrom), string(r.State), "hop resume acquired the lease", gen(handle.lease.Generation), now)
+		}); enterErr != nil {
+			return ResumeResult{}, handle, fmt.Errorf("app: enter resuming: %w", enterErr)
 		}
-		rFrom := r.State
-		r, resumeErr := r.EnterResuming(now)
-		if resumeErr != nil {
-			return resumeErr
-		}
-		if _, saveErr := uow.Runs().Save(ctx, r, rRev); saveErr != nil {
-			return saveErr
-		}
-		return recordTransition(ctx, uow, EntityRun, runID.String(), string(rFrom), string(r.State), "hop resume acquired the lease", gen(handle.lease.Generation), now)
-	}); enterErr != nil {
-		return ResumeResult{}, handle, fmt.Errorf("app: enter resuming: %w", enterErr)
+	default:
+		return ResumeResult{}, handle, fmt.Errorf("app: run %s is in unknown state %q; failing closed", runID, entry.State)
+	}
+
+	if recoverErr := c.recoverPendingOperations(ctx, handle, entry); recoverErr != nil {
+		return ResumeResult{}, handle, recoverErr
 	}
 
 	detail, err := c.Read.LoadRunStatus(ctx, runID)
@@ -100,15 +127,365 @@ func (c *Controller) Resume(ctx context.Context, req ResumeRequest) (ResumeResul
 }
 
 // reconcile dispatches by the attempt's state, per the section 5 tables.
+// An unknown attempt state fails closed rather than passing as terminal.
 func (c *Controller) reconcile(ctx context.Context, handle RunHandle, detail RunDetail, req ResumeRequest) (ResumeResult, error) { //nolint:gocritic // hugeParam: RunHandle, RunDetail and ResumeRequest are per-call DTOs; this runs once per resume round.
 	switch detail.AttemptState {
 	case run.AttemptReserved:
-		return ResumeResult{Outcome: ResumeNothingToDo, Detail: "attempt was never launched"}, nil
+		return c.continueStartup(ctx, handle, detail, req)
 	case run.AttemptRunning, run.AttemptSubmitted, run.AttemptChecking, run.AttemptReconciling, run.AttemptLaunching, run.AttemptRelaunching:
 		return c.reconcileActive(ctx, handle, detail, req)
-	default:
+	case run.AttemptCompleted, run.AttemptFailed, run.AttemptInterrupted:
 		return ResumeResult{Outcome: ResumeNothingToDo, Detail: "attempt is already terminal"}, nil
+	default:
+		return ResumeResult{}, fmt.Errorf("app: attempt %s is in unknown state %q; failing closed", detail.AttemptID, detail.AttemptState)
 	}
+}
+
+// worktreeRecoveryDeadline bounds the wait for an in-flight worktree
+// creation to surface after a crash between intent and act: within it, an
+// absent checkout is ambiguous (the create may still be in flight); past
+// it, an absent checkout settles the old intent as failed and startup
+// re-drives creation.
+const worktreeRecoveryDeadline = 120 * time.Second
+
+// boundedWaitEvidence is the act-evidence payload recording an ambiguous
+// operation's bounded wait window.
+type boundedWaitEvidence struct {
+	WaitingSince string `json:"waiting_since"`
+	Deadline     string `json:"deadline"`
+	Detail       string `json:"detail"`
+}
+
+// recoverPendingOperations resolves pending and reconciling operations
+// from previous generations per the section 4 decision table, oldest
+// first, before any new act: worktree.create by provenance-validated
+// adoption, pane.open/launch.send by creation-label lookup with a bounded
+// wait, and unknown operation kinds fail closed into reconciling.
+// pane.close and check.run operations are resolved by their own drivers
+// (DriveStop, retirement and the check use case), never here.
+func (c *Controller) recoverPendingOperations(ctx context.Context, handle RunHandle, detail RunDetail) error { //nolint:gocritic // hugeParam: RunHandle and RunDetail are per-call DTOs; this runs once per resume.
+	for i := range detail.PendingOperations {
+		op := &detail.PendingOperations[i]
+		var err error
+		switch op.Kind {
+		case OpWorktreeCreate:
+			err = c.recoverWorktreeCreate(ctx, handle, op)
+		case OpPaneOpen, OpLaunchSend:
+			err = c.recoverPaneOpen(ctx, handle, op)
+		case OpPaneClose, OpCheckRun, OpAbsenceAttested:
+			// Resolved by their own drivers; attestations are journal-only.
+		default:
+			err = c.markOperationReconciling(ctx, handle, op.ID, fmt.Sprintf("unknown operation kind %q; failing closed", op.Kind))
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// recoverWorktreeCreate resolves a pending worktree.create operation: the
+// intended repository's worktree listing is searched for the intent's
+// branch, and a found candidate is validated by provenance — adoption
+// requires provenance, never path existence. No candidate within the
+// bounded wait stays ambiguous; past the deadline the intent settles
+// failed so startup may re-drive creation. A worktree row that already
+// exists settles the operation as already adopted.
+func (c *Controller) recoverWorktreeCreate(ctx context.Context, handle RunHandle, op *Operation) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per pending operation.
+	intent, ok := decodeOperationPayload[worktreeCreateIntent](op.Intent)
+	if !ok || intent.RepositoryRoot == "" || intent.Branch == "" || intent.BaseRef == "" {
+		return c.markOperationReconciling(ctx, handle, op.ID, "worktree.create intent could not be decoded; failing closed")
+	}
+
+	already := false
+	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		_, _, getErr := uow.Worktrees().ByRun(ctx, handle.runID)
+		if getErr == nil {
+			already = true
+			return nil
+		}
+		if errors.Is(getErr, ErrNotFound) {
+			return nil
+		}
+		return getErr
+	}); err != nil {
+		return err
+	}
+	if already {
+		return c.settleOperation(ctx, handle, op.ID, OperationSucceeded, "worktree already adopted")
+	}
+
+	listing, status := c.gitOutput(ctx, intent.RepositoryRoot, "worktree", "list", "--porcelain")
+	if status != gitOK {
+		return nil // the listing itself could not be made: ambiguous, retry on a later round.
+	}
+	candidate, found := worktreeForBranch(listing, intent.Branch)
+	if !found {
+		now := c.Clock.Now()
+		if now.Sub(op.CreatedAt) <= worktreeRecoveryDeadline {
+			return c.recordBoundedWait(ctx, handle, op, worktreeRecoveryDeadline, "no checkout for the intended branch yet; creation may be in flight")
+		}
+		return c.settleOperation(ctx, handle, op.ID, OperationFailed, "no checkout for the intended branch surfaced within the bounded wait")
+	}
+
+	provenance, provenanceDetail := c.classifyWorktreeProvenance(ctx, candidate, intent.RepositoryRoot, intent.BaseRef)
+	switch provenance {
+	case worktreeValid:
+		worktreeID, err := identity.ParseWorktreeID(c.IDs.NewID())
+		if err != nil {
+			return fmt.Errorf("app: generate worktree id: %w", err)
+		}
+		return c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+			r, _, getErr := uow.Runs().Get(ctx, handle.runID)
+			if getErr != nil {
+				return getErr
+			}
+			if _, createErr := uow.Worktrees().Create(ctx, run.NewWorktree(worktreeID, r.RepositoryID, handle.runID, candidate, intent.Branch)); createErr != nil {
+				return createErr
+			}
+			latest, getErr := uow.Operations().Get(ctx, op.ID)
+			if getErr != nil {
+				return getErr
+			}
+			latest.State = OperationSucceeded
+			latest.Outcome = worktreeCreateOutcome{Info: WorktreeInfo{Path: candidate, Branch: intent.Branch}, BaseCommit: intent.BaseRef}
+			latest.UpdatedAt = c.Clock.Now()
+			return uow.Operations().Save(ctx, latest)
+		})
+	case worktreeUnrelated:
+		return c.settleOperation(ctx, handle, op.ID, OperationFailed, provenanceDetail)
+	case worktreeAbsent, worktreeAmbiguous:
+		return nil
+	}
+	return nil
+}
+
+// worktreeForBranch finds the checkout path for branch in a
+// `git worktree list --porcelain` listing.
+func worktreeForBranch(listing, branch string) (string, bool) {
+	var path string
+	for line := range strings.SplitSeq(listing, "\n") {
+		switch {
+		case strings.HasPrefix(line, "worktree "):
+			path = strings.TrimPrefix(line, "worktree ")
+		case strings.HasPrefix(line, "branch refs/heads/"):
+			if strings.TrimPrefix(line, "branch refs/heads/") == branch && path != "" {
+				return path, true
+			}
+		}
+	}
+	return "", false
+}
+
+// recoverPaneOpen resolves a pending pane.open (or launch.send) operation
+// whose outcome was lost: the pane is looked up by its unique creation
+// label; found, the binding and success commit — pane creation is never
+// repeated. Not found within the launch-claim deadline is ambiguous (the
+// create may still be in flight); past it the operation goes reconciling
+// with a bounded-wait record, never a second create.
+func (c *Controller) recoverPaneOpen(ctx context.Context, handle RunHandle, op *Operation) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per pending operation.
+	intent, ok := decodeOperationPayload[paneOpenIntent](op.Intent)
+	if !ok || intent.Label == "" {
+		return c.markOperationReconciling(ctx, handle, op.ID, "pane.open intent could not be decoded; failing closed")
+	}
+
+	ref, found, err := c.Runtime.FindPaneByLabel(ctx, intent.Label)
+	if err != nil {
+		return nil //nolint:nilerr // a failed lookup is ambiguous; recovery retries on a later round.
+	}
+	if !found {
+		now := c.Clock.Now()
+		if !LaunchDeadlineExpired(op.CreatedAt, now) {
+			return c.recordBoundedWait(ctx, handle, op, LaunchClaimDeadline, "no pane carries the creation label yet; the create may be in flight")
+		}
+		return c.markOperationReconciling(ctx, handle, op.ID, "no pane surfaced for the creation label within the launch deadline; never re-created")
+	}
+
+	now := c.Clock.Now()
+	return c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		latest, getErr := uow.Operations().Get(ctx, op.ID)
+		if getErr != nil {
+			return getErr
+		}
+		if latest.State != OperationPending && latest.State != OperationReconciling {
+			return nil
+		}
+		if _, foundBinding, bErr := uow.Bindings().Current(ctx, intent.SessionID); bErr != nil {
+			return bErr
+		} else if !foundBinding {
+			kind := run.LaunchInitial
+			if op.Kind == OpLaunchSend {
+				kind = run.LaunchResume
+			}
+			binding := run.NewRuntimeBinding(intent.SessionID, intent.IncarnationID, "", ref.WorkspaceID, ref.TabID, ref.PaneID, intent.Label, kind, now)
+			if bindErr := uow.Bindings().Create(ctx, binding); bindErr != nil {
+				return bindErr
+			}
+		}
+		latest.State = OperationSucceeded
+		latest.ActEvidence = PaneHandle(ref)
+		latest.UpdatedAt = now
+		return uow.Operations().Save(ctx, latest)
+	})
+}
+
+// recordBoundedWait persists the ambiguous operation's wait window as act
+// evidence, once, so the deadline a later round enforces is durable.
+func (c *Controller) recordBoundedWait(ctx context.Context, handle RunHandle, op *Operation, window time.Duration, detail string) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per ambiguous round.
+	if recorded, ok := decodeOperationPayload[boundedWaitEvidence](op.ActEvidence); ok && recorded.WaitingSince != "" {
+		return nil
+	}
+	now := c.Clock.Now()
+	evidence := boundedWaitEvidence{
+		WaitingSince: op.CreatedAt.UTC().Format(time.RFC3339Nano),
+		Deadline:     op.CreatedAt.Add(window).UTC().Format(time.RFC3339Nano),
+		Detail:       detail,
+	}
+	return c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		latest, getErr := uow.Operations().Get(ctx, op.ID)
+		if getErr != nil {
+			return getErr
+		}
+		if latest.State != OperationPending && latest.State != OperationReconciling {
+			return nil
+		}
+		latest.ActEvidence = evidence
+		latest.UpdatedAt = now
+		return uow.Operations().Save(ctx, latest)
+	})
+}
+
+// settleOperation moves an operation to state with outcome, idempotently.
+func (c *Controller) settleOperation(ctx context.Context, handle RunHandle, opID identity.OperationID, state OperationState, outcome string) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per settlement.
+	now := c.Clock.Now()
+	return c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		op, err := uow.Operations().Get(ctx, opID)
+		if err != nil {
+			return err
+		}
+		if op.State != OperationPending && op.State != OperationReconciling {
+			return nil
+		}
+		op.State = state
+		op.Outcome = outcome
+		op.UpdatedAt = now
+		return uow.Operations().Save(ctx, op)
+	})
+}
+
+// continueStartup resumes a run whose attempt is still reserved: the
+// crash happened during (or before) worktree creation, before the launch
+// intent. Once a provenance-valid worktree exists — adopted by recovery
+// or freshly created here — the original startup continues by opening the
+// worker pane with a fresh incarnation. The pane joins the workspace the
+// worktree.create outcome recorded; without that recorded placement the
+// run stays reconciling rather than opening a pane in an unknown
+// workspace.
+func (c *Controller) continueStartup(ctx context.Context, handle RunHandle, detail RunDetail, req ResumeRequest) (ResumeResult, error) { //nolint:gocritic // hugeParam: RunHandle, RunDetail and ResumeRequest are per-call DTOs; this runs once per resume round.
+	if req.HOPPath == "" || req.StateRoot == "" {
+		return ResumeResult{}, errors.New("app: resume requires HOPPath and StateRoot to continue startup")
+	}
+	for i := range detail.PendingOperations {
+		if detail.PendingOperations[i].Kind == OpWorktreeCreate {
+			return ResumeResult{Outcome: ResumeReconciling, Detail: "worktree creation is still unresolved; rerun hop resume"}, nil
+		}
+	}
+
+	var (
+		worktree  run.Worktree
+		hasRow    bool
+		snapshot  RunSnapshot
+		workspace string
+	)
+	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		w, _, getErr := uow.Worktrees().ByRun(ctx, handle.runID)
+		if getErr == nil {
+			worktree = w
+			hasRow = true
+		} else if !errors.Is(getErr, ErrNotFound) {
+			return getErr
+		}
+		ops, opErr := uow.Operations().ByKind(ctx, handle.runID, OpWorktreeCreate)
+		if opErr != nil {
+			return opErr
+		}
+		for i := range ops {
+			if outcome, ok := decodeOperationPayload[worktreeCreateOutcome](ops[i].ActEvidence); ok && outcome.Info.WorkspaceID != "" {
+				workspace = outcome.Info.WorkspaceID
+				break
+			}
+			if outcome, ok := decodeOperationPayload[worktreeCreateOutcome](ops[i].Outcome); ok && outcome.Info.WorkspaceID != "" {
+				workspace = outcome.Info.WorkspaceID
+				break
+			}
+		}
+		return nil
+	}); err != nil {
+		return ResumeResult{}, err
+	}
+	_ = snapshot
+
+	repositoryRoot, err := c.runRepositoryRoot(ctx, handle)
+	if err != nil {
+		return ResumeResult{}, err
+	}
+
+	info := WorktreeInfo{WorkspaceID: workspace, Path: worktree.Path, Branch: worktree.Branch}
+	if !hasRow {
+		// Nothing exists yet (the pre-act crash window, past its bounded
+		// wait): re-drive creation itself; the settled prior intent no
+		// longer blocks it.
+		var seq int
+		if statusDetail, statusErr := c.Read.LoadRunStatus(ctx, handle.runID); statusErr == nil {
+			seq = statusDetail.Sequence
+		}
+		branch := fmt.Sprintf("hop/run-%d", seq)
+		ids := generatedIdentities{Run: handle.runID, Task: detail.TaskID, Attempt: detail.AttemptID, Session: detail.SessionID}
+		var worktreeID identity.WorktreeID
+		if worktreeID, err = identity.ParseWorktreeID(c.IDs.NewID()); err != nil {
+			return ResumeResult{}, fmt.Errorf("app: generate worktree id: %w", err)
+		}
+		ids.Worktree = worktreeID
+		created, createErr := c.createWorktree(ctx, handle, ids, repositoryRoot, branch, c.Clock.Now())
+		if createErr != nil {
+			return ResumeResult{}, createErr
+		}
+		info = created
+	}
+	if info.WorkspaceID == "" {
+		return ResumeResult{Outcome: ResumeReconciling, Detail: "worktree adopted but its workspace placement is unrecorded; the worker pane cannot be opened safely"}, nil
+	}
+
+	incarnationID, err := identity.ParseIncarnationID(c.IDs.NewID())
+	if err != nil {
+		return ResumeResult{}, fmt.Errorf("app: generate incarnation id: %w", err)
+	}
+	ids := generatedIdentities{Run: handle.runID, Task: detail.TaskID, Attempt: detail.AttemptID, Session: detail.SessionID, Incarnation: incarnationID}
+	if err := c.openWorkerPane(ctx, handle, ids, info, req.HOPPath, req.StateRoot); err != nil {
+		return ResumeResult{}, err
+	}
+	return ResumeResult{Outcome: ResumeStartupContinued, Detail: "startup continued: worker pane opened"}, nil
+}
+
+// runRepositoryRoot resolves the run's repository root through ReadStore's
+// run listing scope: the worktree.create intent recorded it durably, so it
+// is read back from the newest such operation.
+func (c *Controller) runRepositoryRoot(ctx context.Context, handle RunHandle) (string, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per startup continuation.
+	var root string
+	err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		ops, opErr := uow.Operations().ByKind(ctx, handle.runID, OpWorktreeCreate)
+		if opErr != nil {
+			return opErr
+		}
+		for i := range ops {
+			if intent, ok := decodeOperationPayload[worktreeCreateIntent](ops[i].Intent); ok && intent.RepositoryRoot != "" {
+				root = intent.RepositoryRoot
+				return nil
+			}
+		}
+		return fmt.Errorf("%w: no worktree.create intent records the repository root for run %s", ErrNotFound, handle.runID)
+	})
+	return root, err
 }
 
 // reconcileActive handles every attempt state a live worker could still

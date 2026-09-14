@@ -8,17 +8,22 @@ import (
 	"github.com/johnlanda/hop/internal/domain/run"
 )
 
-// forceAttemptReserved directly sets runID's task and attempt back to
-// pending/reserved, bypassing the domain's own transitions. It exists only
-// to reach an otherwise-unreachable-through-the-use-cases fixture: a stop
-// requested before StartRun's launch intent ever committed (the narrow
-// crash window between InitializeRun and the pane.open intent).
+// forceAttemptReserved directly sets runID's task, attempt and session
+// back to pending/reserved, bypassing the domain's own transitions. It
+// exists only to reach an otherwise-unreachable-through-the-use-cases
+// fixture: the narrow crash window between InitializeRun and the pane.open
+// launch intent.
 func forceAttemptReserved(t *testing.T, tc *testController, runID identity.RunID) {
 	t.Helper()
 	taskID := tc.Store.TaskByRun[runID]
 	attemptID := tc.Store.AttemptByRun[runID]
 	tc.Store.Tasks[taskID].value.State = run.TaskPending
 	tc.Store.Attempts[attemptID].value.State = run.AttemptReserved
+	for id, sess := range tc.Store.Sessions {
+		if sess.value.AttemptID == attemptID {
+			tc.Store.Sessions[id].value.State = run.SessionReserved
+		}
+	}
 }
 
 // forceAttemptChecking directly sets detail's run/task/attempt to the

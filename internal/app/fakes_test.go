@@ -309,6 +309,16 @@ func (s *fakeStore) LoadRunStatus(_ context.Context, runID identity.RunID) (app.
 			detail.Claim = &c
 		}
 	}
+	if detail.SessionID == "" {
+		// The attempt's current non-terminated session, independent of any
+		// binding: a reserved attempt has a session but no placement yet.
+		for id, sess := range s.Sessions {
+			if sess.value.AttemptID == attemptID && sess.value.State != run.SessionTerminated && sess.value.State != run.SessionLost {
+				detail.SessionID = id
+				break
+			}
+		}
+	}
 	for _, op := range s.Operations { //nolint:gocritic // rangeValCopy: test fake; the domain snapshot is small and read-only here, and indexing would only obscure the loop.
 		if op.RunID == runID && (op.State == app.OperationPending || op.State == app.OperationReconciling) {
 			detail.PendingOperations = append(detail.PendingOperations, op)

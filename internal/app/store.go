@@ -215,12 +215,16 @@ type Operation struct {
 // OperationRepository records and updates the operation journal. Pending
 // lists operations still open (pending or reconciling) for a run, oldest
 // first — what a controller must resolve before any new act of the same
-// kind (section 4).
+// kind (section 4). ByKind lists every operation of one kind for a run,
+// newest first, regardless of state — recovery reads a settled
+// operation's evidence (for example the worktree.create outcome's
+// workspace) through it.
 type OperationRepository interface {
 	Create(ctx context.Context, op Operation) error
 	Get(ctx context.Context, id identity.OperationID) (Operation, error)
 	Save(ctx context.Context, op Operation) error
 	Pending(ctx context.Context, runID identity.RunID) ([]Operation, error)
+	ByKind(ctx context.Context, runID identity.RunID, kind OperationKind) ([]Operation, error)
 }
 
 // EntityKind names the kind of entity a Transition row describes.

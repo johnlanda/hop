@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"sort"
 
 	"github.com/johnlanda/hop/internal/app"
 	"github.com/johnlanda/hop/internal/domain/identity"
@@ -594,6 +595,18 @@ func (r fakeOperationRepo) Pending(_ context.Context, runID identity.RunID) ([]a
 			out = append(out, op)
 		}
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out, nil
+}
+
+func (r fakeOperationRepo) ByKind(_ context.Context, runID identity.RunID, kind app.OperationKind) ([]app.Operation, error) {
+	var out []app.Operation
+	for _, op := range r.u.store.Operations { //nolint:gocritic // rangeValCopy: test fake; the domain snapshot is small and read-only here, and indexing would only obscure the loop.
+		if op.RunID == runID && op.Kind == kind {
+			out = append(out, op)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
 	return out, nil
 }
 

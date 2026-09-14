@@ -514,6 +514,7 @@ func applyLaunchIntent(ctx context.Context, uow UnitOfWork, handle RunHandle, id
 	if err != nil {
 		return err
 	}
+	runFrom := r.State
 	if r, err = r.Launch(now); err != nil {
 		return err
 	}
@@ -558,7 +559,7 @@ func applyLaunchIntent(ctx context.Context, uow UnitOfWork, handle RunHandle, id
 	}
 
 	generation := gen(handle.lease.Generation)
-	if err := recordTransition(ctx, uow, EntityRun, handle.runID.String(), string(run.RunCreated), string(r.State), "launch intent journaled", generation, now); err != nil {
+	if err := recordTransition(ctx, uow, EntityRun, handle.runID.String(), string(runFrom), string(r.State), "launch intent journaled", generation, now); err != nil {
 		return err
 	}
 	if err := recordTransition(ctx, uow, EntityTask, ids.Task.String(), string(taskFrom), string(t.State), "attempt launched", generation, now); err != nil {
