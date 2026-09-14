@@ -270,7 +270,12 @@ func persistAcceptance(ctx context.Context, tx *sql.Tx, acceptance run.Acceptanc
 // the caller must not exec — when the run is stopping or stopped, the
 // incarnation is not the attempt's current identity, or a claim for this
 // incarnation already exists with a different pid; a rewrite by the same
-// pid is idempotent.
+// pid is idempotent. Currency follows launchIncarnationCurrent: the
+// current binding decides when one exists, and before any binding row the
+// authority is the newest pending launch operation's intent JSON
+// ("incarnation_id"), so a launcher racing the controller's pane.open
+// outcome write is admitted while a retired incarnation's launcher never
+// is.
 func (s *Store) ClaimLaunch(ctx context.Context, claim app.LaunchClaim) error { //nolint:gocritic // hugeParam: the port passes the claim value; the adapter mirrors its signature.
 	return s.inWriteTx(ctx, func(tx *sql.Tx) error {
 		runV, _, err := getRun(ctx, tx, claim.RunID)
@@ -280,7 +285,7 @@ func (s *Store) ClaimLaunch(ctx context.Context, claim app.LaunchClaim) error { 
 		if runV.StopRequested || runV.State == run.RunStopping || runV.State == run.RunStopped {
 			return fmt.Errorf("sqlite: run %s is stopping or stopped; launch claim refused", claim.RunID)
 		}
-		isCurrent, err := incarnationCurrent(ctx, tx, claim.AttemptID, claim.IncarnationID)
+		isCurrent, err := launchIncarnationCurrent(ctx, tx, claim.RunID, claim.AttemptID, claim.IncarnationID)
 		if err != nil {
 			return err
 		}

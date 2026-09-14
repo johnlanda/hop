@@ -450,3 +450,51 @@ func incarnationCurrent(ctx context.Context, q querier, attemptID identity.Attem
 	}
 	return binding.IncarnationID == incarnationID, nil
 }
+
+// launchIncarnationCurrent decides ClaimLaunch's currency rule, which must
+// also work in the window before the controller records the binding row:
+// the launcher is the pane's own command and can claim first. The
+// incarnation is current iff (a) the attempt's current session has a
+// current binding carrying exactly this incarnation, or (b) no binding row
+// exists yet for that session — a superseded row without a successor
+// retires the incarnation, so any row at all disables the fallback — and
+// the run's newest pending launch operation (kind pane.open or
+// launch.send) carries the claim's incarnation in its intent JSON under
+// the documented "incarnation_id" key, which the controller commits before
+// dispatching the pane request. Any other case is not current.
+func launchIncarnationCurrent(ctx context.Context, q querier, runID identity.RunID, attemptID identity.AttemptID, incarnationID identity.IncarnationID) (bool, error) {
+	session, _, ok, err := currentSession(ctx, q, attemptID)
+	if err != nil || !ok {
+		return false, err
+	}
+	binding, ok, err := currentBinding(ctx, q, session.ID)
+	if err != nil {
+		return false, err
+	}
+	if ok {
+		return binding.IncarnationID == incarnationID, nil
+	}
+	var bindingRows int64
+	if countErr := q.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM runtime_bindings WHERE session_id = ?`, session.ID.String(),
+	).Scan(&bindingRows); countErr != nil {
+		return false, fmt.Errorf("sqlite: count bindings of session %s: %w", session.ID, countErr)
+	}
+	if bindingRows > 0 {
+		return false, nil
+	}
+	var intentIncarnation sql.NullString
+	err = q.QueryRowContext(ctx,
+		`SELECT json_extract(intent, '$.incarnation_id') FROM operations
+		 WHERE run_id = ? AND state = ? AND kind IN (?, ?)
+		 ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+		runID.String(), string(app.OperationPending), string(app.OpPaneOpen), string(app.OpLaunchSend),
+	).Scan(&intentIncarnation)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("sqlite: read pending launch intent of run %s: %w", runID, err)
+	}
+	return intentIncarnation.Valid && intentIncarnation.String == incarnationID.String(), nil
+}

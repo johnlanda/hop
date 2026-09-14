@@ -467,6 +467,98 @@ func TestClaimLaunch(t *testing.T) {
 		}
 	})
 
+	t.Run("claim before binding with matching intent is accepted", func(t *testing.T) {
+		f := newFixture(t)
+		f.launchAttempt(t)
+		f.createLaunchIntent(t, f.spec.IncarnationID)
+		// No binding row yet: the launcher raced the controller's pane.open
+		// outcome write.
+
+		f.claimLaunch(t)
+
+		if n := countRows(t, f.store, `SELECT COUNT(*) FROM launch_claims`); n != 1 {
+			t.Fatalf("claims after the pre-binding claim = %d, want 1", n)
+		}
+	})
+
+	t.Run("stale incarnation before binding is refused", func(t *testing.T) {
+		f := newFixture(t)
+		f.launchAttempt(t)
+		f.createLaunchIntent(t, f.spec.IncarnationID)
+
+		err := f.store.ClaimLaunch(t.Context(), app.LaunchClaim{
+			IncarnationID: identity.IncarnationID(uid(6205)),
+			RunID:         f.spec.RunID,
+			AttemptID:     f.spec.AttemptID,
+			Executable:    "/opt/harness/claude",
+			ArgvDigest:    "argv-digest",
+			PID:           fixturePID,
+		})
+
+		if err == nil {
+			t.Fatal("a pre-binding claim whose incarnation is not the pending intent's was accepted")
+		}
+	})
+
+	t.Run("binding decides once it exists even against a differing intent", func(t *testing.T) {
+		f := newFixture(t)
+		f.launchAttempt(t)
+		f.createBinding(t)
+		other := identity.IncarnationID(uid(6206))
+		f.createLaunchIntent(t, other)
+
+		err := f.store.ClaimLaunch(t.Context(), app.LaunchClaim{
+			IncarnationID: other,
+			RunID:         f.spec.RunID,
+			AttemptID:     f.spec.AttemptID,
+			Executable:    "/opt/harness/claude",
+			ArgvDigest:    "argv-digest",
+			PID:           fixturePID,
+		})
+		if err == nil {
+			t.Fatal("the intent fallback overrode an existing current binding")
+		}
+
+		f.claimLaunch(t)
+
+		if n := countRows(t, f.store, `SELECT COUNT(*) FROM launch_claims WHERE incarnation_id = ?`, f.spec.IncarnationID.String()); n != 1 {
+			t.Fatalf("claims for the binding's incarnation = %d, want 1", n)
+		}
+	})
+
+	t.Run("superseded binding retires the intent fallback", func(t *testing.T) {
+		f := newFixture(t)
+		f.launchAttempt(t)
+		f.createBinding(t)
+		f.createLaunchIntent(t, f.spec.IncarnationID)
+		f.inUOW(t, func(uow app.UnitOfWork) {
+			binding, ok, err := uow.Bindings().Current(t.Context(), f.spec.SessionID)
+			if err != nil || !ok {
+				t.Fatalf("current binding: %v (found %t)", err, ok)
+			}
+			superseded, err := binding.Supersede("observed replacement occupant", f.clock.Now())
+			if err != nil {
+				t.Fatalf("supersede: %v", err)
+			}
+			if err := uow.Bindings().Save(t.Context(), superseded); err != nil {
+				t.Fatalf("save superseded binding: %v", err)
+			}
+		})
+
+		err := f.store.ClaimLaunch(t.Context(), app.LaunchClaim{
+			IncarnationID: f.spec.IncarnationID,
+			RunID:         f.spec.RunID,
+			AttemptID:     f.spec.AttemptID,
+			Executable:    "/opt/harness/claude",
+			ArgvDigest:    "argv-digest",
+			PID:           fixturePID,
+		})
+
+		if err == nil {
+			t.Fatal("a retired incarnation reclaimed through the intent fallback after supersession")
+		}
+	})
+
 	t.Run("non-current incarnation is refused", func(t *testing.T) {
 		f := newFixture(t)
 		f.launchAttempt(t)

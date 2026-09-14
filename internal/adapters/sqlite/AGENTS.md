@@ -62,8 +62,18 @@ this package never resolves environment variables or defaults.
   attempt/task (and, for an early submission, run) transitions with their
   generation-NULL evidence rows atomically.
 - `ClaimLaunch` refuses when the run is stopping or stopped, the
-  incarnation is not the attempt's current binding identity, or a claim
-  exists with a different pid; a same-pid rewrite is idempotent.
+  incarnation is not current, or a claim exists with a different pid; a
+  same-pid rewrite is idempotent. Currency: the attempt's current
+  session's current binding decides when one exists; before ANY binding
+  row exists for that session (the launcher is the pane's own command and
+  can claim before the controller records the pane.open outcome), the
+  authority is the run's newest pending launch operation (kind pane.open
+  or launch.send), whose intent JSON must carry the claim's incarnation
+  under the key `incarnation_id` — a documented contract between the
+  application (which commits the intent before dispatching the pane
+  request) and this store (which reads it with `json_extract`). A
+  superseded binding without a successor retires the incarnation: any
+  existing binding row disables the intent fallback.
   `LaunchClaims().Settle` moves exec_pending to execed or exec_failed only,
   idempotent per target state. `ClaimCheckExec` requires a pending
   `check.run` operation of the run's current lease generation.

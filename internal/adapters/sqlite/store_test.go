@@ -101,12 +101,14 @@ func newSpec(repoRoot string, base int, now time.Time) app.NewRunSpec {
 	}
 }
 
-// fixture is one initialized run with its store, clock and lease.
+// fixture is one initialized run with its store, clock and lease. opSeq
+// numbers the operations the fixture's helpers create.
 type fixture struct {
 	store *sqlite.Store
 	clock *fakeClock
 	spec  app.NewRunSpec
 	lease app.Lease
+	opSeq int
 }
 
 // newFixture opens a fresh store in a temp root and initializes one run.
@@ -177,6 +179,34 @@ func (f *fixture) launchAttempt(t *testing.T) {
 
 // fixturePID is the launcher pid every fixture claim records.
 const fixturePID = 111
+
+// createLaunchIntent commits a pending pane.open launch operation whose
+// intent JSON carries incarnation under the documented "incarnation_id"
+// key — the controller's pre-dispatch write that ClaimLaunch's pre-binding
+// currency rule reads.
+func (f *fixture) createLaunchIntent(t *testing.T, incarnation identity.IncarnationID) {
+	t.Helper()
+	f.opSeq++
+	opID := identity.OperationID(uid(9500 + f.opSeq))
+	f.inUOW(t, func(uow app.UnitOfWork) {
+		err := uow.Operations().Create(t.Context(), app.Operation{
+			ID:         opID,
+			RunID:      f.spec.RunID,
+			Generation: f.lease.Generation,
+			Kind:       app.OpPaneOpen,
+			State:      app.OperationPending,
+			Intent: map[string]any{
+				"incarnation_id": incarnation.String(),
+				"creation_label": uid(9001),
+			},
+			CreatedAt: f.clock.Now(),
+			UpdatedAt: f.clock.Now(),
+		})
+		if err != nil {
+			t.Fatalf("create launch intent: %v", err)
+		}
+	})
+}
 
 // claimLaunch writes the incarnation's exec_pending launch claim under
 // fixturePID.
