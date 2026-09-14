@@ -49,7 +49,7 @@ func (r *fakeRuntime) CreateWorktree(_ context.Context, req app.WorktreeRequest)
 	return app.WorktreeInfo{WorkspaceID: fmt.Sprintf("workspace-%d", r.nextPaneN), Path: "/worktrees/w", Branch: req.Branch}, nil
 }
 
-func (r *fakeRuntime) OpenWorkerPane(_ context.Context, req app.WorkerPaneRequest) (app.PaneHandle, error) {
+func (r *fakeRuntime) OpenWorkerPane(_ context.Context, req app.WorkerPaneRequest) (app.PaneHandle, error) { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.OpenWorkerPaneFn != nil {
@@ -149,7 +149,7 @@ func newFakeCommands() *fakeCommands {
 	return &fakeCommands{Results: map[string]app.CommandResult{}, Errs: map[string]error{}}
 }
 
-func (c *fakeCommands) key(cmd app.Command) string { return strings.Join(cmd.Argv, " ") }
+func (*fakeCommands) key(cmd app.Command) string { return strings.Join(cmd.Argv, " ") }
 
 func (c *fakeCommands) Run(_ context.Context, cmd app.Command) (app.CommandResult, error) {
 	c.mu.Lock()

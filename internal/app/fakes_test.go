@@ -135,7 +135,7 @@ func newFakeStore(clock interface{ Now() time.Time }) *fakeStore {
 
 // --- StateStore ---
 
-func (s *fakeStore) InitializeRun(_ context.Context, spec app.NewRunSpec) (identity.RunID, app.Lease, error) {
+func (s *fakeStore) InitializeRun(_ context.Context, spec app.NewRunSpec) (identity.RunID, app.Lease, error) { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -249,7 +249,7 @@ func (s *fakeStore) ListRuns(_ context.Context, repositoryRoot string) ([]app.Ru
 func (s *fakeStore) runStatusLocked(runID identity.RunID) app.RunStatus {
 	r := s.Runs[runID].value
 	reconciling := false
-	for _, op := range s.Operations {
+	for _, op := range s.Operations { //nolint:gocritic // rangeValCopy: test fake; the domain snapshot is small and read-only here, and indexing would only obscure the loop.
 		if op.RunID == runID && op.State == app.OperationReconciling {
 			reconciling = true
 			break
@@ -289,7 +289,7 @@ func (s *fakeStore) LoadRunStatus(_ context.Context, runID identity.RunID) (app.
 			detail.Claim = &c
 		}
 	}
-	for _, op := range s.Operations {
+	for _, op := range s.Operations { //nolint:gocritic // rangeValCopy: test fake; the domain snapshot is small and read-only here, and indexing would only obscure the loop.
 		if op.RunID == runID && (op.State == app.OperationPending || op.State == app.OperationReconciling) {
 			detail.PendingOperations = append(detail.PendingOperations, op)
 		}
@@ -330,17 +330,17 @@ func (s *fakeStore) currentBindingByAttemptLocked(attemptID identity.AttemptID) 
 	return "", run.RuntimeBinding{}, false
 }
 
-func (s *fakeStore) LoadLaunchContext(context.Context, identity.RunID, identity.AttemptID) (app.LaunchContext, error) {
+func (*fakeStore) LoadLaunchContext(context.Context, identity.RunID, identity.AttemptID) (app.LaunchContext, error) {
 	return app.LaunchContext{}, fmt.Errorf("app_test: LoadLaunchContext is not exercised by the controller (hop launch's own port)")
 }
 
-func (s *fakeStore) LoadCheckExecutionContext(context.Context, identity.OperationID) (app.CheckExecutionContext, error) {
+func (*fakeStore) LoadCheckExecutionContext(context.Context, identity.OperationID) (app.CheckExecutionContext, error) {
 	return app.CheckExecutionContext{}, fmt.Errorf("app_test: LoadCheckExecutionContext is not exercised by the controller (hop check-exec's own port)")
 }
 
 // --- SubmissionStore ---
 
-func (s *fakeStore) ClaimLaunch(_ context.Context, claim app.LaunchClaim) error {
+func (s *fakeStore) ClaimLaunch(_ context.Context, claim app.LaunchClaim) error { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if existing, ok := s.LaunchClaims[claim.IncarnationID]; ok && existing.PID != claim.PID {
@@ -381,7 +381,7 @@ func (s *fakeStore) RequestStop(_ context.Context, runID identity.RunID) error {
 	return nil
 }
 
-func (s *fakeStore) SubmitResult(_ context.Context, submission app.ResultSubmission) (app.SubmissionOutcome, error) {
+func (s *fakeStore) SubmitResult(_ context.Context, submission app.ResultSubmission) (app.SubmissionOutcome, error) { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.clock.Now()
@@ -443,7 +443,7 @@ func (s *fakeStore) SubmitResult(_ context.Context, submission app.ResultSubmiss
 	return outcome, nil
 }
 
-func (s *fakeStore) RecordMalformed(_ context.Context, claimed app.ClaimedSubmission) (app.SubmissionOutcome, error) {
+func (s *fakeStore) RecordMalformed(_ context.Context, claimed app.ClaimedSubmission) (app.SubmissionOutcome, error) { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	outcome := app.SubmissionOutcome{Kind: app.SubmissionMalformed, Detail: claimed.Detail}

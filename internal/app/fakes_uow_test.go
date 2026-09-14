@@ -124,14 +124,14 @@ func (u *fakeUnitOfWork) Commit() error {
 	for _, w := range u.worktreeCreated {
 		s.Worktrees[w.ID] = &entityRow[run.Worktree]{value: w, revision: 1}
 	}
-	for _, sess := range u.sessionCreated {
+	for _, sess := range u.sessionCreated { //nolint:gocritic // rangeValCopy: test fake; the domain snapshot is small and read-only here, and indexing would only obscure the loop.
 		s.Sessions[sess.ID] = &entityRow[run.Session]{value: sess, revision: 1}
 		s.AttemptByRun[sess.RunID] = sess.AttemptID // Phase 2: one attempt per run
 	}
-	for _, b := range u.bindingCreated {
+	for _, b := range u.bindingCreated { //nolint:gocritic // rangeValCopy: test fake; the domain snapshot is small and read-only here, and indexing would only obscure the loop.
 		s.Bindings[b.SessionID] = append(s.Bindings[b.SessionID], b)
 	}
-	for key, b := range u.bindingSaved {
+	for key, b := range u.bindingSaved { //nolint:gocritic // rangeValCopy: test fake; the domain snapshot is small and read-only here, and indexing would only obscure the loop.
 		history := s.Bindings[key.session]
 		replaced := false
 		for i := range history {
@@ -158,10 +158,10 @@ func (u *fakeUnitOfWork) Commit() error {
 		}
 		s.LaunchClaims[incarnation] = claim
 	}
-	for id, op := range u.opCreated {
+	for id, op := range u.opCreated { //nolint:gocritic // rangeValCopy: test fake; the domain snapshot is small and read-only here, and indexing would only obscure the loop.
 		s.Operations[id] = op
 	}
-	for id, op := range u.opSaved {
+	for id, op := range u.opSaved { //nolint:gocritic // rangeValCopy: test fake; the domain snapshot is small and read-only here, and indexing would only obscure the loop.
 		s.Operations[id] = op
 	}
 	for id, cr := range u.checkRequestSaved {
@@ -192,7 +192,7 @@ func (r fakeRunRepo) Get(_ context.Context, id identity.RunID) (run.Run, int64, 
 	return base.value, base.revision, nil
 }
 
-func (r fakeRunRepo) Save(_ context.Context, v run.Run, expectedRevision int64) (int64, error) {
+func (r fakeRunRepo) Save(_ context.Context, v run.Run, expectedRevision int64) (int64, error) { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
 	if base, ok := r.u.store.Runs[v.ID]; ok {
 		if _, staged := r.u.runs[v.ID]; !staged && base.revision != expectedRevision {
 			return 0, app.ErrRevisionConflict
@@ -221,7 +221,7 @@ func (r fakeTaskRepo) Get(_ context.Context, id identity.TaskID) (run.Task, int6
 	return base.value, base.revision, nil
 }
 
-func (r fakeTaskRepo) Save(_ context.Context, v run.Task, expectedRevision int64) (int64, error) {
+func (r fakeTaskRepo) Save(_ context.Context, v run.Task, expectedRevision int64) (int64, error) { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
 	if base, ok := r.u.store.Tasks[v.ID]; ok {
 		if _, staged := r.u.tasks[v.ID]; !staged && base.revision != expectedRevision {
 			return 0, app.ErrRevisionConflict
@@ -250,7 +250,7 @@ func (r fakeAttemptRepo) Get(_ context.Context, id identity.AttemptID) (run.Atte
 	return base.value, base.revision, nil
 }
 
-func (r fakeAttemptRepo) Save(_ context.Context, v run.Attempt, expectedRevision int64) (int64, error) {
+func (r fakeAttemptRepo) Save(_ context.Context, v run.Attempt, expectedRevision int64) (int64, error) { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
 	if base, ok := r.u.store.Attempts[v.ID]; ok {
 		if _, staged := r.u.attempts[v.ID]; !staged && base.revision != expectedRevision {
 			return 0, app.ErrRevisionConflict
@@ -285,7 +285,7 @@ func (r fakeSessionRepo) Current(_ context.Context, attempt identity.AttemptID) 
 			return staged.value, staged.revision, nil
 		}
 	}
-	for _, sess := range r.u.sessionCreated {
+	for _, sess := range r.u.sessionCreated { //nolint:gocritic // rangeValCopy: test fake; the domain snapshot is small and read-only here, and indexing would only obscure the loop.
 		if sess.AttemptID == attempt && sess.State != run.SessionTerminated {
 			return sess, 1, nil
 		}
@@ -301,7 +301,7 @@ func (r fakeSessionRepo) Current(_ context.Context, attempt identity.AttemptID) 
 	return run.Session{}, 0, fmt.Errorf("%w: no current session for attempt %s", app.ErrNotFound, attempt)
 }
 
-func (r fakeSessionRepo) Save(_ context.Context, v run.Session, expectedRevision int64) (int64, error) {
+func (r fakeSessionRepo) Save(_ context.Context, v run.Session, expectedRevision int64) (int64, error) { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
 	if base, ok := r.u.store.Sessions[v.ID]; ok {
 		if _, staged := r.u.sessions[v.ID]; !staged && base.revision != expectedRevision {
 			return 0, app.ErrRevisionConflict
@@ -315,7 +315,7 @@ func (r fakeSessionRepo) Save(_ context.Context, v run.Session, expectedRevision
 	return next, nil
 }
 
-func (r fakeSessionRepo) Create(_ context.Context, v run.Session) (int64, error) {
+func (r fakeSessionRepo) Create(_ context.Context, v run.Session) (int64, error) { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
 	r.u.sessionCreated = append(r.u.sessionCreated, v)
 	return 1, nil
 }
@@ -349,12 +349,14 @@ func (r fakeWorktreeRepo) ByRun(_ context.Context, runID identity.RunID) (run.Wo
 	return run.Worktree{}, 0, fmt.Errorf("%w: no worktree for run %s", app.ErrNotFound, runID)
 }
 
-func (r fakeWorktreeRepo) Create(_ context.Context, v run.Worktree) (int64, error) {
+func (r fakeWorktreeRepo) Create(_ context.Context, v run.Worktree) (int64, error) { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
+
 	r.u.worktreeCreated = append(r.u.worktreeCreated, v)
 	return 1, nil
 }
 
-func (r fakeWorktreeRepo) Save(_ context.Context, v run.Worktree, expectedRevision int64) (int64, error) {
+func (r fakeWorktreeRepo) Save(_ context.Context, v run.Worktree, expectedRevision int64) (int64, error) { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
+
 	if r.u.worktrees == nil {
 		r.u.worktrees = map[identity.WorktreeID]entityRow[run.Worktree]{}
 	}
@@ -379,7 +381,8 @@ func (r fakeResultRepo) Accepted(_ context.Context, attempt identity.AttemptID) 
 
 type fakeArtifactRepo struct{ u *fakeUnitOfWork }
 
-func (r fakeArtifactRepo) Save(_ context.Context, v run.Artifact) error {
+func (r fakeArtifactRepo) Save(_ context.Context, v run.Artifact) error { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
+
 	r.u.artifactsSaved = append(r.u.artifactsSaved, v)
 	return nil
 }
@@ -394,7 +397,7 @@ func (r fakeBindingRepo) Current(_ context.Context, session identity.SessionID) 
 			return r.u.bindingCreated[i], true, nil
 		}
 	}
-	for key, b := range r.u.bindingSaved {
+	for key, b := range r.u.bindingSaved { //nolint:gocritic // rangeValCopy: test fake; the domain snapshot is small and read-only here, and indexing would only obscure the loop.
 		if key.session == session && !b.Superseded {
 			return b, true, nil
 		}
@@ -403,12 +406,14 @@ func (r fakeBindingRepo) Current(_ context.Context, session identity.SessionID) 
 	return base, ok, nil
 }
 
-func (r fakeBindingRepo) Create(_ context.Context, v run.RuntimeBinding) error {
+func (r fakeBindingRepo) Create(_ context.Context, v run.RuntimeBinding) error { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
+
 	r.u.bindingCreated = append(r.u.bindingCreated, v)
 	return nil
 }
 
-func (r fakeBindingRepo) Save(_ context.Context, v run.RuntimeBinding) error {
+func (r fakeBindingRepo) Save(_ context.Context, v run.RuntimeBinding) error { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
+
 	if r.u.bindingSaved == nil {
 		r.u.bindingSaved = map[bindingKey]run.RuntimeBinding{}
 	}
@@ -427,7 +432,7 @@ func (r fakeLaunchClaimRepo) Get(_ context.Context, incarnation identity.Incarna
 
 func (r fakeLaunchClaimRepo) Pending(_ context.Context, runID identity.RunID) ([]app.LaunchClaim, error) {
 	var out []app.LaunchClaim
-	for _, claim := range r.u.store.LaunchClaims {
+	for _, claim := range r.u.store.LaunchClaims { //nolint:gocritic // rangeValCopy: test fake; the domain snapshot is small and read-only here, and indexing would only obscure the loop.
 		if claim.RunID == runID && claim.State == app.LaunchClaimExecPending {
 			out = append(out, claim)
 		}
@@ -435,7 +440,8 @@ func (r fakeLaunchClaimRepo) Pending(_ context.Context, runID identity.RunID) ([
 	return out, nil
 }
 
-func (r fakeLaunchClaimRepo) Settle(_ context.Context, incarnation identity.IncarnationID, settlement app.LaunchClaimSettlement) error {
+func (r fakeLaunchClaimRepo) Settle(_ context.Context, incarnation identity.IncarnationID, settlement app.LaunchClaimSettlement) error { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
+
 	if r.u.launchClaimSettled == nil {
 		r.u.launchClaimSettled = map[identity.IncarnationID]app.LaunchClaimSettlement{}
 	}
@@ -456,7 +462,8 @@ func (r fakeCheckExecClaimRepo) Get(_ context.Context, op identity.OperationID) 
 
 type fakeOperationRepo struct{ u *fakeUnitOfWork }
 
-func (r fakeOperationRepo) Create(_ context.Context, op app.Operation) error {
+func (r fakeOperationRepo) Create(_ context.Context, op app.Operation) error { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
+
 	if r.u.opCreated == nil {
 		r.u.opCreated = map[identity.OperationID]app.Operation{}
 	}
@@ -478,7 +485,8 @@ func (r fakeOperationRepo) Get(_ context.Context, id identity.OperationID) (app.
 	return op, nil
 }
 
-func (r fakeOperationRepo) Save(_ context.Context, op app.Operation) error {
+func (r fakeOperationRepo) Save(_ context.Context, op app.Operation) error { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
+
 	if r.u.opSaved == nil {
 		r.u.opSaved = map[identity.OperationID]app.Operation{}
 	}
@@ -488,7 +496,7 @@ func (r fakeOperationRepo) Save(_ context.Context, op app.Operation) error {
 
 func (r fakeOperationRepo) Pending(_ context.Context, runID identity.RunID) ([]app.Operation, error) {
 	var out []app.Operation
-	for _, op := range r.u.store.Operations {
+	for _, op := range r.u.store.Operations { //nolint:gocritic // rangeValCopy: test fake; the domain snapshot is small and read-only here, and indexing would only obscure the loop.
 		if op.RunID == runID && (op.State == app.OperationPending || op.State == app.OperationReconciling) {
 			out = append(out, op)
 		}
@@ -500,7 +508,8 @@ func (r fakeOperationRepo) Pending(_ context.Context, runID identity.RunID) ([]a
 
 type fakeTransitionRepo struct{ u *fakeUnitOfWork }
 
-func (r fakeTransitionRepo) Record(_ context.Context, t app.Transition) error {
+func (r fakeTransitionRepo) Record(_ context.Context, t app.Transition) error { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
+
 	r.u.transitions = append(r.u.transitions, t)
 	return nil
 }
@@ -535,7 +544,8 @@ func (r fakeCheckRequestRepo) Pending(_ context.Context, runID identity.RunID) (
 	return app.CheckRequest{}, false, nil
 }
 
-func (r fakeCheckRequestRepo) Save(_ context.Context, cr app.CheckRequest) error {
+func (r fakeCheckRequestRepo) Save(_ context.Context, cr app.CheckRequest) error { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
+
 	if r.u.checkRequestSaved == nil {
 		r.u.checkRequestSaved = map[identity.ResultID]app.CheckRequest{}
 	}

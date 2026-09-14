@@ -24,7 +24,7 @@ type testController struct {
 	Config     *fakeConfig
 }
 
-func newTestController(policy app.RunPolicy) *testController {
+func newTestController(policy app.RunPolicy) *testController { //nolint:gocritic // hugeParam: RunPolicy is a small test fixture value passed once per test setup.
 	clock := newFakeClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
 	store := newFakeStore(clock)
 	runtime := newFakeRuntime()
@@ -193,7 +193,7 @@ func TestStartRun(t *testing.T) {
 	t.Run("recovers a lost create response by creation label", func(t *testing.T) {
 		tc := newTestController(defaultPolicy())
 		tc.Runtime.OpenWorkerPaneErr = context.DeadlineExceeded
-		tc.Runtime.FindPaneByLabelFn = func(label string) (app.PaneRef, bool, error) {
+		tc.Runtime.FindPaneByLabelFn = func(string) (app.PaneRef, bool, error) {
 			return app.PaneRef{WorkspaceID: "workspace-1", TabID: "tab-recovered", PaneID: "pane-recovered"}, true, nil
 		}
 		_, handle, err := tc.Controller.StartRun(context.Background(), defaultStartRunRequest())
