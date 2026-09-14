@@ -131,6 +131,9 @@ func TestLoadParsesPolicies(t *testing.T) {
 }
 
 func TestLoadRejectsInvalidPolicies(t *testing.T) {
+	// secretMarker stands in for a secret mistakenly pasted into the policy
+	// file; no rejection may ever echo it back through a rendered error.
+	const secretMarker = "DUMMY-SECRET-MARKER"
 	cases := []struct {
 		name        string
 		content     string
@@ -159,37 +162,52 @@ func TestLoadRejectsInvalidPolicies(t *testing.T) {
 		{
 			name:        "duplicate key",
 			content:     "[check]\ncommand = [\"a\"]\ncommand = [\"b\"]\n",
-			wantMessage: "key command is already defined",
+			wantMessage: "key command is defined more than once",
 		},
 		{
 			name:        "duplicate table",
 			content:     "[check]\ncommand = [\"a\"]\n[check]\ntimeout = \"1m\"\n",
-			wantMessage: "table check already exists",
+			wantMessage: "key check is defined more than once",
 		},
 		{
-			name:        "unparsable timeout",
-			content:     "[check]\ncommand = [\"a\"]\ntimeout = \"ten minutes\"\n",
-			wantMessage: "check.timeout \"ten minutes\" is not a duration",
+			name:        "unparsable timeout is rejected without echoing it",
+			content:     "[check]\ncommand = [\"a\"]\ntimeout = \"" + secretMarker + "\"\n",
+			wantMessage: "check.timeout is not a Go duration",
+		},
+		{
+			name:        "explicitly empty timeout is rejected, never defaulted",
+			content:     "[check]\ncommand = [\"a\"]\ntimeout = \"\"\n",
+			wantMessage: "check.timeout is not a Go duration",
 		},
 		{
 			name:        "zero timeout",
 			content:     "[check]\ncommand = [\"a\"]\ntimeout = \"0s\"\n",
-			wantMessage: "must be positive",
+			wantMessage: "check.timeout must be a positive duration",
 		},
 		{
 			name:        "negative timeout",
 			content:     "[check]\ncommand = [\"a\"]\ntimeout = \"-5m\"\n",
-			wantMessage: "must be positive",
+			wantMessage: "check.timeout must be a positive duration",
 		},
 		{
-			name:        "timeout with the wrong type names the key",
+			name:        "timeout with the wrong type names the key and expected shape",
 			content:     "[check]\ncommand = [\"a\"]\ntimeout = 600\n",
-			wantMessage: "check.timeout",
+			wantMessage: "key check.timeout must be a string holding a Go duration",
 		},
 		{
-			name:        "unsupported harness",
-			content:     "[check]\ncommand = [\"a\"]\n[worker]\nharness = \"gemini\"\n",
-			wantMessage: "worker.harness \"gemini\" is not a supported harness",
+			name:        "unsupported harness is rejected without echoing it",
+			content:     "[check]\ncommand = [\"a\"]\n[worker]\nharness = \"" + secretMarker + "\"\n",
+			wantMessage: "worker.harness is not a supported harness",
+		},
+		{
+			name:        "explicitly empty harness is rejected, never defaulted",
+			content:     "[check]\ncommand = [\"a\"]\n[worker]\nharness = \"\"\n",
+			wantMessage: "worker.harness is not a supported harness",
+		},
+		{
+			name:        "syntax error is positioned without echoing the document",
+			content:     "[check]\ncommand = [\"a\"]\n[env]\nstrip = [" + secretMarker + "]\n",
+			wantMessage: "not valid TOML at this position",
 		},
 		{
 			name:        "profile dir with a control byte",
@@ -213,6 +231,9 @@ func TestLoadRejectsInvalidPolicies(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), tc.wantMessage) {
 				t.Errorf("error %q does not contain %q", err, tc.wantMessage)
+			}
+			if strings.Contains(err.Error(), secretMarker) {
+				t.Errorf("error %q echoes the supplied value; diagnostics must never render it", err)
 			}
 		})
 	}

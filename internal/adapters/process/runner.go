@@ -33,7 +33,11 @@ const (
 // new process group with the complete environment given, captures bounded
 // output, and on context cancellation kills the whole group and reaps the
 // leader within a bounded wait.
-type Runner struct{}
+type Runner struct {
+	// anchorPath overrides the group-anchor executable for tests; empty
+	// resolves "sleep" from PATH at call time.
+	anchorPath string
+}
 
 var _ app.CommandRunner = Runner{}
 
@@ -71,13 +75,16 @@ func (e *CancellationError) Unwrap() error { return e.Cause }
 //
 // Group discipline: the leader is a fresh group leader (Setpgid, pgid ==
 // leader pid), a sleep anchor is joined into that same group and kept
-// unreaped until after the one group SIGKILL, and a single goroutine owns
-// the leader's Wait — so the group signal can never reach a recycled group
-// id, and no pid is ever waited twice. If the controller process dies
-// mid-run, the orphaned anchor keeps the group id pinned (for at most
-// anchorSleepSeconds) so a successor's retirement of the recorded group
-// cannot hit a recycled id either.
-func (Runner) Run(ctx context.Context, cmd app.Command) (app.CommandResult, error) {
+// unreaped until after the one group SIGKILL, each child has exactly one
+// Wait owner, and every teardown wait is bounded — so the group signal can
+// never reach a recycled group id, and no pid is ever waited twice. An
+// anchor that cannot be started proves nothing about the leader; that path
+// retires the group while the leader is provably unreaped and still
+// returns a completed command's own result (see finishUnanchored). If the
+// controller process dies mid-run, the orphaned anchor keeps the group id
+// pinned (for at most anchorSleepSeconds) so a successor's retirement of
+// the recorded group cannot hit a recycled id either.
+func (r Runner) Run(ctx context.Context, cmd app.Command) (app.CommandResult, error) {
 	if len(cmd.Argv) == 0 {
 		return app.CommandResult{}, errors.New("run: argv is empty")
 	}
@@ -107,20 +114,9 @@ func (Runner) Run(ctx context.Context, cmd app.Command) (app.CommandResult, erro
 	// Join the anchor before any Wait exists: until the leader is reaped it
 	// pins its own group, so this window is race-free, and from here on the
 	// unreaped anchor pins it.
-	anchor, anchorErr := startAnchor(pgid) //nolint:contextcheck // the anchor must outlive ctx: it pins the group id through the cancellation teardown and is retired explicitly, never by a context.
+	anchor, anchorErr := startAnchor(pgid, r.anchorPath) //nolint:contextcheck // the anchor must outlive ctx: it pins the group id through the cancellation teardown and is retired explicitly, never by a context.
 	if anchorErr != nil {
-		if isEmptyGroupJoinError(anchorErr) {
-			// The group is already empty: the leader exited (leaving no
-			// member) before the anchor could join. There is nothing left to
-			// signal; collect the completed result.
-			return resultFromWait(leader.Wait(), stdout, stderr, time.Since(start))
-		}
-		// The group cannot be pinned, so cancellation could not be enforced
-		// safely. The leader is still unreaped (no Wait has run), so the
-		// group kill is safe now; then reap and fail.
-		killErr := killGroup(pgid)
-		_, waitErr := resultFromWait(leader.Wait(), stdout, stderr, time.Since(start))
-		return app.CommandResult{}, errors.Join(fmt.Errorf("anchor process group %d: %w", pgid, anchorErr), killErr, waitErr)
+		return finishUnanchored(leader, pgid, anchorErr, stdout, stderr, start)
 	}
 
 	waitDone := make(chan error, 1)
@@ -139,6 +135,40 @@ func (Runner) Run(ctx context.Context, cmd app.Command) (app.CommandResult, erro
 	}
 }
 
+// finishUnanchored settles a run whose group anchor could not be started.
+// The join failure's errno proves nothing about the leader — EPERM can come
+// from the anchor's own exec as well as from an empty group — so no
+// completion is ever inferred from it. The leader has no Wait owner yet, so
+// it is provably unreaped here: a live process or a zombie, either of which
+// pins the group id, making the one group SIGKILL safe — a no-op for a
+// command that already finished (a zombie's recorded exit status is
+// unaffected), a retirement for one that cannot be supervised without an
+// anchor. The wait that follows is bounded; its goroutine is the leader's
+// single Wait owner and keeps the eventual reap past the bound.
+func finishUnanchored(leader *exec.Cmd, pgid int, anchorErr error, stdout, stderr *boundedBuffer, start time.Time) (app.CommandResult, error) {
+	killErr := killGroup(pgid)
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- leader.Wait() }()
+	select {
+	case waitErr := <-waitDone:
+		result, runErr := resultFromWait(waitErr, stdout, stderr, time.Since(start))
+		if runErr == nil && result.ExitCode >= 0 && killErr == nil {
+			// The leader had already exited on its own — its recorded exit
+			// status survived the group kill — so the completed command's
+			// result stands.
+			return result, nil
+		}
+		// The leader died by a signal (ours, having been alive when the
+		// group was retired, or an indistinguishable external one) or the
+		// teardown itself failed: the run was not supervised to completion.
+		return result, errors.Join(fmt.Errorf("run not supervised: anchor process group %d: %w", pgid, anchorErr), killErr, runErr)
+	case <-time.After(reapTimeout):
+		// The output buffers may still be written by exec's copiers, so
+		// they are not read; the wait goroutine keeps the eventual reap.
+		return app.CommandResult{}, errors.Join(fmt.Errorf("anchor process group %d: %w", pgid, anchorErr), killErr, fmt.Errorf("killed leader (group %d) was not reaped within %s", pgid, reapTimeout))
+	}
+}
+
 // cancelRun tears the canceled command's group down: one group SIGKILL while
 // the anchor provably pins the group id, a bounded reap of the leader, the
 // anchor's reap, and a bounded poll for group absence.
@@ -150,9 +180,11 @@ func cancelRun(ctx context.Context, leader, anchor *exec.Cmd, pgid int, waitDone
 	case <-time.After(reapTimeout):
 		// The SIGKILLed leader was not reaped within the bound. The output
 		// buffers may still be written by exec's copiers, so they are not
-		// read; the anchor stays unreaped and keeps the group id pinned for
-		// a later retirement of the recorded group.
-		return app.CommandResult{}, errors.Join(fmt.Errorf("canceled command's leader (group %d) was not reaped within %s", pgid, reapTimeout), killErr, cancellation)
+		// read. The anchor is retired within its own bound so it keeps a
+		// reap owner; the unreaped leader itself still pins the group id
+		// for a later retirement of the recorded group.
+		anchorRetireErr := retireAnchor(anchor)
+		return app.CommandResult{}, errors.Join(fmt.Errorf("canceled command's leader (group %d) was not reaped within %s", pgid, reapTimeout), killErr, anchorRetireErr, cancellation)
 	}
 	anchorRetireErr := retireAnchor(anchor) // the anchor took the group SIGKILL; this is its single reap
 	cancellation.GroupEmptied = awaitGroupGone(pgid)
@@ -185,14 +217,19 @@ func resultFromWait(waitErr error, stdout, stderr *boundedBuffer, duration time.
 }
 
 // startAnchor launches a sleep into the existing process group pgid, so an
-// unreaped member of ours pins the group id until retirement. Joining an
-// existing group fails (EPERM or ESRCH) once that group is empty, which the
-// caller classifies with isEmptyGroupJoinError. The anchor gets no stdio,
-// so it never holds the leader's output pipes open.
-func startAnchor(pgid int) (*exec.Cmd, error) {
-	sleepBin, err := exec.LookPath("sleep")
-	if err != nil {
-		return nil, fmt.Errorf("resolve sleep for the group anchor: %w", err)
+// unreaped member of ours pins the group id until retirement. A start
+// failure carries no usable meaning about the leader (an empty target
+// group and the anchor's own exec failure are indistinguishable at this
+// level); the caller settles that path with finishUnanchored. The anchor
+// gets no stdio, so it never holds the leader's output pipes open.
+func startAnchor(pgid int, anchorPath string) (*exec.Cmd, error) {
+	sleepBin := anchorPath
+	if sleepBin == "" {
+		resolved, err := exec.LookPath("sleep")
+		if err != nil {
+			return nil, fmt.Errorf("resolve sleep for the group anchor: %w", err)
+		}
+		sleepBin = resolved
 	}
 	anchor := exec.CommandContext(context.Background(), sleepBin, anchorSleepSeconds) //nolint:gosec // G204: a fixed sleep binary with a fixed argument; the anchor only pins the process group id.
 	anchor.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pgid: pgid}
@@ -202,31 +239,28 @@ func startAnchor(pgid int) (*exec.Cmd, error) {
 	return anchor, nil
 }
 
-// isEmptyGroupJoinError reports whether an anchor start failure means the
-// target group has no member left: setpgid into an existing group answers
-// EPERM or ESRCH once the group is empty.
-func isEmptyGroupJoinError(err error) bool {
-	return errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.ESRCH)
-}
-
-// retireAnchor kills and reaps the group anchor; it is the anchor's single
-// reap owner. Killing by pid is safe (os.Process tracks its own done state),
+// retireAnchor kills and reaps the group anchor within a bounded wait. The
+// goroutine spawned here is the anchor's single Wait owner and keeps the
+// eventual reap even past the bound, so no path leaves the anchor without
+// an owner. Killing by pid is safe (os.Process tracks its own done state),
 // and a SIGKILLed anchor's wait error is the expected signal exit.
 func retireAnchor(anchor *exec.Cmd) error {
-	if err := anchor.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-		// Cannot happen for our own live child; without the kill the Wait
-		// below could block for the anchor's full sleep, so fail instead.
-		return fmt.Errorf("kill group anchor: %w", err)
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- anchor.Wait() }()
+	killErr := anchor.Process.Kill()
+	if killErr != nil && errors.Is(killErr, os.ErrProcessDone) {
+		killErr = nil
 	}
-	err := anchor.Wait()
-	if err == nil {
-		return nil
+	select {
+	case err := <-waitDone:
+		var exitErr *exec.ExitError
+		if err != nil && !errors.As(err, &exitErr) {
+			return errors.Join(fmt.Errorf("reap group anchor: %w", err), killErr)
+		}
+		return killErr
+	case <-time.After(reapTimeout):
+		return errors.Join(fmt.Errorf("group anchor (pid %d) was not reaped within %s; its wait owner keeps the eventual reap", anchor.Process.Pid, reapTimeout), killErr)
 	}
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) { // the SIGKILLed anchor's signal exit, expected
-		return nil
-	}
-	return fmt.Errorf("reap group anchor: %w", err)
 }
 
 // killGroup sends the one SIGKILL to the whole group, guarded so a bogus id

@@ -25,14 +25,23 @@ filesystem ambiently; it consumes these ports.
   identity if the platform's randomness source fails (crypto/rand
   documents that it never does on supported platforms).
 - A reader never observes a partial artifact: content lands in a temp file
-  inside the destination directory, is fsynced and pinned to mode 0600,
-  and one atomic rename publishes it; the directory entry is fsynced after
-  the rename. Every failure path removes the temp file, so a failed write
-  leaves the destination exactly as it was and no `.hop-artifact-*` file
-  behind.
-- Parent directories are created (0700) by the write; paths are chosen by
-  the application from the run's frozen artifact directories, never by
-  this adapter.
+  inside the destination directory, is pinned to mode 0600 and then
+  fsynced (so the file sync covers the final mode as well as the data),
+  and one atomic rename publishes it; the destination directory entry is
+  fsynced after the rename. Every failure path removes the temp file, so
+  no `.hop-artifact-*` file is left behind.
+- The failure guarantee is exactly what rename atomicity gives: a failure
+  before the rename leaves the destination in its previous state; a
+  failure after it (the directory fsync) may leave the complete new
+  content whose durability is not yet established, and the caller must
+  treat such an outcome as uncertain durability, never as a rollback.
+  The destination is never anything partial.
+- Missing parent directories are created (0700) with each new entry
+  fsynced into the directory that holds it, walking from the deepest
+  already-existing ancestor, so a first write into a fresh hierarchy is
+  durably reachable when WriteArtifact returns. Paths are chosen by the
+  application from the run's frozen artifact directories, never by this
+  adapter.
 - `WriteArtifact` is never called from inside a store transaction (the
   port's contract): the use case commits intent first, writes as the
   external act, then records the outcome.
@@ -53,7 +62,11 @@ filesystem ambiently; it consumes these ports.
   by `identity.ParseRunID`; artifact round trips (text, empty, binary)
   with directory creation, mode 0600 and no temp residue; overwrite
   replacing content completely; a failed publish (rename onto a directory)
-  leaving no temp file; a missing-artifact read wrapping fs.ErrNotExist.
+  leaving no temp file; deep-hierarchy creation with every new directory
+  0700; a file occupying the directory chain rejected by name; a
+  missing-artifact read wrapping fs.ErrNotExist. Crash-ordering itself
+  (what survives power loss mid-sequence) is not provable by these tests;
+  the sequence above is the documented mechanism.
 - Test fixtures: none on disk; paths live under t.TempDir.
 
 ## Related guides

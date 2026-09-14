@@ -45,9 +45,11 @@ type fileConfig struct {
 }
 
 type checkSection struct {
-	Command    []string `toml:"command"`
-	Timeout    string   `toml:"timeout"`
-	Repeatable bool     `toml:"repeatable"`
+	Command []string `toml:"command"`
+	// Timeout is a pointer so an absent key (defaulted) is distinguishable
+	// from an explicitly supplied value, which is always validated.
+	Timeout    *string `toml:"timeout"`
+	Repeatable bool    `toml:"repeatable"`
 }
 
 type envSection struct {
@@ -56,7 +58,10 @@ type envSection struct {
 }
 
 type workerSection struct {
-	Harness string `toml:"harness"`
+	// Harness is a pointer so an absent key (defaulted to claude) is
+	// distinguishable from an explicitly supplied value, which is always
+	// validated against the supported set.
+	Harness *string `toml:"harness"`
 }
 
 type profileSection struct {
@@ -66,11 +71,13 @@ type profileSection struct {
 // Load reads and validates `<repositoryRoot>/.herdr-orchestrator/
 // config.toml` into the run policy `hop run` freezes. It fails on a
 // missing or unreadable file, any strict-decoding violation, a missing
-// [check] command, a non-positive or unparsable timeout, an unsupported
-// harness, and a profile directory containing control bytes. A relative
-// profile directory is resolved to an absolute path against the repository
-// root here, at load, so the frozen policy never carries a
-// working-directory-dependent path.
+// [check] command, a non-positive, unparsable or explicitly empty timeout,
+// a harness outside the supported set (an explicitly empty one included;
+// only an absent key defaults), and a profile directory containing control
+// bytes. A relative profile directory is resolved to an absolute path
+// against the repository root here, at load, so the frozen policy never
+// carries a working-directory-dependent path. Diagnostics name the file,
+// the key and the expected shape or set, never the supplied value.
 func (Source) Load(ctx context.Context, repositoryRoot string) (app.RunPolicy, error) {
 	if err := ctx.Err(); err != nil {
 		return app.RunPolicy{}, err
@@ -89,8 +96,11 @@ func (Source) Load(ctx context.Context, repositoryRoot string) (app.RunPolicy, e
 	return policyFromFile(&file, repositoryRoot, path)
 }
 
-// decodeError renders a strict-decoding failure with the offending key
-// named, so a typo in the file is directly actionable.
+// decodeError renders a strict-decoding failure with the file, position and
+// offending key named and the expected shape stated, so a typo in the file
+// is directly actionable. Supplied values are never echoed, and the
+// decoder's own message is never rendered — it can quote document content —
+// so a secret pasted into the file cannot leak through a rendered error.
 func decodeError(path string, err error) error {
 	if strict, ok := errors.AsType[*toml.StrictMissingError](err); ok {
 		keys := make([]string, 0, len(strict.Errors))
@@ -100,9 +110,38 @@ func decodeError(path string, err error) error {
 		return fmt.Errorf("%s: unknown key %s: the policy file is decoded strictly and every key must be one the design declares", path, strings.Join(keys, ", "))
 	}
 	if decodeErr, ok := errors.AsType[*toml.DecodeError](err); ok {
-		return fmt.Errorf("%s: key %s: %w", path, strings.Join(decodeErr.Key(), "."), err)
+		row, column := decodeErr.Position()
+		key := strings.Join(decodeErr.Key(), ".")
+		// The decoder's duplicate messages ("already defined", "already
+		// exists") carry only the key, and the distinction matters to the
+		// reader; the sniff is pinned by the duplicate-key table tests.
+		duplicate := strings.Contains(decodeErr.Error(), "already defined") || strings.Contains(decodeErr.Error(), "already exists")
+		switch {
+		case key != "" && duplicate:
+			return fmt.Errorf("%s:%d:%d: key %s is defined more than once", path, row, column, key)
+		case key != "":
+			return fmt.Errorf("%s:%d:%d: key %s must be %s", path, row, column, key, expectedShape(key))
+		default:
+			return fmt.Errorf("%s:%d:%d: the document is not valid TOML at this position", path, row, column)
+		}
 	}
 	return fmt.Errorf("decode %s: %w", path, err)
+}
+
+// expectedShape names the declared shape of one policy key, so a decode
+// failure can state what was expected without echoing what was supplied.
+func expectedShape(key string) string {
+	switch key {
+	case "check.command", "env.strip", "env.passthrough":
+		return "an array of strings"
+	case "check.timeout":
+		return "a string holding a Go duration"
+	case "check.repeatable":
+		return "a boolean"
+	case "worker.harness", "profile.dir":
+		return "a string"
+	}
+	return "the shape the package guide's example shows"
 }
 
 // policyFromFile validates the decoded file and assembles the RunPolicy
@@ -112,25 +151,29 @@ func policyFromFile(file *fileConfig, repositoryRoot, path string) (app.RunPolic
 	if file.Check == nil || len(file.Check.Command) == 0 {
 		return app.RunPolicy{}, fmt.Errorf("%s: [check] command is required; a policy without a check cannot gate completion", path)
 	}
+	// Diagnostics below name the file and key and what was expected, never
+	// the supplied value or a wrapped cause that would echo it: a mistaken
+	// paste of a secret into the policy file must not leak through a
+	// rendered error.
 	timeout := defaultCheckTimeout
-	if file.Check.Timeout != "" {
-		parsed, err := time.ParseDuration(file.Check.Timeout)
+	if file.Check.Timeout != nil {
+		parsed, err := time.ParseDuration(*file.Check.Timeout)
 		if err != nil {
-			return app.RunPolicy{}, fmt.Errorf("%s: check.timeout %q is not a duration (use forms like \"10m\" or \"90s\"): %w", path, file.Check.Timeout, err)
+			return app.RunPolicy{}, fmt.Errorf("%s: check.timeout is not a Go duration string; use forms like \"10m\" or \"90s\"", path)
 		}
 		if parsed <= 0 {
-			return app.RunPolicy{}, fmt.Errorf("%s: check.timeout %q must be positive", path, file.Check.Timeout)
+			return app.RunPolicy{}, fmt.Errorf("%s: check.timeout must be a positive duration", path)
 		}
 		timeout = parsed
 	}
-	harness := file.Worker.Harness
-	if harness == "" {
-		harness = app.HarnessClaude
+	harness := app.HarnessClaude
+	if file.Worker.Harness != nil {
+		harness = *file.Worker.Harness
 	}
 	switch harness {
 	case app.HarnessClaude, app.HarnessCodex, app.HarnessOpencode:
 	default:
-		return app.RunPolicy{}, fmt.Errorf("%s: worker.harness %q is not a supported harness; supported harnesses are %q, %q and %q", path, harness, app.HarnessClaude, app.HarnessCodex, app.HarnessOpencode)
+		return app.RunPolicy{}, fmt.Errorf("%s: worker.harness is not a supported harness; supported harnesses are %q, %q and %q", path, app.HarnessClaude, app.HarnessCodex, app.HarnessOpencode)
 	}
 	profileDir, err := resolveProfileDir(file.Profile.Dir, repositoryRoot, path)
 	if err != nil {

@@ -17,43 +17,71 @@ const (
 	kernProcargs2 = 49 // KERN_PROCARGS2
 )
 
-// processArgv reads pid's exact argv through the kern.procargs2 sysctl,
-// which reports the process's saved argument area byte-for-byte: a native
-// int32 argc, the executable path NUL-terminated, NUL padding, then the
-// argc NUL-separated argv strings (the environment follows and is never
-// read past). Both darwin targets (arm64, amd64) are little-endian, which
-// is the native layout the kernel wrote. The sysctl fails for a process
-// that is gone, a zombie, or another user's; the caller marks the argv
-// unavailable.
+// procargs2PathAlign is the alignment of the executable-path region at the
+// head of the saved argument area: the kernel writes the path and pads it
+// with NULs so the argv strings start at the next multiple of 8. The fixed
+// rule is what disambiguates that padding from a legitimately empty leading
+// argument — the argv area begins exactly at the rounded boundary, never at
+// "the first non-NUL byte". The platform regression tests in
+// argv_darwin_test.go pin this contract with real children whose argv
+// carries empty leading, middle and trailing arguments.
+const procargs2PathAlign = 8
+
+// processArgv reads pid's exact argv through the kern.procargs2 sysctl.
+// The sysctl fails for a process that is gone, a zombie, or another
+// user's; the caller marks the argv unavailable.
 func processArgv(pid int) ([]string, error) {
 	raw, err := procargs2(pid)
 	if err != nil {
 		return nil, fmt.Errorf("sysctl kern.procargs2 for pid %d: %w", pid, err)
 	}
-	if len(raw) < 4 {
-		return nil, fmt.Errorf("kern.procargs2 for pid %d is truncated (%d bytes)", pid, len(raw))
+	argv, err := parseProcargs2(raw)
+	if err != nil {
+		return nil, fmt.Errorf("kern.procargs2 for pid %d: %w", pid, err)
 	}
-	argc := int(binary.LittleEndian.Uint32(raw[:4]))
-	if argc <= 0 {
-		return nil, fmt.Errorf("kern.procargs2 for pid %d reports argc %d; the process has no readable argument vector", pid, argc)
+	return argv, nil
+}
+
+// parseProcargs2 decodes one kern.procargs2 buffer exactly. Layout: a
+// native int32 argc (both darwin targets are little-endian); the
+// executable path in a NUL-padded region of len(path)+1 rounded up to
+// procargs2PathAlign; then exactly argc NUL-terminated argv entries with
+// empty entries preserved. The environment strings that follow are never
+// read: parsing stops at the argc-th terminator, a buffer that ends before
+// it is an error, and a non-NUL byte inside the computed padding region is
+// an error rather than a guessed argument boundary — so an environment
+// value can never be returned as an argument and no argv is ever invented.
+func parseProcargs2(raw []byte) ([]string, error) {
+	if len(raw) < 4 {
+		return nil, fmt.Errorf("buffer is truncated (%d bytes)", len(raw))
+	}
+	argc := int(int32(binary.LittleEndian.Uint32(raw[:4]))) //nolint:gosec // G115: the buffer's leading word is the kernel's native int32 argc; the uint32 is reinterpreted, not range-converted, and a negative result is rejected on the next line.
+	if argc < 0 {
+		return nil, fmt.Errorf("argc %d is negative", argc)
 	}
 	rest := raw[4:]
-	execPathEnd := bytes.IndexByte(rest, 0)
-	if execPathEnd < 0 {
-		return nil, fmt.Errorf("kern.procargs2 for pid %d has no terminated executable path", pid)
+	pathEnd := bytes.IndexByte(rest, 0)
+	if pathEnd < 0 {
+		return nil, errors.New("the executable path is not NUL-terminated")
 	}
-	rest = rest[execPathEnd:]
-	for len(rest) > 0 && rest[0] == 0 {
-		rest = rest[1:]
+	argvStart := (pathEnd + 1 + procargs2PathAlign - 1) / procargs2PathAlign * procargs2PathAlign
+	if argvStart > len(rest) {
+		return nil, errors.New("buffer ends inside the executable-path region")
+	}
+	for _, b := range rest[pathEnd+1 : argvStart] {
+		if b != 0 {
+			return nil, errors.New("the executable-path padding holds a non-NUL byte; the layout is not the understood one")
+		}
 	}
 	argv := make([]string, 0, argc)
-	for len(argv) < argc {
-		end := bytes.IndexByte(rest, 0)
+	p := argvStart
+	for range argc {
+		end := bytes.IndexByte(rest[p:], 0)
 		if end < 0 {
-			return nil, fmt.Errorf("kern.procargs2 for pid %d ends inside argument %d of %d", pid, len(argv), argc)
+			return nil, fmt.Errorf("buffer ends inside argument %d of %d", len(argv), argc)
 		}
-		argv = append(argv, string(rest[:end]))
-		rest = rest[end+1:]
+		argv = append(argv, string(rest[p:p+end]))
+		p += end + 1
 	}
 	return argv, nil
 }

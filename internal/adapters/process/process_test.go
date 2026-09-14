@@ -202,20 +202,6 @@ func readPid(t *testing.T, path string) int {
 	return pid
 }
 
-// cleanupGroup registers a guarded best-effort group kill so a failing test
-// never leaves fixture processes behind.
-func cleanupGroup(t *testing.T, pgid int) {
-	t.Helper()
-	t.Cleanup(func() {
-		if pgid <= 1 || pgid == syscall.Getpgrp() {
-			return
-		}
-		if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-			t.Logf("cleanup kill of group %d: %v", pgid, err)
-		}
-	})
-}
-
 // groupGone reports whether no process remains in the group; signal 0 only
 // reads existence.
 func groupGone(pgid int) bool {
@@ -386,6 +372,7 @@ func TestRunnerCancellationKillsWholeGroupWithTypedResult(t *testing.T) {
 		err    error
 	}
 	done := make(chan runOutcome, 1)
+	finished := make(chan struct{})
 	go func() {
 		result, err := process.Runner{}.Run(ctx, app.Command{
 			Argv: []string{exe},
@@ -396,7 +383,19 @@ func TestRunnerCancellationKillsWholeGroupWithTypedResult(t *testing.T) {
 			},
 		})
 		done <- runOutcome{result: result, err: err}
+		close(finished)
 	}()
+	// Cleanup owns no group signal of its own: it cancels the run and waits
+	// for Run to return, so the runner's anchored retirement — the only
+	// owner of this group's teardown — has finished before the test ends.
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-finished:
+		case <-time.After(30 * time.Second):
+			t.Error("Run did not return after the cleanup cancellation")
+		}
+	})
 
 	waitUntil(t, "both fixture pid files", func() bool {
 		_, leaderErr := os.Stat(leaderPidFile)
@@ -409,7 +408,6 @@ func TestRunnerCancellationKillsWholeGroupWithTypedResult(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getpgid(%d): %v", childPid, err)
 	}
-	cleanupGroup(t, pgid)
 	if pgid != leaderPid {
 		t.Fatalf("child pgid = %d, want the leader pid %d: the leader must lead a fresh group", pgid, leaderPid)
 	}
@@ -476,27 +474,41 @@ func TestGroupInspectorAgainstLiveGroupThenRetirement(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getpgid(%d): %v", childPid, err)
 	}
-	cleanupGroup(t, pgid)
+	anchor, disarm := armGroupRetirement(t, pgid)
 
 	inspector := process.GroupInspector{}
 	members, err := inspector.GroupProcesses(t.Context(), pgid)
 	if err != nil {
 		t.Fatalf("GroupProcesses: %v", err)
 	}
-	if len(members) != 1 {
-		t.Fatalf("live group members = %+v, want exactly the sleeper child", members)
+	if len(members) != 2 {
+		t.Fatalf("live group members = %+v, want the sleeper child and the test anchor", members)
 	}
-	if members[0].PID != childPid {
-		t.Errorf("member pid = %d, want %d", members[0].PID, childPid)
+	var sleeper *app.GroupProcess
+	for i := range members {
+		switch members[i].PID {
+		case childPid:
+			sleeper = &members[i]
+		case anchor.Process.Pid:
+		default:
+			t.Errorf("unexpected group member %+v", members[i])
+		}
+	}
+	if sleeper == nil {
+		t.Fatalf("members = %+v do not include the sleeper child %d", members, childPid)
 	}
 	wantArgv := []string{exe, spaceArg, tabArg}
-	if !slices.Equal(members[0].Argv, wantArgv) {
-		t.Errorf("member argv = %q, want the exact vector %q", members[0].Argv, wantArgv)
+	if !slices.Equal(sleeper.Argv, wantArgv) {
+		t.Errorf("sleeper argv = %q, want the exact vector %q", sleeper.Argv, wantArgv)
 	}
 
 	if signalErr := inspector.SignalGroup(t.Context(), pgid); signalErr != nil {
 		t.Fatalf("SignalGroup: %v", signalErr)
 	}
+	// The retirement under test has been delivered to every member, the
+	// test anchor included; reap the anchor (releasing the identity pin)
+	// and disarm the cleanup so no signal is ever sent after the release.
+	disarm()
 	waitUntil(t, "the retired group to empty", func() bool { return groupGone(pgid) })
 	members, err = inspector.GroupProcesses(t.Context(), pgid)
 	if err != nil {
@@ -504,6 +516,56 @@ func TestGroupInspectorAgainstLiveGroupThenRetirement(t *testing.T) {
 	}
 	if len(members) != 0 {
 		t.Errorf("retired group members = %+v, want none", members)
+	}
+}
+
+// armGroupRetirement joins a test-owned sleep anchor into the group and
+// registers an idempotent retirement owner: while the anchor is unreaped it
+// provably pins the group id, so the failure-path cleanup may signal the
+// group; disarm reaps the anchor and marks the group retired, after which
+// cleanup sends no signal — a signal is never issued after the identity pin
+// is released.
+func armGroupRetirement(t *testing.T, pgid int) (anchor *exec.Cmd, disarm func()) {
+	t.Helper()
+	sleepBin, err := exec.LookPath("sleep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchor = exec.CommandContext(context.Background(), sleepBin, "100000") //nolint:gosec // G204: a fixed sleep binary; the anchor only pins the process group id for this test's cleanup.
+	anchor.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pgid: pgid}
+	if err := anchor.Start(); err != nil {
+		t.Fatalf("join the test anchor into group %d: %v", pgid, err)
+	}
+	retired := false
+	reapAnchor := func() {
+		if killErr := anchor.Process.Kill(); killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
+			t.Errorf("kill test anchor: %v", killErr)
+		}
+		if waitErr := anchor.Wait(); waitErr != nil {
+			var exitErr *exec.ExitError
+			if !errors.As(waitErr, &exitErr) {
+				t.Errorf("reap test anchor: %v", waitErr)
+			}
+		}
+	}
+	t.Cleanup(func() {
+		if retired {
+			return
+		}
+		retired = true
+		// The anchor is still unreaped here, pinning pgid, so this
+		// failure-path group kill cannot reach a recycled group.
+		if killErr := syscall.Kill(-pgid, syscall.SIGKILL); killErr != nil && !errors.Is(killErr, syscall.ESRCH) {
+			t.Logf("cleanup kill of group %d: %v", pgid, killErr)
+		}
+		reapAnchor()
+	})
+	return anchor, func() {
+		if retired {
+			return
+		}
+		retired = true
+		reapAnchor()
 	}
 }
 

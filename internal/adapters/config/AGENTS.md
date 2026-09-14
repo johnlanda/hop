@@ -41,8 +41,11 @@ dir = ".profiles/claude-alt"  # optional; resolved absolute against the reposito
 - `[check] command` is required: a policy without a check cannot gate
   completion, and Load fails naming the file.
 - Defaults are exactly the design's: timeout 10m, repeatable false,
-  harness claude; only `claude`, `codex` and `opencode` are accepted as
-  harnesses (the `app.Harness*` constants).
+  harness claude — and a default applies only when the key is absent. An
+  explicitly supplied value is always validated: `timeout = ""` and
+  `harness = ""` are rejections, never silent defaults. Only `claude`,
+  `codex` and `opencode` are accepted as harnesses (the `app.Harness*`
+  constants).
 - The profile directory is resolved to an absolute, cleaned path against
   the repository root at load — never later, so the frozen policy cannot
   carry a working-directory-dependent path — and a value containing a
@@ -51,9 +54,12 @@ dir = ".profiles/claude-alt"  # optional; resolved absolute against the reposito
   or empty value stays `""` and selects the harness's default profile.
 - Wire shapes stay here: callers receive `app.RunPolicy` values only, and
   returned slices are clones of the decoded document.
-- Errors are actionable: strict-decoding failures name the offending key
-  (`check.repetable`, `check.timeout`, …) and validation failures name the
-  file and the rejected value.
+- Errors are actionable and never disclose: every diagnostic names the
+  file, the position or key (`check.repetable`, `check.timeout`, …) and
+  the expected shape or supported set — and never echoes the supplied
+  value or a decoder message that could quote document content, so a
+  secret mistakenly pasted into the policy file cannot leak through a
+  rendered error.
 
 ## Dependencies and ports
 
@@ -69,9 +75,11 @@ dir = ".profiles/claude-alt"  # optional; resolved absolute against the reposito
   policy with every default, the complete policy with comments, escaped
   strings and multiline arrays, absolute profile dir cleaning, every
   harness; rejections for a missing/empty check command, unknown key
-  (named), duplicate key and duplicate table, unparsable/zero/negative/
-  wrongly-typed timeout, unsupported harness and control bytes in the
-  profile dir (escaped-sequence and literal); a missing file wrapping
+  (named), duplicate key and duplicate table, unparsable/explicitly
+  empty/zero/negative/wrongly-typed timeout, unsupported and explicitly
+  empty harness, a positioned syntax error, and control bytes in the
+  profile dir (escaped-sequence and literal); every rejection asserted
+  never to echo an embedded dummy-secret marker; a missing file wrapping
   fs.ErrNotExist; context cancellation.
 - Test fixtures: none on disk; policy files are written under t.TempDir by
   the tests.

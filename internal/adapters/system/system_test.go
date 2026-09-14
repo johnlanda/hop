@@ -126,6 +126,45 @@ func TestArtifactStoreFailedPublishLeavesNoTempFile(t *testing.T) {
 	assertNoTempFiles(t, dir)
 }
 
+func TestArtifactStoreCreatesDeepHierarchyWithPrivateDirectories(t *testing.T) {
+	store := system.ArtifactStore{}
+	root := t.TempDir()
+	path := filepath.Join(root, "runs", "r2", "checks", "op-9", "stdout")
+
+	if err := store.WriteArtifact(t.Context(), path, []byte("out")); err != nil {
+		t.Fatalf("WriteArtifact into a fresh hierarchy: %v", err)
+	}
+
+	for dir := filepath.Dir(path); dir != root; dir = filepath.Dir(dir) {
+		info, err := os.Stat(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0o700 {
+			t.Errorf("directory %s mode = %o, want 0700", dir, info.Mode().Perm())
+		}
+	}
+	got, err := store.ReadArtifact(t.Context(), path)
+	if err != nil || string(got) != "out" {
+		t.Errorf("round trip = %q, %v", got, err)
+	}
+}
+
+func TestArtifactStoreRejectsFileOnTheDirectoryChain(t *testing.T) {
+	store := system.ArtifactStore{}
+	root := t.TempDir()
+	occupied := filepath.Join(root, "runs")
+	if err := os.WriteFile(occupied, []byte("file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := store.WriteArtifact(t.Context(), filepath.Join(occupied, "r1", "artifact"), []byte("x"))
+
+	if err == nil || !strings.Contains(err.Error(), "not a directory") {
+		t.Errorf("WriteArtifact under a file = %v, want a not-a-directory error", err)
+	}
+}
+
 func TestArtifactStoreReadMissingArtifactFails(t *testing.T) {
 	_, err := system.ArtifactStore{}.ReadArtifact(t.Context(), filepath.Join(t.TempDir(), "absent"))
 
