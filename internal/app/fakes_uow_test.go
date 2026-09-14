@@ -2,12 +2,43 @@ package app_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"github.com/johnlanda/hop/internal/app"
 	"github.com/johnlanda/hop/internal/domain/identity"
 	"github.com/johnlanda/hop/internal/domain/run"
 )
+
+// jsonRoundtripOperation mimics what a real JSON-backed store returns for
+// an operation's Intent/ActEvidence/Outcome payloads: each decoded
+// generically (map[string]any for a struct, a scalar for a string or
+// number), never the original Go type a caller constructed. Application
+// code must never rely on Go type identity for a persisted payload
+// (decodeOperationPayload is the one place that reads one back), and this
+// keeps the fakes exercising that same decode path rather than hiding it
+// behind an in-memory store that happens to keep the exact value.
+func jsonRoundtripOperation(op app.Operation) app.Operation { //nolint:gocritic // hugeParam: mirrors Operation's own shape; called once per commit in tests, never a hot loop.
+	op.Intent = jsonRoundtripAny(op.Intent)
+	op.ActEvidence = jsonRoundtripAny(op.ActEvidence)
+	op.Outcome = jsonRoundtripAny(op.Outcome)
+	return op
+}
+
+func jsonRoundtripAny(v any) any {
+	if v == nil {
+		return nil
+	}
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return v
+	}
+	var decoded any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return v
+	}
+	return decoded
+}
 
 // currentBindingLocked returns sessionID's current (non-superseded)
 // binding from base state alone, ignoring any transaction overlay.
@@ -159,10 +190,10 @@ func (u *fakeUnitOfWork) Commit() error {
 		s.LaunchClaims[incarnation] = claim
 	}
 	for id, op := range u.opCreated { //nolint:gocritic // rangeValCopy: test fake; the domain snapshot is small and read-only here, and indexing would only obscure the loop.
-		s.Operations[id] = op
+		s.Operations[id] = jsonRoundtripOperation(op)
 	}
 	for id, op := range u.opSaved { //nolint:gocritic // rangeValCopy: test fake; the domain snapshot is small and read-only here, and indexing would only obscure the loop.
-		s.Operations[id] = op
+		s.Operations[id] = jsonRoundtripOperation(op)
 	}
 	for id, cr := range u.checkRequestSaved {
 		s.CheckRequests[id] = cr

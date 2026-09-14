@@ -206,7 +206,7 @@ func (c *Controller) stopChecking(ctx context.Context, handle RunHandle, detail 
 		return StopReport{RunState: string(run.RunStopping)}, nil
 	}
 
-	intent, _ := checkOp.Intent.(CheckRunIntent) //nolint:errcheck // a decode failure leaves expectedArgv nil, which ClassifyGroupRetirement treats as never matching — fails closed, not a panic.
+	intent, _ := decodeOperationPayload[CheckRunIntent](checkOp.Intent) // a decode failure leaves expectedArgv nil, which ClassifyGroupRetirement treats as never matching — fails closed, not a panic.
 	outcome := c.retireGroup(ctx, claim.PID, intent.CheckArgv)
 	switch outcome {
 	case GroupEmpty, GroupMatched:

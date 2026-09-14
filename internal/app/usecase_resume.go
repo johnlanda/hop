@@ -438,7 +438,7 @@ func retirePendingLaunchIntents(ctx context.Context, uow UnitOfWork, runID ident
 		if op.Kind != OpPaneOpen && op.Kind != OpLaunchSend {
 			continue
 		}
-		intent, ok := op.Intent.(paneOpenIntent)
+		intent, ok := decodeOperationPayload[paneOpenIntent](op.Intent)
 		if !ok || intent.SessionID != previousSession {
 			continue
 		}

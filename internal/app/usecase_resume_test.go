@@ -71,7 +71,11 @@ func TestResume(t *testing.T) {
 		// unresolved by a crash (its outcome transaction never committed);
 		// the SQLite adapter's pre-binding claim fallback matches
 		// ClaimLaunch against the newest such pending operation, so a
-		// zombie launcher for the old incarnation must never find it.
+		// zombie launcher for the old incarnation must never find it. The
+		// fake store always round-trips Intent through JSON on commit (see
+		// jsonRoundtripOperation), so this operation's Intent is already
+		// the map[string]any shape a real store returns — the same shape
+		// retirePendingLaunchIntents must decode via decodeOperationPayload.
 		for id, op := range tc.Store.Operations {
 			if op.Kind == app.OpPaneOpen {
 				op.State = app.OperationPending
