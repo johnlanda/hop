@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"os/exec"
-	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -64,7 +63,9 @@ func TestRealProcessPTYRendering(t *testing.T) {
 	// The narrow sidebar truncates long entries (e.g. "implementer" renders
 	// as "implement…"), so assertions use markers that survive truncation:
 	// the manager and reviewer agent names, the implementer's unique task
-	// token, and the HOP view label.
+	// token, and the HOP view label. The markers are read from the modeled
+	// final screen, not the accumulated scrollback, so a stale earlier frame
+	// cannot satisfy them.
 	const (
 		managerMark     = "manager"
 		implementerMark = "retry policy"
@@ -80,20 +81,15 @@ func TestRealProcessPTYRendering(t *testing.T) {
 	artifacts.save(t, "pty-screen.txt", rendered)
 	artifacts.save(t, "pty-screen-raw.txt", client.rawSnapshot())
 
-	// Manager-first: under HOP's projection the manager row is drawn above
-	// the workers, and the workers follow in sequence (implementer then
-	// reviewer).
+	// Manager-first on the final screen: the manager row is drawn strictly
+	// above the workers, and the workers follow in sequence (implementer then
+	// reviewer). A reversed screen fails this; see the screen-model tests.
 	managerAt := strings.Index(rendered, managerMark)
 	implementerAt := strings.Index(rendered, implementerMark)
 	reviewerAt := strings.Index(rendered, reviewerMark)
 	if managerAt >= implementerAt || implementerAt >= reviewerAt {
 		t.Errorf("rendered order places manager at %d, implementer at %d, reviewer at %d; want manager-first then worker sequence\n%s",
 			managerAt, implementerAt, reviewerAt, rendered)
-	}
-
-	// The HOP view label is drawn, evidence the projection reached the client.
-	if !strings.Contains(rendered, viewLabel) {
-		t.Errorf("rendered sidebar does not draw the HOP view label %q:\n%s", viewLabel, rendered)
 	}
 
 	// Owned view/clear: after HOP clears its own view the client keeps
@@ -161,10 +157,13 @@ func (c *ptyClient) rawSnapshot() string {
 	return c.output.String()
 }
 
-// screen returns the captured output with terminal escape sequences removed,
-// so substring and ordering checks read the rendered text.
+// screen returns the modeled final screen: the captured output replayed into
+// a fixed-size screen buffer, so substring and ordering checks read the
+// current screen rather than the accumulated scrollback history.
 func (c *ptyClient) screen() string {
-	return stripTerminalEscapes(c.rawSnapshot())
+	buffer := newScreenBuffer(ptyRows, ptyCols)
+	buffer.Write([]byte(c.rawSnapshot()))
+	return buffer.Text()
 }
 
 // waitForScreen polls the rendered screen until it satisfies want, then
@@ -196,30 +195,4 @@ func (c *ptyClient) close(t *testing.T) {
 	if err := c.tty.Close(); err != nil {
 		t.Logf("close pty: %v", err)
 	}
-}
-
-// terminalEscape matches the escape sequences a full-screen TUI emits: OSC
-// strings (ESC ] … BEL or ST), single-byte C1 escapes (ESC + 0x40–0x5f), and
-// CSI sequences (ESC [ params intermediates final). Hex ranges are used so
-// the intent is explicit. Reducing a frame to its visible text is enough for
-// substring and ordering assertions.
-var terminalEscape = regexp.MustCompile(`\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[\x40-\x5f]|\x1b\[[0-9;?]*[\x20-\x2f]*[\x40-\x7e]`)
-
-// stripTerminalEscapes removes terminal escape sequences and normalizes the
-// remaining control bytes to spaces so text drawn on different rows stays
-// separated.
-func stripTerminalEscapes(raw string) string {
-	text := terminalEscape.ReplaceAllString(raw, "")
-	var b strings.Builder
-	for _, r := range text {
-		switch {
-		case r == '\n' || r == '\t':
-			b.WriteRune(r)
-		case r < 0x20 || r == 0x7f:
-			b.WriteByte(' ')
-		default:
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
 }

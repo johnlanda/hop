@@ -102,6 +102,9 @@ func TestRunDoctorMissingBinaryDoesNotGuess(t *testing.T) {
 
 func TestRunDoctorReportsWriteFailures(t *testing.T) {
 	stub := writeFailingHerdrStub(t)
+	// A hermetic PATH so the harness probe cannot execute a real, locally
+	// installed claude/codex/opencode --version during a unit test.
+	t.Setenv("PATH", t.TempDir())
 
 	_, err := runDoctor([]string{"-herdr", stub}, failingWriter{}, io.Discard, emptyGetenv)
 

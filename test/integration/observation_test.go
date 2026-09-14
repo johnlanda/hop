@@ -1,6 +1,7 @@
 package integration
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -50,6 +51,102 @@ func TestRealProcessEventObservationReconcile(t *testing.T) {
 	}
 	if got := state[fixture.manager].Status; got != app.StatusIdle {
 		t.Errorf("manager status = %s, want its snapshot idle preserved", got)
+	}
+}
+
+// TestRealProcessReconcileLoopFoldsLiveTransitions exercises app.Reconcile
+// end to end against the real normalized adapter: it subscribes first, then
+// snapshots, then folds real agent-status transitions delivered while it runs,
+// and stops on cancellation with those transitions folded. The other
+// observation test folds a snapshot and one event directly; this one drives
+// the Reconcile loop itself.
+func TestRealProcessReconcileLoopFoldsLiveTransitions(t *testing.T) {
+	server := prepareServer(t, newArtifactDir(t))
+	server.start(t)
+	fixture := server.createRunFixture(t)
+	observer := herdr.NewObserver(server.socketPath, fixture.implementer)
+
+	ctx, cancel := context.WithCancel(testContext(t))
+	type outcome struct {
+		result app.Reconciliation
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		result, err := app.Reconcile(ctx, observer)
+		done <- outcome{result: result, err: err}
+	}()
+
+	// Drive real transitions after Reconcile has started, confirming each one
+	// landed on the server before driving the next, so the subscription
+	// certainly observes them.
+	states := []app.AgentStatus{app.StatusIdle, app.StatusWorking, app.StatusIdle}
+	for _, want := range states {
+		server.reportAgent(t, fixture.implementer, "implementer", string(want))
+		if !waitUntil(func() bool { return server.agentStatus(t, fixture.implementer) == want }) {
+			t.Fatalf("server never reported the implementer as %s", want)
+		}
+	}
+	cancel()
+
+	got := <-done
+	if got.err != nil {
+		t.Fatalf("Reconcile: %v", got.err)
+	}
+	if len(got.result.Events) == 0 {
+		t.Error("Reconcile folded no live transitions; the loop did not observe the subscription")
+	}
+	if status := got.result.State[fixture.implementer].Status; status != app.StatusIdle && status != app.StatusWorking {
+		t.Errorf("reconciled implementer status = %q, want a real observed status", status)
+	}
+}
+
+// TestRealProcessOptionalMetadataClears proves that publishing a display with
+// an optional field now unset removes that token in Herdr, rather than
+// leaving the stale value from an earlier publish.
+func TestRealProcessOptionalMetadataClears(t *testing.T) {
+	server := prepareServer(t, newArtifactDir(t))
+	stage := stagePlugin(t)
+	server.start(t)
+	server.call(t, "plugin.link", map[string]any{"path": stage, "enabled": true}, &struct{}{})
+
+	fixture := server.createRunFixture(t)
+	presenter := &app.Presenter{Presentation: herdr.NewPresentation(server.socketPath)}
+
+	// Publish with a task and account set.
+	set := app.AgentDisplay{
+		PaneID: fixture.implementer, Run: "r1", RunSequence: 1,
+		Role: app.RoleImplementer, WorkerSequence: 1,
+		Task: "old task", Account: "old account", ParentLabel: "manager-r1",
+	}
+	if err := presenter.Publish(testContext(t), &set); err != nil {
+		t.Fatalf("publish set: %v", err)
+	}
+	tokens := server.agentTokens(t)[fixture.implementer]
+	if tokens["hop_task"] != "old task" || tokens["hop_account"] != "old account" {
+		t.Fatalf("after set, tokens = %v, want the task and account present", tokens)
+	}
+
+	// Publish the same pane with those fields now unset; they must be removed.
+	unset := app.AgentDisplay{
+		PaneID: fixture.implementer, Run: "r1", RunSequence: 1,
+		Role: app.RoleImplementer, WorkerSequence: 1,
+	}
+	if err := presenter.Publish(testContext(t), &unset); err != nil {
+		t.Fatalf("publish unset: %v", err)
+	}
+	cleared := server.agentTokens(t)[fixture.implementer]
+	if _, present := cleared["hop_task"]; present {
+		t.Errorf("hop_task still present after unset: %v", cleared)
+	}
+	if _, present := cleared["hop_account"]; present {
+		t.Errorf("hop_account still present after unset: %v", cleared)
+	}
+	if _, present := cleared["hop_parent"]; present {
+		t.Errorf("hop_parent still present after unset: %v", cleared)
+	}
+	if cleared["hop_role"] != "implementer" {
+		t.Errorf("hop_role = %q, want it still set", cleared["hop_role"])
 	}
 }
 

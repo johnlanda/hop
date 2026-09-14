@@ -167,8 +167,13 @@ type testServer struct {
 	socketPath string
 	config     string
 	cmd        *exec.Cmd
-	client     *herdr.Client
-	artifacts  *artifactDir
+	// pgid is the server's process-group id, captured once at start. Setpgid
+	// makes the child a group leader so pgid == pid; it is recorded here and
+	// never re-resolved after the process is reaped, so a recycled pid can
+	// never map this back to an unrelated group.
+	pgid      int
+	client    *herdr.Client
+	artifacts *artifactDir
 }
 
 // testConfig is the test-only configuration: no onboarding, fixed headless
@@ -196,7 +201,7 @@ func newServerRoots(t *testing.T) (base string) {
 			t.Logf("remove server roots: %v", err)
 		}
 	})
-	for _, dir := range []string{"c/herdr", "r", "st", "work"} {
+	for _, dir := range []string{"c/herdr", "r", "st", "work", "home", "bin", "cache", "data"} {
 		if err := os.MkdirAll(filepath.Join(base, dir), 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -204,24 +209,55 @@ func newServerRoots(t *testing.T) (base string) {
 	if err := os.WriteFile(filepath.Join(base, "c", "herdr", "config.toml"), []byte(testConfig), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	writeHarnessStubs(t, filepath.Join(base, "bin"))
 	return base
+}
+
+// writeHarnessStubs installs harmless stub executables named for the native
+// harnesses in a directory that is prepended to the fixture PATH, so a plugin
+// action that probes `claude`, `codex` or `opencode` resolves these instead of
+// the developer's real, credential-bearing harness binaries. The stubs just
+// print a recognizable fake version.
+func writeHarnessStubs(t *testing.T, binDir string) {
+	t.Helper()
+	for _, name := range []string{"claude", "codex", "opencode"} {
+		script := "#!/bin/sh\necho \"" + name + " 0.0.0-stub\"\n"
+		if err := os.WriteFile(filepath.Join(binDir, name), []byte(script), 0o755); err != nil { //nolint:gosec // G306: a stub must be executable; it lives in this test's private roots.
+			t.Fatal(err)
+		}
+	}
 }
 
 // environ builds the hermetic environment for one subprocess: temporary
 // roots, the test-only config path, and no inherited HERDR_* values at all.
 // The allowlist is built from scratch, so socket, session and caller
-// variables from the developer's live session cannot leak in.
+// variables from the developer's live session cannot leak in. HOME is a
+// directory inside the temp roots, not the developer's real home, so the
+// server and the login shells Herdr opens in panes source only the temp
+// home's startup files and cannot reach the developer's native-harness
+// state or shell profile.
 func (s *testServer) environ() []string {
+	// The stub-harness directory is first on PATH so a probe of claude/codex/
+	// opencode resolves the harmless stubs, never the developer's real
+	// harness binaries; herdr, go and the shell resolve from the inherited
+	// PATH after it.
 	return []string{
-		"PATH=" + os.Getenv("PATH"),
-		"HOME=" + os.Getenv("HOME"),
+		"PATH=" + filepath.Join(s.base, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"),
+		"HOME=" + s.homeDir(),
 		"TMPDIR=" + os.Getenv("TMPDIR"),
 		"SHELL=/bin/sh",
 		"XDG_CONFIG_HOME=" + filepath.Join(s.base, "c"),
 		"XDG_STATE_HOME=" + filepath.Join(s.base, "st"),
 		"XDG_RUNTIME_DIR=" + filepath.Join(s.base, "r"),
+		"XDG_CACHE_HOME=" + filepath.Join(s.base, "cache"),
+		"XDG_DATA_HOME=" + filepath.Join(s.base, "data"),
 		"HERDR_CONFIG_PATH=" + s.config,
 	}
+}
+
+// homeDir is the temp home the server and its pane shells use.
+func (s *testServer) homeDir() string {
+	return filepath.Join(s.base, "home")
 }
 
 // prepareServer lays out roots and the command for one disposable server
@@ -264,6 +300,11 @@ func (s *testServer) start(t *testing.T) {
 		t.Fatalf("start herdr server: %v", err)
 	}
 	s.cmd = cmd
+	// Capture the process-group id once, now, while the pid is certainly the
+	// live server. Setpgid made it a group leader, so its pgid equals its
+	// pid. Never re-resolve this after the process is reaped: a recycled pid
+	// could otherwise map to an unrelated group.
+	s.pgid = cmd.Process.Pid
 	exited := make(chan error, 1)
 	go func() { exited <- cmd.Wait() }()
 	t.Cleanup(func() {
@@ -305,7 +346,6 @@ func (s *testServer) start(t *testing.T) {
 // signaled; nothing is matched by name.
 func (s *testServer) stop(t *testing.T, exited <-chan error) {
 	t.Helper()
-	pid := s.cmd.Process.Pid
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := s.client.Call(ctx, "server.stop", nil, nil); err != nil {
@@ -313,34 +353,43 @@ func (s *testServer) stop(t *testing.T, exited <-chan error) {
 	}
 	select {
 	case <-exited:
-		s.reapProcessGroup(t, pid)
+		s.reapProcessGroup(t)
 		return
 	case <-time.After(10 * time.Second):
 	}
-	s.reapProcessGroup(t, pid)
+	s.reapProcessGroup(t)
 	select {
 	case <-exited:
 	case <-time.After(10 * time.Second):
-		t.Errorf("herdr server pid %d did not exit after killing its process group", pid)
+		t.Errorf("herdr server pgid %d did not exit after killing its process group", s.pgid)
 	}
 	// Reap any straggler descendants once more after the leader has exited.
-	s.reapProcessGroup(t, pid)
+	s.reapProcessGroup(t)
 }
 
 // reapProcessGroup sends SIGKILL to the server's process group, reaping the
-// server and every pane-shell descendant it started. A missing group (already
-// gone) is not an error.
-func (*testServer) reapProcessGroup(t *testing.T, pid int) {
+// server and every pane-shell descendant it started. It uses the pgid
+// captured at start (never re-resolved from a possibly-reaped pid) and
+// refuses to signal an unsafe target, so a recycled pid can never make this
+// kill an unrelated group. A group that is already gone is not an error.
+func (s *testServer) reapProcessGroup(t *testing.T) {
 	t.Helper()
-	pgid, err := syscall.Getpgid(pid)
-	if err != nil {
-		// The leader is already gone; try the pid's own group id, which
-		// equals its pid because it was started with Setpgid.
-		pgid = pid
+	if !safeToSignalGroup(s.pgid, syscall.Getpgrp()) {
+		t.Errorf("refusing to signal unsafe process group %d", s.pgid)
+		return
 	}
-	if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-		t.Logf("kill process group %d: %v", pgid, err)
+	if err := syscall.Kill(-s.pgid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		t.Logf("kill process group %d: %v", s.pgid, err)
 	}
+}
+
+// safeToSignalGroup reports whether pgid is a real, specific process group the
+// suite owns and may signal. It rejects any non-positive value, 1 (init), and
+// the caller's own process group, so a missing, bogus or reused pgid can never
+// turn into a broadcast, a signal to init, or a signal to the test runner's
+// own group.
+func safeToSignalGroup(pgid, ownGroup int) bool {
+	return pgid > 1 && pgid != ownGroup
 }
 
 // runCLI runs one herdr CLI command against the test roots and returns its
