@@ -22,14 +22,21 @@ Cardinality describes retained history, including failed launch reservations.
 | Execution | One invocation of a playbook revision | `domain/workflow` |
 | Step execution | A concrete attempt at executing a defined step | `domain/workflow` |
 | Gate evaluation | Evidence for or against a particular transition and input fingerprint | `domain/workflow` |
-| Account | An authenticated provider identity and non-secret operational metadata | `domain/account` |
-| Pool | Explicit provider-specific account membership and selection policy | `domain/account` |
-| Lease | Reserved account capacity for a session lifecycle | `domain/account` |
+| Account (deferred) | An authenticated provider identity and non-secret operational metadata | `domain/account` |
+| Pool (deferred) | Explicit provider-specific account membership and selection policy | `domain/account` |
+| Lease (deferred) | Reserved account capacity for a session lifecycle | `domain/account` |
 | Runtime profile | Harness settings/tools/history-isolation configuration | Application configuration snapshot |
 
 The manager is a session with a manager role, not a special provider or another
 orchestrator service. A task is not a session: the task can outlive a failed
 process. A HOP run is not a Herdr server session. A pool is not a model router.
+
+Account, Pool and Lease are deferred, not removed: the current delegated-
+authentication phase (see [RESEARCH.md](../../RESEARCH.md)) stores no accounts,
+pools or leases. Workers run in a harness's own default profile, or an optional
+user-configured alternate-profile pointer that HOP only passes through. The
+`domain/account` package, the entities below and their relationships describe a
+later, optional multi-account-pools phase, retained here for continuity.
 
 ## Orchestration relationships
 
@@ -120,6 +127,10 @@ details are omitted from the conceptual diagram for readability.
 
 ## Workflow and account relationships
 
+The `ACCOUNT`, `POOL` and `ACCOUNT_LEASE` entities below are deferred to the
+later, optional multi-account-pools phase (see the vocabulary table above);
+the playbook/execution/gate portion of this diagram is current design.
+
 ```mermaid
 erDiagram
     PLAYBOOK_REVISION ||--o{ STEP_DEFINITION : defines
@@ -204,9 +215,9 @@ member after membership changes.
 | `Message` aggregate | Envelope and delivery/ack lifecycle | Idempotent receipt; retain uncertain delivery for reconciliation |
 | `PlaybookRevision` immutable definition | Step/gate keys and valid workflow structure | Existing executions keep their original revision |
 | `Execution` aggregate | Step progress, retries and gate evaluation history | Transition eligibility uses matching revision and input fingerprint |
-| `Account` aggregate | Provider identity, credential reference, enabled/health state and capacity policy | Capacity checks include all outstanding leases |
-| `Pool` aggregate | Membership, policy and selection cursor | Cursor movement and account/session reservation commit together |
-| `Lease` aggregate | Account/session binding and reserved/active/released lifecycle | Retains capacity while runtime outcome is uncertain |
+| `Account` aggregate (deferred) | Provider identity, credential reference, enabled/health state and capacity policy | Capacity checks include all outstanding leases |
+| `Pool` aggregate (deferred) | Membership, policy and selection cursor | Cursor movement and account/session reservation commit together |
+| `Lease` aggregate (deferred) | Account/session binding and reserved/active/released lifecycle | Retains capacity while runtime outcome is uncertain |
 
 Repositories return aggregates/value objects, not mutable database rows. Aggregates
 refer to each other by ID; the ERD does not imply nested in-memory object graphs.

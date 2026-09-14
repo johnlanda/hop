@@ -70,6 +70,32 @@ exec'ing the harness (for example an `env -u OPENAI_API_KEY … <harness>`
 argv, or a HOP wrapper executable); recipes that rely only on the pane env
 map are conditional until such a launcher arrangement is verified.
 
+## Adopted policy
+
+The human settled the following on 2026-09-14 (see
+[RESEARCH.md](../../RESEARCH.md) and [phases](../plan/phases.md)): HOP
+delegates authentication to each harness and runs workers in that harness's
+own default profile. HOP performs no logins, stores no credentials and owns
+no keychain items. An optional configuration value may point at a
+user-prepared alternate profile directory; HOP only passes the harness's own
+profile variables through (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `HOME` plus the
+four `XDG_*_HOME` variables for opencode) and never bootstraps, seeds or
+verifies that profile beyond reporting the harness's own login status in
+`hop doctor`. Multi-account pools, round-robin selection, leases and
+cross-account resume are deferred to a later, optional phase. Every
+HOP-launched worker still passes through the sanitizing launcher described
+above at the harness exec boundary, stripping provider credential variables
+by default with explicit opt-in passthrough per run or role.
+
+With default profiles, HOP sets no per-pane profile override at launch, so
+Herdr's own auto-restore relaunches the worker under the correct account
+with no HOP coordination; the unsupported-restore finding below applies only
+to the optional alternate-profile configuration (see the restore policy
+table). The evidence and per-harness recipes below were gathered before this
+decision and remain the technical basis for both the default-profile launch
+path and any future alternate-profile/pools work; they are not re-verified
+here.
+
 ## Claude Code
 
 ### Verified
@@ -401,14 +427,20 @@ installed `herdr 0.9.0` documentation):
   profile-selecting overrides are.
 
 Combined with the profile-scoped resume lookups verified above for all three
-harnesses, Herdr auto-resume of a session that was launched in an isolated
-profile runs without the overrides that selected that profile: the resume
-command resolves against whatever profile the inherited server/shell
+harnesses, Herdr auto-resume of a session that was launched against an
+overridden profile runs without the overrides that selected that profile: the
+resume command resolves against whatever profile the inherited server/shell
 environment implies. If that inherited profile differs from the recorded
 one, the transcript may be missing or a session may run with unintended
 credentials (for opencode, with whatever provider key that environment
-carries). The binding is not restored reliably; auto-resume of
-isolated-profile sessions is unsupported.
+carries). The binding is not restored reliably; auto-resume of a worker
+launched against the configured alternate-profile pointer is unsupported.
+This applies only when a profile override was set at launch — the optional
+alternate-profile pointer (see [Adopted policy](#adopted-policy)). A
+default-profile worker sets no such override, so there is nothing for the
+additive-only restore path to fail to replay: the restored pane inherits the
+same default profile the worker used originally, and Herdr auto-restore is
+supported for it.
 
 ## Proposed supported restore policy
 
@@ -416,16 +448,21 @@ isolated-profile sessions is unsupported.
 | --- | --- | --- |
 | Warm reattach: Herdr server and agent process survived; HOP reconciles bindings | Supported | No relaunch occurs; Herdr keeps live processes ([session state](../../repos/herdr/docs/versions/0.9.0/website/src/content/docs/session-state.mdx)) |
 | Cold resume by HOP: relaunch with the recorded profile env, same account, recorded cwd | Pending, per harness, on the account-identity smoke below | Resume lookup verified unauthenticated for Claude Code and Codex; full unauthenticated resume round-trip verified for opencode on its free model — which proves nothing about accounts; authenticated, account-verified continuation untested everywhere |
-| Cold resume via Herdr auto-restore of an isolated-profile session | Unsupported | Original per-pane profile overrides are not replayed; resume uses the inherited server/shell environment, so the recorded profile/account binding is not guaranteed (restore path above; resume lookup profile-scoped, verified) |
+| Cold resume via Herdr auto-restore of a default-profile worker | Supported | No per-pane profile override was recorded at launch, so the additive-only restore path (nothing to replay) is not a gap: the restored pane inherits the same default profile the worker used originally (restore path above; [Adopted policy](#adopted-policy)) |
+| Cold resume via Herdr auto-restore of a worker launched against the configured alternate-profile pointer | Unsupported | Original per-pane profile overrides are not replayed; resume uses the inherited server/shell environment, so the recorded profile binding is not guaranteed (restore path above; resume lookup profile-scoped, verified) |
 | Cold resume where the resuming profile's account differs from the original | Needs opt-in evidence | Transcript portability verified (file copy for Claude Code/Codex, export/import for opencode); provider-side acceptance and account semantics unknown; requires a second account |
 | Automatic account failover during restore | Unsupported | No evidence; [architecture](architecture.md) requires confirmed credential isolation before claiming it |
 
-Consequences HOP must implement: run HOP-managed sessions on a dedicated Herdr
-server/session with `resume_agents_on_restore = false`, or otherwise ensure
-Herdr does not race HOP's own account-correct relaunch; on resume, verify the
-recorded profile still holds the expected account before relaunching, and
-return an actionable unsupported state instead of silently launching on
-default credentials ([phases](../plan/phases.md), phase 1).
+Consequences HOP must implement: for a worker launched against the optional
+alternate-profile pointer, verify on resume that the recorded profile
+directory still resolves and still matches the environment before
+relaunching, and return an actionable unsupported state instead of silently
+launching on default credentials; a dedicated Herdr server/session with
+`resume_agents_on_restore = false` is available as a later opt-in for that
+case, not the default ([phases](../plan/phases.md), phase 1). Default-profile
+workers need no such coordination: nothing was overridden at launch, so
+Herdr's own auto-restore already relaunches under the correct account on the
+user's normal Herdr server.
 
 ## Opt-in live smoke test (described, not implemented)
 
@@ -529,28 +566,44 @@ Code-inspection facts cite `strings` output of the named installed binaries
    always strip provider key variables from worker environments, or is there
    a workflow that intentionally relies on them?
 
+Resolved by the 2026-09-14 decision (see [Adopted policy](#adopted-policy)):
+question 3 is moot — HOP never pre-seeds or bootstraps a profile, so first
+launches always stay interactive; question 4 is no — a dedicated Herdr
+server/session is a later opt-in, not the default, since a default-profile
+worker sets no override for Herdr's own auto-restore to fail to replay;
+question 5 is yes — strip provider credential variables by default, with
+explicit opt-in passthrough per run or role. Questions 1 and 2 stay open only
+for the deferred multi-account-pools phase.
+
 ## Implications for HarnessProfiles
 
 The `HarnessProfiles` port ([architecture](architecture.md)) must:
 
-- own one directory per account profile and produce launch specifications
+- resolve the launch environment for the harness's default profile, or the
+  configured alternate-profile pointer, and produce launch specifications
   that set `CLAUDE_CONFIG_DIR`, `CODEX_HOME` or the opencode full
   `HOME`+XDG set AND name the variables to unset (provider API keys,
   `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_SECURESTORAGE_CONFIG_DIR`), applied by
-  a launcher at the harness exec boundary — Herdr's pane env map is additive
-  and `agent.start` accepts no env, so neither can perform the removal;
-- establish and verify launch readiness per profile: a human-approved
-  interactive bootstrap for the specific workspace until verified pre-seed
-  contents exist, an explicit trust decision per workspace root (never
-  ancestor-path trust), and a not-launch-ready state for a profile that
-  would block on login, onboarding or trust;
-- record session/thread id, profile directory, working directory and account
-  label at launch, and refuse a resume specification when any of them is
-  missing or the profile's account no longer matches the binding;
+  the sanitizing launcher at the harness exec boundary — Herdr's pane env
+  map is additive and `agent.start` accepts no env, so neither can perform
+  the removal; HOP does not create, own or bootstrap the alternate-profile
+  directory itself, only pass its variables through;
+- report launch readiness, not establish it: `hop doctor` surfaces each
+  harness's own login/onboarding/trust state (a not-launch-ready state for a
+  profile that would block on login, onboarding or trust) without HOP
+  performing any bootstrap, pre-seeding or trust decision itself — the human
+  runs the harness's normal interactive first-launch for the specific
+  workspace, exactly as they would without HOP;
+- record session/thread id, profile source (default, or the configured
+  alternate-profile directory) and working directory at launch, and refuse a
+  resume specification when the alternate-profile directory no longer
+  resolves or no longer matches the recorded binding;
 - surface the unsupported restore modes above as explicit errors.
 
-It must never: read or write the developer's default `~/.claude`,
-`~/.claude.json`, `~/.codex` or `~/.local/share/opencode` state; copy
-credentials or keychain items between profiles; rewrite a live profile's
-credentials to switch accounts; or rely on Herdr auto-restore for
-isolated-profile sessions.
+It must never: read, write or verify credential state in any profile —
+default or the configured alternate-profile directory — beyond the harness's
+own reported login status; log in on the developer's behalf or store
+credentials or keychain items itself; copy credentials or keychain items
+between profiles; rewrite a profile's credentials to switch accounts; or rely
+on Herdr auto-restore for a worker launched against the configured
+alternate-profile pointer.

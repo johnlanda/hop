@@ -186,32 +186,37 @@ evaluations stale. Passed checks on an older revision cannot appear as approval 
 the new candidate. When all required conditions pass, show `Ready for integration`
 or `Completed` according to the playbook's terminal state.
 
-## 5. Account inspection
+## 5. Login status inspection
 
-Account details can be a board screen or a user-opened transient popup. Login opens
-a dedicated terminal flow; a session-modal popup should not own a long login.
+HOP delegates authentication to each harness; it performs no logins and stores
+no credentials. Login status details can be a board screen or a user-opened
+transient popup. `[l]` opens that harness's own dedicated login flow (for
+example `claude` then `/login`, or `codex login`) in a normal terminal; a
+session-modal popup should not own a long login.
 
 ```text
 +-----------------------------------------------------------------------+
-| HOP / accounts                         Pool: claude-personal           |
+| HOP / login status                                                    |
 +-----------------------------------------------------------------------+
-| ACCOUNT       STATE            ACTIVE SESSIONS    NEXT ASSIGNMENT      |
-| claude-a      ready            1                  next eligible        |
-| claude-b      cooldown         0                  waiting              |
-| claude-c      login required   0                  unavailable          |
+| HARNESS       PROFILE              LOGIN STATE                        |
+| claude        default              logged in                          |
+| codex         default              logged in                          |
+| opencode      alt: ~/.hop/op-b     login required                     |
 |                                                                       |
-| Policy: round-robin for new sessions                                  |
-| Existing sessions retain their assigned accounts.                    |
-| Quota details: unavailable                                            |
+| HOP performs no logins and stores no credentials; it only reports     |
+| each harness's own status. Login opens that harness's normal flow.   |
 |                                                                       |
-| [Enter] details  [l] login  [Esc] back                                 |
+| [Enter] details  [l] login  [Esc] back                                |
 +-----------------------------------------------------------------------+
 ```
 
-Display provider-reported cooldown deadlines only when known. Do not imply HOP
-has precise quota balances or infer them from agent status. A running account
-binding is shown on task/session details; changing pool membership applies to
-future assignments. Account labels are non-secret and user-defined.
+Report only what the harness itself reports (logged in / login required /
+unknown); HOP does not track quota, cooldowns or organization/project
+membership. The PROFILE column shows `default` or the configured
+alternate-profile directory; HOP only passes that profile's variables through
+and never bootstraps or verifies its contents beyond this status report.
+Multi-account pools and round-robin assignment are a later, optional phase —
+see [RESEARCH.md](../../RESEARCH.md).
 
 ## Layout and interaction rules
 

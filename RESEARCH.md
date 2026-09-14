@@ -25,7 +25,7 @@ No agents, proxy, or integration tests were launched for this research.
 | Inter-agent messaging | Keep and strengthen | Run-scoped durable inboxes, task IDs, acknowledgements, structured results, sender attribution. |
 | Playbooks | Keep and strengthen | Versioned files with explicit triggers, deterministic steps, blocking gates, retries and timeouts. |
 | Worktrees | Keep selectively | Isolate concurrent writers; allow readers to share a checkout; serialize integration. |
-| Profiles | Redesign | Native account login, named account pools, round-robin assignment and explicit session bindings. |
+| Profiles | Delegate to harnesses now; pools later | HOP performs no logins and stores no credentials; workers run in each harness's own default profile, with an optional configuration value pointing at a user-prepared alternate profile. Multi-account pools, round-robin assignment and cross-account resume are deferred to a later, optional phase. |
 | Watchdogs | Remove as a separate product concept | Manager handles judgment; a deterministic controller detects exits, deadlines and stalled progress. |
 | Integrations | Simplify | Existing CLIs/MCP first; executable adapters for missing behavior; small declarative configs where useful. |
 | Status and logs | Keep | CLI status, an optional terminal board, durable events, artifacts and recovery. |
@@ -186,13 +186,30 @@ a general workflow canvas. Record step inputs, exit code and artifacts. Tie chec
 to commit/tree hashes; invalidate approvals and checks when their inputs change.
 Only retry side effects with an idempotency key or known safe reconciliation.
 
-## Account management as the profile replacement
+## Account management: delegated to harnesses now, pools later
 
-Revised after user clarification: study CLIProxyAPI's account authentication and
-multi-account balancing, without integrating its model router or requiring a proxy.
-The target is a more transparent replacement for Scape profiles.
+Settled by the human on 2026-09-14, superseding the account-pool design
+below as the current plan: HOP delegates authentication to each harness
+(Claude Code, Codex, opencode). Workers run in the harness's own default
+profile. HOP performs no logins, stores no credentials and owns no keychain
+items. An optional configuration value may point at a user-prepared
+alternate profile directory; HOP only passes the harness's own profile
+variables through (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `HOME` plus the four
+`XDG_*_HOME` variables for opencode) and never bootstraps, seeds or verifies
+that profile beyond reporting the harness's own login status in
+`hop doctor`. See [native harness compatibility](docs/architecture/native-harness-compat.md)
+for the adopted policy and evidence, and [phases](docs/plan/phases.md) for
+where this lands in the build sequence.
 
-Proposed entities:
+Multi-account pools, round-robin assignment, leases and cross-account resume
+are deferred to a later, optional phase — kept below as a future option, not
+deleted. Users who need multiple accounts today run separate harness
+profiles, or a tool such as CLIProxyAPI, outside HOP. A second account, a
+one-time scratch login and the opencode provider choice discussed below are
+moot while HOP delegates authentication; they apply only if that later phase
+is built. The rest of this section is retained as research for that phase.
+
+### Proposed entities for a later pools phase
 
 - Account: stable ID, provider, human label, organization/project where applicable,
   credential location, health and reauthentication state.
@@ -201,13 +218,15 @@ Proposed entities:
 - Runtime profile: harness settings, tools and history isolation, independent of
   pool selection. Existing repository instructions still apply.
 
-Provide a common login/list/status/logout UX through provider adapters. Prefer the
-native harness login flow in an isolated profile where it reliably supports that;
-custom OAuth/token handling needs a demonstrated native-harness compatibility
-benefit. CLIProxyAPI tokens are not automatically interchangeable with native
-harness credentials. Confirm credential storage and refresh behavior per harness.
+A common login/list/status/logout UX through provider adapters, preferring the
+native harness login flow in an isolated profile where it reliably supports that,
+remains a proposal for that later phase, not current work. Custom OAuth/token
+handling would need a demonstrated native-harness compatibility benefit.
+CLIProxyAPI tokens are not automatically interchangeable with native harness
+credentials. Credential storage and refresh behavior per harness would need
+confirmation before that phase begins.
 
-### Concrete implementation lessons
+### Concrete implementation lessons (reference for a later pools phase)
 
 CLIProxyAPI separates provider authenticators from persistence through an
 [Authenticator interface](repos/CLIProxyAPI/sdk/auth/interfaces.go) and
@@ -220,7 +239,8 @@ promise that every native harness accepts the resulting credentials.
 The [round-robin selector](repos/CLIProxyAPI/sdk/cliproxy/auth/selector.go) filters
 eligible credentials, orders candidates by stable ID and selects the successor of
 the last selected account. Its cursor handles temporarily missing candidates and
-selection is protected by a mutex. Adapt those ideas to account assignment:
+selection is protected by a mutex. A later pools phase could adapt those ideas to
+account assignment:
 
 1. Resolve a provider-specific pool from repository/role configuration.
 2. Filter disabled, authentication-failed, known cooling-down, incompatible and
@@ -229,32 +249,35 @@ selection is protected by a mutex. Adapt those ideas to account assignment:
 4. Launch the native harness with that account's isolated configuration.
 5. Keep the account bound for the session; release its lease when the attempt ends.
 
-Use database transactions across concurrent controller processes; a process-local
-mutex is insufficient for our persistent multi-run assignment. Treat account labels
-as presentation, not identity. Respect explicit organization/project separation.
-Nominal round-robin spreads session counts, not necessarily tokens or compute.
+That phase would need database transactions across concurrent controller
+processes; a process-local mutex is insufficient for persistent multi-run
+assignment. Treat account labels as presentation, not identity. Respect explicit
+organization/project separation. Nominal round-robin spreads session counts, not
+necessarily tokens or compute.
 
 ### Important distinction: sessions versus requests
 
 CLIProxyAPI balances credentials while executing model requests. Selecting a native
-harness profile distributes sessions instead. Session-level round-robin works
-without a proxy and fits the profile replacement well. It does not transparently
-switch an existing session's next request to another account.
+harness profile distributes sessions instead. Session-level round-robin would work
+without a proxy and fit a pools phase well. It would not transparently switch an
+existing session's next request to another account.
 
-Proposed MVP: round-robin new sessions within each provider pool and keep bindings
-stable. If an account hits a known limit, stop assigning new sessions to it and
-surface affected active workers. A checkpoint/relaunch with another account is a
-separate recovery operation whose transcript compatibility must be tested. Do not
-rewrite shared live credentials to force switching. Request-level rotation would
-need request interception or a harness-native mechanism and is outside this scope.
+Proposed MVP for that later phase: round-robin new sessions within each provider
+pool and keep bindings stable. If an account hits a known limit, stop assigning new
+sessions to it and surface affected active workers. A checkpoint/relaunch with
+another account is a separate recovery operation whose transcript compatibility
+must be tested. Do not rewrite shared live credentials to force switching.
+Request-level rotation would need request interception or a harness-native
+mechanism and would remain outside this scope.
 
-Start with Claude Code, Codex and opencode account bindings. Keep Gemini and Grok in the
-adapter scope, but validate their native login/profile isolation and quota signals
-before claiming parity. The proxy's provider support alone does not prove native
-CLI profile support. Let the native harness own token refresh wherever possible;
-otherwise serialize refresh and atomically persist credentials to avoid races.
+Such a phase would start with Claude Code, Codex and opencode account bindings.
+Keep Gemini and Grok in the adapter scope, but validate their native
+login/profile isolation and quota signals before claiming parity. The proxy's
+provider support alone does not prove native CLI profile support. Let the native
+harness own token refresh wherever possible; otherwise serialize refresh and
+atomically persist credentials to avoid races.
 
-Desired CLI (proposed):
+Desired CLI for that later phase (proposed, not current):
 
 ```text
 hop account login claude --name personal-a
@@ -265,10 +288,10 @@ hop run "Implement the change" --account-pool claude-personal
 hop account status
 ```
 
-Status should show worker, harness, account label, pool, selection reason, active
+Status would show worker, harness, account label, pool, selection reason, active
 leases and known cooldown/reauthentication state. Unknown quota remains unknown;
-do not infer precise balances from terminal readiness. Per-role pools support
-mixed-harness runs without mixing unrelated providers' credentials.
+do not infer precise balances from terminal readiness. Per-role pools would
+support mixed-harness runs without mixing unrelated providers' credentials.
 
 ## First vertical slice
 
@@ -276,7 +299,7 @@ Proposed CLI, not existing commands:
 
 ```text
 hop init
-hop account list
+hop doctor
 hop run "Implement the change" --playbook feature
 hop status
 hop attach implementer
@@ -287,13 +310,15 @@ hop stop <run-id>
 
 Build one workflow: brief → manager plan → implementer worktree → independent
 review → deterministic checks → ready for integration. Show tasks, agent state,
-blocking reason, assigned account and next action in one board. Keep integration serialized
+blocking reason, harness and next action in one board. Keep integration serialized
 and use the repository's configured publication/approval policy.
 
 Before expanding, prove: explicit completion versus idle; delivery interrupted by
 a crash; reconnect without event replay; controller restart with surviving workers;
 worktree setup failure preventing launch; failed/stale checks blocking completion;
-permission-dialog handling; simultaneous launches selecting accounts atomically;
-exhausted pools refusing new assignments; isolated native logins and token refresh;
-and recovery without silent account changes. Stop with two harness adapters, one
-workflow and session-level balancing until those pass.
+permission-dialog handling; harness login-status reporting through `hop doctor`;
+and recovery that does not silently launch a worker in the wrong profile. Stop
+with two harness adapters and one workflow until those pass. Multi-account
+pools and session-level balancing are a later, optional phase (see
+[above](#account-management-delegated-to-harnesses-now-pools-later)), not part
+of this slice.

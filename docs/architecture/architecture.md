@@ -20,9 +20,11 @@ IDs); see [internal/app/AGENTS.md](../../internal/app/AGENTS.md).
 
 HOP is one local application with several domain modules, not a set of services.
 Herdr provides agent terminals and runtime observations. HOP provides durable
-orchestration. Native harnesses make model requests using assigned accounts;
-HOP does not introduce a model router. Start with a foreground run controller;
-detached operation and a board remain adapters around the same use cases.
+orchestration. Native harnesses make model requests through their own
+authenticated profile — HOP delegates authentication to the harness, performs
+no logins and does not introduce a model router. Start with a foreground run
+controller; detached operation and a board remain adapters around the same
+use cases.
 
 ## Import direction
 
@@ -87,18 +89,20 @@ These paths and symbols are planned. Every row gains an AGENTS.md when implement
 | `internal/adapters/herdr` | Runtime/worktree operations and event normalization | `client.go`, `runtime.go`, `events.go` |
 | `internal/adapters/sqlite` | Repositories, transactions, durable operation journal | `store.go`, `transaction.go`, `migrations/` |
 | `internal/adapters/config` | Load repository policy, role and playbook files | `load.go`, `decode.go`; `LoadConfiguration` |
-| `internal/adapters/claude` | Claude native authentication/profile preparation | `login.go`, `profile.go`, `PrepareSession` |
-| `internal/adapters/codex` | Codex native authentication/profile preparation | `login.go`, `profile.go`, `PrepareSession` |
-| `internal/adapters/opencode` | opencode native authentication/profile preparation | `login.go`, `profile.go`, `PrepareSession` |
+| `internal/adapters/claude` | Claude login-status probe and profile env passthrough (default profile, or the configured alternate-profile pointer); no login, no credential storage | `status.go`, `profile.go`, `LoginStatus`, `ProfileEnv` |
+| `internal/adapters/codex` | Codex login-status probe and profile env passthrough (default profile, or the configured alternate-profile pointer); no login, no credential storage | `status.go`, `profile.go`, `LoginStatus`, `ProfileEnv` |
+| `internal/adapters/opencode` | opencode login-status probe and profile env passthrough (default profile, or the configured alternate-profile pointer); no login, no credential storage | `status.go`, `profile.go`, `LoginStatus`, `ProfileEnv` |
+| `internal/adapters/launch` | Sanitizing launcher applied at the harness exec boundary: strips provider credential variables by default, applies the resolved profile env, execs the harness | `launcher.go`, `Exec` |
 | `internal/adapters/process` | Execute deterministic playbook commands | `runner.go`, `RunCommand` |
 | `internal/adapters/system` | Concrete clock and ID generation | `clock.go`, `id.go` |
 | `internal` | Import and guide-coverage tests only | `arch_test.go`, `guides_test.go` |
 | `test/integration` | Explicit cross-adapter contract scenarios | Scenario files named by behavior |
 
-Optional later packages: `adapters/board`, `adapters/gemini`, `adapters/grok` and a
-credential-store adapter if native storage is insufficient. Authentication and
-profile preparation are initially one adapter per harness to avoid another layer
-of abstractions before compatibility is established.
+Optional later packages: `adapters/board`, `adapters/gemini`, `adapters/grok` and,
+only for the deferred multi-account-pools phase, a credential-store adapter — HOP
+stores no credentials before then. Login-status probing and profile env
+passthrough are initially one adapter per harness to avoid another layer of
+abstractions before compatibility is established.
 
 `app` is one Go package initially, with focused service types, not one controller
 object containing all behavior. Split only along proven use-case boundaries and
@@ -112,7 +116,8 @@ such as `internal/domain` or `internal/adapters`; those directories have index g
 | `StateStore` / `UnitOfWork` | SQLite | Typed repositories, atomic writes, optimistic revisions, operation journal |
 | `Runtime` | Herdr | Create worktree/session, prompt, inspect and normalize observations |
 | `AgentPresentation` | Herdr | Publish display metadata and select/clear native Agent views without changing domain state |
-| `HarnessProfiles` | Claude/Codex/opencode adapters | Login, inspect identity, prepare isolated launch configuration |
+| `HarnessProfiles` | Claude/Codex/opencode adapters | Report the harness's own login status and resolve its default or configured-pointer profile environment; passthrough only — no login, no credential storage |
+| `LaunchSanitizer` | Sanitizing launcher adapter (harness exec boundary) | Strip provider credential variables by default immediately before exec'ing the harness, with explicit opt-in passthrough per run or role; the only boundary that can unset an inherited variable, since Herdr's pane/workspace env map is additive-only |
 | `ConfigurationSource` | Config adapter | Decode and validate policy/role/playbook input into application values |
 | `CommandRunner` | Process adapter | Execute argv with explicit cwd/env, cancellation and structured result |
 | `Clock`, `IDGenerator` | System adapter | Explicit time and identity generation |
@@ -123,25 +128,33 @@ CLI parsing does not implement those rules. A future control socket is a driving
 adapter; its transport should not move business logic out of `app`.
 
 To launch a worker, `app` obtains a launch specification from `HarnessProfiles`
-and passes it to `Runtime`. The Claude/Codex adapter does not call the Herdr
-adapter. Wiring supplies a registry of profile ports keyed by supported harness.
-Herdr executes the specified harness with process-local configuration; model
-choice remains a harness option independent of account selection.
+— the harness's default profile, or the configured alternate-profile pointer,
+passed through unmodified — and hands it to `LaunchSanitizer` together with the
+credential variables to strip. `Runtime` (Herdr) launches the sanitizing
+launcher argv, never the harness binary directly, because Herdr's pane/workspace
+env map can only add variables, not remove inherited ones (see
+[launch environment](launch-environment.md)). The Claude/Codex/opencode
+adapters do not call the Herdr adapter and do not log in or store credentials.
+Wiring supplies a registry of profile ports keyed by supported harness. Model
+choice remains a harness option independent of profile selection.
 
 ## Atomicity, side effects and recovery
 
-Use one user-scoped SQLite store, partitioned by repository/run, so account pools
-can be shared across concurrent runs. Independent foreground controllers access
-the same store. A single-controller-per-run lease and fencing generation prevent
-stale controllers from committing new state. Lease expiry alone is not proof an
+Use one user-scoped SQLite store, partitioned by repository/run; this shape also
+accommodates the deferred account-pools phase sharing pools across concurrent
+runs without a schema change. Independent foreground controllers access the same
+store. A single-controller-per-run lease and fencing generation prevent stale
+controllers from committing new state. Lease expiry alone is not proof an
 external agent exited; reconcile its observed identity before reclaiming capacity.
 
 The application opens short units of work through ports, calls pure domain
 transitions, and persists state with its operation/event records atomically.
 External calls never happen inside database transactions. Cross-module atomic
-updates are explicitly allowed for assignment: task claim, account capacity,
-pool cursor, account lease, session reservation and launch intent commit together.
-This is a local modular monolith, not a distributed transaction between services.
+updates are explicitly allowed for assignment: task claim, session reservation
+and launch intent commit together now; account capacity, pool cursor and
+account lease join that same transaction only if the deferred account-pools
+phase is built. This is a local modular monolith, not a distributed transaction
+between services.
 
 After committing intent, the application performs the external operation and then
 records the observed outcome. An ambiguous launch remains `reconciling`; it is not
@@ -149,11 +162,12 @@ blindly repeated. Keep operation IDs, stable HOP session IDs and external runtim
 bindings. Herdr does not promise idempotent launch by operation ID, so inspect
 runtime state and escalate unresolved ambiguity before creating another worker.
 
-Account selection considers all pool memberships when enforcing an account's
-capacity. Record the round-robin cursor and reservation in the same transaction;
-a mutex inside one controller cannot serialize other controllers. A failed launch
-releases its lease only after absence/termination is established. A native process
-with uncertain status continues consuming capacity until reconciled.
+For the deferred account-pools phase: account selection would consider all pool
+memberships when enforcing an account's capacity, recording the round-robin
+cursor and reservation in the same transaction, since a mutex inside one
+controller cannot serialize other controllers. A failed launch would release
+its lease only after absence/termination is established, and a native process
+with uncertain status would continue consuming capacity until reconciled.
 
 Durable state is ordinary current-state storage plus an operation/message journal,
 not full event sourcing. Domain events describe successful facts after commit;
@@ -168,7 +182,8 @@ only trigger for required work; the controller consumes durable pending operatio
    checker and package-guide checks before feature code.
 3. Implement the smallest domain slice and table-driven transition tests.
 4. Implement atomic SQLite reservations and recovery tests with fake runtime ports.
-5. Connect Herdr and native account adapters; validate one complete workflow.
+5. Connect Herdr and the native harness login-status/profile adapters; validate
+   one complete workflow.
 
 The module path (`github.com/johnlanda/hop`), the Go toolchain (1.27.1) and the
 linter (golangci-lint v2.13.2) are fixed by the Phase 0 bootstrap. The SQLite
