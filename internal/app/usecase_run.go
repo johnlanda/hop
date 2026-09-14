@@ -335,19 +335,20 @@ func (c *Controller) openWorkerPane(ctx context.Context, handle RunHandle, ids g
 		}
 	}
 
-	return c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+	outcomeErr := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 		op, getErr := uow.Operations().Get(ctx, opID)
 		if getErr != nil {
 			return getErr
 		}
 		op.UpdatedAt = c.Clock.Now()
 		if actErr != nil {
+			// A commit here must succeed even though the pane.open act
+			// itself failed: recording "reconciling" as the outcome is the
+			// whole point, so the closure returns nil (a successful save)
+			// and actErr is surfaced to the caller below, after commit.
 			op.State = OperationReconciling
 			op.Outcome = actErr.Error()
-			if saveErr := uow.Operations().Save(ctx, op); saveErr != nil {
-				return saveErr
-			}
-			return fmt.Errorf("app: pane.open: %w (operation %s is reconciling)", actErr, opID)
+			return uow.Operations().Save(ctx, op)
 		}
 		binding := run.NewRuntimeBinding(ids.Session, ids.Incarnation, "", paneHandle.WorkspaceID, paneHandle.TabID, paneHandle.PaneID, opID.String(), run.LaunchInitial, op.UpdatedAt)
 		if bindErr := uow.Bindings().Create(ctx, binding); bindErr != nil {
@@ -357,6 +358,13 @@ func (c *Controller) openWorkerPane(ctx context.Context, handle RunHandle, ids g
 		op.ActEvidence = paneHandle
 		return uow.Operations().Save(ctx, op)
 	})
+	if outcomeErr != nil {
+		return fmt.Errorf("app: record pane.open outcome: %w", outcomeErr)
+	}
+	if actErr != nil {
+		return fmt.Errorf("app: pane.open: %w (operation %s is reconciling)", actErr, opID)
+	}
+	return nil
 }
 
 // applyLaunchIntent commits the launch-intent transitions shared by a first
