@@ -2,12 +2,42 @@ package app_test
 
 import (
 	"context"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/johnlanda/hop/internal/app"
 	"github.com/johnlanda/hop/internal/domain/identity"
 	"github.com/johnlanda/hop/internal/domain/run"
 )
+
+// plainReadStore implements exactly app.ReadStore over an inner
+// *fakeStore, deliberately NOT forwarding app.WorkflowReadStore (no
+// embedding, so no method promotion): a read store that predates Phase 3
+// feature-mode support, for proving ShowMessage's fail-closed contract —
+// the identical treatment plainStore/plainUnitOfWork (usecase_schedule_
+// test.go) already give app.WorkflowRepositories.
+type plainReadStore struct{ inner *fakeStore }
+
+func (p plainReadStore) ListRuns(ctx context.Context, repositoryRoot string) ([]app.RunStatus, error) {
+	return p.inner.ListRuns(ctx, repositoryRoot)
+}
+
+func (p plainReadStore) LoadRunStatus(ctx context.Context, runID identity.RunID) (app.RunDetail, error) {
+	return p.inner.LoadRunStatus(ctx, runID)
+}
+
+func (p plainReadStore) LoadFrozenRun(ctx context.Context, runID identity.RunID) (app.FrozenRun, error) {
+	return p.inner.LoadFrozenRun(ctx, runID)
+}
+
+func (p plainReadStore) LoadLaunchContext(ctx context.Context, runID identity.RunID, attempt identity.AttemptID) (app.LaunchContext, error) {
+	return p.inner.LoadLaunchContext(ctx, runID, attempt)
+}
+
+func (p plainReadStore) LoadCheckExecutionContext(ctx context.Context, op identity.OperationID) (app.CheckExecutionContext, error) {
+	return p.inner.LoadCheckExecutionContext(ctx, op)
+}
 
 // seedWorkerSession assigns taskID via the scheduler (proving the fixture
 // through code already tested, rather than hand-rolling attempt/session
@@ -301,6 +331,151 @@ func TestAckMessageRequiresOwnDelivery(t *testing.T) {
 	if ack.Outcome != string(app.AckDuplicate) {
 		t.Fatalf("repeat AckMessage() = %+v, want duplicate", ack)
 	}
+}
+
+func TestShowMessage(t *testing.T) {
+	t.Run("renders the envelope plus full delivery/ack history", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		fr := seedFeatureRun(t, tc, 2)
+		taskB := seedImplementTask(t, tc, fr.RunID, 1, "B", false, run.TaskReady)
+		workerID, workerIncarnation := seedWorkerSession(t, tc, fr, taskB)
+		ctx := context.Background()
+
+		send, err := tc.Controller.SendMessage(ctx, app.SendMessageRequest{
+			RunID: fr.RunID.String(), SessionID: workerID.String(), IncarnationID: workerIncarnation.String(),
+			StateRoot: "/state", To: "manager", Kind: "question", Body: []byte("q?"),
+		})
+		if err != nil {
+			t.Fatalf("SendMessage() error = %v", err)
+		}
+
+		// A first fetch, then a re-serve (both re-servable while
+		// unacknowledged): two delivery rows for the one message.
+		if _, fetchErr := tc.Controller.FetchMessage(ctx, app.FetchMessageRequest{
+			RunID: fr.RunID.String(), SessionID: fr.ManagerID.String(), IncarnationID: fr.ManagerIncarnation.String(),
+		}); fetchErr != nil {
+			t.Fatalf("FetchMessage() 1st error = %v", fetchErr)
+		}
+		tc.Clock.Advance(5 * time.Second)
+		if _, fetchErr := tc.Controller.FetchMessage(ctx, app.FetchMessageRequest{
+			RunID: fr.RunID.String(), SessionID: fr.ManagerID.String(), IncarnationID: fr.ManagerIncarnation.String(),
+		}); fetchErr != nil {
+			t.Fatalf("FetchMessage() re-serve error = %v", fetchErr)
+		}
+
+		show, err := tc.Controller.ShowMessage(ctx, app.ShowMessageRequest{RunID: fr.RunID.String(), MessageID: send.MessageID})
+		if err != nil {
+			t.Fatalf("ShowMessage() error = %v", err)
+		}
+		if !show.Found || show.MessageID != send.MessageID || show.Kind != "question" {
+			t.Fatalf("ShowMessage() = %+v, want the found envelope", show)
+		}
+		if show.SenderKind != "session" || show.SenderSession != workerID.String() {
+			t.Fatalf("ShowMessage().Sender = %s/%s, want session/%s", show.SenderKind, show.SenderSession, workerID)
+		}
+		if show.Recipient != "manager" {
+			t.Fatalf("ShowMessage().Recipient = %s, want manager", show.Recipient)
+		}
+		if len(show.Deliveries) != 2 {
+			t.Fatalf("ShowMessage().Deliveries = %+v, want two (fetch + re-serve)", show.Deliveries)
+		}
+		if show.Acknowledged {
+			t.Fatalf("ShowMessage().Acknowledged = true before any ack")
+		}
+
+		if _, ackErr := tc.Controller.AckMessage(ctx, app.AckMessageRequest{
+			RunID: fr.RunID.String(), MessageID: send.MessageID, SessionID: fr.ManagerID.String(), IncarnationID: fr.ManagerIncarnation.String(),
+		}); ackErr != nil {
+			t.Fatalf("AckMessage() error = %v", ackErr)
+		}
+		show, err = tc.Controller.ShowMessage(ctx, app.ShowMessageRequest{RunID: fr.RunID.String(), MessageID: send.MessageID})
+		if err != nil {
+			t.Fatalf("ShowMessage() after ack error = %v", err)
+		}
+		if !show.Acknowledged || show.AcknowledgedAt.IsZero() {
+			t.Fatalf("ShowMessage() after ack = %+v, want an acknowledged time", show)
+		}
+	})
+
+	t.Run("writes, delivers and acks nothing", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		fr := seedFeatureRun(t, tc, 2)
+		taskB := seedImplementTask(t, tc, fr.RunID, 1, "B", false, run.TaskReady)
+		workerID, workerIncarnation := seedWorkerSession(t, tc, fr, taskB)
+		ctx := context.Background()
+
+		send, err := tc.Controller.SendMessage(ctx, app.SendMessageRequest{
+			RunID: fr.RunID.String(), SessionID: workerID.String(), IncarnationID: workerIncarnation.String(),
+			StateRoot: "/state", To: "manager", Kind: "question", Body: []byte("q?"),
+		})
+		if err != nil {
+			t.Fatalf("SendMessage() error = %v", err)
+		}
+		before := len(tc.Store.MessageDeliveries[identity.MessageID(send.MessageID)])
+
+		if _, err := tc.Controller.ShowMessage(ctx, app.ShowMessageRequest{RunID: fr.RunID.String(), MessageID: send.MessageID}); err != nil {
+			t.Fatalf("ShowMessage() error = %v", err)
+		}
+		if _, err := tc.Controller.ShowMessage(ctx, app.ShowMessageRequest{RunID: fr.RunID.String(), MessageID: send.MessageID}); err != nil {
+			t.Fatalf("ShowMessage() 2nd error = %v", err)
+		}
+
+		after := len(tc.Store.MessageDeliveries[identity.MessageID(send.MessageID)])
+		if after != before {
+			t.Fatalf("ShowMessage() must never deliver: deliveries before=%d after=%d", before, after)
+		}
+		if _, acked := tc.Store.MessageAcks[identity.MessageID(send.MessageID)]; acked {
+			t.Fatalf("ShowMessage() must never ack")
+		}
+	})
+
+	t.Run("an unknown message id is refused not-found", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		fr := seedFeatureRun(t, tc, 2)
+
+		show, err := tc.Controller.ShowMessage(context.Background(), app.ShowMessageRequest{
+			RunID: fr.RunID.String(), MessageID: "00000000-0000-4000-8000-000000000000",
+		})
+		if err != nil {
+			t.Fatalf("ShowMessage() error = %v", err)
+		}
+		if show.Found {
+			t.Fatalf("ShowMessage() = %+v, want not found", show)
+		}
+	})
+
+	t.Run("a message from a different run is reported exactly like not-found", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		fr1 := seedFeatureRun(t, tc, 2)
+		fr2 := seedFeatureRun(t, tc, 2)
+		taskB := seedImplementTask(t, tc, fr1.RunID, 1, "B", false, run.TaskReady)
+		workerID, workerIncarnation := seedWorkerSession(t, tc, fr1, taskB)
+
+		send, err := tc.Controller.SendMessage(context.Background(), app.SendMessageRequest{
+			RunID: fr1.RunID.String(), SessionID: workerID.String(), IncarnationID: workerIncarnation.String(),
+			StateRoot: "/state", To: "manager", Kind: "question", Body: []byte("q?"),
+		})
+		if err != nil {
+			t.Fatalf("SendMessage() error = %v", err)
+		}
+
+		show, err := tc.Controller.ShowMessage(context.Background(), app.ShowMessageRequest{RunID: fr2.RunID.String(), MessageID: send.MessageID})
+		if err != nil {
+			t.Fatalf("ShowMessage() error = %v", err)
+		}
+		if show.Found {
+			t.Fatalf("ShowMessage() across runs = %+v, want not found", show)
+		}
+	})
+
+	t.Run("without a workflow-capable read store it fails closed", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		legacy := *tc.Controller
+		legacy.Read = plainReadStore{inner: tc.Store}
+		if _, err := legacy.ShowMessage(context.Background(), app.ShowMessageRequest{RunID: "r", MessageID: "m"}); !errors.Is(err, app.ErrWorkflowReadStoreUnsupported) {
+			t.Fatalf("ShowMessage() over a plain ReadStore error = %v, want ErrWorkflowReadStoreUnsupported", err)
+		}
+	})
 }
 
 func TestFetchMessageEmptyQueueCommitsNothing(t *testing.T) {

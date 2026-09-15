@@ -2,8 +2,10 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
+	"time"
 
 	"github.com/johnlanda/hop/internal/domain/identity"
 	"github.com/johnlanda/hop/internal/domain/run"
@@ -313,6 +315,94 @@ func (c *Controller) Answer(ctx context.Context, req AnswerRequest) (AnswerResul
 		return AnswerResult{}, fmt.Errorf("app: answer question: %w", err)
 	}
 	return AnswerResult{Outcome: string(outcome.Kind), MessageID: outcome.MessageID.String(), Detail: outcome.Detail}, nil
+}
+
+// ShowMessageRequest is `hop msg show`'s driving input: a read-only,
+// same-run envelope lookup callable by any of the run's sessions, or the
+// human controller-machine context — section 7's grammar table validates
+// no caller identity for this verb, so unlike every other message verb no
+// HOP_* identity is parsed or checked here.
+type ShowMessageRequest struct {
+	RunID     string
+	MessageID string
+}
+
+// ShowMessageDelivery is one delivery line ShowMessage renders: the
+// grammar's `delivered: <session> <time>`.
+type ShowMessageDelivery struct {
+	SessionID string
+	At        time.Time
+}
+
+// ShowMessageResult is ShowMessage's outcome. Found is false when no such
+// message exists in the run (the grammar's `refused: not-found`); every
+// other field is meaningful only when Found is true. SenderSession is set
+// only when SenderKind is "session". Acknowledged names the single ack,
+// when one exists.
+type ShowMessageResult struct {
+	Found          bool
+	MessageID      string
+	Kind           string
+	SenderKind     string
+	SenderSession  string
+	Recipient      string
+	ReplyTo        string
+	RelayOf        string
+	Seq            int
+	BodyPath       string
+	Deliveries     []ShowMessageDelivery
+	Acknowledged   bool
+	AcknowledgedAt time.Time
+}
+
+// ShowMessage is `hop msg show`'s driving use case:
+// WorkflowReadStore.LoadMessageDetail is the entire lookup — read-only, no
+// lease, no caller-identity validation, and it never delivers, acks or
+// writes anything (section 7).
+func (c *Controller) ShowMessage(ctx context.Context, req ShowMessageRequest) (ShowMessageResult, error) {
+	wf, err := RequireWorkflowReadStore(c.Read, "ShowMessage")
+	if err != nil {
+		return ShowMessageResult{}, err
+	}
+	runID, err := identity.ParseRunID(req.RunID)
+	if err != nil {
+		return ShowMessageResult{}, fmt.Errorf("app: parse run id: %w", err)
+	}
+	messageID, err := identity.ParseMessageID(req.MessageID)
+	if err != nil {
+		return ShowMessageResult{}, fmt.Errorf("app: parse message id: %w", err)
+	}
+
+	detail, err := wf.LoadMessageDetail(ctx, runID, messageID)
+	if errors.Is(err, ErrNotFound) {
+		return ShowMessageResult{}, nil
+	}
+	if err != nil {
+		return ShowMessageResult{}, fmt.Errorf("app: load message detail: %w", err)
+	}
+
+	result := ShowMessageResult{
+		Found: true, MessageID: detail.Message.ID.String(), Kind: string(detail.Message.Kind),
+		SenderKind: string(detail.Message.Sender.Kind), Recipient: AddressString(detail.Message.Recipient),
+		Seq: detail.Message.EnqueueSeq, BodyPath: detail.Message.BodyPath,
+	}
+	if detail.Message.Sender.Kind == run.PrincipalSession {
+		result.SenderSession = detail.Message.Sender.SessionID.String()
+	}
+	if detail.Message.ReplyTo != nil {
+		result.ReplyTo = detail.Message.ReplyTo.String()
+	}
+	if detail.Message.RelayedFrom != nil {
+		result.RelayOf = detail.Message.RelayedFrom.String()
+	}
+	for _, d := range detail.Deliveries {
+		result.Deliveries = append(result.Deliveries, ShowMessageDelivery{SessionID: d.SessionID.String(), At: d.At})
+	}
+	if detail.Ack != nil {
+		result.Acknowledged = true
+		result.AcknowledgedAt = detail.Ack.At
+	}
+	return result, nil
 }
 
 // messageBodyPath is the deterministic artifact path for one message or

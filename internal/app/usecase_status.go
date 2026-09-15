@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/johnlanda/hop/internal/domain/identity"
+	"github.com/johnlanda/hop/internal/domain/run"
 )
 
 // StatusRequest is hop status's input. An empty RunID lists every run of
@@ -26,6 +27,62 @@ type RunSummaryView struct {
 	StopRequested bool
 	Reconciling   bool
 	UpdatedAt     time.Time
+	// NeedsAttention is section 7's "blocked, needs attention" condition:
+	// true when at least one of the run's mailboxes is Attention. Populated
+	// only by the `-run` detail render (runDetailView derives it from
+	// Mailboxes); the bare listing (Status with no RunID) has no per-
+	// address message data to compute it from and always leaves it false,
+	// like every other field the underlying store has not populated yet.
+	NeedsAttention bool
+}
+
+// TaskSummaryView is one row of RunDetailView's feature-mode task table.
+type TaskSummaryView struct {
+	TaskID       string
+	Seq          int
+	Kind         string
+	State        string
+	DependsOn    []string
+	AttemptCount int
+	WorktreePath string
+}
+
+// IntegrationView is the run's most recently created integration, if any.
+type IntegrationView struct {
+	ID              string
+	TaskID          string
+	SourceCommitOID string
+	PremergeHeadOID string
+	MergeCommitOID  string
+	State           string
+}
+
+// GuardShortfallView is one unmet completion guard, rendered verbatim from
+// EvaluateReadiness's missing list. TaskID is "" except for
+// "task-not-integrated".
+type GuardShortfallView struct {
+	Kind   string
+	TaskID string
+}
+
+// MailboxView is one recipient address's queue condition: section 7's
+// attention status surface. InFlightMessageID is "" when nothing is
+// currently delivered-unacknowledged.
+type MailboxView struct {
+	Address           string // AddressString's canonical form: "manager", "human" or "task:<uuid>"
+	InFlightMessageID string
+	InFlightAge       time.Duration
+	QueuedCount       int
+	OldestQueuedAge   time.Duration
+	AddressLive       bool
+	Attention         bool
+}
+
+// PendingQuestionView is one unanswered human-addressed question.
+type PendingQuestionView struct {
+	MessageID string
+	BodyPath  string
+	Age       time.Duration
 }
 
 // RunDetailView is the full detail block `hop status -run` renders. Every
@@ -51,6 +108,23 @@ type RunDetailView struct {
 	// (docs/plan/phase-2-design.md sections 7-8): rerun after inspection is
 	// a human decision, never an automatic one.
 	LastCheckOptions string
+
+	// Tasks is the feature-mode task table (section 3); nil for a solo run.
+	Tasks []TaskSummaryView
+	// LatestIntegration is the run's most recently created integration, if
+	// any; nil for a solo run or a feature run with no integration
+	// attempted yet.
+	LatestIntegration *IntegrationView
+	// GuardShortfalls is EvaluateReadiness's missing list, rendered
+	// verbatim; always empty for a solo run.
+	GuardShortfalls []GuardShortfallView
+	// Mailboxes is section 7's per-address queue-depth/in-flight-age
+	// status surface: one entry per address with a non-empty queue or an
+	// unacknowledged in-flight message.
+	Mailboxes []MailboxView
+	// PendingQuestions is every unanswered human-addressed question,
+	// oldest first.
+	PendingQuestions []PendingQuestionView
 }
 
 // StatusResult is Status's success value: exactly one of Runs (the -run-less
@@ -122,6 +196,49 @@ func runDetailView(d RunDetail) RunDetailView { //nolint:gocritic // hugeParam: 
 	}
 	for _, a := range d.Artifacts {
 		view.Artifacts = append(view.Artifacts, a.Path)
+	}
+	for _, t := range d.Tasks {
+		dependsOn := make([]string, len(t.DependsOn))
+		for i, dep := range t.DependsOn {
+			dependsOn[i] = dep.String()
+		}
+		view.Tasks = append(view.Tasks, TaskSummaryView{
+			TaskID: t.TaskID.String(), Seq: t.Seq, Kind: string(t.Kind), State: string(t.State),
+			DependsOn: dependsOn, AttemptCount: t.AttemptCount, WorktreePath: t.WorktreePath,
+		})
+	}
+	if d.LatestIntegration != nil {
+		view.LatestIntegration = &IntegrationView{
+			ID: d.LatestIntegration.ID.String(), TaskID: d.LatestIntegration.TaskID.String(),
+			SourceCommitOID: d.LatestIntegration.SourceCommitOID, PremergeHeadOID: d.LatestIntegration.PremergeHeadOID,
+			MergeCommitOID: d.LatestIntegration.MergeCommitOID, State: string(d.LatestIntegration.State),
+		}
+	}
+	for _, s := range d.GuardShortfalls {
+		gv := GuardShortfallView{Kind: string(s.Kind)}
+		if s.Kind == run.ShortfallTaskNotIntegrated {
+			gv.TaskID = s.TaskID.String()
+		}
+		view.GuardShortfalls = append(view.GuardShortfalls, gv)
+	}
+	for _, m := range d.Mailboxes {
+		mv := MailboxView{
+			Address: AddressString(m.Address), QueuedCount: m.QueuedCount, OldestQueuedAge: m.OldestQueuedAge,
+			AddressLive: m.AddressLive, Attention: m.Attention,
+		}
+		if m.InFlight != nil {
+			mv.InFlightMessageID = m.InFlight.MessageID.String()
+			mv.InFlightAge = m.InFlight.Age
+		}
+		view.Mailboxes = append(view.Mailboxes, mv)
+		if m.Attention {
+			view.NeedsAttention = true
+		}
+	}
+	for _, q := range d.PendingQuestions {
+		view.PendingQuestions = append(view.PendingQuestions, PendingQuestionView{
+			MessageID: q.MessageID.String(), BodyPath: q.BodyPath, Age: q.Age,
+		})
 	}
 	return view
 }

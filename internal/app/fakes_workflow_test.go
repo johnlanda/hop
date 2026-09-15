@@ -1037,6 +1037,267 @@ func (s *fakeStore) LoadMessagingContext(_ context.Context, session identity.Ses
 	return out, nil
 }
 
+func (s *fakeStore) LoadMessageDetail(_ context.Context, runID identity.RunID, messageID identity.MessageID) (app.MessageDetail, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	msg, ok := s.Messages[messageID]
+	if !ok || msg.RunID != runID {
+		return app.MessageDetail{}, fmt.Errorf("%w: message %s", app.ErrNotFound, messageID)
+	}
+	detail := app.MessageDetail{Message: s.reconstructMessageStateLocked(msg)}
+	detail.Deliveries = append(detail.Deliveries, s.MessageDeliveries[messageID]...)
+	if ack, ok := s.MessageAcks[messageID]; ok {
+		a := ack
+		detail.Ack = &a
+	}
+	return detail, nil
+}
+
+// --- fakeStore: RunDetail's Phase 3 status-surface assembly (section 3/7) ---
+
+// tasksSummaryLocked returns runID's feature-mode task table, unsorted;
+// callers sort as their rendering requires. WorktreePath is always "":
+// Worktree (internal/domain/run) is still the Phase 2 one-row-per-run
+// shape (no attempt linkage), so a per-attempt worktree path is not yet
+// resolvable from any repository this slice owns — recorded as a known
+// gap for whichever later slice adds attempt-linked worktree tracking.
+// Callers hold s.mu.
+func (s *fakeStore) tasksSummaryLocked(runID identity.RunID) []app.TaskSummary {
+	var out []app.TaskSummary
+	for id, row := range s.Tasks {
+		if row.value.RunID != runID {
+			continue
+		}
+		summary := app.TaskSummary{TaskID: id, Seq: row.value.Seq, Kind: row.value.Kind, State: row.value.State}
+		for _, dep := range s.TaskDependencies {
+			if dep.TaskID == id {
+				summary.DependsOn = append(summary.DependsOn, dep.PrerequisiteID)
+			}
+		}
+		for _, a := range s.Attempts {
+			if a.value.TaskID == id {
+				summary.AttemptCount++
+			}
+		}
+		out = append(out, summary)
+	}
+	return out
+}
+
+// latestIntegrationLocked returns runID's most recently CREATED
+// integration row, if any — "the integration head" hop status renders
+// (section 3); reading exactly what is recorded, never resolving the live
+// git ref (2b's integration-operations concern). Callers hold s.mu.
+func (s *fakeStore) latestIntegrationLocked(runID identity.RunID) (run.Integration, bool) {
+	var latest *run.Integration
+	for _, row := range s.Integrations {
+		if row.value.RunID != runID {
+			continue
+		}
+		if latest == nil || row.value.CreatedAt.After(latest.CreatedAt) {
+			v := row.value
+			latest = &v
+		}
+	}
+	if latest == nil {
+		return run.Integration{}, false
+	}
+	return *latest, true
+}
+
+// guardShortfallsLocked assembles a GuardContext from exactly the evidence
+// this fake tracks and evaluates it against EvaluateReadiness: PlanClosed
+// and every implement task are real; the head object IDs come from the
+// most recently INTEGRATED integration row (a conflicted, checking or
+// merging one has not moved the branch) — both HeadCommitOID and
+// HeadTreeOID collapse to the same MergeCommitOID, since Integration
+// carries no separate tree object id and none of this fake's tests need
+// that distinction; LatestCheck is always nil, since no Phase "2a" port
+// tracks a combined-candidate check receipt yet — so ShortfallCheckMissing
+// is reported whenever a head exists, honestly reflecting that no such
+// evidence has been recorded rather than guessing one way or the other.
+// Returns nil for a solo run, matching RunDetail.GuardShortfalls' doc.
+// Callers hold s.mu.
+func (s *fakeStore) guardShortfallsLocked(runID identity.RunID) []run.GuardShortfall {
+	if !s.Snapshots[runID].Workflow.Feature() {
+		return nil
+	}
+	rRow, ok := s.Runs[runID]
+	if !ok {
+		return nil
+	}
+	var implement []run.Task
+	for _, row := range s.Tasks {
+		if row.value.RunID == runID && row.value.Kind == run.TaskKindImplement {
+			implement = append(implement, row.value)
+		}
+	}
+	ctx := run.GuardContext{PlanClosed: rRow.value.PlanClosed, ImplementTasks: implement}
+
+	var latestIntegrated *run.Integration
+	for _, row := range s.Integrations {
+		if row.value.RunID != runID || row.value.State != run.IntegrationIntegrated {
+			continue
+		}
+		if latestIntegrated == nil || row.value.UpdatedAt.After(latestIntegrated.UpdatedAt) {
+			v := row.value
+			latestIntegrated = &v
+		}
+	}
+	if latestIntegrated != nil {
+		ctx.HeadCommitOID = latestIntegrated.MergeCommitOID
+		ctx.HeadTreeOID = latestIntegrated.MergeCommitOID
+	}
+
+	var latestReview *run.Review
+	for _, r := range s.Reviews { //nolint:gocritic // rangeValCopy: test fake; the domain snapshot is small and read-only here.
+		if r.RunID != runID {
+			continue
+		}
+		if latestReview == nil || r.SubmittedAt.After(latestReview.SubmittedAt) {
+			v := r
+			latestReview = &v
+		}
+	}
+	ctx.LatestReview = latestReview
+
+	_, missing := run.EvaluateReadiness(ctx)
+	return missing
+}
+
+// addressLiveLocked reports whether address's own session is currently
+// non-terminal: the run's current manager session for AddressManager, the
+// address's task's most recent attempt's current session for AddressTask,
+// and always true for AddressHuman (no session to go stale) — section 7's
+// "address's session is live" qualifier on the attention condition.
+// Callers hold s.mu.
+func (s *fakeStore) addressLiveLocked(runID identity.RunID, address run.Address) bool {
+	switch address.Kind {
+	case run.AddressHuman:
+		return true
+	case run.AddressManager:
+		for _, row := range s.Sessions {
+			if row.value.RunID == runID && row.value.Role == run.RoleManager &&
+				row.value.State != run.SessionTerminated && row.value.State != run.SessionLost {
+				return true
+			}
+		}
+		return false
+	case run.AddressTask:
+		var latest *run.Attempt
+		for _, row := range s.Attempts {
+			if row.value.TaskID != address.TaskID {
+				continue
+			}
+			if latest == nil || row.value.Number > latest.Number {
+				v := row.value
+				latest = &v
+			}
+		}
+		if latest == nil {
+			return false
+		}
+		for _, row := range s.Sessions {
+			if row.value.AttemptID == latest.ID &&
+				row.value.State != run.SessionTerminated && row.value.State != run.SessionLost {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+// mailboxesLocked assembles section 7's per-address status surface: one
+// entry per address holding a non-empty queue or an unacknowledged
+// in-flight message, ages computed against now. Attention is gated on the
+// run's frozen [messages] attention_after threshold (a solo run's zero
+// WorkflowSnapshot has a zero threshold, so Attention is always false) and
+// on the single oldest pending item at that address, whichever of the
+// in-flight age or the oldest queued age is larger. Callers hold s.mu.
+func (s *fakeStore) mailboxesLocked(runID identity.RunID, now time.Time) []app.MailboxStatus {
+	byAddress := map[string][]run.Message{}
+	addressOf := map[string]run.Address{}
+	var order []string
+	for _, m := range s.Messages { //nolint:gocritic // rangeValCopy: test fake; the domain snapshot is small and read-only here.
+		if m.RunID != runID {
+			continue
+		}
+		key := app.AddressString(m.Recipient)
+		if _, seen := addressOf[key]; !seen {
+			order = append(order, key)
+			addressOf[key] = m.Recipient
+		}
+		byAddress[key] = append(byAddress[key], s.reconstructMessageStateLocked(m))
+	}
+	sort.Strings(order)
+	threshold := s.Snapshots[runID].Workflow.MessageAttention
+
+	var out []app.MailboxStatus
+	for _, key := range order {
+		address := addressOf[key]
+		status := app.MailboxStatus{Address: address, AddressLive: s.addressLiveLocked(runID, address)}
+		var oldestQueued time.Time
+		for _, m := range byAddress[key] { //nolint:gocritic // rangeValCopy: test fake; the domain snapshot is small and read-only here.
+			switch m.State {
+			case run.MessageDelivered:
+				deliveries := s.MessageDeliveries[m.ID]
+				if len(deliveries) == 0 {
+					continue
+				}
+				latest := deliveries[0].At
+				for _, d := range deliveries[1:] {
+					if d.At.After(latest) {
+						latest = d.At
+					}
+				}
+				status.InFlight = &app.InFlightMessage{MessageID: m.ID, Age: now.Sub(latest)}
+			case run.MessageQueued:
+				status.QueuedCount++
+				if oldestQueued.IsZero() || m.CreatedAt.Before(oldestQueued) {
+					oldestQueued = m.CreatedAt
+				}
+			}
+		}
+		if status.InFlight == nil && status.QueuedCount == 0 {
+			continue
+		}
+		if status.QueuedCount > 0 {
+			status.OldestQueuedAge = now.Sub(oldestQueued)
+		}
+		pendingAge := status.OldestQueuedAge
+		if status.InFlight != nil && status.InFlight.Age > pendingAge {
+			pendingAge = status.InFlight.Age
+		}
+		status.Attention = status.AddressLive && threshold > 0 && pendingAge > threshold
+		out = append(out, status)
+	}
+	return out
+}
+
+// pendingQuestionsLocked returns every unanswered human-addressed
+// question for runID, oldest first. A human question's own ack is bundled
+// atomically into its answer's acceptance (AnswerQuestion above), so
+// s.MessageAcks alone decides "answered". Callers hold s.mu.
+func (s *fakeStore) pendingQuestionsLocked(runID identity.RunID, now time.Time) []app.PendingQuestion {
+	var questions []run.Message
+	for _, m := range s.Messages { //nolint:gocritic // rangeValCopy: test fake; the domain snapshot is small and read-only here.
+		if m.RunID == runID && m.Recipient.Kind == run.AddressHuman && m.Kind == run.MessageQuestion {
+			questions = append(questions, m)
+		}
+	}
+	sort.Slice(questions, func(i, j int) bool { return questions[i].EnqueueSeq < questions[j].EnqueueSeq })
+	var out []app.PendingQuestion
+	for _, q := range questions { //nolint:gocritic // rangeValCopy: test fake; the domain snapshot is small and read-only here.
+		if _, answered := s.MessageAcks[q.ID]; answered {
+			continue
+		}
+		out = append(out, app.PendingQuestion{MessageID: q.ID, BodyPath: q.BodyPath, Age: now.Sub(q.CreatedAt)})
+	}
+	return out
+}
+
 // sendRequestDigest computes the section 7 request digest for a
 // hop msg send, normalizing an answer's payload (question uuid + body
 // digest) separately from an ordinary question/info send.

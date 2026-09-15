@@ -479,6 +479,18 @@ func (s *fakeStore) LoadRunStatus(_ context.Context, runID identity.RunID) (app.
 		last := s.Submissions[len(s.Submissions)-1]
 		detail.LastSubmission = &last
 	}
+
+	detail.Tasks = s.tasksSummaryLocked(runID)
+	if integration, ok := s.latestIntegrationLocked(runID); ok {
+		detail.LatestIntegration = &app.IntegrationSummary{
+			ID: integration.ID, TaskID: integration.TaskID, SourceCommitOID: integration.SourceCommitOID,
+			PremergeHeadOID: integration.PremergeHeadOID, MergeCommitOID: integration.MergeCommitOID, State: integration.State,
+		}
+	}
+	detail.GuardShortfalls = s.guardShortfallsLocked(runID)
+	detail.Mailboxes = s.mailboxesLocked(runID, s.clock.Now())
+	detail.PendingQuestions = s.pendingQuestionsLocked(runID, s.clock.Now())
+
 	return detail, nil
 }
 

@@ -112,6 +112,30 @@ type WorkflowReadStore interface {
 	// session resolves the same address as its predecessor) and current
 	// incarnation, for the message CLI verbs.
 	LoadMessagingContext(ctx context.Context, session identity.SessionID) (MessagingContext, error)
+	// LoadMessageDetail is `hop msg show`'s entire lookup: a message's
+	// immutable envelope plus its full delivery/ack history, addressed by
+	// run and message id alone — read-only, no lease, and callable by any
+	// of the run's sessions or the human controller-machine context
+	// (section 7's grammar table explicitly distinguishes this from the
+	// worker-authority MessageRepository.Get reachable only inside a
+	// controller transaction through WorkflowRepositories). A message
+	// belonging to a different run is reported exactly like one that does
+	// not exist — ErrNotFound wrapped with context — so this lookup can
+	// never leak envelope content across runs.
+	LoadMessageDetail(ctx context.Context, runID identity.RunID, messageID identity.MessageID) (MessageDetail, error)
+}
+
+// MessageDetail is LoadMessageDetail's result: a message's immutable
+// envelope plus its full delivery/ack history — the read-only `hop msg
+// show` recovery and audit surface (section 7's grammar table: one
+// `delivered: <session> <time>` line per entry in Deliveries, plus an
+// `acknowledged: <time>` line when Ack is non-nil). Deliveries are
+// ordered oldest first, re-serves included; Ack is nil until the message
+// is acknowledged.
+type MessageDetail struct {
+	Message    run.Message
+	Deliveries []run.Delivery
+	Ack        *run.Ack
 }
 
 // RequireWorkflowReadStore asserts that read also implements

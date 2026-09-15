@@ -22,6 +22,79 @@ type RunStatus struct {
 	UpdatedAt     time.Time
 }
 
+// TaskSummary is one row of RunDetail's feature-mode task table (section
+// 3's ReadStore extension): a task's identity, kind, state, dependency
+// edges and attempt count, for `hop status -run`. WorktreePath is the
+// task's current attempt's worktree, "" when none exists yet.
+type TaskSummary struct {
+	TaskID       identity.TaskID
+	Seq          int
+	Kind         run.TaskKind
+	State        run.TaskState
+	DependsOn    []identity.TaskID
+	AttemptCount int
+	WorktreePath string
+}
+
+// IntegrationSummary is one integration row `hop status` renders as "the
+// integration head" (section 3's ReadStore extension): which task and
+// result it merges, and its recorded object IDs and state. RunDetail
+// carries the run's most recently CREATED integration, if any — reading
+// exactly what is recorded; resolving what the live git ref currently
+// points to is 2b's integration-operations concern, not this read model's.
+type IntegrationSummary struct {
+	ID              identity.IntegrationID
+	TaskID          identity.TaskID
+	SourceCommitOID string
+	PremergeHeadOID string
+	MergeCommitOID  string
+	State           run.IntegrationState
+}
+
+// InFlightMessage is one delivered-but-unacknowledged message's identity
+// and age (time since its most recent delivery).
+type InFlightMessage struct {
+	MessageID identity.MessageID
+	Age       time.Duration
+}
+
+// MailboxStatus is one recipient address's queue condition: section 7's
+// "idle with pending deliveries" status surface. RunDetail carries one
+// entry per address with a non-empty queue or an unacknowledged in-flight
+// message — an idle, caught-up address has no entry at all. InFlight is
+// nil when nothing is currently delivered-unacknowledged; QueuedCount and
+// OldestQueuedAge describe messages never yet delivered (OldestQueuedAge
+// is the zero value when QueuedCount is 0).
+type MailboxStatus struct {
+	Address         run.Address
+	InFlight        *InFlightMessage
+	QueuedCount     int
+	OldestQueuedAge time.Duration
+	// AddressLive reports whether the address's own session is currently
+	// non-terminal: the run's current manager session for AddressManager,
+	// the address's task's current attempt's current session for
+	// AddressTask, and always true for AddressHuman (which has no session
+	// to go stale) — section 7's "address's session is live" qualifier on
+	// the attention condition.
+	AddressLive bool
+	// Attention is section 7's computed condition: AddressLive and the
+	// single oldest pending item at this address (the in-flight message's
+	// age, or the oldest queued age when nothing is in flight) exceeds the
+	// run's configured `[messages] attention_after` threshold. Computed
+	// once here, against the frozen policy the read side already holds,
+	// and rendered verbatim by every consumer.
+	Attention bool
+}
+
+// PendingQuestion is one unanswered human-addressed question: `hop
+// status`'s pending-human-questions line, naming the body path a human
+// needs to read and the message id `hop answer` takes.
+type PendingQuestion struct {
+	MessageID identity.MessageID
+	BodyPath  string
+	Age       time.Duration
+}
+
 // RunDetail is the full detail block `hop status -run` renders, and the
 // identities the controller use cases (stop, resume) need to load and
 // mutate the run's task, attempt and session directly. Phase 2 gives every
@@ -49,6 +122,27 @@ type RunDetail struct {
 	// journal state and outcome, and the retained evidence artifacts — so
 	// an unknown outcome stays actionable through hop status.
 	LastCheck *CheckExecutionSummary
+
+	// Tasks is the feature-mode task table (section 3's ReadStore
+	// extension): every task recorded for the run, in no particular order.
+	// Nil for a solo run — TaskID/TaskState above stay the Phase 2 single-
+	// task fields for solo's own rendering.
+	Tasks []TaskSummary
+	// LatestIntegration is the run's most recently created integration
+	// row, if any; nil for a solo run or a feature run with no integration
+	// attempted yet.
+	LatestIntegration *IntegrationSummary
+	// GuardShortfalls is EvaluateReadiness's missing list, rendered
+	// verbatim (section 3): always empty for a solo run, since only a
+	// feature run ever assembles a GuardContext.
+	GuardShortfalls []run.GuardShortfall
+	// Mailboxes is section 7's per-address queue-depth/in-flight-age
+	// status surface: one entry per address with a non-empty queue or an
+	// unacknowledged in-flight message.
+	Mailboxes []MailboxStatus
+	// PendingQuestions is every unanswered human-addressed question,
+	// oldest first.
+	PendingQuestions []PendingQuestion
 }
 
 // LaunchContext is what the launch exec boundary (`hop launch`) needs,
