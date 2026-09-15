@@ -81,13 +81,10 @@ func TestSpikeAgentStartArgvCapability(t *testing.T) {
 	// returns agent_pane_busy).
 	server.waitForShellReady(t, pane)
 	runID := newSpikeUUID(t)
-	err := server.client.Call(testContext(t), "agent.start", map[string]any{
+	server.waitForAgentStart(t, map[string]any{
 		"name": "spike-agent", "kind": "claude", "pane_id": pane,
 		"args": []string{"launch", "--run", runID},
-	}, &struct{}{})
-	if err != nil {
-		t.Fatalf("agent.start with a recognized kind: %v", err)
-	}
+	})
 	server.waitForPaneText(t, pane, "claude launch --run "+runID)
 	server.waitForPaneText(t, pane, "claude 0.0.0-stub")
 	artifacts.save(t, "agent-start-pane.txt", server.readPane(t, pane))

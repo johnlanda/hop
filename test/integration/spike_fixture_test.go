@@ -597,6 +597,31 @@ func (s *testServer) waitForShellReady(t *testing.T, paneID string) {
 	}
 }
 
+// waitForAgentStart issues agent.start and retries it through waitUntil
+// while the response is agent_pane_busy, then fails on timeout or any other
+// error. waitForShellReady's process_info observation is a point-in-time
+// proxy, not atomic with the call that follows it (its own doc comment says
+// so), so a shell seen idle can still race a transient busy response; this
+// retries the authoritative signal — agent.start's own busy decision — which
+// is always safe to repeat because Herdr rejects a busy pane
+// (repos/herdr/src/app/agents.rs available_shell_name check) before it
+// mutates any terminal or agent state.
+func (s *testServer) waitForAgentStart(t *testing.T, params map[string]any) {
+	t.Helper()
+	var lastErr error
+	settled := waitUntil(func() bool {
+		lastErr = s.client.Call(testContext(t), "agent.start", params, &struct{}{})
+		if lastErr == nil {
+			return true
+		}
+		var apiErr *herdr.APIError
+		return !errors.As(lastErr, &apiErr) || apiErr.Code != "agent_pane_busy"
+	})
+	if !settled || lastErr != nil {
+		t.Fatalf("agent.start: %v", lastErr)
+	}
+}
+
 // negativeObservationWindow is how long a not-detected assertion keeps
 // polling before concluding absence. Detection is a periodic poll inside
 // Herdr, so a short bounded window is required to observe a negative; this
