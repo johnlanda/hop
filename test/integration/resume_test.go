@@ -169,3 +169,64 @@ func TestRealProcessStaleSubmissionFromRetiredIncarnation(t *testing.T) {
 		t.Errorf("attempt state after the stale submission = %q, want the current incarnation's attempt left unaffected", state)
 	}
 }
+
+// TestRealProcessConfirmAbsentRefusedAfterServerRestart proves the negative
+// half of design section 5 resume case 5's litmus test: identical crash
+// (worker and controller both killed, pane conclusively gone) except that
+// the herdr SERVER ITSELF also restarts before hop resume --confirm-absent
+// runs. Server continuity is no longer established (the creation-time
+// recorded server instance token can never equal a freshly observed one
+// from a different server process), so the attestation is still journaled
+// but the cold relaunch is refused — the run stays resuming/reconciling,
+// never relaunching, distinct from the non-restart case this task also
+// proves.
+func TestRealProcessConfirmAbsentRefusedAfterServerRestart(t *testing.T) {
+	fx := startFixtureRun(t, "")
+	fields := fx.requireRunState(t, "running")
+	paneID := paneIDFromBinding(fields["binding"])
+	_, attemptID := fx.taskAndAttemptIDs(t)
+	oldIncarnationID := fx.currentIncarnationID(t, attemptID)
+
+	info := fx.server.processInfo(t, paneID)
+	if len(info.ForegroundProcesses) == 0 {
+		t.Fatalf("pane %s reports no foreground worker process before the crash", paneID)
+	}
+	workerPID := int(info.ForegroundProcesses[0].PID)
+	if err := syscall.Kill(workerPID, syscall.SIGKILL); err != nil {
+		t.Fatalf("kill fixture worker pid %d: %v", workerPID, err)
+	}
+	if !waitUntil(func() bool { return !fx.server.paneExists(t, paneID) }) {
+		t.Fatalf("pane %s still exists after its foreground worker was killed; a layout.apply command pane must close itself (S6)", paneID)
+	}
+	killControllerLeader(t, fx.controller)
+	waitForLeaseExpiry(t, fx.dbPath(), fx.runID)
+
+	// The restart itself is unrelated to the run's own lease (a pure HOP-side,
+	// sqlite-recorded concept independent of herdr): only the server-instance
+	// continuity token changes.
+	fx.server.restart(t)
+
+	result := runHop(t, fx.env, fx.repo.Root, "resume", "-C", fx.repo.Root, "--confirm-absent", fx.runID)
+	if result.ExitCode != 1 {
+		t.Fatalf("hop resume --confirm-absent after a server restart exit=%d, want 1 (refused, not a cold relaunch); stdout=%q stderr=%q", result.ExitCode, result.Stdout, result.Stderr)
+	}
+	if !strings.Contains(result.Stdout, "resume reconciling") {
+		t.Errorf("hop resume --confirm-absent after a server restart stdout = %q, want it to report reconciling, not cold-relaunched", result.Stdout)
+	}
+	if strings.Contains(result.Stdout, "cold-relaunched") {
+		t.Errorf("hop resume --confirm-absent after a server restart reported cold-relaunched; want it refused: %q", result.Stdout)
+	}
+
+	runState := querySQLite(t, fx.dbPath(), fmt.Sprintf("SELECT state FROM runs WHERE id = '%s';", fx.runID))
+	if runState != "resuming" {
+		t.Errorf("run state after the refused attestation = %q, want \"resuming\" (never relaunching)", runState)
+	}
+	attestations := querySQLite(t, fx.dbPath(), fmt.Sprintf("SELECT count(*) FROM operations WHERE run_id = '%s' AND kind = 'absence.attested';", fx.runID))
+	if attestations == "0" {
+		t.Errorf("no absence.attested operation recorded for run %s; the attestation is journaled even when refused", fx.runID)
+	}
+	currentIncarnation := fx.currentIncarnationID(t, attemptID)
+	if currentIncarnation != oldIncarnationID {
+		t.Errorf("current incarnation after the refused attestation = %s, want unchanged %s (no relaunch happened)", currentIncarnation, oldIncarnationID)
+	}
+}
