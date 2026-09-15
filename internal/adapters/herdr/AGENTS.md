@@ -226,20 +226,34 @@ occupant inspection for the worker-launch use case.
   `syscall.Conn` on any platform: portable, no build tag, and exercises
   every `peerPID` implementation's defensive type check identically.
 - [callsites_test.go](callsites_test.go) is the herdr-adapter half of the
-  no-injection mechanism (docs/plan/phase-3-design.md section 11, part iii):
-  `TestProductionCallSitesUseAllowlistedStringLiterals` parses every
-  non-test `.go` file in this package and fails if any `X.Call(ctx, method,
-  params, result)` site's `method` argument is not a string literal on the
-  reviewed allowlist — a dynamic method expression fails outright, and the
-  six terminal-input methods (`pane.send_text`, `pane.send_keys`,
-  `pane.send_input`, `agent.prompt`, `agent.send_keys`, `agent.start`,
-  S11-confirmed as Herdr 0.9.0's complete real input surface) are never on
-  it except the one staged exception, `pane.send_text` for `SendText`
-  itself, which slice 6 removes together with the port member.
+  no-injection mechanism (docs/plan/phase-3-design.md section 11, part iii).
+  `TestProductionCallSitesUseAllowlistedStringLiterals` type-checks every
+  non-test `.go` file in this package with `go/types` (a stub importer
+  resolves this package's own sibling import, `internal/app`, to an empty
+  stand-in package, since only `Client`/`Call` — which depend on nothing
+  from it — need to resolve correctly) and finds every reference this
+  package makes to `(*Client).Call` BY TYPE — not by name or shape — so a
+  method value assigned to a variable, a method expression, or any other
+  indirection cannot hide from it the way a purely syntactic "is this a
+  4-argument `Call(...)`" walk could (the P1 review finding this replaced).
+  A method-expression reference is always rejected; a method value is
+  accepted only when it is the immediate callee of a direct, 4-argument
+  call whose `method` argument is a string literal on the reviewed
+  allowlist. The six terminal-input methods (`pane.send_text`,
+  `pane.send_keys`, `pane.send_input`, `agent.prompt`, `agent.send_keys`,
+  `agent.start`, S11-confirmed as Herdr 0.9.0's complete real input
+  surface) are never on that allowlist except the one staged exception,
+  `pane.send_text` for `SendText` itself, which slice 6 removes together
+  with the port member. The test cross-checks its own reference count
+  against a plain syntactic count of `.Call`-named selectors and fails if
+  they disagree, so a type-checking gap cannot silently under-cover.
   `TestCallSiteAllowlistRuleCatchesViolations` proves the rule actually
-  catches what it claims to (a dynamic method argument, a forbidden
-  terminal-input method, an unlisted literal) against synthetic sources,
-  rather than only passing vacuously against today's clean tree.
+  catches what it claims to — including the method-value escape itself,
+  both with a dynamic method and with an otherwise-allowed literal, a bare
+  method-expression reference, a forbidden terminal-input method, an
+  unlisted literal and a direct call with the wrong arity — against a
+  synthetic self-contained package (its own `Client` type and `Call`
+  method), rather than only passing vacuously against today's clean tree.
 - Test fixtures: none on disk; stubs and wire lines are written by the tests.
 
 ## Related guides
