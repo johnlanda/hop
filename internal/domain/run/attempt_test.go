@@ -173,3 +173,81 @@ func TestNewAttempt(t *testing.T) {
 		}
 	})
 }
+
+// TestAttemptCompleteReview exhaustively checks CompleteReview: only a
+// submitted review-kind attempt reaches completed through it; every other
+// (kind, source state) combination is ErrInvalidTransition and leaves the
+// attempt unchanged.
+func TestAttemptCompleteReview(t *testing.T) {
+	kinds := []run.TaskKind{run.TaskKindImplement, run.TaskKindReview, ""}
+
+	for _, kind := range kinds {
+		for _, from := range attemptStates() {
+			t.Run(string(kind)+"/"+string(from), func(t *testing.T) {
+				attempt := run.Attempt{ID: testAttemptID, TaskID: testTaskID, Number: 1, State: from}
+
+				got, err := attempt.CompleteReview(kind, epoch())
+
+				wantValid := kind == run.TaskKindReview && from == run.AttemptSubmitted
+				if wantValid {
+					if err != nil {
+						t.Fatalf("CompleteReview(%s) from %s: unexpected error: %v", kind, from, err)
+					}
+					if got.State != run.AttemptCompleted {
+						t.Fatalf("CompleteReview(%s) from %s: State = %s, want completed", kind, from, got.State)
+					}
+					if !got.UpdatedAt.Equal(epoch()) {
+						t.Fatalf("CompleteReview(%s) from %s: UpdatedAt = %v, want %v", kind, from, got.UpdatedAt, epoch())
+					}
+					return
+				}
+				if !errors.Is(err, run.ErrInvalidTransition) {
+					t.Fatalf("CompleteReview(%s) from %s: error = %v, want ErrInvalidTransition", kind, from, err)
+				}
+				if got.State != from {
+					t.Fatalf("CompleteReview(%s) from %s: State = %s, want unchanged", kind, from, got.State)
+				}
+			})
+		}
+	}
+}
+
+// TestNewRetryAttempt proves the retry-reservation rule: a new attempt is
+// reserved only against a terminal prior attempt, and only below the
+// frozen retry limit.
+func TestNewRetryAttempt(t *testing.T) {
+	t.Run("terminal prior, below limit", func(t *testing.T) {
+		prior := run.Attempt{ID: testAttemptID, TaskID: testTaskID, Number: 1, State: run.AttemptFailed}
+
+		got, err := run.NewRetryAttempt(testSecondAttemptID, prior, 3, epoch())
+		if err != nil {
+			t.Fatalf("NewRetryAttempt: unexpected error: %v", err)
+		}
+		if got.Number != 2 || got.TaskID != testTaskID || got.State != run.AttemptReserved {
+			t.Fatalf("NewRetryAttempt = %+v, want number 2, task %s, reserved", got, testTaskID)
+		}
+	})
+
+	t.Run("prior not terminal", func(t *testing.T) {
+		for _, from := range attemptStates() {
+			if from == run.AttemptCompleted || from == run.AttemptFailed || from == run.AttemptInterrupted {
+				continue
+			}
+			prior := run.Attempt{ID: testAttemptID, TaskID: testTaskID, Number: 1, State: from}
+
+			_, err := run.NewRetryAttempt(testSecondAttemptID, prior, 3, epoch())
+			if !errors.Is(err, run.ErrRetryNotTerminal) {
+				t.Fatalf("NewRetryAttempt with prior %s: error = %v, want ErrRetryNotTerminal", from, err)
+			}
+		}
+	})
+
+	t.Run("retry limit reached", func(t *testing.T) {
+		prior := run.Attempt{ID: testAttemptID, TaskID: testTaskID, Number: 3, State: run.AttemptFailed}
+
+		_, err := run.NewRetryAttempt(testSecondAttemptID, prior, 3, epoch())
+		if !errors.Is(err, run.ErrRetryLimit) {
+			t.Fatalf("NewRetryAttempt at the limit: error = %v, want ErrRetryLimit", err)
+		}
+	})
+}

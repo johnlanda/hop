@@ -79,6 +79,30 @@ func NewAttempt(id identity.AttemptID, taskID identity.TaskID, number int, now t
 	return Attempt{ID: id, TaskID: taskID, Number: number, State: AttemptReserved, UpdatedAt: now}, nil
 }
 
+// terminalAttemptStates are the Attempt states a retry may follow: no
+// verb ever revives a terminal attempt, so a retry always reserves a new
+// one rather than reusing it.
+var terminalAttemptStates = map[AttemptState]bool{ //nolint:gochecknoglobals // terminalAttemptStates is the exhaustive, immutable terminal subset of the Attempt state table; it never mutates after init.
+	AttemptCompleted:   true,
+	AttemptFailed:      true,
+	AttemptInterrupted: true,
+}
+
+// NewRetryAttempt constructs attempt number prior.Number+1 for prior's
+// task, reserving the retry a manager (implement) or the controller
+// (review) requested. prior must have reached a terminal state
+// (ErrRetryNotTerminal otherwise) and prior.Number must be below limit,
+// the frozen per-task retry limit (ErrRetryLimit at or past it).
+func NewRetryAttempt(id identity.AttemptID, prior Attempt, limit int, now time.Time) (Attempt, error) { //nolint:gocritic // hugeParam: Attempt is passed by value everywhere in this package; this constructor mirrors that convention.
+	if !terminalAttemptStates[prior.State] {
+		return Attempt{}, fmt.Errorf("%w: attempt %s: prior attempt %s is %s, not terminal", ErrRetryNotTerminal, id, prior.ID, prior.State)
+	}
+	if prior.Number >= limit {
+		return Attempt{}, fmt.Errorf("%w: attempt %s: task %s has reached its retry limit %d", ErrRetryLimit, id, prior.TaskID, limit)
+	}
+	return NewAttempt(id, prior.TaskID, prior.Number+1, now)
+}
+
 // transition returns a with its state moved to to, or ErrInvalidTransition
 // when the section 5 table does not list (a.State, to).
 func (a Attempt) transition(to AttemptState, now time.Time) (Attempt, error) { //nolint:gocritic // hugeParam: Attempt is an immutable domain value returned by every transition; a pointer receiver would let a caller's original be mutated through it, breaking the pure-transition contract.
@@ -136,6 +160,24 @@ func (a Attempt) Reconcile(now time.Time) (Attempt, error) { //nolint:gocritic /
 // semantics), binding a new session and incarnation to this same attempt.
 func (a Attempt) Relaunch(now time.Time) (Attempt, error) { //nolint:gocritic // hugeParam: Attempt is an immutable domain value returned by every transition; a pointer receiver would let a caller's original be mutated through it, breaking the pure-transition contract.
 	return a.transition(AttemptRelaunching, now)
+}
+
+// CompleteReview moves a submitted review attempt into completed: the
+// accepted verdict, applied atomically inside the verdict-acceptance
+// transaction. This is a distinct, independently validated transition (the
+// Reattach precedent) rather than a share of Complete's checking->completed
+// row: a review attempt's settling evidence is the verdict row itself,
+// there is no check phase, and reusing the implement path would make
+// "check receipt" mean something other than a deterministic execution.
+// kind must be TaskKindReview; any other kind, or any source state other
+// than submitted, is ErrInvalidTransition.
+func (a Attempt) CompleteReview(kind TaskKind, now time.Time) (Attempt, error) { //nolint:gocritic // hugeParam: Attempt is an immutable domain value returned by every transition; a pointer receiver would let a caller's original be mutated through it, breaking the pure-transition contract.
+	if kind != TaskKindReview || a.State != AttemptSubmitted {
+		return a, fmt.Errorf("%w: attempt %s: %s to %s is not a valid review completion for kind %q", ErrInvalidTransition, a.ID, a.State, AttemptCompleted, kind)
+	}
+	a.State = AttemptCompleted
+	a.UpdatedAt = now
+	return a, nil
 }
 
 // Reattach moves a reconciling attempt back to to, its prior state, once
