@@ -140,7 +140,13 @@ type SubmissionStore interface {
 	// exec_pending. It fails — and the caller must
 	// not exec — when the run is stopping or stopped, the incarnation is
 	// not current, or a claim for this incarnation already exists with a
-	// different pid. A rewrite by the same pid is idempotent.
+	// different pid, a settled state, or a different executable or argv
+	// digest. A rewrite by the same pid with the same invocation identity
+	// is idempotent except that it refreshes the row's seed evidence to
+	// the retry's freshly applied outcome (healing NULL rows written
+	// before the seed-evidence migration), so the persisted evidence
+	// always matches the plan the launcher execs with; settled history is
+	// never rewritten.
 	ClaimLaunch(ctx context.Context, claim LaunchClaim) error
 	// SettleLaunchFailure records exec_failed on the launcher's error path.
 	SettleLaunchFailure(ctx context.Context, incarnation identity.IncarnationID, reason string) error

@@ -152,9 +152,10 @@ func (c *Controller) PrepareLaunchExec(ctx context.Context, req LaunchExecReques
 	digest := launchArgvDigest(argv)
 	// An existing same-pid exec_pending claim authorizes only the exact
 	// invocation it recorded: the corroboration predicate settles a claim
-	// by its recorded executable and argv identity, and the store keeps
-	// the existing row on an idempotent same-pid rewrite, so executing a
-	// differently composed plan under it would run an invocation the claim
+	// by its recorded executable and argv identity, and a same-pid retry
+	// keeps every identity field of the existing row (the store refreshes
+	// its seed evidence only), so executing a differently composed plan
+	// under it would run an invocation the claim
 	// does not describe. Identical retries stay idempotent; anything else
 	// fails closed before exec.
 	if lc.Claim != nil && (lc.Claim.Executable != executable || lc.Claim.ArgvDigest != digest) {
