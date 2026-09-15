@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -70,25 +71,34 @@ func TestRunHeartbeats(t *testing.T) {
 func TestRunControllerLoop(t *testing.T) {
 	t.Run("prints transitions, corroborates, runs checks and exits on the terminal state", func(t *testing.T) {
 		ctrl := &fakeController{}
-		ctrl.status = scriptStatus(
-			detailStep("launching", "launching", false),
-			detailStep("running", "running", false),
-			detailStep("completed", "completed", false),
-		)
 		ctrl.corroborate = func() (app.LaunchProgress, error) { return app.LaunchSettled, nil }
-		checkCalls := 0
-		ctrl.claimAndRunCheck = func(hopPath string, spawnEnv []string) (app.CheckReport, error) {
-			checkCalls++
+		// The check rounds run asynchronously, so the status script is
+		// keyed to the check fake's progress: the run completes only once
+		// the passing round has executed, exactly as a real run would.
+		var checkCalls atomic.Int32
+		ctrl.claimAndRunCheck = func(_ context.Context, hopPath string, spawnEnv []string) (app.CheckReport, error) {
 			if hopPath != "/opt/hop/bin/hop" {
 				t.Errorf("hop path = %q", hopPath)
 			}
 			if len(spawnEnv) == 0 {
 				t.Error("spawn env is empty; the sanitized environment must be passed through")
 			}
-			if checkCalls == 2 {
+			if checkCalls.Add(1) == 2 {
 				return app.CheckReport{Ran: true, OperationID: "op-1", Passed: true}, nil
 			}
 			return app.CheckReport{}, nil
+		}
+		statusCalls := 0
+		ctrl.status = func(app.StatusRequest) (app.StatusResult, error) {
+			statusCalls++
+			switch {
+			case statusCalls == 1:
+				return detailStep("launching", "launching", false), nil
+			case checkCalls.Load() >= 2:
+				return detailStep("completed", "completed", false), nil
+			default:
+				return detailStep("running", "running", false), nil
+			}
 		}
 		td := newTestDeps(ctrl, map[string]string{"PATH": "/bin"}, t.TempDir())
 		var stdout bytes.Buffer
@@ -109,6 +119,55 @@ func TestRunControllerLoop(t *testing.T) {
 		}
 		if strings.Count(out, "launch settled") != 1 {
 			t.Errorf("launch progress printed more than once on no change:\n%s", out)
+		}
+	})
+
+	t.Run("a stop request interrupts a running check before the stop is driven", func(t *testing.T) {
+		ctrl := &fakeController{}
+		var checkStarted atomic.Bool
+		ctrl.claimAndRunCheck = func(ctx context.Context, _ string, _ []string) (app.CheckReport, error) {
+			checkStarted.Store(true)
+			// The check blocks until the loop cancels its context — the
+			// long-check case; the app then records the outcome under stop
+			// precedence and returns the interrupted report.
+			<-ctx.Done()
+			return app.CheckReport{Ran: true, OperationID: "op-9", Interrupted: true}, nil
+		}
+		ctrl.status = func(app.StatusRequest) (app.StatusResult, error) {
+			// The stop request appears only once the check is already
+			// running: the loop must observe it mid-check.
+			return detailStep("running", "running", checkStarted.Load()), nil
+		}
+		ctrl.driveStop = func() (app.StopReport, error) {
+			return app.StopReport{RunState: "stopped", Terminated: true}, nil
+		}
+		td := newTestDeps(ctrl, nil, t.TempDir())
+		var stdout bytes.Buffer
+
+		result, err := runControllerLoop(context.Background(), td.deps, ctrl, app.RunHandle{}, testRunID, "r1", "/opt/hop/bin/hop", &stdout)
+		if err != nil {
+			t.Fatalf("runControllerLoop: %v", err)
+		}
+
+		if result.FinalState != "stopped" {
+			t.Errorf("result = %+v", result)
+		}
+		out := stdout.String()
+		if !strings.Contains(out, "check op-9 interrupted\n") {
+			t.Errorf("output lacks the interrupted check outcome:\n%s", out)
+		}
+		calls := ctrl.recorded()
+		checkIdx, stopIdx := -1, -1
+		for i, name := range calls {
+			if name == "ClaimAndRunCheck" && checkIdx == -1 {
+				checkIdx = i
+			}
+			if name == "DriveStop" && stopIdx == -1 {
+				stopIdx = i
+			}
+		}
+		if checkIdx == -1 || stopIdx == -1 || stopIdx < checkIdx {
+			t.Errorf("calls = %v; the check must be interrupted before the stop rounds", calls)
 		}
 	})
 

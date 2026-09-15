@@ -26,7 +26,7 @@ type fakeController struct {
 	heartbeat        func() error
 	detach           func() error
 	corroborate      func() (app.LaunchProgress, error)
-	claimAndRunCheck func(hopPath string, spawnEnv []string) (app.CheckReport, error)
+	claimAndRunCheck func(ctx context.Context, hopPath string, spawnEnv []string) (app.CheckReport, error)
 	checkSpawnEnv    func(environ []string) ([]string, error)
 	submitResult     func(req app.SubmitResultRequest) (app.SubmitResultResult, error)
 	prepareLaunch    func(req app.LaunchExecRequest) (app.LaunchExecPlan, error)
@@ -111,12 +111,12 @@ func (f *fakeController) CorroborateLaunch(_ context.Context, _ app.RunHandle) (
 	return f.corroborate()
 }
 
-func (f *fakeController) ClaimAndRunCheck(_ context.Context, _ app.RunHandle, hopPath string, spawnEnv []string) (app.CheckReport, error) { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.
+func (f *fakeController) ClaimAndRunCheck(ctx context.Context, _ app.RunHandle, hopPath string, spawnEnv []string) (app.CheckReport, error) { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.
 	f.record("ClaimAndRunCheck")
 	if f.claimAndRunCheck == nil {
 		return app.CheckReport{}, nil
 	}
-	return f.claimAndRunCheck(hopPath, spawnEnv)
+	return f.claimAndRunCheck(ctx, hopPath, spawnEnv)
 }
 
 func (f *fakeController) CheckSpawnEnvironment(_ context.Context, _ app.RunHandle, environ []string) ([]string, error) { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.

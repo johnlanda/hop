@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -73,49 +74,160 @@ type loopResult struct {
 	Detached   bool
 }
 
+// checkOutcome carries one asynchronous ClaimAndRunCheck completion.
+type checkOutcome struct {
+	report app.CheckReport
+	err    error
+}
+
+// checkDriver runs at most one ClaimAndRunCheck at a time in its own
+// goroutine under a cancelable context derived from the loop's, so the
+// loop keeps observing the run — a stop request, a transition — and
+// heartbeating while a long check executes. Canceling propagates into the
+// app's act context and CommandRunner kills the check's process group;
+// the app's outcome transaction then applies stop precedence.
+type checkDriver struct {
+	cancel context.CancelFunc
+	done   chan checkOutcome
+	// canceled records that the loop canceled the in-flight call
+	// deliberately (stop, detach, exit), so its error is expected and
+	// never reported as a loop failure.
+	canceled bool
+}
+
+// start begins one asynchronous check round; the driver must be idle.
+func (c *checkDriver) start(ctx context.Context, ctrl controllerAPI, handle app.RunHandle, hopPath string, spawnEnv []string) { //nolint:gocritic // hugeParam: RunHandle is the app-defined opaque token, passed by value as every Controller method takes it.
+	checkCtx, cancel := context.WithCancel(ctx)
+	done := make(chan checkOutcome, 1)
+	c.cancel = cancel
+	c.done = done
+	c.canceled = false
+	go func() {
+		defer cancel()
+		report, err := ctrl.ClaimAndRunCheck(checkCtx, handle, hopPath, spawnEnv)
+		done <- checkOutcome{report: report, err: err}
+	}()
+}
+
+// running reports whether a check round is in flight.
+func (c *checkDriver) running() bool { return c.done != nil }
+
+// poll consumes a finished round without blocking; ok is false while the
+// round is still running.
+func (c *checkDriver) poll() (checkOutcome, bool) {
+	if c.done == nil {
+		return checkOutcome{}, false
+	}
+	select {
+	case outcome := <-c.done:
+		c.done = nil
+		return outcome, true
+	default:
+		return checkOutcome{}, false
+	}
+}
+
+// interrupt cancels the in-flight round, if any, and waits for it to
+// return: the group is killed through the runner's cancellation, and the
+// app's outcome transaction records evidence under stop precedence.
+func (c *checkDriver) interrupt() (checkOutcome, bool) {
+	if c.done == nil {
+		return checkOutcome{}, false
+	}
+	c.canceled = true
+	c.cancel()
+	outcome := <-c.done
+	c.done = nil
+	return outcome, true
+}
+
 // runControllerLoop drives one held run in the foreground until the run
 // reaches a terminal state or ctx is canceled: it prints one line per run
 // transition, heartbeats concurrently on the design's interval, drives
 // launch-claim corroboration while the attempt is launching or
 // relaunching, routes to DriveStop as soon as a stop request is visible,
 // and consumes pending check requests through ClaimAndRunCheck on the poll
-// interval. It never sleeps outside d.wait, so tests pace it with a fake.
+// interval — asynchronously, under a cancelable context, so the loop
+// still observes a stop request and keeps heartbeating while a check
+// runs, and a stop interrupts the check through the app's stop precedence
+// instead of waiting it out. It never sleeps outside d.wait, so tests
+// pace it with a fake.
 func runControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, handle app.RunHandle, runID, label, hopPath string, stdout io.Writer) (loopResult, error) { //nolint:gocritic // hugeParam: RunHandle is the app-defined opaque token, passed by value as every Controller method takes it.
 	heartbeatFailed := runHeartbeats(ctx, d, ctrl, handle)
 	var (
 		lastState    string
 		lastProgress app.LaunchProgress
 		spawnEnv     []string
+		checks       checkDriver
 	)
+	// Every exit path retires an in-flight check first: its context dies
+	// with the loop's cancel or is canceled here, and the recorded round
+	// is still reported.
+	reportOutcome := func(outcome checkOutcome) error {
+		if outcome.err != nil {
+			// A canceled or stop-refused round is expected on the stop and
+			// exit paths, never a loop failure.
+			if checks.canceled || errors.Is(outcome.err, context.Canceled) || errors.Is(outcome.err, app.ErrStopRequested) {
+				return nil
+			}
+			return fmt.Errorf("run check: %w", outcome.err)
+		}
+		if outcome.report.Ran {
+			if _, werr := fmt.Fprintf(stdout, "check %s %s\n", outcome.report.OperationID, describeCheckReport(&outcome.report)); werr != nil {
+				return werr
+			}
+		}
+		return nil
+	}
+	drainChecks := func() {
+		if outcome, ok := checks.interrupt(); ok {
+			_ = reportOutcome(outcome) //nolint:errcheck // the loop is already on an exit path; the recorded outcome is durable either way.
+		}
+	}
 	for {
 		select {
 		case err := <-heartbeatFailed:
+			drainChecks()
 			return loopResult{}, fmt.Errorf("heartbeat failed, the lease is lost and in-flight work is canceled: %w", err)
 		case <-ctx.Done():
+			drainChecks()
 			return loopResult{Detached: true}, nil
 		default:
 		}
 
 		status, err := ctrl.Status(ctx, app.StatusRequest{RunID: runID})
 		if err != nil {
+			drainChecks()
 			return loopResult{}, fmt.Errorf("load run status: %w", err)
 		}
 		detail := status.Detail
 		if detail == nil {
+			drainChecks()
 			return loopResult{}, fmt.Errorf("run %s has no status detail", runID)
 		}
 		if detail.State != lastState {
 			if _, werr := fmt.Fprintf(stdout, "run %s %s\n", label, detail.State); werr != nil {
+				drainChecks()
 				return loopResult{}, werr
 			}
 			lastState = detail.State
 		}
 		if isTerminalRunState(detail.State) {
+			drainChecks()
 			return loopResult{FinalState: detail.State}, nil
 		}
 
 		switch {
 		case detail.StopRequested || detail.State == runStateStopping:
+			// Interrupt the running check first: the group dies through
+			// the runner's cancellation and the outcome transaction
+			// records evidence under stop precedence; only then drive the
+			// stop rounds.
+			if outcome, ok := checks.interrupt(); ok {
+				if repErr := reportOutcome(outcome); repErr != nil {
+					return loopResult{}, repErr
+				}
+			}
 			report, stopErr := ctrl.DriveStop(ctx, handle)
 			if stopErr != nil {
 				return loopResult{}, fmt.Errorf("drive stop: %w", stopErr)
@@ -130,10 +242,12 @@ func runControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, handle 
 			if detail.AttemptState == "launching" || detail.AttemptState == "relaunching" {
 				progress, corrErr := ctrl.CorroborateLaunch(ctx, handle)
 				if corrErr != nil {
+					drainChecks()
 					return loopResult{}, fmt.Errorf("corroborate launch: %w", corrErr)
 				}
 				if progress != lastProgress {
 					if _, werr := fmt.Fprintf(stdout, "launch %s\n", describeLaunchProgress(progress)); werr != nil {
+						drainChecks()
 						return loopResult{}, werr
 					}
 					lastProgress = progress
@@ -142,21 +256,22 @@ func runControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, handle 
 			if spawnEnv == nil {
 				spawnEnv, err = ctrl.CheckSpawnEnvironment(ctx, handle, d.environ())
 				if err != nil {
+					drainChecks()
 					return loopResult{}, fmt.Errorf("compose check spawn environment: %w", err)
 				}
 			}
-			report, checkErr := ctrl.ClaimAndRunCheck(ctx, handle, hopPath, spawnEnv)
-			if checkErr != nil {
-				return loopResult{}, fmt.Errorf("run check: %w", checkErr)
-			}
-			if report.Ran {
-				if _, werr := fmt.Fprintf(stdout, "check %s %s\n", report.OperationID, describeCheckReport(&report)); werr != nil {
-					return loopResult{}, werr
+			if outcome, ok := checks.poll(); ok {
+				if repErr := reportOutcome(outcome); repErr != nil {
+					return loopResult{}, repErr
 				}
+			}
+			if !checks.running() {
+				checks.start(ctx, ctrl, handle, hopPath, spawnEnv)
 			}
 		}
 
 		if err := d.wait(ctx, loopPollInterval); err != nil {
+			drainChecks()
 			return loopResult{Detached: true}, nil
 		}
 	}
