@@ -271,7 +271,10 @@ sides together. `cmd/hop` never imports domain or identity types: every
 
 - Allowed inward imports: [internal/domain/identity](../domain/identity/AGENTS.md),
   [internal/domain/run](../domain/run/AGENTS.md) (application code;
-  standard library only beyond these, no third-party dependencies).
+  standard library only beyond these, no third-party dependencies). Test
+  files additionally import
+  [internal/testsupport/storevectors](../testsupport/storevectors/AGENTS.md)
+  (the shared refused-input vectors) — production code never does.
 - Consumed ports and their adapters: `Probe`, `AgentPresentation`,
   `Observer` and `Runtime` (including `ServerInstance`) are implemented by
   [internal/adapters/herdr](../adapters/herdr/AGENTS.md); `StateStore`,
@@ -368,6 +371,74 @@ sides together. `cmd/hop` never imports domain or identity types: every
   the canonical digest vectors (`digest_test.go`) and the persisted-payload
   decode contract (`operation_payload_internal_test.go`, a same-package
   test of `decodeOperationPayload`'s typed and JSON-generic paths).
+- Phase 3 scenario suite, against the same `fakeStore` extended with
+  `fakeUnitOfWork`'s `WorkflowRepositories` implementation and
+  `fakeStore`'s own `MessagingStore`/`PlanStore`/`ReviewStore`/
+  `WorkflowReadStore` implementations (`fakes_workflow_test.go`), wired
+  into `newTestController` alongside the Phase 2 fakes
+  (`usecase_run_test.go`); `seedFeatureRun`/`seedImplementTask`/
+  `seedWorkerSession` (`usecase_schedule_test.go`,
+  `usecase_message_test.go`) build feature-mode fixtures directly (a
+  running `Run` with a `WorkflowSnapshot`, an active manager session and a
+  legitimate `RunHandle`), bypassing `StartRun`'s Phase 2 one-task/
+  one-attempt bootstrap, which feature mode does not use:
+  - `go test ./internal/app -run 'TestRecomputeReleases|TestAssignReadyTasks'` —
+    the section 6 scheduling pass: dependency release only once every
+    prerequisite is integrated; assignment claims the lowest-seq ready
+    task into a free slot (task/attempt/session/worktree/pane, a review
+    task's own frozen subject rather than the integration head,
+    `MaxWorkers` bounded inside the assignment transaction, a consumed
+    retry's already-reserved attempt launched rather than recreated).
+  - `go test ./internal/app -run TestRequireWorkflowRepositoriesFailsClosed` —
+    the `WorkflowRepositories` fail-closed table test via
+    `plainStore`/`plainUnitOfWork` (a `StateStore` implementing exactly
+    `UnitOfWork`, deliberately not also `WorkflowRepositories`): every
+    feature-mode use case refuses with `ErrWorkflowRepositoriesUnsupported`
+    before any side effect, never a nil-interface panic.
+  - `go test ./internal/app -run 'TestCreateTask|TestClosePlanReopenOnCreate|TestClosePlanRefusesEmptyPlan|TestRequestRetry'` —
+    section 8's manager-plan verbs: zero- and chained-dependency creation,
+    self-dependency and cross-run dependency refusal, non-manager caller
+    refusal, request-ID idempotency (identical retry returns the original
+    acceptance), an oversized title malformed before any side effect
+    (`TaskCreate`'s own file-first write included), plan reopen-on-create,
+    empty-plan refusal, and a full retry cycle (terminal needs-rework
+    attempt, below the retry limit, the new attempt reserved immediately
+    inside `RequestRetry` itself).
+  - `go test ./internal/app -run 'TestMessagingReferenceTraceRelayedQuestion|TestSendMessageValidation|TestAckMessageRequiresOwnDelivery|TestShowMessage|TestFetchMessageEmptyQueueCommitsNothing'` —
+    section 7's messaging verbs: the complete relayed-question reference
+    trace end to end (worker question → manager relay to human with
+    `--relay-of` → human answer → manager forwards using only the
+    `origin` envelope field → worker acks, incl. forward-before-ack redo
+    idempotency); send addressing/kind legality, mailbox-closed refusal,
+    an oversized inline body malformed before any store call; ack refused
+    for a message never delivered to the ACKING session itself (a
+    predecessor's delivery proves nothing), then accepted after fetch,
+    then idempotently duplicate on repeat; `ShowMessage` (the envelope
+    plus full delivery/ack history incl. a re-serve, writing/delivering/
+    acking nothing itself, not-found for an unknown id or one from a
+    different run, and its own `WorkflowReadStore` fail-closed case via
+    `plainReadStore`, a `ReadStore` deliberately not also
+    `WorkflowReadStore`); an empty fetch committing neither a delivery row
+    nor a receipt.
+  - `go test ./internal/app -run TestStatus` — the presentation/status
+    integration: the feature-mode task table (seq, kind, state,
+    dependencies, attempt count); the run's most recently created
+    integration row; guard shortfalls (`EvaluateReadiness`'s missing list)
+    across an open plan, an unintegrated task once the plan closes, and
+    every verdict shortfall (reject, stale-subject) against an integrated
+    head — `check-missing` never clears in this suite, since no fake
+    tracks a combined-candidate check receipt yet (documented on
+    `guardShortfallsLocked`, not a bug); the section 7 attention surface
+    (queued vs. in-flight ages, the `[messages] attention_after`
+    threshold, `AddressLive` gating on the manager session's own state,
+    `NeedsAttention`'s OR-reduction over `Mailboxes`); pending human
+    questions clearing once answered; a solo run rendering every Phase 3
+    field at its zero value.
+  - `go test ./internal/app -run TestStoreVectors` — every
+    `internal/testsupport/storevectors` vector
+    ([its own guide](../testsupport/storevectors/AGENTS.md)) driven
+    against `fakeStore` through the ordinary `PlanStore`/`MessagingStore`
+    ports, confirming each documented refusal.
 - Test fixtures: none on disk; the fakes and environ slices live in the
   test files. No real process, file, socket or SQLite access anywhere in
   this package's tests.
