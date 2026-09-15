@@ -24,7 +24,7 @@ func TestRunReportsWriteFailuresThroughTheExitCode(t *testing.T) {
 		stderr io.Writer
 	}{
 		{name: "usage cannot be written", args: nil, stdout: io.Discard, stderr: failingWriter{}},
-		{name: "unknown command cannot be reported", args: []string{"launch"}, stdout: io.Discard, stderr: failingWriter{}},
+		{name: "unknown command cannot be reported", args: []string{"frobnicate"}, stdout: io.Discard, stderr: failingWriter{}},
 		{name: "help cannot be written", args: []string{"help"}, stdout: failingWriter{}, stderr: io.Discard},
 		{name: "version cannot be written", args: []string{"version"}, stdout: failingWriter{}, stderr: io.Discard},
 		{name: "version argument error cannot be reported", args: []string{"version", "x"}, stdout: io.Discard, stderr: failingWriter{}},
@@ -59,9 +59,9 @@ func TestRun(t *testing.T) {
 		},
 		{
 			name:         "unknown command is reported with usage",
-			args:         []string{"launch"},
+			args:         []string{"frobnicate"},
 			wantCode:     exitUsage,
-			wantStderr:   `unknown command "launch"`,
+			wantStderr:   `unknown command "frobnicate"`,
 			wantNoStdout: true,
 		},
 		{

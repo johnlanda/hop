@@ -47,6 +47,20 @@ func dispatch(args []string, stdout, stderr io.Writer) (int, error) {
 		return runDoctor(args[1:], stdout, stderr, os.Getenv)
 	case "plugin-context":
 		return runPluginContext(args[1:], stdout, stderr, os.Environ())
+	case "run":
+		return runRun(args[1:], stdout, stderr, defaultDeps())
+	case "status":
+		return runStatus(args[1:], stdout, stderr, defaultDeps())
+	case "stop":
+		return runStop(args[1:], stdout, stderr, defaultDeps())
+	case "resume":
+		return runResume(args[1:], stdout, stderr, defaultDeps())
+	case "result":
+		return runResult(args[1:], stdout, stderr, defaultDeps())
+	case "launch":
+		return runLaunch(args[1:], stdout, stderr, defaultDeps())
+	case "check-exec":
+		return runCheckExec(args[1:], stdout, stderr, defaultDeps())
 	case "help", "-h", "-help", "--help":
 		return exitOK, printUsage(stdout)
 	default:
@@ -61,9 +75,17 @@ func dispatch(args []string, stdout, stderr io.Writer) (int, error) {
 func printUsage(w io.Writer) error {
 	_, err := fmt.Fprint(w, "Usage: hop <command> [arguments]\n\n"+
 		"Commands:\n"+
+		"  run \"<brief>\"   Start a run and stay as its foreground controller\n"+
+		"  status          List the repository's active runs (-all includes finished; -run for one run's detail)\n"+
+		"  stop <run-id>   Request and drive a stop until termination is observed\n"+
+		"  resume <run-id> Reacquire a run's lease and reconcile, then continue as its controller\n"+
+		"  result submit   Submit a worker result (worker-facing; a transient first line signals retry)\n"+
 		"  version         Print the hop build version\n"+
-		"  doctor          Check the Herdr installation and harness support\n"+
+		"  doctor          Check the Herdr installation, harness support and the state root\n"+
 		"  plugin-context  Print the Herdr plugin invocation environment\n"+
-		"  help            Print this usage text\n")
+		"  help            Print this usage text\n\n"+
+		"Worker plumbing (spawned by HOP, not for direct use):\n"+
+		"  launch          Worker exec boundary: claim, sanitize and exec the harness\n"+
+		"  check-exec      Check exec boundary: claim, sanitize and exec the frozen check command\n")
 	return err
 }
