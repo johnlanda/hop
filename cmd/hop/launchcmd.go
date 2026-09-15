@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/johnlanda/hop/internal/app"
@@ -107,16 +110,37 @@ func runLaunch(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 // preserves the working directory). That resolved form is the
 // workspace-trust seed's exact projects key: macOS resolves /var to
 // /private/var, and Claude Code records trust under the resolved path.
+// Errors carry a fixed operation and errors.Is category only — the raw
+// chain includes the directory itself, which is never rendered.
 func launcherWorkerDir(d *deps) (string, error) {
 	wd, err := d.getwd()
 	if err != nil {
-		return "", fmt.Errorf("resolve the working directory: %w", err)
+		return "", fmt.Errorf("the working directory could not be determined: %s (the directory is never echoed)", pathErrorCategory(err))
 	}
 	resolved, err := resolveCanonicalPath(wd)
 	if err != nil {
-		return "", fmt.Errorf("resolve the working directory's symlinks: %w", err)
+		return "", fmt.Errorf("the working directory could not be canonically resolved: %s (the directory is never echoed)", pathErrorCategory(err))
 	}
 	return resolved, nil
+}
+
+// pathErrorCategory classifies a filesystem error into a fixed value-free
+// category through errors.Is alone, the same way describeStoreOpenFailure
+// classifies store-open failures: the raw chain commonly carries the
+// complete path (os.PathError) and is never rendered.
+func pathErrorCategory(err error) string {
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return "a path element does not exist"
+	case errors.Is(err, fs.ErrPermission):
+		return "permission denied"
+	case errors.Is(err, syscall.ENOTDIR):
+		return "a path element is not a directory"
+	case errors.Is(err, syscall.ELOOP):
+		return "too many levels of symbolic links"
+	default:
+		return "i/o failure"
+	}
 }
 
 // resolveCanonicalPath resolves a path's symlinks to its canonical
