@@ -89,6 +89,11 @@ type fakeStore struct {
 	// commit window.
 	CommitHook func(u *fakeUnitOfWork)
 
+	// LoadRunStatusHook, when set, runs after every LoadRunStatus returns
+	// (outside the store lock): a test can land a write in exactly the
+	// window between a lease-free entry read and the entry transaction.
+	LoadRunStatusHook func()
+
 	// openUnitsOfWork counts units of work begun but not yet committed or
 	// rolled back. The port fakes consult it through
 	// refuseInsideTransaction: an external call made while a store
@@ -302,6 +307,9 @@ func (s *fakeStore) runStatusLocked(runID identity.RunID) app.RunStatus {
 }
 
 func (s *fakeStore) LoadRunStatus(_ context.Context, runID identity.RunID) (app.RunDetail, error) {
+	if hook := s.LoadRunStatusHook; hook != nil {
+		defer hook() // registered before the unlock defer, so it runs after the lock is released.
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.Runs[runID]; !ok {

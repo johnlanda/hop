@@ -1330,3 +1330,59 @@ func TestResumeRoutesHeldStop(t *testing.T) {
 		t.Fatalf("final report = %+v, want terminated/stopped", final)
 	}
 }
+
+// TestStopRacingResumeEntry proves the entry barrier: a stop request
+// recorded between resume's lease-free entry read and its entry
+// transaction is observed under the transaction, the run is never moved
+// toward resuming, and Resume→DriveStop completes with no further user
+// stop request.
+func TestStopRacingResumeEntry(t *testing.T) {
+	tc := newTestController(defaultPolicy())
+	_, detail := runningRun(t, tc)
+
+	fired := false
+	tc.Store.LoadRunStatusHook = func() {
+		if fired {
+			return
+		}
+		fired = true
+		// The worker-authority stop lands right after the entry read.
+		if err := tc.Controller.RequestStop(context.Background(), detail.RunID.String()); err != nil {
+			t.Errorf("RequestStop() error = %v", err)
+		}
+	}
+
+	tc.Clock.Advance(leaseTTL + time.Second)
+	result, handle, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String()))
+	if err != nil {
+		t.Fatalf("Resume() error = %v", err)
+	}
+	if !fired {
+		t.Fatalf("the race hook never fired; the scenario did not exercise the entry window")
+	}
+	if result.Outcome != app.ResumeStopPending {
+		t.Fatalf("Outcome = %s, want %s", result.Outcome, app.ResumeStopPending)
+	}
+	if got := tc.Store.Runs[detail.RunID].value.State; got != run.RunStopping {
+		t.Fatalf("Run.State = %s, want %s (never moved toward resuming over the raced stop)", got, run.RunStopping)
+	}
+
+	// DriveStop completes with no further user stop request.
+	report, err := tc.Controller.DriveStop(context.Background(), handle)
+	if err != nil {
+		t.Fatalf("DriveStop() error = %v", err)
+	}
+	if report.Terminated {
+		t.Fatalf("report = %+v; the dispatched close is not yet observed termination", report)
+	}
+	tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+		return app.PaneProcess{}, app.ErrPaneNotFound
+	}
+	final, err := tc.Controller.DriveStop(context.Background(), handle)
+	if err != nil {
+		t.Fatalf("second DriveStop() error = %v", err)
+	}
+	if !final.Terminated || final.RunState != string(run.RunStopped) {
+		t.Fatalf("final report = %+v, want terminated/stopped", final)
+	}
+}

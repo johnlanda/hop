@@ -104,10 +104,18 @@ func (c *Controller) Resume(ctx context.Context, req ResumeRequest) (ResumeResul
 		// A previous resume round already entered resuming; entry is
 		// idempotent and reconciliation just continues.
 	case run.RunCreated, run.RunLaunching, run.RunRunning, run.RunCompleting:
+		stopObserved := false
 		if enterErr := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 			r, rRev, getErr := uow.Runs().Get(ctx, runID)
 			if getErr != nil {
 				return getErr
+			}
+			// The lease-free entry read races the worker-authority stop
+			// write: re-check under the transaction, and never move a
+			// stopping (or stop-requested) run toward resuming.
+			if r.State == run.RunStopping || r.StopRequested {
+				stopObserved = true
+				return nil
 			}
 			rFrom := r.State
 			r, resumeErr := r.EnterResuming(now)
@@ -120,6 +128,12 @@ func (c *Controller) Resume(ctx context.Context, req ResumeRequest) (ResumeResul
 			return recordTransition(ctx, uow, EntityRun, runID.String(), string(rFrom), string(r.State), "hop resume acquired the lease", gen(handle.lease.Generation), now)
 		}); enterErr != nil {
 			return ResumeResult{}, handle, fmt.Errorf("app: enter resuming: %w", enterErr)
+		}
+		if stopObserved {
+			if _, recoverErr := c.recoverPendingOperations(ctx, handle, entry); recoverErr != nil {
+				return ResumeResult{}, handle, recoverErr
+			}
+			return ResumeResult{Outcome: ResumeStopPending, Detail: "a stop request raced resume's entry; drive hop stop to observe termination"}, handle, nil
 		}
 	default:
 		return ResumeResult{}, handle, fmt.Errorf("app: run %s is in unknown state %q; failing closed", runID, entry.State)
@@ -144,9 +158,28 @@ func (c *Controller) Resume(ctx context.Context, req ResumeRequest) (ResumeResul
 func (c *Controller) reconcile(ctx context.Context, handle RunHandle, detail RunDetail, req ResumeRequest, blocked []string) (ResumeResult, error) { //nolint:gocritic // hugeParam: RunHandle, RunDetail and ResumeRequest are per-call DTOs; this runs once per resume round.
 	if detail.StopRequested {
 		// A held stop request wins over adoption and every new dispatch:
-		// request the stop transition (monotonic; it moves a resuming run
-		// to stopping) and hand the run to stop handling.
-		return ResumeResult{Outcome: ResumeStopPending, Detail: "the run holds a stop request; run hop stop to retire its work and observe termination"}, nil
+		// durably restore the stopping state under the lease (the section 5
+		// resuming→stopping row, cause "stop requested") before handing the
+		// run to stop handling — DriveStop drives only a stopping run.
+		now := c.Clock.Now()
+		if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+			r, rRev, getErr := uow.Runs().Get(ctx, handle.runID)
+			if getErr != nil {
+				return getErr
+			}
+			rFrom := r.State
+			next := r.RequestStop(now)
+			if next.State == rFrom {
+				return nil
+			}
+			if _, saveErr := uow.Runs().Save(ctx, next, rRev); saveErr != nil {
+				return saveErr
+			}
+			return recordTransition(ctx, uow, EntityRun, handle.runID.String(), string(rFrom), string(next.State), "stop requested", gen(handle.lease.Generation), now)
+		}); err != nil {
+			return ResumeResult{}, fmt.Errorf("app: restore stopping for the held stop request: %w", err)
+		}
+		return ResumeResult{Outcome: ResumeStopPending, Detail: "the run holds a stop request; drive hop stop to retire its work and observe termination"}, nil
 	}
 	switch detail.AttemptState {
 	case run.AttemptReserved:
