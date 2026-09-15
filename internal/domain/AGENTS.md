@@ -13,8 +13,10 @@ table.
 - [internal/domain/identity](identity/AGENTS.md): shared typed IDs, pure
   parsing.
 - [internal/domain/run](run/AGENTS.md): `Run`, `Task`, `Attempt`, `Session`,
-  `RuntimeBinding`, `Worktree`, `Result` and `Artifact` entities and their
-  pure state transitions.
+  `RuntimeBinding`, `Worktree`, `Result`, `Artifact`, `Message`/`Delivery`/
+  `Ack`, `Review` and `Integration` entities, their pure state transitions,
+  the task dependency graph and the `EvaluateReadiness` run-completion
+  guard.
 
 ## Rules specific to this subtree
 

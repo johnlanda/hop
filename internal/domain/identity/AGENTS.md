@@ -11,7 +11,7 @@ until another module needs it.
 
 | File | Entities / functions | Responsibility |
 | --- | --- | --- |
-| [id.go](id.go) | `RepositoryID`, `RunID`, `TaskID`, `AttemptID`, `SessionID`, `WorktreeID`, `ResultID`, `ArtifactID`, `OperationID`, `IncarnationID`, `Parse<Kind>ID`, `String`, `ErrInvalidID` | Ten distinct string-backed ID types, each with a pure `Parse<Kind>ID(string) (<Kind>ID, error)` and a `String() string` |
+| [id.go](id.go) | `RepositoryID`, `RunID`, `TaskID`, `AttemptID`, `SessionID`, `WorktreeID`, `ResultID`, `ArtifactID`, `OperationID`, `IncarnationID`, `MessageID`, `ReviewID`, `IntegrationID`, `Parse<Kind>ID`, `String`, `ErrInvalidID` | Thirteen distinct string-backed ID types, each with a pure `Parse<Kind>ID(string) (<Kind>ID, error)` and a `String() string`. `MessageID`, `ReviewID` and `IntegrationID` are Phase 3 additions, added the same way as the other ten. |
 
 ## Invariants
 
@@ -39,11 +39,12 @@ until another module needs it.
 - `go test ./internal/domain/identity` — table-driven `Parse<Kind>ID` tests
   (valid canonical UUIDs; malformed, mixed-case, wrong-length and
   wrong-separator rejections) and `String()` round-trips, for every one of
-  the ten ID types.
+  the thirteen ID types.
 - `go test -fuzz FuzzParseRunID -fuzztime 10s ./internal/domain/identity`
-  (also `FuzzParseSessionID`, `FuzzParseIncarnationID`) — no input panics
-  parsing, and every accepted string is a canonical lowercase UUID that
-  round-trips through `String()`.
+  (also `FuzzParseSessionID`, `FuzzParseIncarnationID`, `FuzzParseMessageID`,
+  `FuzzParseReviewID`, `FuzzParseIntegrationID`) — no input panics parsing,
+  and every accepted string is a canonical lowercase UUID that round-trips
+  through `String()`.
 
 ## Related guides
 
