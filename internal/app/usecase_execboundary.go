@@ -30,12 +30,19 @@ type ExecutableLookup func(name, pathValue string) (string, error)
 // environment and its own pid, and the composition-supplied executable
 // lookup.
 type LaunchExecRequest struct {
-	RunID            string
-	AttemptID        string
-	HOPPath          string
-	WorkerDir        string
-	Environ          []string
-	PID              int
+	RunID     string
+	AttemptID string
+	HOPPath   string
+	WorkerDir string
+	Environ   []string
+	PID       int
+	// ResolvePath canonically resolves an absolute path (symlinks
+	// followed), supplied by composition like LookupExecutable because
+	// this package performs no filesystem access itself. PrepareLaunchExec
+	// resolves BOTH the launcher's working directory and the recorded
+	// worktree path through it and refuses on disagreement; its errors are
+	// never echoed (they may carry the path).
+	ResolvePath      func(path string) (string, error)
 	LookupExecutable ExecutableLookup
 }
 
@@ -98,6 +105,9 @@ func (c *Controller) PrepareLaunchExec(ctx context.Context, req LaunchExecReques
 	if req.LookupExecutable == nil {
 		return LaunchExecPlan{}, fmt.Errorf("app: no executable lookup supplied")
 	}
+	if req.ResolvePath == nil {
+		return LaunchExecPlan{}, fmt.Errorf("app: no path resolver supplied")
+	}
 
 	lc, err := c.Read.LoadLaunchContext(ctx, runID, attemptID)
 	if err != nil {
@@ -151,7 +161,11 @@ func (c *Controller) PrepareLaunchExec(ctx context.Context, req LaunchExecReques
 		return LaunchExecPlan{}, fmt.Errorf("app: the existing launch claim for this incarnation records a different executable or argv than this invocation composed; a claim is never rewritten and this launcher never execs")
 	}
 
-	seedEvidence, err := c.seedWorkspaceTrust(ctx, lc.Snapshot.Harness, env, req.WorkerDir)
+	workerDir, err := resolveWorkerDirAgainstWorktree(req.ResolvePath, req.WorkerDir, lc.WorktreePath)
+	if err != nil {
+		return LaunchExecPlan{}, err
+	}
+	seedEvidence, err := c.seedWorkspaceTrust(ctx, lc.Snapshot.Harness, env, workerDir)
 	if err != nil {
 		return LaunchExecPlan{}, err
 	}
@@ -171,6 +185,33 @@ func (c *Controller) PrepareLaunchExec(ctx context.Context, req LaunchExecReques
 		return LaunchExecPlan{}, fmt.Errorf("app: claim launch: %w", err)
 	}
 	return LaunchExecPlan{Argv: argv, Env: env, IncarnationID: lc.IncarnationID.String(), SeedEvidence: seedEvidence}, nil
+}
+
+// resolveWorkerDirAgainstWorktree canonically resolves the launcher's
+// working directory and the run's recorded worktree path through the
+// composition-supplied resolver and requires them to be one directory: the
+// workspace-trust seed grants trust and the exec runs work, so both must
+// target the attempt's own recorded worktree, never whatever directory a
+// launcher happens to run in. It returns the resolved directory — the
+// exact seed key. A missing recorded path, a resolution failure on either
+// side, and a disagreement all refuse the launch fail-closed; resolver
+// errors may carry a path and are never echoed.
+func resolveWorkerDirAgainstWorktree(resolve func(string) (string, error), workerDir, recordedWorktree string) (string, error) {
+	if recordedWorktree == "" {
+		return "", fmt.Errorf("app: the run has no recorded worktree path; the launcher directory cannot be validated and is never seeded or execed")
+	}
+	resolvedWorker, err := resolve(workerDir)
+	if err != nil {
+		return "", fmt.Errorf("app: the launcher working directory could not be canonically resolved; an unresolvable directory is never seeded or execed")
+	}
+	resolvedRecorded, err := resolve(recordedWorktree)
+	if err != nil {
+		return "", fmt.Errorf("app: the recorded worktree path could not be canonically resolved; the launch is refused rather than run against unverified evidence")
+	}
+	if resolvedWorker != resolvedRecorded {
+		return "", fmt.Errorf("app: the launcher working directory does not resolve to the attempt's recorded worktree; a foreign directory is never seeded or execed")
+	}
+	return resolvedWorker, nil
 }
 
 // seedWorkspaceTrust applies the launch's workspace-trust pre-seed and

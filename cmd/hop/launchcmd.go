@@ -79,6 +79,7 @@ func runLaunch(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 		WorkerDir:        workerDir,
 		Environ:          d.environ(),
 		PID:              d.getpid(),
+		ResolvePath:      resolveCanonicalPath,
 		LookupExecutable: lookupExecutable,
 	})
 	if err != nil {
@@ -111,12 +112,25 @@ func launcherWorkerDir(d *deps) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve the working directory: %w", err)
 	}
-	resolved, err := filepath.EvalSymlinks(wd)
+	resolved, err := resolveCanonicalPath(wd)
 	if err != nil {
 		return "", fmt.Errorf("resolve the working directory's symlinks: %w", err)
 	}
+	return resolved, nil
+}
+
+// resolveCanonicalPath resolves a path's symlinks to its canonical
+// absolute form. It implements app.LaunchExecRequest.ResolvePath, the
+// seam PrepareLaunchExec uses to compare the launcher's cwd with the
+// recorded worktree path; the application never echoes its errors, which
+// may carry the path.
+func resolveCanonicalPath(path string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", err
+	}
 	if !filepath.IsAbs(resolved) {
-		return "", fmt.Errorf("the working directory did not resolve to an absolute path")
+		return "", fmt.Errorf("the path did not resolve to an absolute form")
 	}
 	return resolved, nil
 }

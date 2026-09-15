@@ -174,8 +174,23 @@ func ebLaunchContext(t *testing.T) LaunchContext {
 		Harness:       run.HarnessClaude,
 		Attempt:       run.Attempt{ID: attemptID, TaskID: taskID, State: run.AttemptLaunching},
 		Session:       run.Session{NativeSessionRef: ebNativeRef},
+		WorktreePath:  "/private/var/worktrees/hop-run-1",
 		IncarnationID: incarnationID,
 	}
+}
+
+// ebResolve canonicalizes paths the way the composition resolver does on
+// macOS: a /var/ prefix resolves to /private/var/, anything else is
+// already canonical, and a path naming "cannot-resolve" fails with a
+// path-bearing error (which preparation must never echo).
+func ebResolve(path string) (string, error) {
+	if strings.Contains(path, "cannot-resolve") {
+		return "", errors.New("lstat " + path + ": no such file or directory")
+	}
+	if strings.HasPrefix(path, "/var/") {
+		return "/private" + path, nil
+	}
+	return path, nil
 }
 
 // ebEnviron is a launch environment carrying the pane-provided HOP_*
@@ -228,6 +243,7 @@ func TestPrepareLaunchExec(t *testing.T) {
 			WorkerDir:        "/private/var/worktrees/hop-run-1",
 			Environ:          ebEnviron(),
 			PID:              4242,
+			ResolvePath:      ebResolve,
 			LookupExecutable: ebLookup(nil),
 		}
 	}
@@ -308,6 +324,79 @@ func TestPrepareLaunchExec(t *testing.T) {
 		}
 		if plan.Argv[0] != "/resolved/claude" {
 			t.Errorf("argv = %q", plan.Argv)
+		}
+	})
+
+	t.Run("a symlink alias of the recorded worktree launches and seeds the resolved key", func(t *testing.T) {
+		lc := ebLaunchContext(t)
+		lc.Snapshot.EnvPolicy.ProfileDir = "/profiles/claude"
+		lc.WorktreePath = "/var/worktrees/hop-run-1" // the recorded, unresolved alias
+		read := &ebReadStub{launch: lc}
+		subs := &ebSubmissionStub{}
+		trust := &ebTrustStub{outcome: TrustSeedOutcome{Seeded: true}}
+		c := newController(read, subs)
+		c.Trust = trust
+		req := baseRequest()
+		req.WorkerDir = "/var/worktrees/hop-run-1" // an alias too; both resolve equal
+
+		if _, err := c.PrepareLaunchExec(context.Background(), req); err != nil {
+			t.Fatalf("PrepareLaunchExec: %v", err)
+		}
+
+		if len(trust.calls) != 1 || trust.calls[0] != "/profiles/claude/.claude.json <- /private/var/worktrees/hop-run-1" {
+			t.Fatalf("trust calls = %q, want the seed keyed by the RESOLVED directory", trust.calls)
+		}
+	})
+
+	t.Run("a launcher directory outside the recorded worktree is refused before seed and claim", func(t *testing.T) {
+		lc := ebLaunchContext(t)
+		lc.Snapshot.EnvPolicy.ProfileDir = "/profiles/claude"
+		read := &ebReadStub{launch: lc}
+		subs := &ebSubmissionStub{}
+		trust := &ebTrustStub{outcome: TrustSeedOutcome{Seeded: true}}
+		c := newController(read, subs)
+		c.Trust = trust
+		req := baseRequest()
+		req.WorkerDir = "/private/var/worktrees/another-checkout"
+
+		_, err := c.PrepareLaunchExec(context.Background(), req)
+
+		if err == nil || !strings.Contains(err.Error(), "does not resolve to the attempt's recorded worktree") {
+			t.Fatalf("err = %v, want the foreign-directory refusal", err)
+		}
+		if len(trust.calls) != 0 {
+			t.Errorf("a refused directory was still seeded: %q", trust.calls)
+		}
+		if len(subs.claims) != 0 {
+			t.Errorf("a refused directory still wrote a claim: %+v", subs.claims)
+		}
+	})
+
+	t.Run("an unresolvable directory on either side refuses without echoing the path", func(t *testing.T) {
+		for _, tc := range []struct{ name, workerDir, recorded, wantErr string }{
+			{"launcher side", "/private/var/cannot-resolve-cwd", "/private/var/worktrees/hop-run-1", "launcher working directory could not be canonically resolved"},
+			{"recorded side", "/private/var/worktrees/hop-run-1", "/private/var/cannot-resolve-wt", "recorded worktree path could not be canonically resolved"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				lc := ebLaunchContext(t)
+				lc.WorktreePath = tc.recorded
+				read := &ebReadStub{launch: lc}
+				subs := &ebSubmissionStub{}
+				req := baseRequest()
+				req.WorkerDir = tc.workerDir
+
+				_, err := newController(read, subs).PrepareLaunchExec(context.Background(), req)
+
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("err = %v, want it to contain %q", err, tc.wantErr)
+				}
+				if strings.Contains(err.Error(), "cannot-resolve") {
+					t.Errorf("error echoes the resolver's path-bearing failure: %v", err)
+				}
+				if len(subs.claims) != 0 {
+					t.Errorf("a refused resolution still wrote a claim: %+v", subs.claims)
+				}
+			})
 		}
 	})
 
@@ -551,6 +640,20 @@ func TestPrepareLaunchExec(t *testing.T) {
 				req.WorkerDir = "worktrees/hop-run-1"
 			},
 			wantErr: "working directory is not absolute",
+		},
+		{
+			name: "no recorded worktree path",
+			mutate: func(lc *LaunchContext, _ *LaunchExecRequest, _ *ebSubmissionStub) {
+				lc.WorktreePath = ""
+			},
+			wantErr: "no recorded worktree path",
+		},
+		{
+			name: "no path resolver supplied",
+			mutate: func(_ *LaunchContext, req *LaunchExecRequest, _ *ebSubmissionStub) {
+				req.ResolvePath = nil
+			},
+			wantErr: "no path resolver supplied",
 		},
 		{
 			name: "missing HOP_INCARNATION_ID",

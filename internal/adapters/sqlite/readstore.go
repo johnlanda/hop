@@ -415,11 +415,21 @@ func (s *Store) LoadLaunchContext(ctx context.Context, runID identity.RunID, att
 		if err != nil {
 			return err
 		}
+		// The worktree row is committed by worktree.create's outcome,
+		// before any pane exists; a run whose worktree row is not recorded
+		// yet loads with an empty path, which the launch boundary refuses.
+		worktreePath := ""
+		if worktree, _, wtErr := getWorktree(ctx, tx, "run_id", runID.String()); wtErr == nil {
+			worktreePath = worktree.Path
+		} else if !errors.Is(wtErr, app.ErrNotFound) {
+			return wtErr
+		}
 		launchContext = app.LaunchContext{
 			Snapshot:      snapshot,
 			Harness:       session.Harness,
 			Attempt:       attempt,
 			Session:       session,
+			WorktreePath:  worktreePath,
 			IncarnationID: incarnation,
 			Claim:         claim,
 			StopRequested: runV.StopRequested || runV.State == run.RunStopping || runV.State == run.RunStopped,

@@ -66,6 +66,9 @@ func TestRunLaunch(t *testing.T) {
 		if prepared.WorkerDir != resolvedDir {
 			t.Errorf("prepared worker dir = %q, want the symlink-resolved working directory %q", prepared.WorkerDir, resolvedDir)
 		}
+		if prepared.ResolvePath == nil {
+			t.Error("no path resolver was wired into the request")
+		}
 		if len(prepared.Environ) == 0 {
 			t.Error("the launcher's inherited environment was not passed for validation and sanitization")
 		}

@@ -62,10 +62,18 @@ type RunDetail struct {
 // pane.open (or launch.send) operation's intent recorded, which
 // HOP_INCARNATION_ID must match.
 type LaunchContext struct {
-	Snapshot      RunSnapshot
-	Harness       run.Harness
-	Attempt       run.Attempt
-	Session       run.Session
+	Snapshot RunSnapshot
+	Harness  run.Harness
+	Attempt  run.Attempt
+	Session  run.Session
+	// WorktreePath is the run's recorded worktree path exactly as the
+	// worktree row persisted it (worktree.create's outcome; recorded
+	// before any pane exists, so exposing it keeps this context free of
+	// the later binding), or "" when no worktree row exists yet.
+	// PrepareLaunchExec refuses a launch whose working directory does not
+	// canonically resolve to it — the workspace-trust seed and the exec
+	// must target the attempt's own worktree, never a foreign directory.
+	WorktreePath  string
 	IncarnationID identity.IncarnationID
 	Claim         *LaunchClaim
 	StopRequested bool
