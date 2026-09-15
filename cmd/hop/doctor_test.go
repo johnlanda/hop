@@ -100,6 +100,59 @@ func TestRunDoctorMissingBinaryDoesNotGuess(t *testing.T) {
 	}
 }
 
+func TestRunDoctorStateRootLine(t *testing.T) {
+	stub := writeFailingHerdrStub(t)
+	t.Setenv("PATH", filepath.Dir(stub)) // Harness lookups must miss quickly and hermetically.
+
+	t.Run("override with an existing store file", func(t *testing.T) {
+		root := t.TempDir()
+		if err := os.WriteFile(filepath.Join(root, "hop.db"), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var stdout, stderr bytes.Buffer
+
+		if _, err := runDoctor([]string{"-herdr", stub}, &stdout, &stderr, mapGetenv(map[string]string{"HOP_STATE_DIR": root})); err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+
+		want := "state root: " + root + " (override; store present)"
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("stdout lacks %q; got:\n%s", want, stdout.String())
+		}
+	})
+
+	t.Run("default with no store yet", func(t *testing.T) {
+		home := t.TempDir()
+		var stdout, stderr bytes.Buffer
+
+		if _, err := runDoctor([]string{"-herdr", stub}, &stdout, &stderr, mapGetenv(map[string]string{"HOME": home})); err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+
+		want := "state root: " + filepath.Join(home, ".local", "state", "hop") + " (default; store absent (created on first run))"
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("stdout lacks %q; got:\n%s", want, stdout.String())
+		}
+	})
+
+	t.Run("relative override is reported and unhealthy", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+
+		code, err := runDoctor([]string{"-herdr", stub}, &stdout, &stderr, mapGetenv(map[string]string{"HOP_STATE_DIR": "rel/state"}))
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+
+		if code != exitFailure {
+			t.Errorf("exit code = %d, want %d", code, exitFailure)
+		}
+		want := `unavailable  state root: HOP_STATE_DIR "rel/state" is not an absolute path`
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("stdout lacks %q; got:\n%s", want, stdout.String())
+		}
+	})
+}
+
 func TestRunDoctorReportsWriteFailures(t *testing.T) {
 	stub := writeFailingHerdrStub(t)
 	// A hermetic PATH so the harness probe cannot execute a real, locally
