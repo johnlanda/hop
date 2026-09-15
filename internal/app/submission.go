@@ -133,7 +133,8 @@ type ClaimedSubmission struct {
 type SubmissionStore interface {
 	// ClaimLaunch is written by hop launch BEFORE exec: run, attempt,
 	// incarnation, the expected executable's resolved absolute path, argv
-	// digest, own pid, state exec_pending. It fails — and the caller must
+	// digest, own pid, the workspace-trust seed evidence and state
+	// exec_pending. It fails — and the caller must
 	// not exec — when the run is stopping or stopped, the incarnation is
 	// not current, or a claim for this incarnation already exists with a
 	// different pid. A rewrite by the same pid is idempotent.

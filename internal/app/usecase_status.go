@@ -38,6 +38,9 @@ type RunDetailView struct {
 	WorktreePath   string
 	BindingSummary string // "workspace/tab/pane"; "" when no current binding
 	ClaimState     string // "" when no launch claim exists yet
+	// SeedEvidence is the claim's recorded workspace-trust pre-seeding
+	// outcome; "" when no launch claim exists yet.
+	SeedEvidence   string
 	PendingOps     int
 	LastSubmission string // the last submission outcome's kind; "" when none
 	Artifacts      []string
@@ -106,6 +109,7 @@ func runDetailView(d RunDetail) RunDetailView { //nolint:gocritic // hugeParam: 
 	}
 	if d.Claim != nil {
 		view.ClaimState = string(d.Claim.State)
+		view.SeedEvidence = d.Claim.SeedEvidence
 	}
 	if d.LastSubmission != nil {
 		view.LastSubmission = string(d.LastSubmission.Kind)

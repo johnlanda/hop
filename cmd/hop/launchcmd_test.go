@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -38,7 +39,8 @@ func TestRunLaunch(t *testing.T) {
 			settledIncarnation, settledReason = incarnationID, reason
 			return nil
 		}
-		td := newTestDeps(ctrl, workerEnv, t.TempDir())
+		dir := t.TempDir()
+		td := newTestDeps(ctrl, workerEnv, dir)
 		var stdout, stderr bytes.Buffer
 
 		code, err := runLaunch([]string{"--run", testRunID, "--attempt", testAttemptID}, &stdout, &stderr, td.deps)
@@ -56,6 +58,13 @@ func TestRunLaunch(t *testing.T) {
 		}
 		if prepared.PID != 4242 || prepared.HOPPath != "/opt/hop/bin/hop" || prepared.LookupExecutable == nil {
 			t.Errorf("prepared request = %+v", prepared)
+		}
+		resolvedDir, err := filepath.EvalSymlinks(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if prepared.WorkerDir != resolvedDir {
+			t.Errorf("prepared worker dir = %q, want the symlink-resolved working directory %q", prepared.WorkerDir, resolvedDir)
 		}
 		if len(prepared.Environ) == 0 {
 			t.Error("the launcher's inherited environment was not passed for validation and sanitization")
@@ -118,6 +127,27 @@ func TestRunLaunch(t *testing.T) {
 		}
 		if len(td.openCalls) != 0 {
 			t.Error("the store was opened with a refused state root")
+		}
+	})
+
+	t.Run("an unresolvable working directory is a diagnostic failure before any store access", func(t *testing.T) {
+		td := newTestDeps(&fakeController{}, workerEnv, t.TempDir())
+		td.deps.getwd = func() (string, error) { return "", errors.New("getwd: no such directory") }
+		var stdout, stderr bytes.Buffer
+
+		code, err := runLaunch([]string{"--run", testRunID, "--attempt", testAttemptID}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+
+		if code != exitFailure {
+			t.Errorf("exit code = %d, want %d", code, exitFailure)
+		}
+		if !strings.Contains(stderr.String(), "working directory") {
+			t.Errorf("stderr = %q, want the working-directory diagnostic", stderr.String())
+		}
+		if len(td.openCalls) != 0 {
+			t.Error("the store was opened although the worker directory never resolved")
 		}
 	})
 

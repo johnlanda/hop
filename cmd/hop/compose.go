@@ -141,6 +141,7 @@ func openController(ctx context.Context, cfg controllerConfig) (controllerAPI, f
 		Commands:      process.Runner{},
 		Groups:        process.GroupInspector{},
 		Config:        config.Source{},
+		Trust:         system.TrustSeeder{},
 		GitExecutable: gitExecutable,
 	}
 	if cfg.withRuntime {

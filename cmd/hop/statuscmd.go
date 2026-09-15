@@ -131,6 +131,7 @@ func renderRunDetail(w io.Writer, detail *app.RunDetailView) (int, error) {
 		"  worktree:      " + orUnset(detail.WorktreePath),
 		"  binding:       " + orUnset(detail.BindingSummary),
 		"  launch claim:  " + orUnset(detail.ClaimState),
+		"  trust seed:    " + orUnset(detail.SeedEvidence),
 		fmt.Sprintf("  pending ops:   %d", detail.PendingOps),
 		"  last submit:   " + orUnset(detail.LastSubmission),
 	}
