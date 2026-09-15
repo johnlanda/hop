@@ -14,6 +14,7 @@ and adapter packages, and of every future domain package.
 | --- | --- | --- |
 | [tree_test.go](tree_test.go) | `moduleRoot`, `readTreeFile`, `goModDirective`, `isExcludedDirectory`, `excludedComponent`, `sourceFile`, `sourceTree`, `walkSources`, `parseSourceFile`, `hasBuildConstraint`, `writeFiles` | Source inventory shared by both checkers: parses every Go file outside `repos/`, `vendor`, `testdata` and hidden or underscore-prefixed directories (so `.worktrees/` too), including tests, generated and build-constrained files; fails on a nested module, a parse error or an empty tree |
 | [arch_test.go](arch_test.go) | `category`, `rule`, `ruleTable`, `productionRules`, `validateRules`, `inFamily`, `diagnostic`, `listedPackage`, `listedError`, `isBuildConstraintExclusion`, `goList`, `checker`, `excludedRoot`, `loadDiagnostics`, `checkTree`, `forbiddenSelectors`, `fixtureRules`, `writeFixtureModule`, `TestArchitectureRuleTableIsValid`, `TestArchitectureRealTree`, `TestArchitectureThirdPartyFamilyMatching`, `TestArchitectureDefaultPackageName`, `TestArchitectureFixtures`, `TestArchitectureCleanFixtureCompiles` | Import and purity rules: exact per-package allowlists, category matrix, `go list -deps -test` resolution and production closure, physical excluded-tree check on listed packages, load-error diagnostics, ambient clock and randomness check, synthetic positive and negative fixtures |
+| [forbiddencalls_test.go](forbiddencalls_test.go) | `forbiddenCallTargets`, `forbiddenTransportMethodNames`, `listExportedPackages`, `checkForbiddenCalls`, `checkPackageForbiddenCalls`, `forbiddenCallFixtureBase`, `TestForbiddenTransportCallsRealTree`, `TestForbiddenTransportCallsFixtures` | The type-aware forbidden-call rule (phase-3 design section 7): go/types over `go list -export` data proves production code in `internal/app` and `cmd/hop` never references `SendText`/`SendKeys`/`Prompt` on a herdr- or app-declared type and never calls herdr's `Client.Call`; fixtures cover chained selectors, interface/type aliases, method values, method expressions, a raw composition `Call`, and the allowed shapes (same-named local methods, test files, the adapter's own call sites) |
 | [guides_test.go](guides_test.go) | `guideIssue`, `guideDirectories`, `markdownDocument`, `parseMarkdown`, `bracketSpan`, `inlineDestination`, `stripMarkdownCode`, `listContentIndent`, `blankInlineCode`, `resolveLink`, `findGuides`, `checkGuides`, `TestGuidesRealTree`, `TestGuidesDirectoryMap`, `TestGuidesMarkdownLinks`, `TestGuidesLinkResolution`, `TestGuidesFixtures` | Guide coverage: an AGENTS.md in the root, every package directory and every grouping directory; immediate-child links among the rendered links; resolvable inline, image, reference-use and definition targets in every AGENTS.md, with code blocks, code spans and escapes read literally |
 
 ## Child guides
@@ -113,6 +114,14 @@ and adapter packages, and of every future domain package.
   passing is evidence about a tree that type-checks.
 - `make docs-check` — `go test -count=1 -run '^TestGuides' ./internal`:
   real-tree guides with a nonempty inventory and the fixture table.
+- `go test -count=1 -run '^TestForbiddenTransportCalls' ./internal`: the
+  type-aware forbidden-call rule over the real tree and its synthetic
+  fixture module. It resolves methods through the compiler's export data
+  (`go list -export -deps`), so the running toolchain must be the one
+  that produced the export data — true under `make`, whose pinned
+  GOTOOLCHAIN governs both the test binary and the go tool it invokes.
+  Scope is the production files the go tool compiles on this host
+  (GoFiles); `_test.go` files are deliberately outside the rule.
 - Test fixtures: synthetic modules are written to temporary directories by
   `writeFixtureModule` (architecture) and `writeFiles` (guides). Third-party
   imports resolve through local `replace` directives, so no network is used.
