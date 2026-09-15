@@ -32,6 +32,13 @@ var sessionTransitions = newTransitionTable(concatPairs( //nolint:gochecknogloba
 	fromAny(SessionTerminated, SessionReserved, SessionLaunching, SessionStopping, SessionReconciling),
 ))
 
+// terminalSessionStates are the states the section 5 table never lists as
+// a "from": once reached, a session's own transitions are exhausted.
+var terminalSessionStates = map[SessionState]bool{ //nolint:gochecknoglobals // terminalSessionStates is the exhaustive, immutable terminal subset of the Session state table; it never mutates after init.
+	SessionLost:       true,
+	SessionTerminated: true,
+}
+
 // Role is a session's part in a run. Phase 2 has exactly one worker session
 // per incarnation and no manager session.
 type Role string
@@ -123,20 +130,38 @@ func NewManagerSession(id identity.SessionID, runID identity.RunID, harness Harn
 
 // NewChildSession constructs an implementer or reviewer session in its
 // initial reserved state, bound to attemptID and delegated by parent — the
-// run's manager session at creation time. One-level delegation is enforced
-// here for the part this package can check unaided: parent must itself
-// carry no parent (ErrDelegationDepth otherwise — a session with a parent
-// can never itself be a parent). That parent is actually the run's
-// CURRENT manager session is a cross-session fact only the application,
-// with visibility into every session, can validate before calling this
-// constructor. role must be RoleImplementer or RoleReviewer; any other
-// role is ErrInvalidTransition.
+// run's manager session at creation time. Every fact this package can
+// check unaided about parent is enforced here: it must carry no parent of
+// its own (ErrDelegationDepth otherwise — a session with a parent can
+// never itself be a parent); it must have RoleManager, belong to the same
+// run, and be well-formed for that role (empty AttemptID, nil
+// ParentSessionID — a manager binds neither) and non-terminal
+// (ErrInvalidTransition for any of these). role must be RoleImplementer
+// or RoleReviewer; any other role is also ErrInvalidTransition. That
+// parent is actually the run's sole CURRENT (non-terminal) manager among
+// every session — as opposed to merely A well-formed, non-terminal
+// manager of this run, which is everything a single Session value can
+// ever attest to on its own — is a cross-session uniqueness fact only the
+// application, querying every session, can validate before calling this
+// constructor.
 func NewChildSession(id identity.SessionID, runID identity.RunID, attemptID identity.AttemptID, role Role, parent Session, harness Harness, now time.Time) (Session, error) { //nolint:gocritic // hugeParam: Session is passed by value everywhere in this package; this constructor mirrors that convention.
 	if role != RoleImplementer && role != RoleReviewer {
 		return Session{}, fmt.Errorf("%w: session %s: %q is not a delegable role", ErrInvalidTransition, id, role)
 	}
 	if parent.ParentSessionID != nil {
 		return Session{}, fmt.Errorf("%w: session %s: parent %s already has a parent", ErrDelegationDepth, id, parent.ID)
+	}
+	if parent.Role != RoleManager {
+		return Session{}, fmt.Errorf("%w: session %s: parent %s is not a manager", ErrInvalidTransition, id, parent.ID)
+	}
+	if parent.RunID != runID {
+		return Session{}, fmt.Errorf("%w: session %s: parent %s belongs to a different run", ErrInvalidTransition, id, parent.ID)
+	}
+	if parent.AttemptID != "" {
+		return Session{}, fmt.Errorf("%w: session %s: parent %s is not a well-formed manager (has an attempt)", ErrInvalidTransition, id, parent.ID)
+	}
+	if terminalSessionStates[parent.State] {
+		return Session{}, fmt.Errorf("%w: session %s: parent %s is terminal (%s)", ErrInvalidTransition, id, parent.ID, parent.State)
 	}
 	parentID := parent.ID
 	return Session{

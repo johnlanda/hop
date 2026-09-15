@@ -23,8 +23,10 @@ func later() time.Time { return epoch().Add(time.Hour) }
 const (
 	testRepositoryID = identity.RepositoryID("11111111-1111-4111-8111-111111111111")
 	testRunID        = identity.RunID("22222222-2222-4222-8222-222222222222")
-	testTaskID       = identity.TaskID("33333333-3333-4333-8333-333333333333")
-	testAttemptID    = identity.AttemptID("44444444-4444-4444-8444-444444444444")
+	// testSecondRunID is a distinct run, for cross-run rejection tests.
+	testSecondRunID = identity.RunID("22222222-2222-4222-8222-222222222223")
+	testTaskID      = identity.TaskID("33333333-3333-4333-8333-333333333333")
+	testAttemptID   = identity.AttemptID("44444444-4444-4444-8444-444444444444")
 	// testSecondAttemptID is a retry's new attempt: a fresh identity for
 	// attempt number 2 of the same task.
 	testSecondAttemptID = identity.AttemptID("44444444-4444-4444-8444-444444444445")

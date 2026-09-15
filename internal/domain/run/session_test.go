@@ -182,6 +182,53 @@ func TestNewChildSession(t *testing.T) {
 			t.Fatalf("NewChildSession(parent has a parent): error = %v, want ErrDelegationDepth", err)
 		}
 	})
+
+	// The remaining subtests are the round-1 review's required negative
+	// vectors: NewChildSession must reject a parent that is not actually
+	// a well-formed, same-run, non-terminal manager — not just check
+	// delegation depth and the new child's own role.
+
+	t.Run("a Phase 2 worker session cannot be a parent", func(t *testing.T) {
+		worker := run.NewSession(testSessionID, testRunID, testAttemptID, run.HarnessClaude, epoch())
+
+		_, err := run.NewChildSession(testReviewerSessionID, testRunID, testSecondAttemptID, run.RoleReviewer, worker, run.HarnessClaude, epoch())
+		if !errors.Is(err, run.ErrInvalidTransition) {
+			t.Fatalf("NewChildSession(worker parent): error = %v, want ErrInvalidTransition", err)
+		}
+	})
+
+	t.Run("a manager from a different run cannot be a parent", func(t *testing.T) {
+		otherRunManager := run.NewManagerSession(testManagerSessionID, testSecondRunID, run.HarnessClaude, epoch())
+
+		_, err := run.NewChildSession(testSessionID, testRunID, testAttemptID, run.RoleImplementer, otherRunManager, run.HarnessClaude, epoch())
+		if !errors.Is(err, run.ErrInvalidTransition) {
+			t.Fatalf("NewChildSession(cross-run manager): error = %v, want ErrInvalidTransition", err)
+		}
+	})
+
+	t.Run("a malformed attempt-bound manager cannot be a parent", func(t *testing.T) {
+		// RoleManager but carrying an attempt: not a well-formed manager
+		// shape, regardless of how it was constructed.
+		malformed := run.Session{ID: testManagerSessionID, RunID: testRunID, AttemptID: testAttemptID, Role: run.RoleManager, State: run.SessionActive}
+
+		_, err := run.NewChildSession(testSessionID, testRunID, testSecondAttemptID, run.RoleImplementer, malformed, run.HarnessClaude, epoch())
+		if !errors.Is(err, run.ErrInvalidTransition) {
+			t.Fatalf("NewChildSession(attempt-bound manager): error = %v, want ErrInvalidTransition", err)
+		}
+	})
+
+	t.Run("a terminated manager cannot be a parent", func(t *testing.T) {
+		for _, state := range []run.SessionState{run.SessionLost, run.SessionTerminated} {
+			t.Run(string(state), func(t *testing.T) {
+				terminated := run.Session{ID: testManagerSessionID, RunID: testRunID, Role: run.RoleManager, State: state}
+
+				_, err := run.NewChildSession(testSessionID, testRunID, testAttemptID, run.RoleImplementer, terminated, run.HarnessClaude, epoch())
+				if !errors.Is(err, run.ErrInvalidTransition) {
+					t.Fatalf("NewChildSession(terminated manager, %s): error = %v, want ErrInvalidTransition", state, err)
+				}
+			})
+		}
+	})
 }
 
 // TestSessionAssignNativeRefIsImmutable proves that a session's native
