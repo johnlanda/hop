@@ -33,7 +33,7 @@ func TestSpikeIntegrationRefCompareAndSwap(t *testing.T) {
 	artifacts := newArtifactDir(t)
 	server := prepareServer(t, artifacts)
 	server.start(t)
-	repo := newFixtureRepo(t, artifacts, "repo")
+	repo := newFixtureRepo(t, artifacts, server, "repo")
 
 	const integrationRef = "refs/heads/hop/r1/integration"
 	mustRunGit(t, repo.Root, repo.gitHome, "update-ref", integrationRef, repo.Base)
@@ -82,7 +82,7 @@ func TestSpikeDetachedMergeLeavesRefUntouched(t *testing.T) {
 	artifacts := newArtifactDir(t)
 	server := prepareServer(t, artifacts)
 	server.start(t)
-	repo := newFixtureRepo(t, artifacts, "repo")
+	repo := newFixtureRepo(t, artifacts, server, "repo")
 
 	const integrationRef = "refs/heads/hop/r1/integration"
 	mustRunGit(t, repo.Root, repo.gitHome, "update-ref", integrationRef, repo.Base)
@@ -134,7 +134,7 @@ func TestSpikeDetachedMergeLeavesRefUntouched(t *testing.T) {
 // ref and as a directory.
 func TestSpikeRunScopedRefFamilyCoexists(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	repo := newFixtureRepo(t, artifacts, "repo")
+	repo := newFixtureRepo(t, artifacts, nil, "repo")
 
 	family := []string{
 		"refs/heads/hop/r1/integration",
@@ -166,7 +166,7 @@ func TestSpikeRunScopedRefFamilyCoexists(t *testing.T) {
 // This is exactly the collision `hop/r<seq>/integration` (G1) avoids.
 func TestSpikeBareRunBranchCollidesWithAttemptBranches(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	repo := newFixtureRepo(t, artifacts, "repo")
+	repo := newFixtureRepo(t, artifacts, nil, "repo")
 
 	mustRunGit(t, repo.Root, repo.gitHome, "update-ref", "refs/heads/hop/r1", repo.Base)
 	out, err := runGit(t, repo.Root, repo.gitHome, "update-ref", "refs/heads/hop/r1/t1a1", repo.Base)
@@ -183,7 +183,7 @@ func TestSpikeBareRunBranchCollidesWithAttemptBranches(t *testing.T) {
 // existing value -- once that ref exists.
 func TestSpikeUpdateRefCreateOnlySemantics(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	repo := newFixtureRepo(t, artifacts, "repo")
+	repo := newFixtureRepo(t, artifacts, nil, "repo")
 
 	const ref = "refs/heads/hop/r1/integration"
 	if out, err := runGit(t, repo.Root, repo.gitHome, "update-ref", ref, repo.Base, ""); err != nil {
@@ -217,7 +217,7 @@ func TestSpikeIntegrationRollbackPreservesRejectedMergeReachable(t *testing.T) {
 	artifacts := newArtifactDir(t)
 	server := prepareServer(t, artifacts)
 	server.start(t)
-	repo := newFixtureRepo(t, artifacts, "repo")
+	repo := newFixtureRepo(t, artifacts, server, "repo")
 
 	const ref = "refs/heads/hop/r1/integration"
 	mustRunGit(t, repo.Root, repo.gitHome, "update-ref", ref, repo.Base, "")

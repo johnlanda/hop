@@ -78,7 +78,7 @@ func detachedScratch(t *testing.T, repo *fixtureRepo, artifacts *artifactDir, na
 // here as part of the matrix rather than assumed).
 func TestSpikeMergeTwoParentCommit(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	repo := newFixtureRepo(t, artifacts, "repo")
+	repo := newFixtureRepo(t, artifacts, nil, "repo")
 	const ref = "refs/heads/hop/r1/integration"
 	mustRunGit(t, repo.Root, repo.gitHome, "update-ref", ref, repo.Base)
 
@@ -110,7 +110,7 @@ func TestSpikeMergeTwoParentCommit(t *testing.T) {
 // stays untouched throughout.
 func TestSpikeMergeConflictExitCodeAndIndexState(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	repo := newFixtureRepo(t, artifacts, "repo")
+	repo := newFixtureRepo(t, artifacts, nil, "repo")
 	const ref = "refs/heads/hop/r1/integration"
 
 	repo.writeFile(t, "contested.txt", "base content\n", 0o644)
@@ -162,7 +162,7 @@ func TestSpikeMergeConflictExitCodeAndIndexState(t *testing.T) {
 // commit created.
 func TestSpikeMergeAlreadyUpToDateNoOp(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	repo := newFixtureRepo(t, artifacts, "repo")
+	repo := newFixtureRepo(t, artifacts, nil, "repo")
 	const ref = "refs/heads/hop/r1/integration"
 
 	repo.writeFile(t, "advance.txt", "advance\n", 0o644)
@@ -191,7 +191,7 @@ func TestSpikeMergeAlreadyUpToDateNoOp(t *testing.T) {
 // two-parent merge commit rather than moving HEAD directly to source.
 func TestSpikeMergeNoFFForcesCommitOnFastForwardableHead(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	repo := newFixtureRepo(t, artifacts, "repo")
+	repo := newFixtureRepo(t, artifacts, nil, "repo")
 	const ref = "refs/heads/hop/r1/integration"
 	mustRunGit(t, repo.Root, repo.gitHome, "update-ref", ref, repo.Base)
 
@@ -231,7 +231,7 @@ func TestSpikeMergeNoFFForcesCommitOnFastForwardableHead(t *testing.T) {
 // suppresses both.
 func TestSpikeMergeRepoLocalHooksFire(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	repo := newFixtureRepo(t, artifacts, "repo")
+	repo := newFixtureRepo(t, artifacts, nil, "repo")
 
 	hooksDir := filepath.Join(repo.Root, ".git", "hooks")
 	preMergeCommitMarker := filepath.Join(artifacts.dir(t, "hook-evidence"), "pre-merge-commit-fired")
@@ -264,7 +264,7 @@ func TestSpikeMergeRepoLocalHooksFire(t *testing.T) {
 // has no suppression flag of its own.
 func TestSpikeMergeNoVerifySkipsPreMergeCommitOnly(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	repo := newFixtureRepo(t, artifacts, "repo")
+	repo := newFixtureRepo(t, artifacts, nil, "repo")
 
 	hooksDir := filepath.Join(repo.Root, ".git", "hooks")
 	preMergeCommitMarker := filepath.Join(artifacts.dir(t, "hook-evidence"), "pre-merge-commit-fired")
@@ -298,7 +298,7 @@ func TestSpikeMergeNoVerifySkipsPreMergeCommitOnly(t *testing.T) {
 // configured there", not an error).
 func TestSpikeMergeHooksPathSuppressesRepoLocalHooks(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	repo := newFixtureRepo(t, artifacts, "repo")
+	repo := newFixtureRepo(t, artifacts, nil, "repo")
 
 	hooksDir := filepath.Join(repo.Root, ".git", "hooks")
 	preMergeCommitMarker := filepath.Join(artifacts.dir(t, "hook-evidence"), "pre-merge-commit-fired")
@@ -350,7 +350,7 @@ func writeHookScript(t *testing.T, hooksDir, name, markerPath string) {
 // agent or key configured at all (a signing attempt here would fail loudly).
 func TestSpikeMergeRepoLocalSigningConfigDoesNotBlock(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	repo := newFixtureRepo(t, artifacts, "repo")
+	repo := newFixtureRepo(t, artifacts, nil, "repo")
 
 	// The diverging source commit is built BEFORE turning signing on: this
 	// fixture's own commit path (repo.commit) is a plain `git commit` with no
@@ -386,7 +386,7 @@ func TestSpikeMergeRepoLocalSigningConfigDoesNotBlock(t *testing.T) {
 // discriminator.
 func TestSpikeMergeNonConflictFailureIsDistinctFromConflict(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	repo := newFixtureRepo(t, artifacts, "repo")
+	repo := newFixtureRepo(t, artifacts, nil, "repo")
 
 	repo.writeFile(t, "source.txt", "source change\n", 0o644)
 	source := repo.commit(t, "source change")
@@ -455,7 +455,7 @@ func TestSpikeMergeNonConflictFailureIsDistinctFromConflict(t *testing.T) {
 // "now".
 func TestSpikeCommitTreeIsDeterministic(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	repo := newFixtureRepo(t, artifacts, "repo")
+	repo := newFixtureRepo(t, artifacts, nil, "repo")
 
 	tree := strings.TrimSpace(mustRunGit(t, repo.Root, repo.gitHome, "rev-parse", repo.Base+"^{tree}"))
 	env := append(fixtureGitEnviron(repo.gitHome),

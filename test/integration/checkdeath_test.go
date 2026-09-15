@@ -60,7 +60,7 @@ func configWithTimeout(checkCommand []string, timeout string, repeatable bool) s
 // which kills the group outright rather than waiting out a timeout).
 func TestRealProcessCheckLeaderExitWithLiveChildren(t *testing.T) {
 	artifacts, server := newFixtureRunEnv(t)
-	repo := newFixtureRepo(t, artifacts, "repo")
+	repo := newFixtureRepo(t, artifacts, server, "repo")
 	repo.writeFile(t, leaderExitCheckScriptName, leaderExitCheckScriptSource, 0o755)
 	repo.writeFile(t, configRelPath, configWithTimeout([]string{"sh", leaderExitCheckScriptName}, "5s", false), 0o644)
 	repo.commit(t, "wire a leader-exits-with-live-children check")
@@ -214,7 +214,7 @@ func releaseCheckGate(t *testing.T, gatePath string) {
 // normal completion.
 func TestRealProcessCheckDeathUnknownOutcomeRepeatable(t *testing.T) {
 	artifacts, server := newFixtureRunEnv(t)
-	repo := newFixtureRepo(t, artifacts, "repo")
+	repo := newFixtureRepo(t, artifacts, server, "repo")
 	gatePath := filepath.Join(artifacts.dir(t, "gate"), "release")
 	withGatedCheck(t, repo, gatePath, "30s", true)
 	fx := startRun(t, artifacts, server, repo, "submit-valid")

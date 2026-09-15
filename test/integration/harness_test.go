@@ -255,16 +255,32 @@ func (sp *serverProcess) takeTeardown() bool {
 	return true
 }
 
-// testConfig is the test-only configuration: no onboarding, fixed headless
-// geometry for repeatable pane snapshots, nesting allowed so a client may
-// attach inside the test server, and an Agent sidebar layout that renders
-// HOP's own metadata tokens so the PTY smoke can assert row rendering. The
-// sidebar rows affect only an attached client's rendering, so they are inert
-// for the API-only tests. Missing token values simply disappear.
-const testConfig = "onboarding = false\n" +
-	"\n[server]\nheadless_cols = 100\nheadless_rows = 30\n" +
-	"\n[experimental]\nallow_nested = true\n" +
-	"\n[ui.sidebar.agents]\nrows = [[\"state_icon\", \"agent\", \"$hop_role\"], [\"$hop_run\", \"$hop_task\"]]\n"
+// testConfig renders the test-only configuration for a server rooted at
+// base: no onboarding, fixed headless geometry for repeatable pane
+// snapshots, nesting allowed so a client may attach inside the test server,
+// an Agent sidebar layout that renders HOP's own metadata tokens so the PTY
+// smoke can assert row rendering, and an explicit `[worktrees] directory`
+// pinned under base. The sidebar rows affect only an attached client's
+// rendering, so they are inert for the API-only tests. Missing token values
+// simply disappear.
+//
+// The worktrees pin matters for every server, not only the live test:
+// Herdr's own default (`~/.herdr/worktrees`,
+// repos/herdr/src/config/model.rs's `impl Default for WorktreesConfig`)
+// expands against HOME, and the live scenario deliberately sets HOME to the
+// operator's real home directory (see the live-scenario notes in
+// docs/architecture/native-harness-compat.md and TestLiveClaudeDefaultProfileRun),
+// so an unpinned config would create real worktrees under the operator's
+// actual ~/.herdr/worktrees. base is an absolute path, so Herdr's own tilde
+// expansion (`expand_tilde_absolute_path`, repos/herdr/src/worktree.rs)
+// returns it unchanged regardless of HOME.
+func testConfig(base string) string {
+	return "onboarding = false\n" +
+		"\n[server]\nheadless_cols = 100\nheadless_rows = 30\n" +
+		"\n[experimental]\nallow_nested = true\n" +
+		"\n[ui.sidebar.agents]\nrows = [[\"state_icon\", \"agent\", \"$hop_role\"], [\"$hop_run\", \"$hop_task\"]]\n" +
+		"\n[worktrees]\ndirectory = \"" + filepath.Join(base, "worktrees") + "\"\n"
+}
 
 // newServerRoots prepares the temporary config/state/runtime roots and the
 // test-only config file. The base directory is created outside t.TempDir
@@ -280,12 +296,12 @@ func newServerRoots(t *testing.T) (base string) {
 			t.Logf("remove server roots: %v", err)
 		}
 	})
-	for _, dir := range []string{"c/herdr", "r", "st", "work", "home", "bin", "cache", "data"} {
+	for _, dir := range []string{"c/herdr", "r", "st", "work", "home", "bin", "cache", "data", "worktrees"} {
 		if err := os.MkdirAll(filepath.Join(base, dir), 0o700); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := os.WriteFile(filepath.Join(base, "c", "herdr", "config.toml"), []byte(testConfig), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(base, "c", "herdr", "config.toml"), []byte(testConfig(base)), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	writeHarnessStubs(t, filepath.Join(base, "bin"))

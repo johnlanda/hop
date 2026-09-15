@@ -621,6 +621,29 @@ harness; a transcript continuation without the account/provider/model
 evidence is not sufficient. The suite never stores or logs token values, and
 the ordinary test suite must not depend on it.
 
+### What actually landed instead
+
+The scenario that shipped is narrower than the above: `test/integration`'s
+`TestLiveClaudeDefaultProfileRun` (Claude Code only, the operator's own
+default profile rather than a scratch-authenticated one, gated identically
+on `HOP_LIVE_HARNESS=1`; see
+[test/integration/AGENTS.md](../../test/integration/AGENTS.md)'s "Live
+scenario" section for the full contract). Running it for real surfaced one
+environment fact worth recording here, since it is about Claude Code's own
+credential lookup, not merely test-harness plumbing: Claude Code's keychain
+credential item is keyed by the account name (`$USER`; see the Claude Code
+"Credential storage" note above), so a worker process whose `HOME` is the
+operator's real home directory but whose environment was otherwise built
+from scratch — no `USER`, no `LOGNAME`, exactly as a harness-launched
+pane's environment is constructed — cannot find its own keychain item and
+reports "Not logged in" even though the operator's default profile is
+genuinely authenticated. Confirmed live via `ps -E` on the worker process.
+This is a fact about Claude Code's own lookup, so a test harness (or any
+other launcher) that authenticates the operator's own default profile
+through a from-scratch environment must pass `USER`/`LOGNAME` through
+unchanged; HOP's own launcher does not construct an environment this way
+and is unaffected.
+
 ## Evidence ledger
 
 Sanitized reproduction detail for the observations above. Every probe ran

@@ -85,7 +85,7 @@ func startRun(t *testing.T, artifacts *artifactDir, server *testServer, repo *fi
 func startFixtureRun(t *testing.T, behavior string) *fixtureRun {
 	t.Helper()
 	artifacts, server := newFixtureRunEnv(t)
-	repo := newFixtureRepo(t, artifacts, "repo")
+	repo := newFixtureRepo(t, artifacts, server, "repo")
 	return startRun(t, artifacts, server, repo, behavior)
 }
 

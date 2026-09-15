@@ -35,7 +35,7 @@ func statusDetailValues(output, label string) []string {
 // status as evidence, rather than discarded with the removed checkout.
 func TestRealProcessFailedCheckRetainsArtifacts(t *testing.T) {
 	artifacts, server := newFixtureRunEnv(t)
-	repo := newFixtureRepo(t, artifacts, "repo")
+	repo := newFixtureRepo(t, artifacts, server, "repo")
 	// The fixture worker's commitChange never touches CHECK_RESULT, so
 	// whatever this second commit leaves committed is what check.sh sees
 	// when it runs against the worker's submitted commit.
@@ -105,7 +105,7 @@ func TestRealProcessFailedCheckRetainsArtifacts(t *testing.T) {
 // like the plain deterministic check would.
 func TestRealProcessGitDependentCheckSucceedsInDetachedCheckout(t *testing.T) {
 	artifacts, server := newFixtureRunEnv(t)
-	repo := newFixtureRepoGitDependentCheck(t, artifacts, "repo")
+	repo := newFixtureRepoGitDependentCheck(t, artifacts, server, "repo")
 	fx := startRun(t, artifacts, server, repo, "submit-valid")
 
 	fx.requireRunState(t, "completed")
@@ -137,7 +137,7 @@ func TestRealProcessGitDependentCheckSucceedsInDetachedCheckout(t *testing.T) {
 // failure, not left to the check author to discover.
 func TestRealProcessSubmoduleRepositoryFailsClearly(t *testing.T) {
 	artifacts, server := newFixtureRunEnv(t)
-	repo := newFixtureRepoWithSubmodule(t, artifacts, "repo")
+	repo := newFixtureRepoWithSubmodule(t, artifacts, server, "repo")
 	fx := startRun(t, artifacts, server, repo, "submit-valid")
 
 	fx.requireRunState(t, "failed")

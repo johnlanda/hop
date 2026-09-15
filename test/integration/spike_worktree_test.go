@@ -45,7 +45,7 @@ func TestSpikeConcurrentWorktreeCreate(t *testing.T) {
 	server := prepareServer(t, artifacts)
 	server.start(t)
 
-	repo := newFixtureRepo(t, artifacts, "repo")
+	repo := newFixtureRepo(t, artifacts, server, "repo")
 	repo.writeFile(t, "SECOND_MARKER", "second\n", 0o644)
 	secondOID := repo.commit(t, "second commit")
 	if secondOID == repo.Base {
@@ -227,7 +227,7 @@ func TestSpikeWorktreeCreateExistingBranchIgnoresBase(t *testing.T) {
 	server := prepareServer(t, artifacts)
 	server.start(t)
 
-	repo := newFixtureRepo(t, artifacts, "repo")
+	repo := newFixtureRepo(t, artifacts, server, "repo")
 	const branch = "existing-branch"
 	// Created but never checked out anywhere, so `git worktree add` does not
 	// separately refuse it as already in use.
