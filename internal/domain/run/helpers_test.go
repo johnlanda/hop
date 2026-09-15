@@ -51,9 +51,28 @@ const (
 	testReviewerSessionID = identity.SessionID("55555555-5555-4555-8555-555555555551")
 	testSecondTaskID      = identity.TaskID("33333333-3333-4333-8333-333333333334")
 	testReviewTaskID      = identity.TaskID("33333333-3333-4333-8333-333333333335")
-	testMessageID         = identity.MessageID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
-	testSecondMessageID   = identity.MessageID("cccccccc-cccc-4ccc-8ccc-cccccccccccd")
-	testThirdMessageID    = identity.MessageID("cccccccc-cccc-4ccc-8ccc-cccccccccccf")
-	testReviewID          = identity.ReviewID("dddddddd-dddd-4ddd-8ddd-dddddddddddd")
-	testIntegrationID     = identity.IntegrationID("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee")
+	// testSecondReviewTaskID is the fix task's own review task (trace 5's
+	// R2, reviewing a new head after a reject).
+	testSecondReviewTaskID = identity.TaskID("33333333-3333-4333-8333-333333333336")
+	// testFixTaskID is trace 5's fix task F, planned after a reject.
+	testFixTaskID       = identity.TaskID("33333333-3333-4333-8333-333333333337")
+	testMessageID       = identity.MessageID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+	testSecondMessageID = identity.MessageID("cccccccc-cccc-4ccc-8ccc-cccccccccccd")
+	testThirdMessageID  = identity.MessageID("cccccccc-cccc-4ccc-8ccc-cccccccccccf")
+	// testFourthMessageID is trace 2's forwarded answer a1.
+	testFourthMessageID = identity.MessageID("cccccccc-cccc-4ccc-8ccc-cccccccccce0")
+	testReviewID        = identity.ReviewID("dddddddd-dddd-4ddd-8ddd-dddddddddddd")
+	// testSecondReviewID is trace 5's R2 verdict, approving the new head.
+	testSecondReviewID = identity.ReviewID("dddddddd-dddd-4ddd-8ddd-dddddddddddc")
+	testIntegrationID  = identity.IntegrationID("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee")
+	// testSecondIntegrationID is task B's integration in trace 1, a
+	// distinct row from task A's.
+	testSecondIntegrationID = identity.IntegrationID("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeed")
+	// testFixIntegrationID is trace 5's fix task F's integration,
+	// producing the new head H2.
+	testFixIntegrationID = identity.IntegrationID("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeef")
+	// testReviewAttemptID and testFixAttemptID round out the attempt
+	// identities the traces need beyond testAttemptID/testSecondAttemptID.
+	testReviewAttemptID = identity.AttemptID("44444444-4444-4444-8444-444444444446")
+	testFixAttemptID    = identity.AttemptID("44444444-4444-4444-8444-444444444447")
 )
