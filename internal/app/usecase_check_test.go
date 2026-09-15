@@ -470,7 +470,7 @@ func TestResumeDuringCheck(t *testing.T) {
 	// Controller B resumes: recovery reads the check-exec claim and
 	// signals the still-matching group; the worker warm-reattaches.
 	tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-		return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "/usr/bin/claude", Argv: []string{"claude", detail.AttemptID.String()}}}}, nil
+		return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "claude", Name: "claude", Argv: []string{"/usr/bin/claude", detail.AttemptID.String()}}}}, nil
 	}
 	tc.Clock.Advance(leaseTTL + time.Second)
 	result, newHandle, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String()))

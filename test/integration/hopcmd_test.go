@@ -384,3 +384,137 @@ func TestListGroupMembers(t *testing.T) {
 		t.Errorf("group members after retirement = %+v, want none", got)
 	}
 }
+
+// waitUntilDeadline polls condition like waitUntil, but with a caller-chosen
+// bound instead of the suite's standard conditionTimeout: a full
+// run/launch/corroborate/check round trip against a real herdr server
+// legitimately needs longer than most bounded waits in this suite.
+func waitUntilDeadline(deadline time.Duration, condition func() bool) bool {
+	end := time.Now().Add(deadline)
+	for {
+		if condition() {
+			return true
+		}
+		if time.Now().After(end) {
+			return false
+		}
+		time.Sleep(pollInterval)
+	}
+}
+
+// installFixtureWorkerAsClaudeStub replaces the server's stub "claude" on
+// its fixture PATH (writeHarnessStubs's harmless echo script, installed by
+// prepareServer) with the compiled fixture worker, so hop launch's
+// PATH-based harness resolution (section 6) execs the real fixture worker
+// instead of the stub. Safe to call any time after prepareServer: PATH
+// resolution happens at each launch, not once at server start.
+func installFixtureWorkerAsClaudeStub(t *testing.T, server *testServer, workerPath string) {
+	t.Helper()
+	copyExecutable(t, workerPath, filepath.Join(server.base, "bin", "claude"))
+}
+
+// extractRunID parses a controller's captured stdout for its first
+// "run <label> <uuid> started" line (runcmd.go's runRun) and returns the
+// label and run id.
+func extractRunID(t *testing.T, content string) (label, runID string) {
+	t.Helper()
+	for _, line := range strings.Split(content, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 4 && fields[0] == "run" && fields[3] == "started" {
+			return fields[1], fields[2]
+		}
+	}
+	t.Fatalf("controller output does not contain a \"run <label> <uuid> started\" line:\n%s", content)
+	return "", ""
+}
+
+// parseStatusDetail parses hop status -run's rendered detail block
+// (statuscmd.go's renderRunDetail) into field-name -> value, keyed by the
+// label preceding each line's first colon, trimmed. It is a plain-text
+// scrape of a deliberately human-oriented rendering, not a stable wire
+// format, but the rendering is a table-tested, stable command contract, and
+// scraping it directly is independent evidence — this suite is not
+// importing the DTOs it renders from.
+func parseStatusDetail(output string) map[string]string {
+	fields := map[string]string{}
+	for _, line := range strings.Split(output, "\n") {
+		trimmed := strings.TrimSpace(line)
+		key, value, ok := strings.Cut(trimmed, ":")
+		if !ok {
+			continue
+		}
+		fields[strings.TrimSpace(key)] = strings.TrimSpace(value)
+	}
+	return fields
+}
+
+// paneIDFromBinding extracts the pane id from hop status's rendered
+// binding summary, formatted "<workspace>/<workspace>:<tab>/<workspace>:
+// <pane>" (e.g. "w2/w2:t2/w2:p2"): the pane id is the last "/"-separated
+// segment. A binding with no "/" is returned unchanged.
+func paneIDFromBinding(binding string) string {
+	if idx := strings.LastIndex(binding, "/"); idx >= 0 {
+		return binding[idx+1:]
+	}
+	return binding
+}
+
+// waitForRunState polls `hop status -C <repoRoot> -run <runID>` until the
+// reported state is one of want, bounded by deadline, and returns the last
+// parsed detail fields. It fails the test with the last rendering on
+// timeout, never silently returning a stale or absent state.
+func waitForRunState(t *testing.T, env []string, repoRoot, runID string, deadline time.Duration, want ...string) map[string]string {
+	t.Helper()
+	var fields map[string]string
+	var lastOut string
+	found := waitUntilDeadline(deadline, func() bool {
+		result := runHop(t, env, repoRoot, "status", "-C", repoRoot, "-run", runID)
+		lastOut = result.Stdout
+		fields = parseStatusDetail(result.Stdout)
+		return slices.Contains(want, fields["state"])
+	})
+	if !found {
+		t.Fatalf("run %s never reached state %v; last hop status:\n%s", runID, want, lastOut)
+	}
+	return fields
+}
+
+// readControllerLog reads a hop controller's captured stdout or stderr log
+// (as started by startHopController) from the test's artifact directory.
+func readControllerLog(t *testing.T, artifacts *artifactDir, name, stream string) string {
+	t.Helper()
+	content, err := os.ReadFile(filepath.Join(artifacts.path, name+"-"+stream+".log")) //nolint:gosec // G304: a path this test constructed itself, under its own artifact directory.
+	if err != nil {
+		t.Fatalf("read %s %s log: %v", name, stream, err)
+	}
+	return string(content)
+}
+
+// waitForControllerLog polls a hop controller's captured log stream until
+// its content contains want, bounded by deadline, and returns the content.
+// It fails the test with the accumulated content on timeout.
+func waitForControllerLog(t *testing.T, artifacts *artifactDir, name, stream, want string, deadline time.Duration) string {
+	t.Helper()
+	var content string
+	found := waitUntilDeadline(deadline, func() bool {
+		content = readControllerLog(t, artifacts, name, stream)
+		return strings.Contains(content, want)
+	})
+	if !found {
+		t.Fatalf("%s %s log never contained %q; content:\n%s", name, stream, want, content)
+	}
+	return content
+}
+
+// waitForControllerExit waits for a hop controller leader to exit, bounded
+// by deadline, and returns its ProcessState. It fails the test on timeout.
+func waitForControllerExit(t *testing.T, sp *serverProcess, deadline time.Duration) *os.ProcessState {
+	t.Helper()
+	select {
+	case <-sp.leaderExited:
+		return sp.leaderCmd.ProcessState
+	case <-time.After(deadline):
+		t.Fatalf("hop controller did not exit within %s", deadline)
+		return nil
+	}
+}

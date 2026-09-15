@@ -73,7 +73,7 @@ func TestReferenceTraceSubmitBeforeRunning(t *testing.T) {
 
 	// The claim settles through the inspection predicate.
 	tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-		return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "/usr/bin/claude", Argv: []string{"claude", detail.AttemptID.String()}}}}, nil
+		return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "claude", Name: "claude", Argv: []string{"/usr/bin/claude", detail.AttemptID.String()}}}}, nil
 	}
 	if progress, err := tc.Controller.CorroborateLaunch(context.Background(), handle); err != nil || progress != app.LaunchSettled {
 		t.Fatalf("CorroborateLaunch() = %s, err %v; want settled", progress, err)
@@ -242,7 +242,7 @@ func TestReferenceTraceStopDuringLaunching(t *testing.T) {
 	handle, detail := startedRun(t, tc)
 	claimLaunch(t, tc, detail, 4242)
 	tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-		return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "/usr/bin/hop", Argv: []string{"hop", "launch", "--attempt", detail.AttemptID.String()}}}}, nil
+		return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "hop", Name: "hop", Argv: []string{"/usr/bin/hop", "launch", "--attempt", detail.AttemptID.String()}}}}, nil
 	}
 
 	if err := tc.Controller.RequestStop(context.Background(), detail.RunID.String()); err != nil {

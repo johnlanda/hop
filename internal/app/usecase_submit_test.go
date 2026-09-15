@@ -14,7 +14,7 @@ func runningRun(t *testing.T, tc *testController) (app.RunHandle, app.RunDetail)
 	handle, detail := startedRun(t, tc)
 	claimLaunch(t, tc, detail, 4242)
 	tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-		return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "/usr/bin/claude", Argv: []string{"claude", detail.AttemptID.String()}}}}, nil
+		return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "claude", Name: "claude", Argv: []string{"/usr/bin/claude", detail.AttemptID.String()}}}}, nil
 	}
 	if _, err := tc.Controller.CorroborateLaunch(context.Background(), handle); err != nil {
 		t.Fatalf("CorroborateLaunch() error = %v", err)
@@ -121,7 +121,7 @@ func TestSubmitResult(t *testing.T) {
 		}
 
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "/usr/bin/claude", Argv: []string{"claude", detail.AttemptID.String()}}}}, nil
+			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "claude", Name: "claude", Argv: []string{"/usr/bin/claude", detail.AttemptID.String()}}}}, nil
 		}
 		if _, err := tc.Controller.CorroborateLaunch(context.Background(), handle); err != nil {
 			t.Fatalf("CorroborateLaunch() error = %v", err)

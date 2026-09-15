@@ -48,7 +48,7 @@ func TestDriveStop(t *testing.T) {
 		handle, detail := startedRun(t, tc)
 		claimLaunch(t, tc, detail, 4242)
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "/usr/bin/hop", Argv: []string{"hop", "launch", "--attempt", detail.AttemptID.String()}}}}, nil
+			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "hop", Name: "hop", Argv: []string{"/usr/bin/hop", "launch", "--attempt", detail.AttemptID.String()}}}}, nil
 		}
 
 		if err := tc.Controller.RequestStop(context.Background(), detail.RunID.String()); err != nil {
@@ -106,7 +106,7 @@ func TestDriveStop(t *testing.T) {
 		handle, detail := startedRun(t, tc)
 		claimLaunch(t, tc, detail, 4242)
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 9999, Argv0: "/bin/bash", Argv: []string{"bash"}}}}, nil
+			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 9999, Argv0: "bash", Name: "bash", Argv: []string{"/bin/bash"}}}}, nil
 		}
 
 		if err := tc.Controller.RequestStop(context.Background(), detail.RunID.String()); err != nil {
@@ -132,7 +132,7 @@ func TestDriveStop(t *testing.T) {
 			t.Fatalf("RequestStop() error = %v", err)
 		}
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "/usr/bin/claude", Argv: []string{"claude", detail.AttemptID.String()}}}}, nil
+			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "claude", Name: "claude", Argv: []string{"/usr/bin/claude", detail.AttemptID.String()}}}}, nil
 		}
 		report, err := tc.Controller.DriveStop(context.Background(), handle)
 		if err != nil {
@@ -341,7 +341,7 @@ func TestPaneCloseInterruption(t *testing.T) {
 		handle, detail := runningRun(t, tc)
 		opID := seedPendingClose(t, tc, detail, 4242)
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 9999, Argv0: "/bin/bash", Argv: []string{"bash"}}}}, nil
+			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 9999, Argv0: "bash", Name: "bash", Argv: []string{"/bin/bash"}}}}, nil
 		}
 
 		if err := tc.Controller.RequestStop(context.Background(), detail.RunID.String()); err != nil {
@@ -466,7 +466,7 @@ func TestStopUnboundLaunch(t *testing.T) {
 			return app.PaneRef{}, false, nil
 		}
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "/usr/bin/hop", Argv: []string{"hop", "launch", "--attempt", started.AttemptID.String()}}}}, nil
+			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "hop", Name: "hop", Argv: []string{"/usr/bin/hop", "launch", "--attempt", started.AttemptID.String()}}}}, nil
 		}
 
 		if stopErr := tc.Controller.RequestStop(context.Background(), started.RunID.String()); stopErr != nil {

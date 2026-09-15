@@ -8,6 +8,14 @@ import (
 	"github.com/johnlanda/hop/internal/domain/run"
 )
 
+// TestCorroborateSettlement exercises the executable-identity conjunct
+// (executableMatches, unexported) against the real pane.process_info
+// surface's platform shapes, confirmed against the Herdr source
+// (repos/herdr/src/platform/{macos,linux}.rs): argv[0] is reported
+// verbatim; argv0 is a BASENAME on macOS (process_argv0_name) and never
+// reported at all on Linux (empty); name is the kernel's short process
+// name on both. The claim always records an absolute path, so argv0/name
+// are matched against its basename, never the path itself.
 func TestCorroborateSettlement(t *testing.T) {
 	claim := app.LaunchClaim{PID: 100, Executable: "/usr/bin/claude"}
 	proc := func(pid int, argv0, name string, argv []string) app.PaneProcess {
@@ -21,34 +29,42 @@ func TestCorroborateSettlement(t *testing.T) {
 		markers     []string
 		want        app.LaunchSettlement
 	}{
-		"settled: identity, marker and pid all match": {
-			paneMatches: true, pane: proc(100, "/usr/bin/claude", "claude", []string{"claude", "attempt-1"}),
+		"settled: darwin shape — argv0 and name are the claim's basename": {
+			paneMatches: true, pane: proc(100, "claude", "claude", []string{"/usr/bin/claude", "attempt-1"}),
+			claim: claim, markers: []string{"attempt-1"}, want: app.SettlementSettled,
+		},
+		"settled: linux shape — argv0 empty, name alone is the claim's basename": {
+			paneMatches: true, pane: proc(100, "", "claude", []string{"/usr/bin/claude", "attempt-1"}),
+			claim: claim, markers: []string{"attempt-1"}, want: app.SettlementSettled,
+		},
+		"settled: exact argv[0] match alone suffices, even with a rewritten process title": {
+			paneMatches: true, pane: proc(100, "some-rewritten-title", "some-rewritten-title", []string{"/usr/bin/claude", "attempt-1"}),
 			claim: claim, markers: []string{"attempt-1"}, want: app.SettlementSettled,
 		},
 		"settled: the native session reference marker alone corroborates a resume argv": {
-			paneMatches: true, pane: proc(100, "/usr/bin/claude", "claude", []string{"claude", "--resume", "native-ref-1"}),
+			paneMatches: true, pane: proc(100, "claude", "claude", []string{"/usr/bin/claude", "--resume", "native-ref-1"}),
 			claim: claim, markers: []string{"attempt-1", "native-ref-1"}, want: app.SettlementSettled,
 		},
 		"forking wrapper: identity and marker match but pid differs": {
-			paneMatches: true, pane: proc(999, "/usr/bin/claude", "claude", []string{"claude", "attempt-1"}),
+			paneMatches: true, pane: proc(999, "claude", "claude", []string{"/usr/bin/claude", "attempt-1"}),
 			claim: claim, markers: []string{"attempt-1"}, want: app.SettlementForkingWrapper,
 		},
 		"unresolved: pane does not match the claim's binding": {
-			paneMatches: false, pane: proc(100, "/usr/bin/claude", "claude", []string{"claude", "attempt-1"}),
+			paneMatches: false, pane: proc(100, "claude", "claude", []string{"/usr/bin/claude", "attempt-1"}),
 			claim: claim, markers: []string{"attempt-1"}, want: app.SettlementUnresolved,
 		},
 		"unresolved: no foreground process observed": {
 			paneMatches: true, pane: app.PaneProcess{},
 			claim: claim, markers: []string{"attempt-1"}, want: app.SettlementUnresolved,
 		},
-		"unresolved: executable identity does not match the claim's executable": {
+		"unresolved: a different basename never matches": {
 			// A process that execed another binary while retaining the pid
 			// and marker: the claim-recorded executable refuses adoption.
-			paneMatches: true, pane: proc(100, "/usr/bin/bash", "bash", []string{"bash", "attempt-1"}),
+			paneMatches: true, pane: proc(100, "bash", "bash", []string{"/bin/bash", "attempt-1"}),
 			claim: claim, markers: []string{"attempt-1"}, want: app.SettlementUnresolved,
 		},
 		"unresolved: marker absent from argv": {
-			paneMatches: true, pane: proc(100, "/usr/bin/claude", "claude", []string{"claude"}),
+			paneMatches: true, pane: proc(100, "claude", "claude", []string{"/usr/bin/claude"}),
 			claim: claim, markers: []string{"attempt-1"}, want: app.SettlementUnresolved,
 		},
 		"unresolved: empty claim executable fails closed": {
@@ -56,17 +72,17 @@ func TestCorroborateSettlement(t *testing.T) {
 			claim: app.LaunchClaim{PID: 100}, markers: []string{"attempt-1"}, want: app.SettlementUnresolved,
 		},
 		"unresolved: empty marker set fails closed": {
-			paneMatches: true, pane: proc(100, "/usr/bin/claude", "claude", []string{"claude", "attempt-1"}),
+			paneMatches: true, pane: proc(100, "claude", "claude", []string{"/usr/bin/claude", "attempt-1"}),
 			claim: claim, markers: nil, want: app.SettlementUnresolved,
 		},
 		"unresolved: paused pre-exec launcher never satisfies the predicate": {
-			// argv0 is the hop binary itself, not the expected harness —
-			// the claim's executable identity refuses it.
-			paneMatches: true, pane: proc(100, "/usr/bin/hop", "hop", []string{"hop", "launch", "--attempt", "attempt-1"}),
+			// argv0/name are the hop binary itself, not the expected
+			// harness — the claim's executable identity refuses it.
+			paneMatches: true, pane: proc(100, "hop", "hop", []string{"/usr/bin/hop", "launch", "--attempt", "attempt-1"}),
 			claim: claim, markers: []string{"attempt-1"}, want: app.SettlementUnresolved,
 		},
 		"unresolved: launcher invocation is excluded even when the claim names the hop binary": {
-			paneMatches: true, pane: proc(100, "/usr/bin/hop", "hop", []string{"hop", "launch", "--run", "run-1", "--attempt", "attempt-1"}),
+			paneMatches: true, pane: proc(100, "hop", "hop", []string{"/usr/bin/hop", "launch", "--run", "run-1", "--attempt", "attempt-1"}),
 			claim: app.LaunchClaim{PID: 100, Executable: "/usr/bin/hop"}, markers: []string{"attempt-1"}, want: app.SettlementUnresolved,
 		},
 	}

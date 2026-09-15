@@ -1047,11 +1047,12 @@ acknowledgment, not proof the harness ran. The controller settles it to
 
 - the pane matches the claim's current creation binding (pane ID, or
   recovery by creation label);
-- the foreground process's executable identity (name/argv0 resolved path,
-  from the S2-verified surface) equals the expected harness or fixture
-  executable recorded in the claim — which explicitly excludes a
-  still-running `hop launch` (argv0 = the HOP binary, subcommand
-  `launch`), so a paused pre-exec launcher can never satisfy the
+- the foreground process's executable identity equals the expected harness
+  or fixture executable recorded in the claim — matched by verbatim
+  argv[0], or by basename against name/argv0, since Herdr reports argv0 as
+  a basename (macOS) or not at all (Linux) — which explicitly excludes a
+  still-running `hop launch` (argv0/name = the HOP binary's basename,
+  subcommand `launch`), so a paused pre-exec launcher can never satisfy the
   predicate;
 - the process argv carries the claim's marker;
 - the foreground pid equals the claim pid (execve preserves it).
@@ -1411,7 +1412,7 @@ with executed evidence):
 | Item | Status | Design consequence |
 | --- | --- | --- |
 | S1 launch-line detection, shell readiness, fork topology | Established (YES) | Send-text fallback verified under sh and zsh login shells; detection is process-name identification of known harness names; after `exec` the harness pid = shell pid = foreground group (section 6) |
-| S2 pane process identity fields, command-line observability | Established (YES, with caveats) | `PaneProcess` fields frozen (shell pid, foreground group, per-process pid/name/argv0/argv/cmdline/cwd); NO process start time exists, so occupant identity is label + argv marker + pid, never pid alone; no guarded close upstream — inspect-then-close is a documented race (sections 3–5) |
+| S2 pane process identity fields, command-line observability | Established (YES, with caveats) | `PaneProcess` fields frozen (shell pid, foreground group, per-process pid/name/argv0/argv/cmdline/cwd); executable identity is matched by verbatim argv[0] or by basename against name/argv0, since Herdr reports argv0 as a basename (macOS) or not at all (Linux); NO process start time exists, so occupant identity is label + argv marker + pid, never pid alone; no guarded close upstream — inspect-then-close is a documented race (sections 3–5) |
 | S3 restore behavior and settled signal, restored argv shape | Established (YES) | Restore restores the pane label but not the additive env; a recorded native session auto-relaunches exactly as `claude --resume <id>`, deferred until a client supplies geometry, bypassing `hop launch` and dropping `HOP_*` (env dump verified) — so positive-evidence retirement is verified end to end; a post-restart snapshot can show a phantom agent before any process runs, so absence is established only by live process inspection; no "restore finished" signal and no cancellation route exist — the post-restart `--confirm-absent` limitation and reconciling-plus-report stance stand as established behavior (section 5, items 2–5) |
 | S4 `claude --session-id`/`--resume` with preassigned UUID | Established (YES, claude 2.1.270) | Print mode in a scratch profile with a credential-free env: `--session-id <uuid>` accepted, transcript created under the pre-assigned UUID, `--resume <uuid>` finds it from a different cwd, unknown UUID rejected; version-scoped, re-verify on drift (sections 5–6) |
 | S5 `agent.start` argv capability | Established (NO) | agent.start cannot interpose the sanitizer and types bare names (PATH-unsafe under macOS path_helper); absolute executable paths everywhere (section 6) |

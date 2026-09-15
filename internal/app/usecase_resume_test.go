@@ -20,7 +20,7 @@ func TestResume(t *testing.T) {
 		tc := newTestController(defaultPolicy())
 		_, detail := runningRun(t, tc)
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "/usr/bin/claude", Argv: []string{"claude", detail.AttemptID.String()}}}}, nil
+			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "claude", Name: "claude", Argv: []string{"/usr/bin/claude", detail.AttemptID.String()}}}}, nil
 		}
 
 		tc.Clock.Advance(leaseTTL + time.Second)
@@ -48,7 +48,7 @@ func TestResume(t *testing.T) {
 		// executable identity no longer equals the claim's: the pid+marker
 		// shortcut must not adopt this occupant.
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "/bin/bash", Name: "bash", Argv: []string{"bash", detail.AttemptID.String()}}}}, nil
+			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "bash", Name: "bash", Argv: []string{"/bin/bash", detail.AttemptID.String()}}}}, nil
 		}
 
 		tc.Clock.Advance(leaseTTL + time.Second)
@@ -68,7 +68,7 @@ func TestResume(t *testing.T) {
 		tc := newTestController(defaultPolicy())
 		_, detail := startedRun(t, tc)
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "/usr/bin/claude", Argv: []string{"claude", detail.AttemptID.String()}}}}, nil
+			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "claude", Name: "claude", Argv: []string{"/usr/bin/claude", detail.AttemptID.String()}}}}, nil
 		}
 
 		tc.Clock.Advance(leaseTTL + time.Second)
@@ -86,7 +86,7 @@ func TestResume(t *testing.T) {
 		_, detail := startedRun(t, tc)
 		claimLaunch(t, tc, detail, 4242)
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "/usr/bin/claude", Argv: []string{"claude", detail.AttemptID.String()}}}}, nil
+			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "claude", Name: "claude", Argv: []string{"/usr/bin/claude", detail.AttemptID.String()}}}}, nil
 		}
 
 		tc.Clock.Advance(leaseTTL + time.Second)
@@ -109,7 +109,7 @@ func TestResume(t *testing.T) {
 		tc := newTestController(defaultPolicy())
 		_, detail := runningRun(t, tc)
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 9999, Argv0: "/bin/bash", Argv: []string{"bash"}}}}, nil
+			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 9999, Argv0: "bash", Name: "bash", Argv: []string{"/bin/bash"}}}}, nil
 		}
 
 		tc.Clock.Advance(leaseTTL + time.Second)
@@ -428,7 +428,7 @@ func TestResumeRounds(t *testing.T) {
 		// Round 1: the pane cannot be inspected conclusively and no
 		// positive evidence exists; the run stays resuming/reconciling.
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 9999, Argv0: "/bin/bash", Argv: []string{"bash"}}}}, nil
+			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 9999, Argv0: "bash", Name: "bash", Argv: []string{"/bin/bash"}}}}, nil
 		}
 		tc.Clock.Advance(leaseTTL + time.Second)
 		first, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String()))
@@ -441,7 +441,7 @@ func TestResumeRounds(t *testing.T) {
 
 		// Round 2: the true worker is observable again.
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "/usr/bin/claude", Argv: []string{"claude", detail.AttemptID.String()}}}}, nil
+			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "claude", Name: "claude", Argv: []string{"/usr/bin/claude", detail.AttemptID.String()}}}}, nil
 		}
 		tc.Clock.Advance(leaseTTL + time.Second)
 		second, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String()))
@@ -474,7 +474,7 @@ func TestResumeRounds(t *testing.T) {
 		tc := newTestController(defaultPolicy())
 		_, detail := runningRun(t, tc)
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "/usr/bin/claude", Argv: []string{"claude", detail.AttemptID.String()}}}}, nil
+			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "claude", Name: "claude", Argv: []string{"/usr/bin/claude", detail.AttemptID.String()}}}}, nil
 		}
 		tc.Clock.Advance(leaseTTL + time.Second)
 		result, handle, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String()))
@@ -526,7 +526,7 @@ func TestResumePositiveEvidenceRetirement(t *testing.T) {
 	// Herdr's native restore replaced the worker: a new pid running
 	// `claude --resume <native-ref>`, bypassing the launcher.
 	tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-		return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 7777, Argv0: "/usr/bin/claude", Argv: []string{"claude", "--resume", nativeRef}}}}, nil
+		return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 7777, Argv0: "claude", Name: "claude", Argv: []string{"/usr/bin/claude", "--resume", nativeRef}}}}, nil
 	}
 
 	tc.Clock.Advance(leaseTTL + time.Second)
@@ -738,7 +738,7 @@ func TestResumeAttestation(t *testing.T) {
 		// The deferred restore then fires: the restored occupant carries the
 		// native reference and is retired by positive evidence (item 2).
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 8888, Argv0: "/usr/bin/claude", Argv: []string{"claude", "--resume", nativeRef}}}}, nil
+			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 8888, Argv0: "claude", Name: "claude", Argv: []string{"/usr/bin/claude", "--resume", nativeRef}}}}, nil
 		}
 		tc.Clock.Advance(leaseTTL + time.Second)
 		second, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String()))
@@ -1037,7 +1037,7 @@ func TestSettledClaimIsNotLiveAdoption(t *testing.T) {
 		tc := newTestController(defaultPolicy())
 		detail := settledStuckLaunch(t, tc)
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 9999, Argv0: "/bin/bash", Argv: []string{"bash"}}}}, nil
+			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 9999, Argv0: "bash", Name: "bash", Argv: []string{"/bin/bash"}}}}, nil
 		}
 
 		tc.Clock.Advance(leaseTTL + time.Second)
@@ -1100,7 +1100,7 @@ func TestRecoveryBlockingDispositions(t *testing.T) {
 		// Round 1 records the observed restoration and dispatches the
 		// guarded close.
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 7777, Argv0: "/usr/bin/claude", Argv: []string{"claude", "--resume", nativeRef}}}}, nil
+			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 7777, Argv0: "claude", Name: "claude", Argv: []string{"/usr/bin/claude", "--resume", nativeRef}}}}, nil
 		}
 		tc.Clock.Advance(leaseTTL + time.Second)
 		if _, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String())); err != nil {
@@ -1197,7 +1197,7 @@ func TestRetirementTargetImmutability(t *testing.T) {
 	// Round 1: the restored occupant (pid 7777) is recorded and its
 	// guarded close dispatched; it stays unresolved.
 	tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-		return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 7777, Argv0: "/usr/bin/claude", Argv: []string{"claude", "--resume", nativeRef}}}}, nil
+		return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 7777, Argv0: "claude", Name: "claude", Argv: []string{"/usr/bin/claude", "--resume", nativeRef}}}}, nil
 	}
 	tc.Clock.Advance(leaseTTL + time.Second)
 	if _, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String())); err != nil {
@@ -1211,7 +1211,7 @@ func TestRetirementTargetImmutability(t *testing.T) {
 	// carrying the native marker. The persisted target names 7777; the new
 	// occupant must not be closed under that row.
 	tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-		return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 8888, Argv0: "/usr/bin/claude", Argv: []string{"claude", "--resume", nativeRef}}}}, nil
+		return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 8888, Argv0: "claude", Name: "claude", Argv: []string{"/usr/bin/claude", "--resume", nativeRef}}}}, nil
 	}
 	tc.Clock.Advance(leaseTTL + time.Second)
 	result, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String()))
@@ -1248,7 +1248,7 @@ func TestReconciliationClaimSettlement(t *testing.T) {
 	// Round 1: an unidentified occupant with no claim fails closed and the
 	// attempt enters reconciling.
 	tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-		return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "/usr/bin/hop", Argv: []string{"hop", "launch", "--attempt", detail.AttemptID.String()}}}}, nil
+		return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "hop", Name: "hop", Argv: []string{"/usr/bin/hop", "launch", "--attempt", detail.AttemptID.String()}}}}, nil
 	}
 	tc.Clock.Advance(leaseTTL + time.Second)
 	first, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String()))
@@ -1266,7 +1266,7 @@ func TestReconciliationClaimSettlement(t *testing.T) {
 	// corroborates under the predicate on the next round.
 	claimLaunch(t, tc, detail, 4242)
 	tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-		return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "/usr/bin/claude", Argv: []string{"claude", detail.AttemptID.String()}}}}, nil
+		return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "claude", Name: "claude", Argv: []string{"/usr/bin/claude", detail.AttemptID.String()}}}}, nil
 	}
 	tc.Clock.Advance(leaseTTL + time.Second)
 	second, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String()))

@@ -65,14 +65,41 @@ func CorroborateSettlement(paneMatches bool, pane PaneProcess, markers []string,
 	if isLauncherInvocation(fg.Argv) {
 		return SettlementUnresolved
 	}
-	identityMatches := fg.Argv0 == claim.Executable || fg.Name == claim.Executable
-	if !identityMatches || FirstMarkerMatch(pane, markers) == "" {
+	if !executableMatches(fg, claim.Executable) || FirstMarkerMatch(pane, markers) == "" {
 		return SettlementUnresolved
 	}
 	if fg.PID == claim.PID {
 		return SettlementSettled
 	}
 	return SettlementForkingWrapper
+}
+
+// executableMatches reports whether an observed foreground process's
+// executable identity matches expected (the claim's recorded absolute
+// path), against the real, platform-specific pane.process_info surface:
+// argv[0] is reported verbatim (S2), so an exact match there is the
+// strongest form — hop launch execs the absolute path it recorded, and
+// argv[0] equals it unless the harness rewrites its own process title.
+// argv0 and name are never absolute paths: on macOS, Herdr's argv0 is
+// process_argv0_name, the BASENAME of argv[0] (leading dash stripped); on
+// Linux, Herdr never reports argv0 (empty) and name is the kernel's
+// 15-byte-truncated comm. So both are compared against expected's
+// basename, never expected itself. An empty expected never matches
+// (missing identity fails closed, per CorroborateSettlement). Executable
+// identity is one corroboration conjunct among several (marker, pid,
+// binding); it does not by itself establish occupant identity.
+func executableMatches(fg ProcessInfo, expected string) bool { //nolint:gocritic // hugeParam: ProcessInfo is CorroborateSettlement's own pure-value argument shape, passed by value throughout this decision file; called once per corroboration round, never a hot loop.
+	if expected == "" {
+		return false
+	}
+	if len(fg.Argv) > 0 && fg.Argv[0] == expected {
+		return true
+	}
+	base := filepath.Base(expected)
+	if fg.Argv0 != "" && fg.Argv0 == base {
+		return true
+	}
+	return fg.Name != "" && fg.Name == base
 }
 
 // FirstMarkerMatch returns the first non-empty marker the pane's foreground

@@ -229,7 +229,7 @@ func newFixtureRepoWithCheck(t *testing.T, artifacts *artifactDir, name, checkCo
 // repository's [check] command, and .herdr-orchestrator/config.toml per the
 // section 3 example. It returns after the initial commit, whose object id
 // is fixtureRepo.Base — the base commit hop run resolves at StartRun.
-func newFixtureRepo(t *testing.T, artifacts *artifactDir, name string) *fixtureRepo {
+func newFixtureRepo(t *testing.T, artifacts *artifactDir, name string) *fixtureRepo { //nolint:unparam // every current call site names its one repository "repo"; name exists so a scenario needing two concurrent plain fixture repositories (as newFixtureRepoWithSubmodule already needs internally for its inner/outer pair) can avoid an artifact-directory collision.
 	t.Helper()
 	return newFixtureRepoWithCheck(t, artifacts, name, checkScriptName)
 }

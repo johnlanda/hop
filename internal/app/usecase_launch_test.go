@@ -59,7 +59,7 @@ func TestCorroborateLaunch(t *testing.T) {
 		handle, detail := startedRun(t, tc)
 		claimLaunch(t, tc, detail, 4242)
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "/usr/bin/claude", Argv: []string{"claude", detail.AttemptID.String()}}}}, nil
+			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "claude", Name: "claude", Argv: []string{"/usr/bin/claude", detail.AttemptID.String()}}}}, nil
 		}
 
 		progress, err := tc.Controller.CorroborateLaunch(context.Background(), handle)
@@ -90,7 +90,7 @@ func TestCorroborateLaunch(t *testing.T) {
 		handle, detail := startedRun(t, tc)
 		claimLaunch(t, tc, detail, 4242)
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 9999, Argv0: "/usr/bin/claude", Argv: []string{"claude", detail.AttemptID.String()}}}}, nil
+			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 9999, Argv0: "claude", Name: "claude", Argv: []string{"/usr/bin/claude", detail.AttemptID.String()}}}}, nil
 		}
 
 		progress, err := tc.Controller.CorroborateLaunch(context.Background(), handle)
@@ -143,7 +143,7 @@ func TestCorroborateLaunch(t *testing.T) {
 			t.Fatalf("no native session reference was pre-assigned for the claude harness")
 		}
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "/usr/bin/claude", Argv: []string{"claude", "--resume", nativeRef}}}}, nil
+			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "claude", Name: "claude", Argv: []string{"/usr/bin/claude", "--resume", nativeRef}}}}, nil
 		}
 
 		progress, err := tc.Controller.CorroborateLaunch(context.Background(), handle)

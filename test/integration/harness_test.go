@@ -187,6 +187,13 @@ type testServer struct {
 	// login shell) uses; empty means the default /bin/sh. The spike tests set
 	// it to exercise zsh login-shell behavior.
 	shell string
+	// extraEnv is appended to environ()'s hermetic base. It exists only for
+	// task 6b's exec-boundary tests, which deliberately seed a known, fake
+	// credential-shaped variable into the server's own environment (never a
+	// real credential) to prove the launcher's strip matrix removes it even
+	// when the value IS present in the inherited environment, matching
+	// section 6's "Exec-boundary tests" contract exactly.
+	extraEnv []string
 	// running holds every server process the suite has launched on these
 	// roots, newest last. A restart (S3) launches a second one; each is
 	// reaped exactly once, by restart or by cleanup, so a graceful restart
@@ -317,7 +324,7 @@ func (s *testServer) environ() []string {
 	if shell == "" {
 		shell = "/bin/sh"
 	}
-	return []string{
+	base := []string{
 		"PATH=" + filepath.Join(s.base, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"),
 		"HOME=" + s.homeDir(),
 		"TMPDIR=" + os.Getenv("TMPDIR"),
@@ -329,6 +336,7 @@ func (s *testServer) environ() []string {
 		"XDG_DATA_HOME=" + filepath.Join(s.base, "data"),
 		"HERDR_CONFIG_PATH=" + s.config,
 	}
+	return append(base, s.extraEnv...)
 }
 
 // homeDir is the temp home the server and its pane shells use.

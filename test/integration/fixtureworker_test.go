@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -105,7 +106,7 @@ func main() {
 	}
 	behavior, behaviorArgs := parseBehavior(string(assignmentContent))
 
-	writeObservation(filepath.Join(filepath.Dir(assignmentPath), "worker-observed.txt"), env, assignmentPath, promptAssignmentPath, hopPath, string(assignmentContent), behavior, behaviorArgs)
+	writeObservation(filepath.Join(filepath.Dir(assignmentPath), "worker-observed.txt"), assignmentPath, promptAssignmentPath, hopPath, string(assignmentContent), behavior, behaviorArgs)
 	fmt.Println("FIXTURE-WORKER-READY")
 
 	switch behavior {
@@ -191,22 +192,34 @@ func parseBehavior(assignment string) (behavior string, args []string) {
 // — the same philosophy the Phase 1 spike fixture uses for its environment
 // dump. promptAssignmentPath is the prompt's own marker extraction, already
 // verified equal to assignmentPath (the path actually read) by the time this
-// is called — main fails closed before reaching here on any mismatch.
-func writeObservation(path string, env map[string]string, assignmentPath, promptAssignmentPath, hopPath, assignmentContent, behavior string, behaviorArgs []string) {
+// is called — main fails closed before reaching here on any mismatch. The
+// dump carries the worker's COMPLETE inherited environment (os.Environ()),
+// not just the required HOP_* subset, so a scenario can assert the full
+// sanitized-exec contract directly: every strip-matrix and policy-strip
+// variable absent even when seeded into the server's own environment,
+// HERDR_*/HOP_* present, and passthrough/profile entries exactly as
+// configured (docs/plan/phase-2-design.md section 6).
+func writeObservation(path string, assignmentPath, promptAssignmentPath, hopPath, assignmentContent, behavior string, behaviorArgs []string) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "pid=%d\n", os.Getpid())
+	// os.Executable() is this process's own resolved image path — the
+	// absolute path hop launch's PATH-based harness resolution actually
+	// exec'd. A scenario asserts this equals the fixture-installed stub
+	// path exactly, never a real claude binary elsewhere on the machine.
+	if executable, execErr := os.Executable(); execErr == nil {
+		fmt.Fprintf(&b, "executable=%s\n", executable)
+	} else {
+		fmt.Fprintf(&b, "executable_error=%v\n", execErr)
+	}
 	fmt.Fprintf(&b, "assignment_path=%s\n", assignmentPath)
 	fmt.Fprintf(&b, "prompt_assignment_path=%s\n", promptAssignmentPath)
 	fmt.Fprintf(&b, "hop_path=%s\n", hopPath)
 	fmt.Fprintf(&b, "behavior=%s\n", behavior)
 	fmt.Fprintf(&b, "behavior_args=%s\n", strings.Join(behaviorArgs, " "))
-	keys := make([]string, 0, len(env))
-	for k := range env {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		fmt.Fprintf(&b, "env:%s=%s\n", k, env[k])
+	environ := os.Environ()
+	sort.Strings(environ)
+	for _, entry := range environ {
+		fmt.Fprintf(&b, "env:%s\n", entry)
 	}
 	fmt.Fprintf(&b, "assignment_content_begin\n%s\nassignment_content_end\n", assignmentContent)
 	tmp := path + ".tmp"
@@ -323,12 +336,8 @@ func idle() {
 // behavior names: "submit-valid", "submit-stale", "submit-twice",
 // "exit-without-submitting", "exec-keep-pid"; an empty or unrecognized
 // behavior makes the worker idle without ever submitting.
-func fixtureWorkerBrief(behavior string, args ...string) string {
-	line := "FIXTURE-BEHAVIOR: " + behavior
-	if len(args) > 0 {
-		line += " " + strings.Join(args, " ")
-	}
-	return line + "\n"
+func fixtureWorkerBrief(behavior string) string {
+	return "FIXTURE-BEHAVIOR: " + behavior + "\n"
 }
 
 // buildFixtureWorker compiles fixtureWorkerSource once for the calling test
@@ -542,4 +551,58 @@ func TestFixtureWorkerExitWithoutSubmitting(t *testing.T) {
 	if head := repo.git(t, "rev-parse", "HEAD^{commit}"); head != repo.Base {
 		t.Error("exit-without-submitting committed a change; it must leave the repository untouched")
 	}
+}
+
+// workerObservation is the parsed contents of one worker-observed.txt dump
+// (writeObservation, inside fixtureWorkerSource).
+type workerObservation struct {
+	Fields            map[string]string // pid, assignment_path, prompt_assignment_path, hop_path, behavior, behavior_args
+	Environ           []string          // every "NAME=VALUE" entry from the worker's own os.Environ()
+	AssignmentContent string
+}
+
+// readWorkerObservation reads and parses one worker-observed.txt dump.
+func readWorkerObservation(t *testing.T, path string) workerObservation {
+	t.Helper()
+	raw, err := os.ReadFile(path) //nolint:gosec // G304: a path this test constructed itself, under its own artifact/state directory.
+	if err != nil {
+		t.Fatalf("read worker observation %s: %v", path, err)
+	}
+	obs := workerObservation{Fields: map[string]string{}}
+	lines := strings.Split(string(raw), "\n")
+	for i := 0; i < len(lines); i++ {
+		line := lines[i]
+		switch {
+		case line == "assignment_content_begin":
+			var content []string
+			for i++; i < len(lines) && lines[i] != "assignment_content_end"; i++ {
+				content = append(content, lines[i])
+			}
+			obs.AssignmentContent = strings.Join(content, "\n")
+		case strings.HasPrefix(line, "env:"):
+			obs.Environ = append(obs.Environ, strings.TrimPrefix(line, "env:"))
+		default:
+			if key, value, ok := strings.Cut(line, "="); ok {
+				obs.Fields[key] = value
+			}
+		}
+	}
+	return obs
+}
+
+// HasEnv reports whether the observed environment carries name=value
+// exactly.
+func (o workerObservation) HasEnv(name, value string) bool {
+	return slices.Contains(o.Environ, name+"="+value)
+}
+
+// HasEnvName reports whether the observed environment carries any entry for
+// name, regardless of value.
+func (o workerObservation) HasEnvName(name string) bool {
+	for _, entry := range o.Environ {
+		if n, _, ok := strings.Cut(entry, "="); ok && n == name {
+			return true
+		}
+	}
+	return false
 }
