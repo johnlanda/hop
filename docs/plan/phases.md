@@ -122,6 +122,10 @@ detach is distinct from stopping the run. This is the first useful CLI milestone
 
 ## Phase 3 — Manager, workers and communication
 
+The concrete design for this phase — domain slice, ports, migration 002,
+state machines, messaging protocol, feature workflow, test plan and work
+breakdown — is [phase-3-design.md](phase-3-design.md).
+
 Deliver a manager session, scoped task assignment, acyclic dependencies and bounded
 worker concurrency (default two). Add durable messages, per-recipient serialization,
 acknowledgements, questions and task-attempt provenance. Keep delegation one level
