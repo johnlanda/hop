@@ -81,6 +81,9 @@ func TestParseOperationID(t *testing.T)  { testParser(t, identity.ParseOperation
 func TestParseIncarnationID(t *testing.T) {
 	testParser(t, identity.ParseIncarnationID)
 }
+func TestParseMessageID(t *testing.T)     { testParser(t, identity.ParseMessageID) }
+func TestParseReviewID(t *testing.T)      { testParser(t, identity.ParseReviewID) }
+func TestParseIntegrationID(t *testing.T) { testParser(t, identity.ParseIntegrationID) }
 
 // TestParsedIDsAreDistinctTypes documents that every parsed identifier keeps
 // its own Go type: a RunID and a TaskID built from the same raw UUID are not
@@ -167,6 +170,36 @@ func FuzzParseIncarnationID(f *testing.F) {
 	}
 	f.Fuzz(func(t *testing.T, raw string) {
 		id, err := identity.ParseIncarnationID(raw)
+		checkParseInvariants(t, raw, id.String(), err)
+	})
+}
+
+func FuzzParseMessageID(f *testing.F) {
+	for _, s := range fuzzSeeds() {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, raw string) {
+		id, err := identity.ParseMessageID(raw)
+		checkParseInvariants(t, raw, id.String(), err)
+	})
+}
+
+func FuzzParseReviewID(f *testing.F) {
+	for _, s := range fuzzSeeds() {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, raw string) {
+		id, err := identity.ParseReviewID(raw)
+		checkParseInvariants(t, raw, id.String(), err)
+	})
+}
+
+func FuzzParseIntegrationID(f *testing.F) {
+	for _, s := range fuzzSeeds() {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, raw string) {
+		id, err := identity.ParseIntegrationID(raw)
 		checkParseInvariants(t, raw, id.String(), err)
 	})
 }

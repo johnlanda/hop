@@ -212,3 +212,55 @@ func ParseIncarnationID(raw string) (IncarnationID, error) {
 
 // String returns id's canonical UUID form.
 func (id IncarnationID) String() string { return string(id) }
+
+// MessageID identifies a message: a durable, attributed communication
+// between sessions.
+type MessageID string
+
+// ParseMessageID validates raw as a canonical lowercase UUID and returns it
+// as a MessageID, or ErrInvalidID.
+func ParseMessageID(raw string) (MessageID, error) {
+	v, err := parseUUID(raw)
+	if err != nil {
+		return "", fmt.Errorf("identity: parse message id: %w", err)
+	}
+	return MessageID(v), nil
+}
+
+// String returns id's canonical UUID form.
+func (id MessageID) String() string { return string(id) }
+
+// ReviewID identifies a review: an independent reviewer's immutable verdict
+// on a task attempt's subject.
+type ReviewID string
+
+// ParseReviewID validates raw as a canonical lowercase UUID and returns it
+// as a ReviewID, or ErrInvalidID.
+func ParseReviewID(raw string) (ReviewID, error) {
+	v, err := parseUUID(raw)
+	if err != nil {
+		return "", fmt.Errorf("identity: parse review id: %w", err)
+	}
+	return ReviewID(v), nil
+}
+
+// String returns id's canonical UUID form.
+func (id ReviewID) String() string { return string(id) }
+
+// IntegrationID identifies an integration: one serial attempt to merge a
+// task's accepted result into the run's integration branch and validate the
+// combined candidate.
+type IntegrationID string
+
+// ParseIntegrationID validates raw as a canonical lowercase UUID and returns
+// it as an IntegrationID, or ErrInvalidID.
+func ParseIntegrationID(raw string) (IntegrationID, error) {
+	v, err := parseUUID(raw)
+	if err != nil {
+		return "", fmt.Errorf("identity: parse integration id: %w", err)
+	}
+	return IntegrationID(v), nil
+}
+
+// String returns id's canonical UUID form.
+func (id IntegrationID) String() string { return string(id) }
