@@ -292,7 +292,7 @@ func (c *Controller) recoverCheckState(ctx context.Context, handle RunHandle, fr
 	if blocked != "" {
 		return blocked, nil
 	}
-	if err := c.driveTerminalUnknownFailure(ctx, handle); err != nil {
+	if _, err := c.driveTerminalUnknownFailure(ctx, handle); err != nil {
 		return "", err
 	}
 	return "", c.reopenOrphanedCheckRequest(ctx, handle)
@@ -461,35 +461,45 @@ func (c *Controller) applyUnknownOutcome(ctx context.Context, handle RunHandle, 
 // the task and attempt already failed and the run not yet terminal, the
 // worker is retired through the shared close procedure and the run fails
 // only once its termination has been observed — section 5's run table
-// permits the failure only "after stop of its worker".
-func (c *Controller) driveTerminalUnknownFailure(ctx context.Context, handle RunHandle) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per check round.
+// permits the failure only "after stop of its worker". outstanding names
+// the retirement work still pending; "" means nothing was owed or the
+// failure completed. A stop request that arrives meanwhile takes
+// precedence: retirement still proceeds (a stop-compatible act) but the
+// run's terminal state is left to stop handling.
+func (c *Controller) driveTerminalUnknownFailure(ctx context.Context, handle RunHandle) (string, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per check round.
 	detail, err := c.Read.LoadRunStatus(ctx, handle.runID)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if detail.AttemptState != run.AttemptFailed {
-		return nil
+		return "", nil
 	}
 	if detail.State != run.RunCompleting && detail.State != run.RunResuming && detail.State != run.RunRunning {
-		return nil
+		return "", nil
 	}
 	if detail.LastCheck == nil || !detail.LastCheck.Unknown {
-		return nil
+		return "", nil
 	}
 	outstanding, err := c.retireWorker(ctx, handle, detail)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if outstanding != "" {
-		return nil // termination not yet observed; the run stays actionable.
+		return "worker retirement after the unknown check outcome is outstanding: " + outstanding, nil
 	}
 	now := c.Clock.Now()
-	return c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+	return "", c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 		r, rRev, getErr := uow.Runs().Get(ctx, handle.runID)
 		if getErr != nil {
 			return getErr
 		}
 		if r.State != run.RunCompleting && r.State != run.RunResuming && r.State != run.RunRunning {
+			return nil
+		}
+		if r.StopRequested {
+			// Stop precedence: the retired worker is what stop needed; the
+			// run's terminal state belongs to stop handling, never a
+			// concurrent terminal failure.
 			return nil
 		}
 		rFrom := r.State

@@ -1386,3 +1386,77 @@ func TestStopRacingResumeEntry(t *testing.T) {
 		t.Fatalf("final report = %+v, want terminated/stopped", final)
 	}
 }
+
+// TestResumeDrivesTerminalUnknownRetirement is the Resume-only trace for
+// an unrepeatable lost check: takeover recovery settles the unknown
+// execution and fails the attempt, the FIRST resume round retires the
+// worker without terminal run failure and reports the outstanding
+// retirement (never NothingToDo over a live worker), and the next round
+// fails the run on observed absence — no ClaimAndRunCheck call involved.
+func TestResumeDrivesTerminalUnknownRetirement(t *testing.T) {
+	tc := newTestController(defaultPolicy())
+	handle, detail := runningRun(t, tc)
+	if _, err := tc.Controller.SubmitResult(context.Background(), defaultSubmitRequest(detail)); err != nil {
+		t.Fatalf("SubmitResult() error = %v", err)
+	}
+	// Controller A claims the check, spawns, the child writes its claim,
+	// and A dies with the execution unresolved.
+	tc.Commands.CheckExecFn = func(ctx context.Context, cmd app.Command) (app.CommandResult, error) {
+		if err := tc.Store.ClaimCheckExec(ctx, checkExecOpID(t, cmd), 5150); err != nil {
+			t.Errorf("ClaimCheckExec() error = %v", err)
+		}
+		return app.CommandResult{}, context.DeadlineExceeded
+	}
+	if _, err := tc.Controller.ClaimAndRunCheck(context.Background(), handle, "/usr/local/bin/hop", nil); err == nil {
+		t.Fatalf("ClaimAndRunCheck() succeeded despite the lost execution")
+	}
+	tc.Commands.CheckExecFn = nil
+
+	// Controller B's FIRST resume round: recovery settles the unknown
+	// execution (group observed empty), fails task and attempt, and the
+	// live worker's retirement is dispatched — the run stays non-terminal
+	// and the outcome names the outstanding retirement.
+	tc.Clock.Advance(leaseTTL + time.Second)
+	first, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String()))
+	if err != nil {
+		t.Fatalf("first Resume() error = %v", err)
+	}
+	if first.Outcome == app.ResumeNothingToDo {
+		t.Fatalf("first Outcome = %s; never NothingToDo over a live worker", first.Outcome)
+	}
+	if first.Outcome != app.ResumeReconciling {
+		t.Fatalf("first Outcome = %s, want %s naming the outstanding retirement", first.Outcome, app.ResumeReconciling)
+	}
+	updated, err := tc.Store.LoadRunStatus(context.Background(), detail.RunID)
+	if err != nil {
+		t.Fatalf("LoadRunStatus() error = %v", err)
+	}
+	if updated.AttemptState != run.AttemptFailed {
+		t.Fatalf("Attempt.State = %s, want %s", updated.AttemptState, run.AttemptFailed)
+	}
+	if updated.State == run.RunFailed {
+		t.Fatalf("Run.State = %s; the run must not fail before its worker's observed termination", updated.State)
+	}
+	if len(tc.Runtime.ClosedPanes) != 1 {
+		t.Fatalf("ClosePane calls = %d, want the worker retirement dispatched once", len(tc.Runtime.ClosedPanes))
+	}
+
+	// The next round observes the worker gone and fails the run.
+	tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+		return app.PaneProcess{}, app.ErrPaneNotFound
+	}
+	tc.Clock.Advance(leaseTTL + time.Second)
+	if _, _, secondErr := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String())); secondErr != nil {
+		t.Fatalf("second Resume() error = %v", secondErr)
+	}
+	final, err := tc.Store.LoadRunStatus(context.Background(), detail.RunID)
+	if err != nil {
+		t.Fatalf("LoadRunStatus() error = %v", err)
+	}
+	if final.State != run.RunFailed {
+		t.Fatalf("Run.State = %s, want %s after the worker's observed termination", final.State, run.RunFailed)
+	}
+	if got := tc.Store.Sessions[detail.SessionID].value.State; got != run.SessionTerminated {
+		t.Fatalf("Session.State = %s, want %s", got, run.SessionTerminated)
+	}
+}

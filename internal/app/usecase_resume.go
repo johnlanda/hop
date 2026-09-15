@@ -143,19 +143,27 @@ func (c *Controller) Resume(ctx context.Context, req ResumeRequest) (ResumeResul
 	if recoverErr != nil {
 		return ResumeResult{}, handle, recoverErr
 	}
+	// A terminal unknown check outcome settled by recovery still owes the
+	// run its worker retirement (the run fails only after termination is
+	// observed): drive it here, before the terminal-attempt shortcut, so
+	// no separate check round is needed to discover the work.
+	retirementOutstanding, retireErr := c.driveTerminalUnknownFailure(ctx, handle)
+	if retireErr != nil {
+		return ResumeResult{}, handle, retireErr
+	}
 
 	detail, err := c.Read.LoadRunStatus(ctx, runID)
 	if err != nil {
 		return ResumeResult{}, handle, fmt.Errorf("app: load run status: %w", err)
 	}
 
-	result, err := c.reconcile(ctx, handle, detail, req, blocked)
+	result, err := c.reconcile(ctx, handle, detail, req, blocked, retirementOutstanding)
 	return result, handle, err
 }
 
 // reconcile dispatches by the attempt's state, per the section 5 tables.
 // An unknown attempt state fails closed rather than passing as terminal.
-func (c *Controller) reconcile(ctx context.Context, handle RunHandle, detail RunDetail, req ResumeRequest, blocked []string) (ResumeResult, error) { //nolint:gocritic // hugeParam: RunHandle, RunDetail and ResumeRequest are per-call DTOs; this runs once per resume round.
+func (c *Controller) reconcile(ctx context.Context, handle RunHandle, detail RunDetail, req ResumeRequest, blocked []string, retirementOutstanding string) (ResumeResult, error) { //nolint:gocritic // hugeParam: RunHandle, RunDetail and ResumeRequest are per-call DTOs; this runs once per resume round.
 	if detail.StopRequested {
 		// A held stop request wins over adoption and every new dispatch:
 		// durably restore the stopping state under the lease (the section 5
@@ -187,6 +195,14 @@ func (c *Controller) reconcile(ctx context.Context, handle RunHandle, detail Run
 	case run.AttemptRunning, run.AttemptSubmitted, run.AttemptChecking, run.AttemptReconciling, run.AttemptLaunching, run.AttemptRelaunching:
 		return c.reconcileActive(ctx, handle, detail, req, blocked)
 	case run.AttemptCompleted, run.AttemptFailed, run.AttemptInterrupted:
+		// A terminal attempt over a non-terminal run still owes work — a
+		// live worker awaiting retirement is never NothingToDo.
+		if detail.State != run.RunCompleted && detail.State != run.RunFailed && detail.State != run.RunStopped {
+			if retirementOutstanding != "" {
+				return ResumeResult{Outcome: ResumeReconciling, Detail: retirementOutstanding + "; rerun hop resume once the worker is observed gone"}, nil
+			}
+			return ResumeResult{Outcome: ResumeReconciling, Detail: "attempt is terminal but the run's finalization is not complete; rerun hop resume"}, nil
+		}
 		return ResumeResult{Outcome: ResumeNothingToDo, Detail: "attempt is already terminal"}, nil
 	default:
 		return ResumeResult{}, fmt.Errorf("app: attempt %s is in unknown state %q; failing closed", detail.AttemptID, detail.AttemptState)
