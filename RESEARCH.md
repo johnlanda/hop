@@ -210,7 +210,10 @@ alternate profile directory; HOP only passes the harness's own profile
 variables through (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `HOME` plus the four
 `XDG_*_HOME` variables for opencode) and never bootstraps, seeds or verifies
 that profile beyond reporting the harness's own login status in
-`hop doctor`. See [native harness compatibility](docs/architecture/native-harness-compat.md)
+`hop doctor` — amended 2026-09-15 with one verified launcher-boundary
+exception: `hop launch` pre-seeds Claude's per-worktree workspace-trust
+key, because the trust dialog otherwise stalls every unattended fresh-git-
+worktree launch. See [native harness compatibility](docs/architecture/native-harness-compat.md)
 for the adopted policy and evidence, and [phases](docs/plan/phases.md) for
 where this lands in the build sequence.
 

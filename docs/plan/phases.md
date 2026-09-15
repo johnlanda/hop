@@ -178,7 +178,12 @@ performs themselves with the harness's and Herdr's own commands, not a HOP
 mutation of the profile. HOP only passes the harness's own profile variables
 through (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `HOME` plus the four
 `XDG_*_HOME` variables for opencode); it never bootstraps, seeds or verifies
-that profile beyond the login-status report above.
+that profile beyond the login-status report above — with the one
+launcher-boundary exception the human adopted on 2026-09-15 after a
+verified spike: the Claude per-worktree workspace-trust key is pre-seeded
+at `hop launch` (see
+[native-harness-compat.md](../architecture/native-harness-compat.md)),
+which belongs to the launch path, not to this phase's doctor surface.
 
 Exit: `hop doctor` reports each configured harness's verified login status
 (or `unknown`/`unavailable`) without reading, writing or storing
