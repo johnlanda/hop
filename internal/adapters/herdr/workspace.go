@@ -71,24 +71,32 @@ func (r *Runtime) CreateWorkspace(ctx context.Context, req app.WorkspaceRequest)
 }
 
 // snapshotWorkspaceByLabel is the subset of a session.snapshot workspace
-// record FindWorkspaceByLabel filters on. Label always decodes (Herdr
-// assigns every workspace one, custom or automatic), so it is a plain
-// string; the workspace's own identity is validated only once a match is
-// selected.
+// record FindWorkspaceByLabel filters on. Label is a pointer even though
+// WorkspaceInfo.label always has a value (Herdr assigns every workspace
+// one, custom or automatic): it is the field EVERY workspace record is
+// filtered on, so its absence on any record -- not only a matched one -- is
+// a protocol violation, never a legitimate empty string. Decoding it as a
+// plain string would let an absent label decode as "" and an empty lookup
+// label match a malformed workspace by accident.
 type snapshotWorkspaceByLabel struct {
 	WorkspaceID *string `json:"workspace_id"`
-	Label       string  `json:"label"`
+	Label       *string `json:"label"`
 }
 
 // snapshotTabByWorkspace is the subset of a session.snapshot tab record used
-// to descend from a resolved workspace to its sole tab.
+// to descend from a resolved workspace to its sole tab. WorkspaceID is the
+// field every tab record is filtered on, so its absence on any record is a
+// protocol violation for the same reason snapshotWorkspaceByLabel.Label's
+// is.
 type snapshotTabByWorkspace struct {
 	TabID       *string `json:"tab_id"`
 	WorkspaceID *string `json:"workspace_id"`
 }
 
 // snapshotPaneByTab is the subset of a session.snapshot pane record used to
-// descend from a resolved tab to its sole pane.
+// descend from a resolved tab to its sole pane. TabID is the field every
+// pane record is filtered on, so its absence on any record is a protocol
+// violation for the same reason.
 type snapshotPaneByTab struct {
 	PaneID *string `json:"pane_id"`
 	TabID  *string `json:"tab_id"`
@@ -111,10 +119,22 @@ type findWorkspaceByLabelResult struct {
 // FindWorkspaceByLabel resolves a workspace by its unique creation LABEL --
 // a WORKSPACE attribute (WorkspaceInfo.label), never a pane's -- then
 // descends workspace -> its sole tab -> that tab's sole pane, all from one
-// session.snapshot call. Zero matching workspaces is (zero, false, nil);
-// more than one workspace carrying the label, or more than one tab or pane
-// at any descent step, is an error, never a guess.
+// session.snapshot call. label must be non-empty: Herdr never assigns an
+// empty label, so an empty search label could never legitimately match and
+// is rejected before any request is sent, rather than silently returning
+// not-found or risking a match against a malformed record. Zero matching
+// workspaces is (zero, false, nil); more than one workspace carrying the
+// label, or more than one tab or pane at any descent step (including
+// zero -- a workspace Herdr created always has both), is an error, never a
+// guess. Every schema-required field this method filters on -- a
+// workspace's label, a tab's workspace_id, a pane's tab_id -- is validated
+// on EVERY record it scans, not only the eventual match: these fields are
+// read to decide what matches, so an absent one anywhere is a protocol
+// violation, never a silently-skipped non-match.
 func (r *Runtime) FindWorkspaceByLabel(ctx context.Context, label string) (app.WorkspaceRef, bool, error) {
+	if label == "" {
+		return app.WorkspaceRef{}, false, fmt.Errorf("find workspace by label: label must not be empty")
+	}
 	var result findWorkspaceByLabelResult
 	if err := r.client.Call(ctx, "session.snapshot", nil, &result); err != nil {
 		return app.WorkspaceRef{}, false, fmt.Errorf("find workspace by label %q: %w", label, err)
@@ -137,8 +157,12 @@ func (r *Runtime) FindWorkspaceByLabel(ctx context.Context, label string) (app.W
 
 	var foundWorkspace snapshotWorkspaceByLabel
 	workspaceMatches := 0
-	for _, ws := range *result.Snapshot.Workspaces {
-		if ws.Label == label {
+	for i, ws := range *result.Snapshot.Workspaces {
+		wsLabel, err := requireString("session.snapshot", ws.Label, fmt.Sprintf("workspaces[%d].label", i))
+		if err != nil {
+			return app.WorkspaceRef{}, false, err
+		}
+		if wsLabel == label {
 			workspaceMatches++
 			foundWorkspace = ws
 		}
@@ -158,8 +182,12 @@ func (r *Runtime) FindWorkspaceByLabel(ctx context.Context, label string) (app.W
 
 	var foundTab snapshotTabByWorkspace
 	tabMatches := 0
-	for _, tab := range *result.Snapshot.Tabs {
-		if tab.WorkspaceID != nil && *tab.WorkspaceID == workspaceID {
+	for i, tab := range *result.Snapshot.Tabs {
+		tabWorkspaceID, scanErr := requireString("session.snapshot", tab.WorkspaceID, fmt.Sprintf("tabs[%d].workspace_id", i))
+		if scanErr != nil {
+			return app.WorkspaceRef{}, false, scanErr
+		}
+		if tabWorkspaceID == workspaceID {
 			tabMatches++
 			foundTab = tab
 		}
@@ -174,8 +202,12 @@ func (r *Runtime) FindWorkspaceByLabel(ctx context.Context, label string) (app.W
 
 	var foundPane snapshotPaneByTab
 	paneMatches := 0
-	for _, pane := range *result.Snapshot.Panes {
-		if pane.TabID != nil && *pane.TabID == tabID {
+	for i, pane := range *result.Snapshot.Panes {
+		paneTabID, scanErr := requireString("session.snapshot", pane.TabID, fmt.Sprintf("panes[%d].tab_id", i))
+		if scanErr != nil {
+			return app.WorkspaceRef{}, false, scanErr
+		}
+		if paneTabID == tabID {
 			paneMatches++
 			foundPane = pane
 		}

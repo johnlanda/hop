@@ -143,6 +143,24 @@ func TestRuntimeFindWorkspaceByLabel(t *testing.T) {
 		}
 	})
 
+	t.Run("empty label input is refused before any request is sent", func(t *testing.T) {
+		runtime, got := startFakeRuntime(t, `{"type":"session_snapshot","snapshot":{"workspaces":[],"tabs":[],"panes":[]}}`)
+
+		ref, found, err := runtime.FindWorkspaceByLabel(testContext(t), "")
+
+		if err == nil {
+			t.Fatal(`FindWorkspaceByLabel("") did not error`)
+		}
+		if found || ref != (app.WorkspaceRef{}) {
+			t.Errorf("found = %v, ref = %+v, want the zero value and false alongside the error", found, ref)
+		}
+		select {
+		case <-got:
+			t.Error(`FindWorkspaceByLabel("") sent a request; want it refused before any request`)
+		default:
+		}
+	})
+
 	t.Run("no workspaces at all is a legitimate not-found", func(t *testing.T) {
 		runtime, _ := startFakeRuntime(t, `{"type":"session_snapshot","snapshot":{`+
 			`"workspaces":[],"tabs":[],"panes":[]}}`)
@@ -212,6 +230,21 @@ func TestRuntimeFindWorkspaceByLabel(t *testing.T) {
 
 		if err == nil {
 			t.Fatal("FindWorkspaceByLabel against a two-pane tab did not error")
+		}
+		if found || ref != (app.WorkspaceRef{}) {
+			t.Errorf("found = %v, ref = %+v, want the zero value and false alongside the error", found, ref)
+		}
+	})
+
+	t.Run("zero panes on the resolved tab is an error, not a guess", func(t *testing.T) {
+		runtime, _ := startFakeRuntime(t, `{"type":"session_snapshot","snapshot":{`+
+			`"workspaces":[{"workspace_id":"w1","label":"hop-op-1"}],`+
+			`"tabs":[{"tab_id":"t1","workspace_id":"w1"}],"panes":[]}}`)
+
+		ref, found, err := runtime.FindWorkspaceByLabel(testContext(t), "hop-op-1")
+
+		if err == nil {
+			t.Fatal("FindWorkspaceByLabel against a paneless resolved tab did not error")
 		}
 		if found || ref != (app.WorkspaceRef{}) {
 			t.Errorf("found = %v, ref = %+v, want the zero value and false alongside the error", found, ref)
@@ -342,6 +375,68 @@ func TestRuntimeFindWorkspaceByLabel(t *testing.T) {
 		var protocolErr *herdr.ProtocolError
 		if !errors.As(err, &protocolErr) {
 			t.Fatalf("FindWorkspaceByLabel error = %v, want a ProtocolError for a resolved pane missing its id", err)
+		}
+		if found || ref != (app.WorkspaceRef{}) {
+			t.Errorf("found = %v, ref = %+v, want the zero value and false alongside the error", found, ref)
+		}
+	})
+
+	t.Run("missing label on a scanned workspace is an error, not a silent non-match", func(t *testing.T) {
+		runtime, _ := startFakeRuntime(t, `{"type":"session_snapshot","snapshot":{`+
+			`"workspaces":[{"workspace_id":"w1"}],"tabs":[],"panes":[]}}`)
+
+		ref, found, err := runtime.FindWorkspaceByLabel(testContext(t), "hop-op-1")
+
+		var protocolErr *herdr.ProtocolError
+		if !errors.As(err, &protocolErr) {
+			t.Fatalf("FindWorkspaceByLabel error = %v, want a ProtocolError for a workspace missing its label", err)
+		}
+		if found || ref != (app.WorkspaceRef{}) {
+			t.Errorf("found = %v, ref = %+v, want the zero value and false alongside the error", found, ref)
+		}
+	})
+
+	t.Run("explicit empty label on a scanned workspace is an error, not a silent non-match", func(t *testing.T) {
+		runtime, _ := startFakeRuntime(t, `{"type":"session_snapshot","snapshot":{`+
+			`"workspaces":[{"workspace_id":"w1","label":""}],"tabs":[],"panes":[]}}`)
+
+		ref, found, err := runtime.FindWorkspaceByLabel(testContext(t), "hop-op-1")
+
+		var protocolErr *herdr.ProtocolError
+		if !errors.As(err, &protocolErr) {
+			t.Fatalf("FindWorkspaceByLabel error = %v, want a ProtocolError for a workspace with an explicit empty label", err)
+		}
+		if found || ref != (app.WorkspaceRef{}) {
+			t.Errorf("found = %v, ref = %+v, want the zero value and false alongside the error", found, ref)
+		}
+	})
+
+	t.Run("missing workspace_id on a scanned tab is an error, not a silent non-match", func(t *testing.T) {
+		runtime, _ := startFakeRuntime(t, `{"type":"session_snapshot","snapshot":{`+
+			`"workspaces":[{"workspace_id":"w1","label":"hop-op-1"}],`+
+			`"tabs":[{"tab_id":"t1"}],"panes":[]}}`)
+
+		ref, found, err := runtime.FindWorkspaceByLabel(testContext(t), "hop-op-1")
+
+		var protocolErr *herdr.ProtocolError
+		if !errors.As(err, &protocolErr) {
+			t.Fatalf("FindWorkspaceByLabel error = %v, want a ProtocolError for a tab missing its workspace_id", err)
+		}
+		if found || ref != (app.WorkspaceRef{}) {
+			t.Errorf("found = %v, ref = %+v, want the zero value and false alongside the error", found, ref)
+		}
+	})
+
+	t.Run("missing tab_id on a scanned pane is an error, not a silent non-match", func(t *testing.T) {
+		runtime, _ := startFakeRuntime(t, `{"type":"session_snapshot","snapshot":{`+
+			`"workspaces":[{"workspace_id":"w1","label":"hop-op-1"}],`+
+			`"tabs":[{"tab_id":"t1","workspace_id":"w1"}],"panes":[{"pane_id":"p1"}]}}`)
+
+		ref, found, err := runtime.FindWorkspaceByLabel(testContext(t), "hop-op-1")
+
+		var protocolErr *herdr.ProtocolError
+		if !errors.As(err, &protocolErr) {
+			t.Fatalf("FindWorkspaceByLabel error = %v, want a ProtocolError for a pane missing its tab_id", err)
 		}
 		if found || ref != (app.WorkspaceRef{}) {
 			t.Errorf("found = %v, ref = %+v, want the zero value and false alongside the error", found, ref)

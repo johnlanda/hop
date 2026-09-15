@@ -108,10 +108,18 @@ occupant inspection for the worker-launch use case.
   (`WorkspaceInfo.label`), never a pane, unlike `FindPaneByLabel`'s
   pane-level labels — then descends to the resolved workspace's tabs
   (matched by `workspace_id`) and that tab's panes (matched by `tab_id`).
-  Zero matching workspaces is `(zero value, false, nil)`; more than one
-  workspace carrying the label, or anything other than exactly one tab or
-  exactly one pane at either descent step (including zero — a workspace
-  Herdr created always has both), is an error, never a guess.
+  An empty lookup label is refused before any request is sent, since Herdr
+  never assigns one. Zero matching workspaces is `(zero value, false, nil)`;
+  more than one workspace carrying the label, or anything other than
+  exactly one tab or exactly one pane at either descent step (including
+  zero — a workspace Herdr created always has both), is an error, never a
+  guess. Every schema-required field the descent filters on — a workspace's
+  label, a tab's `workspace_id`, a pane's `tab_id` — is decoded as a
+  pointer and validated on EVERY record scanned, not only the eventual
+  match: these fields are read to decide what matches, so an absent or
+  empty one anywhere is a `ProtocolError`, never a silently-skipped
+  non-match (an absent label decoding as `""` could otherwise let an
+  empty lookup label match a malformed workspace).
 - `ErrPaneNotFound` is a typed, `errors.Is`-checkable sentinel every
   pane-addressed `Runtime` method (`SendText`, `ReadPane`, `InspectPane`,
   `ClosePane`) maps Herdr's `pane_not_found` API error onto, through the
@@ -215,10 +223,14 @@ occupant inspection for the worker-launch use case.
   `FindWorkspaceByLabel` the same way: full-structural request fixtures
   (including that `focus` is always sent as `false`, and that `label`/`env`
   are omitted when unset), `*MapsPartialResponse` tables, an unrelated API
-  error passing through, and `FindWorkspaceByLabel`'s not-found, ambiguous
-  label, ambiguous or zero tab/pane at either descent step, transport-error
-  and missing-required-field cases; both methods are included in
-  `TestRuntimeHonorsCancellation`.
+  error passing through, and `FindWorkspaceByLabel`'s empty-input-label
+  refusal (asserted to send no request at all), not-found, ambiguous label,
+  ambiguous OR ZERO tab/pane at either descent step, transport-error,
+  matched-record missing-required-id, and — separately — a missing or
+  explicitly empty label/`workspace_id`/`tab_id` on a record the descent
+  merely SCANS (not necessarily the eventual match), proving those
+  schema-required filter fields fail closed rather than silently acting as
+  a non-match; both methods are included in `TestRuntimeHonorsCancellation`.
 - [runtime_internal_test.go](runtime_internal_test.go) (`package herdr`,
   same-package per the internal-algorithm testing guidance) —
   `TestPeerPIDUnavailableForNonSocketConn` proves `peerPID` reports
