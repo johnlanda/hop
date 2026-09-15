@@ -122,13 +122,24 @@ func (c *Controller) PrepareLaunchExec(ctx context.Context, req LaunchExecReques
 		return LaunchExecPlan{}, fmt.Errorf("app: resolved harness executable is not an absolute path")
 	}
 	argv := append([]string{executable}, tail...)
+	digest := launchArgvDigest(argv)
+	// An existing same-pid exec_pending claim authorizes only the exact
+	// invocation it recorded: the corroboration predicate settles a claim
+	// by its recorded executable and argv identity, and the store keeps
+	// the existing row on an idempotent same-pid rewrite, so executing a
+	// differently composed plan under it would run an invocation the claim
+	// does not describe. Identical retries stay idempotent; anything else
+	// fails closed before exec.
+	if lc.Claim != nil && (lc.Claim.Executable != executable || lc.Claim.ArgvDigest != digest) {
+		return LaunchExecPlan{}, fmt.Errorf("app: the existing launch claim for this incarnation records a different executable or argv than this invocation composed; a claim is never rewritten and this launcher never execs")
+	}
 
 	claim := LaunchClaim{
 		IncarnationID: lc.IncarnationID,
 		RunID:         runID,
 		AttemptID:     attemptID,
 		Executable:    executable,
-		ArgvDigest:    launchArgvDigest(argv),
+		ArgvDigest:    digest,
 		PID:           req.PID,
 		State:         LaunchClaimExecPending,
 		ClaimedAt:     c.Clock.Now(),

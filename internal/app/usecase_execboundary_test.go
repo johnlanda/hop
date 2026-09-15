@@ -264,6 +264,33 @@ func TestPrepareLaunchExec(t *testing.T) {
 		}
 	})
 
+	t.Run("an identical same-pid retry is idempotent and execs", func(t *testing.T) {
+		lc := ebLaunchContext(t)
+		expectedArgv := []string{
+			"/resolved/claude", "--session-id", ebNativeRef,
+			renderInitialPrompt(lc.Snapshot.AssignmentPath, "/opt/hop/bin/hop"),
+		}
+		lc.Claim = &LaunchClaim{
+			PID: 4242, State: LaunchClaimExecPending,
+			Executable: "/resolved/claude",
+			ArgvDigest: launchArgvDigest(expectedArgv),
+		}
+		read := &ebReadStub{launch: lc}
+		subs := &ebSubmissionStub{}
+
+		plan, err := newController(read, subs).PrepareLaunchExec(context.Background(), baseRequest())
+		if err != nil {
+			t.Fatalf("PrepareLaunchExec: %v", err)
+		}
+
+		if len(subs.claims) != 1 {
+			t.Fatalf("claims = %d; the exact-identity retry re-writes idempotently", len(subs.claims))
+		}
+		if plan.Argv[0] != "/resolved/claude" {
+			t.Errorf("argv = %q", plan.Argv)
+		}
+	})
+
 	t.Run("cold relaunch composes resume argv", func(t *testing.T) {
 		lc := ebLaunchContext(t)
 		lc.Attempt.State = run.AttemptRelaunching
@@ -387,6 +414,25 @@ func TestPrepareLaunchExec(t *testing.T) {
 				lc.Claim = &LaunchClaim{PID: 999, State: LaunchClaimExecPending}
 			},
 			wantErr: "different pid",
+		},
+		{
+			name: "same-pid claim recording a different executable never execs",
+			mutate: func(lc *LaunchContext, _ *LaunchExecRequest, _ *ebSubmissionStub) {
+				lc.Claim = &LaunchClaim{PID: 4242, State: LaunchClaimExecPending, Executable: "/old/claude", ArgvDigest: "differs"}
+			},
+			wantErr: "records a different executable or argv",
+		},
+		{
+			name: "same-pid claim recording a different argv digest never execs",
+			mutate: func(lc *LaunchContext, req *LaunchExecRequest, _ *ebSubmissionStub) {
+				lc.Claim = &LaunchClaim{
+					PID: 4242, State: LaunchClaimExecPending,
+					Executable: "/resolved/claude",
+					ArgvDigest: launchArgvDigest([]string{"/resolved/claude", "--session-id", ebNativeRef, "another prompt"}),
+				}
+				_ = req
+			},
+			wantErr: "records a different executable or argv",
 		},
 		{
 			name: "settled claim never execs again",
