@@ -26,6 +26,37 @@ type RunPolicy struct {
 	// Harness is [worker] harness; default "claude". Phase 2 launches only
 	// claude.
 	Harness string
+
+	// Phase 3 feature-mode additions (docs/plan/phase-3-design.md
+	// section 3). Every field below is the zero value for a repository
+	// that never sets [workflow] mode = "feature"; the config adapter
+	// (internal/adapters/config, slice 4) is responsible for defaults and
+	// feature-mode-required validation. Solo-mode code never reads them.
+
+	// WorkflowMode is [workflow] mode: "solo" (default, and the zero
+	// value) or "feature".
+	WorkflowMode string
+	// MaxWorkers is [workers] max: the bound on non-terminal, non-manager
+	// sessions (implementer and reviewer share the bound); default 2.
+	MaxWorkers int
+	// RetryLimit is [retry] max_attempts: the per-task frozen retry
+	// budget; default 3.
+	RetryLimit int
+	// ManagerRole, ImplementerRole and ReviewerRole are the
+	// [roles.manager]/[roles.implementer]/[roles.reviewer] instructions
+	// paths, relative to .herdr-orchestrator/; required in feature mode.
+	ManagerRole     string
+	ImplementerRole string
+	ReviewerRole    string
+	// ReviewerHarness is [roles.reviewer] harness; default [worker]
+	// harness.
+	ReviewerHarness string
+	// MessageAttention is [messages] attention_after: the status
+	// surface's "needs attention" age threshold; default 120s.
+	MessageAttention time.Duration
+	// MessageWait is [messages] wait_timeout: hop msg wait's default
+	// bound; default 50s.
+	MessageWait time.Duration
 }
 
 // ConfigurationSource loads and validates one repository's policy. The
