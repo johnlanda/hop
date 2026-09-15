@@ -14,6 +14,14 @@ import (
 	"github.com/johnlanda/hop/internal/domain/run"
 )
 
+// ErrStartRefused marks a StartRun failure that happened BEFORE any side
+// effect: an invalid request (including a HOP path failing the launch-line
+// character rules), a missing or check-less repository policy, an
+// unsupported harness, or an unsupported repository object format. hop run
+// maps it to a usage error, exit 2 (docs/plan/phase-2-design.md section 8);
+// every failure after InitializeRun is an ordinary failure, exit 1.
+var ErrStartRefused = errors.New("app: run refused before any side effect")
+
 // StartRunRequest is hop run's input, exactly as parsed from CLI flags and
 // resolved values: RepositoryRoot is already the symlink-resolved absolute
 // repository path, StateRoot is the absolute state root cmd/hop's single
@@ -88,29 +96,29 @@ type paneOpenIntent struct {
 // returning, since the process that owns it is about to exit.
 func (c *Controller) StartRun(ctx context.Context, req StartRunRequest) (StartRunResult, RunHandle, error) { //nolint:gocritic // hugeParam: StartRunRequest is the driving DTO for hop run, called once per controller process; a pointer would only complicate composition's call site.
 	if err := validateStartRunRequest(req); err != nil {
-		return StartRunResult{}, RunHandle{}, err
+		return StartRunResult{}, RunHandle{}, fmt.Errorf("%w: %w", ErrStartRefused, err)
 	}
 
 	policy, err := c.Config.Load(ctx, req.RepositoryRoot)
 	if err != nil {
-		return StartRunResult{}, RunHandle{}, fmt.Errorf("app: load repository policy: %w", err)
+		return StartRunResult{}, RunHandle{}, fmt.Errorf("%w: load repository policy: %w", ErrStartRefused, err)
 	}
 	if len(policy.CheckArgv) == 0 {
-		return StartRunResult{}, RunHandle{}, errors.New("app: repository policy has no [check] command")
+		return StartRunResult{}, RunHandle{}, fmt.Errorf("%w: repository policy has no [check] command", ErrStartRefused)
 	}
 	harness, err := parseHarness(policy.Harness)
 	if err != nil {
-		return StartRunResult{}, RunHandle{}, err
+		return StartRunResult{}, RunHandle{}, fmt.Errorf("%w: %w", ErrStartRefused, err)
 	}
 	// SHA-256-object-format repositories are out of Phase 2 scope and are
 	// refused here, before any side effect: result submission validates
 	// 40-hex object ids and the check pipeline assumes them.
 	objectFormat, err := c.runGit(ctx, req.RepositoryRoot, "rev-parse", "--show-object-format")
 	if err != nil {
-		return StartRunResult{}, RunHandle{}, fmt.Errorf("app: resolve repository object format: %w", err)
+		return StartRunResult{}, RunHandle{}, fmt.Errorf("%w: resolve repository object format: %w", ErrStartRefused, err)
 	}
 	if objectFormat != "sha1" {
-		return StartRunResult{}, RunHandle{}, fmt.Errorf("app: repository object format %q is unsupported in Phase 2 (sha1 only)", objectFormat)
+		return StartRunResult{}, RunHandle{}, fmt.Errorf("%w: repository object format %q is unsupported in Phase 2 (sha1 only)", ErrStartRefused, objectFormat)
 	}
 
 	ids, err := c.generateRunIdentities()
