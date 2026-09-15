@@ -839,7 +839,11 @@ per the decision table (section 4) before any new act.
    Herdr auto-relaunch exactly as `claude --resume <id>` (bypassing
    `hop launch` and dropping the `HOP_*` env — the restored process's
    dump showed `HERDR_*` present and `HOP_RUN_ID` absent), so this
-   positive-evidence mechanism is verified end to end.
+   positive-evidence mechanism is verified end to end. An observation
+   the section 6 predicate classifies as the forking-wrapper topology is
+   never a restored occupant: an `exec_pending` claim's wrapper, or a
+   settled claim's group holding the matching claimed process alongside a
+   matching different-pid process, fails closed without retirement.
    Such an occupant is recorded as an
    observed-restoration binding (`launch_kind = restored-observed`, with
    the observation as its evidence) and becomes a guarded retirement

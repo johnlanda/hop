@@ -35,7 +35,7 @@ sides together. `cmd/hop` never imports domain or identity types: every
 | [process.go](process.go) | `CommandRunner`, `Command`, `CommandResult`, `ProcessGroupInspector`, `GroupProcess` | Process-group-leader execution with cancellation (git operations, spawning `hop check-exec`) and local process-table listing/signaling for group retirement |
 | [configuration.go](configuration.go) | `ConfigurationSource`, `RunPolicy` | Loads and validates one repository's `.herdr-orchestrator/config.toml`-decoded policy: check contract, env strip/passthrough, profile dir, harness, and (Phase 3, zero value for solo) the `[workflow]`/`[workers]`/`[retry]`/`[roles]`/`[messages]` keys; the config adapter owns defaults and feature-mode-required validation |
 | [digest.go](digest.go) | `ResultDigestTag`, `ComputeResultDigest`, `RequestDigestTag`, `ComputeRequestDigest` | The canonical `"hop-result-v1"` result digest and the canonical `"hop-request-v1"` messaging/plan request digest: length-prefixed fields, SHA-256 hex, computed only here — the domain receives each as an opaque validated string |
-| [decision.go](decision.go) | `LaunchClaimDeadline`, `LaunchDeadlineExpired`, `LaunchSettlement`, `SettlementEvidence`, `CorroborateSettlement`, `RestoredHarnessOutcome`, `MatchRestoredHarness`, `restoreInvocationFor`, `restoredHarnessTargetMatches`, `processMarkerMatch`, `OccupantMatches`, `ServerContinuityEstablished`, `GroupRetirementOutcome`, `ClassifyGroupRetirement`, `ArgvUnavailable` | The section 6 claim-corroboration predicate over EVERY foreground-group member (claim-derived executable identity, durable marker set, explicit per-member `hop launch` exclusion, fail-closed on missing identity, wrapper precedence; returns the corroborated member and marker as `SettlementEvidence`), the restored-harness predicate (Herdr's native restore invocation per harness, exact argv elements on one member, exactly one match) that alone authorizes positive-evidence retirement and its close-time recheck, the per-member close-rule occupant match, the server-continuity predicate, and the four-outcome process-group-retirement classifier matching both the frozen check argv and its check-exec invocation |
+| [decision.go](decision.go) | `LaunchClaimDeadline`, `LaunchDeadlineExpired`, `LaunchSettlement`, `SettlementEvidence`, `CorroborateSettlement`, `ClaimProcessMatches`, `RestoredHarnessOutcome`, `MatchRestoredHarness`, `restoreInvocationFor`, `restoredHarnessTargetMatches`, `processMarkerMatch`, `OccupantMatches`, `ServerContinuityEstablished`, `GroupRetirementOutcome`, `ClassifyGroupRetirement`, `ArgvUnavailable` | The section 6 claim-corroboration predicate over EVERY foreground-group member (claim-derived executable identity, durable marker set, explicit per-member `hop launch` exclusion, fail-closed on missing identity, wrapper precedence; returns the corroborated member and marker as `SettlementEvidence`), the claimed-process-present check resume uses to keep the wrapper classification, the restored-harness predicate (Herdr's native restore invocation per harness, exact argv elements on one member, exactly one match) that alone authorizes positive-evidence retirement and its close-time recheck, the per-member close-rule occupant match, the server-continuity predicate, and the four-outcome process-group-retirement classifier matching both the frozen check argv and its check-exec invocation |
 | [operation_payload.go](operation_payload.go) | `decodeOperationPayload` | Reads a persisted operation intent/evidence/outcome payload without relying on Go type identity: a value of the target type passes through, anything else round-trips through JSON. Callers still validate required fields and fail closed on a failed decode |
 | [controller.go](controller.go) | `Controller`, `RunHandle`, `Heartbeat`, `Detach`, `ErrStopRequested` | The driving service composition calls; ports as fields, plus `GitExecutable` (the absolute path of the git binary every repository/worktree command runs, resolved once by composition). `RunHandle` is an opaque per-run token (run identity, the held lease and a dispatch scope) so composition never touches identity types. `Heartbeat` extends the lease on the design's interval and cancels in-flight external calls on failure; `Detach` journals, cancels and releases without stopping; `revalidateForDispatch` is the section 4 step 2 revalidation every external mutation runs first. `Messages`/`Plan`/`Reviews`/`Workspaces` are optional Phase 3 fields, nil for a solo-only Controller |
 | [assignment.go](assignment.go) | `renderAssignment` | Deterministic assignment-artifact content: brief, identities and absolute paths only, referenced by the launch argv, never typed into a dialog |
@@ -179,7 +179,15 @@ sides together. `cmd/hop` never imports domain or identity types: every
     (usecase_stop.go) require the recorded pid and a marker on that same
     member. Launch markers are matched as an exact argv element or a
     cmdline substring (`processMarkerMatch`), because the run, attempt and
-    incarnation markers sit inside the larger prompt argument.
+    incarnation markers sit inside the larger prompt argument. Resume keeps
+    the wrapper classification on both reconciliation paths and never
+    falls through to retirement: an exec_pending claim on a reconciling
+    attempt with any forking-wrapper classification, and a settled claim
+    whose group holds the matching claimed process (`ClaimProcessMatches`)
+    alongside a matching different-pid process, each report
+    `ResumeFailedClosed` with nothing retired. A settled claim's
+    different-pid match with the claimed process GONE is the restored
+    occupant case, decided only by the next shape.
   - restored harness (positive evidence for retiring an occupant that is
     not the claim's corroborated process): `MatchRestoredHarness` requires,
     on the SAME member, the session harness's native restore executable
@@ -390,8 +398,8 @@ sides together. `cmd/hop` never imports domain or identity types: every
   exec-failure session termination, early-acceptance session activation,
   settlement from behind MCP-server members with the corroborated
   member's evidence recorded, and wrapper precedence failing closed);
-  `TestCorroborateSettlement`/`TestMatchRestoredHarness`/
-  `TestOccupantMatches`/
+  `TestCorroborateSettlement`/`TestClaimProcessMatches`/
+  `TestMatchRestoredHarness`/`TestOccupantMatches`/
   `TestClassifyGroupRetirement` (the pure decision tables incl. launcher
   exclusion, fail-closed empty identity, dual check/check-exec argv, and
   the multi-member foreground vectors — the claimed member at index 1+
@@ -427,7 +435,11 @@ sides together. `cmd/hop` never imports domain or identity types: every
   candidates each fail closed with no close, supersession or relaunch; the
   restored harness ahead of its MCP child and the argv-absent fallback are
   retired; a retirement target whose pid changed occupant fails the
-  close-time recheck);
+  close-time recheck); `TestResumeForkingWrapperNeverRetires` (a settled
+  claim with the claimed process plus a matching different-pid process,
+  and an exec_pending claim on a reconciling attempt with that pair or the
+  different-pid process alone, in every member order, fail closed with the
+  wrapper report and nothing retired);
   `TestResumeAttestation` (continuity-gated `--confirm-absent`, refusal on
   changed/unknown instance, delayed restore retired by positive evidence);
   and the four section 5 reference traces as complete four-entity app

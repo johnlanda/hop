@@ -1441,6 +1441,125 @@ func TestResumeRestoredHarnessPredicate(t *testing.T) {
 	})
 }
 
+// TestResumeForkingWrapperNeverRetires proves resume preserves the
+// forking-wrapper classification on both reconciliation paths instead of
+// falling through to positive-evidence retirement: an exec_pending claim
+// on a reconciling attempt with ANY wrapper topology, and a settled claim
+// whose group holds both the matching claimed process and a matching
+// different-pid process, each fail closed with nothing closed, superseded
+// or relaunched — in every member order.
+func TestResumeForkingWrapperNeverRetires(t *testing.T) {
+	claimMember := func(detail app.RunDetail, nativeRef string) app.ProcessInfo {
+		return app.ProcessInfo{PID: 4242, Argv0: "claude", Name: "claude", Argv: []string{"/usr/bin/claude", "--session-id", nativeRef, detail.AttemptID.String()}}
+	}
+	resumeMember := func(nativeRef string) app.ProcessInfo {
+		return app.ProcessInfo{PID: 5151, Argv0: "claude", Name: "claude", Argv: []string{"/usr/bin/claude", "--resume", nativeRef}}
+	}
+	mcpMember := app.ProcessInfo{PID: 4305, Argv0: "npm", Name: "npm", Argv: []string{"npm", "exec", "@executeautomation/playwright-mcp-server"}}
+
+	orders := map[string]func(claim, other app.ProcessInfo) []app.ProcessInfo{
+		"claimed process first": func(claim, other app.ProcessInfo) []app.ProcessInfo {
+			return []app.ProcessInfo{claim, other}
+		},
+		"different-pid process first": func(claim, other app.ProcessInfo) []app.ProcessInfo {
+			return []app.ProcessInfo{other, claim}
+		},
+		"both behind an MCP member": func(claim, other app.ProcessInfo) []app.ProcessInfo {
+			return []app.ProcessInfo{mcpMember, other, claim}
+		},
+	}
+
+	assertWrapperFailedClosed := func(t *testing.T, result app.ResumeResult, detail app.RunDetail) {
+		t.Helper()
+		if result.Outcome != app.ResumeFailedClosed {
+			t.Fatalf("Outcome = %s (%s), want %s", result.Outcome, result.Detail, app.ResumeFailedClosed)
+		}
+		if !strings.Contains(result.Detail, "forking-wrapper") || result.ObservedPaneID != detail.Binding.PaneID {
+			t.Fatalf("result = %+v, want the forking-wrapper report naming pane %q", result, detail.Binding.PaneID)
+		}
+	}
+
+	for name, order := range orders {
+		t.Run("settled claim: claimed process and a matching different-pid process, "+name, func(t *testing.T) {
+			tc := newTestController(defaultPolicy())
+			_, detail := runningRun(t, tc)
+			nativeRef := tc.Store.Sessions[detail.SessionID].value.NativeSessionRef
+			members := order(claimMember(detail, nativeRef), resumeMember(nativeRef))
+			tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+				return app.PaneProcess{ForegroundGroupID: 4242, Foreground: members}, nil
+			}
+
+			tc.Clock.Advance(leaseTTL + time.Second)
+			result, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String()))
+			if err != nil {
+				t.Fatalf("Resume() error = %v", err)
+			}
+			assertWrapperFailedClosed(t, result, detail)
+			assertNothingRetired(t, tc, detail)
+			if got := tc.Store.LaunchClaims[detail.Binding.IncarnationID].State; got != app.LaunchClaimExeced {
+				t.Fatalf("claim state = %s, want %s unchanged", got, app.LaunchClaimExeced)
+			}
+			if got := tc.Store.Attempts[detail.AttemptID].value.State; got != run.AttemptReconciling {
+				t.Fatalf("Attempt.State = %s, want %s (never warm-adopted)", got, run.AttemptReconciling)
+			}
+		})
+	}
+
+	// execPendingOnReconciling drives a launch whose claim was never written
+	// into reconciling (an unidentified pre-exec occupant fails closed), then
+	// writes the exec_pending claim, as TestReconciliationClaimSettlement does.
+	execPendingOnReconciling := func(t *testing.T, tc *testController) app.RunDetail {
+		t.Helper()
+		_, detail := startedRun(t, tc)
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "hop", Name: "hop", Argv: []string{"/usr/bin/hop", "launch", "--attempt", detail.AttemptID.String()}}}}, nil
+		}
+		tc.Clock.Advance(leaseTTL + time.Second)
+		if _, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String())); err != nil {
+			t.Fatalf("first Resume() error = %v", err)
+		}
+		if got := tc.Store.Attempts[detail.AttemptID].value.State; got != run.AttemptReconciling {
+			t.Fatalf("Attempt.State = %s, want %s", got, run.AttemptReconciling)
+		}
+		claimLaunch(t, tc, detail, 4242)
+		return detail
+	}
+	execPendingCases := map[string]func(detail app.RunDetail, nativeRef string) []app.ProcessInfo{}
+	for name, order := range orders {
+		execPendingCases["claimed process and a matching different-pid process, "+name] = func(detail app.RunDetail, nativeRef string) []app.ProcessInfo {
+			return order(claimMember(detail, nativeRef), resumeMember(nativeRef))
+		}
+	}
+	execPendingCases["only a matching different-pid process"] = func(_ app.RunDetail, nativeRef string) []app.ProcessInfo {
+		return []app.ProcessInfo{mcpMember, resumeMember(nativeRef)}
+	}
+	for name, members := range execPendingCases {
+		t.Run("exec_pending claim on a reconciling attempt: "+name, func(t *testing.T) {
+			tc := newTestController(defaultPolicy())
+			detail := execPendingOnReconciling(t, tc)
+			nativeRef := tc.Store.Sessions[detail.SessionID].value.NativeSessionRef
+			observed := members(detail, nativeRef)
+			tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+				return app.PaneProcess{ForegroundGroupID: 4242, Foreground: observed}, nil
+			}
+
+			tc.Clock.Advance(leaseTTL + time.Second)
+			result, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String()))
+			if err != nil {
+				t.Fatalf("second Resume() error = %v", err)
+			}
+			assertWrapperFailedClosed(t, result, detail)
+			assertNothingRetired(t, tc, detail)
+			if got := tc.Store.LaunchClaims[detail.Binding.IncarnationID].State; got != app.LaunchClaimExecPending {
+				t.Fatalf("claim state = %s, want %s (the wrapper topology never settles)", got, app.LaunchClaimExecPending)
+			}
+			if got := tc.Store.Attempts[detail.AttemptID].value.State; got != run.AttemptReconciling {
+				t.Fatalf("Attempt.State = %s, want %s", got, run.AttemptReconciling)
+			}
+		})
+	}
+}
+
 // TestReconciliationClaimSettlement is the M4 pending→reconciling→
 // claim-appears trace: a launch that went ambiguous (attempt reconciling)
 // is settled once the claim appears and its worker corroborates under the

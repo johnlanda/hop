@@ -119,6 +119,32 @@ func CorroborateSettlement(paneMatches bool, pane PaneProcess, markers []string,
 	}
 }
 
+// ClaimProcessMatches reports whether SOME foreground member with the
+// claim's pid satisfies the claim's executable identity and carries one of
+// markers — the claimed process itself, observed among the members, with
+// every conjunct on that SAME member and a `hop launch` invocation skipped.
+// CorroborateSettlement's forking-wrapper classification does not say
+// whether the claimed process was ALSO present; resume needs exactly that
+// distinction, since a group holding both the matching claimed process and
+// a matching different-pid process is the refused wrapper topology, while
+// a matching different-pid process with the claimed process gone is the
+// restored-occupant case the restored-harness predicate decides. An empty
+// claim executable never matches.
+func ClaimProcessMatches(pane PaneProcess, markers []string, claim LaunchClaim) bool { //nolint:gocritic // hugeParam: claim is an immutable snapshot read once by this pure decision function, matching CorroborateSettlement's argument shape.
+	if claim.Executable == "" {
+		return false
+	}
+	for _, fg := range pane.Foreground {
+		if fg.PID != claim.PID || isLauncherInvocation(fg.Argv) {
+			continue
+		}
+		if executableMatches(fg, claim.Executable) && processMarkerMatch(fg, markers) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // RestoredHarnessOutcome classifies a pane's foreground members against a
 // harness's native restore invocation for the session's durable native
 // reference.

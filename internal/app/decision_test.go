@@ -328,6 +328,68 @@ func TestMatchRestoredHarness(t *testing.T) {
 	}
 }
 
+// TestClaimProcessMatches pins the claimed-process-among-the-members check
+// resume uses to tell the refused wrapper topology (the claimed process
+// AND a matching different-pid process) from a restored occupant (the
+// claimed process gone): every conjunct on the one member with the claim's
+// pid, launcher invocations skipped.
+func TestClaimProcessMatches(t *testing.T) {
+	claim := app.LaunchClaim{PID: 100, Executable: "/usr/bin/claude"}
+	member := func(pid int, argv0, name string, argv ...string) app.ProcessInfo {
+		return app.ProcessInfo{PID: pid, Argv0: argv0, Name: name, Argv: argv}
+	}
+	npmMember := member(163, "npm", "npm", "npm", "exec", "@executeautomation/playwright-mcp-server")
+
+	tests := map[string]struct {
+		pane  app.PaneProcess
+		claim app.LaunchClaim
+		want  bool
+	}{
+		"matches: the claimed process behind an MCP member": {
+			pane:  app.PaneProcess{Foreground: []app.ProcessInfo{npmMember, member(100, "claude", "claude", "/usr/bin/claude", "attempt-1")}},
+			claim: claim, want: true,
+		},
+		"matches: the claimed process alongside a matching different-pid member": {
+			pane: app.PaneProcess{Foreground: []app.ProcessInfo{
+				member(999, "claude", "claude", "/usr/bin/claude", "--resume", "attempt-1"),
+				member(100, "claude", "claude", "/usr/bin/claude", "attempt-1"),
+			}},
+			claim: claim, want: true,
+		},
+		"no match: only a matching different-pid member": {
+			pane:  app.PaneProcess{Foreground: []app.ProcessInfo{npmMember, member(999, "claude", "claude", "/usr/bin/claude", "attempt-1")}},
+			claim: claim, want: false,
+		},
+		"no match: the claim pid now runs another executable": {
+			pane:  app.PaneProcess{Foreground: []app.ProcessInfo{member(100, "bash", "bash", "/bin/bash", "attempt-1")}},
+			claim: claim, want: false,
+		},
+		"no match: the claim pid carries no marker, a sibling does": {
+			pane: app.PaneProcess{Foreground: []app.ProcessInfo{
+				member(100, "claude", "claude", "/usr/bin/claude"),
+				member(163, "npm", "npm", "npm", "exec", "attempt-1"),
+			}},
+			claim: claim, want: false,
+		},
+		"no match: a launcher invocation at the claim pid": {
+			pane:  app.PaneProcess{Foreground: []app.ProcessInfo{member(100, "hop", "hop", "/usr/bin/hop", "launch", "--attempt", "attempt-1")}},
+			claim: app.LaunchClaim{PID: 100, Executable: "/usr/bin/hop"}, want: false,
+		},
+		"no match: an empty claim executable": {
+			pane:  app.PaneProcess{Foreground: []app.ProcessInfo{member(100, "claude", "claude", "/usr/bin/claude", "attempt-1")}},
+			claim: app.LaunchClaim{PID: 100}, want: false,
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			if got := app.ClaimProcessMatches(tc.pane, []string{"attempt-1"}, tc.claim); got != tc.want {
+				t.Fatalf("ClaimProcessMatches() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestOccupantMatches(t *testing.T) {
 	evidence := run.OccupantEvidence{Label: "label-1", ArgvMarker: "marker-1", PID: 42}
 

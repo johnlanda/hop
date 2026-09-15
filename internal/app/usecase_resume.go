@@ -674,10 +674,7 @@ func (c *Controller) reconcileActive(ctx context.Context, handle RunHandle, deta
 			if detail.Binding != nil {
 				paneID = detail.Binding.PaneID
 			}
-			return ResumeResult{
-				Outcome: ResumeFailedClosed, ObservedPaneID: paneID,
-				Detail: "the occupant matches the claim's executable identity and marker but not its pid: the unsupported forking-wrapper topology; inspect the pane, then close it or hop stop the run",
-			}, nil
+			return forkingWrapperFailedClosed(paneID), nil
 		case LaunchFailed, LaunchPending:
 			// LaunchPending: still ambiguous — enter reconciling below.
 		}
@@ -728,7 +725,9 @@ func (c *Controller) reconcileActive(ctx context.Context, handle RunHandle, deta
 				return ResumeResult{}, markerErr
 			}
 			paneMatches := detail.Binding.IncarnationID == detail.Claim.IncarnationID && !detail.Binding.Superseded
-			if settlement, occupant := CorroborateSettlement(paneMatches, pane, markers, *detail.Claim); settlement == SettlementSettled {
+			settlement, occupant := CorroborateSettlement(paneMatches, pane, markers, *detail.Claim)
+			switch settlement {
+			case SettlementSettled:
 				now := c.Clock.Now()
 				if settleErr := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 					return uow.LaunchClaims().Settle(ctx, detail.Claim.IncarnationID, LaunchClaimSettlement{
@@ -739,6 +738,12 @@ func (c *Controller) reconcileActive(ctx context.Context, handle RunHandle, deta
 					return ResumeResult{}, fmt.Errorf("app: settle launch claim from reconciliation: %w", settleErr)
 				}
 				return c.warmReattach(ctx, handle, detail, priorAttemptState, occupant)
+			case SettlementForkingWrapper:
+				// The unsettled claim's wrapper topology fails closed exactly
+				// as on the launching path: the claim stays exec_pending and
+				// nothing is retired — the human decides.
+				return forkingWrapperFailedClosed(detail.Binding.PaneID), nil
+			case SettlementUnresolved:
 			}
 		}
 
@@ -751,8 +756,21 @@ func (c *Controller) reconcileActive(ctx context.Context, handle RunHandle, deta
 				return ResumeResult{}, markerErr
 			}
 			paneMatches := detail.Binding.IncarnationID == detail.Claim.IncarnationID && !detail.Binding.Superseded
-			if settlement, occupant := CorroborateSettlement(paneMatches, pane, markers, *detail.Claim); settlement == SettlementSettled {
+			settlement, occupant := CorroborateSettlement(paneMatches, pane, markers, *detail.Claim)
+			switch settlement {
+			case SettlementSettled:
 				return c.warmReattach(ctx, handle, detail, priorAttemptState, occupant)
+			case SettlementForkingWrapper:
+				// A matching member under a different pid while the claimed
+				// process itself still matches is the refused wrapper
+				// topology: rejected without retirement. With the claimed
+				// process gone, the different-pid match is the restored
+				// occupant case, which only the restored-harness predicate
+				// below may authorize.
+				if ClaimProcessMatches(pane, markers, *detail.Claim) {
+					return forkingWrapperFailedClosed(detail.Binding.PaneID), nil
+				}
+			case SettlementUnresolved:
 			}
 		}
 
@@ -817,6 +835,16 @@ func (c *Controller) reconcileActive(ctx context.Context, handle RunHandle, deta
 		return c.attestAbsence(ctx, handle, detail, req)
 	}
 	return ResumeResult{Outcome: ResumeReconciling, Detail: "no live process observed; rerun with --confirm-absent once no worker for this run is running anywhere"}, nil
+}
+
+// forkingWrapperFailedClosed is the fail-closed report for the unsupported
+// forking-wrapper topology, on every resume path that observes it: nothing
+// is settled, adopted or retired, and the human decides.
+func forkingWrapperFailedClosed(paneID string) ResumeResult {
+	return ResumeResult{
+		Outcome: ResumeFailedClosed, ObservedPaneID: paneID,
+		Detail: "the occupant matches the claim's executable identity and marker but not its pid: the unsupported forking-wrapper topology; inspect the pane, then close it or hop stop the run",
+	}
 }
 
 // absenceAttestationRecord is the absence.attested journal entry's payload:
