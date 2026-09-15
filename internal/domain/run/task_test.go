@@ -194,7 +194,6 @@ func TestTaskRelease(t *testing.T) {
 		task := run.Task{ID: testTaskID, RunID: testRunID, Kind: run.TaskKindImplement, HasDependencies: true, State: run.TaskPending}
 
 		got, err := task.Release(true, epoch())
-
 		if err != nil {
 			t.Fatalf("Release(eligible=true): unexpected error: %v", err)
 		}
