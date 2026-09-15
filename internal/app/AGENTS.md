@@ -47,6 +47,7 @@ sides together. `cmd/hop` never imports domain or identity types: every
 | [usecase_check.go](usecase_check.go) | `ClaimAndRunCheck`, `CheckReport`, `CheckClaimDeadline` | Recovers unresolved executions first (claim/group retirement, confirmed absence, then the unknown-outcome rule; bounded no-claim ambiguity), reopens orphaned claimed requests, then claims the oldest pending request atomically with its execution intent and lifecycle transitions, validates and materializes the detached checkout (submodule candidates fail clearly), spawns `hop check-exec` bounded by the frozen timeout, retains stdout/stderr evidence, and applies the section 7 outcome transaction including stop precedence and request settlement |
 | [usecase_execboundary.go](usecase_execboundary.go) | `PrepareLaunchExec`, `LaunchExecRequest`/`LaunchExecPlan`, `FailLaunchExec`, `PrepareCheckExec`, `CheckExecRequest`/`CheckExecPlan`, `CheckSpawnEnvironment`, `ExecutableLookup` | The string-facing exec-boundary use cases behind `hop launch` and `hop check-exec` (composition passes raw strings; typed IDs are parsed here): section 6 launch preparation — fail-closed HOP_* environment validation against the launch context (every pane-provided variable present and agreeing: state root, run, task, attempt, incarnation), sanitization under the frozen policy, per-harness argv composition (first launches for Claude `--session-id <ref>` + fixed prompt, Codex `<prompt>` and opencode `--prompt <prompt>`; cold relaunch is Claude-only `--resume <ref>`, and Codex/opencode cold resume reports the Phase 2 unsupported state), executable resolution through the composition-supplied `ExecutableLookup`, then `ClaimLaunch` — and section 7 check-exec preparation (group-leadership check, `ClaimCheckExec` BEFORE anything else, frozen-argv verification, sanitized env). The exec itself stays in `cmd/hop` through the process adapter; `FailLaunchExec` is the post-claim failure path and `CheckSpawnEnvironment` composes ClaimAndRunCheck's sanitized spawn env |
 | [usecase_status.go](usecase_status.go) | `Status`, `StatusRequest`, `StatusResult`, `RunSummaryView`, `RunDetailView` | Renders `ReadStore` into string-only view DTOs for `hop status`, including the last check execution's identity, evidence paths and the human's options for an unknown outcome |
+| [usecase_schedule.go](usecase_schedule.go) | `RecomputeReleases`, `AssignReadyTasks`, `AssignmentOptions`, `AssignedTask`, `AssignmentReport`, `ReleasedTask`, `ReleaseReport` | The section 6 scheduling pass's dependency-release and assignment steps: `RecomputeReleases` moves a dependent task pending→ready once every prerequisite is integrated; `AssignReadyTasks` claims the lowest-seq ready task into a free worker slot (task ready→active, a fresh or already-reserved-by-retry attempt launched, a delegated implementer/reviewer session, the per-attempt worktree and launch intents), one committed transaction per task, the slot bound counted inside it. A pending `hop task retry`'s bookkeeping row (reserved immediately by `PlanStore.RequestRetry`, worker-authority) is marked consumed in the SAME transaction that launches its already-reserved attempt. Resolving "the current integration head" for an implement task's worktree base is 2b's integration-operations concern; this file only consumes `AssignmentOptions.IntegrationHeadCommitOID` as given |
 
 ## Invariants
 
@@ -71,6 +72,15 @@ sides together. `cmd/hop` never imports domain or identity types: every
   in production; a later slice (6) may fold the getters into
   `UnitOfWork`/`ReadStore` proper as one of its non-additive flips, once
   every implementer is updated together.
+- A `hop task retry` reserves its new attempt IMMEDIATELY inside
+  `PlanStore.RequestRetry`'s own worker-authority transaction (terminal-
+  prior-attempt and retry-limit validation, `Task.Reopen` +
+  `ReopenMailbox`), matching the CLI grammar's `retry accepted t<seq>
+  attempt <n>` naming the attempt number in that same response — never
+  deferred to a later controller step. The `retry_requests` bookkeeping
+  row it also writes (state pending) is consumed by
+  `AssignReadyTasks` in the SAME transaction that launches the
+  already-reserved attempt; nothing else ever creates a retry's attempt.
 - The doctor reports observations, never guesses: a capability that could not
   be checked is `skipped` or `unavailable` with the reason, and a feature is
   `ok` only when the schema advertises every required method. `unsupported`

@@ -148,10 +148,13 @@ type TaskIndexRepository interface {
 
 // AttemptIndexRepository lists a task's attempts in bulk and creates new
 // ones. Attempt creation lives here rather than on AttemptRepository
-// because a controller transaction reserves a task's FIRST attempt (its
-// initial assignment) and a retry's successor attempt identically — both
-// need a bare insert, unlike InitializeRun's bootstrap creation of a solo
-// run's one attempt, which stays StateStore's own concern.
+// because a controller transaction reserves a task's FIRST attempt at
+// assignment time with a bare insert, unlike InitializeRun's bootstrap
+// creation of a solo run's one attempt, which stays StateStore's own
+// concern. A retry's successor attempt is instead reserved immediately by
+// PlanStore.RequestRetry (worker-authority — the CLI grammar reports the
+// attempt number in that same response); the controller's assignment
+// pass only reads it back here to launch it.
 type AttemptIndexRepository interface {
 	// ByTask returns every attempt reserved for task, in reservation
 	// order (ascending Number) — retry provenance and "does a prior
@@ -180,10 +183,14 @@ const (
 	RetryRequestConsumed RetryRequestState = "consumed"
 )
 
-// RetryRequestRecord is one manager-authored `hop task retry` awaiting
-// the scheduler's "consume manager requests" pass. TaskID is the natural
-// key: UNIQUE(task_id) WHERE state='pending' means at most one pending
-// request per task.
+// RetryRequestRecord is one manager-authored `hop task retry`'s
+// bookkeeping row: PlanStore.RequestRetry validates and reserves the new
+// attempt IMMEDIATELY (the CLI grammar's `retry accepted t<seq> attempt
+// <n>` names the attempt number in that same response), and records this
+// row (state pending) as the durable fact a retry happened; the
+// scheduler's assignment pass marks it consumed once it actually launches
+// the reserved attempt. TaskID is the natural key: UNIQUE(task_id) WHERE
+// state='pending' means at most one pending request per task.
 type RetryRequestRecord struct {
 	TaskID      identity.TaskID
 	RequestedBy identity.SessionID
@@ -192,16 +199,18 @@ type RetryRequestRecord struct {
 	CreatedAt   time.Time
 }
 
-// RetryRequestRepository reads and consumes pending retry requests:
-// PlanStore.RequestRetry is this record's only writer (as pending); the
-// controller's scheduling pass is its only consumer.
+// RetryRequestRepository reads and consumes pending retry-request
+// bookkeeping rows: PlanStore.RequestRetry is this record's only writer
+// (as pending); the controller's assignment pass is its only consumer,
+// marking a row consumed once it launches the attempt RequestRetry
+// already reserved.
 type RetryRequestRepository interface {
 	// Pending returns the run's pending retry requests, oldest first.
 	Pending(ctx context.Context, runID identity.RunID) ([]RetryRequestRecord, error)
 	// MarkConsumed marks task's pending request consumed, recording the
-	// attempt number the controller reserved for it — what an identical
-	// request-ID retry against the original PlanStore.RequestRetry
-	// receipt returns instead of a second pending row.
+	// attempt number that was launched — what an identical request-ID
+	// retry against the original PlanStore.RequestRetry receipt returns
+	// instead of a second pending row.
 	MarkConsumed(ctx context.Context, task identity.TaskID, attemptNumber int) error
 }
 
