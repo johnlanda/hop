@@ -12,7 +12,7 @@ this tree, and drives everything through HOP's own protocol client.
 
 | File | Entities / functions | Responsibility |
 | --- | --- | --- |
-| [harness_test.go](harness_test.go) | `requireHerdr`, `prepareServer`, `testServer`, `serverProcess`, `start`, `restart`, `reapServer`, `stagePlugin`, `newArtifactDir`, `registrySnapshot`, `assertNoRegistryLeak`, `waitForLog`, `waitUntil`, `killProcessGroupThenReap`, `safeToSignalGroup`, `call` | Disposable server lifecycle (spawn, bounded socket-readiness wait, API `server.stop` then a process-group `SIGKILL` and reap of the leader), a `restart` that gracefully stops and reaps the current server before relaunching on the same roots so persisted session state survives (S3), per-`serverProcess` at-most-once reaping, hermetic subprocess environment built from scratch (`shell` selects the pane login shell), plugin staging (`go build` + manifest copy), failure-retained evidence, user-global registry leak checks and bounded polling |
+| [harness_test.go](harness_test.go) | `requireHerdr`, `prepareServer`, `testServer`, `serverProcess`, `start`, `startAnchoredLeader`, `restart`, `reapServer`, `stagePlugin`, `newArtifactDir`, `artifactDir.dir`, `registrySnapshot`, `assertNoRegistryLeak`, `waitForLog`, `waitUntil`, `killProcessGroupThenReap`, `safeToSignalGroup`, `call` | Disposable server lifecycle (spawn, bounded socket-readiness wait, API `server.stop` then a process-group `SIGKILL` and reap of the leader), a `restart` that gracefully stops and reaps the current server before relaunching on the same roots so persisted session state survives (S3), per-`serverProcess` at-most-once reaping, `startAnchoredLeader` (the shared start-as-group-leader-and-anchor step every owned leader in this suite uses — the server, spike fixture leaders and task 6b's hop subcommands), hermetic subprocess environment built from scratch (`shell` selects the pane login shell), plugin staging (`go build` + manifest copy), `artifactDir.dir` for evidence that is a directory tree rather than one file (a fixture repository, a built binary), failure-retained evidence, user-global registry leak checks and bounded polling |
 | [reap_test.go](reap_test.go) | `TestSafeToSignalGroup`, `TestKillProcessGroupThenReapKillsDescendants`, `processExists` | Table-driven guard against signaling an unsafe process group (non-positive, init, or the caller's own group), and a fixture leader + backgrounded grandchild proving the whole group is torn down and the leader reaped |
 | [plugin_test.go](plugin_test.go) | `TestRealProcessPluginLifecycle`, `TestRealProcessStartupHookRunsOnServerStart` | Link → action list → invoke → completed log records with real output → workspace/pane open and rendered evidence → unlink; and the startup hook proven to run on server start, not on link |
 | [presentation_test.go](presentation_test.go) | `TestRealProcessAgentPresentationAndView`, `createRunFixture` | A deterministic manager+workers fixture (custom agent identity/state via `pane.report_agent`), HOP metadata published through the presentation adapter, tokens round-tripped through `agent.list`, manager-first ordering, HOP's owned view select/clear, and another owner's view surviving HOP's owned clear |
@@ -29,6 +29,7 @@ this tree, and drives everything through HOP's own protocol client.
 | [spike_agentstart_test.go](spike_agentstart_test.go) | `TestSpikeAgentStartArgvCapability` | S5: `agent.start` rejects an unrecognized kind and control-char args and composes argv as `[executable(kind)] + args`, so no wrapper can be interposed; and it types a bare name whose resolution the pane shell's PATH (`path_helper`) decides |
 | [spike_layout_test.go](spike_layout_test.go) | `TestSpikeLayoutApplyCommandPane`, `TestSpikeLayoutApplyAddsTabToExistingWorkspace`, `snapshotPaneByLabel`, `snapshotIDs`, `paneExists`, `drainEventNames` | S6: `layout.apply` pane nodes carry `command`+`env`+`label` and run the argv as the pane process (asserted, at the requested cwd) with no shell; an additive apply (`workspace_id` only) adds one tab and every pre-existing tab/pane id survives (+1 tab, +1 pane); a non-zero command exit closes the pane and carries no exit status in `pane.exited` |
 | [spike_markers_test.go](spike_markers_test.go) | `TestSpikeCreationMarkerTabLabel` | S7: a `tab.create` creation-time `label` round-trips through `tab.list` and `session.snapshot`, letting a crashed controller recover its own tab and root pane by a unique marker without the create response; the additive env is never a snapshot field |
+| [hopcmd_test.go](hopcmd_test.go) | `TestMain`, `buildHopBinary`, `hopResult`, `runHop`, `requireHopCommand`, `hopEnviron`, `startHopController`, `groupMember`, `listGroupMembers`, `parseGroupMember`, `TestBuildAndRunHopBinary`, `TestHopEnviron`, `TestStartHopController`, `TestListGroupMembers` | Task 6b harness extensions (phase A, item 4): `TestMain` + `buildHopBinary` build `./cmd/hop` once per test binary run into a shared temp dir instead of per test; `runHop` runs a bounded one-shot hop subcommand capturing stdout/stderr/exit code, and `requireHopCommand` skips a scenario with a clear reason when its command is cmd/hop's "unknown command" response (task 6a not yet landed/merged); `hopEnviron` builds the isolated `HOP_STATE_DIR` + this disposable server's own socket/binary path on top of the suite's hermetic base; `startHopController` starts a long-running hop subcommand (`hop run`/`hop resume`) as its own anchored, logged process group via `startAnchoredLeader`, returned as a `serverProcess` so existing group helpers apply unchanged; `listGroupMembers`/`parseGroupMember` independently list an arbitrary process group's members via `ps` — deliberately NOT importing `internal/adapters/process` (disallowed by the architecture checker for this package), so a scenario proving group retirement is evidence against the OS process table, not an echo of the port under test |
 
 ## Invariants
 
@@ -77,9 +78,11 @@ this tree, and drives everything through HOP's own protocol client.
   (`testThirdParty` in the `test/integration` rule); the architecture
   checker's production-closure check proves no production package reaches it.
 - External binaries: `herdr` (skipped when absent), the `go` tool to build the
-  staged plugin and the compiled `TestSpike*` fixture, and — for S4 only —
-  `claude` (opt-in and skipped otherwise). The `TestSpike*` cases also skip a
-  shell capability case (zsh) with a reason when that shell is not installed.
+  staged plugin, the compiled `TestSpike*` fixture and the cached `./cmd/hop`
+  build (`buildHopBinary`), `ps` (`listGroupMembers`'s independent
+  process-group listing), and — for S4 only — `claude` (opt-in and skipped
+  otherwise). The `TestSpike*` cases also skip a shell capability case (zsh)
+  with a reason when that shell is not installed.
 
 ## Verification
 
@@ -94,12 +97,20 @@ this tree, and drives everything through HOP's own protocol client.
   no herdr binary: `TestSafeToSignalGroup`,
   `TestKillProcessGroupThenReapKillsDescendants`,
   `TestArtifactDirRemovedOnPassingRun`, `TestArtifactRetentionDecision`,
-  `TestSpikeRestartWaitsForGracefulExit` and
-  `TestSpikeOwnedGroupTeardownKillsPipeHoldingChild`.
-- Test fixtures: none on disk; servers, roots, the staged plugin and the spike
-  fixture binaries are created per test and removed by cleanup. The suite never
-  removes the shared `$TMPDIR/hop-integration` root by hand — only its own
-  per-test directories.
+  `TestSpikeRestartWaitsForGracefulExit`,
+  `TestSpikeOwnedGroupTeardownKillsPipeHoldingChild` and
+  `TestListGroupMembers`.
+- `go test -count=1 -run 'TestBuildAndRunHopBinary|TestHopEnviron|TestStartHopController' -v ./test/integration` —
+  the cached `cmd/hop` build and one-shot runner against the Phase 1 commands
+  (`version`), `requireHopCommand`'s skip detection against a command name
+  that will never exist, `hopEnviron`'s isolation contract asserted directly
+  with no process execution, and the anchored-leader mechanics via a
+  short-lived command.
+- Test fixtures: none on disk; servers, roots, the staged plugin, the spike
+  fixture binaries and the cached `cmd/hop` build are created per test (or
+  per test binary run) and removed by cleanup. The suite never removes the
+  shared `$TMPDIR/hop-integration` root by hand — only its own per-test
+  directories.
 
 ## Related guides
 

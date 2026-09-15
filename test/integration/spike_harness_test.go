@@ -234,16 +234,7 @@ func startFixtureLeader(t *testing.T, script string) *serverProcess {
 	// context.Background, not t.Context: the leader is owned by its single Wait
 	// goroutine and retired explicitly, with no CommandContext watcher.
 	cmd := exec.CommandContext(context.Background(), "/bin/sh", "-c", script) //nolint:gosec // G204: a fixed shell fixture chosen by this test.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start fixture leader: %v", err)
-	}
-	anchor, err := startAnchor(cmd.Process.Pid)
-	if err != nil {
-		retireUnanchoredLeader(t, cmd)
-		t.Fatalf("anchor could not join fixture leader group: %v", err)
-	}
-	sp := newServerProcess(cmd, anchor, nil, nil)
+	sp := startAnchoredLeader(t, cmd, nil, nil)
 	t.Cleanup(func() {
 		if sp.takeTeardown() {
 			retireInTest(t, sp)

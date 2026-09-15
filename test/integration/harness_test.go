@@ -160,6 +160,21 @@ func (a *artifactDir) create(t *testing.T, name string) *os.File {
 	return file
 }
 
+// dir returns a subdirectory of this test's evidence root, creating it if
+// needed, for content that is not a single named file — a fixture
+// repository's working tree, a built binary's own directory. It shares the
+// artifact directory's retention lifecycle (kept on failure, removed on
+// success) instead of t.TempDir's unconditional removal, so a scenario
+// failure leaves the repository state behind for inspection too.
+func (a *artifactDir) dir(t *testing.T, name string) string {
+	t.Helper()
+	path := filepath.Join(a.path, name)
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 // testServer is one disposable named-session Herdr server on temporary
 // roots, plus the environment every subprocess addressing it must use.
 type testServer struct {
@@ -361,30 +376,7 @@ func (s *testServer) start(t *testing.T) {
 	// directory, can be reaped as a group on stop. An orphaned shell that
 	// outlived a bare server kill would keep those files open and could
 	// leave the artifact directory behind on cleanup.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := cmd.Start(); err != nil {
-		// The log files were created before the failed Start; close them here so
-		// a start failure does not leak descriptors (no cleanup is registered
-		// yet at this point).
-		closeLogs(t, stdout, stderr)
-		t.Fatalf("start herdr server: %v", err)
-	}
-	// Setpgid made the server a group leader, so its pgid equals its pid; it is
-	// captured once, now, while the pid is certainly the live server. Launch an
-	// anchor into that group immediately so an unreaped member of ours pins the
-	// pgid until retirement; if the anchor cannot join, the group is already
-	// gone (the server died at once) and the launch is inconclusive.
-	anchor, err := startAnchor(cmd.Process.Pid)
-	if err != nil {
-		// The server started but could not be anchored (e.g. sleep unresolved);
-		// it is not necessarily dead and has no Wait owner or cleanup registered
-		// yet, so retire and reap it here before failing — no live server, no
-		// unreaped pid. Do not infer leader exit from an anchor error.
-		retireUnanchoredLeader(t, cmd)
-		closeLogs(t, stdout, stderr)
-		t.Fatalf("anchor could not join the server's process group %d: %v", cmd.Process.Pid, err)
-	}
-	sp := newServerProcess(cmd, anchor, stdout, stderr)
+	sp := startAnchoredLeader(t, cmd, stdout, stderr)
 	s.running = append(s.running, sp)
 	t.Cleanup(func() { s.reapServer(t, sp) })
 	deadline := time.Now().Add(30 * time.Second)
@@ -427,6 +419,41 @@ func startAnchor(pgid int) (*exec.Cmd, error) {
 		return nil, err
 	}
 	return anchor, nil
+}
+
+// startAnchoredLeader starts cmd as its own process-group leader and anchors
+// that group immediately (startAnchor), wrapping both as a serverProcess —
+// the ownership discipline every owned process-group leader in this suite
+// shares, whether it fronts the herdr server, a spike fixture leader, or a
+// hop subcommand under test. It registers no cleanup itself; the caller
+// decides its own teardown (the server's graceful server.stop-then-retire, a
+// bare retire, or a signal-driven test).
+func startAnchoredLeader(t *testing.T, cmd *exec.Cmd, stdout, stderr *os.File) *serverProcess {
+	t.Helper()
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		// The log files, if any, were created before the failed Start; close
+		// them here so a start failure does not leak descriptors (no cleanup is
+		// registered yet at this point).
+		closeLogs(t, stdout, stderr)
+		t.Fatalf("start %s: %v", cmd.Path, err)
+	}
+	// Setpgid made the leader a group leader, so its pgid equals its pid; it is
+	// captured once, now, while the pid is certainly the live leader. Launch an
+	// anchor into that group immediately so an unreaped member of ours pins the
+	// pgid until retirement; if the anchor cannot join, the group is already
+	// gone (the leader died at once) and the launch is inconclusive.
+	anchor, err := startAnchor(cmd.Process.Pid)
+	if err != nil {
+		// The leader started but could not be anchored (e.g. sleep unresolved);
+		// it is not necessarily dead and has no Wait owner or cleanup registered
+		// yet, so retire and reap it here before failing — no live leader, no
+		// unreaped pid. Do not infer leader exit from an anchor error.
+		retireUnanchoredLeader(t, cmd)
+		closeLogs(t, stdout, stderr)
+		t.Fatalf("anchor could not join %s's process group %d: %v", cmd.Path, cmd.Process.Pid, err)
+	}
+	return newServerProcess(cmd, anchor, stdout, stderr)
 }
 
 // newServerProcess wraps an already-started leader and its group anchor, and
