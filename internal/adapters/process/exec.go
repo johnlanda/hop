@@ -34,9 +34,30 @@ func Exec(argv, env []string) error {
 	if !filepath.IsAbs(argv[0]) {
 		return fmt.Errorf("exec: executable %q is not an absolute path; bare and relative names do not pin which binary runs", argv[0])
 	}
+	return ExecResolved(argv[0], argv, env)
+}
+
+// ExecResolved replaces the current process with the binary at path via
+// execve, preserving the pid AND argv exactly as given: argv[0] may be the
+// bare name the caller already resolved to path. It is the exec boundary
+// of `hop check-exec`, whose executed argv must stay byte-identical to the
+// run's frozen check argv — group retirement matches a running member's
+// argv against that exact frozen value, so rewriting argv[0] to the
+// resolved path would make an owned check unrecognizable. path must be
+// absolute, which pins which binary runs regardless of what argv[0] says;
+// env is the complete environment of the new image, nil execs with an
+// empty environment. On success ExecResolved never returns; every return
+// is a failure with nothing replaced.
+func ExecResolved(path string, argv, env []string) error {
+	if len(argv) == 0 {
+		return fmt.Errorf("exec: argv is empty; the new process image needs at least argv[0]")
+	}
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("exec: executable %q is not an absolute path; bare and relative names do not pin which binary runs", path)
+	}
 	if env == nil {
 		env = []string{}
 	}
-	err := syscall.Exec(argv[0], argv, env) //nolint:gosec // G204: the argv is chosen by the caller from the run's frozen policy and snapshot, and argv[0] is enforced absolute above; executing it is this boundary's purpose.
-	return fmt.Errorf("exec %s: %w", argv[0], err)
+	err := syscall.Exec(path, argv, env) //nolint:gosec // G204: path and argv are chosen by the caller from the run's frozen policy and snapshot, and path is enforced absolute above; executing it is this boundary's purpose.
+	return fmt.Errorf("exec %s: %w", path, err)
 }

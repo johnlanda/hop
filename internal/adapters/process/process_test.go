@@ -38,6 +38,8 @@ func TestMain(m *testing.M) {
 		helperSpawner()
 	case "exec":
 		helperExec()
+	case "execresolved":
+		helperExecResolved()
 	default:
 		fmt.Fprintf(os.Stderr, "unknown helper mode %q\n", mode)
 		os.Exit(97)
@@ -49,6 +51,9 @@ func TestMain(m *testing.M) {
 // requested code.
 func helperEnvDump() {
 	fmt.Printf("PID %d\n", os.Getpid())
+	for _, arg := range os.Args {
+		fmt.Printf("ARG %s\n", arg)
+	}
 	if wd, err := os.Getwd(); err == nil {
 		fmt.Printf("CWD %s\n", wd)
 	}
@@ -135,6 +140,26 @@ func helperExec() {
 	execErr := process.Exec(
 		[]string{exe, "argument-after-exec"},
 		[]string{helperModeVar + "=envdump", "HOP_HELPER_MARKER=exec-marker"},
+	)
+	fmt.Fprintln(os.Stderr, "exec returned:", execErr)
+	os.Exit(3)
+}
+
+// helperExecResolved replaces itself with the test binary in envdump mode
+// through process.ExecResolved, deliberately renaming argv[0]: the dump must
+// then report the renamed argv, proving the executed path and the reported
+// argv are independent. Reaching the code after ExecResolved means the
+// replacement failed.
+func helperExecResolved() {
+	exe, err := os.Executable()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "resolve executable:", err)
+		os.Exit(94)
+	}
+	execErr := process.ExecResolved(
+		exe,
+		[]string{"renamed-argv0", "frozen-tail"},
+		[]string{helperModeVar + "=envdump"},
 	)
 	fmt.Fprintln(os.Stderr, "exec returned:", execErr)
 	os.Exit(3)
@@ -647,6 +672,52 @@ func TestExecReplacesProcessImage(t *testing.T) {
 	}
 	if strings.Contains(out, "ENV "+helperModeVar+"=exec") {
 		t.Errorf("replaced image inherited the pre-exec environment; Exec must pass env verbatim\noutput: %s", out)
+	}
+}
+
+func TestExecResolvedPreservesArgvVerbatim(t *testing.T) {
+	exe := testExecutable(t)
+	cmd := exec.CommandContext(t.Context(), exe) //nolint:gosec // G204: the executable is this test binary re-run as a fixture child.
+	cmd.Env = []string{helperModeVar + "=execresolved"}
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	spawnedPid := cmd.Process.Pid
+
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("helper failed: %v\nstderr: %s", err, stderr.String())
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, fmt.Sprintf("PID %d\n", spawnedPid)) {
+		t.Errorf("replaced image reports a different pid; execve must preserve it\noutput: %s", out)
+	}
+	if !strings.Contains(out, "ARG renamed-argv0\n") || !strings.Contains(out, "ARG frozen-tail\n") {
+		t.Errorf("replaced image does not report the caller's verbatim argv\noutput: %s", out)
+	}
+}
+
+func TestExecResolvedRejectsNonAbsolutePathsAndEmptyArgv(t *testing.T) {
+	cases := []struct {
+		name string
+		path string
+		argv []string
+	}{
+		{name: "empty argv", path: "/bin/sh", argv: nil},
+		{name: "bare path", path: "sh", argv: []string{"sh"}},
+		{name: "relative path", path: "./sh", argv: []string{"sh"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := process.ExecResolved(tc.path, tc.argv, nil)
+
+			if err == nil {
+				t.Fatalf("ExecResolved(%q, %q) reported success; it must never succeed by returning", tc.path, tc.argv)
+			}
+		})
 	}
 }
 
