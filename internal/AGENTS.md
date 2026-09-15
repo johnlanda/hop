@@ -23,6 +23,8 @@ and adapter packages, and of every future domain package.
   Herdr adapter.
 - [internal/domain](domain/AGENTS.md): domain module index; currently the
   shared identity values and the run domain module.
+- [internal/testsupport](testsupport/AGENTS.md): shared, cross-package
+  test-support code; currently the Phase 3 store-vectors package.
 
 ## Invariants
 

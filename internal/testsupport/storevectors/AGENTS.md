@@ -1,0 +1,70 @@
+# internal/testsupport/storevectors
+
+## Purpose
+
+Shared refused-input vectors for Phase 3's worker-authority store ports
+(`app.MessagingStore`, `app.PlanStore`): request shapes a correct store
+must refuse, expressed once so both `internal/app`'s `fakeStore` tests and
+`internal/adapters/sqlite`'s future real-store tests exercise the
+IDENTICAL input against their own backing implementation. This is the
+section 11 countermeasure for the Phase 2 escaped-defect class "a fake
+accepted arguments the real adapter refuses" — a shape one implementation
+happens to accept and the other genuinely refuses is exactly the drift a
+shared vector catches, since both sides run the same input.
+
+## Quick reference
+
+| File | Entities / functions | Responsibility |
+| --- | --- | --- |
+| [storevectors.go](storevectors.go) | `TaskCreateSelfDependency`, `TaskCreateRequestIDConflictFirst`/`Second`, `TaskCreateNonManagerCaller`, `TaskCreateOversizedTitle`, `AckMessageStaleIncarnation`, `MessageSendAnswerUnknownQuestion` | Six vectors: a malformed dependency graph, a reused request-ID with conflicting content, a non-manager caller, an oversized title, a stale acking incarnation, and an answer replying to an unknown question — one function per vector, each returning the exact `app.TaskCreate`/`app.MessageAck`/`app.MessageSend` value to pass to the port method its doc comment names |
+
+## Invariants
+
+- A vector is a pure function of its caller-supplied identities (run,
+  session, incarnation, task or message ids) to a request value — it never
+  calls a port itself, seeds any store, or asserts anything. The consuming
+  test supplies already-established fixture state (an existing run and its
+  current manager/non-manager sessions) and asserts the refusal.
+- Every vector's doc comment names the EXACT outcome kind and detail
+  observed against `internal/app`'s `fakeStore` — this is empirical
+  documentation of current behavior, not a guessed contract. A vector whose
+  observed refusal reason changes needs its comment updated in the same
+  change.
+- `TaskCreateSelfDependency` does NOT exercise `internal/domain/run`'s
+  `ValidateAcyclic` cycle detection — no multi-node cycle is reachable
+  through `PlanStore.CreateTask` at all, since every dependency edge must
+  reference an ALREADY-persisted task (the persisted graph is a DAG by
+  construction). It is refused earlier, as an unknown dependency; recorded
+  here so a future reader does not re-derive this by surprise.
+- This package takes no dependency on `internal/adapters/sqlite`: the
+  future sqlite vector-contract test imports storevectors, never the
+  reverse (storevectors has no reason to know sqlite exists).
+
+## Dependencies and ports
+
+- Allowed inward imports: [internal/app](../../app/AGENTS.md),
+  [internal/domain/identity](../../domain/identity/AGENTS.md),
+  [internal/domain/run](../../domain/run/AGENTS.md).
+- Consumed/implemented ports: none — this package builds `app.TaskCreate`/
+  `app.MessageAck`/`app.MessageSend` request VALUES for
+  `app.PlanStore`/`app.MessagingStore`; it implements neither port.
+- External libraries: none.
+
+## Verification
+
+- `go test ./internal/app -run TestStoreVectors` — the consuming contract
+  test (`internal/app/storevectors_test.go`) drives every vector above
+  against `fakeStore` through the ordinary `PlanStore`/`MessagingStore`
+  ports and asserts the documented refusal.
+- This package itself has no `_test.go` file: each vector is a pure
+  constructor with nothing meaningful to assert in isolation from an
+  actual store — the assertion worth making only exists once a vector runs
+  against `fakeStore` (today) or the real store (once
+  `internal/adapters/sqlite` lands), which is exactly what the consuming
+  contract test above does.
+
+## Related guides
+
+- [Parent index](../AGENTS.md)
+- [internal/app](../../app/AGENTS.md): today's sole consumer.
+- [Architecture and package catalog](../../../docs/architecture/architecture.md)
