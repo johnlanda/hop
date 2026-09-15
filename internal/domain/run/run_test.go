@@ -30,6 +30,7 @@ func runValidTransitions() map[[2]run.RunState]bool {
 		{run.RunLaunching, run.RunRunning}:    true,
 		{run.RunResuming, run.RunRunning}:     true,
 		{run.RunCompleting, run.RunRunning}:   true,
+		{run.RunResuming, run.RunCompleting}:  true,
 		{run.RunRunning, run.RunCompleting}:   true,
 		{run.RunCompleting, run.RunCompleted}: true,
 		{run.RunCreated, run.RunStopping}:     true,

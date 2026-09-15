@@ -35,6 +35,36 @@ type LaunchClaim struct {
 	SettlementEvidence string
 }
 
+// LaunchClaimSettlement is the controller's corroborated settlement of one
+// launch claim (docs/plan/phase-2-design.md section 6): the target state
+// the corroboration predicate decided and the evidence that established it.
+type LaunchClaimSettlement struct {
+	State      LaunchClaimState // LaunchClaimExeced or LaunchClaimExecFailed
+	PaneID     string
+	PID        int
+	Executable string
+	ArgvMarker string
+	Reason     string // populated for LaunchClaimExecFailed
+	At         time.Time
+}
+
+// LaunchClaimRepository reads launch claims and records the controller's
+// settlement of one to execed or exec_failed. ClaimLaunch and
+// SettleLaunchFailure on SubmissionStore stay the launcher's own pre-exec
+// write and error path; this repository is the controller's counterpart,
+// used only under the lease once corroboration (or a settled exec_failed
+// claim's consequences) is being applied.
+type LaunchClaimRepository interface {
+	Get(ctx context.Context, incarnation identity.IncarnationID) (LaunchClaim, bool, error)
+	// Pending lists the run's still-exec_pending claims.
+	Pending(ctx context.Context, run identity.RunID) ([]LaunchClaim, error)
+	// Settle moves a claim to settlement.State. execed is legal only from
+	// exec_pending; exec_failed is legal only from exec_pending.
+	// Resettling to the same state is idempotent; any other transition is
+	// an error.
+	Settle(ctx context.Context, incarnation identity.IncarnationID, settlement LaunchClaimSettlement) error
+}
+
 // SubmissionOutcomeKind is the section 7 outcome of one result submission.
 type SubmissionOutcomeKind string
 

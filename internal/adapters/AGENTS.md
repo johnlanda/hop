@@ -13,6 +13,7 @@ directory; it is a grouping directory.
 | `config/` | [internal/adapters/config](config/AGENTS.md) | Repository policy file `.herdr-orchestrator/config.toml` |
 | `herdr/` | [internal/adapters/herdr](herdr/AGENTS.md) | Herdr CLI and socket API |
 | `process/` | [internal/adapters/process](process/AGENTS.md) | Local processes: the exec boundary, process groups and the process table |
+| `sqlite/` | [internal/adapters/sqlite](sqlite/AGENTS.md) | SQLite state store (modernc.org/sqlite) |
 | `system/` | [internal/adapters/system](system/AGENTS.md) | Local clock, randomness and artifact filesystem |
 
 ## Rules for this subtree

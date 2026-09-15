@@ -215,12 +215,16 @@ type Operation struct {
 // OperationRepository records and updates the operation journal. Pending
 // lists operations still open (pending or reconciling) for a run, oldest
 // first — what a controller must resolve before any new act of the same
-// kind (section 4).
+// kind (section 4). ByKind lists every operation of one kind for a run,
+// newest first, regardless of state — recovery reads a settled
+// operation's evidence (for example the worktree.create outcome's
+// workspace) through it.
 type OperationRepository interface {
 	Create(ctx context.Context, op Operation) error
 	Get(ctx context.Context, id identity.OperationID) (Operation, error)
 	Save(ctx context.Context, op Operation) error
 	Pending(ctx context.Context, runID identity.RunID) ([]Operation, error)
+	ByKind(ctx context.Context, runID identity.RunID, kind OperationKind) ([]Operation, error)
 }
 
 // EntityKind names the kind of entity a Transition row describes.
@@ -282,6 +286,26 @@ type CheckRequestRepository interface {
 	Save(ctx context.Context, cr CheckRequest) error
 }
 
+// CheckExecClaim is the durable record hop check-exec writes before it
+// execs the check argv: its own pid, which IS the process-group id (it
+// verifies it leads its own group first). It is read-only from the
+// controller side — SubmissionStore.ClaimCheckExec is the only writer —
+// and is read inside a lease-fenced unit of work, like LaunchClaims,
+// because stop and resume decide process-group retirement against a
+// consistent snapshot within that same transaction.
+type CheckExecClaim struct {
+	OperationID identity.OperationID
+	PID         int
+	ClaimedAt   time.Time
+}
+
+// CheckExecClaimRepository reads check-exec claims. Used by stop and
+// resume to find the process group to retire when a check execution's
+// controller crashed or a stop was requested while it ran.
+type CheckExecClaimRepository interface {
+	Get(ctx context.Context, op identity.OperationID) (CheckExecClaim, bool, error)
+}
+
 // UnitOfWork is one controller transaction, fenced by the lease Begin was
 // called with. Commit re-reads the lease inside the transaction and fails
 // with ErrFenced unless it still matches (run, controller, generation,
@@ -295,6 +319,8 @@ type UnitOfWork interface {
 	Results() ResultRepository
 	Artifacts() ArtifactRepository
 	Bindings() BindingRepository
+	LaunchClaims() LaunchClaimRepository
+	CheckExecClaims() CheckExecClaimRepository
 	Operations() OperationRepository
 	Transitions() TransitionRepository
 	CheckRequests() CheckRequestRepository

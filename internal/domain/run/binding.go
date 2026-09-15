@@ -37,9 +37,19 @@ type OccupantEvidence struct {
 // current (non-superseded) binding; supersession requires recorded
 // evidence, never assumption.
 type RuntimeBinding struct {
-	SessionID          identity.SessionID
-	IncarnationID      identity.IncarnationID
-	ServerSocketPath   string
+	SessionID        identity.SessionID
+	IncarnationID    identity.IncarnationID
+	ServerSocketPath string
+	// ServerInstance is the opaque, adapter-formatted identity of the
+	// server process behind the configured socket at the time the binding
+	// was created (for example a socket peer pid). Empty means unknown.
+	// Resume compares it, by equality only, with a freshly observed value
+	// to establish server continuity: a deferred native restore can only
+	// fire after a server restart, so an unchanged instance with the pane
+	// gone cannot have a restore pending. A recycled peer pid is a
+	// documented residual limitation (start-time hardening is a Phase 7
+	// recovery item).
+	ServerInstance     string
 	WorkspaceID        string
 	TabID              string
 	PaneID             string
@@ -54,11 +64,12 @@ type RuntimeBinding struct {
 
 // NewRuntimeBinding constructs a binding for a newly created pane, with no
 // occupant evidence yet: it is recorded once the runtime is inspected.
-func NewRuntimeBinding(sessionID identity.SessionID, incarnationID identity.IncarnationID, serverSocketPath, workspaceID, tabID, paneID, creationLabel string, kind LaunchKind, now time.Time) RuntimeBinding {
+func NewRuntimeBinding(sessionID identity.SessionID, incarnationID identity.IncarnationID, serverSocketPath, serverInstance, workspaceID, tabID, paneID, creationLabel string, kind LaunchKind, now time.Time) RuntimeBinding {
 	return RuntimeBinding{
 		SessionID:        sessionID,
 		IncarnationID:    incarnationID,
 		ServerSocketPath: serverSocketPath,
+		ServerInstance:   serverInstance,
 		WorkspaceID:      workspaceID,
 		TabID:            tabID,
 		PaneID:           paneID,
