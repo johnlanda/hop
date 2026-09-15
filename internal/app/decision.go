@@ -127,9 +127,11 @@ func CorroborateSettlement(paneMatches bool, pane PaneProcess, markers []string,
 // whether the claimed process was ALSO present; resume needs exactly that
 // distinction, since a group holding both the matching claimed process and
 // a matching different-pid process is the refused wrapper topology, while
-// a matching different-pid process with the claimed process gone is the
-// restored-occupant case the restored-harness predicate decides. An empty
-// claim executable never matches.
+// a matching different-pid process with no member under the claim's pid
+// still satisfying these conjuncts is the restored-occupant case the
+// restored-harness predicate decides. A false result observes only that no
+// such member matched — not that the claim's pid is absent from the group.
+// An empty claim executable never matches.
 func ClaimProcessMatches(pane PaneProcess, markers []string, claim LaunchClaim) bool { //nolint:gocritic // hugeParam: claim is an immutable snapshot read once by this pure decision function, matching CorroborateSettlement's argument shape.
 	if claim.Executable == "" {
 		return false
@@ -261,26 +263,25 @@ func restoredHarnessMember(fg ProcessInfo, invocation restoreInvocation, nativeR
 	return containsDelimited(fg.Cmdline, invocation.ResumeFlag+" "+nativeRef)
 }
 
-// restoredHarnessTargetMatches reports whether the member with pid is the
-// restored harness for one of markers under harness: the close-time recheck
-// of a positive-evidence retirement target, applying the same per-member
-// conjuncts that authorized the retirement to the recorded pid's member.
-func restoredHarnessTargetMatches(pane PaneProcess, harness run.Harness, pid int, markers []string) bool {
-	invocation, ok := restoreInvocationFor(harness)
-	if !ok {
-		return false
+// MatchRetirementTarget is the close-time recheck of a persisted
+// positive-evidence retirement target: the whole current foreground group
+// is classified again under MatchRestoredHarness with the recorded native
+// reference, and the target still matches only when that classification is
+// RestoredHarnessMatched AND its one candidate has the recorded pid. The
+// uniqueness that authorized the retirement is therefore re-established on
+// the very observation the close acts on: a second candidate appearing
+// beside the recorded member is ambiguous and never closes, and a unique
+// candidate under another pid is never adopted as a new target. A
+// retirement records exactly one native reference, so any other marker
+// count is RestoredHarnessUnsupported. The outcome and candidates are
+// returned as the fail-closed evidence whenever matched is false.
+func MatchRetirementTarget(pane PaneProcess, harness run.Harness, pid int, markers []string) (matched bool, outcome RestoredHarnessOutcome, candidates []ProcessInfo) {
+	if len(markers) != 1 {
+		return false, RestoredHarnessUnsupported, nil
 	}
-	for _, fg := range pane.Foreground {
-		if fg.PID != pid {
-			continue
-		}
-		for _, marker := range markers {
-			if restoredHarnessMember(fg, invocation, marker) {
-				return true
-			}
-		}
-	}
-	return false
+	outcome, candidates = MatchRestoredHarness(pane, harness, markers[0])
+	matched = outcome == RestoredHarnessMatched && candidates[0].PID == pid
+	return matched, outcome, candidates
 }
 
 // containsDelimited reports whether s contains needle bounded on each side

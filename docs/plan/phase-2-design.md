@@ -833,7 +833,9 @@ per the decision table (section 4) before any new act.
    merely appearing in some member's command line (a transcript path, a
    foreign tool's argument) is never evidence, argv elements are matched
    exactly whenever argv is reported (a space-delimited cmdline match is
-   only the fallback when it is not), and two candidates fail closed. S2
+   only the fallback when it is not), and two candidates fail closed —
+   again at the guarded close, which reclassifies the whole group and
+   acts only when its one candidate is the recorded pid. S2
    established that full process argv IS observable through pane
    inspection, and S3 established that a recorded native session makes
    Herdr auto-relaunch exactly as `claude --resume <id>` (bypassing

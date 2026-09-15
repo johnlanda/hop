@@ -528,7 +528,9 @@ installed `herdr 0.9.0` documentation):
   Code the basename of argv[0] is `claude`) AND an argv element
   `--resume` immediately followed by an argv element exactly equal to the
   session's durable native reference, and exactly one such member —
-  two candidates fail closed. Argv elements are matched exactly whenever
+  two candidates fail closed, both when the retirement is authorized and
+  when its close is rechecked against the recorded pid over the whole
+  group (`MatchRetirementTarget`). Argv elements are matched exactly whenever
   Herdr reports argv. Herdr 0.9.0 derives `cmdline` by joining argv with
   spaces on both platforms and omits both together, so the cmdline
   fallback (identity from argv0/name, a space-delimited `--resume <id>`)

@@ -763,10 +763,10 @@ func (c *Controller) reconcileActive(ctx context.Context, handle RunHandle, deta
 			case SettlementForkingWrapper:
 				// A matching member under a different pid while the claimed
 				// process itself still matches is the refused wrapper
-				// topology: rejected without retirement. With the claimed
-				// process gone, the different-pid match is the restored
-				// occupant case, which only the restored-harness predicate
-				// below may authorize.
+				// topology: rejected without retirement. With no member under
+				// the claim's pid still matching, the different-pid match is
+				// the restored occupant case, which only the restored-harness
+				// predicate below may authorize.
 				if ClaimProcessMatches(pane, markers, *detail.Claim) {
 					return forkingWrapperFailedClosed(detail.Binding.PaneID), nil
 				}

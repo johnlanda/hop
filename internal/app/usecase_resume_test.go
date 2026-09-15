@@ -2,6 +2,7 @@ package app_test
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -1437,6 +1438,227 @@ func TestResumeRestoredHarnessPredicate(t *testing.T) {
 		}
 		if !reconciling {
 			t.Fatalf("the retirement close was not marked reconciling on the recheck mismatch")
+		}
+	})
+}
+
+// retirementCloseOperation returns the run's one pane.close operation and
+// the pid its persisted intent records, failing unless exactly one exists.
+func retirementCloseOperation(t *testing.T, tc *testController) (op app.Operation, pid int) {
+	t.Helper()
+	var found []app.Operation
+	for id := range tc.Store.Operations {
+		if candidate := tc.Store.Operations[id]; candidate.Kind == app.OpPaneClose {
+			found = append(found, candidate)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("pane.close operations = %d, want exactly 1", len(found))
+	}
+	raw, err := json.Marshal(found[0].Intent)
+	if err != nil {
+		t.Fatalf("marshal pane.close intent: %v", err)
+	}
+	var intent struct {
+		PID    int    `json:"pid"`
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal(raw, &intent); err != nil {
+		t.Fatalf("unmarshal pane.close intent: %v", err)
+	}
+	if intent.Reason != "positive-evidence retirement" {
+		t.Fatalf("pane.close intent reason = %q, want the positive-evidence retirement", intent.Reason)
+	}
+	return found[0], intent.PID
+}
+
+// TestRetirementRecheckRequiresUniqueCandidate proves the close-time
+// recheck of a positive-evidence retirement target re-establishes the
+// uniqueness that authorized it, on the very observation the close would
+// act on: the recorded restored harness A still matching is not enough
+// once a second restored-harness candidate B shares the group. The close
+// is never dispatched, the operation stays reconciling with its recorded
+// intent and act evidence intact, the report names the pane and both
+// candidate pids, and nothing is relaunched — in the authorizing round
+// (both member orders) and when the persisted pending retirement is
+// replayed by a later resume round or by stop.
+func TestRetirementRecheckRequiresUniqueCandidate(t *testing.T) {
+	restored := func(pid int, nativeRef string) app.ProcessInfo {
+		return app.ProcessInfo{PID: pid, Argv0: "claude", Name: "claude", Argv: []string{"claude", "--resume", nativeRef}}
+	}
+	mcpChild := app.ProcessInfo{PID: 7840, Argv0: "npm", Name: "npm", Argv: []string{"npm", "exec", "@executeautomation/playwright-mcp-server"}}
+	const recheckRefusal = "the retirement close is not dispatched"
+
+	assertAmbiguityReported := func(t *testing.T, text, paneID string) {
+		t.Helper()
+		for _, want := range []string{recheckRefusal, paneID, "7777", "7778"} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("report %q, want it to name %q", text, want)
+			}
+		}
+	}
+	assertTargetDurable := func(t *testing.T, tc *testController, detail app.RunDetail, wantActEvidence bool) {
+		t.Helper()
+		op, pid := retirementCloseOperation(t, tc)
+		if op.State != app.OperationReconciling {
+			t.Fatalf("pane.close operation state = %s, want %s", op.State, app.OperationReconciling)
+		}
+		if pid != 7777 {
+			t.Fatalf("persisted retirement target pid = %d, want the recorded 7777 (never retargeted)", pid)
+		}
+		if wantActEvidence {
+			if evidence, ok := op.ActEvidence.(string); !ok || !strings.Contains(evidence, "pid 7777") {
+				t.Fatalf("pane.close act evidence = %v, want the recorded dispatch against pid 7777 kept", op.ActEvidence)
+			}
+		}
+		history := tc.Store.Bindings[detail.SessionID]
+		if len(history) != 2 || history[1].Superseded || history[1].Occupant == nil || history[1].Occupant.PID != 7777 {
+			t.Fatalf("binding history = %+v, want the observed restoration of pid 7777, unsuperseded", history)
+		}
+		updated, err := tc.Store.LoadRunStatus(context.Background(), detail.RunID)
+		if err != nil {
+			t.Fatalf("LoadRunStatus() error = %v", err)
+		}
+		if updated.SessionID != detail.SessionID {
+			t.Fatalf("a replacement session %s was bound; no relaunch may follow", updated.SessionID)
+		}
+	}
+
+	orders := map[string]func(a, b app.ProcessInfo) []app.ProcessInfo{
+		"second candidate listed after the recorded member": func(a, b app.ProcessInfo) []app.ProcessInfo {
+			return []app.ProcessInfo{a, mcpChild, b}
+		},
+		"second candidate listed before the recorded member": func(a, b app.ProcessInfo) []app.ProcessInfo {
+			return []app.ProcessInfo{b, mcpChild, a}
+		},
+	}
+	for name, order := range orders {
+		t.Run("authorizing round: "+name, func(t *testing.T) {
+			tc := newTestController(defaultPolicy())
+			_, detail := runningRun(t, tc)
+			nativeRef := tc.Store.Sessions[detail.SessionID].value.NativeSessionRef
+			a, b := restored(7777, nativeRef), restored(7778, nativeRef)
+			// A alone authorizes the retirement; once its observation binding
+			// is recorded, the close procedure's fresh inspection shows B too.
+			tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+				tc.Store.mu.Lock()
+				recorded := len(tc.Store.Bindings[detail.SessionID]) == 2
+				tc.Store.mu.Unlock()
+				if recorded {
+					return app.PaneProcess{ForegroundGroupID: 7777, Foreground: order(a, b)}, nil
+				}
+				return app.PaneProcess{ForegroundGroupID: 7777, Foreground: []app.ProcessInfo{a, mcpChild}}, nil
+			}
+
+			tc.Clock.Advance(leaseTTL + time.Second)
+			result, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String()))
+			if err != nil {
+				t.Fatalf("Resume() error = %v", err)
+			}
+			if result.Outcome != app.ResumeReconciling {
+				t.Fatalf("Outcome = %s (%s), want %s", result.Outcome, result.Detail, app.ResumeReconciling)
+			}
+			if n := len(tc.Runtime.ClosedPanes); n != 0 {
+				t.Fatalf("ClosePane calls = %d, want 0 (an ambiguous recheck never closes)", n)
+			}
+			assertAmbiguityReported(t, result.Detail, detail.Binding.PaneID)
+			assertTargetDurable(t, tc, detail, false)
+		})
+	}
+
+	// dispatchedRetirement runs the authorizing round against A alone: the
+	// close is dispatched but termination is not yet observed, leaving the
+	// retirement operation pending with its recorded act evidence.
+	dispatchedRetirement := func(t *testing.T, tc *testController) (app.RunDetail, string) {
+		t.Helper()
+		_, detail := runningRun(t, tc)
+		nativeRef := tc.Store.Sessions[detail.SessionID].value.NativeSessionRef
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			return app.PaneProcess{ForegroundGroupID: 7777, Foreground: []app.ProcessInfo{restored(7777, nativeRef), mcpChild}}, nil
+		}
+		tc.Clock.Advance(leaseTTL + time.Second)
+		if _, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String())); err != nil {
+			t.Fatalf("first Resume() error = %v", err)
+		}
+		if n := len(tc.Runtime.ClosedPanes); n != 1 {
+			t.Fatalf("ClosePane calls after the authorizing round = %d, want 1", n)
+		}
+		if op, _ := retirementCloseOperation(t, tc); op.State != app.OperationPending {
+			t.Fatalf("pane.close operation state = %s, want pending (dispatched, termination unobserved)", op.State)
+		}
+		return detail, nativeRef
+	}
+
+	t.Run("resume replay of the pending retirement", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		detail, nativeRef := dispatchedRetirement(t, tc)
+		a, b := restored(7777, nativeRef), restored(7778, nativeRef)
+		// The replaying round's own observation still shows A alone; B joins
+		// the group from the close procedure's pre-dispatch revalidation on,
+		// so the ambiguity is present in the inspection the recheck acts on.
+		joined := false
+		tc.Store.HeartbeatHook = func() { joined = true }
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			if joined {
+				return app.PaneProcess{ForegroundGroupID: 7777, Foreground: []app.ProcessInfo{a, mcpChild, b}}, nil
+			}
+			return app.PaneProcess{ForegroundGroupID: 7777, Foreground: []app.ProcessInfo{a, mcpChild}}, nil
+		}
+
+		tc.Clock.Advance(leaseTTL + time.Second)
+		result, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String()))
+		if err != nil {
+			t.Fatalf("second Resume() error = %v", err)
+		}
+		if result.Outcome != app.ResumeReconciling {
+			t.Fatalf("Outcome = %s (%s), want %s", result.Outcome, result.Detail, app.ResumeReconciling)
+		}
+		if n := len(tc.Runtime.ClosedPanes); n != 1 {
+			t.Fatalf("ClosePane calls = %d, want still 1 (no close re-dispatched on an ambiguous recheck)", n)
+		}
+		assertAmbiguityReported(t, result.Detail, detail.Binding.PaneID)
+		assertTargetDurable(t, tc, detail, true)
+	})
+
+	t.Run("stop replay of the pending retirement", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		detail, nativeRef := dispatchedRetirement(t, tc)
+		if err := tc.Controller.RequestStop(context.Background(), detail.RunID.String()); err != nil {
+			t.Fatalf("RequestStop() error = %v", err)
+		}
+		tc.Clock.Advance(leaseTTL + time.Second)
+		routed, handle, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String()))
+		if err != nil {
+			t.Fatalf("second Resume() error = %v", err)
+		}
+		if routed.Outcome != app.ResumeStopPending {
+			t.Fatalf("Outcome = %s (%s), want %s", routed.Outcome, routed.Detail, app.ResumeStopPending)
+		}
+
+		// Stop faces a group that now holds both A and B. The current binding
+		// is the observed restoration, which carries no launch claim, so stop
+		// fails closed on its own rule before any close: the pending
+		// retirement is neither re-dispatched nor retargeted, and its
+		// recorded target and act evidence stay as persisted.
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			return app.PaneProcess{ForegroundGroupID: 7777, Foreground: []app.ProcessInfo{restored(7778, nativeRef), mcpChild, restored(7777, nativeRef)}}, nil
+		}
+		report, err := tc.Controller.DriveStop(context.Background(), handle)
+		if err != nil {
+			t.Fatalf("DriveStop() error = %v", err)
+		}
+		if report.Terminated || len(report.Outstanding) == 0 {
+			t.Fatalf("report = %+v; an unretired occupant is never termination", report)
+		}
+		if n := len(tc.Runtime.ClosedPanes); n != 1 {
+			t.Fatalf("ClosePane calls = %d, want still 1 (no close re-dispatched)", n)
+		}
+		op, pid := retirementCloseOperation(t, tc)
+		if op.State != app.OperationPending || pid != 7777 {
+			t.Fatalf("pane.close operation = state %s pid %d, want the persisted pending target for pid 7777", op.State, pid)
+		}
+		if evidence, ok := op.ActEvidence.(string); !ok || !strings.Contains(evidence, "pid 7777") {
+			t.Fatalf("pane.close act evidence = %v, want the recorded dispatch against pid 7777 kept", op.ActEvidence)
 		}
 	})
 }
