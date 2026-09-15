@@ -111,7 +111,11 @@ func TestRealProcessCheckLeaderExitWithLiveChildren(t *testing.T) {
 // gitDependentCheckScriptSource uses), so a scenario can hold a check
 // execution open indefinitely and release it at a moment of its own
 // choosing rather than a check that merely runs long enough to probably
-// still be running.
+// still be running. This hand-off shares a pre-existing, narrow race with
+// gitDependentCheckScriptSource: a crash-recovery poll landing in the brief
+// window between this script's own exec into check.sh and that process's
+// exit sees a live group member whose argv no longer matches the claimed
+// intent, classifying it as mismatched rather than empty.
 const checkGateScriptName = "check-gate.sh"
 
 // checkGateScriptSource renders checkGateScriptName's body: opening gatePath
@@ -138,17 +142,33 @@ func withGatedCheck(t *testing.T, repo *fixtureRepo, gatePath, timeout string, r
 	repo.commit(t, "wire a gated check")
 }
 
-// releaseCheckGate opens gatePath for writing and immediately closes it,
-// unblocking a checkGateScriptName execution's read through a real
-// rendezvous with that process rather than a guess at how long it needed to
-// start. Bounded by conditionTimeout so a check that never reaches the gate
-// fails the test instead of hanging it.
+// releaseCheckGate opens gatePath for writing, unblocking a
+// checkGateScriptName execution's read through a real rendezvous with that
+// process rather than a guess at how long it needed to start. check.repeatable
+// reruns the identical committed script for its automatic retry, so once the
+// write-open call returns — meaning the reader has already resolved gatePath
+// to the FIFO's own inode, since a FIFO open blocks only after path
+// resolution — gatePath is immediately swapped for an empty regular file
+// (renaming a path never disturbs a file descriptor already resolved to the
+// old inode): a retry's own `cat gatePath` then finds an ordinary file and
+// returns at once instead of waiting for a second release that never comes.
+// Bounded by conditionTimeout so a check that never reaches the gate fails
+// the test instead of hanging it.
 func releaseCheckGate(t *testing.T, gatePath string) {
 	t.Helper()
 	done := make(chan error, 1)
 	go func() {
 		gate, err := os.OpenFile(gatePath, os.O_WRONLY, 0) //nolint:gosec // G304: gatePath is the FIFO this test created under its own artifact directory.
 		if err != nil {
+			done <- err
+			return
+		}
+		replacement := gatePath + ".released"
+		if err := os.WriteFile(replacement, nil, 0o600); err != nil {
+			done <- err
+			return
+		}
+		if err := os.Rename(replacement, gatePath); err != nil {
 			done <- err
 			return
 		}
@@ -185,9 +205,13 @@ func releaseCheckGate(t *testing.T, gatePath string) {
 // TTL wait comfortably outlasts the quick check.sh run that follows, so by
 // the time hop resume reconciles, the group is naturally empty and nothing
 // ever recorded its outcome — exactly the unknowable case the design
-// describes. check.repeatable=true then requeues it automatically, and the
-// resumed (still-live) controller watches the fresh retry to a normal
-// completion.
+// describes. check.repeatable=true then requeues it automatically against
+// the same committed check command, so releaseCheckGate also swaps the FIFO
+// for an empty regular file before returning: the automatic retry's own
+// `cat gatePath` must see an ordinary, already-at-EOF file and proceed at
+// once, never block on a second release this scenario never sends. The
+// resumed (still-live) controller then watches that unblocked retry to a
+// normal completion.
 func TestRealProcessCheckDeathUnknownOutcomeRepeatable(t *testing.T) {
 	artifacts, server := newFixtureRunEnv(t)
 	repo := newFixtureRepo(t, artifacts, "repo")
