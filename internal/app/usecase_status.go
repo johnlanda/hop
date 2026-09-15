@@ -113,7 +113,7 @@ func runDetailView(d RunDetail) RunDetailView { //nolint:gocritic // hugeParam: 
 		view.LastCheckDetail = d.LastCheck.Detail
 		view.LastCheckEvidence = d.LastCheck.EvidencePaths
 		if d.LastCheck.Unknown {
-			view.LastCheckOptions = "inspect the retained evidence, then rerun the check through hop resume (a human decision, never automatic), or hop stop the run"
+			view.LastCheckOptions = "inspect the retained evidence at the listed paths; automated retry is not available for this outcome — after inspection, start a new run for further work, or use hop stop if this run is still active"
 		}
 	}
 	for _, a := range d.Artifacts {

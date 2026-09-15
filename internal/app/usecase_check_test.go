@@ -2,6 +2,7 @@ package app_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -666,4 +667,115 @@ func TestBlockedCheckRefusesColdRelaunch(t *testing.T) {
 	if got := tc.Store.Attempts[detail.AttemptID].value.State; got == run.AttemptRelaunching {
 		t.Fatalf("the attempt relaunched over an unresolved check group")
 	}
+}
+
+// TestCheckEvidenceRetentionFailures proves retention is mandatory: a
+// failed artifact store never lets a passing check complete over lost
+// evidence, an ambiguous spawn still preserves whatever output returned,
+// and the unknown-outcome status options describe implemented actions.
+func TestCheckEvidenceRetentionFailures(t *testing.T) {
+	t.Run("a failed output store blocks completion and keeps the checkout", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		handle, detail := runningRun(t, tc)
+		if _, err := tc.Controller.SubmitResult(context.Background(), defaultSubmitRequest(detail)); err != nil {
+			t.Fatalf("SubmitResult() error = %v", err)
+		}
+		tc.Artifacts.WriteErr = context.DeadlineExceeded
+
+		report, err := tc.Controller.ClaimAndRunCheck(context.Background(), handle, "/usr/local/bin/hop", nil)
+		if err == nil {
+			t.Fatalf("ClaimAndRunCheck() succeeded despite the lost evidence")
+		}
+		if report.Passed {
+			t.Fatalf("report = %+v; a passing exit must not complete over lost evidence", report)
+		}
+		updated, loadErr := tc.Store.LoadRunStatus(context.Background(), detail.RunID)
+		if loadErr != nil {
+			t.Fatalf("LoadRunStatus() error = %v", loadErr)
+		}
+		if updated.State == run.RunCompleted {
+			t.Fatalf("Run.State = %s; completion claimed evidence that was lost", updated.State)
+		}
+		for _, cmd := range tc.Commands.Calls {
+			for _, tok := range cmd.Argv {
+				if tok == "remove" {
+					t.Fatalf("the checkout was cleaned up despite the retention failure: %v", cmd.Argv)
+				}
+			}
+		}
+	})
+
+	t.Run("an ambiguous spawn preserves the returned output before any cleanup", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		handle, detail := runningRun(t, tc)
+		if _, err := tc.Controller.SubmitResult(context.Background(), defaultSubmitRequest(detail)); err != nil {
+			t.Fatalf("SubmitResult() error = %v", err)
+		}
+		tc.Commands.CheckExecFn = func(ctx context.Context, cmd app.Command) (app.CommandResult, error) {
+			if err := tc.Store.ClaimCheckExec(ctx, checkExecOpID(t, cmd), 5150); err != nil {
+				t.Errorf("ClaimCheckExec() error = %v", err)
+			}
+			return app.CommandResult{Stdout: []byte("partial output before loss")}, context.DeadlineExceeded
+		}
+
+		if _, err := tc.Controller.ClaimAndRunCheck(context.Background(), handle, "/usr/local/bin/hop", nil); err == nil {
+			t.Fatalf("ClaimAndRunCheck() succeeded despite the ambiguous spawn")
+		}
+		retained := false
+		for _, artifact := range tc.Store.Artifacts {
+			if artifact.Kind != run.ArtifactCheckStdout {
+				continue
+			}
+			content, readErr := tc.Artifacts.ReadArtifact(context.Background(), artifact.Path)
+			if readErr == nil && string(content) == "partial output before loss" {
+				retained = true
+			}
+		}
+		if !retained {
+			t.Fatalf("the ambiguous spawn's returned output was not retained as evidence")
+		}
+		for _, cmd := range tc.Commands.Calls {
+			for _, tok := range cmd.Argv {
+				if tok == "remove" {
+					t.Fatalf("the checkout was cleaned up under an unresolved execution: %v", cmd.Argv)
+				}
+			}
+		}
+	})
+
+	t.Run("unknown-outcome status options describe implemented actions only", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		handle, detail := runningRun(t, tc)
+		if _, err := tc.Controller.SubmitResult(context.Background(), defaultSubmitRequest(detail)); err != nil {
+			t.Fatalf("SubmitResult() error = %v", err)
+		}
+		tc.Commands.CheckExecFn = func(ctx context.Context, cmd app.Command) (app.CommandResult, error) {
+			if err := tc.Store.ClaimCheckExec(ctx, checkExecOpID(t, cmd), 5150); err != nil {
+				t.Errorf("ClaimCheckExec() error = %v", err)
+			}
+			return app.CommandResult{}, context.DeadlineExceeded
+		}
+		if _, err := tc.Controller.ClaimAndRunCheck(context.Background(), handle, "/usr/local/bin/hop", nil); err == nil {
+			t.Fatalf("ClaimAndRunCheck() succeeded despite the ambiguous spawn")
+		}
+		tc.Commands.CheckExecFn = nil
+		if _, err := tc.Controller.ClaimAndRunCheck(context.Background(), handle, "/usr/local/bin/hop", nil); err != nil {
+			t.Fatalf("recovery ClaimAndRunCheck() error = %v", err)
+		}
+
+		view, err := tc.Controller.Status(context.Background(), app.StatusRequest{RepositoryRoot: "/repo", RunID: detail.RunID.String()})
+		if err != nil {
+			t.Fatalf("Status() error = %v", err)
+		}
+		if view.Detail == nil || !view.Detail.LastCheckUnknown {
+			t.Fatalf("status does not surface the unknown outcome: %+v", view.Detail)
+		}
+		options := view.Detail.LastCheckOptions
+		if !strings.Contains(options, "start a new run") || !strings.Contains(options, "hop stop") {
+			t.Fatalf("options = %q, want the implemented actions named", options)
+		}
+		if strings.Contains(options, "resume") {
+			t.Fatalf("options = %q, must not promise hop resume retries a terminal outcome", options)
+		}
+	})
 }

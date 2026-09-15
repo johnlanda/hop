@@ -106,7 +106,6 @@ func (c *Controller) ClaimAndRunCheck(ctx context.Context, handle RunHandle, hop
 	if err := c.materializeCheckout(actCtx, frozen.RepositoryRoot, checkoutPath, commitOID); err != nil {
 		return c.recordCheckOutcome(ctx, handle, opID, checkRequest, checkRunOutcome{Unknown: true, Detail: err.Error()}, false, fmt.Errorf("materialize checkout: %w", err))
 	}
-	defer c.removeCheckout(ctx, handle, frozen.RepositoryRoot, checkoutPath)
 
 	spawnEnv = withHOPStateDir(spawnEnv, frozen.Snapshot.StateRoot)
 	spawnArgv := checkSpawnArgv(hopPath, opID, frozen.Snapshot.CheckArgv)
@@ -120,24 +119,61 @@ func (c *Controller) ClaimAndRunCheck(ctx context.Context, handle RunHandle, hop
 	boundedCtx, cancel := context.WithTimeout(actCtx, timeout)
 	cmdResult, runErr := c.Commands.Run(boundedCtx, Command{Argv: spawnArgv, Dir: checkoutPath, Env: spawnEnv})
 	cancel()
+
+	// Evidence retention before any cleanup or outcome, on EVERY command
+	// result — a lost execution's partial output is evidence too: stdout
+	// and stderr are written under the execution's own directory and
+	// recorded as result-linked artifact rows with digests.
+	evidence, captureErr := c.captureCheckOutputs(ctx, handle, &frozen, opID, checkRequest.ResultID, cmdResult)
+
 	if runErr != nil {
 		// The spawn's result is unknowable here: the child may never have
 		// started, or may have started and been lost. Ambiguous — the
-		// operation goes reconciling with the error as evidence, and
-		// recovery resolves it through the claim table, never by guessing.
-		if markErr := c.markOperationReconciling(ctx, handle, opID, fmt.Sprintf("check spawn returned an error before an outcome was observed: %v", runErr)); markErr != nil {
+		// operation goes reconciling with the error as evidence, whatever
+		// output was returned is preserved, the checkout is kept for
+		// inspection, and recovery resolves it through the claim table,
+		// never by guessing.
+		if len(evidence) > 0 {
+			if saveErr := c.saveEvidenceRows(ctx, handle, evidence); saveErr != nil {
+				return CheckReport{}, saveErr
+			}
+		}
+		detail := fmt.Sprintf("check spawn returned an error before an outcome was observed: %v", runErr)
+		if captureErr != nil {
+			detail += fmt.Sprintf("; output retention also failed: %v", captureErr)
+		}
+		if markErr := c.markOperationReconciling(ctx, handle, opID, detail); markErr != nil {
 			return CheckReport{}, markErr
 		}
 		return CheckReport{Ran: true, OperationID: opID.String()}, fmt.Errorf("app: check execution ambiguous: %w", runErr)
 	}
-
-	// Evidence retention before any cleanup: stdout and stderr are written
-	// under the execution's own directory and recorded as result-linked
-	// artifact rows with digests in the outcome transaction.
-	evidence := c.captureCheckOutputs(ctx, handle, &frozen, opID, checkRequest.ResultID, cmdResult)
+	if captureErr != nil {
+		// Completion may never claim retained evidence that was lost: the
+		// execution fails with the retention failure named, and the
+		// checkout is kept so the outputs remain inspectable in place.
+		outcome := checkRunOutcome{ExitCode: cmdResult.ExitCode, Detail: fmt.Sprintf("evidence retention failed: %v", captureErr)}
+		return c.recordCheckOutcome(ctx, handle, opID, checkRequest, outcome, false, captureErr, evidence...)
+	}
 
 	outcome := checkRunOutcome{ExitCode: cmdResult.ExitCode}
-	return c.recordCheckOutcome(ctx, handle, opID, checkRequest, outcome, frozen.Snapshot.CheckRepeatable, nil, evidence...)
+	report, outcomeErr := c.recordCheckOutcome(ctx, handle, opID, checkRequest, outcome, frozen.Snapshot.CheckRepeatable, nil, evidence...)
+	// Cleanup only after evidence retention and the recorded outcome; the
+	// retained outputs stay under the execution's own directory.
+	c.removeCheckout(ctx, handle, frozen.RepositoryRoot, checkoutPath)
+	return report, outcomeErr
+}
+
+// saveEvidenceRows persists retained-output artifact rows outside the
+// outcome transaction, for executions whose outcome stays unresolved.
+func (c *Controller) saveEvidenceRows(ctx context.Context, handle RunHandle, evidence []run.Artifact) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per ambiguous execution.
+	return c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		for i := range evidence {
+			if err := uow.Artifacts().Save(ctx, evidence[i]); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // acceptedCommit reads the run's accepted result commit, if one exists.
@@ -164,12 +200,16 @@ func (c *Controller) acceptedCommit(ctx context.Context, handle RunHandle) (stri
 
 // captureCheckOutputs writes the execution's stdout and stderr through the
 // ArtifactStore under the execution's own directory and returns the
-// result-linked artifact rows to persist in the outcome transaction.
-// Capture is evidence: a failed write drops that stream's row but never
-// blocks the outcome.
-func (c *Controller) captureCheckOutputs(ctx context.Context, handle RunHandle, frozen *FrozenRun, opID identity.OperationID, resultID identity.ResultID, cmdResult CommandResult) []run.Artifact { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per execution.
+// result-linked artifact rows to persist. Retention is mandatory
+// evidence: any failed write or row construction is returned, alongside
+// whichever rows did land, so the caller can refuse to complete over
+// evidence it claims but lost.
+func (c *Controller) captureCheckOutputs(ctx context.Context, handle RunHandle, frozen *FrozenRun, opID identity.OperationID, resultID identity.ResultID, cmdResult CommandResult) ([]run.Artifact, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per execution.
 	base := filepath.Join(frozen.Snapshot.StateRoot, "runs", handle.runID.String(), "checks", opID.String())
-	var rows []run.Artifact
+	var (
+		rows       []run.Artifact
+		captureErr error
+	)
 	streams := []struct {
 		name    string
 		kind    run.ArtifactKind
@@ -181,15 +221,17 @@ func (c *Controller) captureCheckOutputs(ctx context.Context, handle RunHandle, 
 	for _, stream := range streams {
 		path := filepath.Join(base, stream.name)
 		if err := c.Artifacts.WriteArtifact(ctx, path, stream.content); err != nil {
+			captureErr = errors.Join(captureErr, fmt.Errorf("retain check %s: %w", stream.name, err))
 			continue
 		}
 		artifactID, err := identity.ParseArtifactID(c.IDs.NewID())
 		if err != nil {
+			captureErr = errors.Join(captureErr, fmt.Errorf("retain check %s: %w", stream.name, err))
 			continue
 		}
 		rows = append(rows, run.NewResultArtifact(artifactID, handle.runID, resultID, stream.kind, path, sha256Hex(stream.content)))
 	}
-	return rows
+	return rows, captureErr
 }
 
 // checkExecutionCheckoutPath is the per-execution detached checkout path.
@@ -740,7 +782,7 @@ func (c *Controller) recordCheckOutcome(ctx context.Context, handle RunHandle, o
 			if err := settleRequest(CheckRequestSettled); err != nil {
 				return err
 			}
-			return finishCheckOutcome(ctx, uow, &checkOutcomeArgs{r, rRev, a, aRev, t, tRev, generation, now, entityFail, "unrepeatable unknown check outcome", op})
+			return finishCheckOutcome(ctx, uow, &checkOutcomeArgs{r, rRev, a, aRev, t, tRev, generation, now, entityFailKeepRun, "unrepeatable unknown check outcome", op})
 		case actErr == nil && outcome.ExitCode == 0:
 			op.State = OperationSucceeded
 			report.Passed = true
