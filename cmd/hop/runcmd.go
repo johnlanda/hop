@@ -174,9 +174,12 @@ func finishControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, hand
 		if ctx.Err() != nil {
 			// The detach path still owes any non-cancellation failure the
 			// loop carried out — a retention or recording error is never
-			// silenced by the signal — before the resume instruction.
-			if !errors.Is(err, context.Canceled) {
-				if _, werr := fmt.Fprintf(stderr, "%s: %v\n", command, err); werr != nil {
+			// silenced by the signal — before the resume instruction. A
+			// joined error is filtered cause by cause: errors.Is alone
+			// would read the whole join as a cancellation the moment ANY
+			// cause is one, silencing the rest.
+			if reportable := nonCancellationCauses(err); reportable != nil {
+				if _, werr := fmt.Fprintf(stderr, "%s: %v\n", command, reportable); werr != nil {
 					return exitFailure, werr
 				}
 			}

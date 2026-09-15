@@ -2,9 +2,11 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 
@@ -180,6 +182,56 @@ func TestRunRun(t *testing.T) {
 		}
 		if !detached {
 			t.Error("Detach was not called on the in-flight cancellation path")
+		}
+	})
+
+	t.Run("a detach carrying a joined retention failure reports it before the resume instruction", func(t *testing.T) {
+		ctrl := &fakeController{}
+		ctrl.startRun = func(app.StartRunRequest) (app.StartRunResult, app.RunHandle, error) {
+			return app.StartRunResult{RunID: testRunID, Sequence: 1}, app.RunHandle{}, nil
+		}
+		td := newTestDeps(ctrl, env, t.TempDir())
+		td.useCheckBarriers()
+		var checkStarted atomic.Bool
+		ctrl.claimAndRunCheck = func(ctx context.Context, _ string, _ []string) (app.CheckReport, error) {
+			checkStarted.Store(true)
+			td.checkStarted <- struct{}{}
+			<-ctx.Done()
+			// The interrupted round could not retain its output: a real
+			// failure that the signal must not silence.
+			return app.CheckReport{}, errors.New("app: check output retention failed after an ambiguous execution (spawn error: killed): disk full")
+		}
+		statusCalls := 0
+		ctrl.status = func(app.StatusRequest) (app.StatusResult, error) {
+			statusCalls++
+			if checkStarted.Load() && statusCalls > 1 {
+				// The signal lands while this Status call is in flight and
+				// its own context observes the cancellation, joining the
+				// canceled status error with the drain's retention failure.
+				td.signals <- syscall.SIGINT
+				<-ctrl.statusCtx().Done()
+				return app.StatusResult{}, fmt.Errorf("load run status: %w", ctrl.statusCtx().Err())
+			}
+			return detailStep("running", "running", false), nil
+		}
+		var stdout, stderr bytes.Buffer
+
+		code, err := runRun([]string{"brief"}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+
+		if code != exitFailure {
+			t.Errorf("exit code = %d, want %d", code, exitFailure)
+		}
+		if !strings.Contains(stderr.String(), "retention failed") {
+			t.Errorf("stderr = %q; the joined retention failure was silenced by the cancellation", stderr.String())
+		}
+		if strings.Contains(stderr.String(), "context canceled") {
+			t.Errorf("stderr = %q; the pure cancellation cause must stay out of the report", stderr.String())
+		}
+		if !strings.Contains(stdout.String(), "resume with: hop resume "+testRunID) {
+			t.Errorf("output lacks the resume instruction:\n%s", stdout.String())
 		}
 	})
 

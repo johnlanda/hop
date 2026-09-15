@@ -89,10 +89,6 @@ type checkOutcome struct {
 type checkDriver struct {
 	cancel context.CancelFunc
 	done   chan checkOutcome
-	// canceled records that the loop canceled the in-flight call
-	// deliberately (stop, detach, exit), so its error is expected and
-	// never reported as a loop failure.
-	canceled bool
 }
 
 // start begins one asynchronous check round; the driver must be idle.
@@ -104,7 +100,6 @@ func (c *checkDriver) start(ctx context.Context, ctrl controllerAPI, handle app.
 	done := make(chan checkOutcome, 1)
 	c.cancel = cancel
 	c.done = done
-	c.canceled = false
 	go func() {
 		defer cancel()
 		report, err := ctrl.ClaimAndRunCheck(checkCtx, handle, hopPath, spawnEnv)
@@ -140,7 +135,6 @@ func (c *checkDriver) interrupt() (checkOutcome, bool) {
 	if c.done == nil {
 		return checkOutcome{}, false
 	}
-	c.canceled = true
 	c.cancel()
 	outcome := <-c.done
 	c.done = nil
@@ -168,16 +162,21 @@ func runControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, handle 
 	)
 	// Every exit path retires an in-flight check first: its context dies
 	// with the loop's cancel or is canceled here, and the recorded round
-	// is still reported. Only the pure cancellation shape of a round the
-	// loop itself interrupted — and a stop-refused dispatch — is expected
-	// and silent; a retention or recording failure is a real error on
-	// every path, deliberate interruption included.
+	// is still reported. Only an error tree whose causes are ENTIRELY
+	// cancellation — an interrupted round's expected shape — and a
+	// stop-refused dispatch are silent; a retention or recording failure
+	// joined with a cancellation is a real error on every path, deliberate
+	// interruption included, and only its non-cancellation causes are
+	// reported.
 	reportOutcome := func(outcome checkOutcome) error {
 		if outcome.err != nil {
-			if errors.Is(outcome.err, app.ErrStopRequested) || (checks.canceled && errors.Is(outcome.err, context.Canceled)) {
+			if errors.Is(outcome.err, app.ErrStopRequested) {
 				return nil
 			}
-			return fmt.Errorf("run check: %w", outcome.err)
+			if reportable := nonCancellationCauses(outcome.err); reportable != nil {
+				return fmt.Errorf("run check: %w", reportable)
+			}
+			return nil
 		}
 		if outcome.report.Ran {
 			if _, werr := fmt.Fprintf(stdout, "check %s %s\n", outcome.report.OperationID, describeCheckReport(&outcome.report)); werr != nil {
@@ -276,6 +275,31 @@ func runControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, handle 
 			return loopResult{Detached: true}, drainChecks()
 		}
 	}
+}
+
+// nonCancellationCauses strips every pure-cancellation cause out of err,
+// recursing through joined errors, and returns what remains — nil when
+// err was nothing but cancellation. Retention and recording failures are
+// constructed without the cancellation shape (the app carries a spawn
+// error as text exactly so this holds), so they always survive the
+// filter.
+func nonCancellationCauses(err error) error {
+	if err == nil {
+		return nil
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		var kept []error
+		for _, cause := range joined.Unwrap() {
+			if survivor := nonCancellationCauses(cause); survivor != nil {
+				kept = append(kept, survivor)
+			}
+		}
+		return errors.Join(kept...)
+	}
+	if errors.Is(err, context.Canceled) {
+		return nil
+	}
+	return err
 }
 
 // describeLaunchProgress renders one CorroborateLaunch progress value as
