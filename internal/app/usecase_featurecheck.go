@@ -112,8 +112,9 @@ func (c *Controller) DriveFeatureChecks(ctx context.Context, handle RunHandle, h
 	}
 	if captureErr != nil {
 		// Retention is mandatory: the execution fails rather than letting
-		// completion claim lost evidence.
-		return report, c.settleFeatureCheckOutcome(persistCtx, handle, &frozen, opID, &task, &attempt, result.ID, checkRunOutcome{ExitCode: cmdResult.ExitCode, Detail: fmt.Sprintf("evidence retention failed: %v", captureErr)}, evidence)
+		// completion claim lost evidence — a zero exit with lost output is
+		// settled as a failure, never a completion.
+		return report, c.settleFeatureCheckFailure(persistCtx, handle, &frozen, opID, &task, &attempt, result.ID, checkRunOutcome{ExitCode: cmdResult.ExitCode, Detail: fmt.Sprintf("evidence retention failed: %v", captureErr)}, evidence)
 	}
 
 	if err := c.settleFeatureCheckOutcome(persistCtx, handle, &frozen, opID, &task, &attempt, result.ID, checkRunOutcome{ExitCode: cmdResult.ExitCode}, evidence); err != nil {
@@ -249,8 +250,23 @@ func (c *Controller) claimFeatureCheck(ctx context.Context, handle RunHandle, fr
 	return claimed, opID, nil
 }
 
-// settleFeatureCheckOutcome applies the `result, feature` outcome row.
+// settleFeatureCheckFailure settles an execution whose OUTCOME is
+// unusable regardless of exit code (lost evidence): the budgeted failure
+// path, with the recorded exit preserved as evidence.
+func (c *Controller) settleFeatureCheckFailure(ctx context.Context, handle RunHandle, frozen *FrozenRun, opID identity.OperationID, task *run.Task, attempt *run.Attempt, resultID identity.ResultID, outcome checkRunOutcome, evidence []run.Artifact) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per execution.
+	return c.settleFeatureCheck(ctx, handle, frozen, opID, task, attempt, resultID, outcome, evidence, false)
+}
+
+// settleFeatureCheckOutcome applies the `result, feature` outcome row
+// for an execution whose output WAS retained.
 func (c *Controller) settleFeatureCheckOutcome(ctx context.Context, handle RunHandle, frozen *FrozenRun, opID identity.OperationID, task *run.Task, attempt *run.Attempt, resultID identity.ResultID, outcome checkRunOutcome, evidence []run.Artifact) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per execution.
+	return c.settleFeatureCheck(ctx, handle, frozen, opID, task, attempt, resultID, outcome, evidence, true)
+}
+
+// settleFeatureCheck applies the `result, feature` outcome row; retained
+// reports whether the execution's output was durably retained — success
+// requires BOTH the clean exit and retention, never the exit code alone.
+func (c *Controller) settleFeatureCheck(ctx context.Context, handle RunHandle, frozen *FrozenRun, opID identity.OperationID, task *run.Task, attempt *run.Attempt, resultID identity.ResultID, outcome checkRunOutcome, evidence []run.Artifact, retained bool) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per execution.
 	// The unknown-plus-repeatable case requeues without touching the
 	// entities; everything else settles through the task consequence.
 	if outcome.Unknown && frozen.Snapshot.CheckRepeatable {
@@ -280,8 +296,9 @@ func (c *Controller) settleFeatureCheckOutcome(ctx context.Context, handle RunHa
 		})
 	}
 
+	passed := outcome.ExitCode == 0 && !outcome.Unknown && retained
 	for round := 0; round < settlementNoticeRetries; round++ {
-		prediction, obligations, err := c.predictTaskConsequence(ctx, handle, frozen, task.ID, outcome.ExitCode == 0 && !outcome.Unknown)
+		prediction, obligations, err := c.predictTaskConsequence(ctx, handle, frozen, task.ID, passed)
 		if err != nil {
 			return err
 		}
@@ -293,7 +310,7 @@ func (c *Controller) settleFeatureCheckOutcome(ctx context.Context, handle RunHa
 				return err
 			}
 		}
-		err = c.applyFeatureCheckSettlement(ctx, handle, frozen, opID, task, attempt, resultID, &outcome, evidence, prediction, obligations, notice)
+		err = c.applyFeatureCheckSettlement(ctx, handle, frozen, opID, task, attempt, resultID, &outcome, evidence, passed, prediction, obligations, notice)
 		if errors.Is(err, errSettlementRetry) {
 			continue
 		}
@@ -368,8 +385,10 @@ func (c *Controller) predictTaskConsequence(ctx context.Context, handle RunHandl
 }
 
 // applyFeatureCheckSettlement is one settlement transaction attempt for a
-// result-subject feature check.
-func (c *Controller) applyFeatureCheckSettlement(ctx context.Context, handle RunHandle, frozen *FrozenRun, opID identity.OperationID, task *run.Task, attempt *run.Attempt, resultID identity.ResultID, outcome *checkRunOutcome, evidence []run.Artifact, prediction taskConsequence, obligations []string, notice controllerNotice) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
+// result-subject feature check. passed is the shared success predicate:
+// clean exit AND retained output — the journal state below records it,
+// so the receipt readers and this settlement can never disagree.
+func (c *Controller) applyFeatureCheckSettlement(ctx context.Context, handle RunHandle, frozen *FrozenRun, opID identity.OperationID, task *run.Task, attempt *run.Attempt, resultID identity.ResultID, outcome *checkRunOutcome, evidence []run.Artifact, passed bool, prediction taskConsequence, obligations []string, notice controllerNotice) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
 	now := c.Clock.Now()
 	return c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 		wf, wfErr := RequireWorkflowRepositories(uow, "feature check settlement")
@@ -385,7 +404,7 @@ func (c *Controller) applyFeatureCheckSettlement(ctx context.Context, handle Run
 		if getErr != nil {
 			return getErr
 		}
-		if outcome.ExitCode == 0 && !outcome.Unknown {
+		if passed {
 			op.State = OperationSucceeded
 		} else {
 			op.State = OperationFailed
@@ -442,7 +461,7 @@ func (c *Controller) applyFeatureCheckSettlement(ctx context.Context, handle Run
 			return recordTransition(ctx, uow, EntityAttempt, a.ID.String(), string(aFrom), string(aNext.State), "stop precedence over the check outcome", generation, now)
 		}
 
-		if outcome.ExitCode == 0 && !outcome.Unknown {
+		if passed {
 			// Pass: attempt completed, task completed — the run stays
 			// running; integration is a separate later claim.
 			tFrom, aFrom := t.State, a.State

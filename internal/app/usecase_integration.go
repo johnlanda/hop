@@ -885,6 +885,28 @@ func (c *Controller) advanceChecking(ctx context.Context, handle RunHandle, froz
 	return final, reportErr
 }
 
+// usableCheckReceipt classifies a settled check operation as receipt
+// evidence. A usable PASSING receipt requires the SUCCEEDED journal
+// state — which the pipeline grants only when the execution passed AND
+// its output was retained — plus a clean zero exit; a usable FAILING
+// receipt is a failed state with a nonzero exit. Anything else — an
+// unknown outcome, or a failed state carrying a zero exit (the
+// retention-anomaly shape) — is usable as NO receipt at all: success is
+// never derived from an exit code alone.
+func usableCheckReceipt(state OperationState, outcome *checkRunOutcome) (passed, usable bool) {
+	if outcome.Unknown {
+		return false, false
+	}
+	switch {
+	case state == OperationSucceeded && outcome.ExitCode == 0:
+		return true, true
+	case state == OperationFailed && outcome.ExitCode != 0:
+		return false, true
+	default:
+		return false, false
+	}
+}
+
 // settledIntegrationCheckReceipt scans settled combined-check executions
 // for one whose subject is EXACTLY (commit, tree), returning its receipt.
 func (c *Controller) settledIntegrationCheckReceipt(ctx context.Context, handle RunHandle, subjectCommit, subjectTree string) (run.CheckReceipt, bool, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
@@ -909,10 +931,14 @@ func (c *Controller) settledIntegrationCheckReceipt(ctx context.Context, handle 
 				continue
 			}
 			outcome, ok := decodeOperationPayload[checkRunOutcome](ops[i].Outcome)
-			if !ok || outcome.Unknown {
+			if !ok {
 				continue
 			}
-			receipt = run.CheckReceipt{Passed: outcome.ExitCode == 0, SubjectCommitOID: subjectCommit, SubjectTreeOID: subjectTree}
+			passed, usable := usableCheckReceipt(ops[i].State, &outcome)
+			if !usable {
+				continue
+			}
+			receipt = run.CheckReceipt{Passed: passed, SubjectCommitOID: subjectCommit, SubjectTreeOID: subjectTree}
 			found = true
 			return nil
 		}

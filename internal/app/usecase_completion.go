@@ -166,10 +166,14 @@ func settledIntegrationCheckReceiptLocked(ctx context.Context, uow UnitOfWork, h
 			continue
 		}
 		outcome, ok := decodeOperationPayload[checkRunOutcome](ops[i].Outcome)
-		if !ok || outcome.Unknown {
+		if !ok {
 			continue
 		}
-		return run.CheckReceipt{Passed: outcome.ExitCode == 0, SubjectCommitOID: subjectCommit, SubjectTreeOID: subjectTree}, true, nil
+		passed, usable := usableCheckReceipt(ops[i].State, &outcome)
+		if !usable {
+			continue
+		}
+		return run.CheckReceipt{Passed: passed, SubjectCommitOID: subjectCommit, SubjectTreeOID: subjectTree}, true, nil
 	}
 	return run.CheckReceipt{}, false, nil
 }

@@ -103,9 +103,17 @@ func (c *Controller) runIntegrationCheck(ctx context.Context, handle RunHandle, 
 	}
 	if captureErr != nil {
 		// Retention is mandatory: completion may never claim evidence that
-		// was lost. The execution fails; the checkout stays inspectable.
+		// was lost, whatever the exit code says. The execution fails — the
+		// operation settles failed with the real exit recorded, the
+		// integration moves check-failed so the reset retires the
+		// candidate, and the checkout stays inspectable. The receipt
+		// readers additionally refuse a failed-state zero-exit row, so
+		// this shape can never be adopted as a passing receipt.
 		if settleErr := c.settleCombinedCheckOutcome(persistCtx, handle, opID, checkRunOutcome{ExitCode: cmdResult.ExitCode, Detail: fmt.Sprintf("evidence retention failed: %v", captureErr)}, evidence); settleErr != nil {
 			return false, settleErr
+		}
+		if failErr := c.failIntegrationCheck(persistCtx, handle, integ, fmt.Sprintf("combined-check output retention failed (operation %s)", opID)); failErr != nil {
+			return false, failErr
 		}
 		return false, fmt.Errorf("app: combined-check output retention failed: %w", captureErr)
 	}
