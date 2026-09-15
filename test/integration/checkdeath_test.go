@@ -2,8 +2,11 @@ package integration
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -103,6 +106,64 @@ func TestRealProcessCheckLeaderExitWithLiveChildren(t *testing.T) {
 	}
 }
 
+// checkGateScriptName names a check that blocks before deferring to
+// check.sh's own pass/fail contract (exec sh check.sh, the same hand-off
+// gitDependentCheckScriptSource uses), so a scenario can hold a check
+// execution open indefinitely and release it at a moment of its own
+// choosing rather than a check that merely runs long enough to probably
+// still be running.
+const checkGateScriptName = "check-gate.sh"
+
+// checkGateScriptSource renders checkGateScriptName's body: opening gatePath
+// (a FIFO releaseCheckGate creates and later opens for writing) for reading
+// blocks until a writer opens it — ordinary POSIX FIFO open semantics, so
+// the check's own progress depends on that rendezvous, never a fixed sleep
+// a hard kill could race.
+func checkGateScriptSource(gatePath string) string {
+	return "#!/bin/sh\nset -eu\ncat \"" + gatePath + "\" >/dev/null\nexec sh check.sh\n"
+}
+
+// withGatedCheck rewires repo's [check] command to checkGateScriptName and
+// commits the change, mirroring stop_test.go's withSlowCheck: the caller
+// gets a check execution it can be certain is still in flight until it
+// calls releaseCheckGate, rather than one merely long enough that a hard
+// kill would probably land while it is still running.
+func withGatedCheck(t *testing.T, repo *fixtureRepo, gatePath, timeout string, repeatable bool) {
+	t.Helper()
+	if err := syscall.Mkfifo(gatePath, 0o600); err != nil {
+		t.Fatalf("create check gate fifo %s: %v", gatePath, err)
+	}
+	repo.writeFile(t, checkGateScriptName, checkGateScriptSource(gatePath), 0o755)
+	repo.writeFile(t, configRelPath, configWithTimeout([]string{"sh", checkGateScriptName}, timeout, repeatable), 0o644)
+	repo.commit(t, "wire a gated check")
+}
+
+// releaseCheckGate opens gatePath for writing and immediately closes it,
+// unblocking a checkGateScriptName execution's read through a real
+// rendezvous with that process rather than a guess at how long it needed to
+// start. Bounded by conditionTimeout so a check that never reaches the gate
+// fails the test instead of hanging it.
+func releaseCheckGate(t *testing.T, gatePath string) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() {
+		gate, err := os.OpenFile(gatePath, os.O_WRONLY, 0) //nolint:gosec // G304: gatePath is the FIFO this test created under its own artifact directory.
+		if err != nil {
+			done <- err
+			return
+		}
+		done <- gate.Close()
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("release check gate %s: %v", gatePath, err)
+		}
+	case <-time.After(conditionTimeout):
+		t.Fatalf("check gate %s was never opened for reading before the deadline", gatePath)
+	}
+}
+
 // TestRealProcessCheckDeathUnknownOutcomeRepeatable proves the other half of
 // design section 9's check.repeatable contract: with check.repeatable=true,
 // a check execution that dies with no observable outcome settles unknown
@@ -116,18 +177,22 @@ func TestRealProcessCheckLeaderExitWithLiveChildren(t *testing.T) {
 // watching controller does NOT produce this: CommandRunner's Wait still
 // observes a completed (if killed) command and hop check-exec's exit
 // status. So the run's whole controller is crash-killed instead, leaving
-// check.sh (an ordinary, fast-passing check with no artificial delay)
-// running unwatched; the lease's own TTL wait comfortably outlasts it, so
-// by the time hop resume reconciles, the group is naturally empty and
-// nothing ever recorded its outcome — exactly the unknowable case the
-// design describes. check.repeatable=true then requeues it automatically,
-// and the resumed (still-live) controller watches the fresh retry to a
-// normal completion.
+// the check running unwatched. withGatedCheck holds the check open on a
+// FIFO so this scenario can be certain the kill lands while it is still
+// running rather than racing a fast, undelayed check that might already
+// have finished and been observed under load; releaseCheckGate lets it
+// proceed only once the controller is confirmed dead, and the lease's own
+// TTL wait comfortably outlasts the quick check.sh run that follows, so by
+// the time hop resume reconciles, the group is naturally empty and nothing
+// ever recorded its outcome — exactly the unknowable case the design
+// describes. check.repeatable=true then requeues it automatically, and the
+// resumed (still-live) controller watches the fresh retry to a normal
+// completion.
 func TestRealProcessCheckDeathUnknownOutcomeRepeatable(t *testing.T) {
 	artifacts, server := newFixtureRunEnv(t)
 	repo := newFixtureRepo(t, artifacts, "repo")
-	repo.writeFile(t, configRelPath, configWithTimeout([]string{"sh", checkScriptName}, "30s", true), 0o644)
-	repo.commit(t, "wire a repeatable check")
+	gatePath := filepath.Join(artifacts.dir(t, "gate"), "release")
+	withGatedCheck(t, repo, gatePath, "30s", true)
 	fx := startRun(t, artifacts, server, repo, "submit-valid")
 
 	if !waitUntil(func() bool {
@@ -138,7 +203,11 @@ func TestRealProcessCheckDeathUnknownOutcomeRepeatable(t *testing.T) {
 	}
 	firstOpID := querySQLite(t, fx.dbPath(), "SELECT operation_id FROM check_exec_claims LIMIT 1;")
 
+	// The check is still blocked on the gate here — nothing has opened it
+	// for writing yet — so this kill is provably concurrent with a live
+	// check execution, never a race against a check that already finished.
 	killControllerLeader(t, fx.controller)
+	releaseCheckGate(t, gatePath)
 	waitForLeaseExpiry(t, fx.dbPath(), fx.runID)
 
 	resumed := fx.server.startHopController(t, fx.stateDir, "resume", "resume", "-C", fx.repo.Root, fx.runID)
