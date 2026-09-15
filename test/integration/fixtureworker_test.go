@@ -27,17 +27,28 @@ import (
 // filepath.Join(StateRoot, "runs", <run-uuid>, "artifacts", "assignment.md")
 // — a stable convention independent of the prompt's exact wording — so the
 // worker computes it the same way from HOP_STATE_DIR and HOP_RUN_ID rather
-// than depending on parsing the not-yet-landed (task 6a) prompt template
-// byte for byte. It still best-effort extracts a path from the prompt's
-// "absolute path (" marker (the phrasing internal/app/assignment.go's
-// renderAssignment already uses for the artifact's own "read this file"
-// instruction, which section 6's prose says the prompt repeats) and records
-// both in its observation dump for cross-validation once task 6a lands; a
-// mismatch or absent marker is not fatal. The hop path has no such
-// independent source, so it comes only from the prompt's " result submit
-// --summary" line, matching renderAssignment's own wording; if task 6a's
-// prompt text ends up differently worded, this marker is the one spot to
-// revisit once real output is available (Phase B).
+// than parsing it out of the prompt.
+//
+// The hop path has no such independent source: it reaches the worker only
+// through the prompt argv, by design. internal/app/usecase_execboundary.go's
+// renderInitialPrompt (the ACTUAL landed prompt renderer hop launch uses,
+// distinct from internal/app/assignment.go's renderAssignment, which renders
+// the separate assignment.md FILE content) renders exactly:
+//
+//	Read your assignment at %s and complete it. When your work is
+//	committed, submit it by running: %s result submit --summary
+//	"<one-line summary>" --commit <commit-oid>. If the first output line
+//	begins with "transient", wait briefly and run the exact same command
+//	again.
+//
+// — a single-line string with no separate "submit" line to isolate, so the
+// worker extracts both paths from this exact wording: the assignment path
+// between "Read your assignment at " and " and complete it." — cross-
+// validated against the independently computed path above, and a mismatch
+// or an absent marker fails the run loudly rather than silently preferring
+// one source — and the hop path between "submit it by running: " and
+// " result submit --summary" (its only source: this worker never falls back
+// to a PATH lookup or a guessed location for the hop binary).
 const fixtureWorkerSource = `package main
 
 import (
@@ -71,10 +82,21 @@ func main() {
 	if len(os.Args) > 0 {
 		prompt = os.Args[len(os.Args)-1]
 	}
-	promptAssignmentPath := extractMarked(prompt, "absolute path (", ")")
-	hopPath := extractLinePrefix(prompt, " result submit --summary")
+	promptAssignmentPath := extractMarked(prompt, "Read your assignment at ", " and complete it.")
+	hopPath := extractMarked(prompt, "submit it by running: ", " result submit --summary")
 	if hopPath == "" {
-		fatalf("prompt does not carry a %q line naming the hop path", " result submit --summary")
+		fatalf("prompt does not carry the %q marker naming the hop path", "submit it by running: ")
+	}
+	if promptAssignmentPath == "" {
+		fatalf("prompt does not carry the %q marker naming the assignment path", "Read your assignment at ")
+	}
+	// The StateRoot-derived path is what this worker actually reads, but the
+	// prompt's own path is cross-validated against it rather than merely
+	// logged: a mismatch means the launch delivered a different assignment
+	// than the one this run's own state root computes, which must fail the
+	// scenario loudly, never silently prefer one source over the other.
+	if promptAssignmentPath != assignmentPath {
+		fatalf("prompt's assignment path (%s) does not match the path computed from HOP_STATE_DIR/HOP_RUN_ID (%s)", promptAssignmentPath, assignmentPath)
 	}
 
 	assignmentContent, err := os.ReadFile(assignmentPath)
@@ -129,29 +151,18 @@ func fatalf(format string, args ...any) {
 }
 
 // extractMarked returns the text between the first occurrence of start and
-// the following end, or "" if either is absent.
+// the following occurrence of end, or "" if either is absent.
 func extractMarked(s, start, end string) string {
 	i := strings.Index(s, start)
 	if i < 0 {
 		return ""
 	}
 	i += len(start)
-	j := strings.IndexByte(s[i:], end[0])
+	j := strings.Index(s[i:], end)
 	if j < 0 {
 		return ""
 	}
 	return s[i : i+j]
-}
-
-// extractLinePrefix finds the line containing marker and returns the
-// trimmed text before it on that same line, or "" if marker is absent.
-func extractLinePrefix(s, marker string) string {
-	idx := strings.Index(s, marker)
-	if idx < 0 {
-		return ""
-	}
-	lineStart := strings.LastIndexByte(s[:idx], '\n') + 1
-	return strings.TrimSpace(s[lineStart:idx])
 }
 
 // parseBehavior finds the "FIXTURE-BEHAVIOR: <name> [args...]" directive
@@ -178,9 +189,9 @@ func parseBehavior(assignment string) (behavior string, args []string) {
 // atomically (write-temp-then-rename), so the test can read it back after
 // the fact rather than trusting this process's own judgment of correctness
 // — the same philosophy the Phase 1 spike fixture uses for its environment
-// dump. promptAssignmentPath is the best-effort marker extraction from the
-// prompt text, kept only for cross-validation against assignmentPath (the
-// path actually read); it may be empty.
+// dump. promptAssignmentPath is the prompt's own marker extraction, already
+// verified equal to assignmentPath (the path actually read) by the time this
+// is called — main fails closed before reaching here on any mismatch.
 func writeObservation(path string, env map[string]string, assignmentPath, promptAssignmentPath, hopPath, assignmentContent, behavior string, behaviorArgs []string) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "pid=%d\n", os.Getpid())
@@ -350,18 +361,16 @@ func buildFixtureWorker(t *testing.T, artifacts *artifactDir) string {
 	return out
 }
 
-// testAssignmentPrompt builds a prompt string in the shape task 6a's launch
-// composition is documented to produce (docs/plan/phase-2-design.md section
-// 6): absolute paths and identities only, the "read this file at its
-// absolute path (%s)" instruction and the "%s result submit --summary"
-// line, both worded exactly as internal/app/assignment.go's renderAssignment
-// already phrases them for the assignment file itself. It is this test's
-// own stand-in for task 6a's not-yet-landed prompt renderer, used only to
-// exercise the fixture worker's parsing in isolation from cmd/hop.
+// testAssignmentPrompt reproduces internal/app/usecase_execboundary.go's
+// renderInitialPrompt byte for byte (that function is unexported, so this
+// package cannot call it directly) — the actual landed prompt hop launch
+// composes into the harness argv. Used only to exercise the fixture worker's
+// parsing directly, in isolation from cmd/hop and herdr; the full
+// run/launch/corroborate scenarios exercise the real rendering end to end.
 func testAssignmentPrompt(assignmentPath, hopPath string) string {
-	return fmt.Sprintf(
-		"Read this file at its absolute path (%s) before doing anything else.\n\n"+
-			"When done, submit with:\n\n    %s result submit --summary \"<one-line summary>\" --commit <commit-oid>\n",
+	return fmt.Sprintf("Read your assignment at %s and complete it. "+
+		"When your work is committed, submit it by running: %s result submit --summary \"<one-line summary>\" --commit <commit-oid>. "+
+		"If the first output line begins with \"transient\", wait briefly and run the exact same command again.",
 		assignmentPath, hopPath)
 }
 
