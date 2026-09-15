@@ -192,22 +192,31 @@ type testDeps struct {
 	mu        sync.Mutex
 	now       time.Time
 	waits     int
-	maxWaits  int
 	execs     []execCall
 	openErr   error
 	closed    int
 	signals   chan os.Signal
 	openCalls []controllerConfig
+
+	// checkPosted receives one token per asynchronous check outcome the
+	// loop's driver has posted (via deps.checkOutcomePosted), and
+	// checkStarted receives tokens a test's check fake sends on entry.
+	// useCheckBarriers switches the poll wait to consume these tokens, so
+	// the loop advances one round per observable event instead of
+	// free-running against the scheduler.
+	checkPosted  chan struct{}
+	checkStarted chan struct{}
 }
 
 // newTestDeps wires fakes around ctrl. env supplies getenv; the working
 // directory defaults to dir.
 func newTestDeps(ctrl *fakeController, env map[string]string, dir string) *testDeps {
 	td := &testDeps{
-		ctrl:     ctrl,
-		now:      time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC),
-		maxWaits: 1000,
-		signals:  make(chan os.Signal, 2),
+		ctrl:         ctrl,
+		now:          time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC),
+		signals:      make(chan os.Signal, 2),
+		checkPosted:  make(chan struct{}, 64),
+		checkStarted: make(chan struct{}, 64),
 	}
 	td.deps = &deps{
 		getenv:     mapGetenv(env),
@@ -232,13 +241,10 @@ func newTestDeps(ctrl *fakeController, env map[string]string, dir string) *testD
 			td.mu.Lock()
 			td.now = td.now.Add(d)
 			td.waits++
-			exhausted := td.waits >= td.maxWaits
 			td.mu.Unlock()
-			if exhausted {
-				return errors.New("test wait budget exhausted")
-			}
 			return nil
 		},
+		checkOutcomePosted: func() { td.checkPosted <- struct{}{} },
 		notifySignals: func() (<-chan os.Signal, func()) {
 			return td.signals, func() {}
 		},
@@ -274,6 +280,32 @@ func newTestDeps(ctrl *fakeController, env map[string]string, dir string) *testD
 		},
 	}
 	return td
+}
+
+// useCheckBarriers replaces the poll wait with a channel barrier: each
+// poll-interval wait consumes one observable event — a posted check
+// outcome, a check fake's start signal, or the context's end — so a test
+// scenario advances by explicit steps and can never outrun the check
+// goroutine, under any scheduler interleaving or shuffle seed. Heartbeat
+// waits keep blocking on the context.
+func (td *testDeps) useCheckBarriers() {
+	td.deps.wait = func(ctx context.Context, d time.Duration) error {
+		if d == heartbeatInterval {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		select {
+		case <-td.checkPosted:
+		case <-td.checkStarted:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		td.mu.Lock()
+		td.now = td.now.Add(d)
+		td.waits++
+		td.mu.Unlock()
+		return nil
+	}
 }
 
 // recordedExecs snapshots the exec-seam calls.

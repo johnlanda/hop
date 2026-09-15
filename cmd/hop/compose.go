@@ -80,6 +80,12 @@ type deps struct {
 	// forceExit ends the process immediately: the second SIGINT/SIGTERM
 	// during a detach shutdown exits without waiting for the release.
 	forceExit func()
+	// checkOutcomePosted, when non-nil, is called by the loop's check
+	// driver after an asynchronous check outcome has been posted for
+	// consumption. Production wiring leaves it nil; loop tests use it as
+	// the channel barrier that makes their pacing deterministic under any
+	// scheduler interleaving.
+	checkOutcomePosted func()
 }
 
 // defaultDeps is the production wiring of deps.

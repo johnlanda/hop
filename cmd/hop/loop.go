@@ -96,7 +96,10 @@ type checkDriver struct {
 }
 
 // start begins one asynchronous check round; the driver must be idle.
-func (c *checkDriver) start(ctx context.Context, ctrl controllerAPI, handle app.RunHandle, hopPath string, spawnEnv []string) { //nolint:gocritic // hugeParam: RunHandle is the app-defined opaque token, passed by value as every Controller method takes it.
+// posted, when non-nil, is called after the outcome is in the channel —
+// the deterministic synchronization point the loop tests' barrier waits
+// consume (deps.checkOutcomePosted); production wiring leaves it nil.
+func (c *checkDriver) start(ctx context.Context, ctrl controllerAPI, handle app.RunHandle, hopPath string, spawnEnv []string, posted func()) { //nolint:gocritic // hugeParam: RunHandle is the app-defined opaque token, passed by value as every Controller method takes it.
 	checkCtx, cancel := context.WithCancel(ctx)
 	done := make(chan checkOutcome, 1)
 	c.cancel = cancel
@@ -106,6 +109,9 @@ func (c *checkDriver) start(ctx context.Context, ctrl controllerAPI, handle app.
 		defer cancel()
 		report, err := ctrl.ClaimAndRunCheck(checkCtx, handle, hopPath, spawnEnv)
 		done <- checkOutcome{report: report, err: err}
+		if posted != nil {
+			posted()
+		}
 	}()
 }
 
@@ -266,7 +272,7 @@ func runControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, handle 
 				}
 			}
 			if !checks.running() {
-				checks.start(ctx, ctrl, handle, hopPath, spawnEnv)
+				checks.start(ctx, ctrl, handle, hopPath, spawnEnv, d.checkOutcomePosted)
 			}
 		}
 

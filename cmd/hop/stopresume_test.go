@@ -2,9 +2,12 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/johnlanda/hop/internal/app"
 )
@@ -92,7 +95,24 @@ func TestRunStop(t *testing.T) {
 			return app.StopReport{RunState: "stopping", Outstanding: []string{"check group 41337 signaled, absence not yet observed"}}, nil
 		}
 		td := newTestDeps(ctrl, env, t.TempDir())
-		td.maxWaits = 3 // the fake wait fails after three rounds, standing in for the deadline
+		// The fake wait reports the deadline after three stop rounds,
+		// standing in for the command's expired context; heartbeat waits
+		// keep blocking on the context (the heartbeat goroutine shares
+		// this seam), and the counter is atomic for the same reason.
+		var polls atomic.Int32
+		td.deps.wait = func(ctx context.Context, d time.Duration) error {
+			if d == heartbeatInterval {
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if polls.Add(1) >= 3 {
+				return context.DeadlineExceeded
+			}
+			return nil
+		}
 		var stdout, stderr bytes.Buffer
 
 		code, err := runStop([]string{testRunID}, &stdout, &stderr, td.deps)

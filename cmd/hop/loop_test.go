@@ -72,21 +72,38 @@ func TestRunControllerLoop(t *testing.T) {
 	t.Run("prints transitions, corroborates, runs checks and exits on the terminal state", func(t *testing.T) {
 		ctrl := &fakeController{}
 		ctrl.corroborate = func() (app.LaunchProgress, error) { return app.LaunchSettled, nil }
-		// The check rounds run asynchronously, so the status script is
-		// keyed to the check fake's progress: the run completes only once
-		// the passing round has executed, exactly as a real run would.
+		td := newTestDeps(ctrl, map[string]string{"PATH": "/bin"}, t.TempDir())
+		td.useCheckBarriers()
+		// Explicit stepping, deterministic under any scheduler
+		// interleaving: every poll wait consumes one posted-outcome
+		// barrier token, so a round begins only once the previous round's
+		// check outcome is already consumable — the loop can never outrun
+		// the check goroutine. Call 1 reports nothing, call 2 is the
+		// passing round; the status script turns the run completed only
+		// once call 3 has begun (call 2's outcome was consumed, because a
+		// new round starts only after consumption), and call 3 blocks
+		// until the terminal drain cancels it.
 		var checkCalls atomic.Int32
-		ctrl.claimAndRunCheck = func(_ context.Context, hopPath string, spawnEnv []string) (app.CheckReport, error) {
+		ctrl.claimAndRunCheck = func(ctx context.Context, hopPath string, spawnEnv []string) (app.CheckReport, error) {
 			if hopPath != "/opt/hop/bin/hop" {
 				t.Errorf("hop path = %q", hopPath)
 			}
 			if len(spawnEnv) == 0 {
 				t.Error("spawn env is empty; the sanitized environment must be passed through")
 			}
-			if checkCalls.Add(1) == 2 {
+			switch checkCalls.Add(1) {
+			case 1:
+				return app.CheckReport{}, nil
+			case 2:
 				return app.CheckReport{Ran: true, OperationID: "op-1", Passed: true}, nil
+			default:
+				// The final round blocks: its start signal releases the
+				// wait barrier so the next status read can turn terminal,
+				// and the terminal drain cancels this call.
+				td.checkStarted <- struct{}{}
+				<-ctx.Done()
+				return app.CheckReport{}, nil
 			}
-			return app.CheckReport{}, nil
 		}
 		statusCalls := 0
 		ctrl.status = func(app.StatusRequest) (app.StatusResult, error) {
@@ -94,13 +111,12 @@ func TestRunControllerLoop(t *testing.T) {
 			switch {
 			case statusCalls == 1:
 				return detailStep("launching", "launching", false), nil
-			case checkCalls.Load() >= 2:
+			case checkCalls.Load() >= 3:
 				return detailStep("completed", "completed", false), nil
 			default:
 				return detailStep("running", "running", false), nil
 			}
 		}
-		td := newTestDeps(ctrl, map[string]string{"PATH": "/bin"}, t.TempDir())
 		var stdout bytes.Buffer
 
 		result, err := runControllerLoop(context.Background(), td.deps, ctrl, app.RunHandle{}, testRunID, "r1", "/opt/hop/bin/hop", &stdout)
@@ -124,9 +140,12 @@ func TestRunControllerLoop(t *testing.T) {
 
 	t.Run("a stop request interrupts a running check before the stop is driven", func(t *testing.T) {
 		ctrl := &fakeController{}
+		td := newTestDeps(ctrl, nil, t.TempDir())
+		td.useCheckBarriers()
 		var checkStarted atomic.Bool
 		ctrl.claimAndRunCheck = func(ctx context.Context, _ string, _ []string) (app.CheckReport, error) {
 			checkStarted.Store(true)
+			td.checkStarted <- struct{}{} // barrier: the round after this one observes the stop
 			// The check blocks until the loop cancels its context — the
 			// long-check case; the app then records the outcome under stop
 			// precedence and returns the interrupted report.
@@ -141,7 +160,6 @@ func TestRunControllerLoop(t *testing.T) {
 		ctrl.driveStop = func() (app.StopReport, error) {
 			return app.StopReport{RunState: "stopped", Terminated: true}, nil
 		}
-		td := newTestDeps(ctrl, nil, t.TempDir())
 		var stdout bytes.Buffer
 
 		result, err := runControllerLoop(context.Background(), td.deps, ctrl, app.RunHandle{}, testRunID, "r1", "/opt/hop/bin/hop", &stdout)
