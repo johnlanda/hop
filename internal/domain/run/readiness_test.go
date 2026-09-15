@@ -10,11 +10,13 @@ import (
 // task, a passing check for the head, and an approve verdict bound to it.
 func readyContext() run.GuardContext {
 	return run.GuardContext{
-		PlanClosed:      true,
-		ImplementTasks:  []run.Task{{ID: testTaskID, State: run.TaskIntegrated}},
-		HeadCommitOID:   "head-commit",
-		HeadTreeOID:     "head-tree",
-		HeadCheckPassed: true,
+		PlanClosed:     true,
+		ImplementTasks: []run.Task{{ID: testTaskID, State: run.TaskIntegrated}},
+		HeadCommitOID:  "head-commit",
+		HeadTreeOID:    "head-tree",
+		LatestCheck: &run.CheckReceipt{
+			Passed: true, SubjectCommitOID: "head-commit", SubjectTreeOID: "head-tree",
+		},
 		LatestReview: &run.Review{
 			ID: testReviewID, Verdict: run.VerdictApprove,
 			SubjectCommitOID: "head-commit", SubjectTreeOID: "head-tree",
@@ -80,7 +82,7 @@ func TestEvaluateReadinessMissingIntegration(t *testing.T) {
 
 func TestEvaluateReadinessCheckMissing(t *testing.T) {
 	ctx := readyContext()
-	ctx.HeadCheckPassed = false
+	ctx.LatestCheck = nil
 
 	ready, missing := run.EvaluateReadiness(ctx)
 	if ready {
@@ -88,6 +90,39 @@ func TestEvaluateReadinessCheckMissing(t *testing.T) {
 	}
 	if !hasShortfall(missing, run.ShortfallCheckMissing) {
 		t.Fatalf("EvaluateReadiness(check missing) missing = %+v, want ShortfallCheckMissing", missing)
+	}
+}
+
+// TestEvaluateReadinessCheckFailed proves a recorded but failing receipt
+// for the current head is exactly as unready as no receipt at all.
+func TestEvaluateReadinessCheckFailed(t *testing.T) {
+	ctx := readyContext()
+	ctx.LatestCheck = &run.CheckReceipt{Passed: false, SubjectCommitOID: "head-commit", SubjectTreeOID: "head-tree"}
+
+	ready, missing := run.EvaluateReadiness(ctx)
+	if ready {
+		t.Fatal("EvaluateReadiness(check failed) ready = true, want false")
+	}
+	if !hasShortfall(missing, run.ShortfallCheckMissing) {
+		t.Fatalf("EvaluateReadiness(check failed) missing = %+v, want ShortfallCheckMissing", missing)
+	}
+}
+
+// TestEvaluateReadinessStaleCheckHeadMoved proves the round-1 review's
+// exact required vector: a passing receipt for an OLDER integration head,
+// alongside an otherwise-valid approve verdict for the CURRENT head, must
+// still report ShortfallCheckMissing — a caller cannot satisfy the check
+// guard by asserting a bare "passed" flag once the head has moved.
+func TestEvaluateReadinessStaleCheckHeadMoved(t *testing.T) {
+	ctx := readyContext()
+	ctx.LatestCheck = &run.CheckReceipt{Passed: true, SubjectCommitOID: "old-commit", SubjectTreeOID: "old-tree"}
+
+	ready, missing := run.EvaluateReadiness(ctx)
+	if ready {
+		t.Fatal("EvaluateReadiness(stale check, head moved) ready = true, want false")
+	}
+	if !hasShortfall(missing, run.ShortfallCheckMissing) {
+		t.Fatalf("EvaluateReadiness(stale check, head moved) missing = %+v, want ShortfallCheckMissing", missing)
 	}
 }
 
@@ -139,10 +174,10 @@ func TestEvaluateReadinessStaleSubjectApprove(t *testing.T) {
 // the first failing guard: every unsatisfied guard is reported together.
 func TestEvaluateReadinessReportsEveryShortfall(t *testing.T) {
 	ctx := run.GuardContext{
-		PlanClosed:      false,
-		ImplementTasks:  []run.Task{{ID: testTaskID, State: run.TaskCompleted}},
-		HeadCheckPassed: false,
-		LatestReview:    nil,
+		PlanClosed:     false,
+		ImplementTasks: []run.Task{{ID: testTaskID, State: run.TaskCompleted}},
+		LatestCheck:    nil,
+		LatestReview:   nil,
 	}
 
 	ready, missing := run.EvaluateReadiness(ctx)
