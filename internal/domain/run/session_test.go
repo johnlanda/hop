@@ -183,10 +183,9 @@ func TestNewChildSession(t *testing.T) {
 		}
 	})
 
-	// The remaining subtests are the round-1 review's required negative
-	// vectors: NewChildSession must reject a parent that is not actually
-	// a well-formed, same-run, non-terminal manager — not just check
-	// delegation depth and the new child's own role.
+	// The remaining subtests prove NewChildSession rejects a parent that
+	// is not actually a well-formed, same-run, non-terminal manager — not
+	// just delegation depth and the new child's own role.
 
 	t.Run("a Phase 2 worker session cannot be a parent", func(t *testing.T) {
 		worker := run.NewSession(testSessionID, testRunID, testAttemptID, run.HarnessClaude, epoch())

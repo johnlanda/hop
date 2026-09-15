@@ -76,11 +76,11 @@ func TestValidateAcyclic(t *testing.T) {
 	})
 }
 
-// TestReleaseEligible exercises every bypass vector Terra's round-1 review
-// named: missing, foreign and duplicate prerequisites, a foreign edge (one
-// naming a different task entirely), and a non-integrated prerequisite —
-// each must refuse, not vacuously pass through an incomplete or
-// mismatched evidence set.
+// TestReleaseEligible proves every way an incomplete or mismatched
+// evidence set must refuse rather than vacuously pass: missing, foreign
+// and duplicate prerequisites, a foreign edge (one naming a different
+// task entirely), a non-integrated prerequisite, and edges disagreeing
+// with HasDependencies.
 func TestReleaseEligible(t *testing.T) {
 	task := run.Task{ID: testTaskID, RunID: testRunID, HasDependencies: true}
 	edges := []run.TaskDependency{
@@ -94,10 +94,6 @@ func TestReleaseEligible(t *testing.T) {
 			t.Fatal("ReleaseEligible(no dependencies) = false, want true")
 		}
 	})
-
-	// Round-2 review's required vectors: edges must agree with
-	// HasDependencies, or an empty edge set is vacuous ground truth for a
-	// task that actually has real dependencies.
 
 	t.Run("dependent task with zero edges is never vacuously eligible", func(t *testing.T) {
 		if run.ReleaseEligible(task, nil, nil) {
@@ -146,9 +142,8 @@ func TestReleaseEligible(t *testing.T) {
 	})
 
 	t.Run("empty prerequisites against a dependent task never vacuously passes", func(t *testing.T) {
-		// The exact bypass the round-1 review found: an empty evidence
-		// slice must never look like "nothing to check" when edges
-		// name real prerequisites.
+		// An empty evidence slice must never look like "nothing to
+		// check" when edges name real prerequisites.
 		if run.ReleaseEligible(task, edges, nil) {
 			t.Fatal("ReleaseEligible(empty prerequisites, real edges) = true, want false")
 		}

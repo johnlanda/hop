@@ -89,10 +89,10 @@ integration — without changing any Phase 2 transition's legality.
   different `TaskID` is rejected outright) is empty or not
   (`ErrDependencyEvidenceMissing` from `Release` on a mismatch — a
   dependent task given zero edges, or a zero-dependency task given any).
-  This closes the residual bypass a round-2 review found: without it, an
-  empty edge set would be indistinguishable from "genuinely zero
-  dependencies" and satisfy a dependent task vacuously. Only once shapes
-  agree does `ReleaseEligible` check that prerequisites accounts for
+  Without this check, an empty edge set would be indistinguishable from
+  "genuinely zero dependencies" and satisfy a dependent task vacuously.
+  Only once shapes agree does `ReleaseEligible` check that prerequisites
+  accounts for
   EXACTLY the IDs edges name — no missing, no foreign (an ID edges never
   named), no duplicate — with every one `integrated`
   (`ErrDependencyNotIntegrated` otherwise). `Release` never accepts a bare

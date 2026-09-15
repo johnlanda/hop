@@ -233,10 +233,9 @@ func TestTaskRelease(t *testing.T) {
 		}
 	})
 
-	// The following two are the round-2 review's required vectors: edges
-	// disagreeing with HasDependencies is refused BEFORE ReleaseEligible
-	// ever runs, closing the residual bypass where an empty edge set
-	// against a dependent task looked like vacuous ground truth.
+	// The following two prove edges disagreeing with HasDependencies is
+	// refused BEFORE ReleaseEligible ever runs: an empty edge set against
+	// a dependent task must never look like vacuous ground truth.
 
 	t.Run("dependent task with zero edges is refused", func(t *testing.T) {
 		task := run.Task{ID: testTaskID, RunID: testRunID, Kind: run.TaskKindImplement, HasDependencies: true, State: run.TaskPending}

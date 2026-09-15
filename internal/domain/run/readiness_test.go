@@ -108,11 +108,11 @@ func TestEvaluateReadinessCheckFailed(t *testing.T) {
 	}
 }
 
-// TestEvaluateReadinessStaleCheckHeadMoved proves the round-1 review's
-// exact required vector: a passing receipt for an OLDER integration head,
-// alongside an otherwise-valid approve verdict for the CURRENT head, must
-// still report ShortfallCheckMissing — a caller cannot satisfy the check
-// guard by asserting a bare "passed" flag once the head has moved.
+// TestEvaluateReadinessStaleCheckHeadMoved proves that a passing receipt
+// for an OLDER integration head, alongside an otherwise-valid approve
+// verdict for the CURRENT head, must still report ShortfallCheckMissing —
+// a caller cannot satisfy the check guard by asserting a bare "passed"
+// flag once the head has moved.
 func TestEvaluateReadinessStaleCheckHeadMoved(t *testing.T) {
 	ctx := readyContext()
 	ctx.LatestCheck = &run.CheckReceipt{Passed: true, SubjectCommitOID: "old-commit", SubjectTreeOID: "old-tree"}
