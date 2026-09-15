@@ -476,6 +476,25 @@ func waitForRunState(t *testing.T, env []string, repoRoot, runID string, deadlin
 	return fields, reached
 }
 
+// querySQLite runs one read-only query against a test's own throwaway
+// sqlite state database via the sqlite3 CLI — a standard tool on this
+// suite's supported platforms, shelled out to the same way this suite
+// already uses git and ps, so no new Go dependency is needed for direct
+// evidence a rendered `hop status` block does not carry (row history, not
+// just current state). dbPath is always this test's own isolated
+// HOP_STATE_DIR/hop.db, never a real one. Returns trimmed combined output;
+// fails the test on any error.
+func querySQLite(t *testing.T, dbPath, query string) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "sqlite3", dbPath, query).CombinedOutput() //nolint:gosec // G204: fixed sqlite3 invocation against this test's own database path and a query it composed itself.
+	if err != nil {
+		t.Fatalf("sqlite3 %s %q: %v\n%s", dbPath, query, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
 // readControllerLog reads a hop controller's captured stdout or stderr log
 // (as started by startHopController) from the test's artifact directory.
 func readControllerLog(t *testing.T, artifacts *artifactDir, name, stream string) string {

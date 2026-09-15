@@ -77,28 +77,39 @@ func TestRealProcessRunEndToEnd(t *testing.T) {
 	label, runID := extractRunID(t, started)
 
 	fields, reached := waitForRunState(t, env, repo.Root, runID, runEndToEndTimeout, "completed", "failed", "stopped")
-	stdout := readControllerLog(t, artifacts, "run", "stdout")
 	if !reached || fields["state"] != "completed" {
 		// The worker pane's own scrollback is never otherwise retained — it
 		// is ephemeral, gone with the pane — so capture it before failing.
 		if binding := fields["binding"]; binding != "" {
 			artifacts.save(t, "worker-pane-scrollback.txt", server.readPane(t, paneIDFromBinding(binding)))
 		}
-		t.Fatalf("run %s ended %q, want completed; hop status detail: %+v\ncontroller stdout:\n%s", runID, fields["state"], fields, stdout)
+		t.Fatalf("run %s ended %q, want completed; hop status detail: %+v\ncontroller stdout:\n%s", runID, fields["state"], fields, readControllerLog(t, artifacts, "run", "stdout"))
 	}
 
+	// hop status (a separate reader) can observe "completed" in the store a
+	// moment before the controller's own loop iteration notices it, prints
+	// its final transition line and exits: wait for the controller to
+	// actually exit before reading its log, so the line assertions below
+	// see the complete, flushed output rather than racing it.
 	status := waitForControllerExit(t, sp, 30*time.Second)
 	if !status.Exited() || status.ExitCode() != 0 {
 		t.Errorf("hop run exit status = %v, want a clean exit(0)", status)
 	}
+	stdout := readControllerLog(t, artifacts, "run", "stdout")
 
 	for _, want := range []string{
 		"run " + label + " " + runID + " started",
 		"run " + label + " running",
-		"run " + label + " completing",
 		"run " + label + " completed",
 		"launch settled",
 	} {
+		// "completing" is not asserted: the loop only prints a line when
+		// the polled state differs from the last one it saw (loop.go), and
+		// a check against a trivial script can settle within the same 2s
+		// poll interval as its own claim — running can jump straight to
+		// completed on the wire with "completing" never observed between
+		// two polls. This is expected polling behavior, not a missed
+		// transition.
 		if !strings.Contains(stdout, want) {
 			t.Errorf("controller stdout missing %q; got:\n%s", want, stdout)
 		}
@@ -151,6 +162,30 @@ func TestRealProcessRunEndToEnd(t *testing.T) {
 	}
 	if fields["last check"] == "" || fields["last check"] == "(none)" {
 		t.Error("hop status does not report a last check execution")
+	}
+
+	// Pin the early-submission/transient round trip (section 7 step 4):
+	// the worker's very first hop result submit races the launch claim's
+	// settlement and is rejected transient, and — because hop result
+	// submit's first stdout line is the fixed section 7 protocol text
+	// (cmd/hop/resultcmd.go's transientRetrySignal), never the store's own
+	// Detail — the worker recognizes it and retries until accepted.
+	if !strings.Contains(server.readPane(t, paneIDFromBinding(fields["binding"])), "first-line=[transient") {
+		t.Error("the worker pane's scrollback never shows a first line beginning with \"transient\"; the early-submission race was not exercised")
+	}
+	history := querySQLite(t, filepath.Join(stateDir, "hop.db"), "SELECT outcome FROM result_submissions ORDER BY submitted_at;")
+	outcomes := strings.Split(history, "\n")
+	transientAt, acceptedAt := -1, -1
+	for i, outcome := range outcomes {
+		switch {
+		case outcome == "transient" && transientAt == -1:
+			transientAt = i
+		case outcome == "accepted" && acceptedAt == -1:
+			acceptedAt = i
+		}
+	}
+	if transientAt == -1 || acceptedAt == -1 || transientAt >= acceptedAt {
+		t.Errorf("result_submissions outcome history = %q, want a transient receipt followed by an accepted one", outcomes)
 	}
 }
 

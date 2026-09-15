@@ -23,11 +23,21 @@ func TestRunResultSubmit(t *testing.T) {
 		"HOP_INCARNATION_ID": testIncarnationID,
 	}
 
+	// realTransientDetail is exactly the text
+	// internal/adapters/sqlite/submission.go's Detail carries for a
+	// transient outcome: run.ErrTransientNotRunning's message
+	// ("run: attempt not yet running"), wrapped with the attempt id
+	// (internal/domain/run/result.go). It never contains the word
+	// "transient" as a prefix — using it here, not an idealized value,
+	// is what proves the protocol line does not depend on it.
+	const realTransientDetail = "run: attempt not yet running: attempt 01931db3-0000-7000-8000-000000000000"
+
 	outcomes := []struct {
-		name      string
-		result    app.SubmitResultResult
-		wantCode  int
-		firstLine string
+		name       string
+		result     app.SubmitResultResult
+		wantCode   int
+		firstLine  string
+		wantStderr string // non-empty: stderr must contain this
 	}{
 		{
 			name:      "accepted exits 0 and prints the result id",
@@ -42,10 +52,15 @@ func TestRunResultSubmit(t *testing.T) {
 			firstLine: "duplicate " + testResultID,
 		},
 		{
-			name:      "transient exits 1 with the retry line verbatim first",
-			result:    app.SubmitResultResult{Kind: "transient", Detail: "transient: attempt not yet running; retry"},
-			wantCode:  exitFailure,
-			firstLine: "transient: attempt not yet running; retry",
+			// The fake outcome carries the REAL sqlite Detail text, not an
+			// idealized one: the protocol line is transientRetrySignal
+			// regardless of what Detail says, and Detail itself lands on
+			// stderr as diagnostics, never on the stdout protocol line.
+			name:       "transient exits 1 with the fixed retry line first, real Detail on stderr",
+			result:     app.SubmitResultResult{Kind: "transient", Detail: realTransientDetail},
+			wantCode:   exitFailure,
+			firstLine:  transientRetrySignal,
+			wantStderr: realTransientDetail,
 		},
 		{
 			name:      "stale exits 1",
@@ -89,6 +104,9 @@ func TestRunResultSubmit(t *testing.T) {
 			if lines[0] != tc.firstLine {
 				t.Errorf("first line = %q, want %q", lines[0], tc.firstLine)
 			}
+			if tc.wantStderr != "" && !strings.Contains(stderr.String(), tc.wantStderr) {
+				t.Errorf("stderr = %q, want it to contain %q", stderr.String(), tc.wantStderr)
+			}
 			if submitted.RunID != testRunID || submitted.TaskID != testTaskID || submitted.AttemptID != testAttemptID {
 				t.Errorf("ids defaulted from HOP_* wrong: %+v", submitted)
 			}
@@ -100,6 +118,20 @@ func TestRunResultSubmit(t *testing.T) {
 			}
 		})
 	}
+
+	// The assignment template's own retry instruction
+	// (internal/app/usecase_execboundary.go's renderInitialPrompt) tells
+	// the worker to retry when "the first output line begins with
+	// \"transient\"". This package cannot call that unexported function
+	// directly, but this assertion ties the two contracts together: if
+	// transientRetrySignal ever stopped satisfying the prompt's own prefix
+	// check, this fails immediately instead of the two silently drifting
+	// apart.
+	t.Run("the fixed retry line satisfies the prompt's own retry prefix check", func(t *testing.T) {
+		if !strings.HasPrefix(transientRetrySignal, "transient") {
+			t.Fatalf("transientRetrySignal = %q does not begin with %q, which the prompt instructs the worker to check for", transientRetrySignal, "transient")
+		}
+	})
 
 	t.Run("explicit id flags beat the environment defaults", func(t *testing.T) {
 		other := "99999999-9999-4999-8999-999999999999"

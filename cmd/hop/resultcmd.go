@@ -13,6 +13,17 @@ import (
 // defaultSubmitTimeout bounds one hop result submit invocation.
 const defaultSubmitTimeout = 30 * time.Second
 
+// transientRetrySignal is section 7's fixed worker-facing retry protocol:
+// hop result submit's first stdout line for a transient outcome is this
+// exact text, regardless of the store's own Detail. The assignment
+// template's retry instruction (internal/app/usecase_execboundary.go's
+// renderInitialPrompt) tells the worker to retry when the first output
+// line begins with "transient", so this literal constant IS that parsed
+// contract — drift here would silently break it. The store's Detail is
+// diagnostic evidence, printed to stderr instead, never part of the
+// protocol line.
+const transientRetrySignal = "transient: attempt not yet running; retry"
+
 // runResult dispatches the `hop result` subcommands; submit is the only
 // one.
 func runResult(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
@@ -31,10 +42,11 @@ func runResult(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 // are handed to the application verbatim, whose section 7 step 1 records
 // an invalid submission as `malformed` through the protocol; the command
 // never pre-judges a value. The submission outcome is printed as the
-// first output line —
-// verbatim for `transient`, whose first line is the worker's retry
-// signal. Exit 0 for accepted and duplicate; 1 for transient, stale,
-// conflicting and malformed; 2 on usage.
+// first output line: the fixed transientRetrySignal for `transient`
+// (never the store's own Detail text, which goes to stderr instead), and
+// the outcome kind plus its own detail for everything else. Exit 0 for
+// accepted and duplicate; 1 for transient, stale, conflicting and
+// malformed; 2 on usage.
 func runResultSubmit(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 	diagnostics := &recordingWriter{w: stderr}
 	flags := flag.NewFlagSet("hop result submit", flag.ContinueOnError)
@@ -103,6 +115,14 @@ func runResultSubmit(args []string, stdout, stderr io.Writer, d *deps) (int, err
 	if _, err := fmt.Fprintln(stdout, submissionLine(&result)); err != nil {
 		return exitFailure, err
 	}
+	if result.Kind == string(app.SubmissionTransient) && result.Detail != "" {
+		// The store's own Detail (domain evidence, not the worker-facing
+		// protocol) goes to stderr — diagnostics for a human, never onto
+		// the stdout line the worker parses by prefix.
+		if _, err := fmt.Fprintf(stderr, "hop result submit: %s\n", result.Detail); err != nil {
+			return exitFailure, err
+		}
+	}
 	switch result.Kind {
 	case string(app.SubmissionAccepted), string(app.SubmissionDuplicate):
 		return exitOK, nil
@@ -112,13 +132,16 @@ func runResultSubmit(args []string, stdout, stderr io.Writer, d *deps) (int, err
 }
 
 // submissionLine renders one submission outcome as the command's first
-// output line. A transient outcome's line is the store's Detail verbatim
-// (`transient: attempt not yet running; retry` — the worker's parseable
-// retry signal); accepted and duplicate name the result id.
+// output line. A transient outcome's line is always transientRetrySignal,
+// the fixed section 7 protocol text — never the store's own Detail, which
+// is diagnostic evidence the caller prints separately to stderr, not part
+// of the line a worker parses by prefix. Accepted and duplicate name the
+// result id; every other outcome embeds its own Detail directly in the
+// line.
 func submissionLine(result *app.SubmitResultResult) string {
 	switch result.Kind {
 	case string(app.SubmissionTransient):
-		return result.Detail
+		return transientRetrySignal
 	case string(app.SubmissionAccepted), string(app.SubmissionDuplicate):
 		return result.Kind + " " + result.ResultID
 	default:
