@@ -22,8 +22,17 @@ const (
 // so a later inspection can corroborate — or fail to corroborate — that the
 // exec happened as claimed.
 type LaunchClaim struct {
-	IncarnationID      identity.IncarnationID
-	RunID              identity.RunID
+	IncarnationID identity.IncarnationID
+	RunID         identity.RunID
+	// SessionID is required (docs/plan/phase-3-design.md section 3/4,
+	// B2): every claim is keyed to the session it launches, not only to
+	// an attempt. AttemptID is optional — empty for an attempt-less
+	// session (the manager); the pre-binding pending-launch-intent
+	// fallback that authorizes a claim before any binding exists is
+	// keyed to the CLAIMED SESSION's newest pending launch operation,
+	// never the run's, so two concurrently pending launches validate
+	// independently.
+	SessionID          identity.SessionID
 	AttemptID          identity.AttemptID
 	Executable         string
 	ArgvDigest         string

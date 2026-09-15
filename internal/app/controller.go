@@ -31,6 +31,19 @@ type Controller struct {
 	Commands    CommandRunner
 	Groups      ProcessGroupInspector
 	Config      ConfigurationSource
+	// Messages, Plan and Reviews are the Phase 3 worker-authority
+	// messaging/plan/review ports (docs/plan/phase-3-design.md section
+	// 3). They are nil for a Controller that only ever runs solo-mode
+	// runs; every feature-mode use case that consumes one checks for nil
+	// and fails closed before any side effect rather than dereferencing a
+	// nil interface.
+	Messages MessagingStore
+	Plan     PlanStore
+	Reviews  ReviewStore
+	// Workspaces is the Phase 3 manager-placement port
+	// (docs/plan/phase-3-design.md section 3). Nil for a Controller that
+	// only ever runs solo-mode runs.
+	Workspaces WorkspaceRuntime
 	// GitExecutable is the absolute path of the git binary every repository
 	// and worktree command runs (StartRun's object-format check and base
 	// commit resolution, worktree provenance classification, check

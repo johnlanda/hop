@@ -138,3 +138,56 @@ type Runtime interface {
 	// process with the pane gone cannot have a restore pending.
 	ServerInstance(ctx context.Context) (string, error)
 }
+
+// WorkspaceRequest is CreateWorkspace's input: an explicit cwd, additive
+// env and a unique creation label. Unlike WorktreeRequest, a plain
+// workspace carries no repository/branch/base — it is the manager's own
+// placement, at the repository root, never a worktree.
+type WorkspaceRequest struct {
+	Cwd   string
+	Env   map[string]string
+	Label string
+}
+
+// WorkspaceHandle is what Herdr created: the workspace, its sole tab and
+// that tab's sole root pane (S8-confirmed shape:
+// {type: "workspace_created", workspace, tab, root_pane}).
+type WorkspaceHandle struct {
+	WorkspaceID string
+	TabID       string
+	PaneID      string
+}
+
+// WorkspaceRef identifies a workspace FindWorkspaceByLabel recovered,
+// descended to its sole tab's sole root pane.
+type WorkspaceRef struct {
+	WorkspaceID string
+	TabID       string
+	PaneID      string
+}
+
+// WorkspaceRuntime is the consumer-owned port over Herdr's plain-workspace
+// surface: the manager's placement only (worker and reviewer placement
+// keeps coming from Runtime.CreateWorktree's returned workspace). Declared
+// as a SEPARATE interface from Runtime, never as new methods added to it,
+// for the identical reason WorkflowRepositories is separate from
+// UnitOfWork: Runtime is a Controller struct field the existing Herdr
+// adapter already satisfies, and adding methods to it would break that
+// satisfaction — and cmd/hop's composition wiring — before the adapter
+// (slice 5) implements them. Composition wires a Controller.Workspaces
+// field of this type once the adapter exists; it is nil for a Controller
+// that never runs feature mode, and no solo-mode code path reads it.
+type WorkspaceRuntime interface {
+	// CreateWorkspace calls workspace.create: no focus, so it never steals
+	// the session's active workspace except that session's very
+	// first-ever one, which Herdr always activates regardless of the
+	// request (S8-confirmed).
+	CreateWorkspace(ctx context.Context, req WorkspaceRequest) (WorkspaceHandle, error)
+	// FindWorkspaceByLabel resolves a workspace by its unique creation
+	// LABEL — a WORKSPACE attribute (WorkspaceInfo.label), never the root
+	// pane's — then descends workspace -> its sole tab -> that tab's sole
+	// pane. Zero matches is (zero, false, nil); more than one workspace
+	// with the label, or more than one tab or pane on the resolved
+	// workspace, is an error, never a guess (S8-confirmed).
+	FindWorkspaceByLabel(ctx context.Context, label string) (WorkspaceRef, bool, error)
+}
