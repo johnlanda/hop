@@ -27,7 +27,11 @@ func runResult(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 // flags default from the launch-provided HOP_RUN_ID, HOP_TASK_ID and
 // HOP_ATTEMPT_ID; the incarnation is read from HOP_INCARNATION_ID (no
 // flag); the absolute HOP_STATE_DIR is required as in every worker
-// context. The submission outcome is printed as the first output line —
+// context. Parse-don't-validate: the flag values — empty ones included —
+// are handed to the application verbatim, whose section 7 step 1 records
+// an invalid submission as `malformed` through the protocol; the command
+// never pre-judges a value. The submission outcome is printed as the
+// first output line —
 // verbatim for `transient`, whose first line is the worker's retry
 // signal. Exit 0 for accepted and duplicate; 1 for transient, stale,
 // conflicting and malformed; 2 on usage.
@@ -35,8 +39,8 @@ func runResultSubmit(args []string, stdout, stderr io.Writer, d *deps) (int, err
 	diagnostics := &recordingWriter{w: stderr}
 	flags := flag.NewFlagSet("hop result submit", flag.ContinueOnError)
 	flags.SetOutput(diagnostics)
-	summary := flags.String("summary", "", "one-line result summary (required)")
-	commit := flags.String("commit", "", "submitted commit object id (required)")
+	summary := flags.String("summary", "", "one-line result summary (required; the value itself is judged by the submission protocol)")
+	commit := flags.String("commit", "", "submitted commit object id (required; the value itself is judged by the submission protocol)")
 	runID := flags.String("run", "", "run id (default $HOP_RUN_ID)")
 	taskID := flags.String("task", "", "task id (default $HOP_TASK_ID)")
 	attemptID := flags.String("attempt", "", "attempt id (default $HOP_ATTEMPT_ID)")
@@ -47,17 +51,25 @@ func runResultSubmit(args []string, stdout, stderr io.Writer, d *deps) (int, err
 		_, err := fmt.Fprintf(stderr, "hop result submit: unexpected argument %q\n", flags.Arg(0))
 		return exitUsage, err
 	}
-	if *summary == "" || *commit == "" {
+	// Flag PRESENCE decides usage; flag VALUES are the protocol's to judge.
+	// An omitted required flag is a usage error, and an omitted id flag
+	// falls back to its launch-provided default — but a flag the worker
+	// explicitly supplied is forwarded verbatim, empty included, so the
+	// application records an invalid value as malformed with a receipt
+	// instead of the CLI discarding it.
+	supplied := map[string]bool{}
+	flags.Visit(func(f *flag.Flag) { supplied[f.Name] = true })
+	if !supplied["summary"] || !supplied["commit"] {
 		_, err := fmt.Fprintln(stderr, "hop result submit: --summary and --commit are required")
 		return exitUsage, err
 	}
-	if *runID == "" {
+	if !supplied["run"] {
 		*runID = d.getenv("HOP_RUN_ID")
 	}
-	if *taskID == "" {
+	if !supplied["task"] {
 		*taskID = d.getenv("HOP_TASK_ID")
 	}
-	if *attemptID == "" {
+	if !supplied["attempt"] {
 		*attemptID = d.getenv("HOP_ATTEMPT_ID")
 	}
 

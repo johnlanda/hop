@@ -121,6 +121,83 @@ func TestRunResultSubmit(t *testing.T) {
 		}
 	})
 
+	t.Run("an explicitly empty commit reaches the app and is recorded as malformed", func(t *testing.T) {
+		ctrl := &fakeController{}
+		var submitted app.SubmitResultRequest
+		ctrl.submitResult = func(req app.SubmitResultRequest) (app.SubmitResultResult, error) {
+			submitted = req
+			return app.SubmitResultResult{Kind: "malformed", Detail: "commit must be a full 40-hex lowercase object id"}, nil
+		}
+		td := newTestDeps(ctrl, workerEnv, t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runResult([]string{"submit", "--summary", "s", "--commit", ""}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+
+		// Flag presence decides usage; the value is the protocol's to
+		// judge: the explicitly empty commit is forwarded verbatim, and the
+		// app records the submission as malformed with a receipt.
+		if code != exitFailure {
+			t.Errorf("exit code = %d, want %d, never usage", code, exitFailure)
+		}
+		if len(ctrl.recorded()) == 0 || ctrl.recorded()[len(ctrl.recorded())-1] != "SubmitResult" {
+			t.Fatalf("calls = %v; the raw submission must reach the app", ctrl.recorded())
+		}
+		if submitted.CommitOID != "" || submitted.Summary != "s" {
+			t.Errorf("submitted = %+v, want the empty commit verbatim", submitted)
+		}
+		if !strings.HasPrefix(stdout.String(), "malformed: ") {
+			t.Errorf("first line = %q, want the recorded malformed verdict", stdout.String())
+		}
+	})
+
+	t.Run("an explicitly empty summary is delegated to the app, not pre-judged", func(t *testing.T) {
+		ctrl := &fakeController{}
+		var submitted app.SubmitResultRequest
+		ctrl.submitResult = func(req app.SubmitResultRequest) (app.SubmitResultResult, error) {
+			submitted = req
+			return app.SubmitResultResult{Kind: "accepted", ResultID: testResultID}, nil
+		}
+		td := newTestDeps(ctrl, workerEnv, t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runResult([]string{"submit", "--summary", "", "--commit", testCommit}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+
+		// The app's summary constraints are size and UTF-8 validity, not
+		// nonemptiness; the CLI forwards the value and reports whatever
+		// the protocol decided.
+		if code != exitOK {
+			t.Errorf("exit code = %d, want %d", code, exitOK)
+		}
+		if submitted.Summary != "" {
+			t.Errorf("submitted summary = %q, want the empty value verbatim", submitted.Summary)
+		}
+	})
+
+	t.Run("an explicitly empty id flag is forwarded, never env-defaulted", func(t *testing.T) {
+		ctrl := &fakeController{}
+		var submitted app.SubmitResultRequest
+		ctrl.submitResult = func(req app.SubmitResultRequest) (app.SubmitResultResult, error) {
+			submitted = req
+			return app.SubmitResultResult{Kind: "malformed", Detail: "run id: empty"}, nil
+		}
+		td := newTestDeps(ctrl, workerEnv, t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		if _, err := runResult([]string{"submit", "--summary", "s", "--commit", testCommit, "--run", ""}, &stdout, &stderr, td.deps); err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+
+		if submitted.RunID != "" {
+			t.Errorf("run id = %q; an explicitly supplied empty flag must not fall back to HOP_RUN_ID", submitted.RunID)
+		}
+	})
+
 	t.Run("missing HOP_STATE_DIR is refused before any store access", func(t *testing.T) {
 		td := newTestDeps(&fakeController{}, map[string]string{"HOME": "/home/u"}, t.TempDir())
 		var stdout, stderr bytes.Buffer
@@ -148,7 +225,8 @@ func TestRunResultSubmit(t *testing.T) {
 	}{
 		{name: "no subcommand", args: nil, want: "usage: hop result submit"},
 		{name: "unknown subcommand", args: []string{"list"}, want: "usage: hop result submit"},
-		{name: "missing summary and commit", args: []string{"submit"}, want: "--summary and --commit are required"},
+		{name: "omitted summary and commit flags", args: []string{"submit"}, want: "--summary and --commit are required"},
+		{name: "omitted commit flag", args: []string{"submit", "--summary", "s"}, want: "--summary and --commit are required"},
 		{name: "unexpected positional", args: []string{"submit", "--summary", "s", "--commit", testCommit, "x"}, want: "unexpected argument"},
 	}
 	for _, tc := range usage {
