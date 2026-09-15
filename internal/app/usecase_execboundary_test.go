@@ -291,6 +291,62 @@ func TestPrepareLaunchExec(t *testing.T) {
 		}
 	})
 
+	t.Run("codex first launch composes the prompt argv with its profile shape", func(t *testing.T) {
+		lc := ebLaunchContext(t)
+		lc.Snapshot.Harness = HarnessCodex
+		lc.Snapshot.EnvPolicy.Harness = HarnessCodex
+		lc.Snapshot.EnvPolicy.ProfileDir = "/profiles/codex"
+		lc.Session.NativeSessionRef = "" // only Claude needs the pre-assigned reference
+		read := &ebReadStub{launch: lc}
+		subs := &ebSubmissionStub{}
+
+		plan, err := newController(read, subs).PrepareLaunchExec(context.Background(), baseRequest())
+		if err != nil {
+			t.Fatalf("PrepareLaunchExec: %v", err)
+		}
+
+		if len(plan.Argv) != 2 || plan.Argv[0] != "/resolved/codex" {
+			t.Fatalf("argv = %q, want the codex executable and the prompt only", plan.Argv)
+		}
+		prompt := plan.Argv[1]
+		for _, want := range []string{"/state/runs/" + ebRunID + "/artifacts/assignment.md", "/opt/hop/bin/hop result submit", "transient"} {
+			if !strings.Contains(prompt, want) {
+				t.Errorf("prompt lacks %q; got %q", want, prompt)
+			}
+		}
+		joined := strings.Join(plan.Env, "\n")
+		if !strings.Contains(joined, "CODEX_HOME=/profiles/codex") {
+			t.Errorf("codex profile shape not assigned:\n%s", joined)
+		}
+		if len(subs.claims) != 1 || subs.claims[0].Executable != "/resolved/codex" || subs.claims[0].ArgvDigest != launchArgvDigest(plan.Argv) {
+			t.Errorf("claim = %+v", subs.claims)
+		}
+	})
+
+	t.Run("opencode first launch composes the --prompt argv", func(t *testing.T) {
+		lc := ebLaunchContext(t)
+		lc.Snapshot.Harness = HarnessOpencode
+		lc.Snapshot.EnvPolicy.Harness = HarnessOpencode
+		lc.Session.NativeSessionRef = ""
+		read := &ebReadStub{launch: lc}
+		subs := &ebSubmissionStub{}
+
+		plan, err := newController(read, subs).PrepareLaunchExec(context.Background(), baseRequest())
+		if err != nil {
+			t.Fatalf("PrepareLaunchExec: %v", err)
+		}
+
+		if len(plan.Argv) != 3 || plan.Argv[0] != "/resolved/opencode" || plan.Argv[1] != "--prompt" {
+			t.Fatalf("argv = %q, want opencode --prompt <prompt>", plan.Argv)
+		}
+		if !strings.Contains(plan.Argv[2], "/state/runs/"+ebRunID+"/artifacts/assignment.md") {
+			t.Errorf("prompt lacks the assignment path (the argv marker); got %q", plan.Argv[2])
+		}
+		if len(subs.claims) != 1 || subs.claims[0].Executable != "/resolved/opencode" {
+			t.Errorf("claim = %+v", subs.claims)
+		}
+	})
+
 	t.Run("cold relaunch composes resume argv", func(t *testing.T) {
 		lc := ebLaunchContext(t)
 		lc.Attempt.State = run.AttemptRelaunching
@@ -442,14 +498,6 @@ func TestPrepareLaunchExec(t *testing.T) {
 			wantErr: "already settled",
 		},
 		{
-			name: "codex launch is unsupported",
-			mutate: func(lc *LaunchContext, _ *LaunchExecRequest, _ *ebSubmissionStub) {
-				lc.Snapshot.Harness = HarnessCodex
-				lc.Snapshot.EnvPolicy.Harness = HarnessCodex
-			},
-			wantErr: "only claude launches",
-		},
-		{
 			name: "codex cold resume names the unsupported state",
 			mutate: func(lc *LaunchContext, _ *LaunchExecRequest, _ *ebSubmissionStub) {
 				lc.Snapshot.Harness = HarnessCodex
@@ -459,7 +507,16 @@ func TestPrepareLaunchExec(t *testing.T) {
 			wantErr: "cold resume for harness",
 		},
 		{
-			name: "missing native reference",
+			name: "opencode cold resume names the unsupported state",
+			mutate: func(lc *LaunchContext, _ *LaunchExecRequest, _ *ebSubmissionStub) {
+				lc.Snapshot.Harness = HarnessOpencode
+				lc.Snapshot.EnvPolicy.Harness = HarnessOpencode
+				lc.Attempt.State = run.AttemptRelaunching
+			},
+			wantErr: "cold resume for harness",
+		},
+		{
+			name: "missing native reference refuses a claude launch",
 			mutate: func(lc *LaunchContext, _ *LaunchExecRequest, _ *ebSubmissionStub) {
 				lc.Session.NativeSessionRef = ""
 			},

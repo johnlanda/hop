@@ -54,9 +54,11 @@ type LaunchExecPlan struct {
 // (validateLaunchEnvironment) — together with attempt currency, the stop
 // state and the different-pid claim rule; sanitizes the launcher's inherited environment under the
 // snapshot's frozen, versioned policy; composes the harness argv from the
-// frozen snapshot (Claude only in Phase 2: the pre-assigned native session
-// reference via --session-id plus the fixed initial prompt on first
-// launch, --resume on a cold relaunch); resolves the harness executable to
+// frozen snapshot per harness (first launches for Claude, Codex and
+// opencode share the fixed initial prompt; a cold relaunch is Claude's
+// --resume with the pre-assigned native reference, and Codex/opencode
+// cold resume reports the Phase 2 unsupported state); resolves the
+// harness executable to
 // an absolute path using the sanitized environment's PATH; and records the
 // launch claim (exec_pending) with that exact executable, the argv digest
 // and the launcher's own pid. Any failure returns before the claim is
@@ -193,29 +195,44 @@ func validateLaunchEnvironment(environ []string, lc *LaunchContext, runID, attem
 	return nil
 }
 
-// composeHarnessArgvTail renders the harness argv after the executable from
-// the frozen snapshot: Phase 2 composes argv for Claude only, and Claude
-// argv is never rendered for another harness. First launch carries the
-// pre-assigned native session reference and the fixed initial prompt; a
-// cold relaunch (attempt relaunching) resumes the same reference.
+// composeHarnessArgvTail renders the harness argv after the executable
+// from the frozen snapshot, per harness. A cold relaunch (attempt
+// relaunching) is supported for Claude only — `--resume <native-ref>`,
+// where the reference was pre-assigned by HOP before first launch —
+// because Codex and opencode native-session capture is unspecified in
+// Phase 2. First launches are supported for all three harnesses, sharing
+// the one fixed initial prompt: Claude `--session-id <ref> <prompt>`
+// (Claude alone needs the native reference), Codex `<prompt>`, opencode
+// `--prompt <prompt>`. Claude argv is never rendered for another harness.
 func composeHarnessArgvTail(lc *LaunchContext, hopPath string) ([]string, error) {
-	if lc.Snapshot.Harness != HarnessClaude {
-		if lc.Attempt.State == run.AttemptRelaunching {
+	if lc.Attempt.State == run.AttemptRelaunching {
+		if lc.Snapshot.Harness != HarnessClaude {
 			return nil, fmt.Errorf("app: cold resume for harness %q is not supported in Phase 2; its native session capture is unspecified — stop the run or continue it manually", lc.Snapshot.Harness)
 		}
-		return nil, fmt.Errorf("app: launching harness %q is not supported in Phase 2; only claude launches", lc.Snapshot.Harness)
-	}
-	ref := lc.Session.NativeSessionRef
-	if ref == "" {
-		return nil, fmt.Errorf("app: the session has no pre-assigned native session reference; claude argv cannot be composed")
-	}
-	if lc.Attempt.State == run.AttemptRelaunching {
+		ref := lc.Session.NativeSessionRef
+		if ref == "" {
+			return nil, fmt.Errorf("app: the session has no pre-assigned native session reference; claude argv cannot be composed")
+		}
 		return []string{"--resume", ref}, nil
 	}
 	if !filepath.IsAbs(lc.Snapshot.AssignmentPath) {
 		return nil, fmt.Errorf("app: the frozen assignment path is not absolute; the initial prompt carries only absolute paths")
 	}
-	return []string{"--session-id", ref, renderInitialPrompt(lc.Snapshot.AssignmentPath, hopPath)}, nil
+	prompt := renderInitialPrompt(lc.Snapshot.AssignmentPath, hopPath)
+	switch lc.Snapshot.Harness {
+	case HarnessClaude:
+		ref := lc.Session.NativeSessionRef
+		if ref == "" {
+			return nil, fmt.Errorf("app: the session has no pre-assigned native session reference; claude argv cannot be composed")
+		}
+		return []string{"--session-id", ref, prompt}, nil
+	case HarnessCodex:
+		return []string{prompt}, nil
+	case HarnessOpencode:
+		return []string{"--prompt", prompt}, nil
+	default:
+		return nil, fmt.Errorf("app: harness %q is not one of claude, codex, opencode", lc.Snapshot.Harness)
+	}
 }
 
 // renderInitialPrompt renders the fixed first-launch prompt: absolute paths
