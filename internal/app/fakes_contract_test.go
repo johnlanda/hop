@@ -8,6 +8,7 @@ import (
 
 	"github.com/johnlanda/hop/internal/app"
 	"github.com/johnlanda/hop/internal/domain/identity"
+	"github.com/johnlanda/hop/internal/domain/run"
 )
 
 // TestFakeStoreContracts proves the handwritten fakes enforce the store
@@ -254,4 +255,106 @@ func TestFakePortsRefuseCallsInsideTransactions(t *testing.T) {
 	if _, err := tc.Commands.Run(context.Background(), app.Command{Argv: []string{"git", "-C", "/repo", "status"}}); err != nil {
 		t.Fatalf("CommandRunner.Run after commit error = %v", err)
 	}
+}
+
+// TestWorkerWritesMoveRevisions proves the fake mirrors the real store's
+// row movement for worker-authority writes: a stop request or an accepted
+// submission bumps the same entity revisions the real transactions do, so
+// a stale controller unit of work conflicts at commit instead of silently
+// overwriting them.
+func TestWorkerWritesMoveRevisions(t *testing.T) {
+	t.Run("a staged unit of work cannot overwrite a stop request", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		_, detail := runningRun(t, tc)
+		lease := tc.Store.Leases[detail.RunID].lease
+
+		uow, err := tc.Store.Begin(context.Background(), lease)
+		if err != nil {
+			t.Fatalf("Begin() error = %v", err)
+		}
+		r, rev, err := uow.Runs().Get(context.Background(), detail.RunID)
+		if err != nil {
+			t.Fatalf("Get() error = %v", err)
+		}
+		if _, err := uow.Runs().Save(context.Background(), r, rev); err != nil {
+			t.Fatalf("Save() error = %v", err)
+		}
+
+		// The worker-authority stop request lands while the unit of work is
+		// still open.
+		if err := tc.Controller.RequestStop(context.Background(), detail.RunID.String()); err != nil {
+			t.Fatalf("RequestStop() error = %v", err)
+		}
+
+		if err := uow.Commit(); !errors.Is(err, app.ErrRevisionConflict) {
+			t.Fatalf("Commit() error = %v, want ErrRevisionConflict", err)
+		}
+		if !tc.Store.Runs[detail.RunID].value.StopRequested {
+			t.Fatalf("the stop request was overwritten by the stale unit of work")
+		}
+	})
+
+	t.Run("a staged unit of work cannot overwrite an accepted submission", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		_, detail := runningRun(t, tc)
+		lease := tc.Store.Leases[detail.RunID].lease
+
+		uow, err := tc.Store.Begin(context.Background(), lease)
+		if err != nil {
+			t.Fatalf("Begin() error = %v", err)
+		}
+		a, rev, err := uow.Attempts().Get(context.Background(), detail.AttemptID)
+		if err != nil {
+			t.Fatalf("Get() error = %v", err)
+		}
+		if _, err := uow.Attempts().Save(context.Background(), a, rev); err != nil {
+			t.Fatalf("Save() error = %v", err)
+		}
+
+		if result, submitErr := tc.Controller.SubmitResult(context.Background(), defaultSubmitRequest(detail)); submitErr != nil || result.Kind != string(app.SubmissionAccepted) {
+			t.Fatalf("SubmitResult() = %+v, err %v; want accepted", result, submitErr)
+		}
+
+		if err := uow.Commit(); !errors.Is(err, app.ErrRevisionConflict) {
+			t.Fatalf("Commit() error = %v, want ErrRevisionConflict", err)
+		}
+		if got := tc.Store.Attempts[detail.AttemptID].value.State; got != run.AttemptSubmitted {
+			t.Fatalf("Attempt.State = %s; the atomic handoff was overwritten by the stale unit of work", got)
+		}
+	})
+
+	t.Run("an unserializable operation payload fails the whole commit", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		_, detail := startedRun(t, tc)
+		lease := tc.Store.Leases[detail.RunID].lease
+		transitionsBefore := len(tc.Store.Transitions)
+
+		uow, err := tc.Store.Begin(context.Background(), lease)
+		if err != nil {
+			t.Fatalf("Begin() error = %v", err)
+		}
+		opID, err := identity.ParseOperationID(tc.IDs.NewID())
+		if err != nil {
+			t.Fatalf("parse operation id: %v", err)
+		}
+		if err := uow.Operations().Create(context.Background(), app.Operation{
+			ID: opID, RunID: detail.RunID, Kind: app.OpCheckRun, State: app.OperationPending,
+			Intent: make(chan int), // not serializable
+		}); err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+		if err := uow.Transitions().Record(context.Background(), app.Transition{EntityKind: app.EntityRun, EntityID: detail.RunID.String()}); err != nil {
+			t.Fatalf("Record() error = %v", err)
+		}
+
+		if err := uow.Commit(); err == nil {
+			t.Fatalf("Commit() accepted an unserializable operation payload")
+		}
+		if _, exists := tc.Store.Operations[opID]; exists {
+			t.Fatalf("the unserializable operation reached the store")
+		}
+		if got := len(tc.Store.Transitions); got != transitionsBefore {
+			t.Fatalf("transitions length = %d after failed commit, want %d (atomic rejection)", got, transitionsBefore)
+		}
+	})
 }

@@ -19,27 +19,37 @@ import (
 // code must never rely on Go type identity for a persisted payload
 // (decodeOperationPayload is the one place that reads one back), and this
 // keeps the fakes exercising that same decode path rather than hiding it
-// behind an in-memory store that happens to keep the exact value.
-func jsonRoundtripOperation(op app.Operation) app.Operation { //nolint:gocritic // hugeParam: mirrors Operation's own shape; called once per commit in tests, never a hot loop.
-	op.Intent = jsonRoundtripAny(op.Intent)
-	op.ActEvidence = jsonRoundtripAny(op.ActEvidence)
-	op.Outcome = jsonRoundtripAny(op.Outcome)
-	return op
+// behind an in-memory store that happens to keep the exact value. A
+// payload that cannot serialize is a faithful persistence FAILURE: the
+// error propagates and the commit rejects atomically, exactly as a real
+// JSON column write would.
+func jsonRoundtripOperation(op app.Operation) (app.Operation, error) { //nolint:gocritic // hugeParam: mirrors Operation's own shape; called once per commit in tests, never a hot loop.
+	var err error
+	if op.Intent, err = jsonRoundtripAny(op.Intent); err != nil {
+		return app.Operation{}, fmt.Errorf("operation %s intent does not serialize: %w", op.ID, err)
+	}
+	if op.ActEvidence, err = jsonRoundtripAny(op.ActEvidence); err != nil {
+		return app.Operation{}, fmt.Errorf("operation %s act evidence does not serialize: %w", op.ID, err)
+	}
+	if op.Outcome, err = jsonRoundtripAny(op.Outcome); err != nil {
+		return app.Operation{}, fmt.Errorf("operation %s outcome does not serialize: %w", op.ID, err)
+	}
+	return op, nil
 }
 
-func jsonRoundtripAny(v any) any {
+func jsonRoundtripAny(v any) (any, error) {
 	if v == nil {
-		return nil
+		return nil, nil
 	}
 	raw, err := json.Marshal(v)
 	if err != nil {
-		return v
+		return nil, err
 	}
 	var decoded any
 	if err := json.Unmarshal(raw, &decoded); err != nil {
-		return v
+		return nil, err
 	}
-	return decoded
+	return decoded, nil
 }
 
 // currentBindingLocked returns sessionID's current (non-superseded)
@@ -120,6 +130,10 @@ type fakeUnitOfWork struct {
 
 	opCreated map[identity.OperationID]app.Operation
 	opSaved   map[identity.OperationID]app.Operation
+	// opRoundtripped holds the serializability-validated JSON round trips
+	// of every staged operation write, built during commit validation and
+	// merged during apply.
+	opRoundtripped map[identity.OperationID]app.Operation
 
 	checkRequestSaved map[identity.ResultID]app.CheckRequest
 
@@ -230,12 +244,7 @@ func (u *fakeUnitOfWork) Commit() error {
 		}
 		s.LaunchClaims[incarnation] = claim
 	}
-	for id, op := range u.opCreated { //nolint:gocritic // rangeValCopy: test fake; the domain snapshot is small and read-only here, and indexing would only obscure the loop.
-		s.Operations[id] = jsonRoundtripOperation(op)
-	}
-	for id, op := range u.opSaved { //nolint:gocritic // rangeValCopy: test fake; the domain snapshot is small and read-only here, and indexing would only obscure the loop.
-		s.Operations[id] = jsonRoundtripOperation(op)
-	}
+	maps.Copy(s.Operations, u.opRoundtripped)
 	maps.Copy(s.CheckRequests, u.checkRequestSaved)
 	s.Artifacts = append(s.Artifacts, u.artifactsSaved...)
 	s.Transitions = append(s.Transitions, u.transitions...)
@@ -309,6 +318,24 @@ func (u *fakeUnitOfWork) validateStagedLocked() error {
 		if claim.State != app.LaunchClaimExecPending && claim.State != settlement.State {
 			return fmt.Errorf("app_test: launch claim %s cannot settle from %s to %s", incarnation, claim.State, settlement.State)
 		}
+	}
+
+	// Serializability is validated before anything merges: a payload that
+	// does not survive the JSON round trip fails the whole commit.
+	u.opRoundtripped = map[identity.OperationID]app.Operation{}
+	for id, op := range u.opCreated { //nolint:gocritic // rangeValCopy: test fake; the staged journal is small and read once here.
+		roundtripped, err := jsonRoundtripOperation(op)
+		if err != nil {
+			return fmt.Errorf("app_test: %w", err)
+		}
+		u.opRoundtripped[id] = roundtripped
+	}
+	for id, op := range u.opSaved { //nolint:gocritic // rangeValCopy: test fake; the staged journal is small and read once here.
+		roundtripped, err := jsonRoundtripOperation(op)
+		if err != nil {
+			return fmt.Errorf("app_test: %w", err)
+		}
+		u.opRoundtripped[id] = roundtripped
 	}
 	return nil
 }

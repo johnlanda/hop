@@ -593,7 +593,11 @@ func (s *fakeStore) RequestStop(_ context.Context, runID identity.RunID) error {
 	if !ok {
 		return fmt.Errorf("%w: run %s", app.ErrNotFound, runID)
 	}
+	// The real store's single-row stop write moves the run's revision: a
+	// controller unit of work that staged the pre-stop run must conflict
+	// at commit instead of silently overwriting the stop flag.
 	row.value = row.value.RequestStop(s.clock.Now())
+	row.revision++
 	return nil
 }
 
@@ -642,10 +646,16 @@ func (s *fakeStore) SubmitResult(_ context.Context, submission app.ResultSubmiss
 	var outcome app.SubmissionOutcome
 	switch {
 	case err == nil:
+		// The acceptance transaction's entity transitions move the same
+		// row revisions the real store does, so a stale controller unit of
+		// work conflicts at commit rather than overwriting the handoff.
 		s.Results[submission.AttemptID] = outcomeVal.Result
 		rRow.value = outcomeVal.Run
+		rRow.revision++
 		tRow.value = outcomeVal.Task
+		tRow.revision++
 		aRow.value = outcomeVal.Attempt
+		aRow.revision++
 		s.CheckRequests[submission.ID] = app.CheckRequest{
 			ResultID: submission.ID, AttemptID: submission.AttemptID,
 			State: app.CheckRequestRequested, CreatedAt: now,
