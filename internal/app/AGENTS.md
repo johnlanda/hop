@@ -25,13 +25,13 @@ sides together. `cmd/hop` never imports domain or identity types: every
 | [store.go](store.go) | `StateStore`, `UnitOfWork`, `Lease`, `NewRunSpec`, `RunSnapshot`, `<Entity>Repository` (Runs, Tasks, Attempts, Sessions, Worktrees, Results, Artifacts, Bindings, LaunchClaims, CheckExecClaims, Operations, Transitions, CheckRequests), `Operation`, `OperationKind`/`OperationState`, `Transition`, `CheckRequest`, `CheckExecClaim`, `ErrRevisionConflict`, `ErrFenced`, `ErrNotFound`, `ErrLeaseHeld` | The controller's authority: lease lifecycle (`InitializeRun`, `AcquireLease`, `Heartbeat`, `ReleaseLease`, CAS-fenced) and fenced units of work over typed repositories; the operation journal's shapes. `OperationRepository.ByKind` lists a run's operations of one kind, newest first, for recovery evidence |
 | [readstore.go](readstore.go) | `ReadStore`, `RunStatus`, `RunDetail`, `CheckExecutionSummary`, `FrozenRun`, `LaunchContext`, `CheckExecutionContext` | Lease-free reads for `hop status` and both exec boundaries. `RunDetail` carries the identities stop and resume need, the frozen `StateRoot` for evidence capture, and `LastCheck` (the newest check execution's identity, state and retained evidence); `FrozenRun` is the check use case's frozen-input source; `LaunchContext` is resolvable from the run snapshot and the recorded launch intent alone, never from a binding that may not exist yet |
 | [submission.go](submission.go) | `SubmissionStore`, `LaunchClaim`, `LaunchClaimState`, `LaunchClaimSettlement`, `LaunchClaimRepository`, `ResultSubmission`, `SubmissionOutcome`, `SubmissionOutcomeKind`, `ClaimedSubmission`, `ClaimedSubmissionFieldLimit` | Worker-authority writes with no controller lease: launch/check-exec claims, `SubmitResult`'s atomic section 7 handoff, `RecordMalformed` for a submission that failed parsing before any typed identity existed, monotonic stop requests |
-| [runtime.go](runtime.go) | `Runtime`, `WorktreeRequest`/`WorktreeInfo`, `WorkerPaneRequest`, `PaneHandle`/`PaneRef`, `ProcessInfo`, `PaneProcess` | Herdr's pane and worktree surface: `CreateWorktree`, `OpenWorkerPane` (a `layout.apply` command pane), `FindPaneByLabel` recovery, `SendText` fallback, `ReadPane` evidence, `InspectPane` occupant identity, `ClosePane`, and `ServerInstance` — the opaque server-process identity behind the configured socket that the resume continuity check compares by equality |
+| [runtime.go](runtime.go) | `Runtime`, `ErrPaneNotFound`, `WorktreeRequest`/`WorktreeInfo`, `WorkerPaneRequest`, `PaneHandle`/`PaneRef`, `ProcessInfo`, `PaneProcess` | Herdr's pane and worktree surface: `CreateWorktree`, `OpenWorkerPane` (a `layout.apply` command pane), `FindPaneByLabel` recovery, `SendText` fallback, `ReadPane` evidence, `InspectPane` occupant identity (reporting the typed `ErrPaneNotFound` for a pane that positively does not exist — distinct from any inspection failure), `ClosePane`, and `ServerInstance` — the opaque identity scoped to both the configured socket and the server process behind it, compared by equality only |
 | [artifactstore.go](artifactstore.go) | `ArtifactStore` | Durable local file writes/reads under the run's artifact directories (assignment, pane scrollback, check stdout/stderr), temp-file-then-rename, never called from inside a `StateStore` transaction |
 | [system.go](system.go) | `Clock`, `IDGenerator` | Explicit time and identity generation |
 | [process.go](process.go) | `CommandRunner`, `Command`, `CommandResult`, `ProcessGroupInspector`, `GroupProcess` | Process-group-leader execution with cancellation (git operations, spawning `hop check-exec`) and local process-table listing/signaling for group retirement |
 | [configuration.go](configuration.go) | `ConfigurationSource`, `RunPolicy` | Loads and validates one repository's `.herdr-orchestrator/config.toml`-decoded policy: check contract, env strip/passthrough, profile dir, harness |
 | [digest.go](digest.go) | `ResultDigestTag`, `ComputeResultDigest` | The canonical `"hop-result-v1"` result digest: length-prefixed fields, SHA-256 hex, computed only here — the domain receives it as an opaque validated string |
-| [decision.go](decision.go) | `LaunchClaimDeadline`, `LaunchDeadlineExpired`, `LaunchSettlement`, `CorroborateSettlement`, `FirstMarkerMatch`, `OccupantMatches`, `ServerEvidence`, `ServerContinuityEstablished`, `GroupRetirementOutcome`, `ClassifyGroupRetirement`, `ArgvUnavailable` | The section 6 claim-corroboration predicate (claim-derived executable identity, durable marker set, explicit `hop launch` exclusion, fail-closed on missing identity), close-rule occupant matching, the server-continuity predicate, and the four-outcome process-group-retirement classifier matching both the frozen check argv and its check-exec invocation |
+| [decision.go](decision.go) | `LaunchClaimDeadline`, `LaunchDeadlineExpired`, `LaunchSettlement`, `CorroborateSettlement`, `FirstMarkerMatch`, `OccupantMatches`, `ServerContinuityEstablished`, `GroupRetirementOutcome`, `ClassifyGroupRetirement`, `ArgvUnavailable` | The section 6 claim-corroboration predicate (claim-derived executable identity, durable marker set, explicit `hop launch` exclusion, fail-closed on missing identity), close-rule occupant matching, the server-continuity predicate, and the four-outcome process-group-retirement classifier matching both the frozen check argv and its check-exec invocation |
 | [operation_payload.go](operation_payload.go) | `decodeOperationPayload` | Reads a persisted operation intent/evidence/outcome payload without relying on Go type identity: a value of the target type passes through, anything else round-trips through JSON. Callers still validate required fields and fail closed on a failed decode |
 | [controller.go](controller.go) | `Controller`, `RunHandle`, `Heartbeat`, `Detach`, `ErrStopRequested` | The driving service composition calls; ports as fields. `RunHandle` is an opaque per-run token (run identity, the held lease and a dispatch scope) so composition never touches identity types. `Heartbeat` extends the lease on the design's interval and cancels in-flight external calls on failure; `Detach` journals, cancels and releases without stopping; `revalidateForDispatch` is the section 4 step 2 revalidation every external mutation runs first |
 | [assignment.go](assignment.go) | `renderAssignment` | Deterministic assignment-artifact content: brief, identities and absolute paths only, referenced by the launch argv, never typed into a dialog |
@@ -118,22 +118,49 @@ sides together. `cmd/hop` never imports domain or identity types: every
   (`closePaneOperation`): the intent freezes the exact target evidence
   (pane, label, session/incarnation, pid, durable argv markers, reason)
   before any act; pane scrollback is captured through the `ArtifactStore`
-  before the close; the outcome commits only on OBSERVED absence and
-  supersedes the target's binding; recovery adopts an already-gone target,
-  re-acts exactly once against the same positively matched target, and
-  stays reconciling on mismatch. A dispatched close or group signal is
-  never itself termination: `DriveStop` reports stopped only once the
-  recorded worker and every check group are observed absent, and a
-  mismatched occupant or failed inspection is never absence.
+  before the close (a refused evidence commit aborts the close, and a
+  fresh revalidation runs immediately before the mutation, which
+  dispatches under the handle's cancelable act context); the outcome
+  commits only on OBSERVED absence and supersedes the target's binding.
+  Reuse of an unresolved close decodes and uses the PERSISTED target in
+  full — never a value derived from the current occupant — so a changed
+  pid under the same marker is never closed under an old row; recovery
+  adopts an already-gone target, re-acts exactly once against the same
+  positively matched target, and stays reconciling on mismatch. A
+  dispatched close or group signal is never itself termination:
+  `DriveStop` reports stopped only once the recorded worker (including a
+  worker recovered by label when no binding was ever committed; an
+  unobserved pre-claim launch window stays outstanding) and every check
+  group are observed absent.
+- Pane absence is one strict rule (`observePaneAbsence`): the pane must be
+  POSITIVELY absent by id (`ErrPaneNotFound`) AND by creation label, each
+  a successful observation. Any inspection or lookup error is ambiguous
+  with the error named, and an empty-foreground pane that still answers by
+  id or by label is never absence.
 - The group-retirement rule signals only a `GroupMatched` listing, matching
   both the frozen check argv and the `hop check-exec` invocation, and a
   signal failure is returned as reconciliation evidence, never discarded.
 - Resume entry is idempotent (a resuming run is not re-transitioned; a
-  terminal run is NothingToDo) and unknown run or attempt states fail
-  closed. Pending operations from prior generations are recovered per the
-  decision table before any reconciliation decision, with bounded waits
-  persisted as act evidence and enforced across rounds; nothing is ever
-  re-sent while an intent is unresolved.
+  terminal run is NothingToDo), unknown run or attempt states fail closed,
+  and a held stop request always routes back to stop handling
+  (`ResumeStopPending`) before any adoption or new dispatch — a stopping
+  run is never turned back toward running. Pending operations from prior
+  generations are recovered per the decision table before any
+  reconciliation decision, with bounded waits persisted as act evidence
+  and enforced across rounds; nothing is ever re-sent while an intent is
+  unresolved, and recovery returns a BLOCKING disposition — unknown
+  operation kinds, undecodable payloads, still-unresolved check
+  executions — that refuses startup continuation, retirement and every
+  cold-relaunch path while it stands. A positive-evidence retirement whose
+  close outcome committed durably finishes the cold recovery on a later
+  round even after its binding was superseded. Applying a settled claim's
+  lifecycle consequences is historical catch-up, never live adoption: the
+  occupant is verified under the predicate before any warm report, and an
+  exec_pending claim on a reconciling attempt settles under the same
+  inspected predicate. Startup continuation takes its repository root and
+  brief from `FrozenRun` and verifies (or recreates byte-identically,
+  failing closed on digest mismatch) the assignment artifact before any
+  worker is launched.
 - A worktree is adopted by provenance, never path existence: canonical
   absolute git common directories of the intended repository and the
   candidate must be EQUAL, and the candidate's HEAD must equal the base
@@ -155,22 +182,36 @@ sides together. `cmd/hop` never imports domain or identity types: every
 - `hop resume --confirm-absent` journals an `absence.attested` operation
   (both required assertions plus the recorded/observed server-continuity
   evidence) and authorizes cold relaunch only when
-  `ServerContinuityEstablished` holds — recorded and observed socket paths
-  equal, both instance strings non-empty and equal — with the pane already
-  observed absent; unknown continuity, inspection errors and a changed
+  `ServerContinuityEstablished` holds — both instance tokens non-empty and
+  equal; under the socket-scoped `ServerInstance` contract token equality
+  is the whole predicate — with the pane already positively absent by id
+  and by label; unknown continuity, inspection errors and a changed
   instance keep the run resuming with the item-2 report. The server
   instance is observed through `Runtime.ServerInstance` immediately before
-  pane creation and recorded in the creation binding.
+  pane creation, frozen into the pane.open intent (`server_instance`) and
+  recorded in the creation binding; recovery by label copies the
+  CREATION-time value from the intent, never a fresh observation, so
+  continuity across a restart cannot be fabricated. An undecodable pending
+  launch payload blocks retirement.
 - The check request is claimed atomically with its execution intent
   (carrying the result id and the pre-resolved candidate tree object id)
   and the lifecycle transitions; execution inputs come from `FrozenRun`,
   never the caller; the frozen timeout bounds the spawned command; a spawn
   error is ambiguous (reconciling), never an immediate unknown; and the
-  unknown-outcome rule runs only after a claimed group's confirmed absence
-  — repeatable requeues the request for a fresh execution from the same
-  checking attempt, unrepeatable settles it terminal with the execution
-  named in status. Check stdout/stderr are retained as result-linked
-  artifact rows before any cleanup.
+  unknown-outcome rule runs only after a claimed group's confirmed
+  absence, with stop precedence applied INSIDE its transaction (a held
+  stop settles the execution and request and interrupts task and attempt,
+  leaving the run to stop handling). Repeatable requeues the request for a
+  fresh execution from the same checking attempt; unrepeatable fails the
+  task and attempt and settles the request, but the run fails only after
+  its worker's termination has been observed. A stop-retired check settles
+  its request too. Check stdout/stderr are retained as result-linked
+  artifact rows on EVERY command result — an ambiguous spawn's partial
+  output included — and retention is mandatory: a retention failure fails
+  the execution rather than letting completion claim lost evidence, and
+  the checkout is cleaned up (with revalidation, under the act context)
+  only after retention and a recorded outcome. Status options for an
+  unknown outcome name only implemented actions.
 - `Session.Terminate` is invalid directly from `active` (a stop against a
   corroborated live process goes through `stopping` first); the shared
   `terminateSession` helper transitions through `Stop` first when needed
@@ -221,11 +262,15 @@ CLI surface needs are also separate (composition, task 6a).
   scenarios rely on, proven by `TestFakeStoreContracts`: commits validate
   everything before applying anything (revision recheck against the rows
   the transaction first read, strict lease expiry, binding-key uniqueness,
-  claim-settlement legality), `SubmitResult` applies existence/agreement
-  before receipts, `ClaimLaunch` enforces the stop/incarnation-currency/
-  different-pid rules with the pre-binding intent fallback, and
-  `ClaimCheckExec` requires a pending check operation of the current
-  generation.
+  claim-settlement legality, operation-payload serializability failing the
+  commit atomically), `SubmitResult` applies existence/agreement before
+  receipts and moves the same row revisions the real acceptance and stop
+  transactions do (`TestWorkerWritesMoveRevisions`), `ClaimLaunch`
+  enforces the stop/incarnation-currency/different-pid rules with the
+  pre-binding intent fallback, `ClaimCheckExec` requires a pending check
+  operation of the current generation, and every Runtime, CommandRunner,
+  ProcessGroupInspector and ArtifactStore fake refuses any call made while
+  a unit of work is open (`TestFakePortsRefuseCallsInsideTransactions`).
 - Named scenario coverage, by test:
   `TestLeaseFencing` (takeover barrier with staged writes discarded,
   heartbeat/release CAS refusals, monotonic generations) and
