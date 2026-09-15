@@ -99,10 +99,9 @@ func TestStoreOpenDiagnosticsNeverEchoTheRoot(t *testing.T) {
 // resolved on the controller's own PATH: a fixed, value-free diagnostic
 // naming neither the PATH value nor the state root. This drives
 // openController directly rather than through a command: every command
-// that reaches it re-describes ANY openController failure through
-// describeStoreOpenFailure's store-open classification (unrelated,
-// pre-existing behavior this change does not touch), which would obscure
-// the exact message asserted here.
+// that reaches it re-describes an openController failure through
+// describeStoreOpenFailure's store-open classification, which would
+// obscure the exact message asserted here.
 func TestOpenControllerGitExecutableNotFound(t *testing.T) {
 	t.Setenv("PATH", t.TempDir()) // a directory that contains no executables at all
 	_, _, err := openController(t.Context(), controllerConfig{stateRoot: t.TempDir()})

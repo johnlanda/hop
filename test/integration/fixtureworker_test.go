@@ -69,6 +69,13 @@ import (
 // so the second incarnation cannot re-exec forever.
 const reexecMarkerEnv = "HOP_FIXTURE_REEXEC_DONE"
 
+// fixtureRetryInterval is this worker's own back-off between hop result
+// submit retries, mandated by the section 7 transient protocol the launch
+// prompt itself states ("wait briefly and run the exact same command
+// again") — worker behavior this fixture reproduces, never a test-side
+// wait.
+const fixtureRetryInterval = 200 * time.Millisecond
+
 func main() {
 	if os.Getenv(reexecMarkerEnv) != "" {
 		fmt.Printf("FIXTURE-REEXECED pid=[%d]\n", os.Getpid())
@@ -313,7 +320,7 @@ func submitOnce(hopPath, oid, summary string) {
 		first, _, _ := strings.Cut(out.String(), "\n")
 		fmt.Printf("FIXTURE-SUBMIT-RESULT err=[%v] first-line=[%s]\n", runErr, first)
 		if strings.HasPrefix(first, "transient") && time.Now().Before(deadline) {
-			time.Sleep(200 * time.Millisecond)
+			time.Sleep(fixtureRetryInterval)
 			continue
 		}
 		return

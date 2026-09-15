@@ -92,17 +92,15 @@ func buildForkingWrapper(t *testing.T, artifacts *artifactDir) string {
 }
 
 // TestRealProcessForkingWrapperAfterExec proves design section 6's
-// forking-wrapper fail-closed rule against a real, confirmed disposition
-// (established by a bounded probe before this assertion-based form was
-// written): forkingWrapperSource is installed as the "claude" stub, execs
-// preserving the launch claim's pid, then forks the real fixture worker as
-// a child carrying the identical argv and its own argv[0] forced to the
-// wrapper's own invocation name. Herdr's pane.process_info reports the
-// CHILD as foreground[0] — a different pid than the claim, despite
-// matching executable identity and marker — which is exactly the
-// executable-identity-and-marker-match-but-pid-differs shape
-// CorroborateSettlement classifies SettlementForkingWrapper: the claim
-// never settles, and CorroborateLaunch reports LaunchNeedsInteraction.
+// forking-wrapper fail-closed rule: forkingWrapperSource is installed as
+// the "claude" stub, execs preserving the launch claim's pid, then forks
+// the real fixture worker as a child carrying the identical argv and its
+// own argv[0] forced to the wrapper's own invocation name. Herdr's
+// pane.process_info reports the CHILD as foreground[0] — a different pid
+// than the claim, despite matching executable identity and marker — which
+// is exactly the executable-identity-and-marker-match-but-pid-differs
+// shape CorroborateSettlement classifies SettlementForkingWrapper: the
+// claim never settles, and CorroborateLaunch reports LaunchNeedsInteraction.
 func TestRealProcessForkingWrapperAfterExec(t *testing.T) {
 	artifacts := newArtifactDir(t)
 	server := prepareServer(t, artifacts)

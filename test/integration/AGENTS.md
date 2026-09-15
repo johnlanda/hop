@@ -31,14 +31,14 @@ this tree, and drives everything through HOP's own protocol client.
 | [spike_markers_test.go](spike_markers_test.go) | `TestSpikeCreationMarkerTabLabel` | S7: a `tab.create` creation-time `label` round-trips through `tab.list` and `session.snapshot`, letting a crashed controller recover its own tab and root pane by a unique marker without the create response; the additive env is never a snapshot field |
 | [hopcmd_test.go](hopcmd_test.go) | `TestMain`, `buildHopBinary`, `hopResult`, `runHop`, `requireHopCommand`, `hopEnviron`, `startHopController`, `groupMember`, `listGroupMembers`, `parseGroupMember`, `TestBuildAndRunHopBinary`, `TestHopEnviron`, `TestStartHopController`, `TestListGroupMembers` | Task 6b harness extensions (phase A, item 4): `TestMain` + `buildHopBinary` build `./cmd/hop` once per test binary run into a shared temp dir instead of per test; `runHop` runs a bounded one-shot hop subcommand capturing stdout/stderr/exit code, and `requireHopCommand` skips a scenario with a clear reason when its command is cmd/hop's "unknown command" response (task 6a not yet landed/merged); `hopEnviron` builds the isolated `HOP_STATE_DIR` + this disposable server's own socket/binary path on top of the suite's hermetic base; `startHopController` starts a long-running hop subcommand (`hop run`/`hop resume`) as its own anchored, logged process group via `startAnchoredLeader`, returned as a `serverProcess` so existing group helpers apply unchanged; `listGroupMembers`/`parseGroupMember` independently list an arbitrary process group's members via `ps` — deliberately NOT importing `internal/adapters/process` (disallowed by the architecture checker for this package), so a scenario proving group retirement is evidence against the OS process table, not an echo of the port under test |
 | [fixturerepo_test.go](fixturerepo_test.go) | `fixtureRepo`, `newFixtureRepo`, `newFixtureRepoGitDependentCheck`, `newFixtureRepoWithSubmodule`, `initFixtureRepo`, `CommitCheckResult`, `fixtureConfigTOML`, `fixtureGitEnviron`, `runShellScript`, `TestFixtureRepoDeterministicCheck`, `TestFixtureRepoGitDependentCheck`, `TestFixtureRepoSubmoduleFailsClearly` | Task 6b fixture repository builder (phase A, item 2): a temporary SHA-1 git repository (`git init --object-format=sha1`, isolated from any developer git config, its own local commit identity) with a trivial source file, the deterministic `check.sh` (`CommitCheckResult` toggles CHECK_RESULT and commits, so the caller picks pass/fail "on demand" by choosing which commit it submits), the git-dependent `check-git.sh` variant (`newFixtureRepoGitDependentCheck`, succeeds only inside a real git checkout), and the submodule variant (`newFixtureRepoWithSubmodule`) whose `check-submodule.sh` fails clearly against a detached `git worktree add` checkout that never initializes submodules |
-| [fixtureworker_test.go](fixtureworker_test.go) | `fixtureWorkerSource`, `fixtureWorkerBrief`, `buildFixtureWorker`, `testAssignmentPrompt`, `writeTransientOnceHopStub`, `isResumeInvocation`, `TestFixtureWorkerSubmitValid`, `TestFixtureWorkerExitWithoutSubmitting` | Task 6b fixture worker (phase A, item 3): a Go program built (never installed) and installed under the recognized name `claude` so `hop launch`'s PATH resolution finds it; reads required `HOP_*` env, locates and reads the assignment artifact (computed from `HOP_STATE_DIR`/`HOP_RUN_ID`, cross-validated against a best-effort marker parsed from its own prompt argv), and dispatches on a `FIXTURE-BEHAVIOR: <name>` directive delivered through the brief -> assignment.md channel (`fixtureWorkerBrief` renders it): `submit-valid`, `submit-stale` (gated on a `FIXTURE-GO` line on stdin, for a test to retire the incarnation first), `submit-twice`, `exit-without-submitting`, `exec-keep-pid` (`syscall.Exec` of itself, proving pid survives exec); every behavior writes an atomic `worker-observed.txt` dump beside the assignment file rather than judging its own correctness, and retries `hop result submit` on a `transient` first line. A cold-relaunch invocation (`--resume <native-ref>`, no prompt argv at all) is detected by `isResumeInvocation` and recovers the hop path from a `.hop-path` sibling file the first launch persisted, rather than parsing a prompt that does not exist (phase B: TestRealProcessConfirmAbsentColdRelaunchNonRestart's discovery) |
+| [fixtureworker_test.go](fixtureworker_test.go) | `fixtureWorkerSource`, `fixtureWorkerBrief`, `buildFixtureWorker`, `testAssignmentPrompt`, `writeTransientOnceHopStub`, `isResumeInvocation`, `TestFixtureWorkerSubmitValid`, `TestFixtureWorkerExitWithoutSubmitting` | Task 6b fixture worker (phase A, item 3): a Go program built (never installed) and installed under the recognized name `claude` so `hop launch`'s PATH resolution finds it; reads required `HOP_*` env, locates and reads the assignment artifact (computed from `HOP_STATE_DIR`/`HOP_RUN_ID`, cross-validated against a best-effort marker parsed from its own prompt argv), and dispatches on a `FIXTURE-BEHAVIOR: <name>` directive delivered through the brief -> assignment.md channel (`fixtureWorkerBrief` renders it): `submit-valid`, `submit-stale` (gated on a `FIXTURE-GO` line on stdin, for a test to retire the incarnation first), `submit-twice`, `exit-without-submitting`, `exec-keep-pid` (`syscall.Exec` of itself, proving pid survives exec); every behavior writes an atomic `worker-observed.txt` dump beside the assignment file rather than judging its own correctness, and retries `hop result submit` on a `transient` first line, pausing `fixtureRetryInterval` (200ms) between attempts — the worker's own back-off under the section 7 transient protocol the launch prompt states, never a test-side wait. A cold-relaunch invocation (`--resume <native-ref>`, no prompt argv at all) is detected by `isResumeInvocation` and recovers the hop path from a `.hop-path` sibling file the first launch persisted, rather than parsing a prompt that does not exist |
 | [resultsubmit_test.go](resultsubmit_test.go) | `fixtureRun`, `newFixtureRunEnv`, `startRun`, `startFixtureRun`, `dbPath`, `taskAndAttemptIDs`, `currentIncarnationID`, `requireRunState`, `containsState`, `TestRealProcessDuplicateSubmissionAfterCompletion` | Phase B's shared setup: `newFixtureRunEnv` builds and starts a disposable server plus the fixture worker installed as `claude`; `startRun` runs `hop run` against a caller-built (and possibly pre-mutated) fixture repository through the `started` line; `startFixtureRun` composes both for the common case. `fixtureRun` tracks the live controller (`controller`/`controllerName`, reassigned together by any scenario that kills and replaces it) plus `dbPath`/`taskAndAttemptIDs`/`currentIncarnationID` helpers for direct `hop result submit`/sqlite assertions, and `requireRunState` (bounded to `runEndToEndTimeout`) fails with the worker pane's scrollback captured first. `TestRealProcessDuplicateSubmissionAfterCompletion` proves section 7 step 3: a fresh submission carrying the already-accepted commit and summary is accepted as `duplicate`, disturbing nothing |
 | [lifecycle_test.go](lifecycle_test.go) | `leaseTimeLayout`, `killControllerLeader`, `waitForLeaseExpiry`, `TestRealProcessDetachDistinctFromStop` | `killControllerLeader` SIGKILLs a controller's leader without touching its anchor; `waitForLeaseExpiry` polls a run's own `run_leases` row (mirroring `internal/adapters/sqlite`'s unexported time layout, since this package may not import that adapter) until it is no longer held past its recorded expiry — the real, unavoidable cost every crash-recovery scenario in this package pays. `TestRealProcessDetachDistinctFromStop` proves a SIGINT to a live controller releases the lease at once (never waiting out the TTL) and disturbs neither run state nor the worker |
 | [check_test.go](check_test.go) | `statusDetailValues`, `TestRealProcessFailedCheckRetainsArtifacts`, `TestRealProcessGitDependentCheckSucceedsInDetachedCheckout`, `TestRealProcessSubmoduleRepositoryFailsClearly` | `statusDetailValues` scrapes every occurrence of a repeated `hop status -run` line (`artifact:`/`evidence:`), since `parseStatusDetail`'s flat map keeps only the last. The three scenarios: a deterministic failing check ends the run `failed` with both stdout/stderr retained at their rendered paths; `newFixtureRepoGitDependentCheck`'s check-git.sh passes inside the real detached-checkout candidate isolation; `newFixtureRepoWithSubmodule`'s submodule reference is rejected by `internal/app`'s own gitlink scan BEFORE any checkout or check argv ever runs (no evidence retained — check-submodule.sh never executes) |
 | [stop_test.go](stop_test.go) | `slowCheckScriptName`/`slowCheckScriptSource`, `withSlowCheck`, `TestRealProcessStopWithTerminationObserved`, `TestRealProcessStopInterruptsRunningCheckGroup` | `withSlowCheck` rewires a fixture repository's `[check]` command to a `sleep 20` script and commits it, giving a scenario a check execution long-lived enough to interrupt mid-flight (confirmed via a durable `check_exec_claims` row, no race). The two scenarios drive `hop stop` from a separate one-shot process (observing, since the live controller holds the lease and drives the stop itself): a plain running worker terminates cleanly to `stopped` with the worktree preserved; a running check group is interrupted by the loop's own context cancellation (CommandRunner kills the group), which DriveStop's retry then settles as an *unknown* outcome (not a distinct "interrupted" one — an empty group alone cannot distinguish "killed a moment ago" from any other cause), while task/attempt still move to `interrupted` and the run reaches `stopped` |
 | [launch_test.go](launch_test.go) | `TestRealProcessDuplicateLaunchInvocation` | Design section 6's duplicate-launcher rule: caught while the attempt is still `launching`/`relaunching` (`PrepareLaunchExec` refuses on attempt state before it ever reaches the claim's pid check, so this is the only window the different-pid refusal is observable in), a second `hop launch` invocation for the same incarnation — a different pid by construction — is rejected, the claim is unchanged, and the original launch settles normally afterward |
 | [execfailure_test.go](execfailure_test.go) | `installBrokenClaudeStub`, `TestRealProcessExecFailureSettlesExecFailed` | A deterministic (non-racy) exec failure: the resolved `claude` stub is a plain executable-bit-set text file with no shebang, which still passes `PrepareLaunchExec`'s regular-file check (so the claim is written) but fails the kernel's `execve` (ENOEXEC). The claim settles `exec_failed`, attempt/task/run all fail immediately (unrecoverable on a first launch, never a detour through `running`), and a `hop stop` against the already-failed run is a clean no-op reporting the run's real state |
-| [forkingwrapper_test.go](forkingwrapper_test.go) | `forkingWrapperSource`, `buildForkingWrapper`, `TestRealProcessForkingWrapperAfterExec` | The "wrapper forks the real harness after exec" fail-closed topology (design section 6), confirmed empirically before being written as assertions: a wrapper execs preserving the launch claim's pid, forks the real fixture worker as a child sharing its own argv with `argv[0]` forced to the wrapper's own invocation name (a bare `select {}` here trips Go's own deadlock detector — the wrapper waits on the child instead), then Herdr's `pane.process_info` reports that CHILD as `foreground[0]` — a different pid than the claim despite matching executable identity and marker. `CorroborateSettlement` classifies this `SettlementForkingWrapper`: the claim stays `exec_pending`, and the controller reports "needs interaction" |
+| [forkingwrapper_test.go](forkingwrapper_test.go) | `forkingWrapperSource`, `buildForkingWrapper`, `TestRealProcessForkingWrapperAfterExec` | The "wrapper forks the real harness after exec" fail-closed topology (design section 6): a wrapper execs preserving the launch claim's pid, forks the real fixture worker as a child sharing its own argv with `argv[0]` forced to the wrapper's own invocation name (a bare `select {}` here trips Go's own deadlock detector — the wrapper waits on the child instead), then Herdr's `pane.process_info` reports that CHILD as `foreground[0]` — a different pid than the claim despite matching executable identity and marker. `CorroborateSettlement` classifies this `SettlementForkingWrapper`: the claim stays `exec_pending`, and the controller reports "needs interaction" |
 | [checkdeath_test.go](checkdeath_test.go) | `leaderExitCheckScriptName`/`Source`, `configWithTimeout`, `TestRealProcessCheckLeaderExitWithLiveChildren`, `TestRealProcessCheckDeathUnknownOutcomeRepeatable` | `configWithTimeout` renders a `[check]` config with an explicit timeout/`repeatable` (unlike `fixtureConfigTOML`'s fixed 30s/false). "Leader exit with live children": a check backgrounds a child and exits, so its stdout/stderr pipes never see EOF on their own — `CommandRunner`'s capture hangs until the (short, here) timeout force-kills the whole group, landing the operation `reconciling` with the timeout-driven cancellation named as evidence (the exact further auto-resolution latency to a settled outcome is not pinned here — a live controller's own recovery cadence for an already-reconciling operation was not established as fast/bounded within a reasonable test iteration). "Unknown outcome, repeatable": getting a genuinely unknown (not a definite failure) outcome needs the check's process group gone with **no live watcher** having captured what happened — directly `SIGKILL`ing a check under a live controller instead produces a definite `exit(-1)` failure — so the whole controller is crash-killed leaving an ordinary fast-passing check running unwatched; `hop resume` finds the group naturally empty with nothing recorded, settles it unknown, and (`check.repeatable=true`) requeues it automatically to a normal completion |
 | [resume_test.go](resume_test.go) | `TestRealProcessControllerKillResumeWarmReattach`, `coldRelaunchAfterCrash`, `TestRealProcessConfirmAbsentColdRelaunchNonRestart`, `TestRealProcessStaleSubmissionFromRetiredIncarnation`, `TestRealProcessConfirmAbsentRefusedAfterServerRestart` | Design section 5's resume cases against real hard kills. Warm reattach: only the controller dies (worker/pane untouched); once the lease expires, `hop resume` reattaches to the same live occupant (same pid, same incarnation, no new session). `coldRelaunchAfterCrash` additionally SIGKILLs the worker itself (its no-shell command pane closes itself, S6, giving both required absence conjuncts) before killing the controller, then drives `hop resume --confirm-absent` to a cold relaunch — shared by the non-restart-litmus-test and stale-submission scenarios. `TestRealProcessConfirmAbsentRefusedAfterServerRestart` repeats the identical crash but restarts the herdr server first: continuity breaks, the attestation is still journaled, and the relaunch is refused |
 | [livehop_test.go](livehop_test.go) | `requireLiveHarness`, `installRealClaudeStub`, `liveTranscriptExists`, `TestLiveClaudeDefaultProfileRun` | Design section 9's one opt-in live scenario: real Claude Code (symlinked, not copied, as the `claude` stub) driven through the real `hop run`/`hop launch` pipeline in the operator's own default profile, with one small brief to a passing check, then a forced cold relaunch (`claude --resume <preassigned-uuid>`) continuation. See "Live scenario" below |
@@ -116,15 +116,61 @@ scenario asserts the receipt-history invariant both orderings satisfy
 rather than forcing one — and deterministically by `cmd/hop`'s own
 `result submit` tests and the sqlite store's submission tests.
 
-Every design section 9 real-process row this task could express against
-the unmodified `hop` binary and current landed code is a scenario listed
-above. The following were evaluated and are **not expressible** without
-either a pause/injection hook added to production code (out of scope for
-this task; never added) or hand-seeded store state bypassing the real
-protocol (which would stop proving anything about the real binary) —
-their dispositions are already covered by `internal/app`'s own
-decision-table unit tests (`decision_test.go`, `usecase_launch_test.go`,
-`usecase_execboundary_test.go`):
+Design section 9's real-process row is organized here into three groups:
+scenarios this task expresses and lands, scenarios judged expressible but
+not attempted in this task's timeframe, and scenarios judged not
+expressible against the unmodified `hop` binary without a pause/injection
+hook added to production code (out of scope for this task; never added).
+The not-expressible group's dispositions are already covered by
+`internal/app`'s own decision-table unit tests (`decision_test.go`,
+`usecase_launch_test.go`, `usecase_execboundary_test.go`).
+
+### Covered
+
+Every real-process scenario in the quick-reference table above: the
+CI-safe end-to-end run and sanitized-exec assertions; duplicate submission
+after completion; the transient early-submission path (both legitimate
+orderings, see above); stale submission from a retired incarnation;
+duplicate `hop launch` invocation; the deterministic (unsuppressed)
+exec-failure case; the wrapper-forks-the-real-harness-after-exec
+fail-closed topology (`TestRealProcessForkingWrapperAfterExec` — Herdr
+reports the forked child as `foreground[0]`, a different pid than the
+claim despite matching identity and marker, and the claim fails closed
+exactly as designed); stop with termination observed (a plain worker, and
+a running check group); controller kill + resume warm reattach;
+confirm-absent cold relaunch (non-restart case) and its refusal after a
+real server restart; detach distinct from stop; the
+failed-check/git-dependent-check/submodule-repository check-pipeline
+scenarios; check-death's leader-exit-with-live-children and
+`check.repeatable`'s two-outcome contract; and the opt-in live-claude
+scenario (compiles, skips cleanly by default, never run by this task).
+
+### Expressible, but deferred (no production hook or race needed)
+
+- **Server-restart positive-evidence retirement of an auto-relaunched
+  occupant, the phantom-snapshot case, and the fail-closed
+  same-kind-replacement case**: `spike_restore_test.go`'s S3 probe
+  (`TestSpikeRestoreAutoRelaunchBypassesLauncher`) already proves Herdr's
+  own auto-relaunch mechanism fires against a generically-named `claude`
+  process, and `resume_test.go`'s `coldRelaunchAfterCrash` /
+  `TestRealProcessConfirmAbsentRefusedAfterServerRestart` already compose
+  `server.restart` with a crash-killed worker and controller cleanly. The
+  missing piece is driving a real run through the auto-relaunch path
+  itself (kill only the worker's OS process while leaving its recorded
+  native session ref in place, so Herdr's own restore fires on server
+  restart) rather than constructing the restored occupant by hand as the
+  spike does — genuine additional engineering, not attempted in this
+  task's timeframe.
+- **A check-exec claim-write failure refusing to run**: expressible by
+  holding an exclusive transaction against the run's own sqlite database
+  from a second connection (`BEGIN EXCLUSIVE` via the `sqlite3` CLI, the
+  same tool `querySQLite` already shells out to) for the whole window
+  `hop check-exec` attempts `ClaimCheckExec` — no process-timing race
+  involved, since the lock can be held for the entire invocation rather
+  than landing inside a sub-millisecond window. Not attempted in this
+  task's timeframe.
+
+### Not expressible without a production pause/injection hook
 
 - **Launcher killed after the claim write, before exec** (design section
   6): the window between `PrepareLaunchExec`'s claim write and the
@@ -139,6 +185,16 @@ decision-table unit tests (`decision_test.go`, `usecase_launch_test.go`,
 - **Paused pre-exec launcher argv exclusion**: requires catching the
   launcher's own argv as the pane's foreground process before it execs —
   the identical race as the first case above.
+- **Stop against a pre-exec launch claim specifically**: same root cause
+  as the first case — reliably catching (and holding) the attempt in
+  `launching` with an *unsettled* claim before issuing `hop stop` needs
+  the same pause hook.
+- **Check death after spawn, before the claim write**: the same class of
+  sub-millisecond internal race as the first case, one boundary over (the
+  window between `hop check-exec` starting and `ClaimCheckExec`'s write
+  landing) — unlike the claim-write-*failure* case above (an externally
+  held lock, no race), this needs the actual write to never happen at
+  all, which only a timing race against the process itself could produce.
 - **The fallback-transport shell-fork pid case, and the send-text
   fallback as its own scenario**: `internal/app` never calls
   `Runtime.SendText` anywhere — `hop run`'s launch flow only ever uses the
@@ -148,31 +204,6 @@ decision-table unit tests (`decision_test.go`, `usecase_launch_test.go`,
   adapter method (`internal/adapters/herdr`'s own tests, and the S1 probe,
   `spike_launch_test.go`) — there is simply nothing in `hop run`'s own
   behavior today to drive it through.
-- **Stop against a pre-exec launch claim specifically**: same root cause
-  as the first case — reliably catching (and holding) the attempt in
-  `launching` with an *unsettled* claim before issuing `hop stop` needs
-  the same pause hook.
-- **Server-restart positive-evidence retirement of an auto-relaunched
-  occupant, the phantom-snapshot case, and the fail-closed
-  same-kind-replacement case**: not fundamentally blocked (S3's spike,
-  `spike_restore_test.go`, already proves Herdr's own auto-relaunch
-  mechanism against a generically-named `claude` process) but not
-  attempted in this task's timeframe — a genuine scope/time tradeoff, not
-  an infeasibility finding, flagged in the handoff for whoever picks up
-  task 6b next if it matters.
-- **Check death before the claim write, and a claim-write failure
-  refusing to run**: both need either the same class of pause hook (to
-  land a kill in the process-spawn-to-claim-write window) or externally
-  holding an exclusive sqlite lock against the run's own database from a
-  second connection — feasible in principle but not attempted within the
-  one-iteration time-box this family of scenarios was given; the
-  reliable, fast parts of the check-death family that ARE expressible
-  (leader exit with live children, and check.repeatable's two-outcome
-  contract) are covered by `checkdeath_test.go`.
-- **Wrapper forks the real harness after exec**: expressible, and
-  covered — `TestRealProcessForkingWrapperAfterExec` confirms Herdr
-  reports the forked child as `foreground[0]` and the claim fails closed
-  exactly as designed.
 
 ## Dependencies and ports
 

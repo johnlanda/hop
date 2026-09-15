@@ -115,11 +115,11 @@ func TestRealProcessRunEndToEnd(t *testing.T) {
 		}
 	}
 
-	// Pin what the S2 spike never did: the launched pane's foreground
-	// process, observed independently through pane.process_info (not
-	// through the worker's own self-report), carries the resolved fixture
-	// stub path verbatim in argv[0] and — on macOS — the basename in argv0
-	// (Herdr's process_argv0_name; Linux never reports argv0 at all).
+	// The launched pane's foreground process, observed independently
+	// through pane.process_info (not through the worker's own
+	// self-report), carries the resolved fixture stub path verbatim in
+	// argv[0] and — on macOS — the basename in argv0 (Herdr's
+	// process_argv0_name; Linux never reports argv0 at all).
 	wantExecutable := filepath.Join(server.base, "bin", "claude")
 	info := server.processInfo(t, paneIDFromBinding(fields["binding"]))
 	if len(info.ForegroundProcesses) == 0 {
