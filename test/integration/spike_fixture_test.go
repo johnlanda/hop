@@ -556,7 +556,7 @@ func (s *testServer) agentRecords(t *testing.T) map[string]spikeAgentRecord {
 
 // waitForAgent polls agent.list until the pane appears with the wanted agent
 // label and returns the record; it fails on timeout with the last state.
-func (s *testServer) waitForAgent(t *testing.T, paneID, agent string) spikeAgentRecord {
+func (s *testServer) waitForAgent(t *testing.T, paneID, agent string) spikeAgentRecord { //nolint:unparam // agent: every current caller detects the fixture's "claude" name; kept as a parameter since it is the general agent-detection wait, not a claude-specific one.
 	t.Helper()
 	var last map[string]spikeAgentRecord
 	found := waitUntil(func() bool {

@@ -266,8 +266,7 @@ Two new methods (and the `SendText` deletion above):
 // itself (WorkspaceInfo.label — source-confirmed on 0.9.0), NOT the root
 // pane, unlike layout.apply/tab.create labels. Used only for the
 // manager's placement; worker and reviewer placement continues to come
-// from worktree.create's returned workspace. Shapes pending S8 executed
-// evidence.
+// from worktree.create's returned workspace. Shapes S8-confirmed.
 CreateWorkspace(ctx context.Context, req WorkspaceRequest) (WorkspaceHandle, error)
 
 // FindWorkspaceByLabel is the workspace.create decision row's recovery
@@ -276,7 +275,7 @@ CreateWorkspace(ctx context.Context, req WorkspaceRequest) (WorkspaceHandle, err
 // pane to recover the root-pane identity — a fresh recovered workspace
 // has exactly one of each, and more than one of either is an error, not
 // a guess. Zero matches is (zero, false, nil); two or more workspaces
-// with the label is an error. Pending S8 executed evidence.
+// with the label is an error. S8-confirmed.
 FindWorkspaceByLabel(ctx context.Context, label string) (WorkspaceRef, bool, error)
 ```
 
@@ -451,7 +450,7 @@ New operation kinds and their decision-table rows (Phase 2 rows unchanged):
 
 | Operation | Crash between intent and act | Crash between act and outcome | Takeover with the intent unresolved |
 | --- | --- | --- | --- |
-| `workspace.create` (manager placement) | Adoption by unique creation label — a WORKSPACE attribute on 0.9.0 (source-confirmed; executed round-trip pending S8), so recovery resolves the labeled workspace and then its sole tab and sole root pane (more than one of either fails closed); label absent → bounded wait for the in-flight request, then `reconciling`; never a second create | same | same |
+| `workspace.create` (manager placement) | Adoption by unique creation label — a WORKSPACE attribute on 0.9.0 (S8-confirmed by executed round-trip), so recovery resolves the labeled workspace and then its sole tab and sole root pane (more than one of either fails closed); label absent → bounded wait for the in-flight request, then `reconciling`; never a second create | same | same |
 | `integration.merge` (scratch merge; never touches the ref) | One merge EXECUTION per operation, with the operation ID fixing all three identities immutably: the exec claim (one row, one pid, never re-armed or overwritten), the frozen merge argv, and the private tree path `runs/<run-uuid>/integrations/<operation-uuid>/tree`. The act is two recorded steps: (i) MATERIALIZE — `git worktree add --detach <tree> <premerge-oid>` run to OBSERVED completion under `CommandRunner`, then verify the new tree's HEAD equals the recorded pre-merge head and record the materialization-complete evidence (path + verified HEAD) in act evidence. Adoption of a materialized directory requires that recorded completion evidence, NEVER a HEAD observation alone: `git worktree add` writes HEAD before it finishes populating the checkout and index, and a preparer surviving a dead controller can still be writing a directory whose HEAD already reads correctly — so a recovery that finds the directory without the completion evidence settles the operation failed and allocates a FRESH operation and directory (the ambiguous directory is abandoned, never entered, its possible surviving preparer confined to it, and it is removed only after settlement plus the ordinary retirement checks); (ii) SPAWN the merge through the generalized exec boundary — `hop check-exec --op <operation-uuid> -- git … merge …` (section 8 fixes the argv) — so a durable pre-exec claim (own pid = group id) exists exactly as for checks, and a Git child surviving a dead controller is retired by the group-retirement rule (argv-matched listing, never a blind signal). A conflict exits non-zero and leaves the tree; no `merge --abort` is ever needed because an operation's tree is never reused. Recovery: no claim after step (ii) dispatched → ambiguous, bounded wait then reconciling (never absence); claim present → retire the group FIRST, settle this operation with the retirement evidence (the old claim row is retained forever as history), THEN read the scratch HEAD — parents exactly {pre-merge head, source} → adopt M; the up-to-date no-op outcome (section 8) → adopt as no-op; anything else → the operation settles failed and any re-act is a NEW `integration.merge` operation under the same integration row, with its own fresh operation ID, claim, argv record, tree path and the takeover's current generation — allocated only AFTER the old operation is settled; the abandoned directory is never adopted and is removed only after settlement | same | same; an unresolved merge blocks further integration (the serial index already prevents a second one) |
 | `integration.publish` | The act is `git update-ref refs/heads/hop/r<seq>/integration <M> <expected-head>` — a compare-and-swap on the expected old value, executed directly by the controller. The CAS alone does NOT fence stop or takeover when the head has not moved — a paused controller's publish dispatched after a stop request would still match its expected-old — so the publish carries three explicit layers: (i) PRE-ACT, the Phase 2 revalidation (heartbeat CAS + stop re-read) runs immediately before the `update-ref` dispatch specifically, not merely before the operation; (ii) POST-ACT, the outcome transaction is lease-fenced and re-reads stop — a landed publish can never settle `checking` past either, and a refused outcome routes the published candidate to the stop/rollback path (the reconciliation rule for the pause window); (iii) EXTERNALLY, stop, takeover and terminal-failure settlement retire any unresolved ref-move intent by moving the ref first (the fencing rule below), so a zombie CAS dispatched after that retirement fails at the ref store. Recovery: ref == M → adopt; ref == expected head → re-act (retry-idempotent); any other value → `reconciling` with the observed ref as evidence | same | same, via the fencing rule |
 | `integration.reset` (combined-check failure rollback, section 8; also the stop path's retirement of a published-but-unsettled candidate) | The act is two steps with the identity persisted BETWEEN them: (i) create the ROLLBACK COMMIT R (`git commit-tree <premerge>^{tree} -p <M>` — R carries the pre-merge content and keeps the rejected M reachable as its parent) and record R's object ID in `act_evidence` — a plain store write — BEFORE any ref move; (ii) `git update-ref … <R> <M>`. Recovery is decidable in every window: R recorded and ref == R → adopt; R recorded and ref == M → re-act step (ii) only (idempotent CAS); no R recorded and ref == M → re-act from step (i) (a prior orphaned commit-tree object is unreferenced and harmless); anything else → `reconciling` | same | same |
@@ -899,8 +898,8 @@ that commit with a create-only compare-and-swap
 empty expected-old value makes a second creation fail instead of moving
 an existing ref).
 
-Worktree base honesty (source-confirmed on 0.9.0, executed evidence
-pending S9): `worktree.create` honors `--base <oid>` ONLY when the branch
+Worktree base honesty (S9-confirmed by executed evidence): `worktree.create`
+honors `--base <oid>` ONLY when the branch
 is new — an existing branch is checked out at its current tip and the
 base is silently ignored. Branch-name uniqueness per attempt is therefore
 a hard invariant, held three ways: the `t<tseq>a<n>` scheme is unique by
@@ -979,9 +978,11 @@ each CHECKED, not merely documented:
   invocation's method argument must be a STRING LITERAL on the reviewed
   method allowlist — any dynamic method expression fails the test
   outright — and the terminal-input methods (`pane.send_text`,
-  `pane.send_keys`, `pane.send_input`, `pane.run`, `agent.prompt`,
-  `agent.send_keys`, `agent.start` — Herdr's real input surface, not just
-  the four names the scenarios grep for) are never on it; the adapter's
+  `pane.send_keys`, `pane.send_input`, `agent.prompt`,
+  `agent.send_keys`, `agent.start` — S11-confirmed against
+  `repos/herdr/src/api/schema.rs` as Herdr 0.9.0's complete real input
+  surface; an earlier draft additionally named a `pane.run` method that
+  does not exist on this version) are never on it; the adapter's
   own `SendText` method is deleted with the port member in slice 6, and
   probes/tests reach `pane.send_text` through `Client.Call` in test files
   only. The recording fakes still assert zero typed-input calls
@@ -1508,25 +1509,29 @@ contracts; the exit scenarios are real-process.
 
 ### Spike probes (task 0, `test/integration`, continuing the S-series)
 
-| Probe | Question | Pins |
+| Probe | Established (executed) | Pins |
 | --- | --- | --- |
-| S8 `workspace.create` (herdr) | Response shape (workspace/tab/root-pane IDs), the creation label as a WORKSPACE attribute (source-confirmed; executed round-trip here) and the workspace → sole tab → sole pane recovery descent, cwd/env delivery to the root pane, no-focus behavior, sibling repo-key grouping observed | The `WorkspaceRequest`/`WorkspaceHandle` shapes and the workspace.create decision-table row's recovery rule |
-| S9 concurrent worktrees (herdr) | Two+ `worktree.create` calls against one repository using the full `hop/r<seq>/*` branch family AND the production request shape including the operation LABEL field (the landed request sends cwd/branch/base only — the label extension is slice 5's): `--base <oid>` honored for a NEW branch (created HEAD equals the base), the existing-branch case demonstrably IGNORING base (pinning why refuse-if-exists is mandatory), label round-trip, returned workspace/path/branch per call, grouping, coexistence with the S6 command-pane launch in each | Per-attempt worktree creation, the refuse-if-exists + verify-HEAD-after-create rule of section 6, label recovery, and reviewer worktrees |
-| S10 multi-pane env isolation (herdr) | Three command panes created back-to-back with distinct env maps and labels (manager-shaped, worker-shaped ×2): each process observes exactly its own additive env (`HOP_SESSION_ID`/`HOP_ROLE` differ), labels resolve to the right panes, agent detection per pane independent | That concurrent launches cannot cross-contaminate identity — the multi-session corroboration and close rules rest on it. S10 deliberately does NOT claim to validate the session-keyed claim queries (that is the sqlite raced suite's job) |
-| G1 ref namespace and branch family (local git, no herdr) | Create the complete `hop/r<seq>/*` family (`integration`, several `t<t>a<n>`) in one repository; verify the create-only `update-ref … ""` refusal on an existing ref | B3's scheme against real Git ref-store behavior |
-| G2 merge outcome matrix (local git, no herdr) | The exact frozen merge argv/env of section 8 against: divergent histories (two-parent commit), a conflict (exit code, tree state), an ancestor/equal source ("already up to date", nothing created), `--no-ff` of a fast-forwardable source (merge commit anyway), a repository with local hooks configured and one with commit signing configured globally (suppression verified; the local-hook non-conflict failure classified), and the deterministic `commit-tree` rollback/fencing construction (fixed identity, dates, message → byte-stable object ID) | The `integration.merge` adoption predicate including the no-op row, the noninteractive argv/env with configuration suppression, and the failure classification |
-| G3 fenced publish/reset (local git, no herdr) | `update-ref <ref> <new> <expected-old>` semantics: success on match, failure on a moved old value, create-only with empty old, behavior with the ref never checked out anywhere, and `commit-tree` rollback-commit construction | The `integration.publish`/`integration.reset` CAS rows and the never-revisit rule's mechanics |
-| S11 request-log observability (herdr) | Enable Herdr's API request logging (`src/logging.rs` api.request start/complete records — info/debug levels exist; the executed probe pins level, location, line format and the start/complete pairing that proves capture completeness). The record carries the METHOD and REQUEST ID, not the pane target, so the probe pins method-level visibility: drive one `pane.send_text` to a disposable raw pane through a separate connection as a positive control and confirm its entry appears, correlated by the request ID the probe itself chose; confirm the same for one entry of each other terminal-input method where cheaply drivable | The `InjectionFreeDelivery` scenario's evidence channel: what a forbidden request WOULD look like in the log, so a zero count over the whole capture is meaningful |
+| S8 `workspace.create` (herdr) | Response shape `{type: "workspace_created", workspace, tab, root_pane}`. The creation `label` is a WORKSPACE attribute (`WorkspaceInfo.label`), never the root pane; the recovery descent (workspace → its sole tab → that tab's sole pane) round-trips through `session.snapshot`, recorded per-run. cwd/env additive delivery to the root pane's login shell confirmed — cwd independently via the LIVE `pane.process_info` (a printed-`$PWD` check line-wrapped at the pane's 100-column width and was abandoned as unreliable). `focus:false` neither reports the workspace focused nor changes the session's active workspace, except the session's very first-ever workspace, which always activates regardless of the request | The `WorkspaceRequest`/`WorkspaceHandle` shapes and the workspace.create decision-table row's recovery rule |
+| S9 concurrent worktrees (herdr) | Three CONCURRENT `worktree.create` calls (the full family: t1a1, t2a1 new branches, t3a1 the review task's branch, pre-existing) driven on the RAW request with the `label` field included (the landed Go adapter still sends cwd/branch/base only today — see slice 5). Response shape `{type: "worktree_created", workspace, tab, root_pane, worktree}`. `--base` honored for each new branch (worktree HEAD == the given base) and SILENTLY IGNORED for the pre-existing branch (worktree HEAD == its own prior tip) — confirming refuse-if-exists is load-bearing, not merely defensive. Label round-trip per call. `WorkspaceInfo.worktree.repo_key` matches across every worktree workspace AND the manager's own plain `workspace.create`d parent workspace (Herdr resolves and marks it as the non-linked source on the first `worktree.create` call). Each worktree workspace coexists with an S6 command-pane launch at its own checkout path | Per-attempt worktree creation, the refuse-if-exists + verify-HEAD-after-create rule of section 6, label recovery, and reviewer worktrees |
+| S10 multi-pane env isolation (herdr) | Three command panes created CONCURRENTLY (manager-shaped, worker-shaped ×2) each observe exactly their own `HOP_SESSION_ID`/`HOP_ROLE`, checked pairwise against the other two — zero cross-contamination. Creation labels resolve to the correct pane per call. `agent.list` returns exactly three records, each independently keyed to its own pane | That concurrent launches cannot cross-contaminate identity — the multi-session corroboration and close rules rest on it. S10 deliberately does NOT claim to validate the session-keyed claim queries (that is the sqlite raced suite's job) |
+| G1 ref namespace and branch family (local git, no herdr) | The complete `hop/r1/integration` + `hop/r1/t1a1`/`t2a1`/`t3a1` family coexists (`git for-each-ref` lists all four). Create-only `update-ref <ref> <new> ""` succeeds only when `<ref>` does not yet exist and is refused (ref unchanged) once it does. NEGATIVE CONTROL, the exact reason the `/integration` suffix is required: a bare `hop/r1` branch collides with any `hop/r1/t<t>a<n>` sibling — `fatal: update_ref failed for ref 'refs/heads/hop/r1/t1a1': cannot lock ref 'refs/heads/hop/r1/t1a1': 'refs/heads/hop/r1' exists; cannot create 'refs/heads/hop/r1/t1a1'` (git's ref storage cannot treat one path as both a file and a directory) | B3's scheme against real Git ref-store behavior |
+| G2 merge outcome matrix (local git, no herdr) | Under the frozen argv `git -c user.name=... -c user.email=... -c commit.gpgsign=false -c merge.verifysignatures=false merge --no-ff --no-edit <source>` (env: `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM=/dev/null`, `GIT_TERMINAL_PROMPT=0`), in a DETACHED scratch checkout throughout (the ref stays untouched in every case): two-parent merge (parents == {base, source}); conflict (non-zero exit, `UU` index entries, clean `merge --abort`); already-up-to-date no-op (nothing created, HEAD unchanged); `--no-ff` forces a genuine merge commit on an otherwise fast-forwardable head; `git commit-tree` with pinned tree/parent/identity/dates/message is byte-stable across two invocations (the G3 rollback's precondition). A repository with `commit.gpgsign=true` set LOCALLY does not block the merge — the frozen argv's own `-c commit.gpgsign=false` wins over every config file, local included (testing GLOBAL config is moot: the frozen env already redirects it to `/dev/null`). A non-conflict failure (an unwritable shared object database) is distinguished from a conflict by OUTPUT TEXT and INDEX STATE, never by abortability — `merge --abort` still succeeds after this failure too. HOOKS FIRE under the current argv (no `--no-verify`); suppression options verified: `--no-verify` skips only `pre-merge-commit`; `-c core.hooksPath=<dir>` (an empty existing directory, or one that does not exist at all — both behave identically) suppresses BOTH `pre-merge-commit` and `post-merge`. Which mitigation, if any, the design adopts is a pending human decision | The `integration.merge` adoption predicate including the no-op row, the noninteractive argv/env with configuration suppression, and the failure classification |
+| G3 fenced publish/reset (local git, no herdr) | `update-ref <ref> <new> <old>` succeeds and moves the ref only when `<old>` matches its actual current value; a stale `<old>` is refused, ref left exactly where it was. `""` as `<old>` is create-only (see G1). The rollback construction — `git commit-tree <pre-merge-tree> -p <rejected-merge> -m <message>`, CAS-published in turn — keeps the rejected merge REACHABLE (`git merge-base --is-ancestor <rejected> <ref>` holds; `git log <ref>` lists it) rather than orphaning it via a destructive reset+force | The `integration.publish`/`integration.reset` CAS rows and the never-revisit rule's mechanics |
+| S11 request-log observability (herdr) | Location: `<the server's own socket directory>/herdr-server.log`. Format: plain text (`tracing_subscriber`'s default formatter, no JSON/ANSI), one line per event, e.g. `... DEBUG herdr::logging: api request received event="api.request.start" ... request_id="hop-1" method="ping" changes_ui=false`. LEVEL splits exactly by method: `pane.send_text`/`pane.send_keys`/`pane.send_input` log their start/complete pair at DEBUG ONLY when they succeed (invisible at the default `herdr=info` filter) — a FAILED or erroring call among these still completes via the SAME `event="api.request.complete"` record, never a distinct fail event, but at INFO, since the server forces INFO whenever `outcome != "ok"`; `agent.prompt`/`agent.send_keys`/`agent.start` log both their start AND completion records at INFO regardless of outcome — confirmed for all six methods on a SEPARATE client connection, none needing to succeed or need a live/matching agent to reach the log. `event="api.request.fail"` (WARN) is a SEPARATE event reserved for a failure WRITING the response back to the client socket itself (e.g. a disconnect mid-write) — it never fires for an ordinary business-logic refusal, and no Phase 3 scenario relies on it. Every line carries `method` and `request_id` but NEVER the pane/agent target or any request parameter (confirmed: neither a sent marker string nor a target pane id ever appears) — the injection-free claim is therefore honestly method-level, never per-pane. `request_id` is a CLIENT-chosen label the server only echoes, NOT a server-assigned global sequence: two independent client connections to the same server both start counting from `"hop-1"`, and that exact value was observed logged against two unrelated methods in one capture — correlation must locate a call's own line by something unique to it (method name, confirmed) and read the id back from there. A capture window is bracketed by two otherwise-unused methods' own log lines (`pane.list`/`tab.list` in the probe) — never by a chosen label, which the log never carries at all | The `InjectionFreeDelivery` scenario's evidence channel: what a forbidden request WOULD look like in the log, so a zero count over the whole capture is meaningful |
 
-Deliberately not probed, with the reason recorded: `agent.prompt`,
-`agent.wait`, `agent.send_keys`, `pane.send_keys` — no Phase 3 decision
-rule consumes them (section 7); probing them would imply a channel this
-design forbids (S11's single positive-control send_text targets a
-test-owned raw pane that never hosts a session, through the test's own
-client). L1 (opt-in, live): a real Claude session executing
-`hop msg wait --timeout 50s` inside its shell tool, pinning that the
-bounded wait returns within the harness's tool timeout and the model can
-loop on the `none:` line; informs the default only, never CI.
+Deliberately not probed for BUSINESS BEHAVIOR, since no Phase 3 decision
+rule consumes them (section 7) and probing their actual EFFECT would imply
+a channel this design forbids: `agent.prompt`, `agent.wait`,
+`agent.send_keys`, `pane.send_keys`, `pane.send_input`, `agent.start`. S11
+DOES drive each of these once, cheaply, except `agent.wait` — but only to
+establish REQUEST-LOG visibility (level, format, correlation), never any
+effect on a pane; several were refused at the business layer (an
+unrecognized agent kind, no live/matching agent) before any terminal
+interaction could occur, and that refusal still reached the log. L1
+(opt-in, live): a real Claude session executing `hop msg wait --timeout
+50s` inside its shell tool, pinning that the bounded wait returns within
+the harness's tool timeout and the model can loop on the `none:` line;
+informs the default only, never CI.
 
 ### Countermeasures for the Phase 2 escaped-defect class
 
@@ -1627,15 +1632,23 @@ user's live server at `~/.config/herdr/herdr.sock` is never touched):
    start/complete record pairing proving no gap); the test performs the
    positive control (its own `pane.send_text` to a test-owned raw pane,
    issued through a SEPARATE connection exactly as production
-   subprocesses connect, asserted PRESENT in the captured log and
-   correlated by the request ID the test chose), then asserts the log
-   contains ZERO entries for the ENTIRE terminal-input method set of
+   subprocesses connect, located in the captured log by its method name —
+   S11 established that `request_id` is a per-connection label the server
+   only echoes, not a global key, so two independent connections can and
+   do log the same id value; a control is identified by method, then its
+   own id read back from that line — and asserted PRESENT), then asserts
+   the log contains ZERO entries, of EITHER the `api.request.complete`
+   (a business-logic refusal) or `api.request.fail` (a response-write
+   failure) event kind, for the ENTIRE terminal-input method set of
    section 7 — `pane.send_text`, `pane.send_keys`, `pane.send_input`,
-   `pane.run`, `agent.prompt`, `agent.send_keys`, `agent.start` — across
-   the whole isolated server's capture, other than that one identified
-   control. The adapter's static allowlist, not this grep set, is what
-   covers any future input surface; the scenario proves the shipped
-   binary made none of the known ones.
+   `agent.prompt`, `agent.send_keys`, `agent.start` (S11-confirmed as
+   Herdr 0.9.0's complete real input surface) — across the whole isolated
+   server's capture, other than that one identified control, run at the
+   S11-pinned elevated level (the default level does not even record a
+   successful `pane.send_text`, so the capture server must opt in to it
+   for a zero count to be meaningful). The adapter's static allowlist,
+   not this grep set, is what covers any future input surface; the
+   scenario proves the shipped binary made none of the known ones.
 
 Claim-protocol race cases that Phase 2 recorded as inexpressible without a
 production pause/injection hook (launcher killed between claim write and
@@ -1731,8 +1744,8 @@ implementation option:
 
 Spike dependencies: S8 gates the `CreateWorkspace`/`FindWorkspaceByLabel`
 shapes and the manager-placement decision row (the label-names-the-
-workspace fact and the sole-tab descent are source-confirmed, execution
-pending); S9 gates per-attempt worktree provenance — including executing
+workspace fact and the sole-tab descent are S8-confirmed by execution);
+S9 gates per-attempt worktree provenance — including executing
 the existing-branch-ignores-base case that makes refuse-if-exists
 mandatory; S10 must pass before multi-session launch lands (a failure
 would force serialized pane creation, a loop change, not a model change)
