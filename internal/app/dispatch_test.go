@@ -259,3 +259,77 @@ func TestDispatchCancellationDuringEvidenceWork(t *testing.T) {
 		}
 	})
 }
+
+// TestTakeoverDuringCandidateInspection proves the checkout is never
+// materialized by a controller superseded during the candidate (ls-tree)
+// inspection: the revalidation immediately before the materialization
+// mutation refuses it.
+func TestTakeoverDuringCandidateInspection(t *testing.T) {
+	tc := newTestController(defaultPolicy())
+	handle, detail := runningRun(t, tc)
+	if _, err := tc.Controller.SubmitResult(context.Background(), defaultSubmitRequest(detail)); err != nil {
+		t.Fatalf("SubmitResult() error = %v", err)
+	}
+	tc.Commands.RunHook = func(ctx context.Context, cmd app.Command) (app.CommandResult, bool, error) {
+		for _, tok := range cmd.Argv {
+			if tok == "ls-tree" {
+				tc.Clock.Advance(leaseTTL + time.Second)
+				if _, err := tc.Store.AcquireLease(ctx, detail.RunID, "controller-B"); err != nil {
+					t.Errorf("AcquireLease() (B) error = %v", err)
+				}
+				return app.CommandResult{ExitCode: 0, Stdout: []byte("100644 blob aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tmain.go\n")}, true, nil
+			}
+		}
+		return app.CommandResult{}, false, nil
+	}
+
+	_, err := tc.Controller.ClaimAndRunCheck(context.Background(), handle, "/usr/local/bin/hop", nil)
+	if !errors.Is(err, app.ErrFenced) {
+		t.Fatalf("ClaimAndRunCheck() error = %v, want ErrFenced from the pre-materialization revalidation", err)
+	}
+	assertNoMaterializationOrSpawn(t, tc)
+}
+
+// assertNoMaterializationOrSpawn fails the test if a worktree add or a
+// hop check-exec spawn was dispatched.
+func assertNoMaterializationOrSpawn(t *testing.T, tc *testController) {
+	t.Helper()
+	for _, cmd := range tc.Commands.Calls {
+		if len(cmd.Argv) >= 2 && cmd.Argv[1] == "check-exec" {
+			t.Fatalf("hop check-exec was spawned: %v", cmd.Argv)
+		}
+		for i, tok := range cmd.Argv {
+			if tok == "worktree" && i+1 < len(cmd.Argv) && cmd.Argv[i+1] == "add" {
+				t.Fatalf("the checkout was materialized: %v", cmd.Argv)
+			}
+		}
+	}
+}
+
+// TestStopDuringCandidateInspection proves a stop recorded while the
+// candidate inspection runs refuses the materialization mutation: no
+// worktree add, no spawn.
+func TestStopDuringCandidateInspection(t *testing.T) {
+	tc := newTestController(defaultPolicy())
+	handle, detail := runningRun(t, tc)
+	if _, err := tc.Controller.SubmitResult(context.Background(), defaultSubmitRequest(detail)); err != nil {
+		t.Fatalf("SubmitResult() error = %v", err)
+	}
+	tc.Commands.RunHook = func(ctx context.Context, cmd app.Command) (app.CommandResult, bool, error) {
+		for _, tok := range cmd.Argv {
+			if tok == "ls-tree" {
+				if err := tc.Controller.RequestStop(ctx, detail.RunID.String()); err != nil {
+					t.Errorf("RequestStop() error = %v", err)
+				}
+				return app.CommandResult{ExitCode: 0, Stdout: []byte("100644 blob aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tmain.go\n")}, true, nil
+			}
+		}
+		return app.CommandResult{}, false, nil
+	}
+
+	_, err := tc.Controller.ClaimAndRunCheck(context.Background(), handle, "/usr/local/bin/hop", nil)
+	if !errors.Is(err, app.ErrStopRequested) {
+		t.Fatalf("ClaimAndRunCheck() error = %v, want ErrStopRequested from the pre-materialization revalidation", err)
+	}
+	assertNoMaterializationOrSpawn(t, tc)
+}

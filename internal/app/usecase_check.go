@@ -103,6 +103,12 @@ func (c *Controller) ClaimAndRunCheck(ctx context.Context, handle RunHandle, hop
 	} else if rejectDetail != "" {
 		return c.recordCheckOutcome(ctx, handle, opID, checkRequest, checkRunOutcome{ExitCode: 1, Detail: rejectDetail}, false, nil)
 	}
+	// The candidate inspection above takes time: revalidate again
+	// immediately before the materialization mutation, so a controller
+	// fenced or stopped during inspection never materializes.
+	if err := c.revalidateForDispatch(ctx, handle, false); err != nil {
+		return CheckReport{}, fmt.Errorf("app: revalidate before checkout materialization: %w", err)
+	}
 	if err := c.materializeCheckout(actCtx, frozen.RepositoryRoot, checkoutPath, commitOID); err != nil {
 		return c.recordCheckOutcome(ctx, handle, opID, checkRequest, checkRunOutcome{Unknown: true, Detail: err.Error()}, false, fmt.Errorf("materialize checkout: %w", err))
 	}
