@@ -1062,31 +1062,48 @@ and never-resend rule apply.
 
 Claim settlement — one corroboration predicate, used identically by
 settlement, adoption and warm reattach: the claim is an intent
-acknowledgment, not proof the harness ran. The controller settles it to
-`execed` only when an `InspectPane` observation satisfies ALL of:
+acknowledgment, not proof the harness ran. An `InspectPane` observation
+reports EVERY member of the pane's foreground process group, in raw
+platform listing order with no positional semantics (macOS: unsorted
+`proc_listpids`, `repos/herdr/src/platform/macos.rs` `foreground_job`;
+Linux: ascending pid, `linux.rs`
+`foreground_process_group_members_with`), and a real harness spawns
+children into its own group — Claude Code 2.1.270 starts its configured
+MCP servers there immediately after the trust check, and the executed
+live probe observed an MCP server at index 0 — so the predicate scans all
+members and never reads a member's position. The controller settles the
+claim to `execed` only when ALL of:
 
 - the pane matches the claim's current creation binding (pane ID, or
   recovery by creation label);
-- the foreground process's executable identity equals the expected harness
-  or fixture executable recorded in the claim — matched by verbatim
-  argv[0], or by basename against name/argv0, since Herdr reports argv0 as
-  a basename (macOS) or not at all (Linux) — which explicitly excludes a
-  still-running `hop launch` (argv0/name = the HOP binary's basename,
-  subcommand `launch`), so a paused pre-exec launcher can never satisfy the
-  predicate;
-- the process argv carries the claim's marker;
-- the foreground pid equals the claim pid (execve preserves it).
+- SOME member's executable identity equals the expected harness or
+  fixture executable recorded in the claim — matched by verbatim argv[0],
+  or by basename against name/argv0, since Herdr reports argv0 as a
+  basename (macOS) or not at all (Linux) — where a still-running
+  `hop launch` invocation (argv0/name = the HOP binary's basename,
+  subcommand `launch`) is skipped per member, so a paused pre-exec
+  launcher can never satisfy the predicate;
+- that SAME member's argv carries the claim's marker (a marker carried
+  only by a foreign sibling — an MCP server, say — corroborates nothing);
+- that SAME member's pid equals the claim pid (execve preserves it);
+- and NO member matches executable identity and marker under a different
+  pid (wrapper precedence, below).
 
 Herdr agent detection (recognized harness names only, per S1) and a valid
 `transient`-rejected early submission are wakeups that TRIGGER this
-inspection; neither ever settles a claim by itself. An observation that
+inspection; neither ever settles a claim by itself. Any member that
 matches on executable identity, marker and binding but differs on pid is
 the forking-wrapper topology, which Phase 2 does not support: it fails
-closed — the claim stays `exec_pending` and the run surfaces `needs
-interaction` with the observed identity, so the human decides. This is the
-settlement path for the test fixture worker too, whose binary name is
-never agent-detected. The decision table and warm reattach adopt only
-settled claims; an `exec_pending` claim is always ambiguous.
+closed — even when the claim-pid member also matches, since a live
+wrapper that already exec'd carries the recorded executable and markers
+in its own argv under the claim's pid, and a settled-first reading would
+adopt exactly the refused topology — the claim stays `exec_pending` and
+the run surfaces `needs interaction` with the observed identity, so the
+human decides. Members matching neither way (MCP servers and other
+marker-free children) are ignored. This is the settlement path for the
+test fixture worker too, whose binary name is never agent-detected. The
+decision table and warm reattach adopt only settled claims; an
+`exec_pending` claim is always ambiguous.
 
 ### Assignment artifact
 

@@ -8,6 +8,28 @@ import (
 	"github.com/johnlanda/hop/internal/domain/run"
 )
 
+// mcpGroupPane reproduces the pinned real InspectPane shape for a worker
+// whose harness spawned MCP servers into its own process group (Claude
+// Code 2.1.270, observed live through pane.process_info against herdr
+// 0.9.0: `npm exec <server>`, `node .../<server>` and app-installed MCP
+// server processes as same-pgid children of the harness). Herdr reports
+// the members in raw platform listing order — macOS unsorted
+// proc_listpids, Linux ascending pid — so the worker holds no particular
+// index; in the executed live probe an MCP server was index 0, which this
+// fixture mirrors by listing the foreign members FIRST. The foreign
+// members carry foreign executables and no HOP marker anywhere.
+func mcpGroupPane(workerPID int, workerArgv ...string) app.PaneProcess { //nolint:unparam // every current scenario scripts the suite's conventional worker pid 4242, but the parameter ties the fixture to the claim pid the calling test asserts against.
+	return app.PaneProcess{
+		ShellPID:          workerPID,
+		ForegroundGroupID: workerPID,
+		Foreground: []app.ProcessInfo{
+			{PID: workerPID + 63, Argv0: "npm", Name: "npm", Argv: []string{"npm", "exec", "@executeautomation/playwright-mcp-server"}, Cmdline: "npm exec @executeautomation/playwright-mcp-server"},
+			{PID: workerPID + 230, Argv0: "node", Name: "node", Argv: []string{"/opt/node/bin/node", "/tmp/npx/playwright-mcp-server"}, Cmdline: "/opt/node/bin/node /tmp/npx/playwright-mcp-server"},
+			{PID: workerPID, Argv0: "claude", Name: "claude", Argv: workerArgv, Cmdline: ""},
+		},
+	}
+}
+
 // forceAttemptReserved directly sets runID's task, attempt and session
 // back to pending/reserved, bypassing the domain's own transitions. It
 // exists only to reach an otherwise-unreachable-through-the-use-cases

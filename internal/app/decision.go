@@ -40,6 +40,16 @@ const (
 	SettlementUnresolved LaunchSettlement = "unresolved"
 )
 
+// SettlementEvidence identifies the foreground member whose identity
+// decided a settlement classification, and the marker its argv or cmdline
+// carried: the values a settlement or adoption records as claim and
+// binding occupant evidence. It is the zero value exactly when the
+// classification is unresolved.
+type SettlementEvidence struct {
+	Occupant ProcessInfo
+	Marker   string
+}
+
 // CorroborateSettlement applies the section 6 corroboration predicate, the
 // ONLY corroboration rule, used identically by settlement, adoption and
 // warm reattach. paneMatches reports whether the inspected pane is the
@@ -49,29 +59,64 @@ const (
 // the claim itself recorded, never a caller-selected value. markers are
 // the run/attempt/incarnation or native session identifiers derived from
 // durable launch/binding context; the observed argv must carry at least
-// one. A still-running `hop launch` invocation is explicitly excluded: a
-// paused pre-exec launcher can never satisfy the predicate even when the
-// recorded executable is the HOP binary itself. Missing identity — an
-// empty claim executable or an empty marker set — is unresolved, never
-// settled: the predicate fails closed.
-func CorroborateSettlement(paneMatches bool, pane PaneProcess, markers []string, claim LaunchClaim) LaunchSettlement { //nolint:gocritic // hugeParam: claim is an immutable snapshot read once by this pure decision function; callers pass a local value, so a pointer would only invite aliasing.
+// one. Missing identity — an empty claim executable or an empty marker
+// set — is unresolved, never settled: the predicate fails closed.
+//
+// EVERY member of the observed foreground process group is considered,
+// not only index 0: a real harness (Claude Code 2.1.270) spawns its
+// configured MCP servers as children in its own process group immediately
+// after the trust check, and Herdr reports group members in raw platform
+// listing order (macOS: unsorted proc_listpids; Linux: ascending pid), so
+// the launched process holds no particular index. Per member, a
+// still-running `hop launch` invocation is skipped (a paused pre-exec
+// launcher can never satisfy the predicate even when the recorded
+// executable is the HOP binary itself), and executable identity, marker
+// and pid are three conjuncts of the SAME member — a marker carried only
+// by a foreign sibling corroborates nothing. Classification, fail-closed
+// on the unsupported topology first: ANY member matching executable
+// identity and marker under a pid DIFFERENT from the claim's is the
+// forking-wrapper topology, even when the claimed pid also matches (a
+// live wrapper that already exec'd carries the recorded executable and
+// markers in its own argv, so a settled-first reading would adopt exactly
+// the topology section 6 refuses); otherwise the member with the claim's
+// pid matching executable and marker settles; otherwise unresolved.
+func CorroborateSettlement(paneMatches bool, pane PaneProcess, markers []string, claim LaunchClaim) (LaunchSettlement, SettlementEvidence) { //nolint:gocritic // hugeParam: claim is an immutable snapshot read once by this pure decision function; callers pass a local value, so a pointer would only invite aliasing.
 	if !paneMatches || len(pane.Foreground) == 0 {
-		return SettlementUnresolved
+		return SettlementUnresolved, SettlementEvidence{}
 	}
 	if claim.Executable == "" {
-		return SettlementUnresolved
+		return SettlementUnresolved, SettlementEvidence{}
 	}
-	fg := pane.Foreground[0]
-	if isLauncherInvocation(fg.Argv) {
-		return SettlementUnresolved
+	var settled, wrapper *SettlementEvidence
+	for _, fg := range pane.Foreground {
+		if isLauncherInvocation(fg.Argv) {
+			continue
+		}
+		if !executableMatches(fg, claim.Executable) {
+			continue
+		}
+		marker := processMarkerMatch(fg, markers)
+		if marker == "" {
+			continue
+		}
+		evidence := SettlementEvidence{Occupant: fg, Marker: marker}
+		switch {
+		case fg.PID == claim.PID:
+			if settled == nil {
+				settled = &evidence
+			}
+		case wrapper == nil:
+			wrapper = &evidence
+		}
 	}
-	if !executableMatches(fg, claim.Executable) || FirstMarkerMatch(pane, markers) == "" {
-		return SettlementUnresolved
+	switch {
+	case wrapper != nil:
+		return SettlementForkingWrapper, *wrapper
+	case settled != nil:
+		return SettlementSettled, *settled
+	default:
+		return SettlementUnresolved, SettlementEvidence{}
 	}
-	if fg.PID == claim.PID {
-		return SettlementSettled
-	}
-	return SettlementForkingWrapper
 }
 
 // executableMatches reports whether an observed foreground process's
@@ -102,13 +147,36 @@ func executableMatches(fg ProcessInfo, expected string) bool { //nolint:gocritic
 	return fg.Name != "" && fg.Name == base
 }
 
-// FirstMarkerMatch returns the first non-empty marker the pane's foreground
-// process argv or cmdline carries, or "" when none matches.
+// FirstMarkerMatch returns the first non-empty marker ANY of the pane's
+// foreground members carries in its argv or cmdline, or "" when none
+// does — the any-member predicate: it reports pane-level positive
+// evidence and never identifies WHICH process carried it (markerBearer
+// does, and per-member decisions such as CorroborateSettlement and the
+// close-target match never combine a marker from one member with the
+// identity of another).
 func FirstMarkerMatch(pane PaneProcess, markers []string) string {
-	if len(pane.Foreground) == 0 {
-		return ""
+	_, marker, _ := markerBearer(pane, markers)
+	return marker
+}
+
+// markerBearer returns the first foreground member whose argv or cmdline
+// carries one of markers, together with the marker it carried. Members
+// are scanned in Herdr's reported listing order, which carries no
+// semantics (macOS reports raw proc_listpids order, Linux ascending pid;
+// the launched process holds no particular index), so a caller uses the
+// returned member's own identity — never its position.
+func markerBearer(pane PaneProcess, markers []string) (ProcessInfo, string, bool) {
+	for _, fg := range pane.Foreground {
+		if marker := processMarkerMatch(fg, markers); marker != "" {
+			return fg, marker, true
+		}
 	}
-	fg := pane.Foreground[0]
+	return ProcessInfo{}, "", false
+}
+
+// processMarkerMatch returns the first non-empty marker fg's own argv or
+// cmdline carries, or "" when none matches.
+func processMarkerMatch(fg ProcessInfo, markers []string) string { //nolint:gocritic // hugeParam: ProcessInfo is the decision file's pure-value member shape, examined a handful of times per corroboration round, never a hot loop.
 	for _, marker := range markers {
 		if marker == "" {
 			continue
@@ -142,21 +210,26 @@ func ServerContinuityEstablished(recorded, observed string) bool {
 	return recorded != "" && recorded == observed
 }
 
-// OccupantMatches reports whether an inspected pane's foreground process
-// matches recorded occupant evidence: the foreground process's argv or
-// cmdline carries the marker and its pid equals the recorded pid. It is
-// used by the close rule immediately before ClosePane and by warm reattach;
-// the caller is responsible for having resolved the pane by the evidence's
-// label first (label identity is not itself observable from PaneProcess).
+// OccupantMatches reports whether an inspected pane's foreground group
+// still contains the recorded occupant: SOME member's pid equals the
+// recorded pid AND that same member's argv or cmdline carries the marker
+// — the claimed-process-is-among-the-members predicate. The recorded
+// occupant spawns its own children (Claude Code's MCP servers) into its
+// own process group, so it holds no particular index in the listing; a
+// pid match on one member with the marker only on another is never a
+// match. The caller is responsible for having resolved the pane by the
+// evidence's label first (label identity is not itself observable from
+// PaneProcess).
 func OccupantMatches(evidence run.OccupantEvidence, pane PaneProcess) bool {
-	if len(pane.Foreground) == 0 {
-		return false
+	for _, fg := range pane.Foreground {
+		if fg.PID != evidence.PID {
+			continue
+		}
+		if slices.Contains(fg.Argv, evidence.ArgvMarker) || strings.Contains(fg.Cmdline, evidence.ArgvMarker) {
+			return true
+		}
 	}
-	fg := pane.Foreground[0]
-	if fg.PID != evidence.PID {
-		return false
-	}
-	return slices.Contains(fg.Argv, evidence.ArgvMarker) || strings.Contains(fg.Cmdline, evidence.ArgvMarker)
+	return false
 }
 
 // GroupRetirementOutcome is one of the four typed outcomes classifying a

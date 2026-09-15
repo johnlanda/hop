@@ -31,7 +31,7 @@ sides together. `cmd/hop` never imports domain or identity types: every
 | [process.go](process.go) | `CommandRunner`, `Command`, `CommandResult`, `ProcessGroupInspector`, `GroupProcess` | Process-group-leader execution with cancellation (git operations, spawning `hop check-exec`) and local process-table listing/signaling for group retirement |
 | [configuration.go](configuration.go) | `ConfigurationSource`, `RunPolicy` | Loads and validates one repository's `.herdr-orchestrator/config.toml`-decoded policy: check contract, env strip/passthrough, profile dir, harness |
 | [digest.go](digest.go) | `ResultDigestTag`, `ComputeResultDigest` | The canonical `"hop-result-v1"` result digest: length-prefixed fields, SHA-256 hex, computed only here — the domain receives it as an opaque validated string |
-| [decision.go](decision.go) | `LaunchClaimDeadline`, `LaunchDeadlineExpired`, `LaunchSettlement`, `CorroborateSettlement`, `FirstMarkerMatch`, `OccupantMatches`, `ServerContinuityEstablished`, `GroupRetirementOutcome`, `ClassifyGroupRetirement`, `ArgvUnavailable` | The section 6 claim-corroboration predicate (claim-derived executable identity, durable marker set, explicit `hop launch` exclusion, fail-closed on missing identity), close-rule occupant matching, the server-continuity predicate, and the four-outcome process-group-retirement classifier matching both the frozen check argv and its check-exec invocation |
+| [decision.go](decision.go) | `LaunchClaimDeadline`, `LaunchDeadlineExpired`, `LaunchSettlement`, `SettlementEvidence`, `CorroborateSettlement`, `FirstMarkerMatch`, `markerBearer`, `processMarkerMatch`, `OccupantMatches`, `ServerContinuityEstablished`, `GroupRetirementOutcome`, `ClassifyGroupRetirement`, `ArgvUnavailable` | The section 6 claim-corroboration predicate over EVERY foreground-group member (claim-derived executable identity, durable marker set, explicit per-member `hop launch` exclusion, fail-closed on missing identity, wrapper precedence; returns the corroborated member and marker as `SettlementEvidence`), the per-member close-rule occupant match, the any-member marker predicates, the server-continuity predicate, and the four-outcome process-group-retirement classifier matching both the frozen check argv and its check-exec invocation |
 | [operation_payload.go](operation_payload.go) | `decodeOperationPayload` | Reads a persisted operation intent/evidence/outcome payload without relying on Go type identity: a value of the target type passes through, anything else round-trips through JSON. Callers still validate required fields and fail closed on a failed decode |
 | [controller.go](controller.go) | `Controller`, `RunHandle`, `Heartbeat`, `Detach`, `ErrStopRequested` | The driving service composition calls; ports as fields, plus `GitExecutable` (the absolute path of the git binary every repository/worktree command runs, resolved once by composition). `RunHandle` is an opaque per-run token (run identity, the held lease and a dispatch scope) so composition never touches identity types. `Heartbeat` extends the lease on the design's interval and cancels in-flight external calls on failure; `Detach` journals, cancels and releases without stopping; `revalidateForDispatch` is the section 4 step 2 revalidation every external mutation runs first |
 | [assignment.go](assignment.go) | `renderAssignment` | Deterministic assignment-artifact content: brief, identities and absolute paths only, referenced by the launch argv, never typed into a dialog |
@@ -116,6 +116,36 @@ sides together. `cmd/hop` never imports domain or identity types: every
   an empty marker set is unresolved — never settled. Adoption requires a
   settled claim; an exec_pending claim settles through the ordinary fenced
   corroboration path first.
+- Foreground-group decisions never depend on member POSITION. Herdr
+  reports `pane.process_info` foreground members in raw platform listing
+  order — macOS: unsorted `proc_listpids` (repos/herdr/src/platform/
+  macos.rs, `foreground_job`); Linux: ascending pid (linux.rs,
+  `foreground_process_group_members_with`) — and a real harness (Claude
+  Code 2.1.270) spawns its configured MCP servers into its own process
+  group right after the trust check, so the launched process holds no
+  particular index (the live probe observed an MCP server at index 0; see
+  docs/architecture/native-harness-compat.md). Per consumer, the predicate
+  is one of exactly two shapes, each applied to ONE member at a time —
+  conjuncts are never combined across members:
+  - claimed-process-among-the-members (identity conjuncts on the SAME
+    member): `CorroborateSettlement` scans every member, skipping
+    `hop launch` invocations per member; ANY member matching executable +
+    marker under a pid different from the claim's classifies
+    forking-wrapper (wrapper precedence — a live wrapper that already
+    exec'd matches all three conjuncts under the claim's pid, so a
+    settled-first reading would adopt the refused topology), else the
+    claim-pid member matching executable + marker settles, else
+    unresolved; the corroborated member's own pid and marker are recorded
+    (`SettlementEvidence`) as claim settlement and binding occupant
+    evidence (`settleExeced`, the resume reconciliation settle and warm
+    adoption). `OccupantMatches` and `matchesCloseTarget`
+    (usecase_stop.go) require the recorded pid and a marker on that same
+    member.
+  - any-member (pane-level positive evidence): `FirstMarkerMatch` /
+    `markerBearer` accept a marker from any member — used for the
+    positive-evidence retirement trigger, whose close target then records
+    the BEARING member's own pid (`retireAndRelaunch`) — and
+    `observePaneAbsence` treats any non-empty foreground as an occupant.
 - Every close runs the shared pane.close operation procedure
   (`closePaneOperation`): the intent freezes the exact target evidence
   (pane, label, session/incarnation, pid, durable argv markers, reason)
@@ -279,7 +309,14 @@ sides together. `cmd/hop` never imports domain or identity types: every
   `fakeCommands.Run` also mirrors the real Runner's own argv contract,
   refusing an empty argv or a non-absolute argv[0], so calling it with a
   bare executable name fails the app suite directly rather than only
-  surfacing against a real process at runtime.
+  surfacing against a real process at runtime. Scripted `InspectPaneFn`
+  panes use the real pane.process_info shapes: `mcpGroupPane`
+  (helpers_test.go) reproduces the pinned multi-member foreground group —
+  MCP-server children listed before the worker in raw platform order —
+  that the executed real-process probe
+  (`TestRealProcessSettlementWithMCPGroupMembers`,
+  test/integration/pgroup_test.go) observed under the production
+  transport.
 - Named scenario coverage, by test:
   `TestLeaseFencing` (takeover barrier with staged writes discarded,
   heartbeat/release CAS refusals, monotonic generations) and
@@ -293,10 +330,17 @@ sides together. `cmd/hop` never imports domain or identity types: every
   format and HOP path, and an unconfigured `GitExecutable` refused before
   any side effect); `TestCorroborateLaunch` (the four settlement
   outcomes, native-reference markers, pre-binding label recovery,
-  exec-failure session termination, early-acceptance session activation);
-  `TestCorroborateSettlement`/`TestOccupantMatches`/
+  exec-failure session termination, early-acceptance session activation,
+  settlement from behind MCP-server members with the corroborated
+  member's evidence recorded, and wrapper precedence failing closed);
+  `TestCorroborateSettlement`/`TestFirstMarkerMatch`/`TestOccupantMatches`/
   `TestClassifyGroupRetirement` (the pure decision tables incl. launcher
-  exclusion, fail-closed empty identity, dual check/check-exec argv);
+  exclusion, fail-closed empty identity, dual check/check-exec argv, and
+  the multi-member foreground vectors — the claimed member at index 1+
+  behind MCP-shaped foreign members, foreign-members-only,
+  cross-member-conjunct refusal, per-member launcher skip, and wrapper
+  precedence over a simultaneously matching claim-pid member — with the
+  returned `SettlementEvidence` pinned per row);
   `TestDriveStop` and `TestPaneCloseInterruption` (observed termination,
   mismatch-never-absence, the pane.close operation's interruption windows
   on both sides of the act); `TestSubmitResult` (submission order incl.

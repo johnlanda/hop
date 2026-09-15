@@ -88,14 +88,21 @@ type paneCloseTarget struct {
 	Reason        string
 }
 
-// matchesCloseTarget applies the close rule's occupant match: the observed
-// foreground pid equals the recorded pid AND the argv carries one of the
-// recorded durable markers. A pid is never evidence alone.
+// matchesCloseTarget applies the close rule's occupant match: SOME member
+// of the observed foreground group has the recorded pid AND that same
+// member's argv or cmdline carries one of the recorded durable markers —
+// the claimed-process-is-among-the-members predicate. A pid is never
+// evidence alone, and the target holds no particular index in the
+// listing (the recorded worker spawns its own MCP children into its own
+// process group); a pid match on one member with a marker only on
+// another is never a match.
 func matchesCloseTarget(target *paneCloseTarget, pane PaneProcess) bool {
-	if len(pane.Foreground) == 0 {
-		return false
+	for _, fg := range pane.Foreground {
+		if fg.PID == target.PID && processMarkerMatch(fg, target.Markers) != "" {
+			return true
+		}
 	}
-	return pane.Foreground[0].PID == target.PID && FirstMarkerMatch(pane, target.Markers) != ""
+	return false
 }
 
 // StopReport is one DriveStop round's outcome.

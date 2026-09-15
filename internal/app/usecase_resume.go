@@ -727,18 +727,17 @@ func (c *Controller) reconcileActive(ctx context.Context, handle RunHandle, deta
 				return ResumeResult{}, markerErr
 			}
 			paneMatches := detail.Binding.IncarnationID == detail.Claim.IncarnationID && !detail.Binding.Superseded
-			if CorroborateSettlement(paneMatches, pane, markers, *detail.Claim) == SettlementSettled {
+			if settlement, occupant := CorroborateSettlement(paneMatches, pane, markers, *detail.Claim); settlement == SettlementSettled {
 				now := c.Clock.Now()
-				matched := FirstMarkerMatch(pane, markers)
 				if settleErr := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 					return uow.LaunchClaims().Settle(ctx, detail.Claim.IncarnationID, LaunchClaimSettlement{
-						State: LaunchClaimExeced, PaneID: detail.Binding.PaneID, PID: firstForeground(pane).PID,
-						Executable: detail.Claim.Executable, ArgvMarker: matched, At: now,
+						State: LaunchClaimExeced, PaneID: detail.Binding.PaneID, PID: occupant.Occupant.PID,
+						Executable: detail.Claim.Executable, ArgvMarker: occupant.Marker, At: now,
 					})
 				}); settleErr != nil {
 					return ResumeResult{}, fmt.Errorf("app: settle launch claim from reconciliation: %w", settleErr)
 				}
-				return c.warmReattach(ctx, handle, detail, priorAttemptState, pane, matched)
+				return c.warmReattach(ctx, handle, detail, priorAttemptState, occupant)
 			}
 		}
 
@@ -751,20 +750,25 @@ func (c *Controller) reconcileActive(ctx context.Context, handle RunHandle, deta
 				return ResumeResult{}, markerErr
 			}
 			paneMatches := detail.Binding.IncarnationID == detail.Claim.IncarnationID && !detail.Binding.Superseded
-			if CorroborateSettlement(paneMatches, pane, markers, *detail.Claim) == SettlementSettled {
-				return c.warmReattach(ctx, handle, detail, priorAttemptState, pane, FirstMarkerMatch(pane, markers))
+			if settlement, occupant := CorroborateSettlement(paneMatches, pane, markers, *detail.Claim); settlement == SettlementSettled {
+				return c.warmReattach(ctx, handle, detail, priorAttemptState, occupant)
 			}
 		}
 
 		// A different, present occupant. Positive evidence (the run's
-		// pre-assigned native session reference in its argv) authorizes
-		// guarded retirement and cold relaunch; anything else fails closed.
+		// pre-assigned native session reference in the argv of SOME
+		// foreground member — the restored occupant spawns its own MCP
+		// children into its own group, so it holds no particular index)
+		// authorizes guarded retirement and cold relaunch, targeted at the
+		// member that carried the reference; anything else fails closed.
 		nativeRef, nativeErr := c.sessionNativeRef(ctx, handle, detail.SessionID)
-		if nativeErr == nil && nativeRef != "" && paneCarriesMarker(pane, nativeRef) {
-			if len(blocked) > 0 {
-				return ResumeResult{Outcome: ResumeReconciling, Detail: "unresolved work blocks the retirement: " + strings.Join(blocked, "; ")}, nil
+		if nativeErr == nil && nativeRef != "" {
+			if bearer, _, found := markerBearer(pane, []string{nativeRef}); found {
+				if len(blocked) > 0 {
+					return ResumeResult{Outcome: ResumeReconciling, Detail: "unresolved work blocks the retirement: " + strings.Join(blocked, "; ")}, nil
+				}
+				return c.retireAndRelaunch(ctx, handle, detail, req, bearer, nativeRef)
 			}
-			return c.retireAndRelaunch(ctx, handle, detail, req, pane, nativeRef)
 		}
 		return ResumeResult{
 			Outcome: ResumeFailedClosed, ObservedPaneID: detail.Binding.PaneID,
@@ -933,9 +937,11 @@ func (c *Controller) observePaneAbsence(ctx context.Context, paneID, label strin
 // warmReattach adopts a verified occupant: the attempt returns to its
 // prior state (derived from durable evidence when the attempt entered this
 // round already reconciling), the session is confirmed active, and the
-// binding's occupant evidence is refreshed with the marker that actually
-// corroborated — never a synthesized one.
-func (c *Controller) warmReattach(ctx context.Context, handle RunHandle, detail RunDetail, priorState run.AttemptState, pane PaneProcess, marker string) (ResumeResult, error) { //nolint:gocritic // hugeParam: RunHandle, RunDetail and PaneProcess are per-call values; this runs once per resume round.
+// binding's occupant evidence is refreshed with the corroborated member's
+// own pid and the marker that actually corroborated it — never a
+// synthesized marker, and never the pid of whichever member the foreground
+// listing happened to report first.
+func (c *Controller) warmReattach(ctx context.Context, handle RunHandle, detail RunDetail, priorState run.AttemptState, occupant SettlementEvidence) (ResumeResult, error) { //nolint:gocritic // hugeParam: RunHandle, RunDetail and SettlementEvidence are per-call values; this runs once per resume round.
 	target := priorState
 	if target == run.AttemptReconciling {
 		derived, deriveErr := c.reattachTarget(ctx, handle, detail)
@@ -980,8 +986,8 @@ func (c *Controller) warmReattach(ctx context.Context, handle RunHandle, detail 
 		if getErr != nil {
 			return getErr
 		}
-		if found && marker != "" {
-			evidence := run.OccupantEvidence{Label: binding.CreationLabel, ArgvMarker: marker, PID: firstForeground(pane).PID}
+		if found && occupant.Marker != "" {
+			evidence := run.OccupantEvidence{Label: binding.CreationLabel, ArgvMarker: occupant.Marker, PID: occupant.Occupant.PID}
 			nextBinding, observeErr := binding.Observe(evidence, now)
 			if observeErr != nil {
 				return observeErr
@@ -1122,7 +1128,10 @@ func (c *Controller) completedRetirement(ctx context.Context, handle RunHandle, 
 // is never reused — supersedes the launch binding with that evidence,
 // retires the occupant through the shared pane.close operation procedure,
 // and proceeds to cold relaunch only once its termination was observed.
-func (c *Controller) retireAndRelaunch(ctx context.Context, handle RunHandle, detail RunDetail, req ResumeRequest, pane PaneProcess, nativeRef string) (ResumeResult, error) { //nolint:gocritic // hugeParam: RunHandle, RunDetail, ResumeRequest and PaneProcess are per-call values; this runs once per resume round.
+// occupant is the foreground member whose own argv or cmdline carried
+// nativeRef (markerBearer): the close target records THAT member's pid,
+// never the pid of whichever member the listing reported first.
+func (c *Controller) retireAndRelaunch(ctx context.Context, handle RunHandle, detail RunDetail, req ResumeRequest, occupant ProcessInfo, nativeRef string) (ResumeResult, error) { //nolint:gocritic // hugeParam: RunHandle, RunDetail, ResumeRequest and ProcessInfo are per-call values; this runs once per resume round.
 	now := c.Clock.Now()
 	evidence := fmt.Sprintf("observed process argv carries native session reference %s", nativeRef)
 	observedInstance := c.observeServerInstance(ctx)
@@ -1145,7 +1154,7 @@ func (c *Controller) retireAndRelaunch(ctx context.Context, handle RunHandle, de
 		target = paneCloseTarget{
 			PaneID: binding.PaneID, Label: binding.CreationLabel,
 			SessionID: detail.SessionID, IncarnationID: binding.IncarnationID,
-			PID: firstForeground(pane).PID, Markers: []string{nativeRef},
+			PID: occupant.PID, Markers: []string{nativeRef},
 			Reason: closeReasonRetirement,
 		}
 		if binding.LaunchKind == run.LaunchRestoredObserved {
@@ -1159,7 +1168,7 @@ func (c *Controller) retireAndRelaunch(ctx context.Context, handle RunHandle, de
 			return saveErr
 		}
 		observed := run.NewRuntimeBinding(detail.SessionID, observationIncarnation, binding.ServerSocketPath, observedInstance, binding.WorkspaceID, binding.TabID, binding.PaneID, binding.CreationLabel, run.LaunchRestoredObserved, now)
-		observedEvidence := run.OccupantEvidence{Label: binding.CreationLabel, ArgvMarker: nativeRef, PID: firstForeground(pane).PID}
+		observedEvidence := run.OccupantEvidence{Label: binding.CreationLabel, ArgvMarker: nativeRef, PID: occupant.PID}
 		observed, observeErr := observed.Observe(observedEvidence, now)
 		if observeErr != nil {
 			return observeErr
@@ -1473,10 +1482,4 @@ func enterReconciling(ctx context.Context, uow UnitOfWork, detail RunDetail, gen
 		return err
 	}
 	return recordTransition(ctx, uow, EntitySession, detail.SessionID.String(), string(sFrom), string(s.State), "takeover", generation, now)
-}
-
-// paneCarriesMarker reports whether pane's foreground process argv or
-// cmdline carries marker.
-func paneCarriesMarker(pane PaneProcess, marker string) bool {
-	return FirstMarkerMatch(pane, []string{marker}) != ""
 }

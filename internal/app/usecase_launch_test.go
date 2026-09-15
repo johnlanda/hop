@@ -2,6 +2,7 @@ package app_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -82,6 +83,70 @@ func TestCorroborateLaunch(t *testing.T) {
 		}
 		if tc.Store.LaunchClaims[detail.Binding.IncarnationID].State != app.LaunchClaimExeced {
 			t.Fatalf("launch claim was not settled to execed")
+		}
+	})
+
+	t.Run("settled: the claimed member corroborates from behind its own MCP-server members", func(t *testing.T) {
+		// The pinned live shape (TestLiveClaudeDefaultProfileRun on main
+		// 3be1748): the harness's MCP-server children share its process
+		// group and are listed BEFORE it, so the worker is not
+		// Foreground[0]. Settlement must find it anyway, and the recorded
+		// claim settlement and occupant evidence must carry the
+		// CORROBORATED member's pid and marker, not index 0's.
+		tc := newTestController(defaultPolicy())
+		handle, detail := startedRun(t, tc)
+		claimLaunch(t, tc, detail, 4242)
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			return mcpGroupPane(4242, "/usr/bin/claude", detail.AttemptID.String()), nil
+		}
+
+		progress, err := tc.Controller.CorroborateLaunch(context.Background(), handle)
+		if err != nil {
+			t.Fatalf("CorroborateLaunch() error = %v", err)
+		}
+		if progress != app.LaunchSettled {
+			t.Fatalf("progress = %s, want %s", progress, app.LaunchSettled)
+		}
+		claim := tc.Store.LaunchClaims[detail.Binding.IncarnationID]
+		if claim.State != app.LaunchClaimExeced {
+			t.Fatalf("launch claim state = %s, want %s", claim.State, app.LaunchClaimExeced)
+		}
+		for _, want := range []string{"pid=4242", "marker=" + detail.AttemptID.String()} {
+			if !strings.Contains(claim.SettlementEvidence, want) {
+				t.Fatalf("settlement evidence %q missing %q: the corroborated member's own pid and marker must be recorded, never an MCP sibling's", claim.SettlementEvidence, want)
+			}
+		}
+		bindings := tc.Store.Bindings[detail.SessionID]
+		if n := len(bindings); n == 0 || bindings[n-1].Occupant == nil || bindings[n-1].Occupant.PID != 4242 {
+			t.Fatalf("binding occupant evidence = %+v, want the corroborated member's pid 4242", bindings)
+		}
+	})
+
+	t.Run("needs interaction: a matching member under a different pid fails closed even when the claimed member matches", func(t *testing.T) {
+		// Wrapper precedence: a live wrapper that already exec'd carries
+		// the recorded executable and markers in its own argv under the
+		// claim's pid, alongside the forked real harness under a different
+		// pid — the unsupported topology must fail closed, never settle
+		// through the wrapper member.
+		tc := newTestController(defaultPolicy())
+		handle, detail := startedRun(t, tc)
+		claimLaunch(t, tc, detail, 4242)
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			return app.PaneProcess{Foreground: []app.ProcessInfo{
+				{PID: 4242, Argv0: "claude", Name: "claude", Argv: []string{"/usr/bin/claude", detail.AttemptID.String()}},
+				{PID: 9999, Argv0: "claude", Name: "claude", Argv: []string{"/usr/bin/claude", detail.AttemptID.String()}},
+			}}, nil
+		}
+
+		progress, err := tc.Controller.CorroborateLaunch(context.Background(), handle)
+		if err != nil {
+			t.Fatalf("CorroborateLaunch() error = %v", err)
+		}
+		if progress != app.LaunchNeedsInteraction {
+			t.Fatalf("progress = %s, want %s", progress, app.LaunchNeedsInteraction)
+		}
+		if tc.Store.LaunchClaims[detail.Binding.IncarnationID].State != app.LaunchClaimExecPending {
+			t.Fatalf("the forking-wrapper topology must never settle the claim, even with the claimed pid also matching")
 		}
 	})
 

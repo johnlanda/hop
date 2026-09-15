@@ -30,6 +30,13 @@ type fakeRuntime struct {
 
 	FindPaneByLabelFn func(label string) (app.PaneRef, bool, error)
 
+	// InspectPaneFn scripts InspectPane. Scripted PaneProcess values must
+	// use the real pane.process_info surface's shapes: Foreground lists
+	// EVERY member of the foreground process group in raw platform order
+	// (macOS unsorted proc_listpids, Linux ascending pid), so a launched
+	// harness with children — Claude Code spawns its MCP servers into its
+	// own group — is a multi-member listing with no index semantics;
+	// mcpGroupPane (helpers_test.go) reproduces the pinned live shape.
 	InspectPaneFn func(paneID string) (app.PaneProcess, error)
 
 	// ReadPaneFn, when set, handles ReadPane; a test can take the lease

@@ -17,10 +17,14 @@ func defaultResumeRequest(runID string) app.ResumeRequest {
 
 func TestResume(t *testing.T) {
 	t.Run("warm reattach: a matching occupant returns the attempt to running", func(t *testing.T) {
+		// The pane reports the pinned multi-member shape: the worker's own
+		// MCP-server children share its process group and are listed before
+		// it, so adoption must corroborate the worker from index 1+ and
+		// record THAT member's pid as occupant evidence.
 		tc := newTestController(defaultPolicy())
 		_, detail := runningRun(t, tc)
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "claude", Name: "claude", Argv: []string{"/usr/bin/claude", detail.AttemptID.String()}}}}, nil
+			return mcpGroupPane(4242, "/usr/bin/claude", detail.AttemptID.String()), nil
 		}
 
 		tc.Clock.Advance(leaseTTL + time.Second)
@@ -38,6 +42,10 @@ func TestResume(t *testing.T) {
 		}
 		if updated.AttemptState != run.AttemptRunning {
 			t.Fatalf("Attempt.State = %s, want %s", updated.AttemptState, run.AttemptRunning)
+		}
+		bindings := tc.Store.Bindings[detail.SessionID]
+		if n := len(bindings); n == 0 || bindings[n-1].Occupant == nil || bindings[n-1].Occupant.PID != 4242 {
+			t.Fatalf("binding occupant evidence = %+v, want the corroborated member's pid 4242, never an MCP sibling's", bindings)
 		}
 	})
 
@@ -524,9 +532,16 @@ func TestResumePositiveEvidenceRetirement(t *testing.T) {
 	originalWorkspace := detail.Binding.WorkspaceID
 
 	// Herdr's native restore replaced the worker: a new pid running
-	// `claude --resume <native-ref>`, bypassing the launcher.
+	// `claude --resume <native-ref>`, bypassing the launcher. The restored
+	// harness spawned its own MCP-server child into its process group, and
+	// the raw listing reports that child FIRST — the positive evidence and
+	// the recorded close target must both come from the member that
+	// actually carries the native reference, never from index 0.
 	tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-		return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 7777, Argv0: "claude", Name: "claude", Argv: []string{"/usr/bin/claude", "--resume", nativeRef}}}}, nil
+		return app.PaneProcess{Foreground: []app.ProcessInfo{
+			{PID: 7840, Argv0: "npm", Name: "npm", Argv: []string{"npm", "exec", "@executeautomation/playwright-mcp-server"}},
+			{PID: 7777, Argv0: "claude", Name: "claude", Argv: []string{"/usr/bin/claude", "--resume", nativeRef}},
+		}}, nil
 	}
 
 	tc.Clock.Advance(leaseTTL + time.Second)
@@ -1262,11 +1277,13 @@ func TestReconciliationClaimSettlement(t *testing.T) {
 		t.Fatalf("Attempt.State = %s, want %s", got, run.AttemptReconciling)
 	}
 
-	// The launcher then writes its claim and execs; the live worker now
-	// corroborates under the predicate on the next round.
+	// The launcher then writes its claim and execs; the live worker — with
+	// its MCP-server children already spawned into its own process group,
+	// so it is NOT index 0 of the raw listing — now corroborates under the
+	// predicate on the next round.
 	claimLaunch(t, tc, detail, 4242)
 	tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-		return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "claude", Name: "claude", Argv: []string{"/usr/bin/claude", detail.AttemptID.String()}}}}, nil
+		return mcpGroupPane(4242, "/usr/bin/claude", detail.AttemptID.String()), nil
 	}
 	tc.Clock.Advance(leaseTTL + time.Second)
 	second, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String()))
@@ -1276,8 +1293,12 @@ func TestReconciliationClaimSettlement(t *testing.T) {
 	if second.Outcome != app.ResumeWarmReattached {
 		t.Fatalf("second Outcome = %s, want %s", second.Outcome, app.ResumeWarmReattached)
 	}
-	if got := tc.Store.LaunchClaims[detail.Binding.IncarnationID].State; got != app.LaunchClaimExeced {
-		t.Fatalf("claim state = %s, want %s (settled from reconciliation)", got, app.LaunchClaimExeced)
+	claim := tc.Store.LaunchClaims[detail.Binding.IncarnationID]
+	if claim.State != app.LaunchClaimExeced {
+		t.Fatalf("claim state = %s, want %s (settled from reconciliation)", claim.State, app.LaunchClaimExeced)
+	}
+	if !strings.Contains(claim.SettlementEvidence, "pid=4242") {
+		t.Fatalf("settlement evidence %q must record the corroborated member's pid 4242, never an MCP sibling's", claim.SettlementEvidence)
 	}
 	updated, err := tc.Store.LoadRunStatus(context.Background(), detail.RunID)
 	if err != nil {

@@ -200,6 +200,38 @@ alternate-profile/pools work; they are not re-verified here.
   attempt budget on detected changes yields not-seeded evidence and the
   dialog fallback. Successful evidence records an observation, not a
   guarantee that trust remains set at exec.
+- MCP servers share the harness's own process group (observed live
+  2026-09-15, claude 2.1.270 under herdr 0.9.0, during the failed
+  `TestLiveClaudeDefaultProfileRun` on main 3be1748 whose evidence is
+  retained under `$TMPDIR/hop-integration/`). A launched
+  `claude --session-id <uuid> "<prompt>"` starts the operator's
+  user-level MCP servers as its children in ITS OWN process group
+  immediately after the (pre-seeded) trust check: the observed group held
+  the harness (pgid leader, argv intact) plus `npm exec
+  @executeautomation/playwright-mcp-server`, its `node .../
+  playwright-mcp-server` child, and an app-installed MCP server binary —
+  foreign executables, no HOP marker in any of their argvs. Herdr's
+  `pane.process_info` reports EVERY member of the foreground group, in
+  raw platform listing order with no sorting and no positional
+  semantics: macOS builds the list from unsorted
+  `proc_listpids(PROC_PGRP_ONLY, ...)`
+  ([macos.rs](../../repos/herdr/src/platform/macos.rs),
+  `foreground_job`); Linux sorts ascending by pid
+  ([linux.rs](../../repos/herdr/src/platform/linux.rs),
+  `foreground_process_group_members_with`), which still gives the leader
+  no fixed index (a recycled lower pid can precede it); the API maps the
+  job's order verbatim
+  ([panes.rs](../../repos/herdr/src/app/api/panes.rs),
+  `handle_pane_process_info`). In the live observation index 0 was an MCP
+  server, which left the launch claim `exec_pending` for the whole bound
+  while settlement read only `foreground[0]`. Consequence: every HOP
+  decision over a pane occupant (settlement, adoption, close-target
+  match, positive-evidence retirement) must scan ALL members and must
+  never depend on member position; the per-member predicate rules live in
+  `internal/app/decision.go` and internal/app/AGENTS.md, and the executed
+  real-process probe pinning the shape under the production transport is
+  `TestRealProcessSettlementWithMCPGroupMembers`
+  (test/integration/pgroup_test.go).
 - Keychain side effect of any launch (observed during the same spike):
   merely starting claude under a fresh `CLAUDE_CONFIG_DIR` — no login —
   creates the keychain item
