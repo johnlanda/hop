@@ -173,6 +173,81 @@ func TestRunRequestStopIsMonotonic(t *testing.T) {
 	}
 }
 
+// TestRunClosePlan proves ClosePlan's two guards: the run must be running
+// (ErrRunNotAccepting), and the plan must have at least one implement task
+// (ErrEmptyPlan).
+func TestRunClosePlan(t *testing.T) {
+	t.Run("running with an implement task", func(t *testing.T) {
+		r := run.Run{ID: testRunID, State: run.RunRunning}
+
+		got, err := r.ClosePlan(true, epoch())
+		if err != nil {
+			t.Fatalf("ClosePlan: unexpected error: %v", err)
+		}
+		if !got.PlanClosed {
+			t.Fatal("ClosePlan: PlanClosed = false, want true")
+		}
+	})
+
+	t.Run("empty plan refused", func(t *testing.T) {
+		r := run.Run{ID: testRunID, State: run.RunRunning}
+
+		got, err := r.ClosePlan(false, epoch())
+		if !errors.Is(err, run.ErrEmptyPlan) {
+			t.Fatalf("ClosePlan(no implement task): error = %v, want ErrEmptyPlan", err)
+		}
+		if got.PlanClosed {
+			t.Fatal("ClosePlan(no implement task): PlanClosed = true, want unchanged")
+		}
+	})
+
+	t.Run("not running refused", func(t *testing.T) {
+		for _, from := range runStates() {
+			if from == run.RunRunning {
+				continue
+			}
+			r := run.Run{ID: testRunID, State: from}
+
+			_, err := r.ClosePlan(true, epoch())
+			if !errors.Is(err, run.ErrRunNotAccepting) {
+				t.Fatalf("ClosePlan from %s: error = %v, want ErrRunNotAccepting", from, err)
+			}
+		}
+	})
+}
+
+// TestRunReopenPlan proves ReopenPlan clears the flag unconditionally.
+func TestRunReopenPlan(t *testing.T) {
+	r := run.Run{ID: testRunID, State: run.RunRunning, PlanClosed: true}
+
+	got := r.ReopenPlan(later())
+
+	if got.PlanClosed {
+		t.Fatal("ReopenPlan: PlanClosed = true, want false")
+	}
+	if !got.UpdatedAt.Equal(later()) {
+		t.Fatalf("ReopenPlan: UpdatedAt = %v, want %v", got.UpdatedAt, later())
+	}
+}
+
+// TestRunCanAcceptManagerVerb proves the shared eligibility check every
+// manager verb's accepting transaction re-validates: only running.
+func TestRunCanAcceptManagerVerb(t *testing.T) {
+	for _, from := range runStates() {
+		r := run.Run{ID: testRunID, State: from}
+		err := r.CanAcceptManagerVerb()
+		if from == run.RunRunning {
+			if err != nil {
+				t.Fatalf("CanAcceptManagerVerb from %s: unexpected error: %v", from, err)
+			}
+			continue
+		}
+		if !errors.Is(err, run.ErrRunNotAccepting) {
+			t.Fatalf("CanAcceptManagerVerb from %s: error = %v, want ErrRunNotAccepting", from, err)
+		}
+	}
+}
+
 func TestNewRun(t *testing.T) {
 	r := run.NewRun(testRunID, testRepositoryID, 1, "brief-digest", epoch())
 

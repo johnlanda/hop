@@ -57,7 +57,10 @@ func concatPairs[S comparable](groups ...[][2]S) [][2]S {
 }
 
 // Run is one orchestration run: one task brief executed under an immutable
-// effective configuration. Phase 2 gives a run exactly one task.
+// effective configuration. Phase 2 gives a run exactly one task; feature
+// mode (Phase 3) gains PlanClosed, the durable statement that the
+// manager's plan is finished. Solo runs never close a plan and never
+// consult the flag.
 type Run struct {
 	ID            identity.RunID
 	RepositoryID  identity.RepositoryID
@@ -65,6 +68,7 @@ type Run struct {
 	BriefDigest   string
 	State         RunState
 	StopRequested bool
+	PlanClosed    bool
 	UpdatedAt     time.Time
 }
 
@@ -146,3 +150,40 @@ func (r Run) MarkStopped(now time.Time) (Run, error) { return r.transition(RunSt
 // EnterResuming moves the run into resuming: hop resume acquired the
 // controller lease and begins reconciliation.
 func (r Run) EnterResuming(now time.Time) (Run, error) { return r.transition(RunResuming, now) } //nolint:gocritic // hugeParam: Run is an immutable domain value returned by every transition; a pointer receiver would let a caller's original be mutated through it, breaking the pure-transition contract.
+
+// CanAcceptManagerVerb reports whether r currently accepts a manager verb
+// (CreateTask, RequestRetry, ClosePlan): only while running.
+// ErrRunNotAccepting otherwise, the fate of a late request racing
+// completion — validated inside the same accepting transaction so nothing
+// can race it.
+func (r Run) CanAcceptManagerVerb() error {
+	if r.State != RunRunning {
+		return fmt.Errorf("%w: run %s: state %s", ErrRunNotAccepting, r.ID, r.State)
+	}
+	return nil
+}
+
+// ClosePlan sets the plan flag: the manager has finished submitting its
+// plan. hasImplementTask must be true — a plan with zero implement tasks
+// is ErrEmptyPlan, a usage error surfaced to the manager rather than a
+// silently-vacuous readiness. Also validates CanAcceptManagerVerb.
+func (r Run) ClosePlan(hasImplementTask bool, now time.Time) (Run, error) { //nolint:gocritic // hugeParam: Run is an immutable domain value returned by every transition; a pointer receiver would let a caller's original be mutated through it, breaking the pure-transition contract.
+	if err := r.CanAcceptManagerVerb(); err != nil {
+		return r, err
+	}
+	if !hasImplementTask {
+		return r, fmt.Errorf("%w: run %s", ErrEmptyPlan, r.ID)
+	}
+	r.PlanClosed = true
+	r.UpdatedAt = now
+	return r, nil
+}
+
+// ReopenPlan clears the plan flag: an accepted CreateTask reopens planning
+// even after a prior close, inside the same transaction that accepts the
+// new task.
+func (r Run) ReopenPlan(now time.Time) Run { //nolint:gocritic // hugeParam: Run is an immutable domain value returned by every transition; a pointer receiver would let a caller's original be mutated through it, breaking the pure-transition contract.
+	r.PlanClosed = false
+	r.UpdatedAt = now
+	return r
+}
