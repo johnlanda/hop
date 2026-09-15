@@ -10,12 +10,11 @@ import (
 	"github.com/johnlanda/hop/internal/adapters/herdr"
 )
 
-// TestSpikeAPIRequestLogObservability is a PROVISIONAL probe (numbering
-// pending the design planner), requested by the Phase 3 design reviewer,
-// establishing exactly what Herdr's own server request log makes observable
-// -- the precondition a future injection-free real-process scenario (design
-// section 11, TestRealProcessInjectionFreeDelivery) needs before it can cite
-// "the server's own log shows no pane.send_text/agent.prompt request" as
+// TestSpikeAPIRequestLogObservability establishes exactly what Herdr's own
+// server request log makes observable -- the precondition a future
+// injection-free real-process scenario (design section 11,
+// TestRealProcessInjectionFreeDelivery) needs before it can cite "the
+// server's own log shows no pane.send_text/agent.prompt request" as
 // evidence.
 //
 // Confirmed against repos/herdr source and this test's own executed
@@ -24,32 +23,29 @@ import (
 //     (filepath.Dir(server.socketPath)), file "herdr-server.log"
 //     (repos/herdr/src/server/headless/bootstrap.rs init_logging,
 //     repos/herdr/src/session.rs data_dir/config_dir).
-//   - Level: pane.send_text (changes_ui=false,
-//     repos/herdr/src/api/mod.rs request_changes_ui) logs its start/complete
-//     pair at DEBUG only when it SUCCEEDS (repos/herdr/src/logging.rs
-//     api_request_started/api_request_completed); agent.prompt
-//     (changes_ui=true, not in logging.rs's routine-method allowlist) logs
-//     its start at INFO regardless of outcome. The default filter (HERDR_LOG
-//     unset) is "herdr=info", so a SUCCESSFUL pane.send_text is invisible at
-//     default settings while agent.prompt is always visible; a FAILED
-//     pane.send_text would still surface via api_request_failed, which logs
-//     at WARN unconditionally -- this probe's send_text calls all succeed,
-//     so that path is not what is being pinned here.
+//   - Level: pane.send_text/pane.send_keys/pane.send_input
+//     (changes_ui=false, repos/herdr/src/api/mod.rs request_changes_ui)
+//     log their start/complete pair at DEBUG only when they succeed
+//     (repos/herdr/src/logging.rs api_request_started/api_request_completed);
+//     a failure logs via api_request_failed, which is DEBUG for its start
+//     line and unconditional WARN for the failure line regardless of
+//     changes_ui. agent.prompt/agent.send_keys/agent.start (changes_ui=true,
+//     not in logging.rs's routine-method allowlist) log their start at INFO
+//     regardless of outcome. The default filter (HERDR_LOG unset) is
+//     "herdr=info", so a SUCCESSFUL pane.* call is invisible at default
+//     settings while every agent.* call is always visible.
 //   - Correlation: every request-log line carries method and request_id, but
-//     NEVER the pane/agent target -- an injection-free scenario can only
-//     honestly claim "no pane.send_text/agent.prompt request was logged
-//     during the run," never a per-pane claim. request_id is a CLIENT-chosen
-//     label the server only echoes back into its own log, never a
-//     server-assigned global sequence: two INDEPENDENT client connections to
-//     the same server (this test's own server.client, driving readiness
-//     polling and workspace.create, and a dedicated probe client) both start
-//     counting from "hop-1", so the SAME id value appears in one log against
-//     two UNRELATED methods (confirmed below). A log-based correlation must
-//     therefore locate its own call's line by something unique to it (here,
-//     method name, since nothing else in this scenario calls pane.send_text
-//     or agent.prompt) and read the id back from there, never treat a
-//     request_id value as a global primary key across every connection
-//     touching the server.
+//     NEVER the pane/agent target or any request payload -- an
+//     injection-free scenario can only honestly claim "no pane.send_text/
+//     agent.prompt request was logged during the run," never a per-pane
+//     claim. request_id is a CLIENT-chosen label the server only echoes
+//     back into its own log, never a server-assigned global sequence: two
+//     INDEPENDENT client connections to the same server both start
+//     counting from "hop-1", so the SAME id value can appear against two
+//     UNRELATED methods in one log -- a log-based correlation must locate
+//     its own call's line by something unique to it (method name, when
+//     nothing else in the scenario calls that method) and read the id back
+//     from there, never treat a request_id value as a global primary key.
 //   - Format: plain text (tracing_subscriber's default formatter, no JSON,
 //     no ANSI), one line per event with a message followed by
 //     space-separated key="value"/key=value fields; captured verbatim into
@@ -64,56 +60,57 @@ func TestSpikeAPIRequestLogObservability(t *testing.T) {
 	server.call(t, "workspace.create", map[string]any{"cwd": server.workDir(), "focus": true}, &workspace)
 	pane := workspace.RootPane.PaneID
 
-	// A dedicated client for the positive control, kept separate from
-	// server.client so its calls are easy to isolate by method name.
-	// request_id is NOT used to locate these lines (see the file comment's
-	// finding) -- it is read back FROM the located line instead.
-	probe := herdr.NewClient(server.socketPath)
+	server.call(t, "pane.list", nil, &struct{}{}) // window-start bracket
 
-	// Capture-window bracketing: request-log lines never carry their own
-	// request's params (see the file comment) -- a chosen "marker" value
-	// like a label is NEVER visible in the log, only method and request_id
-	// are. The bracket must therefore be two otherwise-unused METHODS: one
-	// issued immediately before anything under test (pane.list, never
-	// called elsewhere in this scenario), one immediately after
-	// (tab.list). A future injection-free scenario must scope its "no
-	// send_text/prompt logged" search to BETWEEN its own start and
-	// completion requests' own log lines this way, never the whole
-	// (potentially multi-run) log file.
-	server.call(t, "pane.list", nil, &struct{}{})
+	// Two single-call clients, each its own connection with its own
+	// request-id counter starting at 1: this deterministically reproduces
+	// the collision documented above -- both log request_id="hop-1"
+	// against two DIFFERENT methods, distinguishable only by method, never
+	// by id value.
+	collisionClient := herdr.NewClient(server.socketPath)
+	if err := collisionClient.Call(testContext(t), "session.snapshot", nil, nil); err != nil {
+		t.Fatalf("session.snapshot (collision control): %v", err)
+	}
 
 	sendMarker := "hop-spike-log-probe-" + newSpikeUUID(t)
-	if err := probe.Call(testContext(t), "pane.send_text", map[string]any{
-		"pane_id": pane, "text": sendMarker + "\n",
-	}, nil); err != nil {
-		t.Fatalf("pane.send_text: %v", err)
+	inputMarker := "hop-spike-log-probe-input-" + newSpikeUUID(t)
+	cases := []apiLogCase{
+		{
+			method: "pane.send_text", params: map[string]any{"pane_id": pane, "text": sendMarker + "\n"},
+			succeeds: true, startLevel: "DEBUG", secondLevel: "DEBUG",
+			forbidden: []string{pane, sendMarker},
+		},
+		{
+			method: "pane.send_keys", params: map[string]any{"pane_id": pane, "keys": []string{"Enter"}},
+			succeeds: true, startLevel: "DEBUG", secondLevel: "DEBUG",
+			forbidden: []string{pane},
+		},
+		{
+			method: "pane.send_input", params: map[string]any{"pane_id": pane, "text": inputMarker},
+			succeeds: true, startLevel: "DEBUG", secondLevel: "DEBUG",
+			forbidden: []string{pane, inputMarker},
+		},
+		{
+			method: "agent.prompt", params: map[string]any{"target": pane, "text": "hop-spike-log-probe-prompt"},
+			succeeds: false, startLevel: "INFO", secondLevel: "WARN",
+			forbidden: []string{pane},
+		},
+		{
+			method: "agent.send_keys", params: map[string]any{"target": pane, "keys": []string{"Enter"}},
+			succeeds: false, startLevel: "INFO", secondLevel: "WARN",
+			forbidden: []string{pane},
+		},
+		{
+			method: "agent.start", params: map[string]any{"name": "hop-spike-log-probe", "kind": "hop-spike-unrecognized-kind", "pane_id": pane},
+			succeeds: false, startLevel: "INFO", secondLevel: "WARN",
+			forbidden: []string{pane, "hop-spike-log-probe"},
+		},
 	}
-	promptErr := probe.Call(testContext(t), "agent.prompt", map[string]any{
-		"target": pane, "text": "hop-spike-log-probe-prompt",
-	}, nil)
-	t.Logf("agent.prompt against pane %s (no live/matching agent) returned: %v; only its log visibility is under test here", pane, promptErr)
+	for i := range cases {
+		runAPILogCase(t, server, &cases[i])
+	}
 
-	// Cheap coverage of every other pane/agent input-adjacent method
-	// (design section 7's whole "typed input" surface): none needs to
-	// succeed, only to reach dispatch so its own request-log line exists.
-	// agent.start uses an unrecognized kind (S5's technique) so it is
-	// refused before touching any terminal, never actually starting a
-	// process.
-	otherInputMethods := []struct {
-		method string
-		params map[string]any
-	}{
-		{"pane.send_keys", map[string]any{"pane_id": pane, "keys": []string{"Enter"}}},
-		{"pane.send_input", map[string]any{"pane_id": pane, "text": "hop-spike-log-probe-input"}},
-		{"agent.send_keys", map[string]any{"target": pane, "keys": []string{"Enter"}}},
-		{"agent.start", map[string]any{"name": "hop-spike-log-probe", "kind": "hop-spike-unrecognized-kind", "pane_id": pane}},
-	}
-	for _, call := range otherInputMethods {
-		err := probe.Call(testContext(t), call.method, call.params, nil)
-		t.Logf("%s (probe coverage) returned: %v; only its log visibility is under test here", call.method, err)
-	}
-
-	server.call(t, "tab.list", nil, &struct{}{})
+	server.call(t, "tab.list", nil, &struct{}{}) // window-end bracket
 
 	logPath := filepath.Join(filepath.Dir(server.socketPath), "herdr-server.log")
 	var content string
@@ -141,83 +138,48 @@ func TestSpikeAPIRequestLogObservability(t *testing.T) {
 	if endIdx <= startIdx {
 		t.Fatalf("window-end line %d is not after window-start line %d; the bracket is not usable for scoping a scan", endIdx, startIdx)
 	}
-	for _, call := range append([]struct {
-		method string
-		params map[string]any
-	}{{"pane.send_text", nil}, {"agent.prompt", nil}}, otherInputMethods...) {
-		idx, found := firstLineIndex(lines, `method="`+call.method+`"`)
-		if !found {
-			t.Errorf("herdr-server.log has no line for %s", call.method)
-			continue
-		}
-		if idx <= startIdx || idx >= endIdx {
-			t.Errorf("%s logged at line %d, want it strictly between the window-start (%d) and window-end (%d) markers", call.method, idx, startIdx, endIdx)
-		}
+
+	snapshotLine := requireLine(t, lines, startIdx, endIdx, `request_id="hop-1"`, `method="session.snapshot"`)
+	sendTextStartLine := requireLine(t, lines, startIdx, endIdx, `request_id="hop-1"`, `method="pane.send_text"`, `event="api.request.start"`)
+	if snapshotLine == sendTextStartLine {
+		t.Fatal("the collision control and pane.send_text resolved to the same log line")
+	}
+	t.Logf("collision confirmed, distinguishable only by method:\n%s\n%s", snapshotLine, sendTextStartLine)
+
+	for i := range cases {
+		assertAPILogCase(t, lines, startIdx, endIdx, &cases[i])
 	}
 
-	sendTextLine, ok := lineContaining(content, `method="pane.send_text"`)
-	if !ok {
-		t.Fatalf("herdr-server.log has no line for pane.send_text under HERDR_LOG=herdr=debug; content:\n%s", content)
-	}
-	sendTextID, ok := extractRequestID(sendTextLine)
-	if !ok {
-		t.Fatalf("pane.send_text log line carries no request_id field: %s", sendTextLine)
-	}
-	if strings.Contains(sendTextLine, sendMarker) {
-		t.Errorf("the logged pane.send_text line contains the sent TEXT itself (%q); expected only method/request_id metadata, never payload content: %s", sendMarker, sendTextLine)
-	}
-	if strings.Contains(sendTextLine, pane) {
-		t.Errorf("the logged pane.send_text line names the target pane %q; expected the request log to carry no pane target, only method and request_id: %s", pane, sendTextLine)
-	}
-
-	promptLine, ok := lineContaining(content, `method="agent.prompt"`)
-	if !ok {
-		t.Fatalf("herdr-server.log has no line for agent.prompt; content:\n%s", content)
-	}
-	promptID, ok := extractRequestID(promptLine)
-	if !ok {
-		t.Fatalf("agent.prompt log line carries no request_id field: %s", promptLine)
-	}
-	t.Logf("correlated by method: pane.send_text -> request_id=%s; agent.prompt -> request_id=%s", sendTextID, promptID)
-	if sendTextID == promptID {
-		t.Errorf("pane.send_text and agent.prompt, two distinct calls from the SAME probe client, logged the SAME request_id %s; expected each call to get its own", sendTextID)
-	}
-
-	// The id-collision FINDING itself, made concrete: server.client (this
-	// test's own driver, used for readiness polling and workspace.create
-	// above) is a SEPARATE connection from probe, and both count from 1 --
-	// so "hop-1" is very likely also logged here against an unrelated
-	// method. This is why the lookups above locate lines by method, never by
-	// a pre-guessed request_id value.
-	if line, ok := lineContaining(content, `request_id="hop-1"`); ok {
-		t.Logf("request_id is per-client, not global -- a second, unrelated connection's own request_id=\"hop-1\": %s", line)
-	}
-
-	// Absence, made meaningful: a SEPARATE server at Herdr's DEFAULT log
-	// level (HERDR_LOG unset) proves the two methods diverge exactly as the
-	// elevated run above implies -- agent.prompt is visible even without
-	// elevation, a SUCCESSFUL pane.send_text is not -- using the SAME
-	// detection mechanism that just found real records above, anchored to a
-	// causally later, always-visible checkpoint request (never an instant
-	// read or a fixed sleep) so the absence claim is not merely "nothing had
-	// raced into the file yet."
+	// Absence and presence, made meaningful: a SEPARATE server at Herdr's
+	// DEFAULT log level (HERDR_LOG unset) exercises the SAME six methods
+	// through the SAME assertion mechanism, confirming the level split is
+	// real and not an artifact of the elevated capture above -- a
+	// SUCCESSFUL pane.* call produces no log line for its method at all,
+	// while every agent.* call remains fully visible.
+	// pane.list/tab.list are themselves DEBUG-only (changes_ui=false), so
+	// they cannot bracket a capture at the default level; workspace.create
+	// (already issued here for setup) and workspace.focus (issued below)
+	// are changes_ui=true and non-routine, so both stay visible at INFO
+	// regardless of level.
 	defaultArtifacts := newArtifactDir(t)
 	defaultServer := prepareServer(t, defaultArtifacts)
 	defaultServer.start(t)
 	var defaultWorkspace workspaceCreatedResponse
 	defaultServer.call(t, "workspace.create", map[string]any{"cwd": defaultServer.workDir(), "focus": true}, &defaultWorkspace)
 	defaultPane := defaultWorkspace.RootPane.PaneID
-	defaultServer.call(t, "pane.send_text", map[string]any{
-		"pane_id": defaultPane, "text": "default-level-send-text-probe\n",
-	}, nil)
-	defaultPromptErr := defaultServer.client.Call(testContext(t), "agent.prompt", map[string]any{
-		"target": defaultPane, "text": "default-level-agent-prompt-probe",
-	}, nil)
-	t.Logf("agent.prompt at the default log level returned: %v; only its log visibility is under test here", defaultPromptErr)
-	var checkpoint workspaceCreatedResponse
-	defaultServer.call(t, "workspace.create", map[string]any{
-		"cwd": defaultServer.workDir(), "focus": false, "label": "hop-spike-log-checkpoint",
-	}, &checkpoint)
+
+	defaultCases := []apiLogCase{
+		{method: "pane.send_text", params: map[string]any{"pane_id": defaultPane, "text": "default-level-send-text\n"}, succeeds: true},
+		{method: "pane.send_keys", params: map[string]any{"pane_id": defaultPane, "keys": []string{"Enter"}}, succeeds: true},
+		{method: "pane.send_input", params: map[string]any{"pane_id": defaultPane, "text": "default-level-send-input"}, succeeds: true},
+		{method: "agent.prompt", params: map[string]any{"target": defaultPane, "text": "default-level-prompt"}, succeeds: false, startLevel: "INFO", secondLevel: "WARN"},
+		{method: "agent.send_keys", params: map[string]any{"target": defaultPane, "keys": []string{"Enter"}}, succeeds: false, startLevel: "INFO", secondLevel: "WARN"},
+		{method: "agent.start", params: map[string]any{"name": "hop-spike-log-probe", "kind": "hop-spike-unrecognized-kind", "pane_id": defaultPane}, succeeds: false, startLevel: "INFO", secondLevel: "WARN"},
+	}
+	for i := range defaultCases {
+		runAPILogCase(t, defaultServer, &defaultCases[i])
+	}
+	defaultServer.call(t, "workspace.focus", map[string]any{"workspace_id": defaultWorkspace.Workspace.WorkspaceID}, &struct{}{})
 
 	defaultLogPath := filepath.Join(filepath.Dir(defaultServer.socketPath), "herdr-server.log")
 	var defaultContent string
@@ -227,29 +189,92 @@ func TestSpikeAPIRequestLogObservability(t *testing.T) {
 			return false
 		}
 		defaultContent = string(data)
-		return strings.Contains(defaultContent, checkpoint.Workspace.WorkspaceID)
+		return strings.Contains(defaultContent, `method="workspace.focus"`)
 	}) {
-		t.Fatalf("herdr-server.log at %s never recorded the flush checkpoint workspace %s", defaultLogPath, checkpoint.Workspace.WorkspaceID)
+		t.Fatalf("herdr-server.log at %s never recorded the window-end marker (workspace.focus); last content:\n%s", defaultLogPath, defaultContent)
 	}
 	defaultArtifacts.save(t, "herdr-server-log-default-level.txt", defaultContent)
 
-	if strings.Contains(defaultContent, `method="pane.send_text"`) {
-		t.Errorf("herdr-server.log at the DEFAULT level unexpectedly recorded pane.send_text; the assumption that a log-based injection-free proof needs an elevated level does not hold:\n%s", defaultContent)
+	defaultLines := strings.Split(defaultContent, "\n")
+	defaultStartIdx, ok := firstLineIndex(defaultLines, `method="workspace.create"`)
+	if !ok {
+		t.Fatalf("default-level herdr-server.log never recorded the window-start marker (workspace.create)")
 	}
-	if !strings.Contains(defaultContent, `method="agent.prompt"`) {
-		t.Errorf("herdr-server.log at the DEFAULT level does not record agent.prompt; expected it visible without elevation:\n%s", defaultContent)
+	defaultEndIdx, ok := firstLineIndex(defaultLines, `method="workspace.focus"`)
+	if !ok {
+		t.Fatalf("default-level herdr-server.log never recorded the window-end marker (workspace.focus)")
+	}
+	for i := range defaultCases {
+		c := &defaultCases[i]
+		if c.succeeds {
+			for j := defaultStartIdx + 1; j < defaultEndIdx; j++ {
+				if strings.Contains(defaultLines[j], `method="`+c.method+`"`) {
+					t.Errorf("default-level log unexpectedly records a successful %s: %s", c.method, defaultLines[j])
+				}
+			}
+			continue
+		}
+		assertAPILogCase(t, defaultLines, defaultStartIdx, defaultEndIdx, c)
 	}
 }
 
-// lineContaining returns the first line of content containing substr, and
-// whether one was found.
-func lineContaining(content, substr string) (string, bool) {
-	for _, line := range strings.Split(content, "\n") {
-		if strings.Contains(line, substr) {
-			return line, true
+// apiLogCase is one method's request-log expectation: the call to issue and
+// (once succeeds is known) the exact start/second-record levels and any
+// strings that must never appear in either of that method's own log lines.
+type apiLogCase struct {
+	method      string
+	params      map[string]any
+	succeeds    bool
+	startLevel  string
+	secondLevel string
+	forbidden   []string
+}
+
+// runAPILogCase issues one case's call through a fresh single-call client
+// (so its request_id is deterministically "hop-1" from that client's own
+// counter) and fails the test if the call's outcome does not match what the
+// case declares.
+func runAPILogCase(t *testing.T, server *testServer, c *apiLogCase) {
+	t.Helper()
+	client := herdr.NewClient(server.socketPath)
+	err := client.Call(testContext(t), c.method, c.params, nil)
+	if c.succeeds && err != nil {
+		t.Fatalf("%s: %v", c.method, err)
+	}
+	if !c.succeeds && err == nil {
+		t.Fatalf("%s: unexpectedly succeeded, want a business-layer refusal", c.method)
+	}
+}
+
+// assertAPILogCase asserts one case's exact start record and second record
+// (api.request.complete on success, api.request.fail otherwise) within
+// lines[startIdx+1:endIdx], their levels, and the absence of every
+// forbidden string from both lines.
+func assertAPILogCase(t *testing.T, lines []string, startIdx, endIdx int, c *apiLogCase) {
+	t.Helper()
+	startLine := requireLine(t, lines, startIdx, endIdx, `event="api.request.start"`, `method="`+c.method+`"`)
+	if got := logLevel(startLine); got != c.startLevel {
+		t.Errorf("%s start record level = %s, want %s: %s", c.method, got, c.startLevel, startLine)
+	}
+	secondEvent, wantOutcome := `event="api.request.complete"`, "ok"
+	if !c.succeeds {
+		secondEvent, wantOutcome = `event="api.request.fail"`, "error"
+	}
+	secondLine := requireLine(t, lines, startIdx, endIdx, secondEvent, `method="`+c.method+`"`)
+	if got := logLevel(secondLine); got != c.secondLevel {
+		t.Errorf("%s second record level = %s, want %s: %s", c.method, got, c.secondLevel, secondLine)
+	}
+	if !strings.Contains(secondLine, `outcome="`+wantOutcome+`"`) {
+		t.Errorf("%s second record does not carry outcome=%q: %s", c.method, wantOutcome, secondLine)
+	}
+	for _, forbidden := range c.forbidden {
+		if strings.Contains(startLine, forbidden) {
+			t.Errorf("%s start record contains the forbidden string %q: %s", c.method, forbidden, startLine)
+		}
+		if strings.Contains(secondLine, forbidden) {
+			t.Errorf("%s second record contains the forbidden string %q: %s", c.method, forbidden, secondLine)
 		}
 	}
-	return "", false
 }
 
 // firstLineIndex returns the index of the first line in lines containing
@@ -263,14 +288,42 @@ func firstLineIndex(lines []string, substr string) (int, bool) {
 	return -1, false
 }
 
-// requestIDPattern matches one log line's request_id="..." field.
-var requestIDPattern = regexp.MustCompile(`request_id="([^"]*)"`)
-
-// extractRequestID reads the request_id field's value out of one log line.
-func extractRequestID(line string) (string, bool) {
-	match := requestIDPattern.FindStringSubmatch(line)
-	if match == nil {
-		return "", false
+// requireLine returns the line within lines[startIdx+1:endIdx] containing
+// every one of substrs, failing the test unless exactly one such line
+// exists.
+func requireLine(t *testing.T, lines []string, startIdx, endIdx int, substrs ...string) string {
+	t.Helper()
+	var found string
+	matches := 0
+	for i := startIdx + 1; i < endIdx; i++ {
+		line := lines[i]
+		all := true
+		for _, s := range substrs {
+			if !strings.Contains(line, s) {
+				all = false
+				break
+			}
+		}
+		if all {
+			found = line
+			matches++
+		}
 	}
-	return match[1], true
+	if matches != 1 {
+		t.Fatalf("expected exactly one log line containing %v within the capture window, found %d", substrs, matches)
+	}
+	return found
+}
+
+// logLevelPattern matches a request-log line's level token: a timestamp,
+// then the level, then the tracing target and a colon.
+var logLevelPattern = regexp.MustCompile(`^\S+\s+(\S+)\s+\S+:`)
+
+// logLevel extracts one log line's level (DEBUG, INFO, WARN, ...).
+func logLevel(line string) string {
+	match := logLevelPattern.FindStringSubmatch(line)
+	if match == nil {
+		return ""
+	}
+	return match[1]
 }
