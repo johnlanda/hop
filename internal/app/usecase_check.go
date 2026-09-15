@@ -12,6 +12,12 @@ import (
 	"github.com/johnlanda/hop/internal/domain/run"
 )
 
+// checkPersistenceTimeout bounds the evidence-retention and
+// outcome-recording writes that run AFTER the check command returned:
+// they must complete even when the caller's context was canceled to
+// interrupt the check, so they run under their own bounded context.
+const checkPersistenceTimeout = 30 * time.Second
+
 // CheckClaimDeadline bounds the ambiguous window between a check
 // execution's committed intent and its check-exec claim appearing: within
 // it an absent claim may still be a child that has not reached its
@@ -126,21 +132,35 @@ func (c *Controller) ClaimAndRunCheck(ctx context.Context, handle RunHandle, hop
 	cmdResult, runErr := c.Commands.Run(boundedCtx, Command{Argv: spawnArgv, Dir: checkoutPath, Env: spawnEnv})
 	cancel()
 
+	// A stop or detach interrupts the running check by canceling the
+	// CALLER's context, and that cancellation must reach only the external
+	// act above. Everything after the command returned — mandatory
+	// evidence retention and the outcome/interruption transaction — runs
+	// under its own bounded context that survives the caller's
+	// cancellation. The writes stay lease-fenced (Commit re-reads the
+	// lease), so a genuinely superseded controller still cannot commit,
+	// and no NEW external call runs under the survivable context: checkout
+	// cleanup keeps the caller's context and simply stays behind for
+	// recovery when that context is gone.
+	persistCtx, persistCancel := context.WithTimeout(context.WithoutCancel(ctx), checkPersistenceTimeout)
+	defer persistCancel()
+
 	// Evidence retention before any cleanup or outcome, on EVERY command
 	// result — a lost execution's partial output is evidence too: stdout
 	// and stderr are written under the execution's own directory and
 	// recorded as result-linked artifact rows with digests.
-	evidence, captureErr := c.captureCheckOutputs(ctx, handle, &frozen, opID, checkRequest.ResultID, cmdResult)
+	evidence, captureErr := c.captureCheckOutputs(persistCtx, handle, &frozen, opID, checkRequest.ResultID, cmdResult)
 
 	if runErr != nil {
 		// The spawn's result is unknowable here: the child may never have
-		// started, or may have started and been lost. Ambiguous — the
-		// operation goes reconciling with the error as evidence, whatever
-		// output was returned is preserved, the checkout is kept for
-		// inspection, and recovery resolves it through the claim table,
-		// never by guessing.
+		// started, or may have started and been lost (a canceled check
+		// included). Ambiguous — the operation goes reconciling with the
+		// error as evidence, whatever output was returned is preserved,
+		// the checkout is kept for inspection, and recovery resolves it
+		// through the claim table (or the stop path retires it), never by
+		// guessing.
 		if len(evidence) > 0 {
-			if saveErr := c.saveEvidenceRows(ctx, handle, evidence); saveErr != nil {
+			if saveErr := c.saveEvidenceRows(persistCtx, handle, evidence); saveErr != nil {
 				return CheckReport{}, saveErr
 			}
 		}
@@ -148,8 +168,16 @@ func (c *Controller) ClaimAndRunCheck(ctx context.Context, handle RunHandle, hop
 		if captureErr != nil {
 			detail += fmt.Sprintf("; output retention also failed: %v", captureErr)
 		}
-		if markErr := c.markOperationReconciling(ctx, handle, opID, detail); markErr != nil {
+		if markErr := c.markOperationReconciling(persistCtx, handle, opID, detail); markErr != nil {
 			return CheckReport{}, markErr
+		}
+		if captureErr != nil {
+			// A retention failure is never folded into the cancellation
+			// shape: the caller must see it as a real failure even on a
+			// deliberately interrupted round (the spawn error is carried
+			// as text, not wrapped, so errors.Is never reads this as a
+			// plain cancellation).
+			return CheckReport{Ran: true, OperationID: opID.String()}, fmt.Errorf("app: check output retention failed after an ambiguous execution (spawn error: %s): %w", runErr.Error(), captureErr)
 		}
 		return CheckReport{Ran: true, OperationID: opID.String()}, fmt.Errorf("app: check execution ambiguous: %w", runErr)
 	}
@@ -158,11 +186,11 @@ func (c *Controller) ClaimAndRunCheck(ctx context.Context, handle RunHandle, hop
 		// execution fails with the retention failure named, and the
 		// checkout is kept so the outputs remain inspectable in place.
 		outcome := checkRunOutcome{ExitCode: cmdResult.ExitCode, Detail: fmt.Sprintf("evidence retention failed: %v", captureErr)}
-		return c.recordCheckOutcome(ctx, handle, opID, checkRequest, outcome, false, captureErr, evidence...)
+		return c.recordCheckOutcome(persistCtx, handle, opID, checkRequest, outcome, false, captureErr, evidence...)
 	}
 
 	outcome := checkRunOutcome{ExitCode: cmdResult.ExitCode}
-	report, outcomeErr := c.recordCheckOutcome(ctx, handle, opID, checkRequest, outcome, frozen.Snapshot.CheckRepeatable, nil, evidence...)
+	report, outcomeErr := c.recordCheckOutcome(persistCtx, handle, opID, checkRequest, outcome, frozen.Snapshot.CheckRepeatable, nil, evidence...)
 	if outcomeErr != nil {
 		// The outcome was not durably recorded (a fenced or failed commit):
 		// the operation stays unresolved and the checkout is kept — cleanup

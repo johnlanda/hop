@@ -2,7 +2,8 @@
 
 ## Purpose
 
-Local-process driven adapter: the harness exec boundary (`Exec`), the
+Local-process driven adapter: the harness exec boundary (`Exec`,
+`ExecResolved`), the
 process-group command runner (`Runner` implementing `app.CommandRunner`,
 used for the check's git operations and for spawning `hop check-exec`) and
 the process-group inspector (`GroupInspector` implementing
@@ -14,7 +15,7 @@ package only observes and signals.
 
 | File | Entities / functions | Responsibility |
 | --- | --- | --- |
-| [exec.go](exec.go) | `Exec` | syscall.Exec wrapper: rejects an empty, bare or relative argv[0] before any system call, passes the complete env verbatim (nil execs empty), never returns on success |
+| [exec.go](exec.go) | `Exec`, `ExecResolved` | syscall.Exec wrappers, never returning on success, passing the complete env verbatim (nil execs empty). `Exec` rejects an empty, bare or relative argv[0] before any system call; `ExecResolved` executes an absolute path while preserving the caller's argv byte-for-byte (argv[0] may stay the bare name the caller resolved) — hop check-exec's boundary, whose running argv must equal the frozen check argv exactly for group retirement to match |
 | [runner.go](runner.go) | `Runner`, `CancellationError` | Runs argv as the leader of a new process group (Setpgid) with the complete env given, captures each stream bounded at 1 MiB, maps completions to exit codes (-1 for a signal), and on ctx cancellation SIGKILLs the whole group, reaps the leader within a bounded wait and returns a typed `*CancellationError` with the output captured so far; an unstartable anchor retires the group while the leader is provably unreaped instead of inferring anything from the failure's errno |
 | [inspector.go](inspector.go) | `GroupInspector`, `ArgvUnavailable` | Lists a group's live members (membership from one `ps -A -o pid=,pgid=` parse; a listing failure is an error, never an empty result) and sends the group SIGKILL under the same guard as the runner |
 | [argv_darwin.go](argv_darwin.go) | `processArgv`, `parseProcargs2` | Exact per-pid argv via the `kern.procargs2` sysctl (raw sysctl(2); the stdlib Sysctl cannot address a pid-parameterized MIB), parsed by the exact layout: argc, the executable path in a NUL-padded region of len(path)+1 rounded to 8, then exactly argc entries with empties preserved — never reading into the environment region and never guessing a boundary |
@@ -23,9 +24,11 @@ package only observes and signals.
 ## Invariants
 
 - Absolute executables only: `Exec` and `Runner.Run` reject a bare or
-  relative argv[0] — bare names never pin which binary runs (macOS
-  path_helper PATH reordering), and the design's exec boundary passes
-  absolute paths everywhere.
+  relative argv[0], and `ExecResolved` rejects a bare or relative executed
+  path — bare names never pin which binary runs (macOS path_helper PATH
+  reordering). `ExecResolved` separates the executed path from the reported
+  argv so the frozen check argv is never rewritten; which binary runs is
+  still pinned by the absolute path alone.
 - One owner of reaping per process and every teardown wait bounded: the
   leader is reaped by exactly one Wait goroutine, the anchor by the single
   owner `retireAnchor` spawns, no raw Wait4 ever touches a Cmd-managed
@@ -77,8 +80,9 @@ package only observes and signals.
 
 - Allowed inward imports: [internal/app](../../app/AGENTS.md).
 - Implemented ports: `app.CommandRunner` by `Runner`,
-  `app.ProcessGroupInspector` by `GroupInspector`; `Exec` is consumed
-  directly by the exec-boundary commands wired in `cmd/hop` (task 6a).
+  `app.ProcessGroupInspector` by `GroupInspector`; `Exec` (hop launch) and
+  `ExecResolved` (hop check-exec) are consumed directly by the
+  exec-boundary commands wired in `cmd/hop`.
 - External libraries: none; standard library only (`syscall` for process
   groups, signals and the darwin sysctl).
 
@@ -100,7 +104,9 @@ package only observes and signals.
   test's cleanup holds its own unreaped anchor as the identity pin and is
   disarmed before that pin is released. `Exec` is proven by a helper
   subprocess that observes the replaced image (same pid, exec-provided env
-  only) plus in-process rejection and failure-return cases. Inspection
+  only) plus in-process rejection and failure-return cases; `ExecResolved` by a
+  helper whose replaced image reports the renamed argv[0] and tail verbatim
+  with the pid preserved, plus rejection cases. Inspection
   failures are proven against injected ps stubs (nonzero exit, missing
   binary, unparseable rows) and an out-of-range pid for the
   `ArgvUnavailable` marker. The exact-argv parsers have pure tables

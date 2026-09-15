@@ -2,6 +2,7 @@ package app_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -130,6 +131,9 @@ func TestStartRun(t *testing.T) {
 		if err == nil {
 			t.Fatalf("StartRun() succeeded with no [check] command")
 		}
+		if !errors.Is(err, app.ErrStartRefused) {
+			t.Fatalf("StartRun() error = %v, want it to wrap ErrStartRefused for the usage exit code", err)
+		}
 	})
 
 	t.Run("refuses a SHA-256-object-format repository before any side effect", func(t *testing.T) {
@@ -138,6 +142,9 @@ func TestStartRun(t *testing.T) {
 		_, _, err := tc.Controller.StartRun(context.Background(), defaultStartRunRequest())
 		if err == nil {
 			t.Fatalf("StartRun() accepted an unsupported object format")
+		}
+		if !errors.Is(err, app.ErrStartRefused) {
+			t.Fatalf("StartRun() error = %v, want it to wrap ErrStartRefused for the usage exit code", err)
 		}
 		if len(tc.Store.Runs) != 0 {
 			t.Fatalf("StartRun() created a run despite the unsupported object format")
@@ -151,6 +158,9 @@ func TestStartRun(t *testing.T) {
 		_, _, err := tc.Controller.StartRun(context.Background(), req)
 		if err == nil {
 			t.Fatalf("StartRun() accepted a HOP path with a single quote")
+		}
+		if !errors.Is(err, app.ErrStartRefused) {
+			t.Fatalf("StartRun() error = %v, want it to wrap ErrStartRefused for the usage exit code", err)
 		}
 		if len(tc.Store.Runs) != 0 {
 			t.Fatalf("StartRun() created a run despite the refused path")

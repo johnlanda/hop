@@ -5,6 +5,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/johnlanda/hop/internal/adapters/herdr"
@@ -49,10 +51,34 @@ func runDoctor(args []string, stdout, stderr io.Writer, getenv func(string) stri
 	if err := renderReport(stdout, report); err != nil {
 		return exitOK, err
 	}
-	if !report.Healthy() {
+	rootHealthy, err := renderStateRoot(stdout, getenv)
+	if err != nil {
+		return exitOK, err
+	}
+	if !report.Healthy() || !rootHealthy {
 		return exitFailure, nil
 	}
 	return exitOK, nil
+}
+
+// renderStateRoot prints the doctor's store-path line: the state root the
+// shared resolver computes — without opening or migrating the database —
+// with its source label (override or default) and whether the store file
+// already exists (docs/plan/phase-2-design.md section 4). healthy is false
+// when the resolver refuses the environment, such as a relative
+// HOP_STATE_DIR. The returned error is non-nil only for a failed write.
+func renderStateRoot(w io.Writer, getenv func(string) string) (healthy bool, err error) {
+	root, source, resolveErr := resolveStateRoot(getenv)
+	if resolveErr != nil {
+		_, err = fmt.Fprintf(w, "%-12s state root: %s\n", "unavailable", resolveErr)
+		return false, err
+	}
+	status := "store absent (created on first run)"
+	if _, statErr := os.Stat(filepath.Join(root, "hop.db")); statErr == nil {
+		status = "store present"
+	}
+	_, err = fmt.Fprintf(w, "%-12s state root: %s (%s; %s)\n", "ok", root, source, status)
+	return true, err
 }
 
 // renderReport prints one aligned line per check, an advice line under every

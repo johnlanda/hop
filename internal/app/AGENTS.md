@@ -35,12 +35,13 @@ sides together. `cmd/hop` never imports domain or identity types: every
 | [operation_payload.go](operation_payload.go) | `decodeOperationPayload` | Reads a persisted operation intent/evidence/outcome payload without relying on Go type identity: a value of the target type passes through, anything else round-trips through JSON. Callers still validate required fields and fail closed on a failed decode |
 | [controller.go](controller.go) | `Controller`, `RunHandle`, `Heartbeat`, `Detach`, `ErrStopRequested` | The driving service composition calls; ports as fields. `RunHandle` is an opaque per-run token (run identity, the held lease and a dispatch scope) so composition never touches identity types. `Heartbeat` extends the lease on the design's interval and cancels in-flight external calls on failure; `Detach` journals, cancels and releases without stopping; `revalidateForDispatch` is the section 4 step 2 revalidation every external mutation runs first |
 | [assignment.go](assignment.go) | `renderAssignment` | Deterministic assignment-artifact content: brief, identities and absolute paths only, referenced by the launch argv, never typed into a dialog |
-| [usecase_run.go](usecase_run.go) | `StartRun`, `StartRunRequest`, `StartRunResult`, `classifyWorktreeProvenance` | Refuses unsupported repositories (SHA-256 object format, launch-line-hostile HOP paths) before any side effect, freezes the run snapshot, calls `InitializeRun`, writes/records the assignment artifact, then drives `worktree.create` (base commit resolved to an object id before the intent commits; canonical common-directory EQUALITY plus frozen-base HEAD comparison validate provenance) and `pane.open` as record-intent/act/record-outcome units |
+| [usecase_run.go](usecase_run.go) | `StartRun`, `StartRunRequest`, `StartRunResult`, `ErrStartRefused`, `classifyWorktreeProvenance` | Refuses unsupported repositories (SHA-256 object format, launch-line-hostile HOP paths) and unusable policies before any side effect — every such refusal wraps `ErrStartRefused`, hop run's usage exit — freezes the run snapshot, calls `InitializeRun`, writes/records the assignment artifact, then drives `worktree.create` (base commit resolved to an object id before the intent commits; canonical common-directory EQUALITY plus frozen-base HEAD comparison validate provenance) and `pane.open` as record-intent/act/record-outcome units |
 | [usecase_launch.go](usecase_launch.go) | `CorroborateLaunch`, `LaunchProgress` | One inspection round toward settling a launch claim under the section 6 predicate: settled, needs-interaction (forking wrapper), failed (`exec_failed`, terminating the session), already-settled (early acceptance; activates a still-launching session) or still pending — recovers a lost binding by creation label, never sleeps or resends |
 | [usecase_stop.go](usecase_stop.go) | `RequestStop`, `DriveStop`, `StopReport`, `CheckRunIntent`, `closePaneOperation` | One stop round: retire every check execution's group under the group-retirement rule and the recorded worker under the shared pane.close operation procedure, and mark stopped ONLY once all owned work is observed absent; mismatches and failed inspections stay outstanding, never absent |
 | [usecase_resume.go](usecase_resume.go) | `Resume`, `ResumeRequest`, `ResumeResult`, `ResumeOutcome` | Acquires a new fencing generation (idempotently for a resuming run; NothingToDo for a terminal one), recovers pending operations per the decision table (worktree adoption by provenance, pane adoption by label, check retirement by claim/group, persisted bounded waits), then reconciles per section 5: corroboration for launching attempts, warm adoption of settled claims under the one predicate with the run's state restored atomically, positive-evidence retirement through the pane.close procedure under a distinct observation incarnation, continuity-gated `--confirm-absent` attestation journaled as `absence.attested`, and lineage/workspace-validated cold relaunch |
 | [usecase_submit.go](usecase_submit.go) | `SubmitResult`, `SubmitResultRequest`, `SubmitResultResult` | Section 7 step 1 (parse and bound the inputs) and the canonical digest, computed here; steps 2-5 are `SubmissionStore.SubmitResult`'s contract |
 | [usecase_check.go](usecase_check.go) | `ClaimAndRunCheck`, `CheckReport`, `CheckClaimDeadline` | Recovers unresolved executions first (claim/group retirement, confirmed absence, then the unknown-outcome rule; bounded no-claim ambiguity), reopens orphaned claimed requests, then claims the oldest pending request atomically with its execution intent and lifecycle transitions, validates and materializes the detached checkout (submodule candidates fail clearly), spawns `hop check-exec` bounded by the frozen timeout, retains stdout/stderr evidence, and applies the section 7 outcome transaction including stop precedence and request settlement |
+| [usecase_execboundary.go](usecase_execboundary.go) | `PrepareLaunchExec`, `LaunchExecRequest`/`LaunchExecPlan`, `FailLaunchExec`, `PrepareCheckExec`, `CheckExecRequest`/`CheckExecPlan`, `CheckSpawnEnvironment`, `ExecutableLookup` | The string-facing exec-boundary use cases behind `hop launch` and `hop check-exec` (composition passes raw strings; typed IDs are parsed here): section 6 launch preparation — fail-closed HOP_* environment validation against the launch context (every pane-provided variable present and agreeing: state root, run, task, attempt, incarnation), sanitization under the frozen policy, per-harness argv composition (first launches for Claude `--session-id <ref>` + fixed prompt, Codex `<prompt>` and opencode `--prompt <prompt>`; cold relaunch is Claude-only `--resume <ref>`, and Codex/opencode cold resume reports the Phase 2 unsupported state), executable resolution through the composition-supplied `ExecutableLookup`, then `ClaimLaunch` — and section 7 check-exec preparation (group-leadership check, `ClaimCheckExec` BEFORE anything else, frozen-argv verification, sanitized env). The exec itself stays in `cmd/hop` through the process adapter; `FailLaunchExec` is the post-claim failure path and `CheckSpawnEnvironment` composes ClaimAndRunCheck's sanitized spawn env |
 | [usecase_status.go](usecase_status.go) | `Status`, `StatusRequest`, `StatusResult`, `RunSummaryView`, `RunDetailView` | Renders `ReadStore` into string-only view DTOs for `hop status`, including the last check execution's identity, evidence paths and the human's options for an unknown outcome |
 
 ## Invariants
@@ -220,29 +221,23 @@ sides together. `cmd/hop` never imports domain or identity types: every
   positive-evidence retirement targets a foreign restored occupant and
   leaves the session for the relaunch to mark lost.
 
-## Not yet implemented
-
-Every port here is a consumer-owned interface with no adapter behind it yet:
-`internal/adapters/sqlite` (`StateStore`/`ReadStore`/`SubmissionStore`,
-including `OperationRepository.ByKind` and `ReadStore.LoadFrozenRun`),
-`internal/adapters/system` (`Clock`/`IDGenerator`/`ArtifactStore`),
-`internal/adapters/process` (`CommandRunner`/`ProcessGroupInspector`),
-`internal/adapters/config` (`ConfigurationSource`) and the `Runtime`
-extension to `internal/adapters/herdr` (including `ServerInstance`, the
-socket peer-process identity) are separate tasks. `cmd/hop`'s command
-wiring, the state-root resolver and the launch-line/HOP-path validation the
-CLI surface needs are also separate (composition, task 6a).
-
 ## Dependencies and ports
 
 - Allowed inward imports: [internal/domain/identity](../domain/identity/AGENTS.md),
   [internal/domain/run](../domain/run/AGENTS.md) (application code;
   standard library only beyond these, no third-party dependencies).
-- Consumed ports: `Probe`, `AgentPresentation` and `Observer` (Phase 1),
-  implemented by [internal/adapters/herdr](../adapters/herdr/AGENTS.md); the
-  Phase 2 ports above (`StateStore`, `ReadStore`, `SubmissionStore`,
-  `Runtime`, `ArtifactStore`, `Clock`, `IDGenerator`, `CommandRunner`,
-  `ProcessGroupInspector`, `ConfigurationSource`) have no adapter yet.
+- Consumed ports and their adapters: `Probe`, `AgentPresentation`,
+  `Observer` and `Runtime` (including `ServerInstance`) are implemented by
+  [internal/adapters/herdr](../adapters/herdr/AGENTS.md); `StateStore`,
+  `ReadStore` and `SubmissionStore` by
+  [internal/adapters/sqlite](../adapters/sqlite/AGENTS.md); `CommandRunner`
+  and `ProcessGroupInspector` by
+  [internal/adapters/process](../adapters/process/AGENTS.md); `Clock`,
+  `IDGenerator` and `ArtifactStore` by
+  [internal/adapters/system](../adapters/system/AGENTS.md);
+  `ConfigurationSource` by
+  [internal/adapters/config](../adapters/config/AGENTS.md). Only `cmd/hop`
+  wires the two sides together.
 - External libraries: none.
 
 ## Verification
@@ -311,6 +306,13 @@ CLI surface needs are also separate (composition, task 6a).
   `TestReferenceTraceColdRelaunchSubmitBeforeRunning`,
   `TestReferenceTraceExecFailureAfterRelaunch`,
   `TestReferenceTraceStopDuringLaunching`).
+- `go test ./internal/app -run 'TestPrepareLaunchExec|TestFailLaunchExec|TestPrepareCheckExec|TestCheckSpawnEnvironment'` —
+  the exec-boundary tables against minimal handwritten ReadStore and
+  SubmissionStore stubs: launch environment validation (variable named,
+  value never echoed), the no-claim guarantee on every pre-claim refusal,
+  per-harness argv composition and the unsupported non-Claude states, the
+  claim's recorded executable/digest/pid, check-exec's claim-before-load
+  ordering, group-leadership refusal and the frozen argv kept verbatim.
 - `go test ./internal/app -run 'TestComputeResultDigest|TestDecodeOperationPayload'` —
   the canonical digest vectors (`digest_test.go`) and the persisted-payload
   decode contract (`operation_payload_internal_test.go`, a same-package
@@ -327,9 +329,9 @@ ProfileDir), `EnvPolicy.Validate() (ValidatedEnvPolicy, error)`,
 `ValidatedEnvPolicy`, `SanitizeEnvironment(environ, policy) (env, removed)`,
 the version constant `EnvPolicyVersion1`, the harness constants
 `HarnessClaude`/`HarnessCodex`/`HarnessOpencode`, and `StripMatrixV1()`.
-Nothing imports it yet: its intended consumers are the exec-boundary
-commands (`hop launch`, `hop check-exec`), to be wired in `cmd/hop` by
-task 6a; controller use-case code never calls it.
+Its only consumers are the exec-boundary use cases in
+[usecase_execboundary.go](usecase_execboundary.go), behind `hop launch`
+and `hop check-exec`; controller use-case code never calls it.
 
 - `StripMatrixV1` is the design's version-scoped default strip matrix,
   per harness family; `SanitizeEnvironment` removes the union of every

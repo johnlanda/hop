@@ -3,6 +3,7 @@ package app_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -857,6 +858,148 @@ func TestCleanupOnlyAfterRecordedOutcome(t *testing.T) {
 		// The lease is untouched: the failure is transactional, not fencing.
 		if err := tc.Controller.Heartbeat(context.Background(), handle); err != nil {
 			t.Fatalf("Heartbeat() error = %v; the lease should still be valid", err)
+		}
+	})
+}
+
+// ctxEnforcingArtifacts wraps an ArtifactStore with the real system
+// adapter's context contract: a canceled context refuses the write. It
+// proves the post-run persistence path never runs on the canceled caller
+// context that interrupted the check.
+type ctxEnforcingArtifacts struct{ inner app.ArtifactStore }
+
+func (a ctxEnforcingArtifacts) WriteArtifact(ctx context.Context, path string, content []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return a.inner.WriteArtifact(ctx, path, content)
+}
+
+func (a ctxEnforcingArtifacts) ReadArtifact(ctx context.Context, path string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return a.inner.ReadArtifact(ctx, path)
+}
+
+func TestStopInterruptedCheckRetainsEvidence(t *testing.T) {
+	t.Run("a mid-run cancellation still retains output and records the ambiguous operation", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		handle, detail := runningRun(t, tc)
+		if _, err := tc.Controller.SubmitResult(context.Background(), defaultSubmitRequest(detail)); err != nil {
+			t.Fatalf("SubmitResult() error = %v", err)
+		}
+		tc.Controller.Artifacts = ctxEnforcingArtifacts{inner: tc.Artifacts}
+		checkCtx, cancelCheck := context.WithCancel(context.Background())
+		defer cancelCheck()
+		tc.Commands.CheckExecFn = func(ctx context.Context, _ app.Command) (app.CommandResult, error) {
+			// A stop lands while the check runs: the loop cancels the
+			// CALLER's context, the runner kills the group and returns the
+			// partial output with the cancellation.
+			cancelCheck()
+			<-ctx.Done()
+			return app.CommandResult{ExitCode: -1, Stdout: []byte("partial stdout"), Stderr: []byte("partial stderr")},
+				fmt.Errorf("check group killed on cancellation: %w", context.Canceled)
+		}
+
+		report, err := tc.Controller.ClaimAndRunCheck(checkCtx, handle, "/usr/local/bin/hop", nil)
+
+		if err == nil || !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want the ambiguous cancellation shape", err)
+		}
+		if !report.Ran || report.OperationID == "" {
+			t.Fatalf("report = %+v, want a ran execution with its operation id", report)
+		}
+		base := "/state/runs/" + detail.RunID.String() + "/checks/" + report.OperationID
+		for stream, want := range map[string]string{"stdout": "partial stdout", "stderr": "partial stderr"} {
+			content, readErr := tc.Artifacts.ReadArtifact(context.Background(), base+"/"+stream)
+			if readErr != nil || string(content) != want {
+				t.Errorf("retained %s = %q (err %v), want %q despite the canceled caller context", stream, content, readErr, want)
+			}
+		}
+		updated, err := tc.Store.LoadRunStatus(context.Background(), detail.RunID)
+		if err != nil {
+			t.Fatalf("LoadRunStatus() error = %v", err)
+		}
+		if !updated.Reconciling {
+			t.Errorf("the interrupted execution's operation was not recorded reconciling; recovery has nothing to resolve")
+		}
+		retained := 0
+		for _, artifact := range updated.Artifacts {
+			if artifact.Path == base+"/stdout" || artifact.Path == base+"/stderr" {
+				retained++
+			}
+		}
+		if retained != 2 {
+			t.Errorf("evidence rows = %d, want both retained streams persisted under the surviving context", retained)
+		}
+	})
+
+	t.Run("a stop landing as the check finishes records the interruption with retained output", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		handle, detail := runningRun(t, tc)
+		if _, err := tc.Controller.SubmitResult(context.Background(), defaultSubmitRequest(detail)); err != nil {
+			t.Fatalf("SubmitResult() error = %v", err)
+		}
+		tc.Controller.Artifacts = ctxEnforcingArtifacts{inner: tc.Artifacts}
+		checkCtx, cancelCheck := context.WithCancel(context.Background())
+		defer cancelCheck()
+		tc.Commands.CheckExecFn = func(spawnCtx context.Context, _ app.Command) (app.CommandResult, error) {
+			// The stop request and the loop's cancellation land just as
+			// the command completes: the outcome transaction must still
+			// run — under the surviving context — and apply stop
+			// precedence. The stop request rides the spawn context, as a
+			// worker-side hop stop would.
+			if err := tc.Controller.RequestStop(spawnCtx, detail.RunID.String()); err != nil {
+				t.Errorf("RequestStop() error = %v", err)
+			}
+			cancelCheck()
+			return app.CommandResult{ExitCode: 0, Stdout: []byte("passed just in time")}, nil
+		}
+
+		report, err := tc.Controller.ClaimAndRunCheck(checkCtx, handle, "/usr/local/bin/hop", nil)
+		if err != nil {
+			t.Fatalf("ClaimAndRunCheck() error = %v", err)
+		}
+
+		if !report.Ran || !report.Interrupted || report.Passed {
+			t.Fatalf("report = %+v, want Ran/Interrupted and not Passed (stop precedence)", report)
+		}
+		base := "/state/runs/" + detail.RunID.String() + "/checks/" + report.OperationID
+		if content, readErr := tc.Artifacts.ReadArtifact(context.Background(), base+"/stdout"); readErr != nil || string(content) != "passed just in time" {
+			t.Errorf("retained stdout = %q (err %v); the interrupted execution must keep its output", content, readErr)
+		}
+		updated, err := tc.Store.LoadRunStatus(context.Background(), detail.RunID)
+		if err != nil {
+			t.Fatalf("LoadRunStatus() error = %v", err)
+		}
+		if updated.AttemptState != run.AttemptInterrupted || updated.TaskState != run.TaskInterrupted {
+			t.Fatalf("Attempt/Task = %s/%s, want both interrupted (stop precedence)", updated.AttemptState, updated.TaskState)
+		}
+	})
+
+	t.Run("a retention failure on an interrupted round surfaces, never silenced by the cancellation", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		handle, detail := runningRun(t, tc)
+		if _, err := tc.Controller.SubmitResult(context.Background(), defaultSubmitRequest(detail)); err != nil {
+			t.Fatalf("SubmitResult() error = %v", err)
+		}
+		tc.Artifacts.WriteErr = errors.New("disk full")
+		checkCtx, cancelCheck := context.WithCancel(context.Background())
+		defer cancelCheck()
+		tc.Commands.CheckExecFn = func(ctx context.Context, _ app.Command) (app.CommandResult, error) {
+			cancelCheck()
+			<-ctx.Done()
+			return app.CommandResult{Stdout: []byte("lost")}, fmt.Errorf("killed: %w", context.Canceled)
+		}
+
+		_, err := tc.Controller.ClaimAndRunCheck(checkCtx, handle, "/usr/local/bin/hop", nil)
+
+		if err == nil || !strings.Contains(err.Error(), "retention failed") {
+			t.Fatalf("err = %v, want the retention failure surfaced", err)
+		}
+		if errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v; a retention failure must not read as a plain cancellation, or the interrupt path silences it", err)
 		}
 	})
 }
