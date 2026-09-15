@@ -290,7 +290,7 @@ func TestLoadLaunchContextFailsClosed(t *testing.T) {
 		}
 	})
 
-	t.Run("intent for another session is ignored", func(t *testing.T) {
+	t.Run("intent for another session, no binding", func(t *testing.T) {
 		f := newFixture(t)
 		f.launchAttempt(t)
 		// A stale pre-replacement intent naming a different session is not
@@ -301,6 +301,49 @@ func TestLoadLaunchContextFailsClosed(t *testing.T) {
 
 		if !errors.Is(err, app.ErrNotFound) {
 			t.Fatalf("LoadLaunchContext with an intent for another session = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("intent for another session, binding present", func(t *testing.T) {
+		f := newFixture(t)
+		f.launchAttempt(t)
+		f.createBinding(t)
+		// A current binding exists, but a pending intent naming a different
+		// session makes this session's launch identity ambiguous: fail
+		// closed rather than trust the binding.
+		f.createLaunchIntent(t, identity.SessionID(uid(6503)), f.spec.IncarnationID)
+
+		_, err := f.store.LoadLaunchContext(t.Context(), f.spec.RunID, f.spec.AttemptID)
+
+		if !errors.Is(err, app.ErrNotFound) {
+			t.Fatalf("LoadLaunchContext with a binding and an another-session intent = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("malformed incarnation id, no binding", func(t *testing.T) {
+		f := newFixture(t)
+		f.launchAttempt(t)
+		f.createMalformedLaunchIntent(t, f.spec.SessionID, "not-a-uuid")
+
+		_, err := f.store.LoadLaunchContext(t.Context(), f.spec.RunID, f.spec.AttemptID)
+
+		if !errors.Is(err, app.ErrNotFound) {
+			t.Fatalf("LoadLaunchContext with a malformed intent incarnation and no binding = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("malformed incarnation id, binding present", func(t *testing.T) {
+		f := newFixture(t)
+		f.launchAttempt(t)
+		f.createBinding(t)
+		// A malformed intent identity fails closed even with a binding
+		// present: the intent is parsed whenever one exists.
+		f.createMalformedLaunchIntent(t, f.spec.SessionID, "not-a-uuid")
+
+		_, err := f.store.LoadLaunchContext(t.Context(), f.spec.RunID, f.spec.AttemptID)
+
+		if !errors.Is(err, app.ErrNotFound) {
+			t.Fatalf("LoadLaunchContext with a malformed intent incarnation and a binding = %v, want ErrNotFound", err)
 		}
 	})
 }
@@ -405,6 +448,57 @@ func TestLoadRunStatusLastCheck(t *testing.T) {
 	}
 	if len(detail.LastCheck.EvidencePaths) != 2 {
 		t.Fatalf("LastCheck evidence paths = %v, want the retained stdout and stderr", detail.LastCheck.EvidencePaths)
+	}
+}
+
+// TestLoadRunStatusLastCheckOutcomeVariations proves the outcome payload is
+// read as opaque journal JSON: only the "unknown" (bool) and "detail"
+// (string) members are surfaced, and an absent, null or differently typed
+// member yields its zero value without ever failing the status load.
+func TestLoadRunStatusLastCheckOutcomeVariations(t *testing.T) {
+	cases := []struct {
+		name        string
+		outcome     any
+		wantUnknown bool
+		wantDetail  string
+	}{
+		{name: "literal unknown true with detail", outcome: map[string]any{"unknown": true, "detail": "retired"}, wantUnknown: true, wantDetail: "retired"},
+		{name: "absent members", outcome: map[string]any{"exit_code": 1}, wantUnknown: false, wantDetail: ""},
+		{name: "unknown as string", outcome: map[string]any{"unknown": "true", "detail": "x"}, wantUnknown: false, wantDetail: "x"},
+		{name: "detail as number", outcome: map[string]any{"unknown": true, "detail": 42}, wantUnknown: true, wantDetail: ""},
+		{name: "null members", outcome: map[string]any{"unknown": nil, "detail": nil}, wantUnknown: false, wantDetail: ""},
+		{name: "empty outcome object", outcome: map[string]any{}, wantUnknown: false, wantDetail: ""},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			opID := identity.OperationID(uid(7710 + i))
+			f.inUOW(t, func(uow app.UnitOfWork) {
+				if createErr := uow.Operations().Create(t.Context(), app.Operation{
+					ID: opID, RunID: f.spec.RunID, Generation: f.lease.Generation,
+					Kind: app.OpCheckRun, State: app.OperationFailed,
+					Intent:    map[string]any{"tree_oid": "abc"},
+					Outcome:   tc.outcome,
+					CreatedAt: f.clock.Now(), UpdatedAt: f.clock.Now(),
+				}); createErr != nil {
+					t.Fatalf("create check operation: %v", createErr)
+				}
+			})
+
+			detail, err := f.store.LoadRunStatus(t.Context(), f.spec.RunID)
+			if err != nil {
+				t.Fatalf("LoadRunStatus must not fail on a type-varied outcome: %v", err)
+			}
+			if detail.LastCheck == nil {
+				t.Fatal("LastCheck is nil, want the check execution")
+			}
+			if detail.LastCheck.Unknown != tc.wantUnknown {
+				t.Fatalf("LastCheck.Unknown = %t, want %t", detail.LastCheck.Unknown, tc.wantUnknown)
+			}
+			if detail.LastCheck.Detail != tc.wantDetail {
+				t.Fatalf("LastCheck.Detail = %q, want %q", detail.LastCheck.Detail, tc.wantDetail)
+			}
+		})
 	}
 }
 

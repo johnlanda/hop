@@ -193,20 +193,15 @@ func (s *Store) LoadRunStatus(ctx context.Context, runID identity.RunID) (app.Ru
 	return detail, nil
 }
 
-// checkOutcomeView is the read model's view of a check execution's outcome
-// payload: the members hop status surfaces (`unknown`, `detail`). This is
-// presentation of the journal's own payload, not an authority decision;
-// the authority contract's extracted keys remain the launch intent's
-// incarnation_id and session_id alone.
-type checkOutcomeView struct {
-	Unknown bool   `json:"unknown"`
-	Detail  string `json:"detail"`
-}
-
 // lastCheckSummary summarizes the run's newest check execution, whatever
 // its journal state — a pending execution and a settled unknown one are
 // equally visible. Evidence paths are the run's retained check-stdout,
-// check-stderr and pane-snapshot artifacts.
+// check-stderr and pane-snapshot artifacts. The outcome payload is opaque
+// journal JSON the store never interprets as authority, so the read model
+// reads only the "unknown" (bool) and "detail" (string) members it
+// presents, with checked type assertions on the decoded map: an absent,
+// null or differently typed member yields its zero value and never fails
+// the status load.
 func lastCheckSummary(ctx context.Context, q querier, runID identity.RunID, artifacts []run.Artifact) (*app.CheckExecutionSummary, error) {
 	op, err := scanOperation(q.QueryRowContext(ctx,
 		selectOperationColumns+` WHERE run_id = ? AND kind = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`,
@@ -219,17 +214,13 @@ func lastCheckSummary(ctx context.Context, q querier, runID identity.RunID, arti
 		return nil, fmt.Errorf("sqlite: load newest check execution of run %s: %w", runID, err)
 	}
 	summary := app.CheckExecutionSummary{OperationID: op.ID, State: op.State}
-	if op.Outcome != nil {
-		encoded, err := json.Marshal(op.Outcome)
-		if err != nil {
-			return nil, fmt.Errorf("sqlite: re-encode check outcome of operation %s: %w", op.ID, err)
+	if fields, ok := op.Outcome.(map[string]any); ok {
+		if unknown, ok := fields["unknown"].(bool); ok {
+			summary.Unknown = unknown
 		}
-		var view checkOutcomeView
-		if err := json.Unmarshal(encoded, &view); err != nil {
-			return nil, fmt.Errorf("sqlite: decode check outcome of operation %s: %w", op.ID, err)
+		if detail, ok := fields["detail"].(string); ok {
+			summary.Detail = detail
 		}
-		summary.Unknown = view.Unknown
-		summary.Detail = view.Detail
 	}
 	for _, artifact := range artifacts {
 		switch artifact.Kind {
@@ -445,11 +436,13 @@ func (s *Store) LoadLaunchContext(ctx context.Context, runID identity.RunID, att
 // one launch: the session's current binding when one exists, the session's
 // pending launch intent (the "incarnation_id" the newest pending
 // pane.open/launch.send carries) otherwise, and when both exist they must
-// agree. A malformed intent identity, a binding/intent disagreement, or
-// neither source present fails closed with ErrNotFound rather than handing
-// the launcher an identity nothing recorded. The intent's session
-// ("session_id") must match this session, so a stale pre-replacement
-// intent is treated as absent, never as this session's authority.
+// agree. It fails closed with ErrNotFound rather than hand the launcher an
+// identity nothing recorded — on a binding/intent disagreement, a
+// malformed intent incarnation id, neither source present, and, crucially,
+// whenever a pending launch intent names ANOTHER session: a still-pending
+// intent for a different session makes this session's launch identity
+// ambiguous, so it is a fail-closed condition even when a binding exists,
+// never a signal to trust the binding.
 func launchIdentity(ctx context.Context, q querier, runID identity.RunID, sessionID identity.SessionID) (identity.IncarnationID, error) {
 	binding, hasBinding, err := currentBinding(ctx, q, sessionID)
 	if err != nil {
@@ -459,24 +452,31 @@ func launchIdentity(ctx context.Context, q querier, runID identity.RunID, sessio
 	if err != nil {
 		return "", err
 	}
-	intentMatchesSession := hasIntent && intent.sessionID == sessionID.String()
 
+	if hasIntent && intent.sessionID != sessionID.String() {
+		return "", fmt.Errorf("sqlite: pending launch intent of run %s names session %s, not the current session %s: %w", runID, intent.sessionID, sessionID, app.ErrNotFound)
+	}
+	// After the wrong-session guard a pending intent, if any, is this
+	// session's. Parse its incarnation whenever one exists so a malformed
+	// id fails closed even with a binding present.
 	var intentIncarnation identity.IncarnationID
-	if intentMatchesSession {
-		if intentIncarnation, err = identity.ParseIncarnationID(intent.incarnationID); err != nil {
-			return "", fmt.Errorf("sqlite: pending launch intent of run %s carries a malformed incarnation id: %w", runID, err)
+	if hasIntent {
+		parsed, parseErr := identity.ParseIncarnationID(intent.incarnationID)
+		if parseErr != nil {
+			return "", fmt.Errorf("sqlite: pending launch intent of run %s carries a malformed incarnation id (%s): %w", runID, parseErr.Error(), app.ErrNotFound)
 		}
+		intentIncarnation = parsed
 	}
 
 	switch {
-	case hasBinding && intentMatchesSession:
+	case hasBinding && hasIntent:
 		if binding.IncarnationID != intentIncarnation {
 			return "", fmt.Errorf("sqlite: binding incarnation %s and pending intent incarnation %s disagree for session %s: %w", binding.IncarnationID, intentIncarnation, sessionID, app.ErrNotFound)
 		}
 		return binding.IncarnationID, nil
 	case hasBinding:
 		return binding.IncarnationID, nil
-	case intentMatchesSession:
+	case hasIntent:
 		return intentIncarnation, nil
 	default:
 		return "", fmt.Errorf("sqlite: no binding and no matching pending launch intent for session %s: %w", sessionID, app.ErrNotFound)

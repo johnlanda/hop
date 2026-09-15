@@ -539,28 +539,33 @@ func TestBindingServerInstanceRoundTrip(t *testing.T) {
 
 // TestOperationsByKind proves ByKind returns every operation of one kind
 // for a run whatever its state, newest first, and excludes other kinds.
+// Two of the check.run operations share an identical CreatedAt, so their
+// order is decided solely by the rowid tie-breaker (newest insertion
+// first), not by the timestamp.
 func TestOperationsByKind(t *testing.T) {
 	f := newFixture(t)
-	// Three check.run operations in distinct states, plus a pane.open that
-	// ByKind(check.run) must exclude.
+	tie := f.clock.Now()
+	later := tie.Add(time.Second)
+	// Insertion order matters for the tie: 7601 then 7602 share `tie`, so
+	// 7602 (the newer insertion) must sort before 7601. 7603 has a strictly
+	// later created_at and sorts first. The pane.open must be excluded.
 	specs := []struct {
 		n     int
 		kind  app.OperationKind
 		state app.OperationState
+		at    time.Time
 	}{
-		{n: 7601, kind: app.OpCheckRun, state: app.OperationSucceeded},
-		{n: 7602, kind: app.OpCheckRun, state: app.OperationFailed},
-		{n: 7603, kind: app.OpCheckRun, state: app.OperationPending},
-		{n: 7604, kind: app.OpPaneOpen, state: app.OperationPending},
+		{n: 7601, kind: app.OpCheckRun, state: app.OperationSucceeded, at: tie},
+		{n: 7602, kind: app.OpCheckRun, state: app.OperationFailed, at: tie},
+		{n: 7603, kind: app.OpCheckRun, state: app.OperationPending, at: later},
+		{n: 7604, kind: app.OpPaneOpen, state: app.OperationPending, at: later},
 	}
 	f.inUOW(t, func(uow app.UnitOfWork) {
-		for i, s := range specs {
-			// Distinct created_at so newest-first ordering is unambiguous.
-			at := f.clock.Now().Add(time.Duration(i) * time.Second)
+		for _, s := range specs {
 			err := uow.Operations().Create(t.Context(), app.Operation{
 				ID: identity.OperationID(uid(s.n)), RunID: f.spec.RunID, Generation: f.lease.Generation,
 				Kind: s.kind, State: s.state,
-				Intent: map[string]any{}, CreatedAt: at, UpdatedAt: at,
+				Intent: map[string]any{}, CreatedAt: s.at, UpdatedAt: s.at,
 			})
 			if err != nil {
 				t.Fatalf("create operation %d: %v", s.n, err)
@@ -581,7 +586,7 @@ func TestOperationsByKind(t *testing.T) {
 		}
 		for i, want := range wantOrder {
 			if checks[i].ID != want {
-				t.Fatalf("ByKind order[%d] = %s, want %s (newest first)", i, checks[i].ID, want)
+				t.Fatalf("ByKind order[%d] = %s, want %s (newest first; 7602 before 7601 on the rowid tie-breaker)", i, checks[i].ID, want)
 			}
 		}
 		states := map[app.OperationState]bool{}
