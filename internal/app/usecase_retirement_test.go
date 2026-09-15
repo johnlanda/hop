@@ -21,7 +21,7 @@ type workerFixture struct {
 
 // seedSettledWorker assigns taskID through the real scheduler, then
 // settles its launch: claim execed at pid, session active.
-func seedSettledWorker(t *testing.T, tc *testController, fr featureRun, taskID identity.TaskID, pid int) workerFixture { //nolint:gocritic // hugeParam: featureRun is a small test fixture value.
+func seedSettledWorker(t *testing.T, tc *testController, fr featureRun, taskID identity.TaskID, pid int) workerFixture { //nolint:gocritic,unparam // hugeParam: featureRun is a small test fixture value; unparam: every current scenario uses one worker pid, but the pid is the fixture's point.
 	t.Helper()
 	sessionID, incarnationID := seedWorkerSession(t, tc, fr, taskID)
 	sessRow := tc.Store.Sessions[sessionID]

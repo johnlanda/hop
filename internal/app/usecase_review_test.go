@@ -127,7 +127,7 @@ func TestSubmitReviewVerdict(t *testing.T) {
 			t.Fatalf("reasons artifact %s was never written", reasonsPath)
 		}
 		noticeFound := false
-		for _, m := range f.tc.Store.Messages { //nolint:gocritic // rangeValCopy: test assertion over a small map.
+		for _, m := range f.tc.Store.Messages {
 			if m.Sender.Kind == run.PrincipalController && m.Recipient.Kind == run.AddressManager && m.BodyPath == reasonsPath {
 				noticeFound = true
 			}
