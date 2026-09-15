@@ -100,10 +100,10 @@ func TestReferenceTraceFeatureHappyPathDependencyRelease(t *testing.T) {
 	mustNoError(t, err)
 	mustState(t, "taskA", string(taskA.State), string(run.TaskIntegrated))
 
-	if !run.ReleaseEligible(taskB, []run.Task{taskA}) {
+	if !run.ReleaseEligible(taskB, []run.TaskDependency{dep}, []run.Task{taskA}) {
 		t.Fatal("ReleaseEligible(taskB): want true once taskA is integrated")
 	}
-	taskB, err = taskB.Release(true, later())
+	taskB, err = taskB.Release([]run.TaskDependency{dep}, []run.Task{taskA}, later())
 	mustNoError(t, err)
 	mustState(t, "taskB", string(taskB.State), string(run.TaskReady))
 	infoAIntegrated := run.NewInfo(testMessageID, testRunID, run.ControllerPrincipal(), run.ManagerAddress(), "", "/notice-a-integrated", "digest", 32, 1, later())
@@ -188,12 +188,12 @@ func TestReferenceTraceFeatureHappyPathDependencyRelease(t *testing.T) {
 	mustState(t, "reviewer", string(reviewer.State), string(run.SessionTerminated))
 
 	guardCtx := run.GuardContext{
-		PlanClosed:      r.PlanClosed,
-		ImplementTasks:  []run.Task{taskA, taskB},
-		HeadCommitOID:   "b-merge-oid",
-		HeadTreeOID:     "head-tree",
-		HeadCheckPassed: true,
-		LatestReview:    &verdictOutcome.Review,
+		PlanClosed:     r.PlanClosed,
+		ImplementTasks: []run.Task{taskA, taskB},
+		HeadCommitOID:  "b-merge-oid",
+		HeadTreeOID:    "head-tree",
+		LatestCheck:    &run.CheckReceipt{Passed: true, SubjectCommitOID: "b-merge-oid", SubjectTreeOID: "head-tree"},
+		LatestReview:   &verdictOutcome.Review,
 	}
 	ready, missing := run.EvaluateReadiness(guardCtx)
 	if !ready {
@@ -345,7 +345,9 @@ func TestReferenceTraceDuplicateAndAmbiguousDelivery(t *testing.T) {
 func TestReferenceTraceWorkerInterruptionRetryProvenance(t *testing.T) {
 	t.Run("retried below the limit", func(t *testing.T) {
 		taskB := run.NewImplementTask(testSecondTaskID, testRunID, 2, "B", "digest-b", true, epoch())
-		taskB, err := taskB.Release(true, epoch())
+		bEdges := []run.TaskDependency{{TaskID: taskB.ID, PrerequisiteID: testTaskID}}
+		bPrereqs := []run.Task{{ID: testTaskID, State: run.TaskIntegrated}}
+		taskB, err := taskB.Release(bEdges, bPrereqs, epoch())
 		mustNoError(t, err)
 		taskB, err = taskB.Activate(later())
 		mustNoError(t, err)
@@ -477,7 +479,8 @@ func TestReferenceTraceReviewerRejectionAndReReview(t *testing.T) {
 
 	ready, missing := run.EvaluateReadiness(run.GuardContext{
 		PlanClosed: true, HeadCommitOID: "head-v1-commit", HeadTreeOID: "head-v1-tree",
-		HeadCheckPassed: true, LatestReview: &review1,
+		LatestCheck:  &run.CheckReceipt{Passed: true, SubjectCommitOID: "head-v1-commit", SubjectTreeOID: "head-v1-tree"},
+		LatestReview: &review1,
 	})
 	if ready {
 		t.Fatal("EvaluateReadiness after a reject: ready = true, want false")
@@ -530,7 +533,8 @@ func TestReferenceTraceReviewerRejectionAndReReview(t *testing.T) {
 	reviewTask2 := run.NewReviewTask(testSecondReviewTaskID, testRunID, 5, "head-v2-commit", "head-v2-tree", later())
 	staleReady, staleMissing := run.EvaluateReadiness(run.GuardContext{
 		PlanClosed: true, HeadCommitOID: "head-v2-commit", HeadTreeOID: "head-v2-tree",
-		HeadCheckPassed: true, LatestReview: &review1,
+		LatestCheck:  &run.CheckReceipt{Passed: true, SubjectCommitOID: "head-v2-commit", SubjectTreeOID: "head-v2-tree"},
+		LatestReview: &review1,
 	})
 	if staleReady {
 		t.Fatalf("EvaluateReadiness with R1's stale verdict against the new head: ready = true, missing = %+v, want not ready", staleMissing)
@@ -553,7 +557,8 @@ func TestReferenceTraceReviewerRejectionAndReReview(t *testing.T) {
 
 	finalReady, finalMissing := run.EvaluateReadiness(run.GuardContext{
 		PlanClosed: true, HeadCommitOID: "head-v2-commit", HeadTreeOID: "head-v2-tree",
-		HeadCheckPassed: true, LatestReview: &review2,
+		LatestCheck:  &run.CheckReceipt{Passed: true, SubjectCommitOID: "head-v2-commit", SubjectTreeOID: "head-v2-tree"},
+		LatestReview: &review2,
 	})
 	if !finalReady {
 		t.Fatalf("EvaluateReadiness after R2 approves H2: ready = false, missing = %+v", finalMissing)
