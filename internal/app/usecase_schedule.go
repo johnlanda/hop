@@ -186,6 +186,25 @@ func (c *Controller) assignOneReadyTask(ctx context.Context, handle RunHandle, o
 		if err != nil {
 			return err
 		}
+
+		// Section 4's revalidation rule, applied to this transaction's own
+		// writes (not just the later external act): a stop racing between
+		// dependency release and assignment must never let this
+		// transaction activate a task or launch an attempt/session. Read
+		// fresh and checked first, before any other read or write, so a
+		// concurrently committed stop is never missed.
+		r, _, err := uow.Runs().Get(ctx, handle.runID)
+		if err != nil {
+			return err
+		}
+		runSeq = r.Sequence
+		if acceptErr := r.CanAcceptManagerVerb(); acceptErr != nil {
+			return acceptErr
+		}
+		if r.StopRequested {
+			return fmt.Errorf("%w: run %s", ErrStopRequested, handle.runID)
+		}
+
 		occupied, err := countOccupiedChildSessions(ctx, wf, handle.runID)
 		if err != nil {
 			return err
@@ -217,12 +236,6 @@ func (c *Controller) assignOneReadyTask(ctx context.Context, handle RunHandle, o
 			return err
 		}
 		manager = mgr
-
-		r, _, err := uow.Runs().Get(ctx, handle.runID)
-		if err != nil {
-			return err
-		}
-		runSeq = r.Sequence
 
 		attempts, err := wf.AttemptIndex().ByTask(ctx, task.ID)
 		if err != nil {

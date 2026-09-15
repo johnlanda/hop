@@ -315,6 +315,45 @@ func TestAssignReadyTasks(t *testing.T) {
 		}
 	})
 
+	t.Run("a stop racing between release and assignment creates nothing", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		fr := seedFeatureRun(t, tc, 2)
+		taskA := seedImplementTask(t, tc, fr.RunID, 1, "A", false, run.TaskReady)
+
+		// A stop observed after RecomputeReleases already made the task
+		// ready but before AssignReadyTasks' own transaction runs — the
+		// exact window the review flagged: the run's fresh row must be
+		// read and checked INSIDE the assignment transaction, before any
+		// task/attempt/session write, not merely before the later
+		// external worktree/pane acts.
+		rRow := tc.Store.Runs[fr.RunID]
+		rRow.value = rRow.value.RequestStop(tc.Clock.Now())
+		if rRow.value.State != run.RunStopping || !rRow.value.StopRequested {
+			t.Fatalf("RequestStop() = %+v, want stopping with the flag set", rRow.value)
+		}
+
+		attemptsBefore := len(tc.Store.Attempts)
+		sessionsBefore := len(tc.Store.Sessions)
+
+		_, err := tc.Controller.AssignReadyTasks(context.Background(), fr.Handle, defaultAssignmentOptions())
+		if err == nil {
+			t.Fatalf("AssignReadyTasks() over a stopping run succeeded; want a refusal")
+		}
+		if !errors.Is(err, app.ErrStopRequested) && !errors.Is(err, run.ErrRunNotAccepting) {
+			t.Fatalf("AssignReadyTasks() error = %v, want ErrStopRequested or ErrRunNotAccepting", err)
+		}
+
+		if got := tc.Store.Tasks[taskA].value.State; got != run.TaskReady {
+			t.Fatalf("task state = %s, want unchanged ready — nothing created", got)
+		}
+		if len(tc.Store.Attempts) != attemptsBefore {
+			t.Fatalf("attempts = %d, want unchanged %d — no attempt created", len(tc.Store.Attempts), attemptsBefore)
+		}
+		if len(tc.Store.Sessions) != sessionsBefore {
+			t.Fatalf("sessions = %d, want unchanged %d — no session created", len(tc.Store.Sessions), sessionsBefore)
+		}
+	})
+
 	t.Run("a consumed retry's reserved attempt is launched, not recreated, and the pending request clears", func(t *testing.T) {
 		tc := newTestController(defaultPolicy())
 		fr := seedFeatureRun(t, tc, 2)
