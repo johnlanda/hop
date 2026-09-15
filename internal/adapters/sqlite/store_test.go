@@ -238,6 +238,10 @@ func (f *fixture) createMalformedLaunchIntent(t *testing.T, session identity.Ses
 	})
 }
 
+// fixtureSeedEvidence is the workspace-trust seed evidence claimLaunch
+// records, asserted round-tripped by the read-store tests.
+const fixtureSeedEvidence = "workspace trust seeded for /worktrees/fixture"
+
 // claimLaunch writes the incarnation's exec_pending launch claim under
 // fixturePID.
 func (f *fixture) claimLaunch(t *testing.T) {
@@ -249,6 +253,7 @@ func (f *fixture) claimLaunch(t *testing.T) {
 		Executable:    "/opt/harness/claude",
 		ArgvDigest:    "argv-digest",
 		PID:           fixturePID,
+		SeedEvidence:  fixtureSeedEvidence,
 	})
 	if err != nil {
 		t.Fatalf("ClaimLaunch: %v", err)

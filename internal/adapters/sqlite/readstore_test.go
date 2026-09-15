@@ -203,6 +203,9 @@ func TestLoadLaunchContext(t *testing.T) {
 	if launchContext.Claim == nil || launchContext.Claim.State != app.LaunchClaimExecPending {
 		t.Fatalf("claim = %+v, want the exec_pending claim", launchContext.Claim)
 	}
+	if launchContext.Claim.SeedEvidence != fixtureSeedEvidence {
+		t.Fatalf("claim seed evidence = %q, want the recorded value round-tripped", launchContext.Claim.SeedEvidence)
+	}
 	if launchContext.StopRequested {
 		t.Fatal("stop requested = true on a run with no stop request")
 	}

@@ -324,10 +324,11 @@ func (s *Store) ClaimLaunch(ctx context.Context, claim app.LaunchClaim) error { 
 			claimedAt = s.now()
 		}
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO launch_claims (incarnation_id, run_id, attempt_id, executable, argv_digest, pid, state, error, claimed_at, settled_at, settlement_evidence)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL)`,
+			`INSERT INTO launch_claims (incarnation_id, run_id, attempt_id, executable, argv_digest, pid, state, error, claimed_at, settled_at, settlement_evidence, seed_evidence)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL, ?)`,
 			claim.IncarnationID.String(), claim.RunID.String(), claim.AttemptID.String(), claim.Executable, claim.ArgvDigest,
 			claim.PID, string(app.LaunchClaimExecPending), formatTime(claimedAt),
+			sql.NullString{String: claim.SeedEvidence, Valid: claim.SeedEvidence != ""},
 		); err != nil {
 			return fmt.Errorf("sqlite: insert launch claim: %w", err)
 		}

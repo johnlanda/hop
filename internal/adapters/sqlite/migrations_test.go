@@ -9,8 +9,9 @@ import (
 	"github.com/johnlanda/hop/internal/adapters/sqlite"
 )
 
-// expectedTables is the complete table set of migration 001 plus the
-// migrator's own version table.
+// expectedTables is the complete table set of the migration chain (001
+// creates every table; 002 only adds a column) plus the migrator's own
+// version table.
 func expectedTables() []string {
 	return []string{
 		"schema_migrations",
@@ -35,7 +36,7 @@ func expectedTables() []string {
 }
 
 // TestMigrateFromEmpty proves opening an empty state root creates every
-// table and records schema version 1.
+// table, applies the full migration chain and records its latest version.
 func TestMigrateFromEmpty(t *testing.T) {
 	store := openStoreAt(t, t.TempDir(), newFakeClock())
 
@@ -50,8 +51,8 @@ func TestMigrateFromEmpty(t *testing.T) {
 	if err := sqlite.WriteDB(store).QueryRowContext(t.Context(), `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil {
 		t.Fatalf("read schema version: %v", err)
 	}
-	if version != 1 {
-		t.Fatalf("schema version = %d, want 1", version)
+	if version != 2 {
+		t.Fatalf("schema version = %d, want 2", version)
 	}
 }
 
@@ -66,8 +67,8 @@ func TestReopenAtSameVersion(t *testing.T) {
 	second := openStoreAt(t, root, clock)
 
 	after := countRows(t, second, `SELECT COUNT(*) FROM schema_migrations`)
-	if before != 1 || after != 1 {
-		t.Fatalf("schema_migrations rows: first open %d, second open %d; want 1 and 1", before, after)
+	if before != 2 || after != 2 {
+		t.Fatalf("schema_migrations rows: first open %d, second open %d; want one row per migration, unchanged by the reopen", before, after)
 	}
 }
 
@@ -122,8 +123,8 @@ func TestConcurrentOpenAndMigrate(t *testing.T) {
 		defer stores[i].Close() //nolint:errcheck,gocritic // test cleanup of handles opened in this scope; close failures would already surface as errors above.
 	}
 	n := countRows(t, stores[0], `SELECT COUNT(*) FROM schema_migrations`)
-	if n != 1 {
-		t.Fatalf("schema_migrations rows after concurrent migrate = %d, want exactly 1", n)
+	if n != 2 {
+		t.Fatalf("schema_migrations rows after concurrent migrate = %d, want one row per migration", n)
 	}
 }
 
