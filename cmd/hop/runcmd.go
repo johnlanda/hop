@@ -172,6 +172,14 @@ func finishControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, hand
 	result, err := runControllerLoop(ctx, d, ctrl, handle, runID, label, hopPath, stdout)
 	if err != nil {
 		if ctx.Err() != nil {
+			// The detach path still owes any non-cancellation failure the
+			// loop carried out — a retention or recording error is never
+			// silenced by the signal — before the resume instruction.
+			if !errors.Is(err, context.Canceled) {
+				if _, werr := fmt.Fprintf(stderr, "%s: %v\n", command, err); werr != nil {
+					return exitFailure, werr
+				}
+			}
 			return exitFailure, detachAndReport(ctx, ctrl, handle, runID, stdout)
 		}
 		releaseQuietly(ctx, ctrl, handle)

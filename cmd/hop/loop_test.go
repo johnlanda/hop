@@ -189,6 +189,32 @@ func TestRunControllerLoop(t *testing.T) {
 		}
 	})
 
+	t.Run("a retention failure on an interrupted check surfaces, never silenced by the stop", func(t *testing.T) {
+		ctrl := &fakeController{}
+		td := newTestDeps(ctrl, nil, t.TempDir())
+		td.useCheckBarriers()
+		var checkStarted atomic.Bool
+		ctrl.claimAndRunCheck = func(ctx context.Context, _ string, _ []string) (app.CheckReport, error) {
+			checkStarted.Store(true)
+			td.checkStarted <- struct{}{}
+			<-ctx.Done()
+			// The app canceled the command but could not retain its
+			// output: a real failure, deliberately not a plain
+			// cancellation shape.
+			return app.CheckReport{Ran: true, OperationID: "op-9"}, errors.New("app: check output retention failed after an ambiguous execution (spawn error: killed): disk full")
+		}
+		ctrl.status = func(app.StatusRequest) (app.StatusResult, error) {
+			return detailStep("running", "running", checkStarted.Load()), nil
+		}
+		var stdout bytes.Buffer
+
+		_, err := runControllerLoop(context.Background(), td.deps, ctrl, app.RunHandle{}, testRunID, "r1", "/opt/hop/bin/hop", &stdout)
+
+		if err == nil || !strings.Contains(err.Error(), "retention failed") {
+			t.Fatalf("err = %v, want the retention failure surfaced instead of a silent stop", err)
+		}
+	})
+
 	t.Run("a stop request routes to DriveStop until termination is observed", func(t *testing.T) {
 		ctrl := &fakeController{}
 		ctrl.status = scriptStatus(detailStep("running", "running", true))

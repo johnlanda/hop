@@ -168,12 +168,13 @@ func runControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, handle 
 	)
 	// Every exit path retires an in-flight check first: its context dies
 	// with the loop's cancel or is canceled here, and the recorded round
-	// is still reported.
+	// is still reported. Only the pure cancellation shape of a round the
+	// loop itself interrupted — and a stop-refused dispatch — is expected
+	// and silent; a retention or recording failure is a real error on
+	// every path, deliberate interruption included.
 	reportOutcome := func(outcome checkOutcome) error {
 		if outcome.err != nil {
-			// A canceled or stop-refused round is expected on the stop and
-			// exit paths, never a loop failure.
-			if checks.canceled || errors.Is(outcome.err, context.Canceled) || errors.Is(outcome.err, app.ErrStopRequested) {
+			if errors.Is(outcome.err, app.ErrStopRequested) || (checks.canceled && errors.Is(outcome.err, context.Canceled)) {
 				return nil
 			}
 			return fmt.Errorf("run check: %w", outcome.err)
@@ -185,41 +186,39 @@ func runControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, handle 
 		}
 		return nil
 	}
-	drainChecks := func() {
+	drainChecks := func() error {
 		if outcome, ok := checks.interrupt(); ok {
-			_ = reportOutcome(outcome) //nolint:errcheck // the loop is already on an exit path; the recorded outcome is durable either way.
+			return reportOutcome(outcome)
 		}
+		return nil
 	}
 	for {
 		select {
 		case err := <-heartbeatFailed:
-			drainChecks()
-			return loopResult{}, fmt.Errorf("heartbeat failed, the lease is lost and in-flight work is canceled: %w", err)
+			return loopResult{}, errors.Join(fmt.Errorf("heartbeat failed, the lease is lost and in-flight work is canceled: %w", err), drainChecks())
 		case <-ctx.Done():
-			drainChecks()
-			return loopResult{Detached: true}, nil
+			return loopResult{Detached: true}, drainChecks()
 		default:
 		}
 
 		status, err := ctrl.Status(ctx, app.StatusRequest{RunID: runID})
 		if err != nil {
-			drainChecks()
-			return loopResult{}, fmt.Errorf("load run status: %w", err)
+			return loopResult{}, errors.Join(fmt.Errorf("load run status: %w", err), drainChecks())
 		}
 		detail := status.Detail
 		if detail == nil {
-			drainChecks()
-			return loopResult{}, fmt.Errorf("run %s has no status detail", runID)
+			return loopResult{}, errors.Join(fmt.Errorf("run %s has no status detail", runID), drainChecks())
 		}
 		if detail.State != lastState {
 			if _, werr := fmt.Fprintf(stdout, "run %s %s\n", label, detail.State); werr != nil {
-				drainChecks()
-				return loopResult{}, werr
+				return loopResult{}, errors.Join(werr, drainChecks())
 			}
 			lastState = detail.State
 		}
 		if isTerminalRunState(detail.State) {
-			drainChecks()
+			if drainErr := drainChecks(); drainErr != nil {
+				return loopResult{}, drainErr
+			}
 			return loopResult{FinalState: detail.State}, nil
 		}
 
@@ -248,13 +247,11 @@ func runControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, handle 
 			if detail.AttemptState == "launching" || detail.AttemptState == "relaunching" {
 				progress, corrErr := ctrl.CorroborateLaunch(ctx, handle)
 				if corrErr != nil {
-					drainChecks()
-					return loopResult{}, fmt.Errorf("corroborate launch: %w", corrErr)
+					return loopResult{}, errors.Join(fmt.Errorf("corroborate launch: %w", corrErr), drainChecks())
 				}
 				if progress != lastProgress {
 					if _, werr := fmt.Fprintf(stdout, "launch %s\n", describeLaunchProgress(progress)); werr != nil {
-						drainChecks()
-						return loopResult{}, werr
+						return loopResult{}, errors.Join(werr, drainChecks())
 					}
 					lastProgress = progress
 				}
@@ -262,8 +259,7 @@ func runControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, handle 
 			if spawnEnv == nil {
 				spawnEnv, err = ctrl.CheckSpawnEnvironment(ctx, handle, d.environ())
 				if err != nil {
-					drainChecks()
-					return loopResult{}, fmt.Errorf("compose check spawn environment: %w", err)
+					return loopResult{}, errors.Join(fmt.Errorf("compose check spawn environment: %w", err), drainChecks())
 				}
 			}
 			if outcome, ok := checks.poll(); ok {
@@ -277,8 +273,7 @@ func runControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, handle 
 		}
 
 		if err := d.wait(ctx, loopPollInterval); err != nil {
-			drainChecks()
-			return loopResult{Detached: true}, nil
+			return loopResult{Detached: true}, drainChecks()
 		}
 	}
 }
