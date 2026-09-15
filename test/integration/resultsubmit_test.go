@@ -25,20 +25,27 @@ type fixtureRun struct {
 	runID      string
 }
 
-// startFixtureRun builds a fixture repository and fixture worker, installs
-// the worker as the claude PATH stub, starts a disposable herdr server and
-// runs `hop run` against the repository with brief embedding the given
-// FIXTURE-BEHAVIOR directive (fixtureWorkerBrief), returning once the
-// controller has printed its "started" line.
-func startFixtureRun(t *testing.T, behavior string) *fixtureRun {
+// newFixtureRunEnv builds a disposable, started herdr server and the fixture
+// worker installed as its claude PATH stub — the common prerequisites of
+// every real-process lifecycle scenario in this package, before a caller
+// builds its own fixture repository (possibly mutating it, e.g. flipping
+// CHECK_RESULT, before any run starts against it) and starts a run.
+func newFixtureRunEnv(t *testing.T) (*artifactDir, *testServer) {
 	t.Helper()
 	artifacts := newArtifactDir(t)
 	server := prepareServer(t, artifacts)
 	worker := buildFixtureWorker(t, artifacts)
 	installFixtureWorkerAsClaudeStub(t, server, worker)
 	server.start(t)
+	return artifacts, server
+}
 
-	repo := newFixtureRepo(t, artifacts, "repo")
+// startRun runs `hop run` against repo (already built, and mutated as the
+// caller needs) with brief embedding the given FIXTURE-BEHAVIOR directive
+// (fixtureWorkerBrief), returning once the controller has printed its
+// "started" line.
+func startRun(t *testing.T, artifacts *artifactDir, server *testServer, repo *fixtureRepo, behavior string) *fixtureRun {
+	t.Helper()
 	stateDir := artifacts.dir(t, "state")
 	env := server.hopEnviron(stateDir)
 
@@ -57,6 +64,20 @@ func startFixtureRun(t *testing.T, behavior string) *fixtureRun {
 		label:      label,
 		runID:      runID,
 	}
+}
+
+// startFixtureRun builds a fixture repository and fixture worker, installs
+// the worker as the claude PATH stub, starts a disposable herdr server and
+// runs `hop run` against the repository with brief embedding the given
+// FIXTURE-BEHAVIOR directive (fixtureWorkerBrief), returning once the
+// controller has printed its "started" line. Scenarios that need to mutate
+// the fixture repository before the run starts (e.g. flipping CHECK_RESULT)
+// use newFixtureRunEnv and startRun directly instead.
+func startFixtureRun(t *testing.T, behavior string) *fixtureRun {
+	t.Helper()
+	artifacts, server := newFixtureRunEnv(t)
+	repo := newFixtureRepo(t, artifacts, "repo")
+	return startRun(t, artifacts, server, repo, behavior)
 }
 
 // dbPath is this run's own throwaway hop.db, valid once the state root has
