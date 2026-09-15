@@ -129,6 +129,25 @@ type ebClock struct{ now time.Time }
 
 func (c ebClock) Now() time.Time { return c.now }
 
+// ebTrustStub is a scripted TrustSeeder recording every call.
+type ebTrustStub struct {
+	outcome TrustSeedOutcome
+	err     error
+	calls   []string
+	names   *[]string
+}
+
+func (s *ebTrustStub) SeedWorkspaceTrust(_ context.Context, configPath, projectKey string) (TrustSeedOutcome, error) {
+	s.calls = append(s.calls, configPath+" <- "+projectKey)
+	if s.names != nil {
+		*s.names = append(*s.names, "SeedWorkspaceTrust")
+	}
+	if s.err != nil {
+		return TrustSeedOutcome{}, s.err
+	}
+	return s.outcome, nil
+}
+
 // ebLaunchContext builds a valid first-launch context.
 func ebLaunchContext(t *testing.T) LaunchContext {
 	t.Helper()
@@ -206,6 +225,7 @@ func TestPrepareLaunchExec(t *testing.T) {
 			RunID:            ebRunID,
 			AttemptID:        ebAttemptID,
 			HOPPath:          "/opt/hop/bin/hop",
+			WorkerDir:        "/private/var/worktrees/hop-run-1",
 			Environ:          ebEnviron(),
 			PID:              4242,
 			LookupExecutable: ebLookup(nil),
@@ -291,6 +311,136 @@ func TestPrepareLaunchExec(t *testing.T) {
 		}
 	})
 
+	t.Run("a claude launch seeds workspace trust through the configured profile directory", func(t *testing.T) {
+		lc := ebLaunchContext(t)
+		lc.Snapshot.EnvPolicy.ProfileDir = "/profiles/claude"
+		var order []string
+		read := &ebReadStub{launch: lc}
+		subs := &ebSubmissionStub{calls: &order}
+		trust := &ebTrustStub{outcome: TrustSeedOutcome{Seeded: true}, names: &order}
+		c := newController(read, subs)
+		c.Trust = trust
+
+		plan, err := c.PrepareLaunchExec(context.Background(), baseRequest())
+		if err != nil {
+			t.Fatalf("PrepareLaunchExec: %v", err)
+		}
+
+		if len(trust.calls) != 1 || trust.calls[0] != "/profiles/claude/.claude.json <- /private/var/worktrees/hop-run-1" {
+			t.Fatalf("trust calls = %q, want the profile config seeded with the worker dir key", trust.calls)
+		}
+		if len(order) != 2 || order[0] != "SeedWorkspaceTrust" || order[1] != "ClaimLaunch" {
+			t.Errorf("order = %v, want the seed immediately before the claim", order)
+		}
+		want := "workspace trust seeded for /private/var/worktrees/hop-run-1"
+		if len(subs.claims) != 1 || subs.claims[0].SeedEvidence != want {
+			t.Errorf("claim seed evidence = %+v, want %q", subs.claims, want)
+		}
+		if plan.SeedEvidence != want {
+			t.Errorf("plan seed evidence = %q, want %q", plan.SeedEvidence, want)
+		}
+	})
+
+	t.Run("a claude launch without a profile directory seeds through the inherited HOME", func(t *testing.T) {
+		read := &ebReadStub{launch: ebLaunchContext(t)}
+		subs := &ebSubmissionStub{}
+		trust := &ebTrustStub{outcome: TrustSeedOutcome{Seeded: true}}
+		c := newController(read, subs)
+		c.Trust = trust
+		req := baseRequest()
+		req.Environ = append(req.Environ, "HOME=/Users/dev")
+
+		if _, err := c.PrepareLaunchExec(context.Background(), req); err != nil {
+			t.Fatalf("PrepareLaunchExec: %v", err)
+		}
+
+		if len(trust.calls) != 1 || trust.calls[0] != "/Users/dev/.claude.json <- /private/var/worktrees/hop-run-1" {
+			t.Fatalf("trust calls = %q, want the HOME profile config", trust.calls)
+		}
+	})
+
+	t.Run("an absent or unparsable profile config is not-seeded evidence and still claims", func(t *testing.T) {
+		lc := ebLaunchContext(t)
+		lc.Snapshot.EnvPolicy.ProfileDir = "/profiles/claude"
+		read := &ebReadStub{launch: lc}
+		subs := &ebSubmissionStub{}
+		trust := &ebTrustStub{outcome: TrustSeedOutcome{Reason: "profile config absent"}}
+		c := newController(read, subs)
+		c.Trust = trust
+
+		plan, err := c.PrepareLaunchExec(context.Background(), baseRequest())
+		if err != nil {
+			t.Fatalf("PrepareLaunchExec: %v", err)
+		}
+
+		want := "workspace trust not seeded: profile config absent"
+		if len(subs.claims) != 1 || subs.claims[0].SeedEvidence != want {
+			t.Errorf("claim seed evidence = %+v, want %q", subs.claims, want)
+		}
+		if plan.SeedEvidence != want {
+			t.Errorf("plan seed evidence = %q, want %q", plan.SeedEvidence, want)
+		}
+	})
+
+	t.Run("a claude launch with no profile variable records the unresolved reason and never calls the seeder", func(t *testing.T) {
+		read := &ebReadStub{launch: ebLaunchContext(t)}
+		subs := &ebSubmissionStub{}
+		trust := &ebTrustStub{outcome: TrustSeedOutcome{Seeded: true}}
+		c := newController(read, subs)
+		c.Trust = trust
+
+		// The base environment carries neither CLAUDE_CONFIG_DIR nor HOME.
+		plan, err := c.PrepareLaunchExec(context.Background(), baseRequest())
+		if err != nil {
+			t.Fatalf("PrepareLaunchExec: %v", err)
+		}
+
+		if len(trust.calls) != 0 {
+			t.Errorf("trust calls = %q, want none", trust.calls)
+		}
+		if !strings.Contains(plan.SeedEvidence, "neither CLAUDE_CONFIG_DIR nor HOME") {
+			t.Errorf("seed evidence = %q", plan.SeedEvidence)
+		}
+		if len(subs.claims) != 1 || subs.claims[0].SeedEvidence != plan.SeedEvidence {
+			t.Errorf("claim = %+v", subs.claims)
+		}
+	})
+
+	t.Run("a seeding write failure refuses the launch before any claim", func(t *testing.T) {
+		lc := ebLaunchContext(t)
+		lc.Snapshot.EnvPolicy.ProfileDir = "/profiles/claude"
+		read := &ebReadStub{launch: lc}
+		subs := &ebSubmissionStub{}
+		trust := &ebTrustStub{err: errors.New("write profile config: permission denied")}
+		c := newController(read, subs)
+		c.Trust = trust
+
+		_, err := c.PrepareLaunchExec(context.Background(), baseRequest())
+
+		if err == nil || !strings.Contains(err.Error(), "seed workspace trust") {
+			t.Fatalf("err = %v, want the seeding failure", err)
+		}
+		if len(subs.claims) != 0 {
+			t.Errorf("a refused seed wrote a claim: %+v", subs.claims)
+		}
+	})
+
+	t.Run("a planned seed with no seeder wired refuses the launch before any claim", func(t *testing.T) {
+		lc := ebLaunchContext(t)
+		lc.Snapshot.EnvPolicy.ProfileDir = "/profiles/claude"
+		read := &ebReadStub{launch: lc}
+		subs := &ebSubmissionStub{}
+
+		_, err := newController(read, subs).PrepareLaunchExec(context.Background(), baseRequest())
+
+		if err == nil || !strings.Contains(err.Error(), "no workspace-trust seeder supplied") {
+			t.Fatalf("err = %v, want the missing-seeder refusal", err)
+		}
+		if len(subs.claims) != 0 {
+			t.Errorf("a refused seed wrote a claim: %+v", subs.claims)
+		}
+	})
+
 	t.Run("codex first launch composes the prompt argv with its profile shape", func(t *testing.T) {
 		lc := ebLaunchContext(t)
 		lc.Snapshot.Harness = HarnessCodex
@@ -321,6 +471,9 @@ func TestPrepareLaunchExec(t *testing.T) {
 		if len(subs.claims) != 1 || subs.claims[0].Executable != "/resolved/codex" || subs.claims[0].ArgvDigest != launchArgvDigest(plan.Argv) {
 			t.Errorf("claim = %+v", subs.claims)
 		}
+		if !strings.Contains(subs.claims[0].SeedEvidence, "codex workspace trust is not seeded") {
+			t.Errorf("codex seed evidence = %q, want the not-seeded reason", subs.claims[0].SeedEvidence)
+		}
 	})
 
 	t.Run("opencode first launch composes the --prompt argv", func(t *testing.T) {
@@ -344,6 +497,9 @@ func TestPrepareLaunchExec(t *testing.T) {
 		}
 		if len(subs.claims) != 1 || subs.claims[0].Executable != "/resolved/opencode" {
 			t.Errorf("claim = %+v", subs.claims)
+		}
+		if !strings.Contains(subs.claims[0].SeedEvidence, "opencode workspace trust is not seeded") {
+			t.Errorf("opencode seed evidence = %q, want the not-seeded reason", subs.claims[0].SeedEvidence)
 		}
 	})
 
@@ -388,6 +544,13 @@ func TestPrepareLaunchExec(t *testing.T) {
 			name:    "relative hop path",
 			mutate:  func(_ *LaunchContext, req *LaunchExecRequest, _ *ebSubmissionStub) { req.HOPPath = "bin/hop" },
 			wantErr: "not absolute",
+		},
+		{
+			name: "relative worker dir",
+			mutate: func(_ *LaunchContext, req *LaunchExecRequest, _ *ebSubmissionStub) {
+				req.WorkerDir = "worktrees/hop-run-1"
+			},
+			wantErr: "working directory is not absolute",
 		},
 		{
 			name: "missing HOP_INCARNATION_ID",

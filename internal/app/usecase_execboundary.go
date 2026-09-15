@@ -23,28 +23,34 @@ type ExecutableLookup func(name, pathValue string) (string, error)
 
 // LaunchExecRequest is hop launch's input: the --run/--attempt flag values
 // as raw strings, the absolute path of the running hop executable (rendered
-// into the initial prompt's submit instruction), the launcher's complete
-// inherited environment and its own pid, and the composition-supplied
-// executable lookup.
+// into the initial prompt's submit instruction), the launcher's
+// symlink-resolved absolute working directory (the attempt worktree the
+// pane was created at — execve preserves it, so it is exactly the path the
+// harness resolves as its own cwd), the launcher's complete inherited
+// environment and its own pid, and the composition-supplied executable
+// lookup.
 type LaunchExecRequest struct {
 	RunID            string
 	AttemptID        string
 	HOPPath          string
+	WorkerDir        string
 	Environ          []string
 	PID              int
 	LookupExecutable ExecutableLookup
 }
 
 // LaunchExecPlan is what hop launch execs once PrepareLaunchExec has
-// validated, claimed and composed: the harness argv (argv[0] the resolved
-// absolute executable recorded in the claim) and the sanitized complete
-// environment. IncarnationID is the claimed incarnation as a string, so a
-// failed exec can settle the claim through FailLaunchExec without the
-// caller holding a typed identity.
+// validated, seeded, claimed and composed: the harness argv (argv[0] the
+// resolved absolute executable recorded in the claim) and the sanitized
+// complete environment. IncarnationID is the claimed incarnation as a
+// string, so a failed exec can settle the claim through FailLaunchExec
+// without the caller holding a typed identity. SeedEvidence is the
+// workspace-trust pre-seeding outcome exactly as the claim recorded it.
 type LaunchExecPlan struct {
 	Argv          []string
 	Env           []string
 	IncarnationID string
+	SeedEvidence  string
 }
 
 // PrepareLaunchExec performs every hop launch step before the exec itself
@@ -59,9 +65,15 @@ type LaunchExecPlan struct {
 // --resume with the pre-assigned native reference, and Codex/opencode
 // cold resume reports the Phase 2 unsupported state); resolves the
 // harness executable to
-// an absolute path using the sanitized environment's PATH; and records the
-// launch claim (exec_pending) with that exact executable, the argv digest
-// and the launcher's own pid. Any failure returns before the claim is
+// an absolute path using the sanitized environment's PATH; applies the
+// workspace-trust pre-seed (PlanTrustSeed over the sanitized environment
+// and the launcher's resolved working directory, written through the
+// TrustSeeder port — an absent or unparsable profile config is a
+// not-seeded outcome and the launch proceeds, while a seeding failure
+// refuses the launch fail-closed); and records the
+// launch claim (exec_pending) with that exact executable, the argv digest,
+// the launcher's own pid and the seed outcome as evidence — evidence only,
+// never a decision input. Any failure returns before the claim is
 // written — no claim, no exec — except a failed claim write itself, which
 // is the store's refusal. Error messages name environment variables but
 // never echo their values.
@@ -79,6 +91,9 @@ func (c *Controller) PrepareLaunchExec(ctx context.Context, req LaunchExecReques
 	}
 	if !filepath.IsAbs(req.HOPPath) {
 		return LaunchExecPlan{}, fmt.Errorf("app: hop executable path is not absolute; the initial prompt carries only absolute paths")
+	}
+	if !filepath.IsAbs(req.WorkerDir) {
+		return LaunchExecPlan{}, fmt.Errorf("app: the launcher working directory is not absolute; the workspace-trust seed key must be the resolved worktree path")
 	}
 	if req.LookupExecutable == nil {
 		return LaunchExecPlan{}, fmt.Errorf("app: no executable lookup supplied")
@@ -136,6 +151,11 @@ func (c *Controller) PrepareLaunchExec(ctx context.Context, req LaunchExecReques
 		return LaunchExecPlan{}, fmt.Errorf("app: the existing launch claim for this incarnation records a different executable or argv than this invocation composed; a claim is never rewritten and this launcher never execs")
 	}
 
+	seedEvidence, err := c.seedWorkspaceTrust(ctx, lc.Snapshot.Harness, env, req.WorkerDir)
+	if err != nil {
+		return LaunchExecPlan{}, err
+	}
+
 	claim := LaunchClaim{
 		IncarnationID: lc.IncarnationID,
 		RunID:         runID,
@@ -145,11 +165,40 @@ func (c *Controller) PrepareLaunchExec(ctx context.Context, req LaunchExecReques
 		PID:           req.PID,
 		State:         LaunchClaimExecPending,
 		ClaimedAt:     c.Clock.Now(),
+		SeedEvidence:  seedEvidence,
 	}
 	if err := c.Submissions.ClaimLaunch(ctx, claim); err != nil {
 		return LaunchExecPlan{}, fmt.Errorf("app: claim launch: %w", err)
 	}
-	return LaunchExecPlan{Argv: argv, Env: env, IncarnationID: lc.IncarnationID.String()}, nil
+	return LaunchExecPlan{Argv: argv, Env: env, IncarnationID: lc.IncarnationID.String(), SeedEvidence: seedEvidence}, nil
+}
+
+// seedWorkspaceTrust applies the launch's workspace-trust pre-seed and
+// renders its claim evidence. The step is planned by PlanTrustSeed over
+// the launched harness, the sanitized environment and the launcher's
+// resolved working directory; a planned seed is written through the Trust
+// port immediately before the claim, while the profile's harness is
+// guaranteed not to be running for this incarnation yet. A not-seeded
+// outcome (no seed applies, or the profile config is absent or
+// unparsable) is evidence and the launch proceeds — the interactive trust
+// dialog stays the surfaced fallback — but a seeding write failure is an
+// error and the caller refuses the launch before any claim exists.
+func (c *Controller) seedWorkspaceTrust(ctx context.Context, harness string, sanitizedEnv []string, workerDir string) (string, error) {
+	step := PlanTrustSeed(harness, sanitizedEnv, workerDir)
+	if !step.Seeds() {
+		return "workspace trust not seeded: " + step.Reason, nil
+	}
+	if c.Trust == nil {
+		return "", fmt.Errorf("app: no workspace-trust seeder supplied")
+	}
+	outcome, err := c.Trust.SeedWorkspaceTrust(ctx, step.ConfigPath, step.ProjectKey)
+	if err != nil {
+		return "", fmt.Errorf("app: seed workspace trust: %w", err)
+	}
+	if !outcome.Seeded {
+		return "workspace trust not seeded: " + outcome.Reason, nil
+	}
+	return "workspace trust seeded for " + step.ProjectKey, nil
 }
 
 // FailLaunchExec settles the launch claim of incarnationID to exec_failed
