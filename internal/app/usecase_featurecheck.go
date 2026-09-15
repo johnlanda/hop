@@ -359,7 +359,7 @@ func (c *Controller) predictTaskConsequence(ctx context.Context, handle RunHandl
 		prediction = decideTaskConsequence(r.StopRequested, len(attempts), retryLimitFor(&frozen.Snapshot))
 		if prediction == taskConsequenceFailed {
 			var oblErr error
-			obligations, oblErr = c.pendingTaskObligations(ctx, wf, handle.runID, taskID)
+			obligations, oblErr = pendingTaskObligations(ctx, wf, handle.runID, taskID)
 			return oblErr
 		}
 		return nil
@@ -488,7 +488,7 @@ func (c *Controller) applyFeatureCheckSettlement(ctx context.Context, handle Run
 			if trErr != nil {
 				return trErr
 			}
-			current, oblErr := c.pendingTaskObligations(ctx, wf, handle.runID, task.ID)
+			current, oblErr := pendingTaskObligations(ctx, wf, handle.runID, task.ID)
 			if oblErr != nil {
 				return oblErr
 			}

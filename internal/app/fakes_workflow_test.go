@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 
@@ -227,6 +228,28 @@ func (r fakeMessageRepo) Get(_ context.Context, id identity.MessageID) (run.Mess
 		return run.Message{}, fmt.Errorf("%w: message %s", app.ErrNotFound, id)
 	}
 	return m, nil
+}
+
+func (r fakeMessageRepo) PendingByAddress(_ context.Context, runID identity.RunID, address run.Address) ([]identity.MessageID, error) {
+	var out []identity.MessageID
+	appendPending := func(m *run.Message) {
+		if m.RunID != runID || !m.Recipient.Equal(address) {
+			return
+		}
+		if _, acked := r.u.store.MessageAcks[m.ID]; acked {
+			return
+		}
+		out = append(out, m.ID)
+	}
+	for id := range r.u.store.Messages {
+		m := r.u.store.Messages[id]
+		appendPending(&m)
+	}
+	for i := range r.u.messagesCreated {
+		appendPending(&r.u.messagesCreated[i])
+	}
+	slices.Sort(out)
+	return slices.Compact(out), nil
 }
 
 func (r fakeMessageRepo) ByAddress(_ context.Context, runID identity.RunID, address run.Address) ([]run.Message, error) {
@@ -1031,6 +1054,9 @@ func (s *fakeStore) mailboxClearLocked(task identity.TaskID) bool {
 // --- fakeStore: app.WorkflowReadStore ---
 
 func (s *fakeStore) LoadSessionLaunchContext(_ context.Context, runID identity.RunID, session identity.SessionID) (app.SessionLaunchContext, error) {
+	if err := s.refuseInsideTransaction("WorkflowReadStore.LoadSessionLaunchContext"); err != nil {
+		return app.SessionLaunchContext{}, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sRow, ok := s.Sessions[session]
@@ -1071,6 +1097,9 @@ func (s *fakeStore) LoadSessionLaunchContext(_ context.Context, runID identity.R
 }
 
 func (s *fakeStore) LoadMessagingContext(_ context.Context, session identity.SessionID) (app.MessagingContext, error) {
+	if err := s.refuseInsideTransaction("WorkflowReadStore.LoadMessagingContext"); err != nil {
+		return app.MessagingContext{}, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sRow, ok := s.Sessions[session]
@@ -1093,6 +1122,9 @@ func (s *fakeStore) LoadMessagingContext(_ context.Context, session identity.Ses
 }
 
 func (s *fakeStore) LoadMessageDetail(_ context.Context, runID identity.RunID, messageID identity.MessageID) (app.MessageDetail, error) {
+	if err := s.refuseInsideTransaction("WorkflowReadStore.LoadMessageDetail"); err != nil {
+		return app.MessageDetail{}, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	msg, ok := s.Messages[messageID]

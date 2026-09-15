@@ -302,7 +302,7 @@ func (c *Controller) applyWorkerInterruption(ctx context.Context, handle RunHand
 			return trErr
 		}
 		if consequence == taskConsequenceFailed {
-			current, oblErr := c.pendingTaskObligations(ctx, wf, handle.runID, task.ID)
+			current, oblErr := pendingTaskObligations(ctx, wf, handle.runID, task.ID)
 			if oblErr != nil {
 				return oblErr
 			}

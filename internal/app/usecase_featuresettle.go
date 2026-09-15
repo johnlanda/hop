@@ -96,25 +96,18 @@ func commitControllerNotice(ctx context.Context, wf WorkflowRepositories, runID 
 
 // pendingTaskObligations reads the queued and delivered-unacknowledged
 // message IDs addressed to one task, sorted — the mailbox-closure
-// snapshot-equality contract's ID set (section 5).
-func (c *Controller) pendingTaskObligations(ctx context.Context, wf WorkflowRepositories, runID identity.RunID, taskID identity.TaskID) ([]string, error) {
-	read, err := RequireWorkflowReadStore(c.Read, "pending task obligations")
+// snapshot-equality contract's ID set (section 5). It reads ONLY
+// through the caller's transaction-owned repositories: both the notice
+// snapshot and the settlement's final equality check must see the
+// transaction's own view, never a separate lease-free read port.
+func pendingTaskObligations(ctx context.Context, wf WorkflowRepositories, runID identity.RunID, taskID identity.TaskID) ([]string, error) {
+	ids, err := wf.Messages().PendingByAddress(ctx, runID, run.TaskAddress(taskID))
 	if err != nil {
 		return nil, err
 	}
-	envelopes, err := wf.Messages().ByAddress(ctx, runID, run.TaskAddress(taskID))
-	if err != nil {
-		return nil, err
-	}
-	var pending []string
-	for i := range envelopes {
-		detail, err := read.LoadMessageDetail(ctx, runID, envelopes[i].ID)
-		if err != nil {
-			return nil, err
-		}
-		if detail.Ack == nil {
-			pending = append(pending, envelopes[i].ID.String())
-		}
+	pending := make([]string, 0, len(ids))
+	for _, id := range ids {
+		pending = append(pending, id.String())
 	}
 	slices.Sort(pending)
 	return pending, nil
@@ -142,7 +135,7 @@ type integrationSettlement struct {
 // concurrent send moves the mailbox between preparation and settlement.
 func (c *Controller) settleIntegrationTerminal(ctx context.Context, handle RunHandle, frozen *FrozenRun, integrationID identity.IntegrationID, settlement integrationSettlement) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per settled integration.
 	for round := 0; round < settlementNoticeRetries; round++ {
-		prediction, obligations, taskSeq, err := c.predictIntegrationConsequence(ctx, handle, integrationID)
+		prediction, obligations, taskSeq, err := c.predictIntegrationConsequence(ctx, handle, frozen, integrationID)
 		if err != nil {
 			return err
 		}
@@ -162,8 +155,11 @@ func (c *Controller) settleIntegrationTerminal(ctx context.Context, handle RunHa
 
 // predictIntegrationConsequence reads the state the settlement's notice
 // is composed from: the task consequence as currently decidable, and —
-// when the task would fail — the pending-obligation snapshot.
-func (c *Controller) predictIntegrationConsequence(ctx context.Context, handle RunHandle, integrationID identity.IntegrationID) (taskConsequence, []string, int, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
+// when the task would fail — the pending-obligation snapshot. The frozen
+// snapshot arrives from the caller: an immutable value already loaded
+// outside any transaction, never re-read through a lease-free port
+// inside one.
+func (c *Controller) predictIntegrationConsequence(ctx context.Context, handle RunHandle, frozen *FrozenRun, integrationID identity.IntegrationID) (taskConsequence, []string, int, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
 	var (
 		prediction  taskConsequence
 		obligations []string
@@ -173,10 +169,6 @@ func (c *Controller) predictIntegrationConsequence(ctx context.Context, handle R
 		wf, wfErr := RequireWorkflowRepositories(uow, "predict integration consequence")
 		if wfErr != nil {
 			return wfErr
-		}
-		frozen, frozenErr := c.Read.LoadFrozenRun(ctx, handle.runID)
-		if frozenErr != nil {
-			return frozenErr
 		}
 		integ, _, getErr := wf.Integrations().Get(ctx, integrationID)
 		if getErr != nil {
@@ -198,7 +190,7 @@ func (c *Controller) predictIntegrationConsequence(ctx context.Context, handle R
 		prediction = decideTaskConsequence(r.StopRequested, len(attempts), retryLimitFor(&frozen.Snapshot))
 		if prediction == taskConsequenceFailed {
 			var oblErr error
-			obligations, oblErr = c.pendingTaskObligations(ctx, wf, handle.runID, integ.TaskID)
+			obligations, oblErr = pendingTaskObligations(ctx, wf, handle.runID, integ.TaskID)
 			return oblErr
 		}
 		return nil
@@ -316,7 +308,7 @@ func (c *Controller) applyIntegrationSettlement(ctx context.Context, handle RunH
 				// Failure closes admission in the same commit, under the
 				// snapshot-equality contract: the committed notice's
 				// at-closure ID set must be exactly what is pending now.
-				current, oblErr := c.pendingTaskObligations(ctx, wf, handle.runID, integ.TaskID)
+				current, oblErr := pendingTaskObligations(ctx, wf, handle.runID, integ.TaskID)
 				if oblErr != nil {
 					return oblErr
 				}

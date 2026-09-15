@@ -358,6 +358,9 @@ func (s *fakeStore) refuseInsideTransaction(port string) error {
 // --- ReadStore ---
 
 func (s *fakeStore) ListRuns(_ context.Context, repositoryRoot string) ([]app.RunStatus, error) {
+	if err := s.refuseInsideTransaction("ReadStore.ListRuns"); err != nil {
+		return nil, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	repoID, ok := s.repoByRoot[repositoryRoot]
@@ -526,6 +529,9 @@ func (s *fakeStore) currentBindingByAttemptLocked(attemptID identity.AttemptID) 
 }
 
 func (s *fakeStore) LoadFrozenRun(_ context.Context, runID identity.RunID) (app.FrozenRun, error) {
+	if err := s.refuseInsideTransaction("ReadStore.LoadFrozenRun"); err != nil {
+		return app.FrozenRun{}, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	row, ok := s.Runs[runID]

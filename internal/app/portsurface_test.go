@@ -36,7 +36,7 @@ func portSurfaceAllowlist() map[string][]string {
 		"IDGenerator":              {"NewID"},
 		"IntegrationRepository":    {"ByTask", "Create", "Current", "Get", "Save"},
 		"LaunchClaimRepository":    {"Get", "Pending", "Settle"},
-		"MessageRepository":        {"ByAddress", "Create", "Get"},
+		"MessageRepository":        {"ByAddress", "Create", "Get", "PendingByAddress"},
 		"MessagingStore":           {"AckMessage", "AnswerQuestion", "FetchNextMessage", "SendMessage"},
 		"Observer":                 {"Snapshot", "Subscribe"},
 		"OperationRepository":      {"ByKind", "Create", "Get", "Pending", "Save"},

@@ -268,6 +268,12 @@ type MessageRepository interface {
 	// ByAddress returns every envelope recorded for one recipient address,
 	// oldest enqueue sequence first.
 	ByAddress(ctx context.Context, runID identity.RunID, address run.Address) ([]run.Message, error)
+	// PendingByAddress returns the queued and delivered-unacknowledged
+	// message IDs for one recipient address, sorted: the mailbox-closure
+	// snapshot-equality set (section 5), read INSIDE the caller's
+	// transaction so a settlement's final equality check never escapes
+	// its unit of work through a lease-free read port.
+	PendingByAddress(ctx context.Context, runID identity.RunID, address run.Address) ([]identity.MessageID, error)
 }
 
 // ReviewRepository is the controller-side read of accepted review
