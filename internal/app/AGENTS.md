@@ -35,7 +35,7 @@ sides together. `cmd/hop` never imports domain or identity types: every
 | [process.go](process.go) | `CommandRunner`, `Command`, `CommandResult`, `ProcessGroupInspector`, `GroupProcess` | Process-group-leader execution with cancellation (git operations, spawning `hop check-exec`) and local process-table listing/signaling for group retirement |
 | [configuration.go](configuration.go) | `ConfigurationSource`, `RunPolicy` | Loads and validates one repository's `.herdr-orchestrator/config.toml`-decoded policy: check contract, env strip/passthrough, profile dir, harness, and (Phase 3, zero value for solo) the `[workflow]`/`[workers]`/`[retry]`/`[roles]`/`[messages]` keys; the config adapter owns defaults and feature-mode-required validation |
 | [digest.go](digest.go) | `ResultDigestTag`, `ComputeResultDigest`, `RequestDigestTag`, `ComputeRequestDigest` | The canonical `"hop-result-v1"` result digest and the canonical `"hop-request-v1"` messaging/plan request digest: length-prefixed fields, SHA-256 hex, computed only here — the domain receives each as an opaque validated string |
-| [decision.go](decision.go) | `LaunchClaimDeadline`, `LaunchDeadlineExpired`, `LaunchSettlement`, `CorroborateSettlement`, `FirstMarkerMatch`, `OccupantMatches`, `ServerContinuityEstablished`, `GroupRetirementOutcome`, `ClassifyGroupRetirement`, `ArgvUnavailable` | The section 6 claim-corroboration predicate (claim-derived executable identity, durable marker set, explicit `hop launch` exclusion, fail-closed on missing identity), close-rule occupant matching, the server-continuity predicate, and the four-outcome process-group-retirement classifier matching both the frozen check argv and its check-exec invocation |
+| [decision.go](decision.go) | `LaunchClaimDeadline`, `LaunchDeadlineExpired`, `LaunchSettlement`, `SettlementEvidence`, `CorroborateSettlement`, `ClaimProcessMatches`, `RestoredHarnessOutcome`, `MatchRestoredHarness`, `restoreInvocationFor`, `MatchRetirementTarget`, `processMarkerMatch`, `OccupantMatches`, `ServerContinuityEstablished`, `GroupRetirementOutcome`, `ClassifyGroupRetirement`, `ArgvUnavailable` | The section 6 claim-corroboration predicate over EVERY foreground-group member (claim-derived executable identity, durable marker set, explicit per-member `hop launch` exclusion, fail-closed on missing identity, wrapper precedence; returns the corroborated member and marker as `SettlementEvidence`), the claimed-process-present check resume uses to keep the wrapper classification, the restored-harness predicate (Herdr's native restore invocation per harness, exact argv elements on one member, exactly one match) that alone authorizes positive-evidence retirement and its close-time recheck, the per-member close-rule occupant match, the server-continuity predicate, and the four-outcome process-group-retirement classifier matching both the frozen check argv and its check-exec invocation |
 | [operation_payload.go](operation_payload.go) | `decodeOperationPayload` | Reads a persisted operation intent/evidence/outcome payload without relying on Go type identity: a value of the target type passes through, anything else round-trips through JSON. Callers still validate required fields and fail closed on a failed decode |
 | [controller.go](controller.go) | `Controller`, `RunHandle`, `Heartbeat`, `Detach`, `ErrStopRequested` | The driving service composition calls; ports as fields, plus `GitExecutable` (the absolute path of the git binary every repository/worktree command runs, resolved once by composition). `RunHandle` is an opaque per-run token (run identity, the held lease and a dispatch scope) so composition never touches identity types. `Heartbeat` extends the lease on the design's interval and cancels in-flight external calls on failure; `Detach` journals, cancels and releases without stopping; `revalidateForDispatch` is the section 4 step 2 revalidation every external mutation runs first. `Messages`/`Plan`/`Reviews`/`Workspaces`/`Presentation` are optional Phase 3 fields, nil for a solo-only Controller (`Presentation` is the Phase 1 `AgentPresentation` port, consumed by section 9's run-state token publication) |
 | [assignment.go](assignment.go) | `renderAssignment` | Deterministic assignment-artifact content: brief, identities and absolute paths only, referenced by the launch argv, never typed into a dialog |
@@ -153,6 +153,71 @@ sides together. `cmd/hop` never imports domain or identity types: every
   an empty marker set is unresolved — never settled. Adoption requires a
   settled claim; an exec_pending claim settles through the ordinary fenced
   corroboration path first.
+- Foreground-group decisions never depend on member POSITION. Herdr
+  reports `pane.process_info` foreground members in raw platform listing
+  order — macOS: unsorted `proc_listpids` (repos/herdr/src/platform/
+  macos.rs, `foreground_job`); Linux: ascending pid (linux.rs,
+  `foreground_process_group_members_with`) — and a real harness (Claude
+  Code 2.1.270) spawns its configured MCP servers into its own process
+  group right after the trust check, so the launched process holds no
+  particular index (the live probe observed an MCP server at index 0; see
+  docs/architecture/native-harness-compat.md). Per consumer, the predicate
+  is one of exactly three shapes, each applied to ONE member at a time —
+  conjuncts are never combined across members:
+  - claimed-process-among-the-members (identity conjuncts on the SAME
+    member): `CorroborateSettlement` scans every member, skipping
+    `hop launch` invocations per member; ANY member matching executable +
+    marker under a pid different from the claim's classifies
+    forking-wrapper (wrapper precedence — a live wrapper that already
+    exec'd matches all three conjuncts under the claim's pid, so a
+    settled-first reading would adopt the refused topology), else the
+    claim-pid member matching executable + marker settles, else
+    unresolved; the corroborated member's own pid and marker are recorded
+    (`SettlementEvidence`) as claim settlement and binding occupant
+    evidence (`settleExeced`, the resume reconciliation settle and warm
+    adoption). `OccupantMatches` and a stop target's `closeTargetMismatch`
+    (usecase_stop.go) require the recorded pid and a marker on that same
+    member. Launch markers are matched as an exact argv element or a
+    cmdline substring (`processMarkerMatch`), because the run, attempt and
+    incarnation markers sit inside the larger prompt argument. Resume keeps
+    the wrapper classification on both reconciliation paths and never
+    falls through to retirement: an exec_pending claim on a reconciling
+    attempt with any forking-wrapper classification, and a settled claim
+    whose group holds the matching claimed process (`ClaimProcessMatches`)
+    alongside a matching different-pid process, each report
+    `ResumeFailedClosed` with nothing retired. A settled claim's
+    different-pid match with NO member under the claim's pid still matching
+    (an observation about the listed members, not proof that pid is absent)
+    is the restored occupant case, decided only by the next shape.
+  - restored harness (positive evidence for retiring an occupant that is
+    not the claim's corroborated process): `MatchRestoredHarness` requires,
+    on the SAME member, the session harness's native restore executable
+    and the exact restore argument shape for the durable native reference
+    — for Claude Code (the only harness `restoreInvocationFor` knows, matching
+    Herdr's `agent_resume::plan` and the executed S3 probe
+    `TestSpikeRestoreAutoRelaunchBypassesLauncher`) the basename of argv[0]
+    `claude` and an argv element `--resume` immediately followed by an argv
+    element EXACTLY equal to the reference. Whenever Herdr reports argv,
+    elements are matched exactly and cmdline is never consulted, so a
+    child whose argument merely embeds the reference is not evidence; only
+    when argv is absent does the documented fallback apply (identity from
+    argv0/name, `--resume <ref>` space-delimited in cmdline). Exactly one
+    matching member authorizes `retireAndRelaunch`, whose close target
+    records that member's pid; two or more are ambiguous and fail closed
+    with the candidate pids in the report; none, or a harness with no
+    restore invocation, fails closed. The close procedure rechecks a
+    persisted positive-evidence retirement target — in the authorizing
+    round and whenever a later round replays the pending close — by
+    classifying the WHOLE current group again (`MatchRetirementTarget`):
+    it closes only when `MatchRestoredHarness` finds exactly one candidate
+    for the recorded native reference AND that candidate has the recorded
+    pid, never pid plus a cmdline substring. A second candidate beside the
+    recorded member is ambiguous and a unique candidate under another pid
+    is never adopted as a new target; either way no close is dispatched,
+    the operation stays reconciling with its recorded intent and act
+    evidence, and the report names the pane and, for ambiguity, every
+    candidate pid.
+    `observePaneAbsence` treats any non-empty foreground as an occupant.
 - Every close runs the shared pane.close operation procedure
   (`closePaneOperation`): the intent freezes the exact target evidence
   (pane, label, session/incarnation, pid, durable argv markers, reason)
@@ -319,7 +384,14 @@ sides together. `cmd/hop` never imports domain or identity types: every
   `fakeCommands.Run` also mirrors the real Runner's own argv contract,
   refusing an empty argv or a non-absolute argv[0], so calling it with a
   bare executable name fails the app suite directly rather than only
-  surfacing against a real process at runtime.
+  surfacing against a real process at runtime. Scripted `InspectPaneFn`
+  panes use the real pane.process_info shapes: `mcpGroupPane`
+  (helpers_test.go) reproduces the pinned multi-member foreground group —
+  MCP-server children listed before the worker in raw platform order —
+  that the executed real-process probe
+  (`TestRealProcessSettlementWithMCPGroupMembers`,
+  test/integration/pgroup_test.go) observed under the production
+  transport.
 - Named scenario coverage, by test:
   `TestLeaseFencing` (takeover barrier with staged writes discarded,
   heartbeat/release CAS refusals, monotonic generations) and
@@ -333,10 +405,25 @@ sides together. `cmd/hop` never imports domain or identity types: every
   format and HOP path, and an unconfigured `GitExecutable` refused before
   any side effect); `TestCorroborateLaunch` (the four settlement
   outcomes, native-reference markers, pre-binding label recovery,
-  exec-failure session termination, early-acceptance session activation);
-  `TestCorroborateSettlement`/`TestOccupantMatches`/
+  exec-failure session termination, early-acceptance session activation,
+  settlement from behind MCP-server members with the corroborated
+  member's evidence recorded, and wrapper precedence failing closed);
+  `TestCorroborateSettlement`/`TestClaimProcessMatches`/
+  `TestMatchRestoredHarness`/`TestMatchRetirementTarget`/
+  `TestOccupantMatches`/
   `TestClassifyGroupRetirement` (the pure decision tables incl. launcher
-  exclusion, fail-closed empty identity, dual check/check-exec argv);
+  exclusion, fail-closed empty identity, dual check/check-exec argv, and
+  the multi-member foreground vectors — the claimed member at index 1+
+  behind MCP-shaped foreign members, foreign-members-only,
+  cross-member-conjunct refusal, per-member launcher skip, and wrapper
+  precedence over a simultaneously matching claim-pid member — with the
+  returned `SettlementEvidence` pinned per row; the restored-harness
+  table covers the legitimate restore argv in both member orders, an
+  embedded-reference path, a foreign executable with the exact pair,
+  `--session-id`/joined/suffixed/trailing-flag shapes, argv-present
+  cmdline substrings ignored, cross-member refusal, two candidates
+  ambiguous, the argv-absent fallback with its token boundaries, and
+  unsupported harness/empty reference);
   `TestDriveStop` and `TestPaneCloseInterruption` (observed termination,
   mismatch-never-absence, the pane.close operation's interruption windows
   on both sides of the act); `TestSubmitResult` (submission order incl.
@@ -353,6 +440,24 @@ sides together. `cmd/hop` never imports domain or identity types: every
   never-resend); `TestResumeRounds` (fail-closed→warm restoring all four
   entities; warm→submit→passing check to completed);
   `TestResumePositiveEvidenceRetirement` (the complete section 5 case 2);
+  `TestResumeRestoredHarnessPredicate` (behind a marker-free foreign first
+  member: an embedded-reference child, a foreign executable with the exact
+  `--resume <ref>` pair, an argv-present cmdline substring and two
+  candidates each fail closed with no close, supersession or relaunch; the
+  restored harness ahead of its MCP child and the argv-absent fallback are
+  retired; a retirement target whose pid changed occupant fails the
+  close-time recheck); `TestRetirementRecheckRequiresUniqueCandidate` (A
+  authorizes the retirement, then A plus a second restored-harness
+  candidate at the close-time recheck, in both orders, and again when a
+  later resume round replays the pending close: no close dispatched, the
+  operation reconciling with its recorded pid and act evidence kept, the
+  pane and both pids reported, no relaunch; stop facing the same group
+  never re-dispatches the persisted close);
+  `TestResumeForkingWrapperNeverRetires` (a settled
+  claim with the claimed process plus a matching different-pid process,
+  and an exec_pending claim on a reconciling attempt with that pair or the
+  different-pid process alone, in every member order, fail closed with the
+  wrapper report and nothing retired);
   `TestResumeAttestation` (continuity-gated `--confirm-absent`, refusal on
   changed/unknown instance, delayed restore retired by positive evidence);
   and the four section 5 reference traces as complete four-entity app

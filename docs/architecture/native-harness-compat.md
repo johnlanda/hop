@@ -200,6 +200,43 @@ alternate-profile/pools work; they are not re-verified here.
   attempt budget on detected changes yields not-seeded evidence and the
   dialog fallback. Successful evidence records an observation, not a
   guarantee that trust remains set at exec.
+- MCP servers share the harness's own process group (observed live
+  2026-09-15, claude 2.1.270 under herdr 0.9.0, during the failed
+  `TestLiveClaudeDefaultProfileRun` on main 3be1748 whose evidence is
+  retained under `$TMPDIR/hop-integration/`). A launched
+  `claude --session-id <uuid> "<prompt>"` starts the operator's
+  user-level MCP servers as its children in ITS OWN process group
+  immediately after the (pre-seeded) trust check: the observed group held
+  the harness (pgid leader, argv intact) plus `npm exec
+  @executeautomation/playwright-mcp-server`, its `node .../
+  playwright-mcp-server` child, and an app-installed MCP server binary —
+  foreign executables, no HOP marker in any of their argvs. Herdr's
+  `pane.process_info` reports EVERY member of the foreground group, in
+  raw platform listing order with no sorting and no positional
+  semantics: macOS builds the list from unsorted
+  `proc_listpids(PROC_PGRP_ONLY, ...)`
+  ([macos.rs](../../repos/herdr/src/platform/macos.rs),
+  `foreground_job`); Linux sorts ascending by pid
+  ([linux.rs](../../repos/herdr/src/platform/linux.rs),
+  `foreground_process_group_members_with`), which still gives the leader
+  no fixed index (a recycled lower pid can precede it); the API maps the
+  job's order verbatim
+  ([panes.rs](../../repos/herdr/src/app/api/panes.rs),
+  `handle_pane_process_info`). In the live observation index 0 was an MCP
+  server, which left the launch claim `exec_pending` for the whole bound
+  while settlement read only `foreground[0]`. Consequence: every HOP
+  decision over a pane occupant (settlement, adoption, close-target
+  match, positive-evidence retirement) must scan ALL members and must
+  never depend on member position — the orderings above are observed
+  facts about the current implementations, not guarantees. A positive
+  retirement is authorized only by the restored-harness predicate over
+  one member (see
+  [Herdr cold-restore interaction](#herdr-cold-restore-interaction)). The
+  per-member predicate rules live in `internal/app/decision.go` and
+  internal/app/AGENTS.md, and the executed real-process probe under the
+  production transport is `TestRealProcessSettlementWithMCPGroupMembers`
+  (test/integration/pgroup_test.go), which asserts the position-free
+  shape and records the observed order.
 - Keychain side effect of any launch (observed during the same spike):
   merely starting claude under a fresh `CLAUDE_CONFIG_DIR` — no login —
   creates the keychain item
@@ -483,6 +520,25 @@ installed `herdr 0.9.0` documentation):
   ([`agent_resume::plan`](../../repos/herdr/src/agent_resume.rs)) — so
   nothing in the plan itself re-runs a sanitizing launcher or reselects a
   profile.
+- HOP's positive evidence for retiring such a restored occupant is this
+  exact plan shape, never the reference appearing somewhere in a process
+  command line: the restored-harness predicate
+  (`MatchRestoredHarness`, `internal/app/decision.go`) requires, on ONE
+  foreground-group member, the harness's restore executable (for Claude
+  Code the basename of argv[0] is `claude`) AND an argv element
+  `--resume` immediately followed by an argv element exactly equal to the
+  session's durable native reference, and exactly one such member —
+  two candidates fail closed, both when the retirement is authorized and
+  when its close is rechecked against the recorded pid over the whole
+  group (`MatchRetirementTarget`). Argv elements are matched exactly whenever
+  Herdr reports argv. Herdr 0.9.0 derives `cmdline` by joining argv with
+  spaces on both platforms and omits both together, so the cmdline
+  fallback (identity from argv0/name, a space-delimited `--resume <id>`)
+  applies only to a server that reports cmdline without argv. Only Claude
+  Code has an entry: it is the only harness HOP pre-assigns a native
+  reference for and the only Phase 2 cold resume. The shape is pinned by
+  `TestSpikeRestoreAutoRelaunchBypassesLauncher` (argv exactly
+  `[claude --resume <id>]`).
 - The cold-restore path constructs its launch environment as
   `PaneLaunchEnv::from_extra(Vec::new())`
   ([restore implementation](../../repos/herdr/src/persist/restore.rs)), as

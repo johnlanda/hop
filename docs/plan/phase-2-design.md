@@ -824,15 +824,28 @@ per the decision table (section 4) before any new act.
    that a different process occupies the old pane — it equally matches a
    human's unrelated replacement shell — and NEVER authorizes retirement.
    Automatic retirement requires positive evidence tying the occupant to
-   the run's native session and server instance: the concrete candidate is
-   an observed process command line carrying the run's pre-assigned native
-   session reference (`--resume <uuid>` / `--session-id <uuid>`) — S2
+   the run's native session and server instance: exactly one foreground
+   member that is the harness's native restore invocation for the run's
+   pre-assigned native session reference — for Claude, executable
+   identity `claude` (argv[0] basename) and an argv element `--resume`
+   immediately followed by an argv element exactly equal to the reference,
+   both on that same member (`app.MatchRestoredHarness`). The reference
+   merely appearing in some member's command line (a transcript path, a
+   foreign tool's argument) is never evidence, argv elements are matched
+   exactly whenever argv is reported (a space-delimited cmdline match is
+   only the fallback when it is not), and two candidates fail closed —
+   again at the guarded close, which reclassifies the whole group and
+   acts only when its one candidate is the recorded pid. S2
    established that full process argv IS observable through pane
    inspection, and S3 established that a recorded native session makes
    Herdr auto-relaunch exactly as `claude --resume <id>` (bypassing
    `hop launch` and dropping the `HOP_*` env — the restored process's
    dump showed `HERDR_*` present and `HOP_RUN_ID` absent), so this
-   positive-evidence mechanism is verified end to end.
+   positive-evidence mechanism is verified end to end. An observation
+   the section 6 predicate classifies as the forking-wrapper topology is
+   never a restored occupant: an `exec_pending` claim's wrapper, or a
+   settled claim's group holding the matching claimed process alongside a
+   matching different-pid process, fails closed without retirement.
    Such an occupant is recorded as an
    observed-restoration binding (`launch_kind = restored-observed`, with
    the observation as its evidence) and becomes a guarded retirement
@@ -1062,31 +1075,48 @@ and never-resend rule apply.
 
 Claim settlement — one corroboration predicate, used identically by
 settlement, adoption and warm reattach: the claim is an intent
-acknowledgment, not proof the harness ran. The controller settles it to
-`execed` only when an `InspectPane` observation satisfies ALL of:
+acknowledgment, not proof the harness ran. An `InspectPane` observation
+reports EVERY member of the pane's foreground process group, in raw
+platform listing order with no positional semantics (macOS: unsorted
+`proc_listpids`, `repos/herdr/src/platform/macos.rs` `foreground_job`;
+Linux: ascending pid, `linux.rs`
+`foreground_process_group_members_with`), and a real harness spawns
+children into its own group — Claude Code 2.1.270 starts its configured
+MCP servers there immediately after the trust check, and the executed
+live probe observed an MCP server at index 0 — so the predicate scans all
+members and never reads a member's position. The controller settles the
+claim to `execed` only when ALL of:
 
 - the pane matches the claim's current creation binding (pane ID, or
   recovery by creation label);
-- the foreground process's executable identity equals the expected harness
-  or fixture executable recorded in the claim — matched by verbatim
-  argv[0], or by basename against name/argv0, since Herdr reports argv0 as
-  a basename (macOS) or not at all (Linux) — which explicitly excludes a
-  still-running `hop launch` (argv0/name = the HOP binary's basename,
-  subcommand `launch`), so a paused pre-exec launcher can never satisfy the
-  predicate;
-- the process argv carries the claim's marker;
-- the foreground pid equals the claim pid (execve preserves it).
+- SOME member's executable identity equals the expected harness or
+  fixture executable recorded in the claim — matched by verbatim argv[0],
+  or by basename against name/argv0, since Herdr reports argv0 as a
+  basename (macOS) or not at all (Linux) — where a still-running
+  `hop launch` invocation (argv0/name = the HOP binary's basename,
+  subcommand `launch`) is skipped per member, so a paused pre-exec
+  launcher can never satisfy the predicate;
+- that SAME member's argv carries the claim's marker (a marker carried
+  only by a foreign sibling — an MCP server, say — corroborates nothing);
+- that SAME member's pid equals the claim pid (execve preserves it);
+- and NO member matches executable identity and marker under a different
+  pid (wrapper precedence, below).
 
 Herdr agent detection (recognized harness names only, per S1) and a valid
 `transient`-rejected early submission are wakeups that TRIGGER this
-inspection; neither ever settles a claim by itself. An observation that
+inspection; neither ever settles a claim by itself. Any member that
 matches on executable identity, marker and binding but differs on pid is
 the forking-wrapper topology, which Phase 2 does not support: it fails
-closed — the claim stays `exec_pending` and the run surfaces `needs
-interaction` with the observed identity, so the human decides. This is the
-settlement path for the test fixture worker too, whose binary name is
-never agent-detected. The decision table and warm reattach adopt only
-settled claims; an `exec_pending` claim is always ambiguous.
+closed — even when the claim-pid member also matches, since a live
+wrapper that already exec'd carries the recorded executable and markers
+in its own argv under the claim's pid, and a settled-first reading would
+adopt exactly the refused topology — the claim stays `exec_pending` and
+the run surfaces `needs interaction` with the observed identity, so the
+human decides. Members matching neither way (MCP servers and other
+marker-free children) are ignored. This is the settlement path for the
+test fixture worker too, whose binary name is never agent-detected. The
+decision table and warm reattach adopt only settled claims; an
+`exec_pending` claim is always ambiguous.
 
 ### Assignment artifact
 

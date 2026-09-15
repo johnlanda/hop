@@ -131,8 +131,11 @@ func TestDriveStop(t *testing.T) {
 		if err := tc.Controller.RequestStop(context.Background(), detail.RunID.String()); err != nil {
 			t.Fatalf("RequestStop() error = %v", err)
 		}
+		// The worker's own MCP-server children share its process group and
+		// list before it: the close-target match must find the recorded pid
+		// among the members, not require it at index 0.
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "claude", Name: "claude", Argv: []string{"/usr/bin/claude", detail.AttemptID.String()}}}}, nil
+			return mcpGroupPane(4242, "/usr/bin/claude", detail.AttemptID.String()), nil
 		}
 		report, err := tc.Controller.DriveStop(context.Background(), handle)
 		if err != nil {
@@ -155,6 +158,35 @@ func TestDriveStop(t *testing.T) {
 		}
 		if !final.Terminated || final.RunState != string(run.RunStopped) {
 			t.Fatalf("final report = %+v, want terminated/stopped", final)
+		}
+	})
+
+	t.Run("running: a foreground group of foreign members only never matches the close target", func(t *testing.T) {
+		// The recorded pid appears on no member, and a marker carried by a
+		// foreign member (a same-group process quoting the attempt id in
+		// its own argv) is never combined with another member's pid: the
+		// close-target match is per member, so nothing is closed.
+		tc := newTestController(defaultPolicy())
+		handle, detail := runningRun(t, tc)
+
+		if err := tc.Controller.RequestStop(context.Background(), detail.RunID.String()); err != nil {
+			t.Fatalf("RequestStop() error = %v", err)
+		}
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			return app.PaneProcess{Foreground: []app.ProcessInfo{
+				{PID: 9999, Argv0: "bash", Name: "bash", Argv: []string{"/bin/bash"}},
+				{PID: 9998, Argv0: "npm", Name: "npm", Argv: []string{"npm", "exec", detail.AttemptID.String()}},
+			}}, nil
+		}
+		report, err := tc.Controller.DriveStop(context.Background(), handle)
+		if err != nil {
+			t.Fatalf("DriveStop() error = %v", err)
+		}
+		if report.Terminated {
+			t.Fatalf("report = %+v, must not terminate on a foreign-members-only group", report)
+		}
+		if len(tc.Runtime.ClosedPanes) != 0 {
+			t.Fatalf("ClosePane was called despite no member matching the close target: %v", tc.Runtime.ClosedPanes)
 		}
 	})
 

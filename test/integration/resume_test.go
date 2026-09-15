@@ -19,11 +19,7 @@ func TestRealProcessControllerKillResumeWarmReattach(t *testing.T) {
 	fields := fx.requireRunState(t, "running")
 	paneID := paneIDFromBinding(fields["binding"])
 
-	before := fx.server.processInfo(t, paneID)
-	if len(before.ForegroundProcesses) == 0 {
-		t.Fatalf("pane %s reports no foreground worker process before the controller is killed", paneID)
-	}
-	workerPID := before.ForegroundProcesses[0].PID
+	workerPID := fx.workerForegroundPID(t, paneID)
 	_, attemptID := fx.taskAndAttemptIDs(t)
 	incarnationBefore := fx.currentIncarnationID(t, attemptID)
 
@@ -39,11 +35,11 @@ func TestRealProcessControllerKillResumeWarmReattach(t *testing.T) {
 
 	fx.requireRunState(t, "running")
 
-	after := fx.server.processInfo(t, paneID)
-	if len(after.ForegroundProcesses) == 0 {
-		t.Fatalf("pane %s reports no foreground worker process after warm reattach", paneID)
-	}
-	if got := after.ForegroundProcesses[0].PID; got != workerPID {
+	// The same worker pid must still be among the pane's foreground members
+	// (warm reattach rebinds, it never relaunches); it is located by the
+	// claim's pid, never by listing index — the worker's MCP stand-in child
+	// shares its group and holds no fixed position.
+	if got := fx.workerForegroundPID(t, paneID); got != workerPID {
 		t.Errorf("worker pid after warm reattach = %d, want unchanged %d (warm reattach rebinds, it never relaunches)", got, workerPID)
 	}
 	if got := fx.currentIncarnationID(t, attemptID); got != incarnationBefore {
@@ -76,11 +72,10 @@ func coldRelaunchAfterCrash(t *testing.T, fx *fixtureRun) (oldIncarnationID, new
 	taskID, attemptID = fx.taskAndAttemptIDs(t)
 	oldIncarnationID = fx.currentIncarnationID(t, attemptID)
 
-	info := fx.server.processInfo(t, paneID)
-	if len(info.ForegroundProcesses) == 0 {
-		t.Fatalf("pane %s reports no foreground worker process before the crash", paneID)
-	}
-	workerPID := int(info.ForegroundProcesses[0].PID)
+	// SIGKILL the WORKER itself, located by the claim's pid — never
+	// ForegroundProcesses[0], which is ordinarily the worker's MCP stand-in
+	// child, and killing that would leave the worker (and the pane) alive.
+	workerPID := fx.workerForegroundPID(t, paneID)
 	if err := syscall.Kill(workerPID, syscall.SIGKILL); err != nil {
 		t.Fatalf("kill fixture worker pid %d: %v", workerPID, err)
 	}
@@ -187,11 +182,9 @@ func TestRealProcessConfirmAbsentRefusedAfterServerRestart(t *testing.T) {
 	_, attemptID := fx.taskAndAttemptIDs(t)
 	oldIncarnationID := fx.currentIncarnationID(t, attemptID)
 
-	info := fx.server.processInfo(t, paneID)
-	if len(info.ForegroundProcesses) == 0 {
-		t.Fatalf("pane %s reports no foreground worker process before the crash", paneID)
-	}
-	workerPID := int(info.ForegroundProcesses[0].PID)
+	// Located by the claim's pid — never ForegroundProcesses[0], which is
+	// ordinarily the worker's MCP stand-in child.
+	workerPID := fx.workerForegroundPID(t, paneID)
 	if err := syscall.Kill(workerPID, syscall.SIGKILL); err != nil {
 		t.Fatalf("kill fixture worker pid %d: %v", workerPID, err)
 	}

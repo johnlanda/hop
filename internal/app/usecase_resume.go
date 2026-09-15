@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -673,10 +674,7 @@ func (c *Controller) reconcileActive(ctx context.Context, handle RunHandle, deta
 			if detail.Binding != nil {
 				paneID = detail.Binding.PaneID
 			}
-			return ResumeResult{
-				Outcome: ResumeFailedClosed, ObservedPaneID: paneID,
-				Detail: "the occupant matches the claim's executable identity and marker but not its pid: the unsupported forking-wrapper topology; inspect the pane, then close it or hop stop the run",
-			}, nil
+			return forkingWrapperFailedClosed(paneID), nil
 		case LaunchFailed, LaunchPending:
 			// LaunchPending: still ambiguous — enter reconciling below.
 		}
@@ -727,18 +725,25 @@ func (c *Controller) reconcileActive(ctx context.Context, handle RunHandle, deta
 				return ResumeResult{}, markerErr
 			}
 			paneMatches := detail.Binding.IncarnationID == detail.Claim.IncarnationID && !detail.Binding.Superseded
-			if CorroborateSettlement(paneMatches, pane, markers, *detail.Claim) == SettlementSettled {
+			settlement, occupant := CorroborateSettlement(paneMatches, pane, markers, *detail.Claim)
+			switch settlement {
+			case SettlementSettled:
 				now := c.Clock.Now()
-				matched := FirstMarkerMatch(pane, markers)
 				if settleErr := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 					return uow.LaunchClaims().Settle(ctx, detail.Claim.IncarnationID, LaunchClaimSettlement{
-						State: LaunchClaimExeced, PaneID: detail.Binding.PaneID, PID: firstForeground(pane).PID,
-						Executable: detail.Claim.Executable, ArgvMarker: matched, At: now,
+						State: LaunchClaimExeced, PaneID: detail.Binding.PaneID, PID: occupant.Occupant.PID,
+						Executable: detail.Claim.Executable, ArgvMarker: occupant.Marker, At: now,
 					})
 				}); settleErr != nil {
 					return ResumeResult{}, fmt.Errorf("app: settle launch claim from reconciliation: %w", settleErr)
 				}
-				return c.warmReattach(ctx, handle, detail, priorAttemptState, pane, matched)
+				return c.warmReattach(ctx, handle, detail, priorAttemptState, occupant)
+			case SettlementForkingWrapper:
+				// The unsettled claim's wrapper topology fails closed exactly
+				// as on the launching path: the claim stays exec_pending and
+				// nothing is retired — the human decides.
+				return forkingWrapperFailedClosed(detail.Binding.PaneID), nil
+			case SettlementUnresolved:
 			}
 		}
 
@@ -751,20 +756,53 @@ func (c *Controller) reconcileActive(ctx context.Context, handle RunHandle, deta
 				return ResumeResult{}, markerErr
 			}
 			paneMatches := detail.Binding.IncarnationID == detail.Claim.IncarnationID && !detail.Binding.Superseded
-			if CorroborateSettlement(paneMatches, pane, markers, *detail.Claim) == SettlementSettled {
-				return c.warmReattach(ctx, handle, detail, priorAttemptState, pane, FirstMarkerMatch(pane, markers))
+			settlement, occupant := CorroborateSettlement(paneMatches, pane, markers, *detail.Claim)
+			switch settlement {
+			case SettlementSettled:
+				return c.warmReattach(ctx, handle, detail, priorAttemptState, occupant)
+			case SettlementForkingWrapper:
+				// A matching member under a different pid while the claimed
+				// process itself still matches is the refused wrapper
+				// topology: rejected without retirement. With no member under
+				// the claim's pid still matching, the different-pid match is
+				// the restored occupant case, which only the restored-harness
+				// predicate below may authorize.
+				if ClaimProcessMatches(pane, markers, *detail.Claim) {
+					return forkingWrapperFailedClosed(detail.Binding.PaneID), nil
+				}
+			case SettlementUnresolved:
 			}
 		}
 
-		// A different, present occupant. Positive evidence (the run's
-		// pre-assigned native session reference in its argv) authorizes
-		// guarded retirement and cold relaunch; anything else fails closed.
+		// A different, present occupant. Positive evidence authorizes guarded
+		// retirement and cold relaunch only through the restored-harness
+		// predicate: exactly one foreground member that is the session
+		// harness's native restore invocation for the durable native
+		// reference, with executable identity and the exact resume argument
+		// on that same member (the restored occupant spawns its own MCP
+		// children into its own group, so it holds no particular index).
+		// Retirement targets that member; more than one candidate, or none,
+		// fails closed with nothing closed or superseded.
+		harness, harnessErr := c.sessionHarness(ctx, handle, detail.SessionID)
 		nativeRef, nativeErr := c.sessionNativeRef(ctx, handle, detail.SessionID)
-		if nativeErr == nil && nativeRef != "" && paneCarriesMarker(pane, nativeRef) {
-			if len(blocked) > 0 {
-				return ResumeResult{Outcome: ResumeReconciling, Detail: "unresolved work blocks the retirement: " + strings.Join(blocked, "; ")}, nil
+		if harnessErr == nil && nativeErr == nil {
+			switch outcome, candidates := MatchRestoredHarness(pane, harness, nativeRef); outcome {
+			case RestoredHarnessMatched:
+				if len(blocked) > 0 {
+					return ResumeResult{Outcome: ResumeReconciling, Detail: "unresolved work blocks the retirement: " + strings.Join(blocked, "; ")}, nil
+				}
+				return c.retireAndRelaunch(ctx, handle, detail, req, candidates[0], nativeRef)
+			case RestoredHarnessAmbiguous:
+				pids := make([]string, 0, len(candidates))
+				for _, candidate := range candidates {
+					pids = append(pids, strconv.Itoa(candidate.PID))
+				}
+				return ResumeResult{
+					Outcome: ResumeFailedClosed, ObservedPaneID: detail.Binding.PaneID,
+					Detail: fmt.Sprintf("more than one foreground member (pids %s) matches the restored harness invocation for this run's native session; no single occupant is identified, so nothing is retired; inspect the pane, then close it or hop stop the run, and rerun hop resume", strings.Join(pids, ", ")),
+				}, nil
+			case RestoredHarnessNone, RestoredHarnessUnsupported:
 			}
-			return c.retireAndRelaunch(ctx, handle, detail, req, pane, nativeRef)
 		}
 		return ResumeResult{
 			Outcome: ResumeFailedClosed, ObservedPaneID: detail.Binding.PaneID,
@@ -797,6 +835,16 @@ func (c *Controller) reconcileActive(ctx context.Context, handle RunHandle, deta
 		return c.attestAbsence(ctx, handle, detail, req)
 	}
 	return ResumeResult{Outcome: ResumeReconciling, Detail: "no live process observed; rerun with --confirm-absent once no worker for this run is running anywhere"}, nil
+}
+
+// forkingWrapperFailedClosed is the fail-closed report for the unsupported
+// forking-wrapper topology, on every resume path that observes it: nothing
+// is settled, adopted or retired, and the human decides.
+func forkingWrapperFailedClosed(paneID string) ResumeResult {
+	return ResumeResult{
+		Outcome: ResumeFailedClosed, ObservedPaneID: paneID,
+		Detail: "the occupant matches the claim's executable identity and marker but not its pid: the unsupported forking-wrapper topology; inspect the pane, then close it or hop stop the run",
+	}
 }
 
 // absenceAttestationRecord is the absence.attested journal entry's payload:
@@ -933,9 +981,11 @@ func (c *Controller) observePaneAbsence(ctx context.Context, paneID, label strin
 // warmReattach adopts a verified occupant: the attempt returns to its
 // prior state (derived from durable evidence when the attempt entered this
 // round already reconciling), the session is confirmed active, and the
-// binding's occupant evidence is refreshed with the marker that actually
-// corroborated — never a synthesized one.
-func (c *Controller) warmReattach(ctx context.Context, handle RunHandle, detail RunDetail, priorState run.AttemptState, pane PaneProcess, marker string) (ResumeResult, error) { //nolint:gocritic // hugeParam: RunHandle, RunDetail and PaneProcess are per-call values; this runs once per resume round.
+// binding's occupant evidence is refreshed with the corroborated member's
+// own pid and the marker that actually corroborated it — never a
+// synthesized marker, and never the pid of whichever member the foreground
+// listing happened to report first.
+func (c *Controller) warmReattach(ctx context.Context, handle RunHandle, detail RunDetail, priorState run.AttemptState, occupant SettlementEvidence) (ResumeResult, error) { //nolint:gocritic // hugeParam: RunHandle, RunDetail and SettlementEvidence are per-call values; this runs once per resume round.
 	target := priorState
 	if target == run.AttemptReconciling {
 		derived, deriveErr := c.reattachTarget(ctx, handle, detail)
@@ -980,8 +1030,8 @@ func (c *Controller) warmReattach(ctx context.Context, handle RunHandle, detail 
 		if getErr != nil {
 			return getErr
 		}
-		if found && marker != "" {
-			evidence := run.OccupantEvidence{Label: binding.CreationLabel, ArgvMarker: marker, PID: firstForeground(pane).PID}
+		if found && occupant.Marker != "" {
+			evidence := run.OccupantEvidence{Label: binding.CreationLabel, ArgvMarker: occupant.Marker, PID: occupant.Occupant.PID}
 			nextBinding, observeErr := binding.Observe(evidence, now)
 			if observeErr != nil {
 				return observeErr
@@ -1122,7 +1172,11 @@ func (c *Controller) completedRetirement(ctx context.Context, handle RunHandle, 
 // is never reused — supersedes the launch binding with that evidence,
 // retires the occupant through the shared pane.close operation procedure,
 // and proceeds to cold relaunch only once its termination was observed.
-func (c *Controller) retireAndRelaunch(ctx context.Context, handle RunHandle, detail RunDetail, req ResumeRequest, pane PaneProcess, nativeRef string) (ResumeResult, error) { //nolint:gocritic // hugeParam: RunHandle, RunDetail, ResumeRequest and PaneProcess are per-call values; this runs once per resume round.
+// occupant is the one foreground member MatchRestoredHarness identified as
+// the restored harness for nativeRef: the close target records THAT
+// member's pid, never the pid of whichever member the listing reported
+// first.
+func (c *Controller) retireAndRelaunch(ctx context.Context, handle RunHandle, detail RunDetail, req ResumeRequest, occupant ProcessInfo, nativeRef string) (ResumeResult, error) { //nolint:gocritic // hugeParam: RunHandle, RunDetail, ResumeRequest and ProcessInfo are per-call values; this runs once per resume round.
 	now := c.Clock.Now()
 	evidence := fmt.Sprintf("observed process argv carries native session reference %s", nativeRef)
 	observedInstance := c.observeServerInstance(ctx)
@@ -1145,7 +1199,7 @@ func (c *Controller) retireAndRelaunch(ctx context.Context, handle RunHandle, de
 		target = paneCloseTarget{
 			PaneID: binding.PaneID, Label: binding.CreationLabel,
 			SessionID: detail.SessionID, IncarnationID: binding.IncarnationID,
-			PID: firstForeground(pane).PID, Markers: []string{nativeRef},
+			PID: occupant.PID, Markers: []string{nativeRef},
 			Reason: closeReasonRetirement,
 		}
 		if binding.LaunchKind == run.LaunchRestoredObserved {
@@ -1159,7 +1213,7 @@ func (c *Controller) retireAndRelaunch(ctx context.Context, handle RunHandle, de
 			return saveErr
 		}
 		observed := run.NewRuntimeBinding(detail.SessionID, observationIncarnation, binding.ServerSocketPath, observedInstance, binding.WorkspaceID, binding.TabID, binding.PaneID, binding.CreationLabel, run.LaunchRestoredObserved, now)
-		observedEvidence := run.OccupantEvidence{Label: binding.CreationLabel, ArgvMarker: nativeRef, PID: firstForeground(pane).PID}
+		observedEvidence := run.OccupantEvidence{Label: binding.CreationLabel, ArgvMarker: nativeRef, PID: occupant.PID}
 		observed, observeErr := observed.Observe(observedEvidence, now)
 		if observeErr != nil {
 			return observeErr
@@ -1473,10 +1527,4 @@ func enterReconciling(ctx context.Context, uow UnitOfWork, detail RunDetail, gen
 		return err
 	}
 	return recordTransition(ctx, uow, EntitySession, detail.SessionID.String(), string(sFrom), string(s.State), "takeover", generation, now)
-}
-
-// paneCarriesMarker reports whether pane's foreground process argv or
-// cmdline carries marker.
-func paneCarriesMarker(pane PaneProcess, marker string) bool {
-	return FirstMarkerMatch(pane, []string{marker}) != ""
 }

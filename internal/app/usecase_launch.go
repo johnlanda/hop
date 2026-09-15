@@ -74,7 +74,7 @@ func (c *Controller) CorroborateLaunch(ctx context.Context, handle RunHandle) (L
 		// The claim already settled (an adoption path, or a prior
 		// generation's settlement whose lifecycle consequences were lost):
 		// apply the remaining transitions idempotently.
-		return c.settleExeced(ctx, handle, *detail.Claim, nil, "")
+		return c.settleExeced(ctx, handle, *detail.Claim, nil)
 	case LaunchClaimExecPending:
 		// fall through to inspection below.
 	}
@@ -97,10 +97,10 @@ func (c *Controller) CorroborateLaunch(ctx context.Context, handle RunHandle) (L
 		return "", err
 	}
 	paneMatches := detail.Binding.IncarnationID == detail.Claim.IncarnationID && !detail.Binding.Superseded
-	settlement := CorroborateSettlement(paneMatches, pane, markers, *detail.Claim)
+	settlement, occupant := CorroborateSettlement(paneMatches, pane, markers, *detail.Claim)
 	switch settlement {
 	case SettlementSettled:
-		return c.settleExeced(ctx, handle, *detail.Claim, &pane, FirstMarkerMatch(pane, markers))
+		return c.settleExeced(ctx, handle, *detail.Claim, &occupant)
 	case SettlementForkingWrapper:
 		return LaunchNeedsInteraction, nil
 	case SettlementUnresolved:
@@ -292,10 +292,13 @@ func (c *Controller) settleRemainingLifecycle(ctx context.Context, handle RunHan
 
 // settleExeced commits the section 5 Run/Attempt/Session "claim settled
 // execed" transitions, records the controller's LaunchClaims settlement,
-// and — when a fresh observation is supplied — records it as the current
-// binding's occupant evidence. A nil pane applies only the lifecycle
-// transitions still missing for an already-settled claim, idempotently.
-func (c *Controller) settleExeced(ctx context.Context, handle RunHandle, claim LaunchClaim, pane *PaneProcess, marker string) (LaunchProgress, error) { //nolint:gocritic // hugeParam: RunHandle and LaunchClaim carry design-fixed value shapes; this runs once per settlement, never a hot loop.
+// and — when a fresh corroboration supplied its settlement evidence —
+// records the CORROBORATED member's pid and marker as the claim
+// settlement and the current binding's occupant evidence (never an
+// arbitrary member of the foreground listing, whose order carries no
+// semantics). A nil occupant applies only the lifecycle transitions still
+// missing for an already-settled claim, idempotently.
+func (c *Controller) settleExeced(ctx context.Context, handle RunHandle, claim LaunchClaim, occupant *SettlementEvidence) (LaunchProgress, error) { //nolint:gocritic // hugeParam: RunHandle and LaunchClaim carry design-fixed value shapes; this runs once per settlement, never a hot loop.
 	now := c.Clock.Now()
 	err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 		r, rRev, getErr := uow.Runs().Get(ctx, handle.runID)
@@ -334,8 +337,10 @@ func (c *Controller) settleExeced(ctx context.Context, handle RunHandle, claim L
 
 		if claim.State == LaunchClaimExecPending {
 			fgPID := claim.PID
-			if pane != nil {
-				fgPID = firstForeground(*pane).PID
+			marker := ""
+			if occupant != nil {
+				fgPID = occupant.Occupant.PID
+				marker = occupant.Marker
 			}
 			if settleErr := uow.LaunchClaims().Settle(ctx, claim.IncarnationID, LaunchClaimSettlement{
 				State: LaunchClaimExeced, PID: fgPID, Executable: claim.Executable, ArgvMarker: marker, At: now,
@@ -348,13 +353,13 @@ func (c *Controller) settleExeced(ctx context.Context, handle RunHandle, claim L
 		if getErr != nil {
 			return getErr
 		}
-		if pane != nil && marker != "" {
+		if occupant != nil && occupant.Marker != "" {
 			binding, found, getErr := uow.Bindings().Current(ctx, s.ID)
 			if getErr != nil {
 				return getErr
 			}
 			if found {
-				evidence := run.OccupantEvidence{Label: binding.CreationLabel, ArgvMarker: marker, PID: firstForeground(*pane).PID}
+				evidence := run.OccupantEvidence{Label: binding.CreationLabel, ArgvMarker: occupant.Marker, PID: occupant.Occupant.PID}
 				observed, observeErr := binding.Observe(evidence, now)
 				if observeErr != nil {
 					return observeErr
@@ -389,15 +394,6 @@ func (c *Controller) settleExeced(ctx context.Context, handle RunHandle, claim L
 		return "", fmt.Errorf("app: settle launch claim: %w", err)
 	}
 	return LaunchSettled, nil
-}
-
-// firstForeground returns pane's first foreground process, or the zero
-// ProcessInfo when none was observed.
-func firstForeground(pane PaneProcess) ProcessInfo {
-	if len(pane.Foreground) == 0 {
-		return ProcessInfo{}
-	}
-	return pane.Foreground[0]
 }
 
 // settleExecFailed commits the section 5 "exec_failed claim" failure

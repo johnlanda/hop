@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -88,14 +89,46 @@ type paneCloseTarget struct {
 	Reason        string
 }
 
-// matchesCloseTarget applies the close rule's occupant match: the observed
-// foreground pid equals the recorded pid AND the argv carries one of the
-// recorded durable markers. A pid is never evidence alone.
-func matchesCloseTarget(target *paneCloseTarget, pane PaneProcess) bool {
-	if len(pane.Foreground) == 0 {
-		return false
+// closeTargetMismatchDetail is the fail-closed detail for an observed
+// occupant that is not the recorded close target.
+const closeTargetMismatchDetail = "pane occupant does not match the recorded close target; failing closed"
+
+// closeTargetMismatch applies the close rule's occupant match and returns
+// "" when the observed occupant is the recorded target, otherwise the
+// fail-closed detail. For a stop target, SOME member of the observed
+// foreground group has the recorded pid AND that same member's argv or
+// cmdline carries one of the recorded durable markers — the
+// claimed-process-is-among-the-members predicate. A pid is never evidence
+// alone, and the target holds no particular index in the listing (the
+// recorded worker spawns its own MCP children into its own process group);
+// a pid match on one member with a marker only on another is never a match.
+// A positive-evidence retirement target is rechecked under the predicate
+// that authorized it instead (MatchRetirementTarget): the whole group must
+// still hold exactly one restored-harness member for the recorded native
+// reference, and it must be the recorded pid. A second candidate is
+// reported with every candidate pid and the pane, and never closes.
+func closeTargetMismatch(target *paneCloseTarget, pane PaneProcess, harness run.Harness) string {
+	if target.Reason == closeReasonRetirement {
+		matched, outcome, candidates := MatchRetirementTarget(pane, harness, target.PID, target.Markers)
+		switch {
+		case matched:
+			return ""
+		case outcome == RestoredHarnessAmbiguous:
+			pids := make([]string, 0, len(candidates))
+			for _, candidate := range candidates {
+				pids = append(pids, strconv.Itoa(candidate.PID))
+			}
+			return fmt.Sprintf("pane %s holds more than one foreground member (pids %s) matching the restored harness invocation for the recorded native reference; no single occupant is identified, so the retirement close is not dispatched; failing closed", target.PaneID, strings.Join(pids, ", "))
+		default:
+			return closeTargetMismatchDetail
+		}
 	}
-	return pane.Foreground[0].PID == target.PID && FirstMarkerMatch(pane, target.Markers) != ""
+	for _, fg := range pane.Foreground {
+		if fg.PID == target.PID && processMarkerMatch(fg, target.Markers) != "" {
+			return ""
+		}
+	}
+	return closeTargetMismatchDetail
 }
 
 // StopReport is one DriveStop round's outcome.
@@ -484,11 +517,21 @@ func (c *Controller) closePaneOperation(ctx context.Context, handle RunHandle, d
 		}
 		return true, "", nil
 	}
-	if !matchesCloseTarget(target, pane) {
-		if err := c.markOperationReconciling(ctx, handle, opID, "occupant does not match the recorded close target; failing closed"); err != nil {
+	var harness run.Harness
+	if target.Reason == closeReasonRetirement {
+		var harnessErr error
+		if harness, harnessErr = c.sessionHarness(ctx, handle, target.SessionID); harnessErr != nil {
+			return false, "", harnessErr
+		}
+	}
+	if mismatch := closeTargetMismatch(target, pane, harness); mismatch != "" {
+		// The operation stays reconciling with its recorded intent and act
+		// evidence intact, for a later round to recheck against the same
+		// persisted target.
+		if err := c.markOperationReconciling(ctx, handle, opID, mismatch); err != nil {
 			return false, "", err
 		}
-		return false, "pane occupant does not match the recorded close target; failing closed", nil
+		return false, mismatch, nil
 	}
 
 	// The occupant is the recorded target: capture scrollback evidence (it

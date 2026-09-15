@@ -40,6 +40,16 @@ const (
 	SettlementUnresolved LaunchSettlement = "unresolved"
 )
 
+// SettlementEvidence identifies the foreground member whose identity
+// decided a settlement classification, and the marker its argv or cmdline
+// carried: the values a settlement or adoption records as claim and
+// binding occupant evidence. It is the zero value exactly when the
+// classification is unresolved.
+type SettlementEvidence struct {
+	Occupant ProcessInfo
+	Marker   string
+}
+
 // CorroborateSettlement applies the section 6 corroboration predicate, the
 // ONLY corroboration rule, used identically by settlement, adoption and
 // warm reattach. paneMatches reports whether the inspected pane is the
@@ -49,29 +59,250 @@ const (
 // the claim itself recorded, never a caller-selected value. markers are
 // the run/attempt/incarnation or native session identifiers derived from
 // durable launch/binding context; the observed argv must carry at least
-// one. A still-running `hop launch` invocation is explicitly excluded: a
-// paused pre-exec launcher can never satisfy the predicate even when the
-// recorded executable is the HOP binary itself. Missing identity — an
-// empty claim executable or an empty marker set — is unresolved, never
-// settled: the predicate fails closed.
-func CorroborateSettlement(paneMatches bool, pane PaneProcess, markers []string, claim LaunchClaim) LaunchSettlement { //nolint:gocritic // hugeParam: claim is an immutable snapshot read once by this pure decision function; callers pass a local value, so a pointer would only invite aliasing.
+// one. Missing identity — an empty claim executable or an empty marker
+// set — is unresolved, never settled: the predicate fails closed.
+//
+// EVERY member of the observed foreground process group is considered,
+// not only index 0: a real harness (Claude Code 2.1.270) spawns its
+// configured MCP servers as children in its own process group immediately
+// after the trust check, and Herdr reports group members in raw platform
+// listing order (macOS: unsorted proc_listpids; Linux: ascending pid), so
+// the launched process holds no particular index. Per member, a
+// still-running `hop launch` invocation is skipped (a paused pre-exec
+// launcher can never satisfy the predicate even when the recorded
+// executable is the HOP binary itself), and executable identity, marker
+// and pid are three conjuncts of the SAME member — a marker carried only
+// by a foreign sibling corroborates nothing. Classification, fail-closed
+// on the unsupported topology first: ANY member matching executable
+// identity and marker under a pid DIFFERENT from the claim's is the
+// forking-wrapper topology, even when the claimed pid also matches (a
+// live wrapper that already exec'd carries the recorded executable and
+// markers in its own argv, so a settled-first reading would adopt exactly
+// the topology section 6 refuses); otherwise the member with the claim's
+// pid matching executable and marker settles; otherwise unresolved.
+func CorroborateSettlement(paneMatches bool, pane PaneProcess, markers []string, claim LaunchClaim) (LaunchSettlement, SettlementEvidence) { //nolint:gocritic // hugeParam: claim is an immutable snapshot read once by this pure decision function; callers pass a local value, so a pointer would only invite aliasing.
 	if !paneMatches || len(pane.Foreground) == 0 {
-		return SettlementUnresolved
+		return SettlementUnresolved, SettlementEvidence{}
 	}
 	if claim.Executable == "" {
-		return SettlementUnresolved
+		return SettlementUnresolved, SettlementEvidence{}
 	}
-	fg := pane.Foreground[0]
-	if isLauncherInvocation(fg.Argv) {
-		return SettlementUnresolved
+	var settled, wrapper *SettlementEvidence
+	for _, fg := range pane.Foreground {
+		if isLauncherInvocation(fg.Argv) {
+			continue
+		}
+		if !executableMatches(fg, claim.Executable) {
+			continue
+		}
+		marker := processMarkerMatch(fg, markers)
+		if marker == "" {
+			continue
+		}
+		evidence := SettlementEvidence{Occupant: fg, Marker: marker}
+		switch {
+		case fg.PID == claim.PID:
+			if settled == nil {
+				settled = &evidence
+			}
+		case wrapper == nil:
+			wrapper = &evidence
+		}
 	}
-	if !executableMatches(fg, claim.Executable) || FirstMarkerMatch(pane, markers) == "" {
-		return SettlementUnresolved
+	switch {
+	case wrapper != nil:
+		return SettlementForkingWrapper, *wrapper
+	case settled != nil:
+		return SettlementSettled, *settled
+	default:
+		return SettlementUnresolved, SettlementEvidence{}
 	}
-	if fg.PID == claim.PID {
-		return SettlementSettled
+}
+
+// ClaimProcessMatches reports whether SOME foreground member with the
+// claim's pid satisfies the claim's executable identity and carries one of
+// markers — the claimed process itself, observed among the members, with
+// every conjunct on that SAME member and a `hop launch` invocation skipped.
+// CorroborateSettlement's forking-wrapper classification does not say
+// whether the claimed process was ALSO present; resume needs exactly that
+// distinction, since a group holding both the matching claimed process and
+// a matching different-pid process is the refused wrapper topology, while
+// a matching different-pid process with no member under the claim's pid
+// still satisfying these conjuncts is the restored-occupant case the
+// restored-harness predicate decides. A false result observes only that no
+// such member matched — not that the claim's pid is absent from the group.
+// An empty claim executable never matches.
+func ClaimProcessMatches(pane PaneProcess, markers []string, claim LaunchClaim) bool { //nolint:gocritic // hugeParam: claim is an immutable snapshot read once by this pure decision function, matching CorroborateSettlement's argument shape.
+	if claim.Executable == "" {
+		return false
 	}
-	return SettlementForkingWrapper
+	for _, fg := range pane.Foreground {
+		if fg.PID != claim.PID || isLauncherInvocation(fg.Argv) {
+			continue
+		}
+		if executableMatches(fg, claim.Executable) && processMarkerMatch(fg, markers) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// RestoredHarnessOutcome classifies a pane's foreground members against a
+// harness's native restore invocation for the session's durable native
+// reference.
+type RestoredHarnessOutcome string
+
+// Restored-harness outcomes.
+const (
+	// RestoredHarnessMatched means exactly one member is the restored
+	// harness: positive evidence tying that member to the run's native
+	// session.
+	RestoredHarnessMatched RestoredHarnessOutcome = "matched"
+	// RestoredHarnessNone means no member is the restored harness.
+	RestoredHarnessNone RestoredHarnessOutcome = "none"
+	// RestoredHarnessAmbiguous means more than one member is the restored
+	// harness: no single occupant is identified, so the caller fails closed.
+	RestoredHarnessAmbiguous RestoredHarnessOutcome = "ambiguous"
+	// RestoredHarnessUnsupported means no restore invocation shape is known
+	// for the harness, or the native reference is empty: nothing can match.
+	RestoredHarnessUnsupported RestoredHarnessOutcome = "unsupported"
+)
+
+// restoreInvocation is a harness's native restore command shape: the
+// executable name Herdr's restore plan runs and the flag whose immediately
+// following argument is the native session reference.
+type restoreInvocation struct {
+	Executable string
+	ResumeFlag string
+}
+
+// restoreInvocationFor returns a harness's native restore invocation for
+// retiring restored occupants: Herdr's native restore plan (repos/herdr/src/agent_resume.rs, `plan`:
+// `["claude", "--resume", <id>]`, run by bare name through a login shell).
+// The shape is pinned by the executed S3 probe
+// (test/integration/spike_restore_test.go,
+// TestSpikeRestoreAutoRelaunchBypassesLauncher: a restored process's argv
+// is exactly `[claude --resume <id>]`, argv[0] basename `claude`). Only
+// Claude Code has an invocation: it is the only harness HOP pre-assigns a
+// native reference for and the only Phase 2 cold resume, so every other
+// harness reports false and never authorizes a retirement.
+func restoreInvocationFor(harness run.Harness) (restoreInvocation, bool) {
+	if harness == run.HarnessClaude {
+		return restoreInvocation{Executable: "claude", ResumeFlag: "--resume"}, true
+	}
+	return restoreInvocation{}, false
+}
+
+// MatchRestoredHarness is the restored-harness predicate: the positive
+// evidence that authorizes retiring a present occupant which is not the
+// claim's corroborated process. A member is the restored harness only when,
+// on that SAME member, both hold:
+//
+//   - executable identity equals the harness's restore executable: when
+//     Herdr reports argv, the basename of argv[0] (verbatim argv[0] is a
+//     bare name under Herdr's restore and an absolute path under a launch);
+//     when it reports none, argv0 or name, the only identity fields left;
+//   - the native resume argument shape: when argv is reported, an argv
+//     element equal to the resume flag immediately followed by an argv
+//     element EXACTLY equal to nativeRef — never a substring, so a child
+//     whose argument merely embeds the reference (a transcript path, say)
+//     is not evidence. Only when Herdr reports no argv does the documented
+//     fallback apply: cmdline carries `<flag> <nativeRef>` delimited by the
+//     string's ends or spaces. On herdr 0.9.0 cmdline is argv joined by
+//     spaces on both platforms (repos/herdr/src/platform/{macos,linux}.rs),
+//     so the fallback is reachable only through a server that reports
+//     cmdline without argv, which the schema permits.
+//
+// Exactly one matching member is RestoredHarnessMatched and is returned;
+// two or more are RestoredHarnessAmbiguous, and every candidate is returned
+// as the fail-closed evidence. A harness with no restore invocation, or an
+// empty nativeRef, is RestoredHarnessUnsupported. Listing order carries no
+// semantics and is never consulted.
+func MatchRestoredHarness(pane PaneProcess, harness run.Harness, nativeRef string) (RestoredHarnessOutcome, []ProcessInfo) {
+	invocation, ok := restoreInvocationFor(harness)
+	if !ok || nativeRef == "" {
+		return RestoredHarnessUnsupported, nil
+	}
+	var candidates []ProcessInfo
+	for _, fg := range pane.Foreground {
+		if restoredHarnessMember(fg, invocation, nativeRef) {
+			candidates = append(candidates, fg)
+		}
+	}
+	switch len(candidates) {
+	case 0:
+		return RestoredHarnessNone, nil
+	case 1:
+		return RestoredHarnessMatched, candidates
+	default:
+		return RestoredHarnessAmbiguous, candidates
+	}
+}
+
+// restoredHarnessMember reports whether one foreground member is the
+// restored harness for nativeRef under invocation (MatchRestoredHarness's
+// per-member conjuncts).
+func restoredHarnessMember(fg ProcessInfo, invocation restoreInvocation, nativeRef string) bool { //nolint:gocritic // hugeParam: ProcessInfo is the decision file's pure-value member shape, examined once per member per resume round, never a hot loop.
+	if nativeRef == "" {
+		return false
+	}
+	if len(fg.Argv) > 0 {
+		if filepath.Base(fg.Argv[0]) != invocation.Executable {
+			return false
+		}
+		for i := 1; i+1 < len(fg.Argv); i++ {
+			if fg.Argv[i] == invocation.ResumeFlag && fg.Argv[i+1] == nativeRef {
+				return true
+			}
+		}
+		return false
+	}
+	if fg.Argv0 != invocation.Executable && fg.Name != invocation.Executable {
+		return false
+	}
+	return containsDelimited(fg.Cmdline, invocation.ResumeFlag+" "+nativeRef)
+}
+
+// MatchRetirementTarget is the close-time recheck of a persisted
+// positive-evidence retirement target: the whole current foreground group
+// is classified again under MatchRestoredHarness with the recorded native
+// reference, and the target still matches only when that classification is
+// RestoredHarnessMatched AND its one candidate has the recorded pid. The
+// uniqueness that authorized the retirement is therefore re-established on
+// the very observation the close acts on: a second candidate appearing
+// beside the recorded member is ambiguous and never closes, and a unique
+// candidate under another pid is never adopted as a new target. A
+// retirement records exactly one native reference, so any other marker
+// count is RestoredHarnessUnsupported. The outcome and candidates are
+// returned as the fail-closed evidence whenever matched is false.
+func MatchRetirementTarget(pane PaneProcess, harness run.Harness, pid int, markers []string) (matched bool, outcome RestoredHarnessOutcome, candidates []ProcessInfo) {
+	if len(markers) != 1 {
+		return false, RestoredHarnessUnsupported, nil
+	}
+	outcome, candidates = MatchRestoredHarness(pane, harness, markers[0])
+	matched = outcome == RestoredHarnessMatched && candidates[0].PID == pid
+	return matched, outcome, candidates
+}
+
+// containsDelimited reports whether s contains needle bounded on each side
+// by the start or end of s or a space.
+func containsDelimited(s, needle string) bool {
+	if needle == "" {
+		return false
+	}
+	for offset := 0; offset+len(needle) <= len(s); {
+		idx := strings.Index(s[offset:], needle)
+		if idx < 0 {
+			return false
+		}
+		start := offset + idx
+		end := start + len(needle)
+		if (start == 0 || s[start-1] == ' ') && (end == len(s) || s[end] == ' ') {
+			return true
+		}
+		offset = start + 1
+	}
+	return false
 }
 
 // executableMatches reports whether an observed foreground process's
@@ -102,13 +333,14 @@ func executableMatches(fg ProcessInfo, expected string) bool { //nolint:gocritic
 	return fg.Name != "" && fg.Name == base
 }
 
-// FirstMarkerMatch returns the first non-empty marker the pane's foreground
-// process argv or cmdline carries, or "" when none matches.
-func FirstMarkerMatch(pane PaneProcess, markers []string) string {
-	if len(pane.Foreground) == 0 {
-		return ""
-	}
-	fg := pane.Foreground[0]
+// processMarkerMatch returns the first non-empty marker fg's own argv or
+// cmdline carries, or "" when none matches. It serves the launch-marker
+// conjunct of settlement and the stop close rule, where the run, attempt
+// and incarnation markers legitimately sit INSIDE the larger prompt
+// argument, so a cmdline substring is accepted. It is never the authority
+// for retiring an occupant that is not the claim's corroborated process;
+// that is MatchRestoredHarness, which matches argv elements exactly.
+func processMarkerMatch(fg ProcessInfo, markers []string) string { //nolint:gocritic // hugeParam: ProcessInfo is the decision file's pure-value member shape, examined a handful of times per corroboration round, never a hot loop.
 	for _, marker := range markers {
 		if marker == "" {
 			continue
@@ -142,21 +374,26 @@ func ServerContinuityEstablished(recorded, observed string) bool {
 	return recorded != "" && recorded == observed
 }
 
-// OccupantMatches reports whether an inspected pane's foreground process
-// matches recorded occupant evidence: the foreground process's argv or
-// cmdline carries the marker and its pid equals the recorded pid. It is
-// used by the close rule immediately before ClosePane and by warm reattach;
-// the caller is responsible for having resolved the pane by the evidence's
-// label first (label identity is not itself observable from PaneProcess).
+// OccupantMatches reports whether an inspected pane's foreground group
+// still contains the recorded occupant: SOME member's pid equals the
+// recorded pid AND that same member's argv or cmdline carries the marker
+// — the claimed-process-is-among-the-members predicate. The recorded
+// occupant spawns its own children (Claude Code's MCP servers) into its
+// own process group, so it holds no particular index in the listing; a
+// pid match on one member with the marker only on another is never a
+// match. The caller is responsible for having resolved the pane by the
+// evidence's label first (label identity is not itself observable from
+// PaneProcess).
 func OccupantMatches(evidence run.OccupantEvidence, pane PaneProcess) bool {
-	if len(pane.Foreground) == 0 {
-		return false
+	for _, fg := range pane.Foreground {
+		if fg.PID != evidence.PID {
+			continue
+		}
+		if slices.Contains(fg.Argv, evidence.ArgvMarker) || strings.Contains(fg.Cmdline, evidence.ArgvMarker) {
+			return true
+		}
 	}
-	fg := pane.Foreground[0]
-	if fg.PID != evidence.PID {
-		return false
-	}
-	return slices.Contains(fg.Argv, evidence.ArgvMarker) || strings.Contains(fg.Cmdline, evidence.ArgvMarker)
+	return false
 }
 
 // GroupRetirementOutcome is one of the four typed outcomes classifying a
