@@ -209,8 +209,12 @@ func initFixtureRepo(t *testing.T, artifacts *artifactDir, name string) *fixture
 
 // newFixtureRepoWithCheck is the shared constructor behind newFixtureRepo
 // and newFixtureRepoGitDependentCheck: same repository shape, differing
-// only in which committed script is wired as the [check] command.
-func newFixtureRepoWithCheck(t *testing.T, artifacts *artifactDir, name, checkCommand string) *fixtureRepo {
+// only in which committed script is wired as the [check] command. server,
+// when non-nil, registers this repository's worktree cleanup
+// (registerWorktreeCleanup) — pass nil for a scenario that never touches a
+// herdr server and so cannot create a real worktree against this repo at
+// all (a pure git-level probe).
+func newFixtureRepoWithCheck(t *testing.T, artifacts *artifactDir, server *testServer, name, checkCommand string) *fixtureRepo {
 	t.Helper()
 	repo := initFixtureRepo(t, artifacts, name)
 	repo.writeFile(t, "hello.go", trivialSourceFile, 0o644)
@@ -219,6 +223,7 @@ func newFixtureRepoWithCheck(t *testing.T, artifacts *artifactDir, name, checkCo
 	repo.writeFile(t, checkResultFile, "pass\n", 0o644)
 	repo.writeFile(t, configRelPath, fixtureConfigTOML([]string{"sh", checkCommand}), 0o644)
 	repo.Base = repo.commit(t, "initial commit")
+	registerWorktreeCleanup(t, server, repo)
 	return repo
 }
 
@@ -228,10 +233,11 @@ func newFixtureRepoWithCheck(t *testing.T, artifacts *artifactDir, name, checkCo
 // deterministic check.sh (starting at CHECK_RESULT=pass) wired as the
 // repository's [check] command, and .herdr-orchestrator/config.toml per the
 // section 3 example. It returns after the initial commit, whose object id
-// is fixtureRepo.Base — the base commit hop run resolves at StartRun.
-func newFixtureRepo(t *testing.T, artifacts *artifactDir, name string) *fixtureRepo { //nolint:unparam // every current call site names its one repository "repo"; name exists so a scenario needing two concurrent plain fixture repositories (as newFixtureRepoWithSubmodule already needs internally for its inner/outer pair) can avoid an artifact-directory collision.
+// is fixtureRepo.Base — the base commit hop run resolves at StartRun. server
+// is passed to registerWorktreeCleanup; see newFixtureRepoWithCheck.
+func newFixtureRepo(t *testing.T, artifacts *artifactDir, server *testServer, name string) *fixtureRepo { //nolint:unparam // every current call site names its one repository "repo"; name exists so a scenario needing two concurrent plain fixture repositories (as newFixtureRepoWithSubmodule already needs internally for its inner/outer pair) can avoid an artifact-directory collision.
 	t.Helper()
-	return newFixtureRepoWithCheck(t, artifacts, name, checkScriptName)
+	return newFixtureRepoWithCheck(t, artifacts, server, name, checkScriptName)
 }
 
 // newFixtureRepoGitDependentCheck is newFixtureRepo with check-git.sh wired
@@ -239,9 +245,9 @@ func newFixtureRepo(t *testing.T, artifacts *artifactDir, name string) *fixtureR
 // checkout, proving the check pipeline's candidate isolation is a detached
 // `git worktree add` (which keeps .git metadata) rather than an archive
 // export (which would strip it).
-func newFixtureRepoGitDependentCheck(t *testing.T, artifacts *artifactDir, name string) *fixtureRepo {
+func newFixtureRepoGitDependentCheck(t *testing.T, artifacts *artifactDir, server *testServer, name string) *fixtureRepo {
 	t.Helper()
-	return newFixtureRepoWithCheck(t, artifacts, name, gitDependentCheckScriptName)
+	return newFixtureRepoWithCheck(t, artifacts, server, name, gitDependentCheckScriptName)
 }
 
 // newFixtureRepoWithSubmodule creates a fixture repository whose working
@@ -249,8 +255,11 @@ func newFixtureRepoGitDependentCheck(t *testing.T, artifacts *artifactDir, name 
 // worktree add` (the check pipeline's candidate isolation, section 7) does
 // not initialize submodules, so check-submodule.sh — wired as this
 // repository's [check] command — fails clearly with the missing path named,
-// proving the "submodule repository fails clearly" scenario.
-func newFixtureRepoWithSubmodule(t *testing.T, artifacts *artifactDir, name string) *fixtureRepo {
+// proving the "submodule repository fails clearly" scenario. server is
+// passed to registerWorktreeCleanup for the outer (submodule-referencing)
+// repository only — nothing ever runs hop or worktree.create against the
+// inner one.
+func newFixtureRepoWithSubmodule(t *testing.T, artifacts *artifactDir, server *testServer, name string) *fixtureRepo {
 	t.Helper()
 	inner := initFixtureRepo(t, artifacts, name+"-submodule")
 	inner.writeFile(t, "marker.txt", "submodule-content\n", 0o644)
@@ -267,6 +276,7 @@ func newFixtureRepoWithSubmodule(t *testing.T, artifacts *artifactDir, name stri
 	// so the restriction has nothing to protect here.
 	outer.git(t, "-c", "protocol.file.allow=always", "submodule", "add", "--", inner.Root, submoduleDir)
 	outer.Base = outer.commit(t, "initial commit with submodule reference")
+	registerWorktreeCleanup(t, server, outer)
 	return outer
 }
 
@@ -298,7 +308,7 @@ func runShellScript(t *testing.T, dir, script string) (output string, exitCode i
 // starts passing, and CommitCheckResult flips it deterministically.
 func TestFixtureRepoDeterministicCheck(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	repo := newFixtureRepo(t, artifacts, "repo")
+	repo := newFixtureRepo(t, artifacts, nil, "repo")
 
 	if len(repo.Base) != 40 {
 		t.Fatalf("base commit %q is not a 40-hex sha1 object id", repo.Base)
@@ -331,7 +341,7 @@ func TestFixtureRepoDeterministicCheck(t *testing.T) {
 // (metadata stripped).
 func TestFixtureRepoGitDependentCheck(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	repo := newFixtureRepoGitDependentCheck(t, artifacts, "repo")
+	repo := newFixtureRepoGitDependentCheck(t, artifacts, nil, "repo")
 
 	if out, code := runShellScript(t, repo.Root, gitDependentCheckScriptName); code != 0 {
 		t.Fatalf("check-git.sh inside the real checkout exit=%d, want 0:\n%s", code, out)
@@ -362,7 +372,7 @@ func TestFixtureRepoGitDependentCheck(t *testing.T) {
 // the script's failure is specifically about the submodule content.
 func TestFixtureRepoSubmoduleFailsClearly(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	repo := newFixtureRepoWithSubmodule(t, artifacts, "repo")
+	repo := newFixtureRepoWithSubmodule(t, artifacts, nil, "repo")
 
 	checkout := artifacts.dir(t, "repo-detached-checkout")
 	if err := os.RemoveAll(checkout); err != nil {

@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -103,6 +104,43 @@ func liveTranscriptExists(t *testing.T, home, nativeRef string) bool {
 	return found
 }
 
+// waitForRunStateWithProcessDiagnostics polls exactly like waitForRunState
+// (hopcmd_test.go), but on every poll where a worker pane binding is already
+// known it also appends a foreground-process-list snapshot, taken through
+// the same pane.process_info adapter call and rendering every other
+// real-process scenario in this suite uses (testServer.processInfo,
+// renderProcessInfo — see e.g. spike_identity_test.go,
+// spike_launch_test.go). Evidence (a) that motivated this diagnostic — a
+// prior live run that never settled left only the pane scrollback, with no
+// record of which foreground process Herdr had actually reported at any
+// point along the way — is exactly what a poll-by-poll trail closes: it
+// survives even when the run never reaches a terminal state and the final
+// failure path has nothing but scrollback left to read. tryProcessInfo is
+// used instead of processInfo so a poll landing before the pane has a live
+// runtime yet does not fail the test; the snapshot for that poll is simply
+// omitted. The accumulated log is saved once, under name+"-process-info.txt",
+// regardless of outcome (a passing run's artifact directory is removed on
+// cleanup like every other evidence file).
+func waitForRunStateWithProcessDiagnostics(t *testing.T, server *testServer, artifacts *artifactDir, name string, env []string, repoRoot, runID string, deadline time.Duration, want ...string) (fields map[string]string, reached bool) {
+	t.Helper()
+	var log strings.Builder
+	reached = waitUntilDeadline(deadline, func() bool {
+		result := runHop(t, env, repoRoot, "status", "-C", repoRoot, "-run", runID)
+		fields = parseStatusDetail(result.Stdout)
+		if binding := fields["binding"]; binding != "" {
+			paneID := paneIDFromBinding(binding)
+			if info, err := server.tryProcessInfo(t, paneID); err == nil {
+				fmt.Fprintf(&log, "state=%s %s", fields["state"], renderProcessInfo(info))
+			}
+		}
+		return slices.Contains(want, fields["state"])
+	})
+	if log.Len() > 0 {
+		artifacts.save(t, name+"-process-info.txt", log.String())
+	}
+	return fields, reached
+}
+
 // TestLiveClaudeDefaultProfileRun is design section 9's opt-in live test:
 // real Claude Code, in the operator's own default profile, driven through
 // the real hop run/hop launch pipeline against the fixture repository with
@@ -135,10 +173,31 @@ func TestLiveClaudeDefaultProfileRun(t *testing.T) {
 	for _, name := range forbiddenCredentialVars {
 		server.extraEnv = append(server.extraEnv, name+"=hop-test-not-a-secret-"+strings.ToLower(name))
 	}
+	// environ() builds every subprocess's environment from scratch with no
+	// login shell (harness_test.go's testServer.environ), so nothing here
+	// inherits USER/LOGNAME by default — confirmed live: a `ps -E` on a real
+	// worker pane spawned this way showed HOME, SHELL, TERM and XDG_* but no
+	// USER, no LOGNAME. Claude Code's keychain credential item is keyed by
+	// the account name ($USER; see "Credential storage" under Claude Code in
+	// docs/architecture/native-harness-compat.md), so a worker whose HOME is
+	// the operator's real home but whose USER is unset cannot find its own
+	// login and reports "Not logged in" even though the operator is
+	// authenticated. HOP's own sanitizing launcher (internal/app/launchenv.go's
+	// StripMatrixV1) is a strip list that never names USER/LOGNAME/LANG/
+	// LC_ALL, so passing them through is a harness/test-environment fix, not
+	// a HOP behavior change — the ordinary suite's constructed environment
+	// (testServer.environ) is left untouched; only this live test, and only
+	// with values read from this test process's own environment, ever sets
+	// them.
+	for _, name := range []string{"USER", "LOGNAME", "LANG", "LC_ALL"} {
+		if value := os.Getenv(name); value != "" {
+			server.extraEnv = append(server.extraEnv, name+"="+value)
+		}
+	}
 	server.extraEnv = append(server.extraEnv, "HOME="+home)
 	server.start(t)
 
-	repo := newFixtureRepo(t, artifacts, "repo")
+	repo := newFixtureRepo(t, artifacts, server, "repo")
 	stateDir := artifacts.dir(t, "state")
 	env := server.hopEnviron(stateDir)
 
@@ -147,7 +206,7 @@ func TestLiveClaudeDefaultProfileRun(t *testing.T) {
 	started := waitForControllerLog(t, artifacts, "run", "started")
 	label, runID := extractRunID(t, started)
 
-	fields, reached := waitForRunState(t, env, repo.Root, runID, liveHarnessTimeout, "running", "failed", "stopped")
+	fields, reached := waitForRunStateWithProcessDiagnostics(t, server, artifacts, "first-launch", env, repo.Root, runID, liveHarnessTimeout, "running", "failed", "stopped")
 	if !reached || fields["state"] != "running" {
 		if binding := fields["binding"]; binding != "" {
 			artifacts.save(t, "worker-pane-scrollback-first-launch.txt", server.readPane(t, paneIDFromBinding(binding)))
@@ -165,12 +224,34 @@ func TestLiveClaudeDefaultProfileRun(t *testing.T) {
 		t.Fatalf("no native_session_ref recorded for attempt %s after the first launch settled", attemptID)
 	}
 
+	// The harness config pins [worktrees] directory under the test's own
+	// scratch root (harness_test.go's testConfig) for every server, not only
+	// this one, precisely so a run like this one — whose HOME is the
+	// operator's real home directory — can never create a worktree under
+	// the operator's real ~/.herdr/worktrees default. Assert it held.
+	worktreePath := querySQLite(t, dbPath, fmt.Sprintf("SELECT path FROM worktrees WHERE run_id = '%s';", runID))
+	if worktreePath == "" {
+		t.Fatalf("run %s has no recorded worktree path", runID)
+	}
+	resolvedWorktree, err := filepath.EvalSymlinks(worktreePath)
+	if err != nil {
+		t.Fatalf("resolve recorded worktree path %q: %v", worktreePath, err)
+	}
+	resolvedScratchRoot, err := filepath.EvalSymlinks(server.base)
+	if err != nil {
+		t.Fatalf("resolve test scratch root %q: %v", server.base, err)
+	}
+	if !strings.HasPrefix(resolvedWorktree, resolvedScratchRoot+string(os.PathSeparator)) {
+		t.Fatalf("worktree path %q is not under the test's scratch root %q; the harness's [worktrees] directory pin may not be effective", resolvedWorktree, resolvedScratchRoot)
+	}
+
 	// Force a cold relaunch: kill the real claude worker and the
 	// controller, wait out the abandoned lease, then confirm absence — the
 	// same mechanism resume_test.go's coldRelaunchAfterCrash uses against
 	// the fixture worker, driven here by hand since a live run's own
 	// scratch environment differs (real HOME, real claude symlink).
 	info := server.processInfo(t, firstPaneID)
+	artifacts.save(t, "worker-pane-process-info-before-kill.txt", renderProcessInfo(info))
 	if len(info.ForegroundProcesses) == 0 {
 		t.Fatalf("pane %s reports no foreground worker process before the forced cold relaunch", firstPaneID)
 	}
@@ -190,7 +271,7 @@ func TestLiveClaudeDefaultProfileRun(t *testing.T) {
 		t.Fatalf("hop resume --confirm-absent did not report cold-relaunched (native ref %s); stdout:\n%s", nativeRef, resumeStdout)
 	}
 
-	fields, reached = waitForRunState(t, env, repo.Root, runID, liveHarnessTimeout, "completed", "failed", "stopped")
+	fields, reached = waitForRunStateWithProcessDiagnostics(t, server, artifacts, "second-launch", env, repo.Root, runID, liveHarnessTimeout, "completed", "failed", "stopped")
 	if !reached || fields["state"] != "completed" {
 		if binding := fields["binding"]; binding != "" {
 			artifacts.save(t, "worker-pane-scrollback-second-launch.txt", server.readPane(t, paneIDFromBinding(binding)))

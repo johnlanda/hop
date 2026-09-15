@@ -74,7 +74,7 @@ func TestRealProcessStopWithTerminationObserved(t *testing.T) {
 // that was killed rather than observed to a real outcome.
 func TestRealProcessStopInterruptsRunningCheckGroup(t *testing.T) {
 	artifacts, server := newFixtureRunEnv(t)
-	repo := newFixtureRepo(t, artifacts, "repo")
+	repo := newFixtureRepo(t, artifacts, server, "repo")
 	withSlowCheck(t, repo)
 	fx := startRun(t, artifacts, server, repo, "submit-valid")
 

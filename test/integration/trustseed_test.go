@@ -56,7 +56,7 @@ func TestRealProcessLaunchSeedsWorkspaceTrust(t *testing.T) {
 	if err := os.WriteFile(configPath, []byte(trustFixtureConfig), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	repo := newFixtureRepo(t, artifacts, "repo")
+	repo := newFixtureRepo(t, artifacts, server, "repo")
 	fx := startRun(t, artifacts, server, repo, "submit-valid")
 
 	fields := fx.requireRunState(t, "completed")
