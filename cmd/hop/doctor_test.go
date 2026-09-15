@@ -146,9 +146,12 @@ func TestRunDoctorStateRootLine(t *testing.T) {
 		if code != exitFailure {
 			t.Errorf("exit code = %d, want %d", code, exitFailure)
 		}
-		want := `unavailable  state root: HOP_STATE_DIR "rel/state" is not an absolute path`
+		want := "unavailable  state root: HOP_STATE_DIR is set to a relative path"
 		if !strings.Contains(stdout.String(), want) {
 			t.Errorf("stdout lacks %q; got:\n%s", want, stdout.String())
+		}
+		if strings.Contains(stdout.String(), "rel/state") {
+			t.Errorf("the doctor line echoes the refused value:\n%s", stdout.String())
 		}
 	})
 }

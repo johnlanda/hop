@@ -177,8 +177,11 @@ func TestRunRun(t *testing.T) {
 		if code != exitUsage {
 			t.Errorf("exit code = %d, want %d", code, exitUsage)
 		}
-		if !strings.Contains(stderr.String(), "not an absolute path") {
+		if !strings.Contains(stderr.String(), "HOP_STATE_DIR is set to a relative path") {
 			t.Errorf("stderr = %q", stderr.String())
+		}
+		if strings.Contains(stderr.String(), "rel") && strings.Contains(stderr.String(), `"rel"`) {
+			t.Errorf("stderr echoes the refused value: %q", stderr.String())
 		}
 	})
 }

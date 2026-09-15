@@ -24,7 +24,9 @@ const (
 func resolveStateRoot(getenv func(string) string) (root, source string, err error) {
 	if override := getenv("HOP_STATE_DIR"); override != "" {
 		if !filepath.IsAbs(override) {
-			return "", "", fmt.Errorf("HOP_STATE_DIR %q is not an absolute path", override)
+			// The value is never echoed: a mistaken paste into the
+			// variable must not surface in diagnostics or logs.
+			return "", "", fmt.Errorf("HOP_STATE_DIR is set to a relative path; the override must be an absolute directory")
 		}
 		return filepath.Clean(override), stateRootSourceOverride, nil
 	}
@@ -50,7 +52,9 @@ func requireWorkerStateRoot(getenv func(string) string) (string, error) {
 	case root == "":
 		return "", fmt.Errorf("HOP_STATE_DIR is not set; this command runs in a HOP-launched worker context, which provides the absolute state root, and never falls back to the default resolution")
 	case !filepath.IsAbs(root):
-		return "", fmt.Errorf("HOP_STATE_DIR %q is not an absolute path; the launch-provided state root is always absolute", root)
+		// The value is never echoed (exec-boundary diagnostic
+		// confidentiality): only the variable is named.
+		return "", fmt.Errorf("HOP_STATE_DIR is not an absolute path; the launch-provided state root is always absolute and is never resolved from anything else")
 	}
 	return filepath.Clean(root), nil
 }

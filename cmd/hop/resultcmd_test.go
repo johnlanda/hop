@@ -198,6 +198,23 @@ func TestRunResultSubmit(t *testing.T) {
 		}
 	})
 
+	t.Run("a relative HOP_STATE_DIR names the variable, never the value", func(t *testing.T) {
+		td := newTestDeps(&fakeController{}, map[string]string{"HOP_STATE_DIR": "s3kr3t-pasted/rel"}, t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runResult([]string{"submit", "--summary", "s", "--commit", testCommit}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+
+		if code != exitFailure {
+			t.Errorf("exit code = %d, want %d", code, exitFailure)
+		}
+		if !strings.Contains(stderr.String(), "HOP_STATE_DIR") || strings.Contains(stderr.String(), "s3kr3t") {
+			t.Errorf("stderr = %q; the diagnostic must name the variable and never its value", stderr.String())
+		}
+	})
+
 	t.Run("missing HOP_STATE_DIR is refused before any store access", func(t *testing.T) {
 		td := newTestDeps(&fakeController{}, map[string]string{"HOME": "/home/u"}, t.TempDir())
 		var stdout, stderr bytes.Buffer

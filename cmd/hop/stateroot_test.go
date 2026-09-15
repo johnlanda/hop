@@ -33,7 +33,7 @@ func TestResolveStateRoot(t *testing.T) {
 		{
 			name:    "relative HOP_STATE_DIR is refused",
 			env:     map[string]string{"HOP_STATE_DIR": "state", "HOME": "/home/u"},
-			wantErr: `HOP_STATE_DIR "state" is not an absolute path`,
+			wantErr: "HOP_STATE_DIR is set to a relative path",
 		},
 		{
 			name:       "XDG_STATE_HOME default",
@@ -87,6 +87,20 @@ func TestResolveStateRoot(t *testing.T) {
 	}
 }
 
+func TestStateRootDiagnosticsNeverEchoTheValue(t *testing.T) {
+	// A malformed HOP_STATE_DIR can carry a pasted sensitive value; both
+	// resolvers must name the variable only.
+	const sentinel = "s3kr3t-pasted-value/rel"
+	env := map[string]string{"HOP_STATE_DIR": sentinel, "HOME": "/home/u"}
+
+	if _, _, err := resolveStateRoot(mapGetenv(env)); err == nil || strings.Contains(err.Error(), "s3kr3t") {
+		t.Errorf("resolveStateRoot error discloses the value: %v", err)
+	}
+	if _, err := requireWorkerStateRoot(mapGetenv(env)); err == nil || strings.Contains(err.Error(), "s3kr3t") {
+		t.Errorf("requireWorkerStateRoot error discloses the value: %v", err)
+	}
+}
+
 func TestRequireWorkerStateRoot(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -107,7 +121,7 @@ func TestRequireWorkerStateRoot(t *testing.T) {
 		{
 			name:    "relative HOP_STATE_DIR is refused, never resolved",
 			env:     map[string]string{"HOP_STATE_DIR": "some/dir", "HOME": "/home/u"},
-			wantErr: `HOP_STATE_DIR "some/dir" is not an absolute path`,
+			wantErr: "HOP_STATE_DIR is not an absolute path",
 		},
 	}
 	for _, tc := range cases {
