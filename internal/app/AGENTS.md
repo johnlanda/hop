@@ -33,7 +33,7 @@ sides together. `cmd/hop` never imports domain or identity types: every
 | [digest.go](digest.go) | `ResultDigestTag`, `ComputeResultDigest` | The canonical `"hop-result-v1"` result digest: length-prefixed fields, SHA-256 hex, computed only here — the domain receives it as an opaque validated string |
 | [decision.go](decision.go) | `LaunchClaimDeadline`, `LaunchDeadlineExpired`, `LaunchSettlement`, `CorroborateSettlement`, `FirstMarkerMatch`, `OccupantMatches`, `ServerContinuityEstablished`, `GroupRetirementOutcome`, `ClassifyGroupRetirement`, `ArgvUnavailable` | The section 6 claim-corroboration predicate (claim-derived executable identity, durable marker set, explicit `hop launch` exclusion, fail-closed on missing identity), close-rule occupant matching, the server-continuity predicate, and the four-outcome process-group-retirement classifier matching both the frozen check argv and its check-exec invocation |
 | [operation_payload.go](operation_payload.go) | `decodeOperationPayload` | Reads a persisted operation intent/evidence/outcome payload without relying on Go type identity: a value of the target type passes through, anything else round-trips through JSON. Callers still validate required fields and fail closed on a failed decode |
-| [controller.go](controller.go) | `Controller`, `RunHandle`, `Heartbeat`, `Detach`, `ErrStopRequested` | The driving service composition calls; ports as fields. `RunHandle` is an opaque per-run token (run identity, the held lease and a dispatch scope) so composition never touches identity types. `Heartbeat` extends the lease on the design's interval and cancels in-flight external calls on failure; `Detach` journals, cancels and releases without stopping; `revalidateForDispatch` is the section 4 step 2 revalidation every external mutation runs first |
+| [controller.go](controller.go) | `Controller`, `RunHandle`, `Heartbeat`, `Detach`, `ErrStopRequested` | The driving service composition calls; ports as fields, plus `GitExecutable` (the absolute path of the git binary every repository/worktree command runs, resolved once by composition). `RunHandle` is an opaque per-run token (run identity, the held lease and a dispatch scope) so composition never touches identity types. `Heartbeat` extends the lease on the design's interval and cancels in-flight external calls on failure; `Detach` journals, cancels and releases without stopping; `revalidateForDispatch` is the section 4 step 2 revalidation every external mutation runs first |
 | [assignment.go](assignment.go) | `renderAssignment` | Deterministic assignment-artifact content: brief, identities and absolute paths only, referenced by the launch argv, never typed into a dialog |
 | [usecase_run.go](usecase_run.go) | `StartRun`, `StartRunRequest`, `StartRunResult`, `ErrStartRefused`, `classifyWorktreeProvenance` | Refuses unsupported repositories (SHA-256 object format, launch-line-hostile HOP paths) and unusable policies before any side effect — every such refusal wraps `ErrStartRefused`, hop run's usage exit — freezes the run snapshot, calls `InitializeRun`, writes/records the assignment artifact, then drives `worktree.create` (base commit resolved to an object id before the intent commits; canonical common-directory EQUALITY plus frozen-base HEAD comparison validate provenance) and `pane.open` as record-intent/act/record-outcome units |
 | [usecase_launch.go](usecase_launch.go) | `CorroborateLaunch`, `LaunchProgress` | One inspection round toward settling a launch claim under the section 6 predicate: settled, needs-interaction (forking wrapper), failed (`exec_failed`, terminating the session), already-settled (early acceptance; activates a still-launching session) or still pending — recovers a lost binding by creation label, never sleeps or resends |
@@ -162,6 +162,15 @@ sides together. `cmd/hop` never imports domain or identity types: every
   brief from `FrozenRun` and verifies (or recreates byte-identically,
   failing closed on digest mismatch) the assignment artifact before any
   worker is launched.
+- Every git invocation (`gitOutput`, `runGit` in usecase_run.go, backing
+  StartRun's object-format check and base-commit resolution, worktree
+  provenance classification and check materialization) runs argv[0] as
+  `Controller.GitExecutable`, never a bare `"git"`: `CommandRunner.Run`
+  requires an absolute executable path, and both helpers refuse before any
+  side effect when it is empty or not absolute — `runGit`'s refusal reaches
+  StartRun's callers as an ordinary error, wrapped in `ErrStartRefused` when
+  it happens before any side effect, exactly like every other pre-side-effect
+  refusal.
 - A worktree is adopted by provenance, never path existence: canonical
   absolute git common directories of the intended repository and the
   candidate must be EQUAL, and the candidate's HEAD must equal the base
@@ -266,6 +275,10 @@ sides together. `cmd/hop` never imports domain or identity types: every
   operation of the current generation, and every Runtime, CommandRunner,
   ProcessGroupInspector and ArtifactStore fake refuses any call made while
   a unit of work is open (`TestFakePortsRefuseCallsInsideTransactions`).
+  `fakeCommands.Run` also mirrors the real Runner's own argv contract,
+  refusing an empty argv or a non-absolute argv[0], so calling it with a
+  bare executable name fails the app suite directly rather than only
+  surfacing against a real process at runtime.
 - Named scenario coverage, by test:
   `TestLeaseFencing` (takeover barrier with staged writes discarded,
   heartbeat/release CAS refusals, monotonic generations) and
@@ -276,7 +289,8 @@ sides together. `cmd/hop` never imports domain or identity types: every
   `TestStartRun` (effect ordering, worktree provenance incl. the
   wrong-repository-prefix and wrong-base rejections, frozen base object
   id, transport errors left reconciling, label recovery, refused object
-  format and HOP path); `TestCorroborateLaunch` (the four settlement
+  format and HOP path, and an unconfigured `GitExecutable` refused before
+  any side effect); `TestCorroborateLaunch` (the four settlement
   outcomes, native-reference markers, pre-binding label recovery,
   exec-failure session termination, early-acceptance session activation);
   `TestCorroborateSettlement`/`TestOccupantMatches`/

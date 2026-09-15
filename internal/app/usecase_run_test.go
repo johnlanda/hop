@@ -44,6 +44,7 @@ func newTestController(policy app.RunPolicy) *testController { //nolint:gocritic
 			Store: store, Read: store, Submissions: store,
 			Runtime: runtime, Artifacts: artifacts, Clock: clock, IDs: ids,
 			Commands: commands, Groups: groups, Config: config,
+			GitExecutable: "/usr/bin/git",
 		},
 		Store: store, Runtime: runtime, Artifacts: artifacts, Clock: clock,
 		IDs: ids, Commands: commands, Groups: groups, Config: config,
@@ -138,7 +139,7 @@ func TestStartRun(t *testing.T) {
 
 	t.Run("refuses a SHA-256-object-format repository before any side effect", func(t *testing.T) {
 		tc := newTestController(defaultPolicy())
-		tc.Commands.Results["git -C /repo rev-parse --show-object-format"] = app.CommandResult{ExitCode: 0, Stdout: []byte("sha256\n")}
+		tc.Commands.Results["/usr/bin/git -C /repo rev-parse --show-object-format"] = app.CommandResult{ExitCode: 0, Stdout: []byte("sha256\n")}
 		_, _, err := tc.Controller.StartRun(context.Background(), defaultStartRunRequest())
 		if err == nil {
 			t.Fatalf("StartRun() accepted an unsupported object format")
@@ -148,6 +149,32 @@ func TestStartRun(t *testing.T) {
 		}
 		if len(tc.Store.Runs) != 0 {
 			t.Fatalf("StartRun() created a run despite the unsupported object format")
+		}
+	})
+
+	t.Run("refuses to start when GitExecutable is not configured as an absolute path", func(t *testing.T) {
+		cases := []struct {
+			name string
+			git  string
+		}{
+			{"empty", ""},
+			{"relative", "git"},
+		}
+		for _, tt := range cases {
+			t.Run(tt.name, func(t *testing.T) {
+				tc := newTestController(defaultPolicy())
+				tc.Controller.GitExecutable = tt.git
+				_, _, err := tc.Controller.StartRun(context.Background(), defaultStartRunRequest())
+				if err == nil {
+					t.Fatalf("StartRun() succeeded with GitExecutable = %q", tt.git)
+				}
+				if !errors.Is(err, app.ErrStartRefused) {
+					t.Fatalf("StartRun() error = %v, want it to wrap ErrStartRefused for the usage exit code", err)
+				}
+				if len(tc.Store.Runs) != 0 {
+					t.Fatalf("StartRun() created a run despite the unconfigured git executable")
+				}
+			})
 		}
 	})
 
@@ -198,7 +225,7 @@ func TestStartRun(t *testing.T) {
 		// The candidate's common directory is a lexical PREFIX-extension of
 		// the intended repository ("/repo-other" vs "/repo"): the old
 		// prefix comparison would adopt it; equality must reject it.
-		tc.Commands.Results["git -C /worktrees/w rev-parse --path-format=absolute --git-common-dir"] = app.CommandResult{ExitCode: 0, Stdout: []byte("/repo-other/.git\n")}
+		tc.Commands.Results["/usr/bin/git -C /worktrees/w rev-parse --path-format=absolute --git-common-dir"] = app.CommandResult{ExitCode: 0, Stdout: []byte("/repo-other/.git\n")}
 		_, _, err := tc.Controller.StartRun(context.Background(), defaultStartRunRequest())
 		if err == nil {
 			t.Fatalf("StartRun() adopted a checkout of a different repository")
@@ -219,7 +246,7 @@ func TestStartRun(t *testing.T) {
 
 	t.Run("worktree provenance: a candidate at the wrong base commit is rejected", func(t *testing.T) {
 		tc := newTestController(defaultPolicy())
-		tc.Commands.Results["git -C /worktrees/w rev-parse HEAD^{commit}"] = app.CommandResult{ExitCode: 0, Stdout: []byte("dddddddddddddddddddddddddddddddddddddddd\n")}
+		tc.Commands.Results["/usr/bin/git -C /worktrees/w rev-parse HEAD^{commit}"] = app.CommandResult{ExitCode: 0, Stdout: []byte("dddddddddddddddddddddddddddddddddddddddd\n")}
 		_, _, err := tc.Controller.StartRun(context.Background(), defaultStartRunRequest())
 		if err == nil {
 			t.Fatalf("StartRun() adopted a checkout at the wrong base commit")

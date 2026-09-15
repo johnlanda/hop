@@ -279,9 +279,14 @@ const (
 
 // gitOutput runs one git subcommand against dir (via `git -C`, so the
 // invocation is fully identified by its argv) and returns its trimmed
-// stdout with a typed status.
+// stdout with a typed status. It refuses before any side effect when
+// GitExecutable is not configured as an absolute path — CommandRunner.Run
+// requires one, and this is never a bare name.
 func (c *Controller) gitOutput(ctx context.Context, dir string, args ...string) (string, gitStatus) {
-	result, err := c.Commands.Run(ctx, Command{Argv: append([]string{"git", "-C", dir}, args...)})
+	if !filepath.IsAbs(c.GitExecutable) {
+		return "", gitTransportError
+	}
+	result, err := c.Commands.Run(ctx, Command{Argv: append([]string{c.GitExecutable, "-C", dir}, args...)})
 	if err != nil {
 		return "", gitTransportError
 	}
@@ -306,9 +311,15 @@ func (c *Controller) gitCommonDir(ctx context.Context, dir string) (string, gitS
 }
 
 // runGit runs one git subcommand against dir and returns its trimmed
-// stdout, folding a non-zero exit into the error.
+// stdout, folding a non-zero exit into the error. It refuses before any
+// side effect when GitExecutable is not configured as an absolute path —
+// CommandRunner.Run requires one, and this is never a bare name; StartRun's
+// callers surface that refusal through the existing ErrStartRefused path.
 func (c *Controller) runGit(ctx context.Context, dir string, args ...string) (string, error) {
-	result, err := c.Commands.Run(ctx, Command{Argv: append([]string{"git", "-C", dir}, args...)})
+	if !filepath.IsAbs(c.GitExecutable) {
+		return "", errors.New("app: git executable is not configured as an absolute path")
+	}
+	result, err := c.Commands.Run(ctx, Command{Argv: append([]string{c.GitExecutable, "-C", dir}, args...)})
 	if err != nil {
 		return "", err
 	}

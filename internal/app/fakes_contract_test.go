@@ -232,7 +232,7 @@ func TestFakePortsRefuseCallsInsideTransactions(t *testing.T) {
 	if err := tc.Runtime.ClosePane(context.Background(), detail.Binding.PaneID); err == nil {
 		t.Fatalf("Runtime.ClosePane succeeded inside an open transaction")
 	}
-	if _, err := tc.Commands.Run(context.Background(), app.Command{Argv: []string{"git", "-C", "/repo", "status"}}); err == nil {
+	if _, err := tc.Commands.Run(context.Background(), app.Command{Argv: []string{"/usr/bin/git", "-C", "/repo", "status"}}); err == nil {
 		t.Fatalf("CommandRunner.Run succeeded inside an open transaction")
 	}
 	if _, err := tc.Groups.GroupProcesses(context.Background(), 1); err == nil {
@@ -252,7 +252,7 @@ func TestFakePortsRefuseCallsInsideTransactions(t *testing.T) {
 	if _, err := tc.Runtime.ServerInstance(context.Background()); err != nil {
 		t.Fatalf("Runtime.ServerInstance after commit error = %v", err)
 	}
-	if _, err := tc.Commands.Run(context.Background(), app.Command{Argv: []string{"git", "-C", "/repo", "status"}}); err != nil {
+	if _, err := tc.Commands.Run(context.Background(), app.Command{Argv: []string{"/usr/bin/git", "-C", "/repo", "status"}}); err != nil {
 		t.Fatalf("CommandRunner.Run after commit error = %v", err)
 	}
 }

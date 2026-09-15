@@ -31,6 +31,13 @@ type Controller struct {
 	Commands    CommandRunner
 	Groups      ProcessGroupInspector
 	Config      ConfigurationSource
+	// GitExecutable is the absolute path of the git binary every repository
+	// and worktree command runs (StartRun's object-format check and base
+	// commit resolution, worktree provenance classification, check
+	// materialization). Composition resolves it once, before constructing
+	// the Controller; CommandRunner.Run requires an absolute argv[0], so
+	// this is never a bare name.
+	GitExecutable string
 }
 
 // RunHandle is an opaque token identifying one run and the lease a

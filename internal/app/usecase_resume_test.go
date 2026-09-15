@@ -304,7 +304,7 @@ func TestResumeOperationRecovery(t *testing.T) {
 
 		// The creation actually happened before the lost response: the
 		// repository's worktree listing shows the intended branch.
-		tc.Commands.Results["git -C /repo worktree list --porcelain"] = app.CommandResult{
+		tc.Commands.Results["/usr/bin/git -C /repo worktree list --porcelain"] = app.CommandResult{
 			ExitCode: 0,
 			Stdout:   []byte("worktree /repo\nHEAD cccccccccccccccccccccccccccccccccccccccc\nbranch refs/heads/main\n\nworktree /worktrees/recovered\nHEAD cccccccccccccccccccccccccccccccccccccccc\nbranch refs/heads/hop/run-1\n"),
 		}

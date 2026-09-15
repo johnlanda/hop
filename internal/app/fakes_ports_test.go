@@ -3,6 +3,7 @@ package app_test
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -235,6 +236,17 @@ func newFakeCommands() *fakeCommands {
 func (*fakeCommands) key(cmd app.Command) string { return strings.Join(cmd.Argv, " ") }
 
 func (c *fakeCommands) Run(ctx context.Context, cmd app.Command) (app.CommandResult, error) {
+	// Mirror the real Runner's own contract (internal/adapters/process.
+	// Runner.Run): argv must be non-empty and argv[0] must be an absolute
+	// path. Enforcing it here, not just in the real adapter, is what makes
+	// a caller passing a bare or relative executable name fail the app
+	// suite instead of only surfacing against a real process at runtime.
+	if len(cmd.Argv) == 0 {
+		return app.CommandResult{}, fmt.Errorf("app_test: CommandRunner.Run called with an empty argv")
+	}
+	if !filepath.IsAbs(cmd.Argv[0]) {
+		return app.CommandResult{}, fmt.Errorf("app_test: CommandRunner.Run called with executable %q, which is not an absolute path; the real Runner refuses this", cmd.Argv[0])
+	}
 	if err := c.store.refuseInsideTransaction("CommandRunner.Run"); err != nil {
 		return app.CommandResult{}, err
 	}

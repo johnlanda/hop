@@ -118,20 +118,30 @@ func defaultDeps() *deps {
 // concrete adapters into their ports. The returned closer releases the
 // store's connection pools.
 func openController(ctx context.Context, cfg controllerConfig) (controllerAPI, func() error, error) {
+	// The controller's own git binary is resolved once here, against the
+	// controller process's own PATH (os.Getenv("PATH") — never the
+	// sanitized worker environment a launched harness or check runs under):
+	// CommandRunner.Run requires an absolute argv[0], and a bare "git"
+	// never pins which binary runs.
+	gitExecutable, err := lookupExecutable("git", os.Getenv("PATH"))
+	if err != nil {
+		return nil, nil, errors.New("git executable not found on PATH")
+	}
 	store, err := sqlite.Open(ctx, cfg.stateRoot, sqlite.Options{})
 	if err != nil {
 		return nil, nil, fmt.Errorf("open state store: %w", err)
 	}
 	controller := &app.Controller{
-		Store:       store,
-		Read:        store,
-		Submissions: store,
-		Artifacts:   system.ArtifactStore{},
-		Clock:       system.Clock{},
-		IDs:         system.IDGenerator{},
-		Commands:    process.Runner{},
-		Groups:      process.GroupInspector{},
-		Config:      config.Source{},
+		Store:         store,
+		Read:          store,
+		Submissions:   store,
+		Artifacts:     system.ArtifactStore{},
+		Clock:         system.Clock{},
+		IDs:           system.IDGenerator{},
+		Commands:      process.Runner{},
+		Groups:        process.GroupInspector{},
+		Config:        config.Source{},
+		GitExecutable: gitExecutable,
 	}
 	if cfg.withRuntime {
 		controller.Runtime = herdr.NewRuntime(cfg.socketPath)

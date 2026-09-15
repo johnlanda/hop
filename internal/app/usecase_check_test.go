@@ -333,7 +333,7 @@ func TestClaimAndRunCheck(t *testing.T) {
 		if _, err := tc.Controller.SubmitResult(context.Background(), defaultSubmitRequest(detail)); err != nil {
 			t.Fatalf("SubmitResult() error = %v", err)
 		}
-		tc.Commands.Results["git -C /repo ls-tree -r cccccccccccccccccccccccccccccccccccccccc"] = app.CommandResult{
+		tc.Commands.Results["/usr/bin/git -C /repo ls-tree -r cccccccccccccccccccccccccccccccccccccccc"] = app.CommandResult{
 			ExitCode: 0,
 			Stdout:   []byte("100644 blob aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tmain.go\n160000 commit bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tvendor/dep\n"),
 		}

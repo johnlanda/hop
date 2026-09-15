@@ -16,7 +16,7 @@ prepare use cases and then exec through the process adapter.
 | File | Entities / functions | Responsibility |
 | --- | --- | --- |
 | [main.go](main.go) | `main`, `run`, `dispatch`, `printUsage`, `exitOK`, `exitFailure`, `exitUsage` | Entry point; maps a command name to its handler (worker plumbing listed under its own usage heading) and a failed write to `exitFailure` |
-| [compose.go](compose.go) | `controllerAPI`, `controllerConfig`, `deps`, `defaultDeps`, `openController`, `describeStoreOpenFailure`, `waitInterval`, `lookupExecutable` | The composition root proper: opens the SQLite store under the resolved state root, wires the system/process/config adapters and — for pane-acting commands — the Herdr runtime (compile-time `app.Runtime` assertion) into one `app.Controller`; `deps` carries every effectful seam (env, clock, wait, signals, exec, store opening) so command tests substitute fakes; `lookupExecutable` implements `app.ExecutableLookup` over the sanitized PATH |
+| [compose.go](compose.go) | `controllerAPI`, `controllerConfig`, `deps`, `defaultDeps`, `openController`, `describeStoreOpenFailure`, `waitInterval`, `lookupExecutable` | The composition root proper: resolves the controller's own `git` executable once against its own PATH (`os.Getenv("PATH")`, never the sanitized worker environment) and sets `Controller.GitExecutable`, opens the SQLite store under the resolved state root, wires the system/process/config adapters and — for pane-acting commands — the Herdr runtime (compile-time `app.Runtime` assertion) into one `app.Controller`; `deps` carries every effectful seam (env, clock, wait, signals, exec, store opening) so command tests substitute fakes; `lookupExecutable` implements `app.ExecutableLookup` over the sanitized PATH |
 | [stateroot.go](stateroot.go) | `resolveStateRoot`, `requireWorkerStateRoot` | The design's single state-root rule: `${XDG_STATE_HOME:-$HOME/.local/state}/hop` with `HOP_STATE_DIR` as the only override (relative refused); worker contexts REQUIRE the launch-provided absolute `HOP_STATE_DIR` and never fall back |
 | [loop.go](loop.go) | `runControllerLoop`, `runHeartbeats`, `loopResult`, `detachAndReport`, `releaseQuietly`, `resolveRunArg`, `seqLabel`, `exitForRunState` | The foreground controller loop: concurrent 10s heartbeats under the 30s TTL, one line per run transition, launch corroboration, stop routing, 2s check polling; run arguments resolve as UUIDs or `r<seq>` labels |
 | [runcmd.go](runcmd.go) | `runRun`, `finishControllerLoop`, `watchDetachSignals`, `resolveRepositoryRoot`, `hopExecutablePath`, `stringList` | `hop run "<brief>"`: StartRun, the start line, then the loop; SIGINT/SIGTERM detach (second signal force-exits); `ErrStartRefused` maps to exit 2 |
@@ -60,6 +60,12 @@ commands expect the built binary at `.bin/hop` (see `make build`).
   is wired only for commands that act on panes/worktrees (`run`, `stop`,
   `resume`). `hop status`, the exec boundaries and `result submit` run
   store-only with a nil Runtime.
+- `openController` resolves `Controller.GitExecutable` before opening the
+  store, for every command: `lookupExecutable("git", os.Getenv("PATH"))`
+  against the controller process's own environment. A bare `"git"` is
+  never passed to `app`'s git invocations — `CommandRunner.Run` requires an
+  absolute argv[0]. Composition fails with a fixed, value-free diagnostic
+  ("git executable not found on PATH") when it cannot be resolved.
 - SIGINT/SIGTERM on a foreground controller detach — journal, cancel,
   release, print the resume instruction — and never stop the run; a second
   signal exits immediately. Only `hop stop` stops a run.
@@ -103,6 +109,12 @@ commands expect the built binary at `.bin/hop` (see `make build`).
   exec, no exec on refusal).
 - `go test -race -shuffle=on ./cmd/hop` — the loop's concurrent heartbeat
   goroutine under the race detector.
+- `storeopen_test.go` drives the real `openController` (not the scripted
+  fake) directly: `TestStoreOpenDiagnosticsNeverEchoTheRoot` proves every
+  worker and controller command classifies a store-open failure without
+  ever echoing the state-root value, and `TestOpenControllerGitExecutableNotFound`
+  proves composition refuses with a fixed, value-free diagnostic when git
+  cannot be resolved on its own PATH.
 - `make build && .bin/hop version` — builds the binary and prints the version
   the Go toolchain derived from version control.
 - `.bin/hop doctor` — probes the real installation on this machine.
