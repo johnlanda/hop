@@ -227,11 +227,13 @@ alternate-profile/pools work; they are not re-verified here.
   while settlement read only `foreground[0]`. Consequence: every HOP
   decision over a pane occupant (settlement, adoption, close-target
   match, positive-evidence retirement) must scan ALL members and must
-  never depend on member position; the per-member predicate rules live in
-  `internal/app/decision.go` and internal/app/AGENTS.md, and the executed
-  real-process probe pinning the shape under the production transport is
-  `TestRealProcessSettlementWithMCPGroupMembers`
-  (test/integration/pgroup_test.go).
+  never depend on member position — the orderings above are observed
+  facts about the current implementations, not guarantees. The
+  per-member predicate rules live in `internal/app/decision.go` and
+  internal/app/AGENTS.md, and the executed real-process probe under the
+  production transport is `TestRealProcessSettlementWithMCPGroupMembers`
+  (test/integration/pgroup_test.go), which asserts the position-free
+  shape and records the observed order.
 - Keychain side effect of any launch (observed during the same spike):
   merely starting claude under a fresh `CLAUDE_CONFIG_DIR` — no login —
   creates the keychain item

@@ -50,17 +50,23 @@ func (f *fixtureRun) workerForegroundPID(t *testing.T, paneID string) int {
 // corroboration path settling the claim against the multi-member listing —
 // the early-acceptance path is never available to mask a stuck settlement.
 //
-// Ordering, pinned by Herdr's source and this executed observation: Herdr
-// reports foreground members in raw platform listing order — macOS,
-// unsorted proc_listpids (repos/herdr/src/platform/macos.rs,
-// foreground_job); Linux, ascending pid
+// Ordering: Herdr reports foreground members in raw platform listing
+// order — macOS, unsorted proc_listpids (repos/herdr/src/platform/
+// macos.rs, foreground_job); Linux, ascending pid
 // (repos/herdr/src/platform/linux.rs,
 // foreground_process_group_members_with) — mapped verbatim into
 // foreground_processes (repos/herdr/src/app/api/panes.rs,
-// handle_pane_process_info). Neither order makes the launched process
-// index 0 (macOS observably lists its children first; on Linux a recycled
-// lower pid can precede the leader), so the app must never depend on
-// position, and this scenario asserts the claimed pid is NOT at index 0.
+// handle_pane_process_info). Neither order GUARANTEES the launched
+// process any index (the live probe observed an MCP server at index 0;
+// on Linux a recycled lower pid can precede the leader), so the app must
+// never depend on position. This scenario therefore asserts only
+// position-free facts — the group is multi-member, the claimed pid is
+// among the members, every non-claim member is the marker-free MCP
+// stand-in, and the claim settled — and RECORDS the observed order and
+// the claimed pid's index for the ledger; the deterministic position
+// coverage (claim pid at index 1+, foreign-members-only,
+// wrapper-with-matching-child) lives in internal/app's decision-table
+// vectors, where the ordering is scripted rather than kernel-supplied.
 func TestRealProcessSettlementWithMCPGroupMembers(t *testing.T) {
 	fx := startFixtureRun(t, "")
 	fields := fx.requireRunState(t, "running")
@@ -119,22 +125,31 @@ func TestRealProcessSettlementWithMCPGroupMembers(t *testing.T) {
 	if standInIdx < 0 {
 		t.Fatalf("the MCP stand-in pid %d is not among the foreground members:\n%s", standInPID, strings.Join(memberList, "\n"))
 	}
-	if workerIdx == 0 {
-		t.Errorf("the claimed worker is foreground[0]; this scenario must reproduce the live defect shape (children listed before the leader in macOS's raw proc_listpids order) — if this platform's raw order now lists the leader first, the pinned ordering in test/integration/AGENTS.md and docs/architecture/native-harness-compat.md needs re-verification")
-	}
+	// Recorded, not asserted: position carries no semantics, so the
+	// observed index is ledger evidence only (the live probe saw an MCP
+	// server at index 0; a platform change reordering the raw listing must
+	// never turn this scenario red).
+	t.Logf("claimed worker pid %d observed at foreground index %d of %d members (stand-in at index %d)", workerPID, workerIdx, len(info.ForegroundProcesses), standInIdx)
 
 	worker := info.ForegroundProcesses[workerIdx]
 	wantExecutable := filepath.Join(fx.server.base, "bin", "claude")
 	if len(worker.Argv) == 0 || worker.Argv[0] != wantExecutable {
 		t.Errorf("worker member argv[0] = %q, want the resolved fixture stub %q verbatim", worker.Argv, wantExecutable)
 	}
-	standIn := info.ForegroundProcesses[standInIdx]
-	if len(standIn.Argv) < 2 || standIn.Argv[1] != "fixture-mcp-stand-in" {
-		t.Errorf("stand-in member argv = %q, want [<worker argv0> fixture-mcp-stand-in]", standIn.Argv)
-	}
-	for _, marker := range []string{fx.runID, observed.Fields["prompt_assignment_path"]} {
-		if marker != "" && strings.Contains(strings.Join(standIn.Argv, " "), marker) {
-			t.Errorf("stand-in member argv %q carries the marker %q; the stand-in must stay a foreign, marker-free member", standIn.Argv, marker)
+	// Every non-claim member must be the marker-free MCP stand-in: nothing
+	// else may share the worker's group, and no stand-in may carry a
+	// marker that could corroborate.
+	for i, member := range info.ForegroundProcesses {
+		if int(member.PID) == workerPID {
+			continue
+		}
+		if len(member.Argv) < 2 || member.Argv[1] != "fixture-mcp-stand-in" {
+			t.Errorf("non-claim member [%d] argv = %q, want the MCP stand-in [<worker argv0> fixture-mcp-stand-in]", i, member.Argv)
+		}
+		for _, marker := range []string{fx.runID, observed.Fields["prompt_assignment_path"]} {
+			if marker != "" && strings.Contains(strings.Join(member.Argv, " "), marker) {
+				t.Errorf("non-claim member [%d] argv %q carries the marker %q; stand-ins must stay foreign, marker-free members", i, member.Argv, marker)
+			}
 		}
 	}
 }
