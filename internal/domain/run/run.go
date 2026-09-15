@@ -156,7 +156,7 @@ func (r Run) EnterResuming(now time.Time) (Run, error) { return r.transition(Run
 // ErrRunNotAccepting otherwise, the fate of a late request racing
 // completion — validated inside the same accepting transaction so nothing
 // can race it.
-func (r Run) CanAcceptManagerVerb() error {
+func (r Run) CanAcceptManagerVerb() error { //nolint:gocritic // hugeParam: Run is an immutable domain value returned by every transition; a pointer receiver would let a caller's original be mutated through it, breaking the pure-transition contract.
 	if r.State != RunRunning {
 		return fmt.Errorf("%w: run %s: state %s", ErrRunNotAccepting, r.ID, r.State)
 	}

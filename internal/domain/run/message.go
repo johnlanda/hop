@@ -261,13 +261,13 @@ func NextDeliverable(queue []Message) (Message, bool) {
 		lowest      Message
 		hasQueued   bool
 	)
-	for _, m := range queue {
-		switch m.State {
+	for i := range queue {
+		switch queue[i].State {
 		case MessageDelivered:
-			inFlight, hasInFlight = m, true
+			inFlight, hasInFlight = queue[i], true
 		case MessageQueued:
-			if !hasQueued || m.EnqueueSeq < lowest.EnqueueSeq {
-				lowest, hasQueued = m, true
+			if !hasQueued || queue[i].EnqueueSeq < lowest.EnqueueSeq {
+				lowest, hasQueued = queue[i], true
 			}
 		case MessageAcknowledged:
 			// Settled; never a delivery candidate.
@@ -355,7 +355,7 @@ func AcceptAnswer(question Message, prior *Message, destination Address, sender 
 // replyToQuestion.ID itself. This is the grammar's "origin" field (section
 // 7): a restarted manager forwards a human answer using only this
 // CLI-returned data, never store spelunking.
-func ResolveOrigin(replyToQuestion Message) identity.MessageID {
+func ResolveOrigin(replyToQuestion Message) identity.MessageID { //nolint:gocritic // hugeParam: Message is passed by value everywhere in this package; this read-only helper mirrors that convention.
 	if replyToQuestion.RelayedFrom != nil {
 		return *replyToQuestion.RelayedFrom
 	}

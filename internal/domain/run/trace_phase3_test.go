@@ -133,6 +133,7 @@ func TestReferenceTraceFeatureHappyPathDependencyRelease(t *testing.T) {
 	mustNoError(t, err)
 	implB, err = implB.Terminate(later())
 	mustNoError(t, err)
+	mustState(t, "implB", string(implB.State), string(run.SessionTerminated))
 
 	attemptB, err = attemptB.EnterChecking(later())
 	mustNoError(t, err)
@@ -147,6 +148,7 @@ func TestReferenceTraceFeatureHappyPathDependencyRelease(t *testing.T) {
 	mustNoError(t, err)
 	integrationB, err = integrationB.Integrate(later())
 	mustNoError(t, err)
+	mustState(t, "integrationB", string(integrationB.State), string(run.IntegrationIntegrated))
 	taskB, err = taskB.Integrate(later())
 	mustNoError(t, err)
 	mustState(t, "taskB", string(taskB.State), string(run.TaskIntegrated))
@@ -183,6 +185,7 @@ func TestReferenceTraceFeatureHappyPathDependencyRelease(t *testing.T) {
 	mustNoError(t, err)
 	reviewer, err = reviewer.Terminate(later())
 	mustNoError(t, err)
+	mustState(t, "reviewer", string(reviewer.State), string(run.SessionTerminated))
 
 	guardCtx := run.GuardContext{
 		PlanClosed:      r.PlanClosed,
@@ -402,6 +405,7 @@ func TestReferenceTraceWorkerInterruptionRetryProvenance(t *testing.T) {
 		mustNoError(t, err)
 		worker2, err = worker2.ConfirmActive(later())
 		mustNoError(t, err)
+		mustState(t, "worker2", string(worker2.State), string(run.SessionActive))
 
 		submission := run.ResultSubmission{ID: testResultID, CommitOID: "b2-commit", Summary: "B retried", Digest: "digest-b2"}
 		r := run.Run{ID: testRunID, State: run.RunRunning}
@@ -430,8 +434,8 @@ func TestReferenceTraceWorkerInterruptionRetryProvenance(t *testing.T) {
 		// Attempt 3 (the limit) is the one that gets interrupted; no
 		// retry remains.
 		attemptB3 := run.Attempt{ID: testAttemptID, TaskID: taskB.ID, Number: 3, State: run.AttemptInterrupted}
-		if _, err := run.NewRetryAttempt(testSecondAttemptID, attemptB3, 3, later()); !errors.Is(err, run.ErrRetryLimit) {
-			t.Fatalf("NewRetryAttempt at the limit: error = %v, want ErrRetryLimit", err)
+		if _, retryErr := run.NewRetryAttempt(testSecondAttemptID, attemptB3, 3, later()); !errors.Is(retryErr, run.ErrRetryLimit) {
+			t.Fatalf("NewRetryAttempt at the limit: error = %v, want ErrRetryLimit", retryErr)
 		}
 
 		taskB, err = taskB.Fail(later())
@@ -469,6 +473,7 @@ func TestReferenceTraceReviewerRejectionAndReReview(t *testing.T) {
 	r, reviewTask1, reviewAttempt1 = verdictOutcome.Run, verdictOutcome.Task, verdictOutcome.Attempt
 	review1 := verdictOutcome.Review
 	mustState(t, "reviewTask1", string(reviewTask1.State), string(run.TaskCompleted))
+	mustState(t, "reviewAttempt1", string(reviewAttempt1.State), string(run.AttemptCompleted))
 
 	ready, missing := run.EvaluateReadiness(run.GuardContext{
 		PlanClosed: true, HeadCommitOID: "head-v1-commit", HeadTreeOID: "head-v1-tree",
@@ -501,6 +506,7 @@ func TestReferenceTraceReviewerRejectionAndReReview(t *testing.T) {
 	mustNoError(t, err)
 	fixAttempt, err = fixAttempt.Complete(later())
 	mustNoError(t, err)
+	mustState(t, "fixAttempt", string(fixAttempt.State), string(run.AttemptCompleted))
 	fixTask, err = fixTask.Complete(later())
 	mustNoError(t, err)
 	fixTask, err = fixTask.EnterIntegrating(later())
@@ -510,6 +516,7 @@ func TestReferenceTraceReviewerRejectionAndReReview(t *testing.T) {
 	mustNoError(t, err)
 	fixIntegration, err = fixIntegration.Integrate(later())
 	mustNoError(t, err)
+	mustState(t, "fixIntegration", string(fixIntegration.State), string(run.IntegrationIntegrated))
 	fixTask, err = fixTask.Integrate(later())
 	mustNoError(t, err)
 	mustState(t, "fixTask", string(fixTask.State), string(run.TaskIntegrated))
@@ -578,7 +585,7 @@ func TestReferenceTraceStopPrecedenceAcrossNewMachinery(t *testing.T) {
 		r = r.RequestStop(later())
 		mustState(t, "run", string(r.State), string(run.RunStopping))
 
-		// The merge command's group is cancelled and retired; the
+		// The merge command's group is canceled and retired; the
 		// integration settles interrupted (no candidate was ever
 		// published).
 		integration, err = integration.Interrupt(later())
@@ -611,6 +618,7 @@ func TestReferenceTraceStopPrecedenceAcrossNewMachinery(t *testing.T) {
 
 		r := run.Run{ID: testRunID, State: run.RunRunning}
 		r = r.RequestStop(later())
+		mustState(t, "run", string(r.State), string(run.RunStopping))
 
 		// DriveStop drives the reset (rollback commit, CAS) so the
 		// integration ref never rests on an unvalidated candidate in

@@ -70,8 +70,8 @@ func ReleaseEligible(task Task, prerequisites []Task) bool { //nolint:gocritic /
 	if !task.HasDependencies {
 		return true
 	}
-	for _, p := range prerequisites {
-		if p.State != TaskIntegrated {
+	for i := range prerequisites {
+		if prerequisites[i].State != TaskIntegrated {
 			return false
 		}
 	}

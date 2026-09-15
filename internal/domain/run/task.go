@@ -147,7 +147,7 @@ func NewReviewTask(id identity.TaskID, runID identity.RunID, seq int, subjectCom
 // table returns t's applicable transition table: reviewTaskTransitions for
 // Kind == TaskKindReview, taskTransitions (the implement table) for every
 // other Kind including the Phase 2 zero value.
-func (t Task) table() transitionTable[TaskState] {
+func (t Task) table() transitionTable[TaskState] { //nolint:gocritic // hugeParam: Task is an immutable domain value returned by every transition; a pointer receiver would let a caller's original be mutated through it, breaking the pure-transition contract.
 	if t.Kind == TaskKindReview {
 		return reviewTaskTransitions
 	}

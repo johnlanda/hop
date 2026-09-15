@@ -62,9 +62,9 @@ func EvaluateReadiness(ctx GuardContext) (ready bool, missing []GuardShortfall) 
 	if !ctx.PlanClosed {
 		missing = append(missing, GuardShortfall{Kind: ShortfallPlanOpen})
 	}
-	for _, task := range ctx.ImplementTasks {
-		if task.State != TaskIntegrated {
-			missing = append(missing, GuardShortfall{Kind: ShortfallTaskNotIntegrated, TaskID: task.ID})
+	for i := range ctx.ImplementTasks {
+		if ctx.ImplementTasks[i].State != TaskIntegrated {
+			missing = append(missing, GuardShortfall{Kind: ShortfallTaskNotIntegrated, TaskID: ctx.ImplementTasks[i].ID})
 		}
 	}
 	if !ctx.HeadCheckPassed {
