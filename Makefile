@@ -67,6 +67,10 @@ test: ## Race and shuffle tests, including the architecture and guide checks
 .PHONY: check
 check: fmt-check docs-check lint test ## Non-mutating gate: fmt-check, docs-check, lint and test
 
+.PHONY: test-live
+test-live: ## Opt-in: real Claude Code against the fixture repo (costs tokens, never part of check)
+	HOP_LIVE_HARNESS=1 go test -count=1 -v -run '^TestLiveClaudeDefaultProfileRun$$' -timeout 20m ./test/integration
+
 .PHONY: golangci-lint
 golangci-lint: ## Install the pinned golangci-lint into .bin when missing or at another version
 	@if [ "$$($(GOLANGCI_LINT) version --short 2>/dev/null)" != "$(GOLANGCI_LINT_VERSION:v%=%)" ]; then \
