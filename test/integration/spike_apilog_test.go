@@ -27,13 +27,20 @@ import (
 //     (changes_ui=false, repos/herdr/src/api/mod.rs request_changes_ui)
 //     log their start/complete pair at DEBUG only when they succeed
 //     (repos/herdr/src/logging.rs api_request_started/api_request_completed);
-//     a failure logs via api_request_failed, which is DEBUG for its start
-//     line and unconditional WARN for the failure line regardless of
-//     changes_ui. agent.prompt/agent.send_keys/agent.start (changes_ui=true,
-//     not in logging.rs's routine-method allowlist) log their start at INFO
-//     regardless of outcome. The default filter (HERDR_LOG unset) is
-//     "herdr=info", so a SUCCESSFUL pane.* call is invisible at default
-//     settings while every agent.* call is always visible.
+//     a FAILED or erroring call among these still completes via the same
+//     event="api.request.complete" record, never a distinct fail event, but
+//     at INFO, since api_request_completed forces INFO whenever
+//     outcome != "ok". agent.prompt/agent.send_keys/agent.start
+//     (changes_ui=true, not in logging.rs's routine-method allowlist) log
+//     both their start and completion records at INFO regardless of
+//     outcome. event="api.request.fail" (WARN, logging.rs
+//     api_request_failed) is a separate event reserved for a failure
+//     WRITING the response back to the client socket itself (e.g. a
+//     disconnect mid-write) -- it never fires for an ordinary
+//     business-logic refusal, and no case in this probe induces it. The
+//     default filter (HERDR_LOG unset) is "herdr=info", so a SUCCESSFUL
+//     pane.* call is invisible at default settings while every agent.*
+//     call, and any FAILED or erroring call of either kind, is visible.
 //   - Correlation: every request-log line carries method and request_id, but
 //     NEVER the pane/agent target or any request payload -- an
 //     injection-free scenario can only honestly claim "no pane.send_text/
@@ -92,17 +99,17 @@ func TestSpikeAPIRequestLogObservability(t *testing.T) {
 		},
 		{
 			method: "agent.prompt", params: map[string]any{"target": pane, "text": "hop-spike-log-probe-prompt"},
-			succeeds: false, startLevel: "INFO", secondLevel: "WARN",
+			succeeds: false, startLevel: "INFO", secondLevel: "INFO",
 			forbidden: []string{pane},
 		},
 		{
 			method: "agent.send_keys", params: map[string]any{"target": pane, "keys": []string{"Enter"}},
-			succeeds: false, startLevel: "INFO", secondLevel: "WARN",
+			succeeds: false, startLevel: "INFO", secondLevel: "INFO",
 			forbidden: []string{pane},
 		},
 		{
 			method: "agent.start", params: map[string]any{"name": "hop-spike-log-probe", "kind": "hop-spike-unrecognized-kind", "pane_id": pane},
-			succeeds: false, startLevel: "INFO", secondLevel: "WARN",
+			succeeds: false, startLevel: "INFO", secondLevel: "INFO",
 			forbidden: []string{pane, "hop-spike-log-probe"},
 		},
 	}
@@ -139,7 +146,7 @@ func TestSpikeAPIRequestLogObservability(t *testing.T) {
 		t.Fatalf("window-end line %d is not after window-start line %d; the bracket is not usable for scoping a scan", endIdx, startIdx)
 	}
 
-	snapshotLine := requireLine(t, lines, startIdx, endIdx, `request_id="hop-1"`, `method="session.snapshot"`)
+	snapshotLine := requireLine(t, lines, startIdx, endIdx, `request_id="hop-1"`, `method="session.snapshot"`, `event="api.request.start"`)
 	sendTextStartLine := requireLine(t, lines, startIdx, endIdx, `request_id="hop-1"`, `method="pane.send_text"`, `event="api.request.start"`)
 	if snapshotLine == sendTextStartLine {
 		t.Fatal("the collision control and pane.send_text resolved to the same log line")
@@ -172,9 +179,9 @@ func TestSpikeAPIRequestLogObservability(t *testing.T) {
 		{method: "pane.send_text", params: map[string]any{"pane_id": defaultPane, "text": "default-level-send-text\n"}, succeeds: true},
 		{method: "pane.send_keys", params: map[string]any{"pane_id": defaultPane, "keys": []string{"Enter"}}, succeeds: true},
 		{method: "pane.send_input", params: map[string]any{"pane_id": defaultPane, "text": "default-level-send-input"}, succeeds: true},
-		{method: "agent.prompt", params: map[string]any{"target": defaultPane, "text": "default-level-prompt"}, succeeds: false, startLevel: "INFO", secondLevel: "WARN"},
-		{method: "agent.send_keys", params: map[string]any{"target": defaultPane, "keys": []string{"Enter"}}, succeeds: false, startLevel: "INFO", secondLevel: "WARN"},
-		{method: "agent.start", params: map[string]any{"name": "hop-spike-log-probe", "kind": "hop-spike-unrecognized-kind", "pane_id": defaultPane}, succeeds: false, startLevel: "INFO", secondLevel: "WARN"},
+		{method: "agent.prompt", params: map[string]any{"target": defaultPane, "text": "default-level-prompt"}, succeeds: false, startLevel: "INFO", secondLevel: "INFO"},
+		{method: "agent.send_keys", params: map[string]any{"target": defaultPane, "keys": []string{"Enter"}}, succeeds: false, startLevel: "INFO", secondLevel: "INFO"},
+		{method: "agent.start", params: map[string]any{"name": "hop-spike-log-probe", "kind": "hop-spike-unrecognized-kind", "pane_id": defaultPane}, succeeds: false, startLevel: "INFO", secondLevel: "INFO"},
 	}
 	for i := range defaultCases {
 		runAPILogCase(t, defaultServer, &defaultCases[i])
@@ -247,20 +254,23 @@ func runAPILogCase(t *testing.T, server *testServer, c *apiLogCase) {
 }
 
 // assertAPILogCase asserts one case's exact start record and second record
-// (api.request.complete on success, api.request.fail otherwise) within
-// lines[startIdx+1:endIdx], their levels, and the absence of every
-// forbidden string from both lines.
+// within lines[startIdx+1:endIdx], their levels, and the absence of every
+// forbidden string from both lines. The second record always carries
+// event="api.request.complete", whether the call succeeded (outcome="ok")
+// or was refused at the business layer (outcome="error") -- a distinct
+// event="api.request.fail" (WARN) record exists only for a failure writing
+// the response back to the client socket itself, which no case here induces.
 func assertAPILogCase(t *testing.T, lines []string, startIdx, endIdx int, c *apiLogCase) {
 	t.Helper()
 	startLine := requireLine(t, lines, startIdx, endIdx, `event="api.request.start"`, `method="`+c.method+`"`, `request_id="hop-1"`)
 	if got := logLevel(startLine); got != c.startLevel {
 		t.Errorf("%s start record level = %s, want %s: %s", c.method, got, c.startLevel, startLine)
 	}
-	secondEvent, wantOutcome := `event="api.request.complete"`, "ok"
+	wantOutcome := "ok"
 	if !c.succeeds {
-		secondEvent, wantOutcome = `event="api.request.fail"`, "error"
+		wantOutcome = "error"
 	}
-	secondLine := requireLine(t, lines, startIdx, endIdx, secondEvent, `method="`+c.method+`"`, `request_id="hop-1"`)
+	secondLine := requireLine(t, lines, startIdx, endIdx, `event="api.request.complete"`, `method="`+c.method+`"`, `request_id="hop-1"`)
 	if got := logLevel(secondLine); got != c.secondLevel {
 		t.Errorf("%s second record level = %s, want %s: %s", c.method, got, c.secondLevel, secondLine)
 	}

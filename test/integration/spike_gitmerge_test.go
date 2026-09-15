@@ -392,13 +392,34 @@ func TestSpikeMergeNonConflictFailureIsDistinctFromConflict(t *testing.T) {
 	source := repo.commit(t, "source change")
 	scratch := detachedScratch(t, repo, artifacts, "scratch-unwritable", repo.Base)
 
+	// A new loose object lands one level under objectsDir (objects/<xx>/<rest>);
+	// writing into an EXISTING <xx> subdirectory needs write permission on
+	// that subdirectory alone, not on objectsDir itself. Locking only
+	// objectsDir therefore still allows the merge to succeed whenever its new
+	// object hashes happen to collide with a two-hex prefix the fixture
+	// commits already created -- lock every existing subdirectory too so the
+	// write failure is deterministic regardless of hash prefix.
 	objectsDir := filepath.Join(repo.Root, ".git", "objects")
-	if err := os.Chmod(objectsDir, 0o500); err != nil { //nolint:gosec // G302: deliberately read-only to force a git write failure; restored below.
-		t.Fatalf("chmod object database read-only: %v", err)
+	entries, err := os.ReadDir(objectsDir)
+	if err != nil {
+		t.Fatalf("read object database: %v", err)
+	}
+	lockPaths := []string{objectsDir}
+	for _, e := range entries {
+		if e.IsDir() {
+			lockPaths = append(lockPaths, filepath.Join(objectsDir, e.Name()))
+		}
+	}
+	for _, p := range lockPaths {
+		if chmodErr := os.Chmod(p, 0o500); chmodErr != nil { //nolint:gosec // G302: deliberately read-only to force a git write failure; restored below.
+			t.Fatalf("chmod object database read-only: %v", chmodErr)
+		}
 	}
 	t.Cleanup(func() {
-		if err := os.Chmod(objectsDir, 0o700); err != nil { //nolint:gosec // G302: restoring this test's own throwaway object database to owner rwx so cleanup can remove it; not a security-sensitive permission.
-			t.Errorf("restore object database permissions: %v", err)
+		for _, p := range lockPaths {
+			if chmodErr := os.Chmod(p, 0o700); chmodErr != nil { //nolint:gosec // G302: restoring this test's own throwaway object database to owner rwx so cleanup can remove it; not a security-sensitive permission.
+				t.Errorf("restore object database permissions: %v", chmodErr)
+			}
 		}
 	})
 
