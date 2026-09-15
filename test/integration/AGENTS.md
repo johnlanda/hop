@@ -31,6 +31,7 @@ this tree, and drives everything through HOP's own protocol client.
 | [spike_markers_test.go](spike_markers_test.go) | `TestSpikeCreationMarkerTabLabel` | S7: a `tab.create` creation-time `label` round-trips through `tab.list` and `session.snapshot`, letting a crashed controller recover its own tab and root pane by a unique marker without the create response; the additive env is never a snapshot field |
 | [hopcmd_test.go](hopcmd_test.go) | `TestMain`, `buildHopBinary`, `hopResult`, `runHop`, `requireHopCommand`, `hopEnviron`, `startHopController`, `groupMember`, `listGroupMembers`, `parseGroupMember`, `TestBuildAndRunHopBinary`, `TestHopEnviron`, `TestStartHopController`, `TestListGroupMembers` | Task 6b harness extensions (phase A, item 4): `TestMain` + `buildHopBinary` build `./cmd/hop` once per test binary run into a shared temp dir instead of per test; `runHop` runs a bounded one-shot hop subcommand capturing stdout/stderr/exit code, and `requireHopCommand` skips a scenario with a clear reason when its command is cmd/hop's "unknown command" response (task 6a not yet landed/merged); `hopEnviron` builds the isolated `HOP_STATE_DIR` + this disposable server's own socket/binary path on top of the suite's hermetic base; `startHopController` starts a long-running hop subcommand (`hop run`/`hop resume`) as its own anchored, logged process group via `startAnchoredLeader`, returned as a `serverProcess` so existing group helpers apply unchanged; `listGroupMembers`/`parseGroupMember` independently list an arbitrary process group's members via `ps` — deliberately NOT importing `internal/adapters/process` (disallowed by the architecture checker for this package), so a scenario proving group retirement is evidence against the OS process table, not an echo of the port under test |
 | [fixturerepo_test.go](fixturerepo_test.go) | `fixtureRepo`, `newFixtureRepo`, `newFixtureRepoGitDependentCheck`, `newFixtureRepoWithSubmodule`, `initFixtureRepo`, `CommitCheckResult`, `fixtureConfigTOML`, `fixtureGitEnviron`, `runShellScript`, `TestFixtureRepoDeterministicCheck`, `TestFixtureRepoGitDependentCheck`, `TestFixtureRepoSubmoduleFailsClearly` | Task 6b fixture repository builder (phase A, item 2): a temporary SHA-1 git repository (`git init --object-format=sha1`, isolated from any developer git config, its own local commit identity) with a trivial source file, the deterministic `check.sh` (`CommitCheckResult` toggles CHECK_RESULT and commits, so the caller picks pass/fail "on demand" by choosing which commit it submits), the git-dependent `check-git.sh` variant (`newFixtureRepoGitDependentCheck`, succeeds only inside a real git checkout), and the submodule variant (`newFixtureRepoWithSubmodule`) whose `check-submodule.sh` fails clearly against a detached `git worktree add` checkout that never initializes submodules |
+| [fixtureworker_test.go](fixtureworker_test.go) | `fixtureWorkerSource`, `fixtureWorkerBrief`, `buildFixtureWorker`, `testAssignmentPrompt`, `writeTransientOnceHopStub`, `TestFixtureWorkerSubmitValid`, `TestFixtureWorkerExitWithoutSubmitting` | Task 6b fixture worker (phase A, item 3): a Go program built (never installed) and installed under the recognized name `claude` so `hop launch`'s PATH resolution finds it; reads required `HOP_*` env, locates and reads the assignment artifact (computed from `HOP_STATE_DIR`/`HOP_RUN_ID`, cross-validated against a best-effort marker parsed from its own prompt argv), and dispatches on a `FIXTURE-BEHAVIOR: <name>` directive delivered through the brief -> assignment.md channel (`fixtureWorkerBrief` renders it): `submit-valid`, `submit-stale` (gated on a `FIXTURE-GO` line on stdin, for a test to retire the incarnation first), `submit-twice`, `exit-without-submitting`, `exec-keep-pid` (`syscall.Exec` of itself, proving pid survives exec); every behavior writes an atomic `worker-observed.txt` dump beside the assignment file rather than judging its own correctness, and retries `hop result submit` on a `transient` first line |
 
 ## Invariants
 
@@ -79,14 +80,14 @@ this tree, and drives everything through HOP's own protocol client.
   (`testThirdParty` in the `test/integration` rule); the architecture
   checker's production-closure check proves no production package reaches it.
 - External binaries: `herdr` (skipped when absent), the `go` tool to build the
-  staged plugin, the compiled `TestSpike*` fixture and the cached `./cmd/hop`
-  build (`buildHopBinary`), `git` (fixture repository construction, isolated
-  per repository from any developer git configuration — see
-  `fixtureGitEnviron` — never the invariant the suite is proving), `ps`
-  (`listGroupMembers`'s independent process-group listing), and — for S4
-  only — `claude` (opt-in and skipped otherwise). The `TestSpike*` cases also
-  skip a shell capability case (zsh) with a reason when that shell is not
-  installed.
+  staged plugin, the compiled `TestSpike*` fixture, the cached `./cmd/hop`
+  build (`buildHopBinary`) and the compiled fixture worker, `git` (fixture
+  repository construction and the fixture worker's own commits — isolated
+  per repository from any developer git configuration, never the invariant
+  the suite is proving), `ps` (`listGroupMembers`'s independent process-group
+  listing), and — for S4 only — `claude` (opt-in and skipped otherwise). The
+  `TestSpike*` cases also skip a shell capability case (zsh) with a reason
+  when that shell is not installed.
 
 ## Verification
 
@@ -102,22 +103,25 @@ this tree, and drives everything through HOP's own protocol client.
   `TestKillProcessGroupThenReapKillsDescendants`,
   `TestArtifactDirRemovedOnPassingRun`, `TestArtifactRetentionDecision`,
   `TestSpikeRestartWaitsForGracefulExit`,
-  `TestSpikeOwnedGroupTeardownKillsPipeHoldingChild` and
-  `TestListGroupMembers`.
-- `go test -count=1 -run 'TestBuildAndRunHopBinary|TestHopEnviron|TestStartHopController|TestFixtureRepo' -v ./test/integration` —
-  the cached `cmd/hop` build and one-shot runner against the Phase 1 commands
-  (`version`), `requireHopCommand`'s skip detection against a command name
-  that will never exist, `hopEnviron`'s isolation contract asserted directly
-  with no process execution, the anchored-leader mechanics via a short-lived
-  command, and the fixture repository's deterministic/git-dependent/
-  submodule checks proven at the git level with no herdr or hop binary.
+  `TestSpikeOwnedGroupTeardownKillsPipeHoldingChild`, `TestListGroupMembers`,
+  and task 6b's harness/fixture self-tests below.
+- `go test -count=1 -run 'TestBuildAndRunHopBinary|TestHopEnviron|TestStartHopController|TestFixtureRepo|TestFixtureWorker' -v ./test/integration` —
+  task 6b's Phase A self-tests: the cached `cmd/hop` build and one-shot
+  runner against the Phase 1 commands (`version`), `requireHopCommand`'s skip
+  detection against a command name that will never exist, `hopEnviron`'s
+  isolation contract asserted directly with no process execution, the
+  anchored-leader mechanics via a short-lived command, the fixture
+  repository's deterministic/git-dependent/submodule checks proven at the
+  git level with no herdr or hop binary, and the fixture worker driven
+  directly (no herdr) against a fake `hop` stub proving argv/env parsing,
+  transient-retry and the FIXTURE-BEHAVIOR dispatch.
 - Test fixtures: none on disk as static files; every fixture (servers, roots,
-  the staged plugin, the spike fixture binaries, the cached `cmd/hop` build
-  and fixture repositories) is generated or compiled per test run and
-  removed by cleanup — retained only on failure, under the same artifact
-  directory as every other evidence this suite produces. The suite never
-  removes the shared `$TMPDIR/hop-integration` root by hand — only its own
-  per-test directories.
+  the staged plugin, the spike fixture binaries, the cached `cmd/hop` build,
+  fixture repositories and the fixture worker) is generated or compiled per
+  test run and removed by cleanup — retained only on failure, under the same
+  artifact directory as every other evidence this suite produces. The suite
+  never removes the shared `$TMPDIR/hop-integration` root by hand — only its
+  own per-test directories.
 
 ## Related guides
 
