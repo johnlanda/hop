@@ -333,6 +333,84 @@ func TestAckMessageRequiresOwnDelivery(t *testing.T) {
 	}
 }
 
+// TestAckMessageRequiresCurrentIncarnation is the successor/relaunch
+// regression: a delivery served to a session's earlier, now-superseded
+// incarnation must never authorize that same session's CURRENT incarnation
+// to ack without itself being served — section 7's delivery fence is
+// keyed on (session, incarnation), not session alone.
+func TestAckMessageRequiresCurrentIncarnation(t *testing.T) {
+	tc := newTestController(defaultPolicy())
+	fr := seedFeatureRun(t, tc, 2)
+	taskB := seedImplementTask(t, tc, fr.RunID, 1, "B", false, run.TaskReady)
+	workerID, firstIncarnation := seedWorkerSession(t, tc, fr, taskB)
+	ctx := context.Background()
+
+	send, err := tc.Controller.SendMessage(ctx, app.SendMessageRequest{
+		RunID: fr.RunID.String(), SessionID: fr.ManagerID.String(), IncarnationID: fr.ManagerIncarnation.String(),
+		StateRoot: "/state", To: "task:" + taskB.String(), Kind: "info", Body: []byte("update"),
+	})
+	if err != nil {
+		t.Fatalf("SendMessage() error = %v", err)
+	}
+	if _, fetchErr := tc.Controller.FetchMessage(ctx, app.FetchMessageRequest{
+		RunID: fr.RunID.String(), SessionID: workerID.String(), IncarnationID: firstIncarnation.String(),
+	}); fetchErr != nil {
+		t.Fatalf("FetchMessage() at the first incarnation error = %v", fetchErr)
+	}
+
+	// A warm reattach supersedes the first incarnation with a second, same
+	// session — seeded directly, mirroring how resume's own adoption path
+	// mints a binding under a distinct incarnation (test-only state
+	// seeding, bypassing lease fencing, per this file's established
+	// convention).
+	history := tc.Store.Bindings[workerID]
+	if len(history) != 1 {
+		t.Fatalf("Bindings[worker] = %+v, want exactly one binding before reattach", history)
+	}
+	history[0].Superseded = true
+	secondIncarnation, err := identity.ParseIncarnationID(tc.IDs.NewID())
+	if err != nil {
+		t.Fatalf("parse incarnation id: %v", err)
+	}
+	second := run.NewRuntimeBinding(workerID, secondIncarnation, history[0].ServerSocketPath, history[0].ServerInstance, history[0].WorkspaceID, history[0].TabID, history[0].PaneID, history[0].CreationLabel, run.LaunchResume, tc.Clock.Now())
+	tc.Store.Bindings[workerID] = append(history, second)
+
+	// The current (second) incarnation was never itself served this
+	// message — only the now-superseded first incarnation was. Acking
+	// must be refused, not accepted on the strength of that stale
+	// delivery.
+	ack, err := tc.Controller.AckMessage(ctx, app.AckMessageRequest{
+		RunID: fr.RunID.String(), MessageID: send.MessageID, SessionID: workerID.String(), IncarnationID: secondIncarnation.String(),
+	})
+	if err != nil {
+		t.Fatalf("AckMessage() error = %v", err)
+	}
+	if ack.Outcome != string(app.AckRefused) {
+		t.Fatalf("AckMessage() at the current-but-never-served incarnation = %+v, want refused", ack)
+	}
+
+	// Once the current incarnation is actually served (a re-serve of the
+	// same still-in-flight message), it may ack.
+	refetch, err := tc.Controller.FetchMessage(ctx, app.FetchMessageRequest{
+		RunID: fr.RunID.String(), SessionID: workerID.String(), IncarnationID: secondIncarnation.String(),
+	})
+	if err != nil {
+		t.Fatalf("FetchMessage() at the second incarnation error = %v", err)
+	}
+	if !refetch.Delivered || refetch.MessageID != send.MessageID {
+		t.Fatalf("FetchMessage() at the second incarnation = %+v, want the same message re-served", refetch)
+	}
+	ack, err = tc.Controller.AckMessage(ctx, app.AckMessageRequest{
+		RunID: fr.RunID.String(), MessageID: send.MessageID, SessionID: workerID.String(), IncarnationID: secondIncarnation.String(),
+	})
+	if err != nil {
+		t.Fatalf("AckMessage() after re-serve error = %v", err)
+	}
+	if ack.Outcome != string(app.AckAccepted) {
+		t.Fatalf("AckMessage() after re-serve to the current incarnation = %+v, want accepted", ack)
+	}
+}
+
 func TestShowMessage(t *testing.T) {
 	t.Run("renders the envelope plus full delivery/ack history", func(t *testing.T) {
 		tc := newTestController(defaultPolicy())

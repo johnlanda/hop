@@ -578,9 +578,17 @@ func (s *fakeStore) AckMessage(_ context.Context, ack app.MessageAck) (app.Messa
 		p := existing
 		priorAck = &p
 	}
+	// Section 7: a first ack requires a delivery row for the ACKING
+	// SESSION ITSELF at its CURRENT incarnation — a delivery served to an
+	// earlier, now-superseded incarnation of this same session proves
+	// nothing about what the CURRENT incarnation actually saw, exactly
+	// like a predecessor session's delivery proves nothing about a
+	// successor's. Matching SessionID alone (accepting any historical
+	// incarnation) would let a warm-reattached successor incarnation ack
+	// a message only a stale incarnation was ever served.
 	deliveredToSession := false
 	for _, d := range s.MessageDeliveries[ack.MessageID] {
-		if d.SessionID == ack.SessionID {
+		if d.SessionID == ack.SessionID && d.IncarnationID == ack.IncarnationID {
 			deliveredToSession = true
 			break
 		}
