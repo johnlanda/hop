@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -298,6 +299,55 @@ func TestRunControllerLoop(t *testing.T) {
 			t.Fatalf("err = %v, want the heartbeat failure", err)
 		}
 	})
+}
+
+func TestNonCancellationCauses(t *testing.T) {
+	retention := errors.New("retention failed: disk full")
+	cases := []struct {
+		name string
+		err  error
+		want string // "" means nil: the tree was entirely cancellation
+	}{
+		{name: "nil", err: nil, want: ""},
+		{name: "bare cancellation", err: context.Canceled, want: ""},
+		{name: "wrapped cancellation", err: fmt.Errorf("load run status: %w", context.Canceled), want: ""},
+		{name: "bare failure survives", err: retention, want: "retention failed"},
+		{name: "join keeps only survivors", err: errors.Join(context.Canceled, retention), want: "retention failed"},
+		{name: "all-cancellation join", err: errors.Join(context.Canceled, fmt.Errorf("wait: %w", context.Canceled)), want: ""},
+		{
+			name: "wrapped mixed join keeps the wrapper whole",
+			err:  fmt.Errorf("run check: %w", errors.Join(context.Canceled, retention)),
+			want: "run check: ",
+		},
+		{
+			name: "nested wrapped mixed join survives",
+			err:  fmt.Errorf("outer: %w", fmt.Errorf("inner: %w", errors.Join(context.Canceled, retention))),
+			want: "outer: inner: ",
+		},
+		{
+			name: "wrapped all-cancellation join is silent",
+			err:  fmt.Errorf("outer: %w", errors.Join(context.Canceled, context.Canceled)),
+			want: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := nonCancellationCauses(tc.err)
+
+			if tc.want == "" {
+				if got != nil {
+					t.Fatalf("nonCancellationCauses(%v) = %v, want nil", tc.err, got)
+				}
+				return
+			}
+			if got == nil || !strings.Contains(got.Error(), tc.want) {
+				t.Fatalf("nonCancellationCauses(%v) = %v, want it to contain %q", tc.err, got, tc.want)
+			}
+			if !strings.Contains(got.Error(), "retention failed") {
+				t.Fatalf("nonCancellationCauses(%v) = %v; the surviving cause was lost", tc.err, got)
+			}
+		})
+	}
 }
 
 func TestExitForRunState(t *testing.T) {

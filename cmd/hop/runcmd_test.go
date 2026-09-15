@@ -235,6 +235,51 @@ func TestRunRun(t *testing.T) {
 		}
 	})
 
+	t.Run("a detach carrying a WRAPPED mixed join still reports the retention failure", func(t *testing.T) {
+		ctrl := &fakeController{}
+		ctrl.startRun = func(app.StartRunRequest) (app.StartRunResult, app.RunHandle, error) {
+			return app.StartRunResult{RunID: testRunID, Sequence: 1}, app.RunHandle{}, nil
+		}
+		td := newTestDeps(ctrl, env, t.TempDir())
+		td.useCheckBarriers()
+		var checkStarted atomic.Bool
+		ctrl.claimAndRunCheck = func(ctx context.Context, _ string, _ []string) (app.CheckReport, error) {
+			checkStarted.Store(true)
+			td.checkStarted <- struct{}{}
+			<-ctx.Done()
+			// The reviewer's probe shape: the retention failure arrives
+			// wrapped AROUND a join that also carries the cancellation, so
+			// a whole-tree errors.Is reads it as canceled.
+			return app.CheckReport{}, fmt.Errorf("run check cleanup: %w", errors.Join(context.Canceled, errors.New("retention failed: disk full")))
+		}
+		statusCalls := 0
+		ctrl.status = func(app.StatusRequest) (app.StatusResult, error) {
+			statusCalls++
+			if checkStarted.Load() && statusCalls > 1 {
+				td.signals <- syscall.SIGINT
+				<-ctrl.statusCtx().Done()
+				return app.StatusResult{}, fmt.Errorf("load run status: %w", ctrl.statusCtx().Err())
+			}
+			return detailStep("running", "running", false), nil
+		}
+		var stdout, stderr bytes.Buffer
+
+		code, err := runRun([]string{"brief"}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+
+		if code != exitFailure {
+			t.Errorf("exit code = %d, want %d", code, exitFailure)
+		}
+		if !strings.Contains(stderr.String(), "retention failed") {
+			t.Errorf("stderr = %q; the wrapped joined retention failure was discarded as a plain cancellation", stderr.String())
+		}
+		if !strings.Contains(stdout.String(), "resume with: hop resume "+testRunID) {
+			t.Errorf("output lacks the resume instruction:\n%s", stdout.String())
+		}
+	})
+
 	usage := []struct {
 		name string
 		args []string

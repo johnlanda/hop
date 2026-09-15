@@ -277,24 +277,37 @@ func runControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, handle 
 	}
 }
 
-// nonCancellationCauses strips every pure-cancellation cause out of err,
-// recursing through joined errors, and returns what remains — nil when
-// err was nothing but cancellation. Retention and recording failures are
-// constructed without the cancellation shape (the app carries a spawn
-// error as text exactly so this holds), so they always survive the
-// filter.
+// nonCancellationCauses strips every pure-cancellation cause out of err
+// and returns what remains — nil when err was nothing but cancellation.
+// It recurses through BOTH unwrapping shapes before deciding: a joined
+// error (Unwrap() []error) keeps only its surviving members, and a
+// single-error wrapper (Unwrap() error) is kept WHOLE — its wrapping text
+// preserved — whenever anything under it survives, so a wrapped mixed
+// join is never discarded as a plain cancellation just because errors.Is
+// finds a canceled member somewhere inside. Retention and recording
+// failures are constructed without the cancellation shape (the app
+// carries a spawn error as text exactly so this holds), so they always
+// survive the filter.
 func nonCancellationCauses(err error) error {
 	if err == nil {
 		return nil
 	}
-	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+	switch unwrapped := err.(type) { //nolint:errorlint // the filter walks the tree's unwrap SHAPE node by node — the structural traversal errors.As cannot express; cancellation itself is still decided semantically with errors.Is at each leaf.
+	case interface{ Unwrap() []error }:
 		var kept []error
-		for _, cause := range joined.Unwrap() {
+		for _, cause := range unwrapped.Unwrap() {
 			if survivor := nonCancellationCauses(cause); survivor != nil {
 				kept = append(kept, survivor)
 			}
 		}
 		return errors.Join(kept...)
+	case interface{ Unwrap() error }:
+		if inner := unwrapped.Unwrap(); inner != nil {
+			if nonCancellationCauses(inner) == nil {
+				return nil
+			}
+			return err
+		}
 	}
 	if errors.Is(err, context.Canceled) {
 		return nil
