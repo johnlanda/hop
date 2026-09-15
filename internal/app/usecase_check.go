@@ -163,8 +163,15 @@ func (c *Controller) ClaimAndRunCheck(ctx context.Context, handle RunHandle, hop
 
 	outcome := checkRunOutcome{ExitCode: cmdResult.ExitCode}
 	report, outcomeErr := c.recordCheckOutcome(ctx, handle, opID, checkRequest, outcome, frozen.Snapshot.CheckRepeatable, nil, evidence...)
-	// Cleanup only after evidence retention and the recorded outcome; the
-	// retained outputs stay under the execution's own directory.
+	if outcomeErr != nil {
+		// The outcome was not durably recorded (a fenced or failed commit):
+		// the operation stays unresolved and the checkout is kept — cleanup
+		// happens only after a recorded outcome, never before.
+		return report, outcomeErr
+	}
+	// Cleanup only after evidence retention and the durably recorded
+	// outcome; the retained outputs stay under the execution's own
+	// directory.
 	c.removeCheckout(ctx, handle, frozen.RepositoryRoot, checkoutPath)
 	return report, outcomeErr
 }

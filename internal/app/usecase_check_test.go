@@ -2,6 +2,7 @@ package app_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -776,6 +777,86 @@ func TestCheckEvidenceRetentionFailures(t *testing.T) {
 		}
 		if strings.Contains(options, "resume") {
 			t.Fatalf("options = %q, must not promise hop resume retries a terminal outcome", options)
+		}
+	})
+}
+
+// TestCleanupOnlyAfterRecordedOutcome proves the checkout survives a
+// failed outcome record — cleanup never runs before the outcome is
+// durable — for both a fenced commit (takeover) and an ordinary
+// transaction failure under a still-valid lease.
+func TestCleanupOnlyAfterRecordedOutcome(t *testing.T) {
+	assertRetained := func(t *testing.T, tc *testController) {
+		t.Helper()
+		for _, cmd := range tc.Commands.Calls {
+			for i, tok := range cmd.Argv {
+				if tok == "worktree" && i+1 < len(cmd.Argv) && cmd.Argv[i+1] == "remove" {
+					t.Fatalf("the checkout was cleaned up before the outcome was durably recorded: %v", cmd.Argv)
+				}
+			}
+		}
+		for id := range tc.Store.Operations {
+			op := tc.Store.Operations[id]
+			if op.Kind == app.OpCheckRun && op.State != app.OperationPending {
+				t.Fatalf("check operation state = %s, want pending (unresolved and recoverable)", op.State)
+			}
+		}
+	}
+
+	t.Run("fenced outcome commit: checkout retained, operation unresolved", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		handle, detail := runningRun(t, tc)
+		if _, err := tc.Controller.SubmitResult(context.Background(), defaultSubmitRequest(detail)); err != nil {
+			t.Fatalf("SubmitResult() error = %v", err)
+		}
+		tc.Commands.CheckExecFn = func(ctx context.Context, _ app.Command) (app.CommandResult, error) {
+			tc.Clock.Advance(leaseTTL + time.Second)
+			if _, err := tc.Store.AcquireLease(ctx, detail.RunID, "controller-B"); err != nil {
+				t.Errorf("AcquireLease() (B) error = %v", err)
+			}
+			return app.CommandResult{ExitCode: 0, Stdout: []byte("passing output")}, nil
+		}
+
+		if _, err := tc.Controller.ClaimAndRunCheck(context.Background(), handle, "/usr/local/bin/hop", nil); err == nil {
+			t.Fatalf("ClaimAndRunCheck() succeeded despite the fenced outcome commit")
+		}
+		assertRetained(t, tc)
+	})
+
+	t.Run("outcome transaction failure under a valid lease: checkout retained, operation recoverable", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		handle, detail := runningRun(t, tc)
+		if _, err := tc.Controller.SubmitResult(context.Background(), defaultSubmitRequest(detail)); err != nil {
+			t.Fatalf("SubmitResult() error = %v", err)
+		}
+		// A concurrent write moves the attempt row inside exactly the
+		// outcome transaction's commit window: the commit fails with a
+		// revision conflict while the lease stays valid.
+		fired := false
+		tc.Store.CommitHook = func(u *fakeUnitOfWork) {
+			if fired {
+				return
+			}
+			for _, op := range u.opSaved {
+				if op.Kind == app.OpCheckRun && op.State != app.OperationPending {
+					fired = true
+					tc.Store.Attempts[detail.AttemptID].revision++
+					return
+				}
+			}
+		}
+
+		_, err := tc.Controller.ClaimAndRunCheck(context.Background(), handle, "/usr/local/bin/hop", nil)
+		if !errors.Is(err, app.ErrRevisionConflict) {
+			t.Fatalf("ClaimAndRunCheck() error = %v, want ErrRevisionConflict from the outcome commit", err)
+		}
+		if !fired {
+			t.Fatalf("the outcome-commit hook never fired; the scenario did not exercise the intended window")
+		}
+		assertRetained(t, tc)
+		// The lease is untouched: the failure is transactional, not fencing.
+		if err := tc.Controller.Heartbeat(context.Background(), handle); err != nil {
+			t.Fatalf("Heartbeat() error = %v; the lease should still be valid", err)
 		}
 	})
 }

@@ -177,6 +177,9 @@ func (u *fakeUnitOfWork) Commit() error {
 	u.ensureOpen()
 	u.done = true
 	s := u.store
+	if s.CommitHook != nil {
+		s.CommitHook(u)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.openUnitsOfWork--

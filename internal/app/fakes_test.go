@@ -83,6 +83,12 @@ type fakeStore struct {
 	// controller at exactly the pre-dispatch revalidation point.
 	HeartbeatHook func()
 
+	// CommitHook, when set, runs at the start of every unit-of-work
+	// Commit, outside the store lock, with the committing unit of work: a
+	// test can race a concurrent write against exactly one transaction's
+	// commit window.
+	CommitHook func(u *fakeUnitOfWork)
+
 	// openUnitsOfWork counts units of work begun but not yet committed or
 	// rolled back. The port fakes consult it through
 	// refuseInsideTransaction: an external call made while a store
