@@ -314,16 +314,17 @@ type occupantJSON struct {
 	PID        int    `json:"pid"`
 }
 
-const selectBindingColumns = `SELECT session_id, incarnation_id, server_socket_path, workspace_id, tab_id, pane_id, creation_label, launch_kind, occupant_evidence, observed_at, superseded, superseded_at, superseded_evidence FROM runtime_bindings`
+const selectBindingColumns = `SELECT session_id, incarnation_id, server_socket_path, server_instance, workspace_id, tab_id, pane_id, creation_label, launch_kind, occupant_evidence, observed_at, superseded, superseded_at, superseded_evidence FROM runtime_bindings`
 
-// scanBinding maps one runtime_bindings row.
+// scanBinding maps one runtime_bindings row. server_instance stores NULL
+// for an empty ServerInstance and round-trips it back as "".
 func scanBinding(row *sql.Row) (run.RuntimeBinding, error) {
 	var (
 		sessionID, incarnationID, socketPath, workspaceID, tabID, paneID, label, kind, observedAt string
-		occupant, supersededAt, supersededEvidence                                                sql.NullString
+		serverInstance, occupant, supersededAt, supersededEvidence                                sql.NullString
 		superseded                                                                                int64
 	)
-	err := row.Scan(&sessionID, &incarnationID, &socketPath, &workspaceID, &tabID, &paneID, &label, &kind, &occupant, &observedAt, &superseded, &supersededAt, &supersededEvidence)
+	err := row.Scan(&sessionID, &incarnationID, &socketPath, &serverInstance, &workspaceID, &tabID, &paneID, &label, &kind, &occupant, &observedAt, &superseded, &supersededAt, &supersededEvidence)
 	if err != nil {
 		return run.RuntimeBinding{}, err
 	}
@@ -343,6 +344,7 @@ func scanBinding(row *sql.Row) (run.RuntimeBinding, error) {
 		SessionID:          parsedSessionID,
 		IncarnationID:      parsedIncarnationID,
 		ServerSocketPath:   socketPath,
+		ServerInstance:     serverInstance.String,
 		WorkspaceID:        workspaceID,
 		TabID:              tabID,
 		PaneID:             paneID,
@@ -486,21 +488,39 @@ func launchIncarnationCurrent(ctx context.Context, q querier, runID identity.Run
 	if bindingRows > 0 {
 		return false, nil
 	}
+	intent, ok, err := pendingLaunchIntent(ctx, q, runID)
+	if err != nil {
+		return false, err
+	}
+	return ok && intent.incarnationID == incarnationID.String() && intent.sessionID == session.ID.String(), nil
+}
+
+// launchIntentIdentities are the two stable identity keys of a pending
+// launch operation's intent JSON — the documented app↔store contract keys
+// "incarnation_id" and "session_id". A missing or non-string member is "".
+type launchIntentIdentities struct {
+	incarnationID string
+	sessionID     string
+}
+
+// pendingLaunchIntent reads the run's newest pending launch operation
+// (kind pane.open or launch.send) and returns its intent's identity keys;
+// ok is false when no such operation is pending.
+func pendingLaunchIntent(ctx context.Context, q querier, runID identity.RunID) (launchIntentIdentities, bool, error) {
 	var intentIncarnation, intentSession sql.NullString
-	err = q.QueryRowContext(ctx,
+	err := q.QueryRowContext(ctx,
 		`SELECT json_extract(intent, '$.incarnation_id'), json_extract(intent, '$.session_id') FROM operations
 		 WHERE run_id = ? AND state = ? AND kind IN (?, ?)
 		 ORDER BY created_at DESC, rowid DESC LIMIT 1`,
 		runID.String(), string(app.OperationPending), string(app.OpPaneOpen), string(app.OpLaunchSend),
 	).Scan(&intentIncarnation, &intentSession)
 	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
+		return launchIntentIdentities{}, false, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("sqlite: read pending launch intent of run %s: %w", runID, err)
+		return launchIntentIdentities{}, false, fmt.Errorf("sqlite: read pending launch intent of run %s: %w", runID, err)
 	}
-	return intentIncarnation.Valid && intentIncarnation.String == incarnationID.String() &&
-		intentSession.Valid && intentSession.String == session.ID.String(), nil
+	return launchIntentIdentities{incarnationID: intentIncarnation.String, sessionID: intentSession.String}, true, nil
 }
 
 // runOfTask returns the persisted owning run of a task row.

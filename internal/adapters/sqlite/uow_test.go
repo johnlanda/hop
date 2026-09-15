@@ -1,6 +1,7 @@
 package sqlite_test
 
 import (
+	"database/sql"
 	"errors"
 	"sync"
 	"testing"
@@ -379,7 +380,7 @@ func TestUnitOfWorkIsScopedToTheLeasedRun(t *testing.T) {
 			name: "binding create",
 			mutate: func(t *testing.T, uow app.UnitOfWork) error {
 				t.Helper()
-				return uow.Bindings().Create(t.Context(), run.NewRuntimeBinding(specB.SessionID, identity.IncarnationID(uid(8852)), "/s", "w", "t", "p", "l", run.LaunchResume, now))
+				return uow.Bindings().Create(t.Context(), run.NewRuntimeBinding(specB.SessionID, identity.IncarnationID(uid(8852)), "/s", "si", "w", "t", "p", "l", run.LaunchResume, now))
 			},
 		},
 		{
@@ -481,6 +482,119 @@ func TestUnitOfWorkIsScopedToTheLeasedRun(t *testing.T) {
 		}
 		if err := uow.Commit(); err != nil {
 			t.Fatalf("commit: %v", err)
+		}
+	})
+}
+
+// TestBindingServerInstanceRoundTrip proves the reserved server_instance
+// column maps to run.RuntimeBinding.ServerInstance both ways: a non-empty
+// value stores non-NULL and reads back equal, and an empty value stores
+// NULL and reads back "".
+func TestBindingServerInstanceRoundTrip(t *testing.T) {
+	cases := []struct {
+		name           string
+		serverInstance string
+		wantNull       bool
+	}{
+		{name: "present", serverInstance: "srv-7f3a", wantNull: false},
+		{name: "absent", serverInstance: "", wantNull: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			f.launchAttempt(t)
+			f.inUOW(t, func(uow app.UnitOfWork) {
+				binding := run.NewRuntimeBinding(
+					f.spec.SessionID, f.spec.IncarnationID,
+					"/tmp/herdr.sock", tc.serverInstance, "workspace-1", "tab-1", "pane-1",
+					uid(9001), run.LaunchInitial, f.clock.Now(),
+				)
+				if err := uow.Bindings().Create(t.Context(), binding); err != nil {
+					t.Fatalf("create binding: %v", err)
+				}
+			})
+
+			f.inUOW(t, func(uow app.UnitOfWork) {
+				binding, ok, err := uow.Bindings().Current(t.Context(), f.spec.SessionID)
+				if err != nil || !ok {
+					t.Fatalf("current binding: %v (found %t)", err, ok)
+				}
+				if binding.ServerInstance != tc.serverInstance {
+					t.Fatalf("server instance = %q, want %q", binding.ServerInstance, tc.serverInstance)
+				}
+			})
+
+			var stored sql.NullString
+			if err := sqlite.WriteDB(f.store).QueryRowContext(t.Context(),
+				`SELECT server_instance FROM runtime_bindings WHERE session_id = ?`, f.spec.SessionID.String(),
+			).Scan(&stored); err != nil {
+				t.Fatalf("read server_instance column: %v", err)
+			}
+			if stored.Valid == tc.wantNull {
+				t.Fatalf("server_instance column valid=%t, want NULL=%t", stored.Valid, tc.wantNull)
+			}
+		})
+	}
+}
+
+// TestOperationsByKind proves ByKind returns every operation of one kind
+// for a run whatever its state, newest first, and excludes other kinds.
+func TestOperationsByKind(t *testing.T) {
+	f := newFixture(t)
+	// Three check.run operations in distinct states, plus a pane.open that
+	// ByKind(check.run) must exclude.
+	specs := []struct {
+		n     int
+		kind  app.OperationKind
+		state app.OperationState
+	}{
+		{n: 7601, kind: app.OpCheckRun, state: app.OperationSucceeded},
+		{n: 7602, kind: app.OpCheckRun, state: app.OperationFailed},
+		{n: 7603, kind: app.OpCheckRun, state: app.OperationPending},
+		{n: 7604, kind: app.OpPaneOpen, state: app.OperationPending},
+	}
+	f.inUOW(t, func(uow app.UnitOfWork) {
+		for i, s := range specs {
+			// Distinct created_at so newest-first ordering is unambiguous.
+			at := f.clock.Now().Add(time.Duration(i) * time.Second)
+			err := uow.Operations().Create(t.Context(), app.Operation{
+				ID: identity.OperationID(uid(s.n)), RunID: f.spec.RunID, Generation: f.lease.Generation,
+				Kind: s.kind, State: s.state,
+				Intent: map[string]any{}, CreatedAt: at, UpdatedAt: at,
+			})
+			if err != nil {
+				t.Fatalf("create operation %d: %v", s.n, err)
+			}
+		}
+	})
+
+	f.inUOW(t, func(uow app.UnitOfWork) {
+		checks, err := uow.Operations().ByKind(t.Context(), f.spec.RunID, app.OpCheckRun)
+		if err != nil {
+			t.Fatalf("ByKind: %v", err)
+		}
+		if len(checks) != 3 {
+			t.Fatalf("ByKind(check.run) returned %d operations, want 3 across all states", len(checks))
+		}
+		wantOrder := []identity.OperationID{
+			identity.OperationID(uid(7603)), identity.OperationID(uid(7602)), identity.OperationID(uid(7601)),
+		}
+		for i, want := range wantOrder {
+			if checks[i].ID != want {
+				t.Fatalf("ByKind order[%d] = %s, want %s (newest first)", i, checks[i].ID, want)
+			}
+		}
+		states := map[app.OperationState]bool{}
+		for _, op := range checks {
+			states[op.State] = true
+			if op.Kind != app.OpCheckRun {
+				t.Fatalf("ByKind(check.run) returned a %s operation", op.Kind)
+			}
+		}
+		for _, want := range []app.OperationState{app.OperationSucceeded, app.OperationFailed, app.OperationPending} {
+			if !states[want] {
+				t.Fatalf("ByKind coverage missing state %s: %v", want, states)
+			}
 		}
 	})
 }

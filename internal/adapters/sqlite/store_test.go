@@ -144,7 +144,7 @@ func (f *fixture) createBinding(t *testing.T) {
 	f.inUOW(t, func(uow app.UnitOfWork) {
 		binding := run.NewRuntimeBinding(
 			f.spec.SessionID, f.spec.IncarnationID,
-			"/tmp/herdr.sock", "workspace-1", "tab-1", "pane-1",
+			"/tmp/herdr.sock", "server-instance-1", "workspace-1", "tab-1", "pane-1",
 			uid(9001), run.LaunchInitial, f.clock.Now(),
 		)
 		if err := uow.Bindings().Create(t.Context(), binding); err != nil {

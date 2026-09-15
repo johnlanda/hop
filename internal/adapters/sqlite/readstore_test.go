@@ -114,8 +114,14 @@ func TestLoadRunStatus(t *testing.T) {
 	if detail.WorktreePath != "/worktrees/alpha-r1" {
 		t.Fatalf("worktree path = %q, want /worktrees/alpha-r1", detail.WorktreePath)
 	}
+	if detail.StateRoot != "/state/root" {
+		t.Fatalf("state root = %q, want the frozen /state/root", detail.StateRoot)
+	}
 	if detail.Binding == nil || detail.Binding.IncarnationID != f.spec.IncarnationID {
 		t.Fatalf("binding = %+v, want the current incarnation's binding", detail.Binding)
+	}
+	if detail.Binding.ServerInstance != "server-instance-1" {
+		t.Fatalf("binding server instance = %q, want server-instance-1", detail.Binding.ServerInstance)
 	}
 	if detail.Claim == nil || detail.Claim.State != app.LaunchClaimExeced {
 		t.Fatalf("claim = %+v, want the settled execed claim", detail.Claim)
@@ -162,8 +168,9 @@ func TestLoadRunStatusUnknownRun(t *testing.T) {
 	}
 }
 
-// TestLoadLaunchContext proves the launch exec boundary's lease-free load:
-// the frozen snapshot, session, binding, claim state and stop state.
+// TestLoadLaunchContext proves the launch exec boundary's lease-free load
+// with a committed binding: the frozen snapshot, session, the binding's
+// incarnation, the claim state and the stop state.
 func TestLoadLaunchContext(t *testing.T) {
 	f := newFixture(t)
 	f.launchAttempt(t)
@@ -190,8 +197,8 @@ func TestLoadLaunchContext(t *testing.T) {
 	if launchContext.Session.ID != f.spec.SessionID || launchContext.Session.NativeSessionRef != f.spec.NativeSessionRef {
 		t.Fatalf("session = %+v, want the fixture session with its native reference", launchContext.Session)
 	}
-	if launchContext.Binding.IncarnationID != f.spec.IncarnationID {
-		t.Fatalf("binding incarnation = %s, want %s", launchContext.Binding.IncarnationID, f.spec.IncarnationID)
+	if launchContext.IncarnationID != f.spec.IncarnationID {
+		t.Fatalf("incarnation = %s, want %s (from the current binding)", launchContext.IncarnationID, f.spec.IncarnationID)
 	}
 	if launchContext.Claim == nil || launchContext.Claim.State != app.LaunchClaimExecPending {
 		t.Fatalf("claim = %+v, want the exec_pending claim", launchContext.Claim)
@@ -212,12 +219,15 @@ func TestLoadLaunchContext(t *testing.T) {
 	}
 }
 
-// TestLoadLaunchContextBeforeBinding proves the launcher's load succeeds
-// as soon as InitializeRun's rows exist: hop launch is the pane's own
-// command and can run before the controller records the binding row, so a
-// missing binding yields the zero Binding and a nil Claim, never an error.
+// TestLoadLaunchContextBeforeBinding proves the launcher's load succeeds as
+// soon as InitializeRun's rows and the recorded launch intent exist: hop
+// launch is the pane's own command and can run before the controller
+// records the binding row, so IncarnationID resolves from the pending
+// intent, with a nil Claim until the launcher writes one.
 func TestLoadLaunchContextBeforeBinding(t *testing.T) {
 	f := newFixture(t)
+	f.launchAttempt(t)
+	f.createLaunchIntent(t, f.spec.SessionID, f.spec.IncarnationID)
 
 	launchContext, err := f.store.LoadLaunchContext(t.Context(), f.spec.RunID, f.spec.AttemptID)
 	if err != nil {
@@ -229,15 +239,70 @@ func TestLoadLaunchContextBeforeBinding(t *testing.T) {
 	if launchContext.Session.ID != f.spec.SessionID || launchContext.Session.NativeSessionRef != f.spec.NativeSessionRef {
 		t.Fatalf("session = %+v, want the fixture session with its native reference", launchContext.Session)
 	}
-	if launchContext.Binding != (run.RuntimeBinding{}) {
-		t.Fatalf("binding before the row is committed = %+v, want the zero value", launchContext.Binding)
+	if launchContext.IncarnationID != f.spec.IncarnationID {
+		t.Fatalf("incarnation before the binding = %s, want %s (from the pending intent)", launchContext.IncarnationID, f.spec.IncarnationID)
 	}
 	if launchContext.Claim != nil {
-		t.Fatalf("claim before any binding = %+v, want nil", launchContext.Claim)
+		t.Fatalf("claim before any launch write = %+v, want nil", launchContext.Claim)
 	}
 	if launchContext.StopRequested {
 		t.Fatal("stop requested = true on a run with no stop request")
 	}
+
+	// Once the launcher writes its claim, the same load carries it — keyed
+	// by the incarnation the intent resolved.
+	f.claimLaunch(t)
+	withClaim, err := f.store.LoadLaunchContext(t.Context(), f.spec.RunID, f.spec.AttemptID)
+	if err != nil {
+		t.Fatalf("LoadLaunchContext after the claim: %v", err)
+	}
+	if withClaim.Claim == nil || withClaim.Claim.State != app.LaunchClaimExecPending {
+		t.Fatalf("claim after the launcher write = %+v, want the exec_pending claim", withClaim.Claim)
+	}
+}
+
+// TestLoadLaunchContextFailsClosed proves the launcher's load fails closed
+// rather than handing back an identity nothing recorded: no binding and no
+// matching intent, and a binding whose incarnation disagrees with the
+// pending intent's, are both ErrNotFound.
+func TestLoadLaunchContextFailsClosed(t *testing.T) {
+	t.Run("no binding and no intent", func(t *testing.T) {
+		f := newFixture(t)
+		f.launchAttempt(t)
+
+		_, err := f.store.LoadLaunchContext(t.Context(), f.spec.RunID, f.spec.AttemptID)
+
+		if !errors.Is(err, app.ErrNotFound) {
+			t.Fatalf("LoadLaunchContext with no identity source = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("binding and intent disagree", func(t *testing.T) {
+		f := newFixture(t)
+		f.launchAttempt(t)
+		f.createBinding(t)
+		f.createLaunchIntent(t, f.spec.SessionID, identity.IncarnationID(uid(6501)))
+
+		_, err := f.store.LoadLaunchContext(t.Context(), f.spec.RunID, f.spec.AttemptID)
+
+		if !errors.Is(err, app.ErrNotFound) {
+			t.Fatalf("LoadLaunchContext with a disagreeing binding and intent = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("intent for another session is ignored", func(t *testing.T) {
+		f := newFixture(t)
+		f.launchAttempt(t)
+		// A stale pre-replacement intent naming a different session is not
+		// this session's authority, so with no binding the load fails closed.
+		f.createLaunchIntent(t, identity.SessionID(uid(6502)), f.spec.IncarnationID)
+
+		_, err := f.store.LoadLaunchContext(t.Context(), f.spec.RunID, f.spec.AttemptID)
+
+		if !errors.Is(err, app.ErrNotFound) {
+			t.Fatalf("LoadLaunchContext with an intent for another session = %v, want ErrNotFound", err)
+		}
+	})
 }
 
 // TestLoadLaunchContextAttemptOfOtherRun proves the agreement check: an
@@ -253,6 +318,134 @@ func TestLoadLaunchContextAttemptOfOtherRun(t *testing.T) {
 
 	if !errors.Is(err, app.ErrNotFound) {
 		t.Fatalf("LoadLaunchContext across runs = %v, want ErrNotFound", err)
+	}
+}
+
+// TestLoadFrozenRun proves the lease-free frozen-run read returns the
+// immutable snapshot, the repository root and the frozen brief.
+func TestLoadFrozenRun(t *testing.T) {
+	f := newFixture(t)
+
+	frozen, err := f.store.LoadFrozenRun(t.Context(), f.spec.RunID)
+	if err != nil {
+		t.Fatalf("LoadFrozenRun: %v", err)
+	}
+	if frozen.RepositoryRoot != "/repos/alpha" {
+		t.Fatalf("repository root = %q, want /repos/alpha", frozen.RepositoryRoot)
+	}
+	if frozen.Brief != f.spec.Brief {
+		t.Fatalf("brief = %q, want %q", frozen.Brief, f.spec.Brief)
+	}
+	if frozen.Snapshot.StateRoot != "/state/root" || frozen.Snapshot.AssignmentDigest != "assignment-digest" {
+		t.Fatalf("snapshot = %+v, want the frozen fixture snapshot", frozen.Snapshot)
+	}
+	if len(frozen.Snapshot.CheckArgv) != 2 || frozen.Snapshot.CheckArgv[1] != "check.sh" {
+		t.Fatalf("check argv = %v, want the frozen [sh check.sh]", frozen.Snapshot.CheckArgv)
+	}
+}
+
+// TestLoadFrozenRunUnknownRun proves an unknown run is ErrNotFound.
+func TestLoadFrozenRunUnknownRun(t *testing.T) {
+	f := newFixture(t)
+
+	_, err := f.store.LoadFrozenRun(t.Context(), identity.RunID(uid(6601)))
+
+	if !errors.Is(err, app.ErrNotFound) {
+		t.Fatalf("LoadFrozenRun of an unknown run = %v, want ErrNotFound", err)
+	}
+}
+
+// TestLoadRunStatusLastCheck proves LastCheck surfaces both a pending check
+// execution and a settled unknown one, with the unknown flag, the detail
+// and the retained evidence paths.
+func TestLoadRunStatusLastCheck(t *testing.T) {
+	f := runningFixture(t)
+	accepted, err := f.store.SubmitResult(t.Context(), f.submission(8201, "digest-1"))
+	if err != nil || accepted.Kind != app.SubmissionAccepted {
+		t.Fatalf("SubmitResult = %+v, %v", accepted, err)
+	}
+	opID := identity.OperationID(uid(7701))
+	f.inUOW(t, func(uow app.UnitOfWork) {
+		// A settled check execution whose outcome is unknown, with retained
+		// stdout/stderr evidence tied to the accepted result.
+		if createErr := uow.Operations().Create(t.Context(), app.Operation{
+			ID: opID, RunID: f.spec.RunID, Generation: f.lease.Generation,
+			Kind: app.OpCheckRun, State: app.OperationFailed,
+			Intent:    map[string]any{"tree_oid": "abc"},
+			Outcome:   map[string]any{"unknown": true, "detail": "process group retired after takeover; result unknown"},
+			CreatedAt: f.clock.Now(), UpdatedAt: f.clock.Now(),
+		}); createErr != nil {
+			t.Fatalf("create settled unknown check operation: %v", createErr)
+		}
+		stdout := run.NewResultArtifact(identity.ArtifactID(uid(7702)), f.spec.RunID, accepted.ResultID, run.ArtifactCheckStdout, "/state/root/runs/x/checks/y/stdout", "d1")
+		stderr := run.NewResultArtifact(identity.ArtifactID(uid(7703)), f.spec.RunID, accepted.ResultID, run.ArtifactCheckStderr, "/state/root/runs/x/checks/y/stderr", "d2")
+		if saveErr := uow.Artifacts().Save(t.Context(), stdout); saveErr != nil {
+			t.Fatalf("save stdout artifact: %v", saveErr)
+		}
+		if saveErr := uow.Artifacts().Save(t.Context(), stderr); saveErr != nil {
+			t.Fatalf("save stderr artifact: %v", saveErr)
+		}
+	})
+
+	detail, err := f.store.LoadRunStatus(t.Context(), f.spec.RunID)
+	if err != nil {
+		t.Fatalf("LoadRunStatus: %v", err)
+	}
+	if detail.LastCheck == nil {
+		t.Fatal("LastCheck is nil, want the settled unknown check execution")
+	}
+	if detail.LastCheck.OperationID != opID || detail.LastCheck.State != app.OperationFailed {
+		t.Fatalf("LastCheck identity/state = (%s, %s), want (%s, failed)", detail.LastCheck.OperationID, detail.LastCheck.State, opID)
+	}
+	if !detail.LastCheck.Unknown {
+		t.Fatal("LastCheck.Unknown = false, want true for a settled unknown outcome")
+	}
+	if detail.LastCheck.Detail == "" {
+		t.Fatal("LastCheck.Detail is empty, want the recorded unknown-outcome detail")
+	}
+	if len(detail.LastCheck.EvidencePaths) != 2 {
+		t.Fatalf("LastCheck evidence paths = %v, want the retained stdout and stderr", detail.LastCheck.EvidencePaths)
+	}
+}
+
+// TestLoadRunStatusStopRequested proves the status read surfaces the run's
+// monotonic stop flag, both in the detail and its embedded RunStatus.
+func TestLoadRunStatusStopRequested(t *testing.T) {
+	f := runningFixture(t)
+
+	before, err := f.store.LoadRunStatus(t.Context(), f.spec.RunID)
+	if err != nil {
+		t.Fatalf("LoadRunStatus: %v", err)
+	}
+	if before.StopRequested {
+		t.Fatal("stop requested = true before any stop request")
+	}
+	if stopErr := f.store.RequestStop(t.Context(), f.spec.RunID); stopErr != nil {
+		t.Fatalf("RequestStop: %v", stopErr)
+	}
+
+	after, err := f.store.LoadRunStatus(t.Context(), f.spec.RunID)
+	if err != nil {
+		t.Fatalf("LoadRunStatus after stop: %v", err)
+	}
+	if !after.StopRequested {
+		t.Fatal("stop requested = false after RequestStop")
+	}
+}
+
+// TestListRunsStopRequested proves the run-list read surfaces the stop flag.
+func TestListRunsStopRequested(t *testing.T) {
+	f := newFixture(t)
+	if err := f.store.RequestStop(t.Context(), f.spec.RunID); err != nil {
+		t.Fatalf("RequestStop: %v", err)
+	}
+
+	statuses, err := f.store.ListRuns(t.Context(), "/repos/alpha")
+	if err != nil {
+		t.Fatalf("ListRuns: %v", err)
+	}
+	if len(statuses) != 1 || !statuses[0].StopRequested {
+		t.Fatalf("listed statuses = %+v, want one run with StopRequested true", statuses)
 	}
 }
 

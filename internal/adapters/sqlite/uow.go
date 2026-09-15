@@ -350,8 +350,9 @@ func (r bindingRepository) Create(ctx context.Context, b run.RuntimeBinding) err
 	}
 	if _, err := r.u.tx.ExecContext(ctx,
 		`INSERT INTO runtime_bindings (id, session_id, incarnation_id, server_socket_path, server_instance, workspace_id, tab_id, pane_id, creation_label, launch_kind, occupant_evidence, observed_at, superseded, superseded_at, superseded_evidence)
-		 VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, b.SessionID.String(), b.IncarnationID.String(), b.ServerSocketPath, b.WorkspaceID, b.TabID, b.PaneID,
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, b.SessionID.String(), b.IncarnationID.String(), b.ServerSocketPath, nullString(b.ServerInstance),
+		b.WorkspaceID, b.TabID, b.PaneID,
 		b.CreationLabel, string(b.LaunchKind), occupant, formatTime(b.ObservedAt),
 		boolToInt(b.Superseded), nullTime(b.SupersededAt), nullString(b.SupersededEvidence),
 	); err != nil {
@@ -672,6 +673,23 @@ func (r operationRepository) Save(ctx context.Context, op app.Operation) error {
 	return nil
 }
 
+// collectOperations drains one operations query into decoded rows.
+func collectOperations(rows *sql.Rows) ([]app.Operation, error) {
+	defer rows.Close() //nolint:errcheck // the deferred close of a fully-iterated read cursor has no failure the rows.Err check below misses.
+	var operations []app.Operation
+	for rows.Next() {
+		op, err := scanOperation(rows.Scan)
+		if err != nil {
+			return nil, fmt.Errorf("sqlite: scan operation row: %w", err)
+		}
+		operations = append(operations, op)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("sqlite: iterate operation rows: %w", err)
+	}
+	return operations, nil
+}
+
 // pendingOperations lists a run's open operations (pending or reconciling),
 // oldest first, through any querier.
 func pendingOperations(ctx context.Context, q querier, runID identity.RunID) ([]app.Operation, error) {
@@ -682,23 +700,24 @@ func pendingOperations(ctx context.Context, q querier, runID identity.RunID) ([]
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: list open operations of run %s: %w", runID, err)
 	}
-	defer rows.Close() //nolint:errcheck // the deferred close of a fully-iterated read cursor has no failure the rows.Err check below misses.
-	var operations []app.Operation
-	for rows.Next() {
-		op, err := scanOperation(rows.Scan)
-		if err != nil {
-			return nil, fmt.Errorf("sqlite: scan open operation: %w", err)
-		}
-		operations = append(operations, op)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("sqlite: iterate open operations: %w", err)
-	}
-	return operations, nil
+	return collectOperations(rows)
 }
 
 func (r operationRepository) Pending(ctx context.Context, runID identity.RunID) ([]app.Operation, error) {
 	return pendingOperations(ctx, r.u.tx, runID)
+}
+
+// ByKind lists every operation of one kind for a run, whatever its state,
+// newest first.
+func (r operationRepository) ByKind(ctx context.Context, runID identity.RunID, kind app.OperationKind) ([]app.Operation, error) {
+	rows, err := r.u.tx.QueryContext(ctx,
+		selectOperationColumns+` WHERE run_id = ? AND kind = ? ORDER BY created_at DESC, rowid DESC`,
+		runID.String(), string(kind),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: list %s operations of run %s: %w", kind, runID, err)
+	}
+	return collectOperations(rows)
 }
 
 // transitionRepository records append-only transition evidence inside the

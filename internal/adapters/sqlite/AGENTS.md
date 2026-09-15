@@ -21,10 +21,10 @@ this package never resolves environment variables or defaults.
 | [migrations.go](migrations.go) | `ErrFutureSchema`, `migrate`, `applyMigration`, `loadMigrations`, `schemaVersion` | Ordered embedded migrations, each applied in its own immediate transaction with the version re-read inside it; refuses a store newer than the binary |
 | [migrations/001_initial_schema.sql](migrations/001_initial_schema.sql) | — | The complete Phase 2 schema: 17 STRICT tables and the partial unique indexes (one active attempt per task, one accepted result per attempt, one current session per attempt) |
 | [statestore.go](statestore.go) | `InitializeRun`, `AcquireLease`, `Heartbeat`, `ReleaseLease`, `Begin`, `validateLease` | The controller authority: run bootstrap in one transaction, lease CAS with monotonic generations, fenced unit-of-work begin |
-| [uow.go](uow.go) | `unitOfWork` and the typed repositories (`Runs`…`CheckExecClaims`), `Commit`, `Rollback` | One immediate transaction per unit of work; optimistic-concurrency saves; append-only bindings and transitions; journal payloads persisted as uninterpreted JSON; controller-side launch-claim settlement |
-| [entities.go](entities.go) | `getRun`, `getTask`, `getAttempt`, `getSession`, `currentSession`, `currentBinding`, `getLaunchClaim`, `acceptedResult`, `incarnationCurrent` | Row ↔ domain-value mapping shared by all three authorities through the `querier` interface |
+| [uow.go](uow.go) | `unitOfWork` and the typed repositories (`Runs`…`CheckExecClaims`), `OperationRepository.Pending`/`ByKind`, `Commit`, `Rollback` | One immediate transaction per unit of work; optimistic-concurrency saves; append-only bindings and transitions; journal payloads persisted as uninterpreted JSON; controller-side launch-claim settlement |
+| [entities.go](entities.go) | `getRun`, `getTask`, `getAttempt`, `getSession`, `currentSession`, `currentBinding`, `getLaunchClaim`, `acceptedResult`, `incarnationCurrent`, `launchIncarnationCurrent`, `pendingLaunchIntent` | Row ↔ domain-value mapping shared by all three authorities through the `querier` interface |
 | [submission.go](submission.go) | `SubmitResult`, `RecordMalformed`, `ClaimLaunch`, `SettleLaunchFailure`, `ClaimCheckExec`, `RequestStop`, `insertReceipt` | The worker authority: the section 7 validation order with the domain's `AcceptResult` inside one transaction, receipts for every outcome, the pre-exec claim contracts, the monotonic stop request |
-| [readstore.go](readstore.go) | `ListRuns`, `LoadRunStatus`, `LoadLaunchContext`, `LoadCheckExecutionContext` | Lease-free reads, each inside one deferred read transaction for a consistent WAL snapshot |
+| [readstore.go](readstore.go) | `ListRuns`, `LoadRunStatus`, `LoadFrozenRun`, `LoadLaunchContext`, `LoadCheckExecutionContext`, `launchIdentity`, `lastCheckSummary` | Lease-free reads, each inside one deferred read transaction for a consistent WAL snapshot |
 
 ## Invariants
 
@@ -98,7 +98,25 @@ this package never resolves environment variables or defaults.
   idempotent per target state. `ClaimCheckExec` requires a pending
   `check.run` operation of the run's current lease generation.
 - Stop requests are monotonic: `stop_requested_at` is set once and never
-  cleared or moved.
+  cleared or moved; `RunStatus.StopRequested` and `RunDetail.StopRequested`
+  mirror it for the read model.
+- `LoadLaunchContext` returns the incarnation HOP_INCARNATION_ID must match
+  (`LaunchContext.IncarnationID`), not a binding: the current binding
+  decides it when one exists, the session's pending launch intent
+  (`incarnation_id`, gated on a matching `session_id`) otherwise, and when
+  both exist they must agree — a disagreement, a malformed intent identity,
+  or neither source fails closed with `app.ErrNotFound` rather than handing
+  the launcher an identity nothing recorded.
+- `LoadFrozenRun` serves the frozen snapshot, repository root and brief
+  lease-free; `RunDetail.StateRoot` carries the frozen state root and
+  `RunDetail.LastCheck` summarizes the newest `check.run` operation
+  whatever its state — a settled unknown outcome stays visible with its
+  `Unknown` flag, detail and retained evidence paths, so an unrepeatable
+  unknown result stays actionable through status.
+- `runtime_bindings.server_instance` maps to
+  `run.RuntimeBinding.ServerInstance` on Create and every read, empty
+  string ↔ NULL. `NewRuntimeBinding` takes `serverInstance` right after
+  `serverSocketPath`.
 - The store receives the state root as an absolute path and refuses a
   relative one; worker-context resolution rules live in cmd/hop, not here.
 
@@ -146,8 +164,15 @@ this package never resolves environment variables or defaults.
   precedence, supersession retirement, replacement-session refusal);
   `SettleLaunchFailure` and controller settlement transitions;
   `ClaimCheckExec` generation/kind/state matrix; monotonic `RequestStop`;
-  the read-store loads. No sleeps: a shared hand-advanced fake clock
-  decides every expiry.
+  the read-store loads, including `LoadLaunchContext` resolving the
+  incarnation from a binding, from the pending intent pre-binding, and
+  failing closed on no-source, binding/intent disagreement and a
+  wrong-session intent; `LoadFrozenRun`; `RunDetail.LastCheck` for a
+  settled unknown execution with evidence paths; `StopRequested` in both
+  the detail and the run list; `OperationRepository.ByKind` ordering and
+  all-state coverage; and the `server_instance` NULL/non-NULL binding
+  round-trip. No sleeps: a shared hand-advanced fake clock decides every
+  expiry.
 - `go test -count=3 ./internal/adapters/sqlite` — flake resistance for the
   raced scenarios.
 - Test fixtures: none on disk; every database is created in a `t.TempDir`

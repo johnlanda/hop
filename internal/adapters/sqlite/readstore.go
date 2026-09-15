@@ -62,7 +62,7 @@ func (s *Store) ListRuns(ctx context.Context, repositoryRoot string) ([]app.RunS
 			return fmt.Errorf("sqlite: resolve repository root: %w", err)
 		}
 		rows, err := tx.QueryContext(ctx,
-			`SELECT id, seq, state, updated_at FROM runs WHERE repository_id = ? ORDER BY seq`, repositoryID,
+			`SELECT id, seq, state, stop_requested_at, updated_at FROM runs WHERE repository_id = ? ORDER BY seq`, repositoryID,
 		)
 		if err != nil {
 			return fmt.Errorf("sqlite: list runs: %w", err)
@@ -71,9 +71,10 @@ func (s *Store) ListRuns(ctx context.Context, repositoryRoot string) ([]app.RunS
 		for rows.Next() {
 			var (
 				id, state, updatedAt string
+				stopRequestedAt      sql.NullString
 				seq                  int64
 			)
-			if scanErr := rows.Scan(&id, &seq, &state, &updatedAt); scanErr != nil {
+			if scanErr := rows.Scan(&id, &seq, &state, &stopRequestedAt, &updatedAt); scanErr != nil {
 				return fmt.Errorf("sqlite: scan run row: %w", scanErr)
 			}
 			runID, parseErr := identity.ParseRunID(id)
@@ -85,10 +86,11 @@ func (s *Store) ListRuns(ctx context.Context, repositoryRoot string) ([]app.RunS
 				return timeErr
 			}
 			statuses = append(statuses, app.RunStatus{
-				RunID:     runID,
-				Sequence:  int(seq),
-				State:     run.RunState(state),
-				UpdatedAt: updated,
+				RunID:         runID,
+				Sequence:      int(seq),
+				State:         run.RunState(state),
+				StopRequested: stopRequestedAt.Valid,
+				UpdatedAt:     updated,
 			})
 		}
 		if iterErr := rows.Err(); iterErr != nil {
@@ -127,18 +129,24 @@ func (s *Store) LoadRunStatus(ctx context.Context, runID identity.RunID) (app.Ru
 		if err != nil {
 			return err
 		}
+		snapshot, err := loadSnapshot(ctx, tx, runID)
+		if err != nil {
+			return err
+		}
 		detail = app.RunDetail{
 			RunStatus: app.RunStatus{
-				RunID:       runID,
-				Sequence:    runV.Sequence,
-				State:       runV.State,
-				Reconciling: reconciling,
-				UpdatedAt:   runV.UpdatedAt,
+				RunID:         runID,
+				Sequence:      runV.Sequence,
+				State:         runV.State,
+				StopRequested: runV.StopRequested,
+				Reconciling:   reconciling,
+				UpdatedAt:     runV.UpdatedAt,
 			},
 			TaskID:       task.ID,
 			AttemptID:    attempt.ID,
 			TaskState:    task.State,
 			AttemptState: attempt.State,
+			StateRoot:    snapshot.StateRoot,
 		}
 		worktree, _, err := getWorktree(ctx, tx, "run_id", runID.String())
 		switch {
@@ -174,12 +182,62 @@ func (s *Store) LoadRunStatus(ctx context.Context, runID identity.RunID) (app.Ru
 		if detail.Artifacts, err = runArtifacts(ctx, tx, runID); err != nil {
 			return err
 		}
+		if detail.LastCheck, err = lastCheckSummary(ctx, tx, runID, detail.Artifacts); err != nil {
+			return err
+		}
 		return nil
 	})
 	if err != nil {
 		return app.RunDetail{}, err
 	}
 	return detail, nil
+}
+
+// checkOutcomeView is the read model's view of a check execution's outcome
+// payload: the members hop status surfaces (`unknown`, `detail`). This is
+// presentation of the journal's own payload, not an authority decision;
+// the authority contract's extracted keys remain the launch intent's
+// incarnation_id and session_id alone.
+type checkOutcomeView struct {
+	Unknown bool   `json:"unknown"`
+	Detail  string `json:"detail"`
+}
+
+// lastCheckSummary summarizes the run's newest check execution, whatever
+// its journal state — a pending execution and a settled unknown one are
+// equally visible. Evidence paths are the run's retained check-stdout,
+// check-stderr and pane-snapshot artifacts.
+func lastCheckSummary(ctx context.Context, q querier, runID identity.RunID, artifacts []run.Artifact) (*app.CheckExecutionSummary, error) {
+	op, err := scanOperation(q.QueryRowContext(ctx,
+		selectOperationColumns+` WHERE run_id = ? AND kind = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+		runID.String(), string(app.OpCheckRun),
+	).Scan)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil //nolint:nilnil // a nil summary with a nil error is the documented "no check execution yet" value.
+	}
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: load newest check execution of run %s: %w", runID, err)
+	}
+	summary := app.CheckExecutionSummary{OperationID: op.ID, State: op.State}
+	if op.Outcome != nil {
+		encoded, err := json.Marshal(op.Outcome)
+		if err != nil {
+			return nil, fmt.Errorf("sqlite: re-encode check outcome of operation %s: %w", op.ID, err)
+		}
+		var view checkOutcomeView
+		if err := json.Unmarshal(encoded, &view); err != nil {
+			return nil, fmt.Errorf("sqlite: decode check outcome of operation %s: %w", op.ID, err)
+		}
+		summary.Unknown = view.Unknown
+		summary.Detail = view.Detail
+	}
+	for _, artifact := range artifacts {
+		switch artifact.Kind {
+		case run.ArtifactCheckStdout, run.ArtifactCheckStderr, run.ArtifactPaneSnapshot:
+			summary.EvidencePaths = append(summary.EvidencePaths, artifact.Path)
+		}
+	}
+	return &summary, nil
 }
 
 // lastSubmission loads the newest submission receipt claiming the run, or
@@ -284,13 +342,51 @@ func loadSnapshot(ctx context.Context, q querier, runID identity.RunID) (app.Run
 	return snapshot, nil
 }
 
+// LoadFrozenRun returns the run's frozen execution inputs, lease-free: the
+// immutable snapshot, the repository root it belongs to, and the frozen
+// brief text — the check use case reads its argv, timeout, repeatability
+// and state root from here, never from caller arguments.
+func (s *Store) LoadFrozenRun(ctx context.Context, runID identity.RunID) (app.FrozenRun, error) {
+	var frozen app.FrozenRun
+	err := s.inReadTx(ctx, func(tx *sql.Tx) error {
+		snapshot, err := loadSnapshot(ctx, tx, runID)
+		if err != nil {
+			return err
+		}
+		var repositoryID, brief string
+		err = tx.QueryRowContext(ctx,
+			`SELECT repository_id, brief FROM runs WHERE id = ?`, runID.String(),
+		).Scan(&repositoryID, &brief)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("sqlite: run %s: %w", runID, app.ErrNotFound)
+		}
+		if err != nil {
+			return fmt.Errorf("sqlite: load frozen run %s: %w", runID, err)
+		}
+		var repositoryRoot string
+		if err := tx.QueryRowContext(ctx,
+			`SELECT root_path FROM repositories WHERE id = ?`, repositoryID,
+		).Scan(&repositoryRoot); err != nil {
+			return fmt.Errorf("sqlite: resolve repository root of run %s: %w", runID, err)
+		}
+		frozen = app.FrozenRun{Snapshot: snapshot, RepositoryRoot: repositoryRoot, Brief: brief}
+		return nil
+	})
+	if err != nil {
+		return app.FrozenRun{}, err
+	}
+	return frozen, nil
+}
+
 // LoadLaunchContext loads what the launch exec boundary needs, without any
 // lease: the frozen snapshot, the attempt, the session, the stop state,
-// and — when the controller has already recorded them — the session's
-// current binding and that incarnation's launch-claim state. It succeeds
-// as soon as InitializeRun's rows exist: the launcher starts as the pane's
-// own command and may load before the binding row is committed, in which
-// case Binding is the zero value and Claim is nil.
+// the incarnation HOP_INCARNATION_ID must match and that incarnation's
+// launch-claim state. The launcher starts as the pane's own command and
+// may load before the binding row is committed, so IncarnationID resolves
+// from the session's current binding when one exists, from the session's
+// pending launch intent otherwise, and when both exist they must agree —
+// disagreement, a malformed intent identity, or neither source fails
+// closed rather than handing the launcher an identity nothing recorded.
 func (s *Store) LoadLaunchContext(ctx context.Context, runID identity.RunID, attemptID identity.AttemptID) (app.LaunchContext, error) {
 	var launchContext app.LaunchContext
 	err := s.inReadTx(ctx, func(tx *sql.Tx) error {
@@ -320,27 +416,20 @@ func (s *Store) LoadLaunchContext(ctx context.Context, runID identity.RunID, att
 		if !ok {
 			return fmt.Errorf("sqlite: current session of attempt %s: %w", attemptID, app.ErrNotFound)
 		}
-		// The launcher is the pane's own command, so it can run before the
-		// controller has recorded the binding row as the pane.open outcome.
-		// A missing binding therefore never fails this load: Binding stays
-		// its zero value and Claim nil — the launcher does not need pane
-		// identifiers, and a claim is keyed by the binding's incarnation.
-		binding, hasBinding, err := currentBinding(ctx, tx, session.ID)
+		incarnation, err := launchIdentity(ctx, tx, runID, session.ID)
 		if err != nil {
 			return err
 		}
-		var claim *app.LaunchClaim
-		if hasBinding {
-			if claim, err = getLaunchClaim(ctx, tx, binding.IncarnationID); err != nil {
-				return err
-			}
+		claim, err := getLaunchClaim(ctx, tx, incarnation)
+		if err != nil {
+			return err
 		}
 		launchContext = app.LaunchContext{
 			Snapshot:      snapshot,
 			Harness:       session.Harness,
 			Attempt:       attempt,
 			Session:       session,
-			Binding:       binding,
+			IncarnationID: incarnation,
 			Claim:         claim,
 			StopRequested: runV.StopRequested || runV.State == run.RunStopping || runV.State == run.RunStopped,
 		}
@@ -350,6 +439,48 @@ func (s *Store) LoadLaunchContext(ctx context.Context, runID identity.RunID, att
 		return app.LaunchContext{}, err
 	}
 	return launchContext, nil
+}
+
+// launchIdentity resolves the incarnation HOP_INCARNATION_ID must match for
+// one launch: the session's current binding when one exists, the session's
+// pending launch intent (the "incarnation_id" the newest pending
+// pane.open/launch.send carries) otherwise, and when both exist they must
+// agree. A malformed intent identity, a binding/intent disagreement, or
+// neither source present fails closed with ErrNotFound rather than handing
+// the launcher an identity nothing recorded. The intent's session
+// ("session_id") must match this session, so a stale pre-replacement
+// intent is treated as absent, never as this session's authority.
+func launchIdentity(ctx context.Context, q querier, runID identity.RunID, sessionID identity.SessionID) (identity.IncarnationID, error) {
+	binding, hasBinding, err := currentBinding(ctx, q, sessionID)
+	if err != nil {
+		return "", err
+	}
+	intent, hasIntent, err := pendingLaunchIntent(ctx, q, runID)
+	if err != nil {
+		return "", err
+	}
+	intentMatchesSession := hasIntent && intent.sessionID == sessionID.String()
+
+	var intentIncarnation identity.IncarnationID
+	if intentMatchesSession {
+		if intentIncarnation, err = identity.ParseIncarnationID(intent.incarnationID); err != nil {
+			return "", fmt.Errorf("sqlite: pending launch intent of run %s carries a malformed incarnation id: %w", runID, err)
+		}
+	}
+
+	switch {
+	case hasBinding && intentMatchesSession:
+		if binding.IncarnationID != intentIncarnation {
+			return "", fmt.Errorf("sqlite: binding incarnation %s and pending intent incarnation %s disagree for session %s: %w", binding.IncarnationID, intentIncarnation, sessionID, app.ErrNotFound)
+		}
+		return binding.IncarnationID, nil
+	case hasBinding:
+		return binding.IncarnationID, nil
+	case intentMatchesSession:
+		return intentIncarnation, nil
+	default:
+		return "", fmt.Errorf("sqlite: no binding and no matching pending launch intent for session %s: %w", sessionID, app.ErrNotFound)
+	}
 }
 
 // LoadCheckExecutionContext loads what the check exec boundary needs,
