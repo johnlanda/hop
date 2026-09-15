@@ -115,7 +115,7 @@ func TestRealProcessForkingWrapperAfterExec(t *testing.T) {
 		"HOP_FIXTURE_DIAG_DIR="+diagDir)
 	server.start(t)
 
-	repo := newFixtureRepo(t, artifacts, "repo")
+	repo := newFixtureRepo(t, artifacts, server, "repo")
 	fx := startRun(t, artifacts, server, repo, "")
 
 	if !waitUntil(func() bool {

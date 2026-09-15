@@ -36,7 +36,8 @@ this tree, and drives everything through HOP's own protocol client.
 | [spike_gitrefs_test.go](spike_gitrefs_test.go) | `TestSpikeIntegrationRefCompareAndSwap`, `TestSpikeDetachedMergeLeavesRefUntouched`, `TestSpikeRunScopedRefFamilyCoexists`, `TestSpikeBareRunBranchCollidesWithAttemptBranches`, `TestSpikeUpdateRefCreateOnlySemantics`, `TestSpikeIntegrationRollbackPreservesRejectedMergeReachable`, `runGit`, `runGitWithEnv`, `mustRunGit`, `readRef` | Phase 3 pre-freeze git-level probes G1/G3 (provisional numbering, requested by the design reviewer for the fenced-publish assumptions a revised integration design rests on). `refs/heads/hop/r<seq>/integration` is the CONFIRMED real run-scoped ref scheme; `TestSpikeBareRunBranchCollidesWithAttemptBranches` is the executed negative control proving why (the ORIGINAL bare `hop/r<seq>` branch cannot coexist with any `hop/r<seq>/t<t>a<n>` sibling: git's ref storage cannot treat one path as both a file and a directory). `git update-ref <ref> <new> <old>` against a `worktree.create`'d checkout is a true compare-and-swap (matches → moves; stale → refused, ref untouched); `""` as `<old>` is create-only (succeeds only when the ref does not yet exist). A `git merge --no-ff` in a plain DETACHED scratch checkout (never the integration branch's own checkout) computes a candidate merge commit without moving the ref at all — publishing (and rolling back a rejected merge via `git commit-tree` with the rejected merge as parent, keeping it reachable) is a separate, explicit CAS step |
 | [spike_gitmerge_test.go](spike_gitmerge_test.go) | `TestSpikeMergeTwoParentCommit`, `TestSpikeMergeConflictExitCodeAndIndexState`, `TestSpikeMergeAlreadyUpToDateNoOp`, `TestSpikeMergeNoFFForcesCommitOnFastForwardableHead`, `TestSpikeMergeRepoLocalHooksFire`, `TestSpikeMergeHooksPathSuppressesRepoLocalHooks`, `TestSpikeMergeRepoLocalSigningConfigDoesNotBlock`, `TestSpikeMergeNonConflictFailureIsDistinctFromConflict`, `TestSpikeCommitTreeIsDeterministic`, `mergeIdentityArgs`, `mergeEnviron`, `runMerge`, `detachedScratch` | Phase 3 pre-freeze git-level probe G2 (provisional numbering): the merge outcome matrix under the frozen non-interactive argv (`git -c user.name=... -c user.email=... -c commit.gpgsign=false -c merge.verifysignatures=false merge --no-ff --no-edit`) and env (`GIT_TERMINAL_PROMPT=0`, plus fixtureGitEnviron's `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM=/dev/null`) — two-parent merge, conflict (exit code, `UU` index state, clean abort), already-up-to-date no-op, and `--no-ff` forcing a merge commit on an otherwise fast-forwardable head, all leaving the run-scoped ref untouched. FINDINGS: repo-LOCAL `.git/hooks` (`pre-merge-commit`, `post-merge`) fire under this argv (no `--no-verify`), but `-c core.hooksPath=<dir>` (an empty existing directory OR one that does not exist at all) suppresses BOTH -- a verified suppression option, not a design choice made here; repo-local `commit.gpgsign=true` does NOT block the merge (command-line `-c` wins). A non-conflict failure (an unwritable shared object database) is distinct from a conflict (no `CONFLICT` text, no `UU` entries) but -- unlike that difference -- still cleanly `merge --abort`s. `git commit-tree` with pinned tree/parent/identity/dates/message is deterministic (identical oid twice), the property the rollback construction depends on |
 | [hopcmd_test.go](hopcmd_test.go) | `TestMain`, `buildHopBinary`, `hopResult`, `runHop`, `requireHopCommand`, `hopEnviron`, `startHopController`, `groupMember`, `listGroupMembers`, `parseGroupMember`, `TestBuildAndRunHopBinary`, `TestHopEnviron`, `TestStartHopController`, `TestListGroupMembers` | Task 6b harness extensions (phase A, item 4): `TestMain` + `buildHopBinary` build `./cmd/hop` once per test binary run into a shared temp dir instead of per test; `runHop` runs a bounded one-shot hop subcommand capturing stdout/stderr/exit code, and `requireHopCommand` skips a scenario with a clear reason when its command is cmd/hop's "unknown command" response (task 6a not yet landed/merged); `hopEnviron` builds the isolated `HOP_STATE_DIR` + this disposable server's own socket/binary path on top of the suite's hermetic base; `startHopController` starts a long-running hop subcommand (`hop run`/`hop resume`) as its own anchored, logged process group via `startAnchoredLeader`, returned as a `serverProcess` so existing group helpers apply unchanged; `listGroupMembers`/`parseGroupMember` independently list an arbitrary process group's members via `ps` — deliberately NOT importing `internal/adapters/process` (disallowed by the architecture checker for this package), so a scenario proving group retirement is evidence against the OS process table, not an echo of the port under test |
-| [fixturerepo_test.go](fixturerepo_test.go) | `fixtureRepo`, `newFixtureRepo`, `newFixtureRepoGitDependentCheck`, `newFixtureRepoWithSubmodule`, `initFixtureRepo`, `CommitCheckResult`, `fixtureConfigTOML`, `fixtureGitEnviron`, `runShellScript`, `TestFixtureRepoDeterministicCheck`, `TestFixtureRepoGitDependentCheck`, `TestFixtureRepoSubmoduleFailsClearly` | Task 6b fixture repository builder (phase A, item 2): a temporary SHA-1 git repository (`git init --object-format=sha1`, isolated from any developer git config, its own local commit identity) with a trivial source file, the deterministic `check.sh` (`CommitCheckResult` toggles CHECK_RESULT and commits, so the caller picks pass/fail "on demand" by choosing which commit it submits), the git-dependent `check-git.sh` variant (`newFixtureRepoGitDependentCheck`, succeeds only inside a real git checkout), and the submodule variant (`newFixtureRepoWithSubmodule`) whose `check-submodule.sh` fails clearly against a detached `git worktree add` checkout that never initializes submodules |
+| [fixturerepo_test.go](fixturerepo_test.go) | `fixtureRepo`, `newFixtureRepo`, `newFixtureRepoGitDependentCheck`, `newFixtureRepoWithSubmodule`, `initFixtureRepo`, `CommitCheckResult`, `fixtureConfigTOML`, `fixtureGitEnviron`, `runShellScript`, `TestFixtureRepoDeterministicCheck`, `TestFixtureRepoGitDependentCheck`, `TestFixtureRepoSubmoduleFailsClearly` | Task 6b fixture repository builder (phase A, item 2): a temporary SHA-1 git repository (`git init --object-format=sha1`, isolated from any developer git config, its own local commit identity) with a trivial source file, the deterministic `check.sh` (`CommitCheckResult` toggles CHECK_RESULT and commits, so the caller picks pass/fail "on demand" by choosing which commit it submits), the git-dependent `check-git.sh` variant (`newFixtureRepoGitDependentCheck`, succeeds only inside a real git checkout), and the submodule variant (`newFixtureRepoWithSubmodule`) whose `check-submodule.sh` fails clearly against a detached `git worktree add` checkout that never initializes submodules. Each constructor takes the scenario's `*testServer` (or `nil` for a pure git-level probe that never touches one) and registers that repository's worktree cleanup (worktreecleanup_test.go's `registerWorktreeCleanup`) |
+| [worktreecleanup_test.go](worktreecleanup_test.go) | `registerWorktreeCleanup`, `cleanupServerWorktrees`, `serverScratchRoots`, `removeGitWorktree`, `worktreeBelongsToRepo`, `parseWorktreeListPaths`, `TestRealProcessWorktreeCleanedUpAfterRun` | Real git-worktree teardown, registered as a `t.Cleanup` at every fixture-repo construction that has a server: resolves every worktree to remove ONLY from `git -C <repo> worktree list --porcelain` (repo's own administrative metadata), never by globbing `~/.herdr` or any path outside the test's own roots; a listed worktree outside the test's known scratch roots (the pre-fix leak case, evidence (b)) is removed only after independently confirming its `.git` file points back at this fixture repo, otherwise the test fails naming the exact path rather than removing it blind. A second pass sweeps any directory left under the configured `[worktrees]` directory that never finished registering with git. `TestRealProcessWorktreeCleanedUpAfterRun` drives the cleanup directly (not only via the automatic `t.Cleanup`) against a worktree a real `hop run` created, so it can assert the postcondition — directory gone, `git worktree list` down to the main checkout — inside its own body |
 | [fixtureworker_test.go](fixtureworker_test.go) | `fixtureWorkerSource`, `fixtureWorkerBrief`, `buildFixtureWorker`, `testAssignmentPrompt`, `writeTransientOnceHopStub`, `isResumeInvocation`, `parsedStandInPID`, `TestFixtureWorkerSubmitValid`, `TestFixtureWorkerExitWithoutSubmitting` | Task 6b fixture worker (phase A, item 3): a Go program built (never installed) and installed under the recognized name `claude` so `hop launch`'s PATH resolution finds it; before anything else is observable (in every mode, the re-exec'd incarnation included) it spawns ONE long-lived MCP stand-in child into its own process group — this same binary in stand-in mode (`fixture-mcp-stand-in` argv[1]), marker-free argv, detached stdio except a stdin pipe the worker holds open forever so the child exits on EOF exactly when the worker exits or execs — reproducing the pinned Claude Code 2.1.270 shape (MCP servers as same-pgid children, spawned before the worker is ready) so EVERY scenario's settlement, stop, reattach and retirement decisions run against a multi-member foreground group; the child's pid is recorded in the observation dump (`mcp_stand_in_pid`) and the self-test asserts it dies with its parent; reads required `HOP_*` env, locates and reads the assignment artifact (computed from `HOP_STATE_DIR`/`HOP_RUN_ID`, cross-validated against a best-effort marker parsed from its own prompt argv), and dispatches on a `FIXTURE-BEHAVIOR: <name>` directive delivered through the brief -> assignment.md channel (`fixtureWorkerBrief` renders it): `submit-valid`, `submit-stale` (gated on a `FIXTURE-GO` line on stdin, for a test to retire the incarnation first), `submit-twice`, `exit-without-submitting`, `exec-keep-pid` (`syscall.Exec` of itself, proving pid survives exec); every behavior writes an atomic `worker-observed.txt` dump beside the assignment file rather than judging its own correctness, and retries `hop result submit` on a `transient` first line, pausing `fixtureRetryInterval` (200ms) between attempts — the worker's own back-off under the section 7 transient protocol the launch prompt states, never a test-side wait. A cold-relaunch invocation (`--resume <native-ref>`, no prompt argv at all) is detected by `isResumeInvocation` and recovers the hop path from a `.hop-path` sibling file the first launch persisted, rather than parsing a prompt that does not exist |
 | [resultsubmit_test.go](resultsubmit_test.go) | `fixtureRun`, `newFixtureRunEnv`, `startRun`, `startFixtureRun`, `dbPath`, `taskAndAttemptIDs`, `currentIncarnationID`, `requireRunState`, `containsState`, `TestRealProcessDuplicateSubmissionAfterCompletion` | Phase B's shared setup: `newFixtureRunEnv` builds and starts a disposable server plus the fixture worker installed as `claude`; `startRun` runs `hop run` against a caller-built (and possibly pre-mutated) fixture repository through the `started` line; `startFixtureRun` composes both for the common case. `fixtureRun` tracks the live controller (`controller`/`controllerName`, reassigned together by any scenario that kills and replaces it) plus `dbPath`/`taskAndAttemptIDs`/`currentIncarnationID` helpers for direct `hop result submit`/sqlite assertions, and `requireRunState` (bounded to `runEndToEndTimeout`) fails with the worker pane's scrollback captured first. `TestRealProcessDuplicateSubmissionAfterCompletion` proves section 7 step 3: a fresh submission carrying the already-accepted commit and summary is accepted as `duplicate`, disturbing nothing |
 | [lifecycle_test.go](lifecycle_test.go) | `leaseTimeLayout`, `killControllerLeader`, `waitForLeaseExpiry`, `TestRealProcessDetachDistinctFromStop` | `killControllerLeader` SIGKILLs a controller's leader without touching its anchor; `waitForLeaseExpiry` polls a run's own `run_leases` row (mirroring `internal/adapters/sqlite`'s unexported time layout, since this package may not import that adapter) until it is no longer held past its recorded expiry — the real, unavoidable cost every crash-recovery scenario in this package pays. `TestRealProcessDetachDistinctFromStop` proves a SIGINT to a live controller releases the lease at once (never waiting out the TTL) and disturbs neither run state nor the worker |
@@ -58,6 +59,18 @@ this tree, and drives everything through HOP's own protocol client.
   every server is a named session under a temporary `XDG_CONFIG_HOME`, and
   the suite only ever reads the real user-global registry files to prove
   they did not change.
+- Every test server's harness config pins `[worktrees] directory` under
+  that server's own scratch root (`harness_test.go`'s `testConfig`) — never
+  the herdr default (`~/.herdr/worktrees`, which expands against whatever
+  `HOME` the server is given). This closes a real leak (evidence (b)): a
+  live run's `HOME` is deliberately the operator's own real home directory
+  (see "Live scenario" below), and without this pin Herdr's own default
+  would create worktrees inside it. Every fixture-repo constructor also
+  registers a `t.Cleanup` (`worktreecleanup_test.go`'s
+  `registerWorktreeCleanup`/`cleanupServerWorktrees`) that removes every
+  worktree `git -C <repo> worktree list` reports for that repository through
+  real `git worktree remove --force` + `git worktree prune` calls, as a
+  second, independent layer on top of the directory pin itself.
 - No fixed sleeps: readiness and completion are bounded polls against the
   socket, plugin log records or pane text.
 - An invocation response is not success. Completion is the log record the
@@ -95,7 +108,8 @@ this tree, and drives everything through HOP's own protocol client.
   probe saw an MCP server at index 0) — an observation, never a
   guarantee, so no test asserts any position either way. Scenarios
   locate the worker by the launch claim's recorded pid via
-  `fixtureRun.workerForegroundPID`, and
+  `fixtureRun.workerForegroundPID` (the live scenario, which runs outside
+  `fixtureRun`, reads `launch_claims.pid` directly), and
   `TestRealProcessSettlementWithMCPGroupMembers` records the observed
   shape and order.
 
@@ -130,6 +144,53 @@ deliberately via `make test-live`.
   `HOP_LIVE_HARNESS=1 go test -count=1 -v -run '^TestLiveClaudeDefaultProfileRun$' -timeout 20m ./test/integration`.
   `HOP_LIVE_HARNESS_HOME=/path/to/profile` prepends to either form to use a
   prepared profile instead of the real one.
+- **Account identity env**: this test alone also passes `USER`/`LOGNAME`
+  (and `LANG`/`LC_ALL` when set) from the test process's own environment
+  into the server's `extraEnv`, on top of the `HOME` override above.
+  `testServer.environ()` otherwise builds every subprocess's environment
+  from scratch with no login shell, so a worker pane spawned this way
+  inherits no `USER`/`LOGNAME` at all — confirmed live (`ps -E` on the
+  worker showed `HOME`, `SHELL`, `TERM`, `XDG_*`, but neither). Claude
+  Code's keychain credential item is keyed by the account name (`$USER`;
+  see native-harness-compat.md's Claude Code "Credential storage" note), so
+  a worker with the operator's `HOME` but no `USER` cannot find its own
+  login and reports "Not logged in" even though the operator is
+  authenticated. This is a harness/test-environment gap, not a HOP
+  behavior — `internal/app/launchenv.go`'s strip matrix never names these
+  variables, so HOP's own sanitizing launcher already passes them through.
+  The ordinary suite's constructed environment (`testServer.environ`) is
+  left untouched; only this live test sets them, and only with values read
+  from the test process's own environment, never hardcoded.
+- **Worktree isolation**: every test server's config pins
+  `[worktrees] directory` under that server's own scratch root (see
+  Invariants below) specifically because this test sets `HOME` to the
+  operator's real home directory — without the pin, Herdr's own
+  `~/.herdr/worktrees` default would expand against that real `HOME` and
+  create worktrees in the operator's actual home. The test asserts the
+  created worktree's path resolves under the scratch root as a direct
+  check that the pin held. This test's fixture repository also gets the
+  same worktree cleanup as every other (`worktreecleanup_test.go`'s
+  `registerWorktreeCleanup`), which resolves every worktree to remove ONLY
+  from `git worktree list` against the fixture repo itself — never by
+  globbing `~/.herdr` — so even if the directory pin above were ever
+  defeated, a worktree this run created outside the scratch root would
+  still be found and removed (after independently confirming its `.git`
+  points back at this fixture repository) rather than left in the
+  operator's real home.
+- **Diagnostics**: on both the first (real Claude) launch and the
+  post-cold-relaunch continuation, every `hop status` poll that already
+  knows the worker pane's binding also captures that pane's full foreground
+  process list (pid, name, argv0, argv, cmdline, in Herdr's own order) via
+  the same `pane.process_info` adapter call and rendering every other
+  real-process scenario in this suite uses (`testServer.processInfo`,
+  `renderProcessInfo`). The accumulated per-poll trail is saved as
+  `first-launch-process-info.txt` / `second-launch-process-info.txt`
+  regardless of outcome, and a snapshot immediately before the forced kill
+  is saved as `worker-pane-process-info-before-kill.txt`; the pane
+  scrollback is still saved on the two run-state failure paths as before.
+  This closes a real gap: a prior live run that never settled left only
+  the scrollback, with no record of which foreground process Herdr had
+  actually reported at any point.
 
 ## Section 9 real-process scenario coverage
 
@@ -331,7 +392,8 @@ scenario (compiles, skips cleanly by default, never run by this task).
   `TestRealProcessCheckLeaderExitWithLiveChildren`,
   `TestRealProcessCheckDeathUnknownOutcomeRepeatable`,
   `TestRealProcessLaunchSeedsWorkspaceTrust`,
-  `TestRealProcessLaunchWithoutProfileConfigNotSeeded`. Several pay a real,
+  `TestRealProcessLaunchWithoutProfileConfigNotSeeded`,
+  `TestRealProcessWorktreeCleanedUpAfterRun`. Several pay a real,
   unavoidable wall-clock cost (the lease TTL a crash-recovery scenario
   waits out, a herdr server restart, a real check's sleep) — this sweep
   takes several minutes, not seconds; run a narrower `-run` pattern while

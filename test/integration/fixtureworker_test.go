@@ -508,7 +508,7 @@ func testAssignmentPrompt(assignmentPath, hopPath string) string {
 func TestFixtureWorkerSubmitValid(t *testing.T) {
 	artifacts := newArtifactDir(t)
 	worker := buildFixtureWorker(t, artifacts)
-	repo := newFixtureRepo(t, artifacts, "repo")
+	repo := newFixtureRepo(t, artifacts, nil, "repo")
 
 	stateDir := artifacts.dir(t, "state")
 	runID := "11111111-1111-1111-1111-111111111111"
@@ -646,7 +646,7 @@ func writeTransientOnceHopStub(t *testing.T, artifacts *artifactDir) (hopPath, c
 func TestFixtureWorkerExitWithoutSubmitting(t *testing.T) {
 	artifacts := newArtifactDir(t)
 	worker := buildFixtureWorker(t, artifacts)
-	repo := newFixtureRepo(t, artifacts, "repo")
+	repo := newFixtureRepo(t, artifacts, nil, "repo")
 
 	stateDir := artifacts.dir(t, "state")
 	runID := "66666666-6666-6666-6666-666666666666"

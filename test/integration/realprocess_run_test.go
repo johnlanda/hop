@@ -67,7 +67,7 @@ func TestRealProcessRunEndToEnd(t *testing.T) {
 	installFixtureWorkerAsClaudeStub(t, server, worker)
 	server.start(t)
 
-	repo := newFixtureRepo(t, artifacts, "repo")
+	repo := newFixtureRepo(t, artifacts, server, "repo")
 	stateDir := artifacts.dir(t, "state")
 	env := server.hopEnviron(stateDir)
 
@@ -233,7 +233,7 @@ func TestRealProcessSanitizedLaunchExec(t *testing.T) {
 	}
 	server.start(t)
 
-	repo := newFixtureRepo(t, artifacts, "repo")
+	repo := newFixtureRepo(t, artifacts, server, "repo")
 	stateDir := artifacts.dir(t, "state")
 
 	brief := fixtureWorkerBrief("exit-without-submitting")

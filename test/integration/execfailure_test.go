@@ -35,7 +35,7 @@ func installBrokenClaudeStub(t *testing.T, server *testServer) {
 func TestRealProcessExecFailureSettlesExecFailed(t *testing.T) {
 	artifacts, server := newFixtureRunEnv(t)
 	installBrokenClaudeStub(t, server)
-	repo := newFixtureRepo(t, artifacts, "repo")
+	repo := newFixtureRepo(t, artifacts, server, "repo")
 	fx := startRun(t, artifacts, server, repo, "submit-valid")
 
 	fx.requireRunState(t, "failed")
