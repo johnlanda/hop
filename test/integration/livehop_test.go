@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -250,12 +251,35 @@ func TestLiveClaudeDefaultProfileRun(t *testing.T) {
 	// same mechanism resume_test.go's coldRelaunchAfterCrash uses against
 	// the fixture worker, driven here by hand since a live run's own
 	// scratch environment differs (real HOME, real claude symlink).
+	//
+	// The worker pid is identified by the launch claim's own recorded pid
+	// (launch_claims.pid for this attempt), never by ForegroundProcesses[0]:
+	// against real Claude Code, the foreground process group also holds the
+	// operator's own MCP servers, and Herdr lists foreground members
+	// unsorted, so index 0 is not reliably the worker. At this point in the
+	// test exactly one launch_claims row exists for this attempt (the
+	// cold-relaunch's own row is written later), so this lookup is
+	// unambiguous.
+	claimPID := querySQLite(t, dbPath, fmt.Sprintf("SELECT pid FROM launch_claims WHERE attempt_id = '%s';", attemptID))
+	if claimPID == "" {
+		t.Fatalf("no launch_claims pid recorded for attempt %s", attemptID)
+	}
+	workerPID, err := strconv.Atoi(claimPID)
+	if err != nil {
+		t.Fatalf("launch_claims pid %q for attempt %s is not an integer: %v", claimPID, attemptID, err)
+	}
 	info := server.processInfo(t, firstPaneID)
 	artifacts.save(t, "worker-pane-process-info-before-kill.txt", renderProcessInfo(info))
-	if len(info.ForegroundProcesses) == 0 {
-		t.Fatalf("pane %s reports no foreground worker process before the forced cold relaunch", firstPaneID)
+	found := false
+	for _, p := range info.ForegroundProcesses {
+		if int(p.PID) == workerPID {
+			found = true
+			break
+		}
 	}
-	workerPID := int(info.ForegroundProcesses[0].PID)
+	if !found {
+		t.Fatalf("launch claim pid %d not found among pane %s's foreground processes:\n%s", workerPID, firstPaneID, renderProcessInfo(info))
+	}
 	if err := syscall.Kill(workerPID, syscall.SIGKILL); err != nil {
 		t.Fatalf("kill live claude worker pid %d: %v", workerPID, err)
 	}
