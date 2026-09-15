@@ -95,6 +95,27 @@ func TestReleaseEligible(t *testing.T) {
 		}
 	})
 
+	// Round-2 review's required vectors: edges must agree with
+	// HasDependencies, or an empty edge set is vacuous ground truth for a
+	// task that actually has real dependencies.
+
+	t.Run("dependent task with zero edges is never vacuously eligible", func(t *testing.T) {
+		if run.ReleaseEligible(task, nil, nil) {
+			t.Fatal("ReleaseEligible(dependent, zero edges) = true, want false")
+		}
+	})
+
+	t.Run("zero-dependency task with a non-empty edge set is refused", func(t *testing.T) {
+		noDeps := run.Task{ID: testTaskID, RunID: testRunID, HasDependencies: false}
+		prereqs := []run.Task{
+			{ID: testSecondTaskID, State: run.TaskIntegrated},
+			{ID: testReviewTaskID, State: run.TaskIntegrated},
+		}
+		if run.ReleaseEligible(noDeps, edges, prereqs) {
+			t.Fatal("ReleaseEligible(zero-dependency, non-empty edges) = true, want false")
+		}
+	})
+
 	t.Run("every named prerequisite integrated", func(t *testing.T) {
 		prereqs := []run.Task{
 			{ID: testSecondTaskID, State: run.TaskIntegrated},

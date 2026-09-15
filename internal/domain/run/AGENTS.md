@@ -33,7 +33,7 @@ integration — without changing any Phase 2 transition's legality.
 | [integration.go](integration.go) | `Integration`, `IntegrationState`, `NewIntegration`, `EnterChecking`, `Conflict`, `Integrate`, `FailCheck`, `RollBack`, `Interrupt` | Serial per-task integration's state machine (section 5, "Integration") |
 | [readiness.go](readiness.go) | `GuardContext`, `CheckReceipt`, `GuardShortfall`, `ShortfallKind`, `EvaluateReadiness` | The run-completion guard (section 8): a pure function meant to gate `Run.Complete` in feature mode (the actual wiring is a later application slice — see Invariants) |
 | [artifact.go](artifact.go) | `Artifact`, `ArtifactKind`, `NewArtifact`, `NewResultArtifact` | File references owned by a run or a result |
-| [errors.go](errors.go) | `ErrInvalidTransition`, `ErrStaleSubmission`, `ErrConflictingResult`, `ErrDuplicateResult`, `ErrTransientNotRunning`, `ErrDependencyCycle`, `ErrDependencyNotIntegrated`, `ErrDelegationDepth`, `ErrDuplicateAnswer`, `ErrConflictingAnswer`, `ErrStaleAck`, `ErrNotDelivered`, `ErrVerdictSubjectMismatch`, `ErrRetryNotTerminal`, `ErrRetryLimit`, `ErrRunNotAccepting`, `ErrEmptyPlan`, `ErrMailboxClosed`, `ErrMailboxNotClear`, `ErrRequestConflict`, `ErrTaskNotReleased` | Typed errors every transition and cross-entity acceptance function returns |
+| [errors.go](errors.go) | `ErrInvalidTransition`, `ErrStaleSubmission`, `ErrConflictingResult`, `ErrDuplicateResult`, `ErrTransientNotRunning`, `ErrDependencyCycle`, `ErrDependencyNotIntegrated`, `ErrDependencyEvidenceMissing`, `ErrDelegationDepth`, `ErrDuplicateAnswer`, `ErrConflictingAnswer`, `ErrStaleAck`, `ErrNotDelivered`, `ErrVerdictSubjectMismatch`, `ErrRetryNotTerminal`, `ErrRetryLimit`, `ErrRunNotAccepting`, `ErrEmptyPlan`, `ErrMailboxClosed`, `ErrMailboxNotClear`, `ErrRequestConflict`, `ErrTaskNotReleased` | Typed errors every transition and cross-entity acceptance function returns |
 | [transition.go](transition.go) | `transitionTable`, `fromAny`, `concatPairs` | The generic, table-driven legality check shared by every entity's state machine |
 
 ## Invariants
@@ -80,23 +80,25 @@ integration — without changing any Phase 2 transition's legality.
   dependencies (`HasDependencies == false`, the Phase 2/solo shape, since
   Phase 2 never populates `HasDependencies` at all); for a DEPENDENT task,
   refused (`ErrTaskNotReleased`) until `Task.Release` has moved it to
-  `ready` first. `HasDependencies` is a plain, comparable flag Activate
-  dispatches on ONLY — it is deliberately not the release gate's ground
-  truth, and not the task's actual prerequisite ID set: `Task` stores no
-  `[]identity.TaskID` field (that would make `Task` incomparable, breaking
-  every Phase 2 test's `==`/`!=` use of it). `Release` instead takes edges
-  (the task's own persisted `TaskDependency` rows — an edge naming a
-  different `TaskID` is rejected outright) and prerequisites (their
-  current state) DIRECTLY, computing eligibility itself via
-  `ReleaseEligible` rather than accepting a bare caller-asserted boolean —
-  the exact shape that let an incomplete or empty evidence set slip
-  through in the round-1 review. `ReleaseEligible` requires prerequisites
-  to account for EXACTLY the IDs edges name — no missing, no foreign (an
-  ID edges never named), no duplicate — with every one `integrated`
-  (`ErrDependencyNotIntegrated` otherwise, from `Release`); a
-  zero-dependency task is created `ready` directly (`NewImplementTask`)
-  and never calls `Release` in practice, though calling it with empty
-  edges is harmless (vacuously eligible — 0 required, 0 given).
+  `ready` first. `HasDependencies` is a plain, comparable flag — `Task`
+  stores no `[]identity.TaskID` field (that would make `Task`
+  incomparable, breaking every Phase 2 test's `==`/`!=` use of it) — but
+  it is NOT merely Activate's own concern: `Release` and `ReleaseEligible`
+  both check it FIRST, requiring it to agree with whether the supplied
+  edges (the task's own persisted `TaskDependency` rows — one naming a
+  different `TaskID` is rejected outright) is empty or not
+  (`ErrDependencyEvidenceMissing` from `Release` on a mismatch — a
+  dependent task given zero edges, or a zero-dependency task given any).
+  This closes the residual bypass a round-2 review found: without it, an
+  empty edge set would be indistinguishable from "genuinely zero
+  dependencies" and satisfy a dependent task vacuously. Only once shapes
+  agree does `ReleaseEligible` check that prerequisites accounts for
+  EXACTLY the IDs edges name — no missing, no foreign (an ID edges never
+  named), no duplicate — with every one `integrated`
+  (`ErrDependencyNotIntegrated` otherwise). `Release` never accepts a bare
+  caller-asserted eligibility boolean; it computes eligibility itself.
+  A zero-dependency task is created `ready` directly (`NewImplementTask`)
+  and never calls `Release` in practice.
 - `TaskDependency` edges are immutable once created (a task's dependency
   set is fixed at creation); `ValidateAcyclic` checks one candidate edge
   against the run's persisted edge set by graph reachability, not by
@@ -232,7 +234,8 @@ integration — without changing any Phase 2 transition's legality.
   kind/state restriction; `NewRetryAttempt`'s terminal/limit rules; the
   dependency graph's acyclicity and `ReleaseEligible`'s bypass vectors
   (missing, foreign and duplicate prerequisites, a foreign edge naming a
-  different task, an empty evidence set against a real dependency);
+  different task, an empty prerequisite set against a real dependency,
+  and edges disagreeing with `HasDependencies` in either direction);
   `NewChildSession`'s delegation-depth, role and full parent-shape checks
   (worker parent, cross-run manager, malformed attempt-bound manager,
   terminated manager); runtime binding observation/supersession;

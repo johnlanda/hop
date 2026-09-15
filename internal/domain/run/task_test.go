@@ -220,16 +220,50 @@ func TestTaskRelease(t *testing.T) {
 		}
 	})
 
-	t.Run("empty evidence against a dependent task is refused, never a bare assertion", func(t *testing.T) {
+	t.Run("empty prerequisites against real edges is refused, never a bare assertion", func(t *testing.T) {
 		task := run.Task{ID: testTaskID, RunID: testRunID, Kind: run.TaskKindImplement, HasDependencies: true, State: run.TaskPending}
 
 		got, err := task.Release(edges, nil, epoch())
 
 		if !errors.Is(err, run.ErrDependencyNotIntegrated) {
-			t.Fatalf("Release(empty evidence): error = %v, want ErrDependencyNotIntegrated", err)
+			t.Fatalf("Release(empty prerequisites): error = %v, want ErrDependencyNotIntegrated", err)
 		}
 		if got.State != run.TaskPending {
-			t.Fatalf("Release(empty evidence): State = %s, want unchanged", got.State)
+			t.Fatalf("Release(empty prerequisites): State = %s, want unchanged", got.State)
+		}
+	})
+
+	// The following two are the round-2 review's required vectors: edges
+	// disagreeing with HasDependencies is refused BEFORE ReleaseEligible
+	// ever runs, closing the residual bypass where an empty edge set
+	// against a dependent task looked like vacuous ground truth.
+
+	t.Run("dependent task with zero edges is refused", func(t *testing.T) {
+		task := run.Task{ID: testTaskID, RunID: testRunID, Kind: run.TaskKindImplement, HasDependencies: true, State: run.TaskPending}
+
+		got, err := task.Release(nil, nil, epoch())
+
+		if !errors.Is(err, run.ErrDependencyEvidenceMissing) {
+			t.Fatalf("Release(dependent, zero edges): error = %v, want ErrDependencyEvidenceMissing", err)
+		}
+		if got.State != run.TaskPending {
+			t.Fatalf("Release(dependent, zero edges): State = %s, want unchanged", got.State)
+		}
+	})
+
+	t.Run("zero-dependency task with a non-empty edge set is refused", func(t *testing.T) {
+		// HasDependencies false but somehow parked in pending with real
+		// edges supplied: the mismatch itself is refused, regardless of
+		// how such a task came to exist.
+		task := run.Task{ID: testTaskID, RunID: testRunID, Kind: run.TaskKindImplement, HasDependencies: false, State: run.TaskPending}
+
+		got, err := task.Release(edges, integratedPrereqs, epoch())
+
+		if !errors.Is(err, run.ErrDependencyEvidenceMissing) {
+			t.Fatalf("Release(zero-dependency, non-empty edges): error = %v, want ErrDependencyEvidenceMissing", err)
+		}
+		if got.State != run.TaskPending {
+			t.Fatalf("Release(zero-dependency, non-empty edges): State = %s, want unchanged", got.State)
 		}
 	})
 

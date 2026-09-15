@@ -105,3 +105,11 @@ var ErrMailboxNotClear = errors.New("run: mailbox has undelivered messages")
 // where a task never carries a dependency graph and activates straight
 // from pending).
 var ErrTaskNotReleased = errors.New("run: task has dependencies and is not released")
+
+// ErrDependencyEvidenceMissing reports that Release's supplied edges do
+// not match the task's own HasDependencies shape: a dependent task
+// (HasDependencies true) was given zero edges, or a zero-dependency task
+// (HasDependencies false) was given a non-empty edge set. Distinct from
+// ErrDependencyNotIntegrated, which reports a shape-consistent but still
+// incomplete or unintegrated evidence set.
+var ErrDependencyEvidenceMissing = errors.New("run: release evidence does not match the task's dependency shape")

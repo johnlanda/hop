@@ -195,14 +195,22 @@ func (t Task) Activate(now time.Time) (Task, error) { //nolint:gocritic // hugeP
 // of every task edges names. Release computes eligibility itself via
 // ReleaseEligible — it never accepts a bare caller-asserted boolean, which
 // is exactly what would let an incomplete or empty evidence set slip
-// through unnoticed. ErrDependencyNotIntegrated when the evidence is
-// incomplete, contains a foreign or duplicate prerequisite, or any named
-// prerequisite has not reached integrated. Any source state other than
-// pending is ErrInvalidTransition — a task with no dependencies is
-// created ready directly and never calls Release.
+// through unnoticed. Checked in order: any source state other than
+// pending is ErrInvalidTransition; a mismatch between t.HasDependencies
+// and whether edges is non-empty is ErrDependencyEvidenceMissing (a
+// dependent task given zero edges, or a zero-dependency task given any —
+// the shape-consistency check that keeps an empty edge set from being
+// vacuous ground truth); otherwise ErrDependencyNotIntegrated when the
+// (shape-consistent) evidence is incomplete, contains a foreign or
+// duplicate prerequisite, or any named prerequisite has not reached
+// integrated. A task with no dependencies is created ready directly and
+// never calls Release in practice.
 func (t Task) Release(edges []TaskDependency, prerequisites []Task, now time.Time) (Task, error) { //nolint:gocritic // hugeParam: Task is an immutable domain value returned by every transition; a pointer receiver would let a caller's original be mutated through it, breaking the pure-transition contract.
 	if t.State != TaskPending || t.Kind == TaskKindReview {
 		return t, fmt.Errorf("%w: task %s: %s to %s", ErrInvalidTransition, t.ID, t.State, TaskReady)
+	}
+	if t.HasDependencies != (len(edges) > 0) {
+		return t, fmt.Errorf("%w: task %s", ErrDependencyEvidenceMissing, t.ID)
 	}
 	if !ReleaseEligible(t, edges, prerequisites) {
 		return t, fmt.Errorf("%w: task %s", ErrDependencyNotIntegrated, t.ID)

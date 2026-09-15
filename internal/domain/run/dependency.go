@@ -66,15 +66,20 @@ func ValidateAcyclic(existing []TaskDependency, candidate TaskDependency) error 
 // whose TaskID does not equal task.ID is rejected outright (false), never
 // silently ignored, since it would otherwise let a foreign task's edges
 // stand in for task's own. prerequisites carries the CURRENT state of
-// every prerequisite edges names. Eligible only when prerequisites
-// accounts for EXACTLY the prerequisite IDs edges names — no missing, no
-// foreign (an ID edges never named), no duplicate — and every one has
-// reached integrated. Zero edges is vacuously eligible (0 required, 0
-// given); Release's own pending-only source-state guard is what actually
-// prevents this from misfiring on a task created with real dependencies,
-// since such a task never even reaches pending without a caller
-// separately establishing edges for it.
+// every prerequisite edges names. False immediately when edges disagrees
+// with task.HasDependencies — a dependent task given zero edges, or a
+// zero-dependency task given any — since that mismatch is exactly what
+// would otherwise let a caller assert eligibility by omission (a Terra
+// round-2 finding: an empty edge set is vacuous ground truth just as an
+// empty prerequisite slice was, unless it is itself checked against the
+// task's own declared shape). Given a shape-consistent edges, eligible
+// only when prerequisites accounts for EXACTLY the prerequisite IDs edges
+// names — no missing, no foreign (an ID edges never named), no duplicate
+// — and every one has reached integrated.
 func ReleaseEligible(task Task, edges []TaskDependency, prerequisites []Task) bool { //nolint:gocritic // hugeParam: Task is passed by value everywhere in this package; this predicate mirrors that convention.
+	if task.HasDependencies != (len(edges) > 0) {
+		return false
+	}
 	want := make(map[identity.TaskID]bool, len(edges))
 	for _, e := range edges {
 		if e.TaskID != task.ID {
