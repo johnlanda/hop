@@ -145,6 +145,7 @@ type fakeUnitOfWork struct {
 	// Phase 2 repositories stage above, merged into the store atomically
 	// on Commit.
 	attemptCreated     []run.Attempt
+	taskCreated        []run.Task
 	messagesCreated    []run.Message
 	integrationCreated map[identity.IntegrationID]run.Integration
 	integrationSaved   map[identity.IntegrationID]stagedRow[run.Integration]
@@ -269,6 +270,16 @@ func (u *fakeUnitOfWork) Commit() error {
 
 	for _, a := range u.attemptCreated {
 		s.Attempts[a.ID] = &entityRow[run.Attempt]{value: a, revision: 1}
+	}
+	for _, t := range u.taskCreated { //nolint:gocritic // rangeValCopy: test fake; the domain snapshot is small and read-only here, and indexing would only obscure the loop.
+		s.Tasks[t.ID] = &entityRow[run.Task]{value: t, revision: 1}
+		// The controller computes a created task's seq from the run's
+		// existing tasks; the store's own per-run seq counter (used by
+		// PlanStore.CreateTask) advances past it so a later manager
+		// create can never collide with a controller-created row.
+		if s.taskSeqByRun[t.RunID] < t.Seq {
+			s.taskSeqByRun[t.RunID] = t.Seq
+		}
 	}
 	for _, m := range u.messagesCreated { //nolint:gocritic // rangeValCopy: test fake; the domain snapshot is small and read-only here, and indexing would only obscure the loop.
 		s.Messages[m.ID] = m

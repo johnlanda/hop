@@ -172,6 +172,13 @@ type TaskIndexRepository interface {
 	// order; callers sort as their pass requires (task seq order for
 	// assignment).
 	ByRun(ctx context.Context, runID identity.RunID) ([]run.Task, error)
+	// Create inserts a controller-created task row, returning its initial
+	// revision: controller-transaction task creation under the lease
+	// fence, used for review tasks (section 8 — only the controller
+	// creates them, with the frozen subject in the row).
+	// PlanStore.CreateTask remains the worker-authority path for
+	// manager-authored tasks and still refuses kind=review.
+	Create(ctx context.Context, t run.Task) (int64, error)
 }
 
 // AttemptIndexRepository lists a task's attempts in bulk and creates new

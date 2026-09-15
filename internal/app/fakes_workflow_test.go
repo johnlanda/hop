@@ -117,6 +117,14 @@ func (r fakeTaskIndexRepo) ByRun(_ context.Context, runID identity.RunID) ([]run
 		out = append(out, staged.value)
 		seen[id] = true
 	}
+	for i := range r.u.taskCreated {
+		t := r.u.taskCreated[i]
+		if t.RunID != runID || seen[t.ID] {
+			continue
+		}
+		out = append(out, t)
+		seen[t.ID] = true
+	}
 	for id, base := range r.u.store.Tasks {
 		if seen[id] || base.value.RunID != runID {
 			continue
@@ -124,6 +132,11 @@ func (r fakeTaskIndexRepo) ByRun(_ context.Context, runID identity.RunID) ([]run
 		out = append(out, base.value)
 	}
 	return out, nil
+}
+
+func (r fakeTaskIndexRepo) Create(_ context.Context, t run.Task) (int64, error) { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
+	r.u.taskCreated = append(r.u.taskCreated, t)
+	return 1, nil
 }
 
 // --- AttemptIndex ---
