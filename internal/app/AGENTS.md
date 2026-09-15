@@ -332,12 +332,17 @@ sides together. `cmd/hop` never imports domain or identity types: every
   codex/opencode/absent configs, the fail-closed no-claim refusal on a
   seeding write failure or a missing seeder), check-exec's claim-before-load
   ordering, group-leadership refusal and the frozen argv kept verbatim.
-- `go test ./internal/app -run 'TestPlanTrustSeed|TestSeedTrustEdit'` —
+- `go test ./internal/app -run 'TestPlanTrustSeed|TestSeedTrustEdit|TestSanitizedEnvironmentToTrustSeed'` —
   the pure trust-seed tables in [trustseed_test.go](trustseed_test.go):
-  profile-file resolution per harness and environment shape, and the
+  profile-file resolution per harness and environment shape, the composed
+  sanitizer-to-seeder boundary (a hostile inherited CLAUDE_CONFIG_DIR
+  stripped, passthrough honored, a configured ProfileDir winning, a
+  policy-stripped HOME never falling back ambiently, codex/opencode
+  planning no seed), and the
   byte-surgical edit (create-if-absent map/entry/key, false→true
-  overwrite with formatting preserved, unknown fields and other projects
-  byte-identical, duplicate-key last-wins, escaped keys, and the
+  overwrite with formatting preserved, unknown fields, other projects,
+  number spellings, exponents and escapes byte-identical,
+  duplicate-key last-wins, escaped keys, and the
   unparsable-document error table).
 - `go test ./internal/app -run 'TestComputeResultDigest|TestDecodeOperationPayload'` —
   the canonical digest vectors (`digest_test.go`) and the persisted-payload

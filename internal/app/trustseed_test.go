@@ -106,6 +106,80 @@ func TestPlanTrustSeed(t *testing.T) {
 	}
 }
 
+// TestSanitizedEnvironmentToTrustSeed composes SanitizeEnvironment with
+// PlanTrustSeed — the exact pipeline PrepareLaunchExec runs — and pins the
+// security cases at that boundary: what the seeder targets is decided by
+// the SANITIZED environment alone.
+func TestSanitizedEnvironmentToTrustSeed(t *testing.T) {
+	const worktree = "/private/var/worktrees/hop-run-1"
+	base := EnvPolicy{Version: EnvPolicyVersion1, Harness: HarnessClaude}
+	cases := []struct {
+		name       string
+		policy     EnvPolicy
+		environ    []string
+		wantConfig string
+		wantReason string
+	}{
+		{
+			name:       "a hostile inherited CLAUDE_CONFIG_DIR is stripped by default and never targeted",
+			policy:     base,
+			environ:    []string{"HOME=/Users/dev", "CLAUDE_CONFIG_DIR=/hostile/profile"},
+			wantConfig: "/Users/dev/.claude.json",
+		},
+		{
+			name:       "an explicit passthrough CLAUDE_CONFIG_DIR is targeted",
+			policy:     EnvPolicy{Version: EnvPolicyVersion1, Harness: HarnessClaude, Passthrough: []string{"CLAUDE_CONFIG_DIR"}},
+			environ:    []string{"HOME=/Users/dev", "CLAUDE_CONFIG_DIR=/opted/in/profile"},
+			wantConfig: "/opted/in/profile/.claude.json",
+		},
+		{
+			name:       "a configured profile directory wins over an inherited passthrough",
+			policy:     EnvPolicy{Version: EnvPolicyVersion1, Harness: HarnessClaude, Passthrough: []string{"CLAUDE_CONFIG_DIR"}, ProfileDir: "/profiles/claude"},
+			environ:    []string{"HOME=/Users/dev", "CLAUDE_CONFIG_DIR=/opted/in/profile"},
+			wantConfig: "/profiles/claude/.claude.json",
+		},
+		{
+			name:       "a policy-stripped HOME never falls back to any ambient value",
+			policy:     EnvPolicy{Version: EnvPolicyVersion1, Harness: HarnessClaude, Strip: []string{"HOME"}},
+			environ:    []string{"HOME=/Users/dev"},
+			wantReason: "neither CLAUDE_CONFIG_DIR nor HOME",
+		},
+		{
+			name:       "codex plans no seed even with a passthrough claude config dir present",
+			policy:     EnvPolicy{Version: EnvPolicyVersion1, Harness: HarnessCodex, Passthrough: []string{"CLAUDE_CONFIG_DIR"}},
+			environ:    []string{"HOME=/Users/dev", "CLAUDE_CONFIG_DIR=/opted/in/profile"},
+			wantReason: "codex workspace trust is not seeded",
+		},
+		{
+			name:       "opencode plans no seed even though its profile shape assigns HOME",
+			policy:     EnvPolicy{Version: EnvPolicyVersion1, Harness: HarnessOpencode, ProfileDir: "/profiles/opencode"},
+			environ:    []string{"HOME=/Users/dev"},
+			wantReason: "opencode workspace trust is not seeded",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			validated, err := tc.policy.Validate()
+			if err != nil {
+				t.Fatalf("Validate: %v", err)
+			}
+			env, _ := SanitizeEnvironment(tc.environ, validated)
+
+			step := PlanTrustSeed(tc.policy.Harness, env, worktree)
+
+			if tc.wantConfig != "" {
+				if step.ConfigPath != tc.wantConfig || step.ProjectKey != worktree {
+					t.Errorf("step = %+v, want config %q keyed by the worktree", step, tc.wantConfig)
+				}
+				return
+			}
+			if step.Seeds() || !strings.Contains(step.Reason, tc.wantReason) {
+				t.Errorf("step = %+v, want a not-seeded reason containing %q", step, tc.wantReason)
+			}
+		})
+	}
+}
+
 // TestPlanTrustSeedLastDuplicateWins pins the duplicate-entry rule to
 // SanitizeEnvironment's: the last entry of a name is the one read.
 func TestPlanTrustSeedLastDuplicateWins(t *testing.T) {
@@ -118,8 +192,8 @@ func TestPlanTrustSeedLastDuplicateWins(t *testing.T) {
 }
 
 // fullDefaultEntry is the complete default project entry Claude Code
-// 2.1.270 persists when a trust dialog is abandoned (the spike's P3
-// observation): hasTrustDialogAccepted false among every other key, which
+// 2.1.270 persists when a trust dialog is abandoned:
+// hasTrustDialogAccepted false among every other key, which
 // the seed must flip without disturbing anything else.
 const fullDefaultEntry = `{"allowedTools":[],"disabledMcpjsonServers":[],"enabledMcpjsonServers":[],"exampleFiles":[],"hasClaudeMdExternalIncludesApproved":false,"hasClaudeMdExternalIncludesWarningShown":false,"hasTrustDialogAccepted":false,"hasUnseenTeamArtifacts":false,"lastGracefulShutdown":false,"lastVersionBase":"2.1.270","mcpContextUris":[],"mcpServers":{}}`
 
@@ -200,6 +274,12 @@ func TestSeedTrustEdit(t *testing.T) {
 			name:        "a nested projects key inside another member is not the projects map",
 			config:      `{"cache":{"projects":{"` + key + `":{"hasTrustDialogAccepted":false}}}}`,
 			wantEdited:  `{"projects":{"` + key + `":{"hasTrustDialogAccepted":true}},"cache":{"projects":{"` + key + `":{"hasTrustDialogAccepted":false}}}}`,
+			wantChanged: true,
+		},
+		{
+			name:        "preserves number spellings, escapes and whitespace byte-for-byte",
+			config:      "{\n  \"big\": 123456789012345678901234567890,\n  \"exp\": 1.5E+10,\n  \"neg\": -0.0e-7,\n  \"esc\": \"a\\u00e9\\n\\\"q\\\"\\\\\",\n  \"projects\": {\"" + key + "\": {\"hasTrustDialogAccepted\": false}}\n}",
+			wantEdited:  "{\n  \"big\": 123456789012345678901234567890,\n  \"exp\": 1.5E+10,\n  \"neg\": -0.0e-7,\n  \"esc\": \"a\\u00e9\\n\\\"q\\\"\\\\\",\n  \"projects\": {\"" + key + "\": {\"hasTrustDialogAccepted\": true}}\n}",
 			wantChanged: true,
 		},
 		{

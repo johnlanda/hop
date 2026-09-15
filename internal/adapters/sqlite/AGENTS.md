@@ -138,7 +138,11 @@ this package never resolves environment variables or defaults.
 
 - `go test ./internal/adapters/sqlite` — the real-temporary-database suite:
   migrations from empty, reopen at the same version, refusal of a future
-  version (`ErrFutureSchema`), concurrent open/migrate from two handles;
+  version (`ErrFutureSchema`), concurrent open/migrate from two handles, and
+  a populated version-1→2 upgrade (`TestUpgradePopulatedV1StoreToV2`: the
+  001 schema built raw with a full claim chain, upgraded through
+  `sqlite.Open`, old values and relationships intact with NULL seed
+  evidence, a new evidence-bearing claim, idempotent reopen);
   DSN escaping (roots containing `#`, `?`, `%`, spaces, Unicode and a
   mode=memory lookalike land at `<root>/hop.db` per `pragma_database_list`
   and survive reopen); connection-churn PRAGMA checks on both pools; the

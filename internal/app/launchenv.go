@@ -264,8 +264,11 @@ func stripUnionV1() map[string]bool {
 // for Claude Code, CODEX_HOME for Codex, and for opencode the full HOME plus
 // XDG_*_HOME layout — never a flat directory, because an inherited XDG
 // variable would otherwise split the profile and could point credentials at
-// a shared directory. The directory passes through unmodified; HOP never
-// prepares, inspects or writes it.
+// a shared directory. The directory passes through unmodified; the only
+// profile content HOP writes anywhere is the launch boundary's
+// workspace-trust seed — one key of a Claude profile's .claude.json,
+// through the TrustSeeder port (trustseed.go) — and nothing here prepares,
+// inspects or writes the directory itself.
 func profileAssignments(harness, dir string) []string {
 	switch harness {
 	case HarnessClaude:
