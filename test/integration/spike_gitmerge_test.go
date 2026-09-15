@@ -8,14 +8,14 @@ import (
 )
 
 // mergeIdentityArgs are the frozen non-interactive argv prefix flags the
-// design's merge invocations use (G2, extended per the planner's
-// Confirmation-1 revision): an inline `-c user.name=... -c user.email=...`
-// identity so a merge never depends on ambient git configuration existing at
-// the checkout, plus `-c commit.gpgsign=false -c merge.verifysignatures=false`
-// so a repository with signing turned on locally (commit.gpgsign=true) never
-// blocks an automated merge -- these two `-c` flags always win over any
-// config file, including the checkout's own local config, because command-
-// line `-c` has the highest git config precedence.
+// design's merge invocations use (G2): an inline `-c user.name=... -c
+// user.email=...` identity so a merge never depends on ambient git
+// configuration existing at the checkout, plus `-c commit.gpgsign=false -c
+// merge.verifysignatures=false` so a repository with signing turned on
+// locally (commit.gpgsign=true) never blocks an automated merge -- these
+// two `-c` flags always win over any config file, including the checkout's
+// own local config, because command-line `-c` has the highest git config
+// precedence.
 func mergeIdentityArgs() []string {
 	return []string{
 		"-c", "user.name=hop-integration",
@@ -223,13 +223,12 @@ func TestSpikeMergeNoFFForcesCommitOnFastForwardableHead(t *testing.T) {
 // (GIT_CONFIG_GLOBAL/GIT_CONFIG_SYSTEM=/dev/null); it does nothing to a
 // repository's own LOCAL .git/hooks. Neither `pre-merge-commit` nor
 // `post-merge` is skipped by the frozen argv (there is no `--no-verify` in
-// it), so a repo-local hook script DOES fire during an automated merge --
+// it), so a repo-local hook script fires during an automated merge --
 // arbitrary repository-supplied code executes with the same privileges as
-// the merge itself. This is recorded as a FINDING: a design that wants
-// hook-free automated merges must add `--no-verify` to the frozen argv
-// (which skips `pre-merge-commit`, a real gate) and accept that `post-merge`
-// has no corresponding suppression flag at all -- it always runs after a
-// successful merge.
+// the merge itself. See TestSpikeMergeNoVerifySkipsPreMergeCommitOnly for
+// what adding `--no-verify` does and does not suppress, and
+// TestSpikeMergeHooksPathSuppressesRepoLocalHooks for the option that
+// suppresses both.
 func TestSpikeMergeRepoLocalHooksFire(t *testing.T) {
 	artifacts := newArtifactDir(t)
 	repo := newFixtureRepo(t, artifacts, "repo")
@@ -251,14 +250,42 @@ func TestSpikeMergeRepoLocalHooksFire(t *testing.T) {
 	}
 
 	if _, err := os.Stat(preMergeCommitMarker); err != nil {
-		t.Errorf("pre-merge-commit hook did NOT fire under the frozen argv (no --no-verify): %v", err)
-	} else {
-		t.Log("FINDING confirmed: pre-merge-commit hook fired (the frozen argv has no --no-verify to skip it)")
+		t.Errorf("pre-merge-commit hook did not fire under the frozen argv: %v", err)
 	}
 	if _, err := os.Stat(postMergeMarker); err != nil {
-		t.Errorf("post-merge hook did NOT fire under the frozen argv: %v", err)
-	} else {
-		t.Log("FINDING confirmed: post-merge hook fired (post-merge has no --no-verify/suppression flag at all)")
+		t.Errorf("post-merge hook did not fire under the frozen argv: %v", err)
+	}
+}
+
+// TestSpikeMergeNoVerifySkipsPreMergeCommitOnly is G2's `--no-verify`
+// control: adding `--no-verify` to the frozen argv skips `pre-merge-commit`
+// (git's own documented behavior for `merge --no-verify`) but has no effect
+// on `post-merge`, which fires unconditionally after a successful merge and
+// has no suppression flag of its own.
+func TestSpikeMergeNoVerifySkipsPreMergeCommitOnly(t *testing.T) {
+	artifacts := newArtifactDir(t)
+	repo := newFixtureRepo(t, artifacts, "repo")
+
+	hooksDir := filepath.Join(repo.Root, ".git", "hooks")
+	preMergeCommitMarker := filepath.Join(artifacts.dir(t, "hook-evidence"), "pre-merge-commit-fired")
+	postMergeMarker := filepath.Join(artifacts.dir(t, "hook-evidence"), "post-merge-fired")
+	writeHookScript(t, hooksDir, "pre-merge-commit", preMergeCommitMarker)
+	writeHookScript(t, hooksDir, "post-merge", postMergeMarker)
+
+	repo.writeFile(t, "source.txt", "source change\n", 0o644)
+	source := repo.commit(t, "source change")
+	scratch := detachedScratch(t, repo, artifacts, "scratch-no-verify", repo.Base)
+
+	args := append(append([]string{}, mergeIdentityArgs()...), "merge", "--no-ff", "--no-edit", "--no-verify", source)
+	if out, err := runGitWithEnv(t, scratch, mergeEnviron(repo.gitHome), args...); err != nil {
+		t.Fatalf("git merge --no-ff --no-edit --no-verify %s: %v\n%s", source, err, out)
+	}
+
+	if _, err := os.Stat(preMergeCommitMarker); err == nil {
+		t.Error("pre-merge-commit hook fired despite --no-verify")
+	}
+	if _, err := os.Stat(postMergeMarker); err != nil {
+		t.Errorf("post-merge hook did not fire despite --no-verify (it has no suppression flag of its own): %v", err)
 	}
 }
 

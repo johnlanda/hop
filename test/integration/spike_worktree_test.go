@@ -27,9 +27,9 @@ type worktreeAttempt struct {
 // worktree creation under the shapes Phase 3's worker/reviewer launch path
 // depends on, and cover BOTH `base` cases side by side: t1a1/t2a1 are
 // genuinely new branches (base honored), t3a1 reuses a branch created ahead
-// of time (base silently ignored, TestSpikeWorktreeCreateExistingBranchIgnoresBase's
-// FINDING, repeated here as part of the full family rather than in
-// isolation).
+// of time (base silently ignored -- see also
+// TestSpikeWorktreeCreateExistingBranchIgnoresBase, which isolates that
+// case on its own).
 //
 // worktree.create's response is the same {workspace, tab, root_pane} triple
 // as workspace.create (S8) and tab.create (S7), plus a fourth `worktree`
@@ -209,8 +209,9 @@ func TestSpikeConcurrentWorktreeCreate(t *testing.T) {
 	}
 }
 
-// TestSpikeWorktreeCreateExistingBranchIgnoresBase is the S9 FINDING: when
-// the requested branch already exists (and is not checked out anywhere else,
+// TestSpikeWorktreeCreateExistingBranchIgnoresBase is S9's existing-branch
+// case, isolated: when the requested branch already exists (and is not
+// checked out anywhere else,
 // so git does not additionally refuse it), Herdr checks it out at its OWN
 // current tip (`git worktree add <path> <branch>`,
 // repos/herdr/src/worktree.rs build_worktree_add_existing_branch_command) and
@@ -249,7 +250,7 @@ func TestSpikeWorktreeCreateExistingBranchIgnoresBase(t *testing.T) {
 
 	got := worktreeHead(t, repo, path)
 	if got == secondOID {
-		t.Fatalf("worktree.create honored base %s for an already-existing branch %s; expected it to be ignored (FINDING)", secondOID, branch)
+		t.Fatalf("worktree.create honored base %s for an already-existing branch %s; expected it to be ignored", secondOID, branch)
 	}
 	if got != repo.Base {
 		t.Errorf("worktree.create checked out %s at %s, want its own existing tip %s (base %s must be ignored)", branch, got, repo.Base, secondOID)

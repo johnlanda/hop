@@ -8,24 +8,21 @@ import (
 	"testing"
 )
 
-// This file's git-level probes (G1, G3 -- provisional numbering, requested
-// by the Phase 3 design reviewer) establish the fenced-publish assumptions a
-// revised integration design rests on. Herdr itself has no ref-fencing
-// surface (worktree.create only creates a checkout; merges and ref updates
-// are plain `git` invocations HOP's own CommandRunner would issue against a
-// checkout path, per design section 4's "Merges and resets run `git -C`
-// with the absolute Controller.GitExecutable"), so every probe here drives
-// real `git` directly against a worktree.create'd checkout, exactly as
-// production code would.
+// This file's git-level probes (G1, G3) establish the fenced-publish
+// assumptions the integration design rests on. Herdr itself has no
+// ref-fencing surface (worktree.create only creates a checkout; merges and
+// ref updates are plain `git` invocations HOP's own CommandRunner would
+// issue against a checkout path, per design section 4's "Merges and resets
+// run `git -C` with the absolute Controller.GitExecutable"), so every probe
+// here drives real `git` directly against a worktree.create'd checkout,
+// exactly as production code would.
 //
-// The run-scoped ref name, `refs/heads/hop/r<seq>/integration` (r1 in every
-// probe below), is the CONFIRMED real scheme the design planner named: it
-// disambiguates the integration ref from the `hop/r<seq>/t<t>a<n>` attempt
-// branches sharing its `hop/r<seq>/` prefix.
-// TestSpikeBareRunBranchCollidesWithAttemptBranches is the executed evidence
-// for exactly why that disambiguation is required -- the ORIGINAL design's
-// bare `hop/r<seq>` branch name cannot coexist with any `hop/r<seq>/t<t>a<n>`
-// attempt branch at all.
+// The run-scoped ref name is `refs/heads/hop/r<seq>/integration` (r1 in
+// every probe below): it disambiguates the integration ref from the
+// `hop/r<seq>/t<t>a<n>` attempt branches sharing its `hop/r<seq>/` prefix.
+// TestSpikeBareRunBranchCollidesWithAttemptBranches proves why that
+// disambiguation is required -- a bare `hop/r<seq>` branch name cannot
+// coexist with any `hop/r<seq>/t<t>a<n>` attempt branch at all.
 
 // TestSpikeIntegrationRefCompareAndSwap proves `git update-ref <ref> <new>
 // <old>` is a true compare-and-swap when run against a worktree.create'd
@@ -131,10 +128,10 @@ func TestSpikeDetachedMergeLeavesRefUntouched(t *testing.T) {
 // -- the integration ref plus one attempt branch per role, including the
 // review task's (no separate review-branch scheme: it gets an ordinary
 // `hop/r<seq>/t<t>a<n>` name like any implement task) -- coexists in one
-// repository. None is a path-prefix of another (unlike the ORIGINAL design's
-// bare `hop/r<seq>` integration branch; see
-// TestSpikeBareRunBranchCollidesWithAttemptBranches), so git's ref storage
-// never has to treat the same path both as a leaf ref and as a directory.
+// repository. None is a path-prefix of another (see
+// TestSpikeBareRunBranchCollidesWithAttemptBranches for the case where one
+// is), so git's ref storage never has to treat the same path both as a leaf
+// ref and as a directory.
 func TestSpikeRunScopedRefFamilyCoexists(t *testing.T) {
 	artifacts := newArtifactDir(t)
 	repo := newFixtureRepo(t, artifacts, "repo")
@@ -162,12 +159,11 @@ func TestSpikeRunScopedRefFamilyCoexists(t *testing.T) {
 }
 
 // TestSpikeBareRunBranchCollidesWithAttemptBranches is the NEGATIVE control
-// proving why the run-scoped ref needs its own "/integration" leaf rather
-// than the ORIGINAL design's bare `hop/r<seq>`: git's ref storage is a
-// filesystem-like path namespace, so a ref named exactly "hop/r1" and a ref
-// named "hop/r1/t1a1" cannot coexist -- the first requires "hop/r1" to be a
-// FILE, the second requires it to be a DIRECTORY. This is exactly the
-// collision `hop/r<seq>/integration` (G1) avoids.
+// proving why the run-scoped ref needs its own "/integration" leaf: git's
+// ref storage is a filesystem-like path namespace, so a ref named exactly
+// "hop/r1" and a ref named "hop/r1/t1a1" cannot coexist -- the first
+// requires "hop/r1" to be a FILE, the second requires it to be a DIRECTORY.
+// This is exactly the collision `hop/r<seq>/integration` (G1) avoids.
 func TestSpikeBareRunBranchCollidesWithAttemptBranches(t *testing.T) {
 	artifacts := newArtifactDir(t)
 	repo := newFixtureRepo(t, artifacts, "repo")

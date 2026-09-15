@@ -266,8 +266,7 @@ Two new methods (and the `SendText` deletion above):
 // itself (WorkspaceInfo.label — source-confirmed on 0.9.0), NOT the root
 // pane, unlike layout.apply/tab.create labels. Used only for the
 // manager's placement; worker and reviewer placement continues to come
-// from worktree.create's returned workspace. Shapes pending S8 executed
-// evidence.
+// from worktree.create's returned workspace. Shapes S8-confirmed.
 CreateWorkspace(ctx context.Context, req WorkspaceRequest) (WorkspaceHandle, error)
 
 // FindWorkspaceByLabel is the workspace.create decision row's recovery
@@ -276,7 +275,7 @@ CreateWorkspace(ctx context.Context, req WorkspaceRequest) (WorkspaceHandle, err
 // pane to recover the root-pane identity — a fresh recovered workspace
 // has exactly one of each, and more than one of either is an error, not
 // a guess. Zero matches is (zero, false, nil); two or more workspaces
-// with the label is an error. Pending S8 executed evidence.
+// with the label is an error. S8-confirmed.
 FindWorkspaceByLabel(ctx context.Context, label string) (WorkspaceRef, bool, error)
 ```
 
@@ -451,7 +450,7 @@ New operation kinds and their decision-table rows (Phase 2 rows unchanged):
 
 | Operation | Crash between intent and act | Crash between act and outcome | Takeover with the intent unresolved |
 | --- | --- | --- | --- |
-| `workspace.create` (manager placement) | Adoption by unique creation label — a WORKSPACE attribute on 0.9.0 (source-confirmed; executed round-trip pending S8), so recovery resolves the labeled workspace and then its sole tab and sole root pane (more than one of either fails closed); label absent → bounded wait for the in-flight request, then `reconciling`; never a second create | same | same |
+| `workspace.create` (manager placement) | Adoption by unique creation label — a WORKSPACE attribute on 0.9.0 (S8-confirmed by executed round-trip), so recovery resolves the labeled workspace and then its sole tab and sole root pane (more than one of either fails closed); label absent → bounded wait for the in-flight request, then `reconciling`; never a second create | same | same |
 | `integration.merge` (scratch merge; never touches the ref) | One merge EXECUTION per operation, with the operation ID fixing all three identities immutably: the exec claim (one row, one pid, never re-armed or overwritten), the frozen merge argv, and the private tree path `runs/<run-uuid>/integrations/<operation-uuid>/tree`. The act is two recorded steps: (i) MATERIALIZE — `git worktree add --detach <tree> <premerge-oid>` run to OBSERVED completion under `CommandRunner`, then verify the new tree's HEAD equals the recorded pre-merge head and record the materialization-complete evidence (path + verified HEAD) in act evidence. Adoption of a materialized directory requires that recorded completion evidence, NEVER a HEAD observation alone: `git worktree add` writes HEAD before it finishes populating the checkout and index, and a preparer surviving a dead controller can still be writing a directory whose HEAD already reads correctly — so a recovery that finds the directory without the completion evidence settles the operation failed and allocates a FRESH operation and directory (the ambiguous directory is abandoned, never entered, its possible surviving preparer confined to it, and it is removed only after settlement plus the ordinary retirement checks); (ii) SPAWN the merge through the generalized exec boundary — `hop check-exec --op <operation-uuid> -- git … merge …` (section 8 fixes the argv) — so a durable pre-exec claim (own pid = group id) exists exactly as for checks, and a Git child surviving a dead controller is retired by the group-retirement rule (argv-matched listing, never a blind signal). A conflict exits non-zero and leaves the tree; no `merge --abort` is ever needed because an operation's tree is never reused. Recovery: no claim after step (ii) dispatched → ambiguous, bounded wait then reconciling (never absence); claim present → retire the group FIRST, settle this operation with the retirement evidence (the old claim row is retained forever as history), THEN read the scratch HEAD — parents exactly {pre-merge head, source} → adopt M; the up-to-date no-op outcome (section 8) → adopt as no-op; anything else → the operation settles failed and any re-act is a NEW `integration.merge` operation under the same integration row, with its own fresh operation ID, claim, argv record, tree path and the takeover's current generation — allocated only AFTER the old operation is settled; the abandoned directory is never adopted and is removed only after settlement | same | same; an unresolved merge blocks further integration (the serial index already prevents a second one) |
 | `integration.publish` | The act is `git update-ref refs/heads/hop/r<seq>/integration <M> <expected-head>` — a compare-and-swap on the expected old value, executed directly by the controller. The CAS alone does NOT fence stop or takeover when the head has not moved — a paused controller's publish dispatched after a stop request would still match its expected-old — so the publish carries three explicit layers: (i) PRE-ACT, the Phase 2 revalidation (heartbeat CAS + stop re-read) runs immediately before the `update-ref` dispatch specifically, not merely before the operation; (ii) POST-ACT, the outcome transaction is lease-fenced and re-reads stop — a landed publish can never settle `checking` past either, and a refused outcome routes the published candidate to the stop/rollback path (the reconciliation rule for the pause window); (iii) EXTERNALLY, stop, takeover and terminal-failure settlement retire any unresolved ref-move intent by moving the ref first (the fencing rule below), so a zombie CAS dispatched after that retirement fails at the ref store. Recovery: ref == M → adopt; ref == expected head → re-act (retry-idempotent); any other value → `reconciling` with the observed ref as evidence | same | same, via the fencing rule |
 | `integration.reset` (combined-check failure rollback, section 8; also the stop path's retirement of a published-but-unsettled candidate) | The act is two steps with the identity persisted BETWEEN them: (i) create the ROLLBACK COMMIT R (`git commit-tree <premerge>^{tree} -p <M>` — R carries the pre-merge content and keeps the rejected M reachable as its parent) and record R's object ID in `act_evidence` — a plain store write — BEFORE any ref move; (ii) `git update-ref … <R> <M>`. Recovery is decidable in every window: R recorded and ref == R → adopt; R recorded and ref == M → re-act step (ii) only (idempotent CAS); no R recorded and ref == M → re-act from step (i) (a prior orphaned commit-tree object is unreferenced and harmless); anything else → `reconciling` | same | same |
@@ -899,8 +898,8 @@ that commit with a create-only compare-and-swap
 empty expected-old value makes a second creation fail instead of moving
 an existing ref).
 
-Worktree base honesty (source-confirmed on 0.9.0, executed evidence
-pending S9): `worktree.create` honors `--base <oid>` ONLY when the branch
+Worktree base honesty (S9-confirmed by executed evidence): `worktree.create`
+honors `--base <oid>` ONLY when the branch
 is new — an existing branch is checked out at its current tip and the
 base is silently ignored. Branch-name uniqueness per attempt is therefore
 a hard invariant, held three ways: the `t<tseq>a<n>` scheme is unique by
@@ -1743,8 +1742,8 @@ implementation option:
 
 Spike dependencies: S8 gates the `CreateWorkspace`/`FindWorkspaceByLabel`
 shapes and the manager-placement decision row (the label-names-the-
-workspace fact and the sole-tab descent are source-confirmed, execution
-pending); S9 gates per-attempt worktree provenance — including executing
+workspace fact and the sole-tab descent are S8-confirmed by execution);
+S9 gates per-attempt worktree provenance — including executing
 the existing-branch-ignores-base case that makes refuse-if-exists
 mandatory; S10 must pass before multi-session launch lands (a failure
 would force serialized pane creation, a loop change, not a model change)
