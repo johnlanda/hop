@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -55,6 +56,7 @@ const fixtureWorkerSource = `package main
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -69,6 +71,20 @@ import (
 // so the second incarnation cannot re-exec forever.
 const reexecMarkerEnv = "HOP_FIXTURE_REEXEC_DONE"
 
+// mcpStandInArg selects this binary's MCP-stand-in child mode (argv[1]).
+const mcpStandInArg = "fixture-mcp-stand-in"
+
+// mcpStandInPID is the spawned stand-in child's pid, recorded in the
+// observation dump so a scenario can locate it in the pane's foreground
+// group listing; mcpStandInStdin holds the pipe write end open for this
+// process's whole lifetime, so the child's stdin reaches EOF — and the
+// child exits — exactly when this process exits or execs (Go pipe fds are
+// close-on-exec).
+var (
+	mcpStandInPID   int
+	mcpStandInStdin io.WriteCloser
+)
+
 // fixtureRetryInterval is this worker's own back-off between hop result
 // submit retries, mandated by the section 7 transient protocol the launch
 // prompt itself states ("wait briefly and run the exact same command
@@ -77,6 +93,19 @@ const reexecMarkerEnv = "HOP_FIXTURE_REEXEC_DONE"
 const fixtureRetryInterval = 200 * time.Millisecond
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == mcpStandInArg {
+		mcpStandIn()
+		return
+	}
+	// Reproduce the pinned real-harness process-group shape BEFORE anything
+	// about this worker is observable as ready: Claude Code 2.1.270 spawns
+	// its configured MCP servers as children in its own process group
+	// immediately after the trust check, so every settlement, stop and
+	// adoption decision in production runs against a multi-member
+	// foreground group whose raw listing order gives the worker no
+	// particular index.
+	spawnMCPStandIn()
+
 	if os.Getenv(reexecMarkerEnv) != "" {
 		fmt.Printf("FIXTURE-REEXECED pid=[%d]\n", os.Getpid())
 		idle()
@@ -159,6 +188,44 @@ func main() {
 		// scenario that only needs a settled, idle worker still gets one.
 	}
 	idle()
+}
+
+// spawnMCPStandIn starts one long-lived child in this process's OWN
+// process group (plain fork/exec inheritance; no setpgid), standing in for
+// the MCP servers a real Claude Code 2.1.270 launch spawns before the
+// worker does anything observable. The child is this same binary in
+// stand-in mode: its argv carries no HOP marker, its argv[0] mirrors this
+// process's own argv[0] (in a wrapper topology that is the spoofed
+// invocation name, keeping the pane's non-claimed members uniformly
+// claude-named), its stdio is detached except a stdin pipe whose write
+// end this process holds forever — so the child exits on EOF exactly when
+// this process exits or execs, and it is never reaped here (it cannot
+// outlive this process long enough to matter, and must never block a
+// direct test run's cmd.Wait through inherited pipes).
+func spawnMCPStandIn() {
+	self, err := os.Executable()
+	if err != nil {
+		fatalf("resolve own executable for the mcp stand-in: %v", err)
+	}
+	cmd := exec.Command(self, mcpStandInArg)
+	if len(os.Args) > 0 && os.Args[0] != "" {
+		cmd.Args = []string{os.Args[0], mcpStandInArg}
+	}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		fatalf("open the mcp stand-in's stdin pipe: %v", err)
+	}
+	if err := cmd.Start(); err != nil {
+		fatalf("start the mcp stand-in: %v", err)
+	}
+	mcpStandInPID = cmd.Process.Pid
+	mcpStandInStdin = stdin
+}
+
+// mcpStandIn is the stand-in child's own loop: block until stdin (held
+// open by the parent) reaches EOF, then exit.
+func mcpStandIn() {
+	_, _ = io.Copy(io.Discard, os.Stdin)
 }
 
 // isResumeInvocation reports whether argv is a cold-relaunch invocation
@@ -251,6 +318,7 @@ func writeObservation(path string, assignmentPath, promptAssignmentPath, hopPath
 	} else {
 		fmt.Fprintf(&b, "executable_error=%v\n", execErr)
 	}
+	fmt.Fprintf(&b, "mcp_stand_in_pid=%d\n", mcpStandInPID)
 	fmt.Fprintf(&b, "assignment_path=%s\n", assignmentPath)
 	fmt.Fprintf(&b, "prompt_assignment_path=%s\n", promptAssignmentPath)
 	fmt.Fprintf(&b, "hop_path=%s\n", hopPath)
@@ -510,10 +578,36 @@ func TestFixtureWorkerSubmitValid(t *testing.T) {
 		}
 	}
 
+	// The worker spawned its MCP stand-in child before reporting ready and
+	// recorded its pid; the child holds the worker's pipe, so it must be
+	// gone shortly after the worker exits — the fixture never leaks a
+	// process past its own run.
+	standInPID := parsedStandInPID(t, dump)
+	if !waitUntil(func() bool { return !processExists(standInPID) }) {
+		t.Errorf("mcp stand-in child pid %d still exists after the worker exited; the stand-in must die with its parent", standInPID)
+	}
+
 	head := repo.git(t, "rev-parse", "HEAD^{commit}")
 	if head == repo.Base {
 		t.Error("fixture worker did not commit a change before submitting")
 	}
+}
+
+// parsedStandInPID extracts the positive mcp_stand_in_pid the worker's
+// observation dump records.
+func parsedStandInPID(t *testing.T, dump string) int {
+	t.Helper()
+	for _, line := range strings.Split(dump, "\n") {
+		if value, ok := strings.CutPrefix(line, "mcp_stand_in_pid="); ok {
+			pid, err := strconv.Atoi(strings.TrimSpace(value))
+			if err != nil || pid <= 0 {
+				t.Fatalf("worker observation dump mcp_stand_in_pid = %q, want a positive pid", value)
+			}
+			return pid
+		}
+	}
+	t.Fatalf("worker observation dump carries no mcp_stand_in_pid line; dump:\n%s", dump)
+	return 0
 }
 
 // writeTransientOnceHopStub writes a fake `hop` at a fresh path that prints

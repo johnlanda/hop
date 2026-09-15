@@ -1,6 +1,7 @@
 package integration
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -115,17 +116,31 @@ func TestRealProcessRunEndToEnd(t *testing.T) {
 		}
 	}
 
-	// The launched pane's foreground process, observed independently
-	// through pane.process_info (not through the worker's own
-	// self-report), carries the resolved fixture stub path verbatim in
-	// argv[0] and — on macOS — the basename in argv0 (Herdr's
-	// process_argv0_name; Linux never reports argv0 at all).
+	// The launched pane's foreground group, observed independently through
+	// pane.process_info (not through the worker's own self-report),
+	// contains the settled claim's pid, and THAT member carries the
+	// resolved fixture stub path verbatim in argv[0] and — on macOS — the
+	// basename in argv0 (Herdr's process_argv0_name; Linux never reports
+	// argv0 at all). The worker is located by the claim pid, never by
+	// index: the fixture (like real Claude Code) spawns an MCP stand-in
+	// child into its own process group, and the raw listing order gives
+	// the worker no particular position.
 	wantExecutable := filepath.Join(server.base, "bin", "claude")
+	claimPID := querySQLite(t, filepath.Join(stateDir, "hop.db"), fmt.Sprintf("SELECT pid FROM launch_claims WHERE run_id = '%s';", runID))
 	info := server.processInfo(t, paneIDFromBinding(fields["binding"]))
 	if len(info.ForegroundProcesses) == 0 {
 		t.Fatalf("pane %s reports no foreground process after the run completed", fields["binding"])
 	}
-	fg := info.ForegroundProcesses[0]
+	workerIdx := -1
+	for i, p := range info.ForegroundProcesses {
+		if fmt.Sprint(p.PID) == claimPID {
+			workerIdx = i
+		}
+	}
+	if workerIdx < 0 {
+		t.Fatalf("the settled claim pid %s is not among the pane's foreground members: %+v", claimPID, info.ForegroundProcesses)
+	}
+	fg := info.ForegroundProcesses[workerIdx]
 	if len(fg.Argv) == 0 || fg.Argv[0] != wantExecutable {
 		t.Errorf("launched pane foreground argv[0] = %q, want %q verbatim", fg.Argv, wantExecutable)
 	}

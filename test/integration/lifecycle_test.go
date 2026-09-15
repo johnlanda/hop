@@ -69,11 +69,9 @@ func TestRealProcessDetachDistinctFromStop(t *testing.T) {
 	fields := fx.requireRunState(t, "running")
 
 	paneID := paneIDFromBinding(fields["binding"])
-	before := fx.server.processInfo(t, paneID)
-	if len(before.ForegroundProcesses) == 0 {
-		t.Fatalf("pane %s reports no foreground worker process before detach", paneID)
-	}
-	workerPID := before.ForegroundProcesses[0].PID
+	// Located by the claim's pid — never ForegroundProcesses[0], which is
+	// ordinarily the worker's MCP stand-in child, listed before it.
+	workerPID := fx.workerForegroundPID(t, paneID)
 
 	if err := fx.controller.leaderCmd.Process.Signal(syscall.SIGINT); err != nil {
 		t.Fatalf("send SIGINT to the hop run controller: %v", err)
@@ -105,11 +103,7 @@ func TestRealProcessDetachDistinctFromStop(t *testing.T) {
 		t.Errorf("lease state immediately after detach = %q, want \"released\" (detach releases at once, never waiting out the TTL)", leaseState)
 	}
 
-	after := fx.server.processInfo(t, paneID)
-	if len(after.ForegroundProcesses) == 0 {
-		t.Fatalf("pane %s reports no foreground worker process after detach; the worker must keep running", paneID)
-	}
-	if got := after.ForegroundProcesses[0].PID; got != workerPID {
+	if got := fx.workerForegroundPID(t, paneID); got != workerPID {
 		t.Errorf("worker pid after detach = %d, want unchanged %d (the worker must keep running, untouched by detach)", got, workerPID)
 	}
 }
