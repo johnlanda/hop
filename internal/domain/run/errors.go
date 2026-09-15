@@ -29,3 +29,79 @@ var ErrDuplicateResult = errors.New("run: duplicate result")
 // yet settled: the submission may become valid once the claim settles, and
 // the caller is expected to retry.
 var ErrTransientNotRunning = errors.New("run: attempt not yet running")
+
+// ErrDependencyCycle reports that a task dependency edge would close a
+// cycle in its run's dependency graph.
+var ErrDependencyCycle = errors.New("run: dependency cycle")
+
+// ErrDependencyNotIntegrated reports that a task is not release-eligible:
+// at least one prerequisite has not reached integrated.
+var ErrDependencyNotIntegrated = errors.New("run: dependency not integrated")
+
+// ErrDelegationDepth reports a one-level-delegation violation: a session
+// with a parent of its own was named as another session's parent.
+var ErrDelegationDepth = errors.New("run: delegation depth exceeded")
+
+// ErrDuplicateAnswer reports an answer resubmission whose body digest
+// matches the question's already-accepted answer. Callers treat this as
+// success, not failure; it is returned as an error only so acceptance has
+// one uniform (outcome, error) shape.
+var ErrDuplicateAnswer = errors.New("run: duplicate answer")
+
+// ErrConflictingAnswer reports an answer resubmission whose body digest
+// differs from the question's already-accepted answer. The accepted answer
+// is never replaced.
+var ErrConflictingAnswer = errors.New("run: conflicting answer")
+
+// ErrStaleAck reports an ack from an incarnation that is not the acking
+// session's current, non-superseded one.
+var ErrStaleAck = errors.New("run: stale ack")
+
+// ErrNotDelivered reports an ack of a message with no delivery row recorded
+// for the acking session itself: a predecessor session's delivery never
+// authorizes a successor's ack.
+var ErrNotDelivered = errors.New("run: message not delivered to this session")
+
+// ErrVerdictSubjectMismatch reports a review submission whose subject
+// commit and tree object IDs do not equal the review task's frozen
+// subject.
+var ErrVerdictSubjectMismatch = errors.New("run: verdict subject mismatch")
+
+// ErrRetryNotTerminal reports a retry request against a task whose most
+// recent attempt has not reached a terminal state.
+var ErrRetryNotTerminal = errors.New("run: prior attempt is not terminal")
+
+// ErrRetryLimit reports a retry request against a task that has already
+// reached its frozen retry limit.
+var ErrRetryLimit = errors.New("run: retry limit reached")
+
+// ErrRunNotAccepting reports a manager verb (CreateTask, RequestRetry,
+// ClosePlan) against a run that has left running.
+var ErrRunNotAccepting = errors.New("run: run is not accepting this request")
+
+// ErrEmptyPlan reports a plan closure attempted with zero implement tasks
+// created.
+var ErrEmptyPlan = errors.New("run: plan has no implement task")
+
+// ErrMailboxClosed reports a send addressed to a task whose mailbox
+// admission has closed.
+var ErrMailboxClosed = errors.New("run: mailbox is closed")
+
+// ErrRequestConflict reports a caller-stable request ID reused with
+// different request content than its original acceptance.
+var ErrRequestConflict = errors.New("run: request id reused with different content")
+
+// ErrMailboxNotClear reports a result or verdict submission whose task's
+// mailbox still has a queued or delivered-unacknowledged message: section
+// 5's drain-then-submit contract (`transient: undelivered messages; drain
+// with hop msg next, ack, then resubmit`). Distinct from ErrMailboxClosed:
+// a mailbox can be open yet not clear.
+var ErrMailboxNotClear = errors.New("run: mailbox has undelivered messages")
+
+// ErrTaskNotReleased reports a direct pending->active activation attempted
+// against a task that has dependencies: a dependent task must be released
+// (pending->ready, every prerequisite integrated) before it can activate.
+// A task with no dependencies is exempt (the Phase 2/solo legacy path,
+// where a task never carries a dependency graph and activates straight
+// from pending).
+var ErrTaskNotReleased = errors.New("run: task has dependencies and is not released")
