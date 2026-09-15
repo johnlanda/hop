@@ -1059,9 +1059,10 @@ func (s *fakeStore) LoadMessageDetail(_ context.Context, runID identity.RunID, m
 // callers sort as their rendering requires. WorktreePath is always "":
 // Worktree (internal/domain/run) is still the Phase 2 one-row-per-run
 // shape (no attempt linkage), so a per-attempt worktree path is not yet
-// resolvable from any repository this slice owns — recorded as a known
-// gap for whichever later slice adds attempt-linked worktree tracking.
-// Callers hold s.mu.
+// resolvable from any repository this slice owns. Per the manager: slice
+// 3's migration adds attempt_id and base_commit to worktrees, at which
+// point this field resolves for real — left "" here deliberately rather
+// than guessed. Callers hold s.mu.
 func (s *fakeStore) tasksSummaryLocked(runID identity.RunID) []app.TaskSummary {
 	var out []app.TaskSummary
 	for id, row := range s.Tasks {

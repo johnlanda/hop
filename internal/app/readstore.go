@@ -25,7 +25,10 @@ type RunStatus struct {
 // TaskSummary is one row of RunDetail's feature-mode task table (section
 // 3's ReadStore extension): a task's identity, kind, state, dependency
 // edges and attempt count, for `hop status -run`. WorktreePath is the
-// task's current attempt's worktree, "" when none exists yet.
+// task's current attempt's worktree, "" when none exists yet — also ""
+// until a later slice's migration links a Worktree row to the attempt
+// that created it (Worktree is still the Phase 2 one-row-per-run shape
+// today; slice 3's migration adds attempt_id and base_commit).
 type TaskSummary struct {
 	TaskID       identity.TaskID
 	Seq          int
