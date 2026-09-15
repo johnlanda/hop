@@ -130,7 +130,7 @@ func runRun(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 
 	ctrl, closeStore, err := d.openController(ctx, controllerConfig{stateRoot: stateRoot, socketPath: *socketPath, withRuntime: true})
 	if err != nil {
-		_, werr := fmt.Fprintf(stderr, "hop run: %v\n", err)
+		_, werr := fmt.Fprintf(stderr, "hop run: %s\n", describeStoreOpenFailure(err, "the resolved state root"))
 		return exitFailure, werr
 	}
 	defer closeStore() //nolint:errcheck // the store closes on process exit either way; commands report command errors, not pool teardown.

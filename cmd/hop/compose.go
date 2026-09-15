@@ -139,6 +139,26 @@ func openController(ctx context.Context, cfg controllerConfig) (controllerAPI, f
 	return controller, store.Close, nil
 }
 
+// describeStoreOpenFailure classifies a store-open failure into a fixed,
+// value-free diagnostic: the raw error chain carries the state-root path —
+// in a worker context, the complete HOP_STATE_DIR value — so the wrapped
+// error is never printed. location names where the root came from
+// ("HOP_STATE_DIR" for worker commands; "the resolved state root" for
+// controller commands, whose path hop doctor prints by design). Only
+// error CATEGORIES established through errors.Is are surfaced.
+func describeStoreOpenFailure(err error, location string) string {
+	category := "the state root could not be created or the database could not be opened"
+	switch {
+	case errors.Is(err, syscall.ENOTDIR):
+		category = "a path element is not a directory"
+	case errors.Is(err, os.ErrPermission):
+		category = "permission denied creating or opening the store"
+	case errors.Is(err, os.ErrNotExist):
+		category = "a required path element does not exist"
+	}
+	return fmt.Sprintf("cannot open the state store under %s: %s (the configured value is never echoed; run hop doctor to inspect the resolved state root)", location, category)
+}
+
 // waitInterval blocks for d or until ctx is done, returning ctx's error in
 // that case. It is the production pacing primitive of the controller loop;
 // tests substitute a fake that advances a fake clock instead of sleeping.

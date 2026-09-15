@@ -16,7 +16,7 @@ prepare use cases and then exec through the process adapter.
 | File | Entities / functions | Responsibility |
 | --- | --- | --- |
 | [main.go](main.go) | `main`, `run`, `dispatch`, `printUsage`, `exitOK`, `exitFailure`, `exitUsage` | Entry point; maps a command name to its handler (worker plumbing listed under its own usage heading) and a failed write to `exitFailure` |
-| [compose.go](compose.go) | `controllerAPI`, `controllerConfig`, `deps`, `defaultDeps`, `openController`, `waitInterval`, `lookupExecutable` | The composition root proper: opens the SQLite store under the resolved state root, wires the system/process/config adapters and — for pane-acting commands — the Herdr runtime (compile-time `app.Runtime` assertion) into one `app.Controller`; `deps` carries every effectful seam (env, clock, wait, signals, exec, store opening) so command tests substitute fakes; `lookupExecutable` implements `app.ExecutableLookup` over the sanitized PATH |
+| [compose.go](compose.go) | `controllerAPI`, `controllerConfig`, `deps`, `defaultDeps`, `openController`, `describeStoreOpenFailure`, `waitInterval`, `lookupExecutable` | The composition root proper: opens the SQLite store under the resolved state root, wires the system/process/config adapters and — for pane-acting commands — the Herdr runtime (compile-time `app.Runtime` assertion) into one `app.Controller`; `deps` carries every effectful seam (env, clock, wait, signals, exec, store opening) so command tests substitute fakes; `lookupExecutable` implements `app.ExecutableLookup` over the sanitized PATH |
 | [stateroot.go](stateroot.go) | `resolveStateRoot`, `requireWorkerStateRoot` | The design's single state-root rule: `${XDG_STATE_HOME:-$HOME/.local/state}/hop` with `HOP_STATE_DIR` as the only override (relative refused); worker contexts REQUIRE the launch-provided absolute `HOP_STATE_DIR` and never fall back |
 | [loop.go](loop.go) | `runControllerLoop`, `runHeartbeats`, `loopResult`, `detachAndReport`, `releaseQuietly`, `resolveRunArg`, `seqLabel`, `exitForRunState` | The foreground controller loop: concurrent 10s heartbeats under the 30s TTL, one line per run transition, launch corroboration, stop routing, 2s check polling; run arguments resolve as UUIDs or `r<seq>` labels |
 | [runcmd.go](runcmd.go) | `runRun`, `finishControllerLoop`, `watchDetachSignals`, `resolveRepositoryRoot`, `hopExecutablePath`, `stringList` | `hop run "<brief>"`: StartRun, the start line, then the loop; SIGINT/SIGTERM detach (second signal force-exits); `ErrStartRefused` maps to exit 2 |
@@ -37,6 +37,11 @@ commands expect the built binary at `.bin/hop` (see `make build`).
 
 ## Invariants
 
+- A store-open failure is rendered only through
+  `describeStoreOpenFailure`: a classified, value-free line naming where
+  the root came from (`HOP_STATE_DIR` for worker commands, the resolved
+  state root for controller commands) — the raw sqlite/filesystem error
+  chain carries the complete path and is never printed.
 - Exit codes: 0 success, 1 failure, 2 usage. `hop run`/`hop resume` exit 0
   only on a `completed` run; failed, stopped, detach and errors exit 1; a
   StartRun refusal before any side effect (`app.ErrStartRefused`) is usage.

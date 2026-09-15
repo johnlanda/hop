@@ -83,7 +83,7 @@ func runResultSubmit(args []string, stdout, stderr io.Writer, d *deps) (int, err
 	defer cancel()
 	ctrl, closeStore, err := d.openController(ctx, controllerConfig{stateRoot: stateRoot})
 	if err != nil {
-		_, werr := fmt.Fprintf(stderr, "hop result submit: %v\n", err)
+		_, werr := fmt.Fprintf(stderr, "hop result submit: %s\n", describeStoreOpenFailure(err, "HOP_STATE_DIR"))
 		return exitFailure, werr
 	}
 	defer closeStore() //nolint:errcheck // the store closes on process exit either way; commands report command errors, not pool teardown.

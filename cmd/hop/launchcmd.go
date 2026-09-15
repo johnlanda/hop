@@ -58,7 +58,7 @@ func runLaunch(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 	defer cancel()
 	ctrl, closeStore, err := d.openController(ctx, controllerConfig{stateRoot: stateRoot})
 	if err != nil {
-		_, werr := fmt.Fprintf(stderr, "hop launch: %v\n", err)
+		_, werr := fmt.Fprintf(stderr, "hop launch: %s\n", describeStoreOpenFailure(err, "HOP_STATE_DIR"))
 		return exitFailure, werr
 	}
 	defer closeStore() //nolint:errcheck // an exec success never reaches this; on failure the store closes on process exit either way.

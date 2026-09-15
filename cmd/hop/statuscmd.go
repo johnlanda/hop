@@ -48,7 +48,7 @@ func runStatus(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 	defer cancel()
 	ctrl, closeStore, err := d.openController(ctx, controllerConfig{stateRoot: stateRoot})
 	if err != nil {
-		_, werr := fmt.Fprintf(stderr, "hop status: %v\n", err)
+		_, werr := fmt.Fprintf(stderr, "hop status: %s\n", describeStoreOpenFailure(err, "the resolved state root"))
 		return exitFailure, werr
 	}
 	defer closeStore() //nolint:errcheck // the store closes on process exit either way; commands report command errors, not pool teardown.
