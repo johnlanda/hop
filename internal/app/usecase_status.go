@@ -17,11 +17,15 @@ type StatusRequest struct {
 
 // RunSummaryView is one rendered line of `hop status` without -run.
 type RunSummaryView struct {
-	RunID       string
-	Sequence    int
-	State       string
-	Reconciling bool
-	UpdatedAt   time.Time
+	RunID    string
+	Sequence int
+	State    string
+	// StopRequested mirrors the run's monotonic stop flag, so a foreground
+	// controller can route to stop handling when hop stop was requested
+	// elsewhere.
+	StopRequested bool
+	Reconciling   bool
+	UpdatedAt     time.Time
 }
 
 // RunDetailView is the full detail block `hop status -run` renders. Every
@@ -85,7 +89,7 @@ func (c *Controller) Status(ctx context.Context, req StatusRequest) (StatusResul
 func runSummaryView(s RunStatus) RunSummaryView {
 	return RunSummaryView{
 		RunID: s.RunID.String(), Sequence: s.Sequence, State: string(s.State),
-		Reconciling: s.Reconciling, UpdatedAt: s.UpdatedAt,
+		StopRequested: s.StopRequested, Reconciling: s.Reconciling, UpdatedAt: s.UpdatedAt,
 	}
 }
 
