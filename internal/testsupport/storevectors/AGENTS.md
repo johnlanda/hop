@@ -16,7 +16,7 @@ shared vector catches, since both sides run the same input.
 
 | File | Entities / functions | Responsibility |
 | --- | --- | --- |
-| [storevectors.go](storevectors.go) | `TaskCreateSelfDependency`, `TaskCreateRequestIDConflictFirst`/`Second`, `TaskCreateNonManagerCaller`, `TaskCreateOversizedTitle`, `AckMessageStaleIncarnation`, `MessageSendAnswerUnknownQuestion` | Six vectors: a malformed dependency graph, a reused request-ID with conflicting content, a non-manager caller, an oversized title, a stale acking incarnation, and an answer replying to an unknown question — one function per vector, each returning the exact `app.TaskCreate`/`app.MessageAck`/`app.MessageSend` value to pass to the port method its doc comment names |
+| [storevectors.go](storevectors.go) | `TaskCreateSelfDependency`, `TaskCreateRequestIDConflictFirst`/`Second`, `TaskCreateNonManagerCaller`, `TaskCreateOversizedTitle`, `AckMessageStaleIncarnation`, `MessageSendAnswerUnknownQuestion`, `MessageSendCrossRun`, `MessageFetchCrossRun`, `AckMessageCrossRun` | Nine vectors: a malformed dependency graph, a reused request-ID with conflicting content, a non-manager caller, an oversized title, a stale acking incarnation, an answer replying to an unknown question, and a send/fetch/ack from a session belonging to a DIFFERENT run than the request claims — one function per vector, each returning the exact `app.TaskCreate`/`app.MessageAck`/`app.MessageSend`/`app.MessageFetch` value to pass to the port method its doc comment names |
 
 ## Invariants
 

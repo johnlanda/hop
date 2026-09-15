@@ -277,6 +277,89 @@ func TestSendMessageValidation(t *testing.T) {
 			t.Fatalf("SendMessage() over a solo Controller succeeded; want ErrFeatureModeUnsupported")
 		}
 	})
+
+	t.Run("a session claiming a different run is refused before the body is ever written", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		fr1 := seedFeatureRun(t, tc, 2)
+		fr2 := seedFeatureRun(t, tc, 2)
+
+		// fr1's manager session, but the request claims fr2 as its run —
+		// the exact cross-run authentication gap the review found: the
+		// driving use case must refuse this BEFORE writing the body
+		// artifact or calling the store at all.
+		result, err := tc.Controller.SendMessage(context.Background(), app.SendMessageRequest{
+			RunID: fr2.RunID.String(), SessionID: fr1.ManagerID.String(), IncarnationID: fr1.ManagerIncarnation.String(),
+			StateRoot: "/state", To: "human", Kind: "question", Body: []byte("cross-run?"),
+		})
+		if err != nil {
+			t.Fatalf("SendMessage() error = %v", err)
+		}
+		if result.Outcome != string(app.MessageRefused) {
+			t.Fatalf("SendMessage(cross-run) = %+v, want refused", result)
+		}
+		if len(tc.Store.Messages) != 0 {
+			t.Fatalf("a cross-run send must not create a message")
+		}
+		if len(tc.Artifacts.files) != 0 {
+			t.Fatalf("a cross-run send must not write the body artifact")
+		}
+	})
+}
+
+// TestFetchMessageCrossRunRefused proves the driving use case refuses a
+// session claiming a different run than its own before ever calling the
+// store — the same gap TestSendMessageValidation's cross-run subtest
+// covers for SendMessage.
+func TestFetchMessageCrossRunRefused(t *testing.T) {
+	tc := newTestController(defaultPolicy())
+	fr1 := seedFeatureRun(t, tc, 2)
+	fr2 := seedFeatureRun(t, tc, 2)
+
+	_, err := tc.Controller.FetchMessage(context.Background(), app.FetchMessageRequest{
+		RunID: fr2.RunID.String(), SessionID: fr1.ManagerID.String(), IncarnationID: fr1.ManagerIncarnation.String(),
+	})
+	if !errors.Is(err, app.ErrMessagingUnauthorized) {
+		t.Fatalf("FetchMessage(cross-run) error = %v, want ErrMessagingUnauthorized", err)
+	}
+}
+
+// TestAckMessageCrossRunRefused proves the driving use case refuses a
+// session claiming a different run than its own before ever calling the
+// store, distinct from TestAckMessageRequiresOwnDelivery's own-run-but-
+// never-delivered case.
+func TestAckMessageCrossRunRefused(t *testing.T) {
+	tc := newTestController(defaultPolicy())
+	fr1 := seedFeatureRun(t, tc, 2)
+	fr2 := seedFeatureRun(t, tc, 2)
+	taskB := seedImplementTask(t, tc, fr1.RunID, 1, "B", false, run.TaskReady)
+	workerID, workerIncarnation := seedWorkerSession(t, tc, fr1, taskB)
+	ctx := context.Background()
+
+	send, err := tc.Controller.SendMessage(ctx, app.SendMessageRequest{
+		RunID: fr1.RunID.String(), SessionID: workerID.String(), IncarnationID: workerIncarnation.String(),
+		StateRoot: "/state", To: "manager", Kind: "question", Body: []byte("q?"),
+	})
+	if err != nil {
+		t.Fatalf("SendMessage() error = %v", err)
+	}
+	if _, fetchErr := tc.Controller.FetchMessage(ctx, app.FetchMessageRequest{
+		RunID: fr1.RunID.String(), SessionID: fr1.ManagerID.String(), IncarnationID: fr1.ManagerIncarnation.String(),
+	}); fetchErr != nil {
+		t.Fatalf("FetchMessage() error = %v", fetchErr)
+	}
+
+	// fr2's manager session, but the request claims fr1 (the message's
+	// actual run) — an unrelated run's session acking someone else's
+	// message.
+	ack, err := tc.Controller.AckMessage(ctx, app.AckMessageRequest{
+		RunID: fr1.RunID.String(), MessageID: send.MessageID, SessionID: fr2.ManagerID.String(), IncarnationID: fr2.ManagerIncarnation.String(),
+	})
+	if err != nil {
+		t.Fatalf("AckMessage() error = %v", err)
+	}
+	if ack.Outcome != string(app.AckRefused) {
+		t.Fatalf("AckMessage(cross-run) = %+v, want refused", ack)
+	}
 }
 
 func TestAckMessageRequiresOwnDelivery(t *testing.T) {

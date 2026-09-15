@@ -106,6 +106,9 @@ func (c *Controller) SendMessage(ctx context.Context, req SendMessageRequest) (S
 	if err != nil {
 		return SendMessageResult{}, fmt.Errorf("app: load messaging context: %w", err)
 	}
+	if msgCtx.RunID != runID {
+		return SendMessageResult{Outcome: string(MessageRefused), Detail: "session does not belong to this run"}, nil
+	}
 
 	msgID, err := identity.ParseMessageID(c.IDs.NewID())
 	if err != nil {
@@ -183,6 +186,9 @@ func (c *Controller) FetchMessage(ctx context.Context, req FetchMessageRequest) 
 	if err != nil {
 		return FetchMessageResult{}, fmt.Errorf("app: load messaging context: %w", err)
 	}
+	if msgCtx.RunID != runID {
+		return FetchMessageResult{}, fmt.Errorf("%w: session does not belong to run %s", ErrMessagingUnauthorized, runID)
+	}
 
 	delivery, ok, err := c.Messages.FetchNextMessage(ctx, MessageFetch{
 		RunID: runID, SessionID: sessionID, IncarnationID: incarnationID, Address: msgCtx.Address,
@@ -231,6 +237,10 @@ func (c *Controller) AckMessage(ctx context.Context, req AckMessageRequest) (Ack
 	if c.Messages == nil {
 		return AckMessageResult{}, fmt.Errorf("%w: AckMessage", ErrFeatureModeUnsupported)
 	}
+	wf, err := RequireWorkflowReadStore(c.Read, "AckMessage")
+	if err != nil {
+		return AckMessageResult{}, err
+	}
 	runID, err := identity.ParseRunID(req.RunID)
 	if err != nil {
 		return AckMessageResult{}, fmt.Errorf("app: parse run id: %w", err)
@@ -246,6 +256,13 @@ func (c *Controller) AckMessage(ctx context.Context, req AckMessageRequest) (Ack
 	incarnationID, err := identity.ParseIncarnationID(req.IncarnationID)
 	if err != nil {
 		return AckMessageResult{}, fmt.Errorf("app: parse incarnation id: %w", err)
+	}
+	msgCtx, err := wf.LoadMessagingContext(ctx, sessionID)
+	if err != nil {
+		return AckMessageResult{}, fmt.Errorf("app: load messaging context: %w", err)
+	}
+	if msgCtx.RunID != runID {
+		return AckMessageResult{Outcome: string(AckRefused), Detail: "session does not belong to this run"}, nil
 	}
 	outcome, err := c.Messages.AckMessage(ctx, MessageAck{
 		RunID: runID, MessageID: messageID, SessionID: sessionID, IncarnationID: incarnationID,

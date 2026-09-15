@@ -125,3 +125,39 @@ func MessageSendAnswerUnknownQuestion(runID identity.RunID, session identity.Ses
 		BodyPath: bodyPath, BodyDigest: bodyDigest, BodyBytes: bodyBytes,
 	}
 }
+
+// MessageSendCrossRun returns a MessagingStore.SendMessage request whose
+// sender session belongs to a DIFFERENT run than claimedRunID names —
+// refused app.MessageRefused, detail "session does not belong to this
+// run": every messaging verb resolves the caller's session and requires
+// session.RunID == the request's stated run; the stated RunID is a
+// caller-supplied field, never authoritative on its own. Kind is fixed to
+// MessageQuestion: the cross-run check runs before addressing legality,
+// but callers must still pass a (senderAddress, recipient) pair
+// ValidateSendAddressing would otherwise accept (e.g. ManagerAddress to
+// HumanAddress), or a passing test would prove nothing — an addressing
+// refusal and a cross-run refusal share the same outcome kind.
+func MessageSendCrossRun(claimedRunID identity.RunID, session identity.SessionID, senderAddress run.Address, incarnation identity.IncarnationID, messageID identity.MessageID, recipient run.Address, bodyPath, bodyDigest string, bodyBytes int64) app.MessageSend {
+	return app.MessageSend{
+		ID: messageID, RunID: claimedRunID, Sender: run.SessionPrincipal(session), SenderAddress: senderAddress,
+		IncarnationID: incarnation, Recipient: recipient, Kind: run.MessageQuestion,
+		BodyPath: bodyPath, BodyDigest: bodyDigest, BodyBytes: bodyBytes,
+	}
+}
+
+// MessageFetchCrossRun returns a MessagingStore.FetchNextMessage request
+// whose session belongs to a DIFFERENT run than claimedRunID names —
+// refused app.ErrMessagingUnauthorized: FetchNextMessage independently
+// re-derives the session's own run, current incarnation and resolved
+// address rather than trusting any of MessageFetch's caller-supplied
+// fields.
+func MessageFetchCrossRun(claimedRunID identity.RunID, session identity.SessionID, incarnation identity.IncarnationID, address run.Address) app.MessageFetch {
+	return app.MessageFetch{RunID: claimedRunID, SessionID: session, IncarnationID: incarnation, Address: address}
+}
+
+// AckMessageCrossRun returns a MessagingStore.AckMessage request whose
+// session belongs to a DIFFERENT run than claimedRunID names — refused
+// app.AckRefused, detail "session does not belong to this run".
+func AckMessageCrossRun(claimedRunID identity.RunID, messageID identity.MessageID, session identity.SessionID, incarnation identity.IncarnationID) app.MessageAck {
+	return app.MessageAck{RunID: claimedRunID, MessageID: messageID, SessionID: session, IncarnationID: incarnation}
+}

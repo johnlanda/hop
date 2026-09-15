@@ -107,10 +107,14 @@ type WorkflowReadStore interface {
 	// pending-intent resolution is session-keyed, matching the
 	// session-keyed claim fallback (section 3/4).
 	LoadSessionLaunchContext(ctx context.Context, runID identity.RunID, session identity.SessionID) (SessionLaunchContext, error)
-	// LoadMessagingContext resolves session's logical address (manager,
-	// task:<id> via its attempt's task, lineage-based so a successor
-	// session resolves the same address as its predecessor) and current
-	// incarnation, for the message CLI verbs.
+	// LoadMessagingContext resolves session's OWN run, logical address
+	// (manager, task:<id> via its attempt's task, lineage-based so a
+	// successor session resolves the same address as its predecessor) and
+	// current incarnation, for the message CLI verbs. Every driving
+	// messaging use case compares the returned RunID against its own
+	// caller-supplied one and refuses a mismatch before any side effect —
+	// a session belongs to exactly one run, and this is the ONLY
+	// authoritative source for which one.
 	LoadMessagingContext(ctx context.Context, session identity.SessionID) (MessagingContext, error)
 	// LoadMessageDetail is `hop msg show`'s entire lookup: a message's
 	// immutable envelope plus its full delivery/ack history, addressed by
@@ -300,8 +304,13 @@ type SessionLaunchContext struct {
 }
 
 // MessagingContext is LoadMessagingContext's result: the caller session's
-// resolved logical address and current incarnation, lease-free.
+// OWN run (never the caller-supplied one — every driving messaging use
+// case must compare this against its own parsed RunID and refuse a
+// mismatch before any side effect, since a session belongs to exactly one
+// run and nothing else may authorize a cross-run request), resolved
+// logical address and current incarnation, lease-free.
 type MessagingContext struct {
+	RunID         identity.RunID
 	Address       run.Address
 	IncarnationID identity.IncarnationID
 	StopRequested bool

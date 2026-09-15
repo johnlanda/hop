@@ -413,6 +413,14 @@ func (s *fakeStore) SendMessage(_ context.Context, send app.MessageSend) (app.Me
 	if !ok {
 		return app.MessageOutcome{Kind: app.MessageMalformed, Detail: "unknown run"}, nil
 	}
+	// The sender session's OWN run is the only authoritative source for
+	// which run it may act in — send.RunID is a caller-supplied field,
+	// never trusted on its own (a current session for run A must not be
+	// able to supply run B and act against B's messages).
+	senderRow, ok := s.Sessions[send.Sender.SessionID]
+	if !ok || senderRow.value.RunID != send.RunID {
+		return app.MessageOutcome{Kind: app.MessageRefused, Detail: "session does not belong to this run"}, nil
+	}
 	binding, hasBinding := s.currentBindingLocked(send.Sender.SessionID)
 	if !hasBinding || binding.IncarnationID != send.IncarnationID || binding.Superseded {
 		return app.MessageOutcome{Kind: app.MessageRefused, Detail: "incarnation is not current"}, nil
@@ -536,6 +544,25 @@ func (s *fakeStore) FetchNextMessage(_ context.Context, fetch app.MessageFetch) 
 	defer s.mu.Unlock()
 	now := s.clock.Now()
 
+	// FetchNextMessage has no outcome-kind field to carry a business
+	// refusal (an empty fetch's ok-false already means "nothing queued"),
+	// so every one of the four caller-supplied identity fields is
+	// independently re-derived from the session row itself and compared —
+	// never trusted at face value, exactly like SendMessage/AckMessage
+	// (ErrMessagingUnauthorized's own doc comment).
+	sessionRow, ok := s.Sessions[fetch.SessionID]
+	if !ok || sessionRow.value.RunID != fetch.RunID {
+		return app.MessageDelivery{}, false, fmt.Errorf("%w: session %s does not belong to run %s", app.ErrMessagingUnauthorized, fetch.SessionID, fetch.RunID)
+	}
+	binding, hasBinding := s.currentBindingLocked(fetch.SessionID)
+	if !hasBinding || binding.IncarnationID != fetch.IncarnationID || binding.Superseded {
+		return app.MessageDelivery{}, false, fmt.Errorf("%w: session %s incarnation %s is not current", app.ErrMessagingUnauthorized, fetch.SessionID, fetch.IncarnationID)
+	}
+	resolvedAddress, ok := s.resolveSessionAddressLocked(fetch.SessionID)
+	if !ok || !resolvedAddress.Equal(fetch.Address) {
+		return app.MessageDelivery{}, false, fmt.Errorf("%w: session %s does not resolve to address %s", app.ErrMessagingUnauthorized, fetch.SessionID, app.AddressString(fetch.Address))
+	}
+
 	var queue []run.Message
 	for _, m := range s.Messages { //nolint:gocritic // rangeValCopy: test fake; the domain snapshot is small and read-only here, and indexing would only obscure the loop.
 		if m.RunID == fetch.RunID && m.Recipient.Equal(fetch.Address) {
@@ -570,6 +597,13 @@ func (s *fakeStore) AckMessage(_ context.Context, ack app.MessageAck) (app.Messa
 	msg, ok := s.Messages[ack.MessageID]
 	if !ok || msg.RunID != ack.RunID {
 		return app.MessageAckOutcome{Kind: app.AckRefused, Detail: "unknown message"}, nil
+	}
+	// The acking session's OWN run is the only authoritative source for
+	// which run it may act in — ack.RunID is a caller-supplied field,
+	// never trusted on its own.
+	ackerRow, ok := s.Sessions[ack.SessionID]
+	if !ok || ackerRow.value.RunID != ack.RunID {
+		return app.MessageAckOutcome{Kind: app.AckRefused, Detail: "session does not belong to this run"}, nil
 	}
 	msg = s.reconstructMessageStateLocked(msg)
 
@@ -1038,7 +1072,7 @@ func (s *fakeStore) LoadMessagingContext(_ context.Context, session identity.Ses
 	if !ok {
 		return app.MessagingContext{}, fmt.Errorf("%w: run %s", app.ErrNotFound, sRow.value.RunID)
 	}
-	out := app.MessagingContext{Address: address, StopRequested: rRow.value.StopRequested}
+	out := app.MessagingContext{RunID: sRow.value.RunID, Address: address, StopRequested: rRow.value.StopRequested}
 	if binding, ok := s.currentBindingLocked(session); ok {
 		out.IncarnationID = binding.IncarnationID
 	}

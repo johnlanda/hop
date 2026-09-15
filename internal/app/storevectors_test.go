@@ -2,6 +2,7 @@ package app_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/johnlanda/hop/internal/app"
@@ -155,6 +156,90 @@ func TestStoreVectors(t *testing.T) {
 		}
 		if got.Kind != app.MessageMalformed {
 			t.Fatalf("SendMessage(answer to unknown question) = %+v, want malformed", got)
+		}
+	})
+
+	t.Run("MessageSendCrossRun", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		fr1 := seedFeatureRun(t, tc, 2)
+		fr2 := seedFeatureRun(t, tc, 2)
+		messageID, err := identity.ParseMessageID(tc.IDs.NewID())
+		if err != nil {
+			t.Fatalf("parse message id: %v", err)
+		}
+
+		// fr1's manager session, but the request claims fr2 as its run.
+		got, err := tc.Controller.Messages.SendMessage(context.Background(), storevectors.MessageSendCrossRun(
+			fr2.RunID, fr1.ManagerID, run.ManagerAddress(), fr1.ManagerIncarnation, messageID, run.HumanAddress(), "/state/body.md", "digest", 3,
+		))
+		if err != nil {
+			t.Fatalf("SendMessage() error = %v", err)
+		}
+		if got.Kind != app.MessageRefused {
+			t.Fatalf("SendMessage(cross-run) = %+v, want refused", got)
+		}
+		if _, exists := tc.Store.Messages[messageID]; exists {
+			t.Fatalf("SendMessage(cross-run) must not create a message")
+		}
+	})
+
+	t.Run("MessageFetchCrossRun", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		fr1 := seedFeatureRun(t, tc, 2)
+		fr2 := seedFeatureRun(t, tc, 2)
+
+		// fr1's manager session, but the request claims fr2 as its run.
+		_, ok, err := tc.Controller.Messages.FetchNextMessage(context.Background(), storevectors.MessageFetchCrossRun(
+			fr2.RunID, fr1.ManagerID, fr1.ManagerIncarnation, run.ManagerAddress(),
+		))
+		if ok {
+			t.Fatalf("FetchNextMessage(cross-run) reported a delivery; want refused")
+		}
+		if !errors.Is(err, app.ErrMessagingUnauthorized) {
+			t.Fatalf("FetchNextMessage(cross-run) error = %v, want ErrMessagingUnauthorized", err)
+		}
+	})
+
+	t.Run("AckMessageCrossRun", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		fr1 := seedFeatureRun(t, tc, 2)
+		fr2 := seedFeatureRun(t, tc, 2)
+		taskB := seedImplementTask(t, tc, fr1.RunID, 1, "B", false, run.TaskReady)
+		workerID, workerIncarnation := seedWorkerSession(t, tc, fr1, taskB)
+
+		send, err := tc.Controller.SendMessage(context.Background(), app.SendMessageRequest{
+			RunID: fr1.RunID.String(), SessionID: workerID.String(), IncarnationID: workerIncarnation.String(),
+			StateRoot: "/state", To: "manager", Kind: "question", Body: []byte("q?"),
+		})
+		if err != nil {
+			t.Fatalf("SendMessage() error = %v", err)
+		}
+		messageID, err := identity.ParseMessageID(send.MessageID)
+		if err != nil {
+			t.Fatalf("parse message id: %v", err)
+		}
+
+		// A delivery row for fr2's manager, seeded directly rather than
+		// through FetchNextMessage (whose own cross-run refusal — the
+		// MessageFetchCrossRun vector above — would otherwise make this
+		// row impossible to create honestly): this isolates the ack-side
+		// cross-run check from the ALSO-true "never delivered to this
+		// session" refusal (TestAckMessageRequiresOwnDelivery) that would
+		// otherwise produce the identical outcome for an unrelated
+		// reason, defense in depth against exactly this kind of
+		// already-corrupt row.
+		tc.Store.MessageDeliveries[messageID] = append(tc.Store.MessageDeliveries[messageID], run.Delivery{
+			MessageID: messageID, SessionID: fr2.ManagerID, IncarnationID: fr2.ManagerIncarnation, At: tc.Clock.Now(),
+		})
+
+		// fr2's manager session, but the request claims fr1 (the
+		// message's actual run) — a cross-run ack attempt.
+		got, err := tc.Controller.Messages.AckMessage(context.Background(), storevectors.AckMessageCrossRun(fr1.RunID, messageID, fr2.ManagerID, fr2.ManagerIncarnation))
+		if err != nil {
+			t.Fatalf("AckMessage() error = %v", err)
+		}
+		if got.Kind != app.AckRefused {
+			t.Fatalf("AckMessage(cross-run) = %+v, want refused", got)
 		}
 	})
 }

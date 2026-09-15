@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 
 	"github.com/johnlanda/hop/internal/domain/identity"
 	"github.com/johnlanda/hop/internal/domain/run"
@@ -16,6 +17,23 @@ const (
 	// MessageBodyInlineLimit bounds an inline body (`--body`).
 	MessageBodyInlineLimit = 4 * 1024
 )
+
+// ErrMessagingUnauthorized reports that FetchNextMessage's caller session
+// is not authorized for the fetch it claims: the session does not belong
+// to the stated run, its current incarnation does not match the one
+// claimed, or its resolved logical address does not match the one
+// claimed. FetchNextMessage has no outcome-kind field to carry a business
+// refusal the way SendMessage/AckMessage/AnswerQuestion do (an empty
+// fetch's ok-false already means "nothing queued"), so this is that
+// signal instead — every implementation validates all three independently
+// of whatever the driving use case already checked (section 7: "all
+// validate the caller's session and incarnation currency"), since a
+// direct caller of the port, or a future real adapter, must refuse
+// exactly like the fake does, never trust a caller-supplied identity
+// field at face value. SendMessage and AckMessage express the identical
+// session/run/incarnation validation through their own MessageOutcomeKind/
+// MessageAckOutcomeKind (Refused), never through this error.
+var ErrMessagingUnauthorized = errors.New("app: messaging session is not authorized for this request")
 
 // AddressString renders a's canonical, stable form for the request digest
 // and for equality/logging: "manager", "human" or "task:<uuid>". Never
@@ -160,12 +178,29 @@ type HumanAnswer struct {
 // empty FetchNextMessage is the one deliberate exception to "every outcome
 // leaves evidence": it commits nothing, so a 1s poll loop cannot grow the
 // store.
+//
+// "Validated by the caller's session" is never satisfied by trusting a
+// caller-supplied field at face value: SendMessage/FetchNextMessage/
+// AckMessage each independently resolve the caller SessionID's OWN
+// current run and (Fetch) resolved address, and refuse when they disagree
+// with the request's stated RunID/Address — a session belongs to exactly
+// one run, and only the session row itself is authoritative for which
+// one. This holds even when a driving use case already performed the
+// identical check (SendMessage/FetchMessage/AckMessage,
+// usecase_message.go, via WorkflowReadStore.LoadMessagingContext): a
+// direct caller of this port must be refused exactly like one that went
+// through the use case.
 type MessagingStore interface {
 	SendMessage(ctx context.Context, send MessageSend) (MessageOutcome, error)
 	// FetchNextMessage serves the in-flight delivered-unacknowledged
 	// message for fetch.Address if one exists, else the lowest-enqueue-
 	// sequence queued message. ok is false for an empty fetch, which
-	// commits neither a delivery row nor a receipt.
+	// commits neither a delivery row nor a receipt. Validates, before
+	// touching the queue: fetch.SessionID exists and belongs to
+	// fetch.RunID; its current, non-superseded binding's incarnation
+	// equals fetch.IncarnationID; and its resolved logical address equals
+	// fetch.Address — any disagreement is ErrMessagingUnauthorized, never
+	// silently treated as an empty fetch.
 	FetchNextMessage(ctx context.Context, fetch MessageFetch) (MessageDelivery, bool, error)
 	AckMessage(ctx context.Context, ack MessageAck) (MessageAckOutcome, error)
 	AnswerQuestion(ctx context.Context, answer HumanAnswer) (MessageOutcome, error)
