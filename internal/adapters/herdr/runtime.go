@@ -374,12 +374,14 @@ type processInfoProcess struct {
 // InspectPane returns the occupant identity used by every launch, stop and
 // adoption decision. Herdr's pane_not_found error from this method means
 // either no such pane, or a pane that exists but has no live runtime yet;
-// ErrPaneNotFound covers both so the caller can classify "no runtime"
-// apart from every other failure.
+// the returned error wraps both app.ErrPaneNotFound (the port's "positively
+// does not exist" absence contract) and this adapter's own ErrPaneNotFound
+// in that case, and only that case — every other failure (transport,
+// protocol, a wrong-typed response) satisfies neither.
 func (r *Runtime) InspectPane(ctx context.Context, paneID string) (app.PaneProcess, error) {
 	var result processInfoResult
 	if err := r.client.Call(ctx, "pane.process_info", processInfoParams{PaneID: paneID}, &result); err != nil {
-		return app.PaneProcess{}, wrapPaneError("inspect", paneID, err)
+		return app.PaneProcess{}, wrapInspectPaneError(paneID, err)
 	}
 	if result.Type != "pane_process_info" {
 		return app.PaneProcess{}, protocolErrorf("pane.process_info result type %q, want pane_process_info", result.Type)
@@ -444,4 +446,43 @@ func wrapPaneError(action, paneID string, err error) error {
 		return fmt.Errorf("%s pane %s: %w", action, paneID, ErrPaneNotFound)
 	}
 	return fmt.Errorf("%s pane %s: %w", action, paneID, err)
+}
+
+// wrapInspectPaneError adds pane-address context to InspectPane's Call
+// error. Herdr's pane_not_found code becomes an error satisfying
+// errors.Is for both app.ErrPaneNotFound — the app.Runtime port's exact
+// "positively does not exist" absence contract InspectPane's callers rely
+// on — and this adapter's own ErrPaneNotFound; every other error keeps its
+// own type under the added context and satisfies neither.
+func wrapInspectPaneError(paneID string, err error) error {
+	if err == nil {
+		return nil
+	}
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && apiErr.Code == "pane_not_found" {
+		return fmt.Errorf("inspect pane %s: %w (%w)", paneID, app.ErrPaneNotFound, ErrPaneNotFound)
+	}
+	return fmt.Errorf("inspect pane %s: %w", paneID, err)
+}
+
+// ServerInstance identifies the server process behind the configured
+// socket: the peer pid of the process that accepted the dialed
+// connection, rendered as "peer-pid:<n>". A non-empty token identifies
+// both the configured socket and the server process behind it, so equal
+// tokens imply the same socket and the same server process; peer-pid
+// recycling is not detected. An empty string, with a nil error, means the
+// identity could not be established (an unsupported platform, or the
+// platform lookup failing) — never a fabricated value. Only a failure to
+// connect at all is an error.
+func (r *Runtime) ServerInstance(ctx context.Context) (string, error) {
+	conn, err := r.client.dial(ctx)
+	if err != nil {
+		return "", fmt.Errorf("determine server instance: %w", err)
+	}
+	defer closeConn(conn)
+	pid, ok := peerPID(conn)
+	if !ok {
+		return "", nil
+	}
+	return fmt.Sprintf("peer-pid:%d", pid), nil
 }

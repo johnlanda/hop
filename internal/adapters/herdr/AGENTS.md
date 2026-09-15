@@ -18,7 +18,8 @@ worker-launch use case.
 | [probe.go](probe.go) | `InstallationProbe`, `parseSchema` | Implements `app.Probe`: resolves executables, reads `--version` lines, extracts protocol and method constants from `herdr api schema --json`, pings the configured socket |
 | [presentation.go](presentation.go) | `Presentation`, `NewPresentation` | Implements `app.AgentPresentation`: `pane.report_metadata` token patches, `agent.view.set` with a manager-first token sort and `agent.view.clear` — all under HOP's fixed source so its view is owned and clearable |
 | [observation.go](observation.go) | `Observer`, `NewObserver`, `statusStream`, `DrainRemaining`, `flushBacklog` | Implements `app.Observer`: one `pane.agent_status_changed` subscription per watched pane, normalized into `app.StatusEvent`, and a `session.snapshot` reduced to `app.PaneObservation`; on stop-intake, the decode pump moves its pending event and the rest of the raw backlog into an overflow slice that `DrainRemaining` exposes |
-| [runtime.go](runtime.go) | `Runtime`, `NewRuntime`, `ErrPaneNotFound`, `ErrWorkspaceIDRequired` | Implements `app.Runtime`: `worktree.create`, `layout.apply` worker-pane creation, pane recovery by creation label via `session.snapshot`, the `pane.send_text` fallback transport, `pane.read` scrollback capture, `pane.process_info` occupant inspection and `pane.close` |
+| [runtime.go](runtime.go) | `Runtime`, `NewRuntime`, `ErrPaneNotFound`, `ErrWorkspaceIDRequired` | Implements `app.Runtime`: `worktree.create`, `layout.apply` worker-pane creation, pane recovery by creation label via `session.snapshot`, the `pane.send_text` fallback transport, `pane.read` scrollback capture, `pane.process_info` occupant inspection, `pane.close`, and `ServerInstance`'s dial-inspect-close socket-peer-pid lookup |
+| [runtime_darwin.go](runtime_darwin.go), [runtime_linux.go](runtime_linux.go), [runtime_other.go](runtime_other.go) | `peerPID` | GOOS-selected: `peerPID` reads a dialed connection's socket peer pid — `getsockopt(SOL_LOCAL, LOCAL_PEERPID)` on darwin, `getsockopt(SOL_SOCKET, SO_PEERCRED)` on linux, unconditionally unavailable elsewhere |
 
 ## Invariants
 
@@ -90,7 +91,26 @@ worker-launch use case.
   the added pane-address context. For `InspectPane` specifically, Herdr
   returns this same code both for no such pane and for a pane that exists
   but has no live runtime yet (the delayed-restore window), so the caller
-  reads it as "no runtime," not strictly "no such pane."
+  reads it as "no runtime," not strictly "no such pane." `InspectPane`
+  alone uses a second, dedicated helper, `wrapInspectPaneError`: the same
+  `pane_not_found` mapping, but wrapping both `ErrPaneNotFound` and
+  `app.ErrPaneNotFound` — the `app.Runtime` port's own "positively does not
+  exist" absence contract — so `errors.Is(err, app.ErrPaneNotFound)` holds
+  for that case and only that case; every other `InspectPane` failure
+  (transport, protocol, a wrong-typed response) satisfies neither sentinel.
+  `FindPaneByLabel`'s own not-found reporting is unrelated and unchanged by
+  this: it is `(zero value, false, nil)`, never an error.
+- `ServerInstance` dials the configured socket (no NDJSON frame is sent —
+  a bare connect, `peerPID` lookup, close, reusing `Client.dial`'s existing
+  context handling so a wedged server cannot hang the call) and renders
+  `"peer-pid:<n>"` from the connection's socket peer pid. `peerPID` reports
+  `(0, false)` — never a fabricated pid — when the connection is not backed
+  by a real socket descriptor or the platform lookup fails; `ServerInstance`
+  turns that into `("", nil)`, not an error. Only a dial failure is an
+  error. The token identifies both the configured socket and the server
+  process behind it, so equal non-empty tokens across two calls imply the
+  same socket and the same server process; peer-pid recycling is not
+  detected.
 - `Runtime.ClosePane` only issues `pane.close`; there is no
   occupant-conditioned or compare-and-swap close upstream (S2), so the close
   rule (re-inspect and match occupant evidence immediately before closing)
@@ -150,8 +170,20 @@ worker-launch use case.
   response and a non-string response id surfacing as the `Client`'s own
   `ProtocolError`, a wrong-typed field (`argv` as a string) rejected by the
   standard decoder itself before any adapter validation runs, context
-  cancellation across every method, and `FindPaneByLabel`'s
-  not-found/ambiguous/transport-error cases.
+  cancellation across every method, `FindPaneByLabel`'s
+  not-found/ambiguous/transport-error cases, `ServerInstance` (the token
+  equals `"peer-pid:" + os.Getpid()` against an in-process temp Unix
+  listener, since listener and dialer are the same test process; a dead
+  socket errors with an empty token) and
+  `TestRuntimeInspectPaneAppErrPaneNotFoundClassification` (a table proving
+  `errors.Is(err, app.ErrPaneNotFound)` holds only for the `pane_not_found`
+  case, never for a transport, unrelated-API-code or protocol failure).
+- [runtime_internal_test.go](runtime_internal_test.go) (`package herdr`,
+  same-package per the internal-algorithm testing guidance) —
+  `TestPeerPIDUnavailableForNonSocketConn` proves `peerPID` reports
+  `(0, false)` for a `net.Pipe` connection, which implements no
+  `syscall.Conn` on any platform: portable, no build tag, and exercises
+  every `peerPID` implementation's defensive type check identically.
 - Test fixtures: none on disk; stubs and wire lines are written by the tests.
 
 ## Related guides

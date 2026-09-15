@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -541,12 +542,71 @@ func TestRuntimeInspectPaneOmittedForegroundProcesses(t *testing.T) {
 func TestRuntimeInspectPaneMapsPaneNotFound(t *testing.T) {
 	// This is the specific classification the application layer relies on
 	// to distinguish "no runtime yet" from every other InspectPane failure.
+	// app.ErrPaneNotFound is the app.Runtime port's own absence contract;
+	// ErrPaneNotFound is this adapter's local sentinel for the same case.
 	runtime := startFakeRuntimeError(t, "pane_not_found", "pane not found")
 
 	_, err := runtime.InspectPane(testContext(t), "w1:p1")
 
 	if !errors.Is(err, herdr.ErrPaneNotFound) {
 		t.Fatalf("InspectPane error = %v, want ErrPaneNotFound", err)
+	}
+	if !errors.Is(err, app.ErrPaneNotFound) {
+		t.Fatalf("InspectPane error = %v, want app.ErrPaneNotFound", err)
+	}
+}
+
+// TestRuntimeInspectPaneAppErrPaneNotFoundClassification proves
+// errors.Is(err, app.ErrPaneNotFound) — the app.Runtime port's "positively
+// does not exist" absence contract — holds for a pane_not_found API error
+// and only that case: a transport failure (dead socket), an unrelated API
+// error code and a protocol-level decode failure (wrong result type) must
+// all produce an error that does NOT satisfy it. FindPaneByLabel's own
+// not-found reporting is untouched by this: it stays (zero value, false,
+// nil) with no error at all, proven by TestRuntimeFindPaneByLabel above.
+func TestRuntimeInspectPaneAppErrPaneNotFoundClassification(t *testing.T) {
+	cases := []struct {
+		name            string
+		runtime         func(t *testing.T) *herdr.Runtime
+		wantAppNotFound bool
+	}{
+		{
+			name:            "pane_not_found API error",
+			runtime:         func(t *testing.T) *herdr.Runtime { return startFakeRuntimeError(t, "pane_not_found", "pane not found") },
+			wantAppNotFound: true,
+		},
+		{
+			name:            "unrelated API error",
+			runtime:         func(t *testing.T) *herdr.Runtime { return startFakeRuntimeError(t, "internal_error", "boom") },
+			wantAppNotFound: false,
+		},
+		{
+			name:            "transport error (dead socket)",
+			runtime:         func(t *testing.T) *herdr.Runtime { return herdr.NewRuntime(deadSocket(t)) },
+			wantAppNotFound: false,
+		},
+		{
+			name: "protocol error (wrong result type)",
+			runtime: func(t *testing.T) *herdr.Runtime {
+				runtime, _ := startFakeRuntime(t, `{"type":"something_else","process_info":{}}`)
+				return runtime
+			},
+			wantAppNotFound: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runtime := tc.runtime(t)
+
+			_, err := runtime.InspectPane(testContext(t), "w1:p1")
+
+			if err == nil {
+				t.Fatalf("InspectPane did not error for %s", tc.name)
+			}
+			if got := errors.Is(err, app.ErrPaneNotFound); got != tc.wantAppNotFound {
+				t.Errorf("errors.Is(err, app.ErrPaneNotFound) = %v, want %v (err = %v)", got, tc.wantAppNotFound, err)
+			}
+		})
 	}
 }
 
@@ -632,6 +692,43 @@ func TestRuntimeClosePaneMapsPaneNotFound(t *testing.T) {
 
 	if !errors.Is(err, herdr.ErrPaneNotFound) {
 		t.Fatalf("ClosePane error = %v, want ErrPaneNotFound", err)
+	}
+}
+
+// TestRuntimeServerInstance proves the token identifies the server process
+// behind the dialed socket: the fake endpoint's listener and this test's
+// dialer are the same OS process, so the observed peer pid is this
+// process's own pid on every platform the adapter implements the lookup
+// for (darwin, linux).
+func TestRuntimeServerInstance(t *testing.T) {
+	endpoint := startFakeEndpoint(t, func(_ *testing.T, conn net.Conn) {
+		holdUntilPeerCloses(conn)
+	})
+	runtime := herdr.NewRuntime(endpoint.socketPath)
+
+	token, err := runtime.ServerInstance(testContext(t))
+	if err != nil {
+		t.Fatalf("ServerInstance: %v", err)
+	}
+
+	want := fmt.Sprintf("peer-pid:%d", os.Getpid())
+	if token != want {
+		t.Errorf("token = %q, want %q", token, want)
+	}
+}
+
+// TestRuntimeServerInstanceMapsDialFailure proves ServerInstance errors
+// only on a genuine connection failure, never returning a fabricated token.
+func TestRuntimeServerInstanceMapsDialFailure(t *testing.T) {
+	runtime := herdr.NewRuntime(deadSocket(t))
+
+	token, err := runtime.ServerInstance(testContext(t))
+
+	if err == nil {
+		t.Fatal("ServerInstance against a dead socket did not error")
+	}
+	if token != "" {
+		t.Errorf("token = %q, want empty on a dial failure", token)
 	}
 }
 
