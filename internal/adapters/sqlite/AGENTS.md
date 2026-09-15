@@ -20,6 +20,7 @@ this package never resolves environment variables or defaults.
 | [sqlite.go](sqlite.go) | `Store`, `Options`, `Open`, `Close`, `dsn`, `inWriteTx`, `formatTime`, `parseTime`, `newUUID` | Two pools onto one file (immediate-write and read), DSN-applied per-connection settings, bounded whole-transaction busy retry, canonical fixed-width UTC timestamps, adapter-internal UUID minting |
 | [migrations.go](migrations.go) | `ErrFutureSchema`, `migrate`, `applyMigration`, `loadMigrations`, `schemaVersion` | Ordered embedded migrations, each applied in its own immediate transaction with the version re-read inside it; refuses a store newer than the binary |
 | [migrations/001_initial_schema.sql](migrations/001_initial_schema.sql) | — | The complete Phase 2 schema: 17 STRICT tables and the partial unique indexes (one active attempt per task, one accepted result per attempt, one current session per attempt) |
+| [migrations/002_launch_claim_seed_evidence.sql](migrations/002_launch_claim_seed_evidence.sql) | — | Adds `launch_claims.seed_evidence` (nullable TEXT): the workspace-trust pre-seeding outcome hop launch records with the claim; evidence only, NULL on pre-migration rows. The next new migration is 003 (Phase 3's slice-3 design text predates this one and renumbers) |
 | [statestore.go](statestore.go) | `InitializeRun`, `AcquireLease`, `Heartbeat`, `ReleaseLease`, `Begin`, `validateLease` | The controller authority: run bootstrap in one transaction, lease CAS with monotonic generations, fenced unit-of-work begin |
 | [uow.go](uow.go) | `unitOfWork` and the typed repositories (`Runs`…`CheckExecClaims`), `OperationRepository.Pending`/`ByKind`, `Commit`, `Rollback` | One immediate transaction per unit of work; optimistic-concurrency saves; append-only bindings and transitions; journal payloads persisted as uninterpreted JSON; controller-side launch-claim settlement |
 | [entities.go](entities.go) | `getRun`, `getTask`, `getAttempt`, `getSession`, `currentSession`, `currentBinding`, `getLaunchClaim`, `acceptedResult`, `incarnationCurrent`, `launchIncarnationCurrent`, `pendingLaunchIntent` | Row ↔ domain-value mapping shared by all three authorities through the `querier` interface |
@@ -79,8 +80,12 @@ this package never resolves environment variables or defaults.
   persisted owning run must be the claimed run, so a mixed tuple never has
   its stop or currency questions answered against the wrong run — then
   refuses when the run is stopping or stopped, the incarnation is not
-  current, or a claim exists with a different run, attempt or pid; a
-  same-pid rewrite on the same tuple is idempotent. Currency: the
+  current, or a claim exists with a different run, attempt or pid. A
+  same-pid retry on the same tuple is accepted only while the claim is
+  exec_pending and its executable and argv digest match. It refreshes
+  only seed_evidence to the retry's outcome; all invocation identity
+  fields remain unchanged, and settled claims refuse retries. Currency:
+  the
   attempt's current session's current binding decides when one exists;
   before ANY binding row exists for that session (the launcher is the
   pane's own command and can claim before the controller records the
@@ -137,7 +142,11 @@ this package never resolves environment variables or defaults.
 
 - `go test ./internal/adapters/sqlite` — the real-temporary-database suite:
   migrations from empty, reopen at the same version, refusal of a future
-  version (`ErrFutureSchema`), concurrent open/migrate from two handles;
+  version (`ErrFutureSchema`), concurrent open/migrate from two handles, and
+  a populated version-1→2 upgrade (`TestUpgradePopulatedV1StoreToV2`: the
+  001 schema built raw with a full claim chain, upgraded through
+  `sqlite.Open`, old values and relationships intact with NULL seed
+  evidence, a new evidence-bearing claim, idempotent reopen);
   DSN escaping (roots containing `#`, `?`, `%`, spaces, Unicode and a
   mode=memory lookalike land at `<root>/hop.db` per `pragma_database_list`
   and survive reopen); connection-churn PRAGMA checks on both pools; the

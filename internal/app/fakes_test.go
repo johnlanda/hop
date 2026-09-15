@@ -558,8 +558,16 @@ func (s *fakeStore) ClaimLaunch(_ context.Context, claim app.LaunchClaim) error 
 		if existing.PID != claim.PID {
 			return fmt.Errorf("app_test: launch claim for incarnation %s already exists with a different pid", claim.IncarnationID)
 		}
-		// A rewrite by the same pid is idempotent.
-		s.LaunchClaims[claim.IncarnationID] = claim
+		if existing.State != app.LaunchClaimExecPending {
+			return fmt.Errorf("app_test: launch claim for incarnation %s is already settled; a retry never rewrites settled history", claim.IncarnationID)
+		}
+		if existing.Executable != claim.Executable || existing.ArgvDigest != claim.ArgvDigest {
+			return fmt.Errorf("app_test: launch claim for incarnation %s records a different executable or argv; an incompatible retry is refused", claim.IncarnationID)
+		}
+		// A same-pid retry refreshes the seed evidence only; every
+		// invocation identity field stays as first claimed.
+		existing.SeedEvidence = claim.SeedEvidence
+		s.LaunchClaims[claim.IncarnationID] = existing
 		return nil
 	}
 	rRow, ok := s.Runs[claim.RunID]

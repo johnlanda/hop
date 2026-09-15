@@ -392,13 +392,13 @@ func currentBinding(ctx context.Context, q querier, sessionID identity.SessionID
 func getLaunchClaim(ctx context.Context, q querier, incarnationID identity.IncarnationID) (*app.LaunchClaim, error) {
 	var (
 		runID, attemptID, executable, argvDigest, state, claimedAt string
-		claimError, settledAt, settlementEvidence                  sql.NullString
+		claimError, settledAt, settlementEvidence, seedEvidence    sql.NullString
 		pid                                                        int64
 	)
 	err := q.QueryRowContext(ctx,
-		`SELECT run_id, attempt_id, executable, argv_digest, pid, state, error, claimed_at, settled_at, settlement_evidence FROM launch_claims WHERE incarnation_id = ?`,
+		`SELECT run_id, attempt_id, executable, argv_digest, pid, state, error, claimed_at, settled_at, settlement_evidence, seed_evidence FROM launch_claims WHERE incarnation_id = ?`,
 		incarnationID.String(),
-	).Scan(&runID, &attemptID, &executable, &argvDigest, &pid, &state, &claimError, &claimedAt, &settledAt, &settlementEvidence)
+	).Scan(&runID, &attemptID, &executable, &argvDigest, &pid, &state, &claimError, &claimedAt, &settledAt, &settlementEvidence, &seedEvidence)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil //nolint:nilnil // a nil claim with a nil error is the documented "no claim recorded" value.
 	}
@@ -435,6 +435,7 @@ func getLaunchClaim(ctx context.Context, q querier, incarnationID identity.Incar
 		ClaimedAt:          claimed,
 		SettledAt:          settled,
 		SettlementEvidence: settlementEvidence.String,
+		SeedEvidence:       seedEvidence.String,
 	}, nil
 }
 

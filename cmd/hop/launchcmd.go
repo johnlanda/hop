@@ -2,9 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
+	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/johnlanda/hop/internal/app"
@@ -17,10 +21,13 @@ const defaultLaunchPrepTimeout = 30 * time.Second
 // runLaunch implements `hop launch --run <uuid> --attempt <uuid>`, the
 // worker exec boundary (design section 6): it requires the launch-provided
 // absolute HOP_STATE_DIR (never falling back to the default resolution),
-// prepares the exec through the application — environment validation
-// against the launch context, sanitization under the frozen policy,
-// per-harness argv composition, executable resolution, the exec_pending
-// claim — and execs through the process adapter. On success it never
+// resolves its own working directory to the symlink-resolved worktree path
+// the workspace-trust seed keys on, prepares the exec through the
+// application — environment validation against the launch context,
+// sanitization under the frozen policy, per-harness argv composition,
+// executable resolution, the workspace-trust pre-seed with its recorded
+// evidence, the exec_pending claim — and execs through the process
+// adapter. On success it never
 // returns. Every failure exits 1 with one stderr line that never echoes an
 // environment value; a failure after the claim (the exec itself) settles
 // the claim exec_failed first.
@@ -53,6 +60,11 @@ func runLaunch(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 		_, werr := fmt.Fprintf(stderr, "hop launch: %v\n", err)
 		return exitFailure, werr
 	}
+	workerDir, err := launcherWorkerDir(d)
+	if err != nil {
+		_, werr := fmt.Fprintf(stderr, "hop launch: %v\n", err)
+		return exitFailure, werr
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), defaultLaunchPrepTimeout)
 	defer cancel()
@@ -67,8 +79,10 @@ func runLaunch(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 		RunID:            *runID,
 		AttemptID:        *attemptID,
 		HOPPath:          hopPath,
+		WorkerDir:        workerDir,
 		Environ:          d.environ(),
 		PID:              d.getpid(),
+		ResolvePath:      resolveCanonicalPath,
 		LookupExecutable: lookupExecutable,
 	})
 	if err != nil {
@@ -88,4 +102,59 @@ func runLaunch(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 	}
 	_, werr := fmt.Fprintf(stderr, "hop launch: %v\n", execErr)
 	return exitFailure, werr
+}
+
+// launcherWorkerDir resolves the launcher's own working directory — the
+// attempt worktree its pane was created at — to the symlink-resolved
+// absolute path the launched harness will observe as its cwd (execve
+// preserves the working directory). That resolved form is the
+// workspace-trust seed's exact projects key: macOS resolves /var to
+// /private/var, and Claude Code records trust under the resolved path.
+// Errors carry a fixed operation and errors.Is category only — the raw
+// chain includes the directory itself, which is never rendered.
+func launcherWorkerDir(d *deps) (string, error) {
+	wd, err := d.getwd()
+	if err != nil {
+		return "", fmt.Errorf("the working directory could not be determined: %s (the directory is never echoed)", pathErrorCategory(err))
+	}
+	resolved, err := resolveCanonicalPath(wd)
+	if err != nil {
+		return "", fmt.Errorf("the working directory could not be canonically resolved: %s (the directory is never echoed)", pathErrorCategory(err))
+	}
+	return resolved, nil
+}
+
+// pathErrorCategory classifies a filesystem error into a fixed value-free
+// category through errors.Is alone, the same way describeStoreOpenFailure
+// classifies store-open failures: the raw chain commonly carries the
+// complete path (os.PathError) and is never rendered.
+func pathErrorCategory(err error) string {
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return "a path element does not exist"
+	case errors.Is(err, fs.ErrPermission):
+		return "permission denied"
+	case errors.Is(err, syscall.ENOTDIR):
+		return "a path element is not a directory"
+	case errors.Is(err, syscall.ELOOP):
+		return "too many levels of symbolic links"
+	default:
+		return "i/o failure"
+	}
+}
+
+// resolveCanonicalPath resolves a path's symlinks to its canonical
+// absolute form. It implements app.LaunchExecRequest.ResolvePath, the
+// seam PrepareLaunchExec uses to compare the launcher's cwd with the
+// recorded worktree path; the application never echoes its errors, which
+// may carry the path.
+func resolveCanonicalPath(path string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", err
+	}
+	if !filepath.IsAbs(resolved) {
+		return "", fmt.Errorf("the path did not resolve to an absolute form")
+	}
+	return resolved, nil
 }

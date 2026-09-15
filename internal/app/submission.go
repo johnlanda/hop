@@ -42,6 +42,14 @@ type LaunchClaim struct {
 	ClaimedAt          time.Time
 	SettledAt          time.Time
 	SettlementEvidence string
+	// SeedEvidence records the launch's workspace-trust pre-seeding outcome
+	// ("workspace trust seeded for <worktree path> (verified; best-effort
+	// against external profile writers)", or "workspace trust not seeded:
+	// <reason>" — the seed write is verified by a post-publish re-read but
+	// remains best-effort against a running harness rewriting the same
+	// profile). It is evidence only — no decision ever reads
+	// it — and never carries an environment value or profile path.
+	SeedEvidence string
 }
 
 // LaunchClaimSettlement is the controller's corroborated settlement of one
@@ -137,10 +145,17 @@ type ClaimedSubmission struct {
 type SubmissionStore interface {
 	// ClaimLaunch is written by hop launch BEFORE exec: run, attempt,
 	// incarnation, the expected executable's resolved absolute path, argv
-	// digest, own pid, state exec_pending. It fails — and the caller must
+	// digest, own pid, the workspace-trust seed evidence and state
+	// exec_pending. It fails — and the caller must
 	// not exec — when the run is stopping or stopped, the incarnation is
 	// not current, or a claim for this incarnation already exists with a
-	// different pid. A rewrite by the same pid is idempotent.
+	// different pid, a settled state, or a different executable or argv
+	// digest. A rewrite by the same pid with the same invocation identity
+	// is idempotent except that it refreshes the row's seed evidence to
+	// the retry's freshly applied outcome (healing NULL rows written
+	// before the seed-evidence migration), so the persisted evidence
+	// always matches the plan the launcher execs with; settled history is
+	// never rewritten.
 	ClaimLaunch(ctx context.Context, claim LaunchClaim) error
 	// SettleLaunchFailure records exec_failed on the launcher's error path.
 	SettleLaunchFailure(ctx context.Context, incarnation identity.IncarnationID, reason string) error

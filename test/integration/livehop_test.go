@@ -152,7 +152,7 @@ func TestLiveClaudeDefaultProfileRun(t *testing.T) {
 		if binding := fields["binding"]; binding != "" {
 			artifacts.save(t, "worker-pane-scrollback-first-launch.txt", server.readPane(t, paneIDFromBinding(binding)))
 		}
-		t.Fatalf("run %s never reached running for its first (real Claude) launch; got %q; detail: %+v\ncontroller stdout:\n%s", runID, fields["state"], fields, readControllerLog(t, artifacts, "run"))
+		t.Fatalf("run %s never reached running for its first (real Claude) launch; got %q; detail: %+v (trust seed: %q — if the saved scrollback shows the \"Quick safety check\" workspace-trust dialog, this claude version no longer honors the pre-seeded key; see docs/architecture/native-harness-compat.md)\ncontroller stdout:\n%s", runID, fields["state"], fields, fields["trust seed"], readControllerLog(t, artifacts, "run"))
 	}
 	firstPaneID := paneIDFromBinding(fields["binding"])
 

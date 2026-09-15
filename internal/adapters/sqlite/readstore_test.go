@@ -177,9 +177,23 @@ func TestLoadLaunchContext(t *testing.T) {
 	f.createBinding(t)
 	f.claimLaunch(t)
 
+	// Before the worktree row exists, the context loads with an empty
+	// recorded worktree path — the launch boundary refuses that itself.
+	preWorktree, err := f.store.LoadLaunchContext(t.Context(), f.spec.RunID, f.spec.AttemptID)
+	if err != nil {
+		t.Fatalf("LoadLaunchContext before the worktree row: %v", err)
+	}
+	if preWorktree.WorktreePath != "" {
+		t.Fatalf("worktree path before the row = %q, want empty", preWorktree.WorktreePath)
+	}
+	createWorktree(t, f)
+
 	launchContext, err := f.store.LoadLaunchContext(t.Context(), f.spec.RunID, f.spec.AttemptID)
 	if err != nil {
 		t.Fatalf("LoadLaunchContext: %v", err)
+	}
+	if launchContext.WorktreePath != "/worktrees/alpha-r1" {
+		t.Fatalf("worktree path = %q, want the recorded /worktrees/alpha-r1", launchContext.WorktreePath)
 	}
 	snapshot := launchContext.Snapshot
 	if snapshot.Harness != "claude" || snapshot.StateRoot != "/state/root" || snapshot.AssignmentDigest != "assignment-digest" {
@@ -202,6 +216,9 @@ func TestLoadLaunchContext(t *testing.T) {
 	}
 	if launchContext.Claim == nil || launchContext.Claim.State != app.LaunchClaimExecPending {
 		t.Fatalf("claim = %+v, want the exec_pending claim", launchContext.Claim)
+	}
+	if launchContext.Claim.SeedEvidence != fixtureSeedEvidence {
+		t.Fatalf("claim seed evidence = %q, want the recorded value round-tripped", launchContext.Claim.SeedEvidence)
 	}
 	if launchContext.StopRequested {
 		t.Fatal("stop requested = true on a run with no stop request")

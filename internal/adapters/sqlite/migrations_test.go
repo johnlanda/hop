@@ -1,16 +1,20 @@
 package sqlite_test
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 
 	"github.com/johnlanda/hop/internal/adapters/sqlite"
 )
 
-// expectedTables is the complete table set of migration 001 plus the
-// migrator's own version table.
+// expectedTables is the complete table set of the migration chain (001
+// creates every table; 002 only adds a column) plus the migrator's own
+// version table.
 func expectedTables() []string {
 	return []string{
 		"schema_migrations",
@@ -35,7 +39,7 @@ func expectedTables() []string {
 }
 
 // TestMigrateFromEmpty proves opening an empty state root creates every
-// table and records schema version 1.
+// table, applies the full migration chain and records its latest version.
 func TestMigrateFromEmpty(t *testing.T) {
 	store := openStoreAt(t, t.TempDir(), newFakeClock())
 
@@ -50,8 +54,8 @@ func TestMigrateFromEmpty(t *testing.T) {
 	if err := sqlite.WriteDB(store).QueryRowContext(t.Context(), `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil {
 		t.Fatalf("read schema version: %v", err)
 	}
-	if version != 1 {
-		t.Fatalf("schema version = %d, want 1", version)
+	if version != 2 {
+		t.Fatalf("schema version = %d, want 2", version)
 	}
 }
 
@@ -66,8 +70,8 @@ func TestReopenAtSameVersion(t *testing.T) {
 	second := openStoreAt(t, root, clock)
 
 	after := countRows(t, second, `SELECT COUNT(*) FROM schema_migrations`)
-	if before != 1 || after != 1 {
-		t.Fatalf("schema_migrations rows: first open %d, second open %d; want 1 and 1", before, after)
+	if before != 2 || after != 2 {
+		t.Fatalf("schema_migrations rows: first open %d, second open %d; want one row per migration, unchanged by the reopen", before, after)
 	}
 }
 
@@ -122,8 +126,8 @@ func TestConcurrentOpenAndMigrate(t *testing.T) {
 		defer stores[i].Close() //nolint:errcheck,gocritic // test cleanup of handles opened in this scope; close failures would already surface as errors above.
 	}
 	n := countRows(t, stores[0], `SELECT COUNT(*) FROM schema_migrations`)
-	if n != 1 {
-		t.Fatalf("schema_migrations rows after concurrent migrate = %d, want exactly 1", n)
+	if n != 2 {
+		t.Fatalf("schema_migrations rows after concurrent migrate = %d, want one row per migration", n)
 	}
 }
 
@@ -197,5 +201,99 @@ func TestMigrationTableListMatchesDesign(t *testing.T) {
 
 	if want := expectedTables(); n != len(want) {
 		t.Fatalf("store holds %d tables, the design's migration defines %d: %s", n, len(want), fmt.Sprint(want))
+	}
+}
+
+// TestUpgradePopulatedV1StoreToV2 upgrades a genuine populated version-1
+// store: the 001 schema file executed verbatim on a raw connection with
+// schema_migrations recording version 1 and a full claim chain (repository
+// → run → task → attempt → a settled launch claim, written before the
+// seed_evidence column existed). Opening through sqlite.Open applies 002;
+// the old rows, values and relationships survive with NULL seed evidence,
+// a new evidence-bearing claim row round-trips, and a reopen applies
+// nothing further.
+func TestUpgradePopulatedV1StoreToV2(t *testing.T) {
+	root := t.TempDir()
+	schema, err := os.ReadFile(filepath.Join("migrations", "001_initial_schema.sql"))
+	if err != nil {
+		t.Fatalf("read 001 schema: %v", err)
+	}
+	raw, err := sql.Open("sqlite", "file:"+filepath.Join(root, "hop.db")+"?_pragma=foreign_keys(1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const ts = "2026-09-01T00:00:00.000000000Z"
+	for _, stmt := range []string{
+		string(schema),
+		`CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL) STRICT`,
+		`INSERT INTO schema_migrations (version, applied_at) VALUES (1, '` + ts + `')`,
+		`INSERT INTO repositories (id, root_path, created_at) VALUES ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', '/repos/v1', '` + ts + `')`,
+		`INSERT INTO runs (id, repository_id, seq, brief, brief_digest, state, stop_requested_at, revision, created_at, updated_at)
+		 VALUES ('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 1, 'v1 brief', 'v1-brief-digest', 'running', NULL, 1, '` + ts + `', '` + ts + `')`,
+		`INSERT INTO tasks (id, run_id, instructions_digest, state, revision, updated_at)
+		 VALUES ('cccccccc-cccc-4ccc-8ccc-cccccccccccc', 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', 'v1-instructions', 'active', 1, '` + ts + `')`,
+		`INSERT INTO attempts (id, task_id, number, state, revision, updated_at)
+		 VALUES ('dddddddd-dddd-4ddd-8ddd-dddddddddddd', 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', 1, 'running', 1, '` + ts + `')`,
+		`INSERT INTO launch_claims (incarnation_id, run_id, attempt_id, executable, argv_digest, pid, state, error, claimed_at, settled_at, settlement_evidence)
+		 VALUES ('eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee', 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', '/opt/harness/claude', 'v1-argv-digest', 4242, 'execed', NULL, '` + ts + `', '` + ts + `', 'settled by the v1 controller')`,
+	} {
+		if _, execErr := raw.ExecContext(t.Context(), stmt); execErr != nil {
+			t.Fatalf("build v1 store: %v\nstatement: %.80s", execErr, stmt)
+		}
+	}
+	if closeErr := raw.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+
+	store := openStoreAt(t, root, newFakeClock())
+
+	var version int
+	if err := sqlite.WriteDB(store).QueryRowContext(t.Context(), `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil {
+		t.Fatalf("read schema version: %v", err)
+	}
+	if version != 2 {
+		t.Fatalf("schema version after the upgrade = %d, want 2", version)
+	}
+	var (
+		executable, argvDigest, state, settlementEvidence string
+		pid                                               int
+		seedEvidence                                      sql.NullString
+	)
+	if err := sqlite.WriteDB(store).QueryRowContext(t.Context(),
+		`SELECT lc.executable, lc.argv_digest, lc.pid, lc.state, lc.settlement_evidence, lc.seed_evidence
+		 FROM launch_claims lc
+		 JOIN attempts a ON a.id = lc.attempt_id
+		 JOIN tasks tk ON tk.id = a.task_id AND tk.run_id = lc.run_id
+		 JOIN runs r ON r.id = lc.run_id
+		 JOIN repositories rp ON rp.id = r.repository_id AND rp.root_path = '/repos/v1'
+		 WHERE lc.incarnation_id = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'`,
+	).Scan(&executable, &argvDigest, &pid, &state, &settlementEvidence, &seedEvidence); err != nil {
+		t.Fatalf("read the upgraded v1 claim through its full relationship chain: %v", err)
+	}
+	if executable != "/opt/harness/claude" || argvDigest != "v1-argv-digest" || pid != 4242 || state != "execed" || settlementEvidence != "settled by the v1 controller" {
+		t.Fatalf("v1 claim values changed by the upgrade: %s %s %d %s %q", executable, argvDigest, pid, state, settlementEvidence)
+	}
+	if seedEvidence.Valid {
+		t.Fatalf("v1 claim seed evidence = %q, want NULL", seedEvidence.String)
+	}
+
+	if _, err := sqlite.WriteDB(store).ExecContext(t.Context(),
+		`INSERT INTO launch_claims (incarnation_id, run_id, attempt_id, executable, argv_digest, pid, state, error, claimed_at, settled_at, settlement_evidence, seed_evidence)
+		 VALUES ('ffffffff-ffff-4fff-8fff-ffffffffffff', 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', '/opt/harness/claude', 'v2-argv-digest', 4243, 'exec_pending', NULL, '`+ts+`', NULL, NULL, 'workspace trust seeded for /worktrees/v2')`,
+	); err != nil {
+		t.Fatalf("insert an evidence-bearing claim after the upgrade: %v", err)
+	}
+	var newEvidence string
+	if err := sqlite.WriteDB(store).QueryRowContext(t.Context(),
+		`SELECT seed_evidence FROM launch_claims WHERE incarnation_id = 'ffffffff-ffff-4fff-8fff-ffffffffffff'`,
+	).Scan(&newEvidence); err != nil || newEvidence != "workspace trust seeded for /worktrees/v2" {
+		t.Fatalf("new claim evidence = %q, %v", newEvidence, err)
+	}
+	reopened := openStoreAt(t, root, newFakeClock())
+	if n := countRows(t, reopened, `SELECT COUNT(*) FROM schema_migrations`); n != 2 {
+		t.Fatalf("schema_migrations rows after reopen = %d, want one per migration, unchanged", n)
+	}
+	if n := countRows(t, reopened, `SELECT COUNT(*) FROM launch_claims`); n != 2 {
+		t.Fatalf("launch claims after reopen = %d, want both rows intact", n)
 	}
 }

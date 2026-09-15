@@ -1029,13 +1029,33 @@ and never-resend rule apply.
    brief content never needs escaping.
 4. Resolves the harness executable to an absolute path using the sanitized
    environment's PATH.
-5. Records the launch claim (`exec_pending`): run, attempt, incarnation,
-   the resolved expected executable path, the argv digest, and its own
+5. Applies the workspace-trust pre-seed (verified against Claude Code
+   2.1.270; see
+   [native-harness-compat.md](../architecture/native-harness-compat.md)):
+   for Claude, it resolves the profile trust file from the SANITIZED
+   environment (`$CLAUDE_CONFIG_DIR/.claude.json` when the policy passes a
+   config dir through, else `$HOME/.claude.json`) and sets exactly
+   `projects["<worktree>"].hasTrustDialogAccepted = true`, keyed by the
+   launcher's own symlink-resolved absolute working directory — the exact
+   path the harness resolves as its cwd, since ancestor trust is not
+   honored for git roots — overwriting `false` (an abandoned dialog
+   persists a default entry with `false`) and preserving every other byte.
+   The write is an atomic 0600 temp+rename serialized under an advisory
+   lock file beside the config. An absent or unparsable config is NOT
+   created or rewritten: the launch proceeds with "not seeded" evidence
+   and the needs-interaction fallback stays. Any other seeding failure
+   refuses the launch fail-closed, before the claim, with a value-free
+   diagnostic. Codex and opencode are not seeded (Codex trust sits behind
+   login and is unverified; opencode has no known mechanism). The outcome
+   is recorded with the claim as evidence only — never a decision input.
+6. Records the launch claim (`exec_pending`): run, attempt, incarnation,
+   the resolved expected executable path, the argv digest, the seed
+   evidence, and its own
    pid. execve preserves the pid, so the claim's pid is the harness's pid
    on success. A second `hop launch` for the same incarnation is rejected
    by the claim's different-pid rule and never execs — a duplicate
    launcher invocation cannot mint a second worker.
-6. `Exec`s. A failed exec settles the claim to `exec_failed` with the
+7. `Exec`s. A failed exec settles the claim to `exec_failed` with the
    error and exits 1; if that settlement write is itself lost, the claim
    stays `exec_pending` and recovery treats it as ambiguous (decision
    table) — a pre-exec write is never read as proof of exec.

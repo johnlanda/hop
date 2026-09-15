@@ -1,6 +1,7 @@
 package sqlite_test
 
 import (
+	"database/sql"
 	"strings"
 	"sync"
 	"testing"
@@ -373,9 +374,52 @@ func TestRecordMalformed(t *testing.T) {
 	}
 }
 
-// TestClaimLaunch proves the pre-exec claim contract: same-pid idempotence,
-// different-pid rejection (including raced from two handles), the
-// non-current incarnation refusal, and the stop refusal.
+// seedClaim builds the fixture's launch claim carrying evidence, otherwise
+// identical to claimLaunch's.
+func (f *fixture) seedClaim(evidence string) app.LaunchClaim {
+	return app.LaunchClaim{
+		IncarnationID: f.spec.IncarnationID,
+		RunID:         f.spec.RunID,
+		AttemptID:     f.spec.AttemptID,
+		Executable:    "/opt/harness/claude",
+		ArgvDigest:    "argv-digest",
+		PID:           fixturePID,
+		SeedEvidence:  evidence,
+	}
+}
+
+// claimSeedEvidence reads the fixture claim row's persisted seed evidence
+// and whether the column is NULL (the pre-migration row shape).
+func claimSeedEvidence(t *testing.T, f *fixture) (value string, isNull bool) {
+	t.Helper()
+	var v sql.NullString
+	if err := sqlite.WriteDB(f.store).QueryRowContext(t.Context(),
+		`SELECT seed_evidence FROM launch_claims WHERE incarnation_id = ?`, f.spec.IncarnationID.String(),
+	).Scan(&v); err != nil {
+		t.Fatalf("read seed evidence: %v", err)
+	}
+	return v.String, !v.Valid
+}
+
+// loadClaimRow reads the fixture claim's invocation identity fields.
+func loadClaimRow(t *testing.T, f *fixture) app.LaunchClaim {
+	t.Helper()
+	var (
+		executable, argvDigest, state string
+		pid                           int
+	)
+	if err := sqlite.WriteDB(f.store).QueryRowContext(t.Context(),
+		`SELECT executable, argv_digest, pid, state FROM launch_claims WHERE incarnation_id = ?`, f.spec.IncarnationID.String(),
+	).Scan(&executable, &argvDigest, &pid, &state); err != nil {
+		t.Fatalf("read launch claim row: %v", err)
+	}
+	return app.LaunchClaim{Executable: executable, ArgvDigest: argvDigest, PID: pid, State: app.LaunchClaimState(state)}
+}
+
+// TestClaimLaunch proves the pre-exec claim contract: same-pid idempotence
+// with the seed-evidence refresh, different-pid rejection (including raced
+// from two handles), the settled-history and incompatible-retry refusals,
+// the non-current incarnation refusal, and the stop refusal.
 func TestClaimLaunch(t *testing.T) {
 	t.Run("same pid is idempotent", func(t *testing.T) {
 		f := newFixture(t)
@@ -387,6 +431,86 @@ func TestClaimLaunch(t *testing.T) {
 
 		if n := countRows(t, f.store, `SELECT COUNT(*) FROM launch_claims`); n != 1 {
 			t.Fatalf("claims after an idempotent rewrite = %d, want 1", n)
+		}
+		if got, null := claimSeedEvidence(t, f); null || got != fixtureSeedEvidence {
+			t.Fatalf("seed evidence after an identical retry = %q (null %t), want it unchanged", got, null)
+		}
+	})
+
+	t.Run("a same-pid retry refreshes NULL seed evidence", func(t *testing.T) {
+		f := newFixture(t)
+		f.launchAttempt(t)
+		f.createBinding(t)
+		// A claim with empty evidence persists NULL — the shape of every
+		// row written before the seed-evidence migration.
+		if err := f.store.ClaimLaunch(t.Context(), f.seedClaim("")); err != nil {
+			t.Fatalf("ClaimLaunch: %v", err)
+		}
+		if _, null := claimSeedEvidence(t, f); !null {
+			t.Fatal("the empty-evidence claim did not persist NULL")
+		}
+
+		if err := f.store.ClaimLaunch(t.Context(), f.seedClaim(fixtureSeedEvidence)); err != nil {
+			t.Fatalf("ClaimLaunch retry: %v", err)
+		}
+
+		if got, null := claimSeedEvidence(t, f); null || got != fixtureSeedEvidence {
+			t.Fatalf("seed evidence after the retry = %q (null %t), want the refreshed value", got, null)
+		}
+		claim := loadClaimRow(t, f)
+		if claim.Executable != "/opt/harness/claude" || claim.ArgvDigest != "argv-digest" || claim.PID != fixturePID || claim.State != app.LaunchClaimExecPending {
+			t.Fatalf("claim identity after the evidence refresh = %+v, want it untouched", claim)
+		}
+	})
+
+	t.Run("a same-pid retry records a changed seed outcome", func(t *testing.T) {
+		f := newFixture(t)
+		f.launchAttempt(t)
+		f.createBinding(t)
+		if err := f.store.ClaimLaunch(t.Context(), f.seedClaim("workspace trust not seeded: profile config absent")); err != nil {
+			t.Fatalf("ClaimLaunch: %v", err)
+		}
+
+		if err := f.store.ClaimLaunch(t.Context(), f.seedClaim(fixtureSeedEvidence)); err != nil {
+			t.Fatalf("ClaimLaunch retry: %v", err)
+		}
+
+		if got, null := claimSeedEvidence(t, f); null || got != fixtureSeedEvidence {
+			t.Fatalf("seed evidence after the changed-outcome retry = %q (null %t), want the new outcome", got, null)
+		}
+	})
+
+	t.Run("a settled claim refuses a same-pid retry", func(t *testing.T) {
+		f := newFixture(t)
+		f.launchAttempt(t)
+		f.createBinding(t)
+		f.claimLaunch(t)
+		if err := f.store.SettleLaunchFailure(t.Context(), f.spec.IncarnationID, "exec failed"); err != nil {
+			t.Fatalf("SettleLaunchFailure: %v", err)
+		}
+
+		err := f.store.ClaimLaunch(t.Context(), f.seedClaim(fixtureSeedEvidence))
+
+		if err == nil || !strings.Contains(err.Error(), "settled") {
+			t.Fatalf("err = %v, want the settled-history refusal", err)
+		}
+		if got, null := claimSeedEvidence(t, f); null || got != fixtureSeedEvidence {
+			t.Fatalf("settled claim's evidence = %q (null %t); settled history must stay untouched", got, null)
+		}
+	})
+
+	t.Run("an incompatible same-pid retry is refused", func(t *testing.T) {
+		f := newFixture(t)
+		f.launchAttempt(t)
+		f.createBinding(t)
+		f.claimLaunch(t)
+
+		incompatible := f.seedClaim(fixtureSeedEvidence)
+		incompatible.ArgvDigest = "a-differently-composed-argv"
+		err := f.store.ClaimLaunch(t.Context(), incompatible)
+
+		if err == nil || !strings.Contains(err.Error(), "different executable or argv") {
+			t.Fatalf("err = %v, want the incompatible-retry refusal", err)
 		}
 	})
 

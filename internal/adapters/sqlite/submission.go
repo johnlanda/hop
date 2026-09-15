@@ -317,6 +317,24 @@ func (s *Store) ClaimLaunch(ctx context.Context, claim app.LaunchClaim) error { 
 			if existing.PID != claim.PID {
 				return fmt.Errorf("sqlite: incarnation %s already has a launch claim by pid %d; a claim by pid %d is refused", claim.IncarnationID, existing.PID, claim.PID)
 			}
+			if existing.State != app.LaunchClaimExecPending {
+				return fmt.Errorf("sqlite: incarnation %s's launch claim is already settled %s; a launcher retry never rewrites settled history", claim.IncarnationID, existing.State)
+			}
+			if existing.Executable != claim.Executable || existing.ArgvDigest != claim.ArgvDigest {
+				return fmt.Errorf("sqlite: incarnation %s's existing claim records a different executable or argv; an incompatible retry is refused", claim.IncarnationID)
+			}
+			// A same-pid retry re-applies the seed, so the row's evidence
+			// tracks the newest application (healing NULL rows written
+			// before the seed-evidence migration); every invocation
+			// identity field stays exactly as first claimed.
+			if existing.SeedEvidence != claim.SeedEvidence {
+				if _, err := tx.ExecContext(ctx,
+					`UPDATE launch_claims SET seed_evidence = ? WHERE incarnation_id = ?`,
+					sql.NullString{String: claim.SeedEvidence, Valid: claim.SeedEvidence != ""}, claim.IncarnationID.String(),
+				); err != nil {
+					return fmt.Errorf("sqlite: refresh launch claim seed evidence: %w", err)
+				}
+			}
 			return nil
 		}
 		claimedAt := claim.ClaimedAt
@@ -324,10 +342,11 @@ func (s *Store) ClaimLaunch(ctx context.Context, claim app.LaunchClaim) error { 
 			claimedAt = s.now()
 		}
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO launch_claims (incarnation_id, run_id, attempt_id, executable, argv_digest, pid, state, error, claimed_at, settled_at, settlement_evidence)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL)`,
+			`INSERT INTO launch_claims (incarnation_id, run_id, attempt_id, executable, argv_digest, pid, state, error, claimed_at, settled_at, settlement_evidence, seed_evidence)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL, ?)`,
 			claim.IncarnationID.String(), claim.RunID.String(), claim.AttemptID.String(), claim.Executable, claim.ArgvDigest,
 			claim.PID, string(app.LaunchClaimExecPending), formatTime(claimedAt),
+			sql.NullString{String: claim.SeedEvidence, Valid: claim.SeedEvidence != ""},
 		); err != nil {
 			return fmt.Errorf("sqlite: insert launch claim: %w", err)
 		}

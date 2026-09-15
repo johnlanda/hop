@@ -44,6 +44,9 @@ type Controller struct {
 	// (docs/plan/phase-3-design.md section 3). Nil for a Controller that
 	// only ever runs solo-mode runs.
 	Workspaces WorkspaceRuntime
+	// Trust applies the workspace-trust pre-seed at the launch exec
+	// boundary (PrepareLaunchExec); no controller use case calls it.
+	Trust TrustSeeder
 	// GitExecutable is the absolute path of the git binary every repository
 	// and worktree command runs (StartRun's object-format check and base
 	// commit resolution, worktree provenance classification, check

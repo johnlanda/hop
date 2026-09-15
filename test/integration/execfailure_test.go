@@ -24,7 +24,7 @@ func installBrokenClaudeStub(t *testing.T, server *testServer) {
 	}
 }
 
-// TestRealProcessExecFailureSettlesExecFailed proves design section 6 step 6
+// TestRealProcessExecFailureSettlesExecFailed proves design section 6 step 7
 // directly: when the harness exec itself fails (never a lookup failure — a
 // broken-format executable still passes PrepareLaunchExec's regular-file-
 // and-executable-bit check), hop launch settles the claim exec_failed

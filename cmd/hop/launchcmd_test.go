@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -38,7 +39,8 @@ func TestRunLaunch(t *testing.T) {
 			settledIncarnation, settledReason = incarnationID, reason
 			return nil
 		}
-		td := newTestDeps(ctrl, workerEnv, t.TempDir())
+		dir := t.TempDir()
+		td := newTestDeps(ctrl, workerEnv, dir)
 		var stdout, stderr bytes.Buffer
 
 		code, err := runLaunch([]string{"--run", testRunID, "--attempt", testAttemptID}, &stdout, &stderr, td.deps)
@@ -56,6 +58,16 @@ func TestRunLaunch(t *testing.T) {
 		}
 		if prepared.PID != 4242 || prepared.HOPPath != "/opt/hop/bin/hop" || prepared.LookupExecutable == nil {
 			t.Errorf("prepared request = %+v", prepared)
+		}
+		resolvedDir, err := filepath.EvalSymlinks(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if prepared.WorkerDir != resolvedDir {
+			t.Errorf("prepared worker dir = %q, want the symlink-resolved working directory %q", prepared.WorkerDir, resolvedDir)
+		}
+		if prepared.ResolvePath == nil {
+			t.Error("no path resolver was wired into the request")
 		}
 		if len(prepared.Environ) == 0 {
 			t.Error("the launcher's inherited environment was not passed for validation and sanitization")
@@ -118,6 +130,56 @@ func TestRunLaunch(t *testing.T) {
 		}
 		if len(td.openCalls) != 0 {
 			t.Error("the store was opened with a refused state root")
+		}
+	})
+
+	t.Run("a failed getwd is a diagnostic failure that never echoes the raw error", func(t *testing.T) {
+		td := newTestDeps(&fakeController{}, workerEnv, t.TempDir())
+		td.deps.getwd = func() (string, error) { return "", errors.New("getwd: s3kr3t-cwd vanished") }
+		var stdout, stderr bytes.Buffer
+
+		code, err := runLaunch([]string{"--run", testRunID, "--attempt", testAttemptID}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+
+		if code != exitFailure {
+			t.Errorf("exit code = %d, want %d", code, exitFailure)
+		}
+		if !strings.Contains(stderr.String(), "working directory could not be determined") {
+			t.Errorf("stderr = %q, want the fixed working-directory diagnostic", stderr.String())
+		}
+		if strings.Contains(stderr.String(), "s3kr3t") {
+			t.Errorf("stderr echoes the raw getwd error: %q", stderr.String())
+		}
+		if len(td.openCalls) != 0 {
+			t.Error("the store was opened although the worker directory never resolved")
+		}
+	})
+
+	t.Run("a path-bearing symlink-resolution failure names a category, never the path", func(t *testing.T) {
+		missing := filepath.Join(t.TempDir(), "sensitive-workspace-does-not-exist")
+		td := newTestDeps(&fakeController{}, workerEnv, t.TempDir())
+		td.deps.getwd = func() (string, error) { return missing, nil }
+		var stdout, stderr bytes.Buffer
+
+		code, err := runLaunch([]string{"--run", testRunID, "--attempt", testAttemptID}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+
+		if code != exitFailure {
+			t.Errorf("exit code = %d, want %d", code, exitFailure)
+		}
+		out := stderr.String()
+		if !strings.Contains(out, "could not be canonically resolved") || !strings.Contains(out, "a path element does not exist") {
+			t.Errorf("stderr = %q, want the fixed resolution diagnostic with its category", out)
+		}
+		if strings.Contains(out, "sensitive-workspace") || strings.Contains(out, missing) || strings.Contains(out, filepath.Dir(missing)) {
+			t.Errorf("stderr echoes the failing path or a component of it: %q", out)
+		}
+		if len(td.openCalls) != 0 {
+			t.Error("the store was opened although the worker directory never resolved")
 		}
 	})
 

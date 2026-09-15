@@ -23,28 +23,41 @@ type ExecutableLookup func(name, pathValue string) (string, error)
 
 // LaunchExecRequest is hop launch's input: the --run/--attempt flag values
 // as raw strings, the absolute path of the running hop executable (rendered
-// into the initial prompt's submit instruction), the launcher's complete
-// inherited environment and its own pid, and the composition-supplied
-// executable lookup.
+// into the initial prompt's submit instruction), the launcher's
+// symlink-resolved absolute working directory (the attempt worktree the
+// pane was created at — execve preserves it, so it is exactly the path the
+// harness resolves as its own cwd), the launcher's complete inherited
+// environment and its own pid, and the composition-supplied executable
+// lookup.
 type LaunchExecRequest struct {
-	RunID            string
-	AttemptID        string
-	HOPPath          string
-	Environ          []string
-	PID              int
+	RunID     string
+	AttemptID string
+	HOPPath   string
+	WorkerDir string
+	Environ   []string
+	PID       int
+	// ResolvePath canonically resolves an absolute path (symlinks
+	// followed), supplied by composition like LookupExecutable because
+	// this package performs no filesystem access itself. PrepareLaunchExec
+	// resolves BOTH the launcher's working directory and the recorded
+	// worktree path through it and refuses on disagreement; its errors are
+	// never echoed (they may carry the path).
+	ResolvePath      func(path string) (string, error)
 	LookupExecutable ExecutableLookup
 }
 
 // LaunchExecPlan is what hop launch execs once PrepareLaunchExec has
-// validated, claimed and composed: the harness argv (argv[0] the resolved
-// absolute executable recorded in the claim) and the sanitized complete
-// environment. IncarnationID is the claimed incarnation as a string, so a
-// failed exec can settle the claim through FailLaunchExec without the
-// caller holding a typed identity.
+// validated, seeded, claimed and composed: the harness argv (argv[0] the
+// resolved absolute executable recorded in the claim) and the sanitized
+// complete environment. IncarnationID is the claimed incarnation as a
+// string, so a failed exec can settle the claim through FailLaunchExec
+// without the caller holding a typed identity. SeedEvidence is the
+// workspace-trust pre-seeding outcome exactly as the claim recorded it.
 type LaunchExecPlan struct {
 	Argv          []string
 	Env           []string
 	IncarnationID string
+	SeedEvidence  string
 }
 
 // PrepareLaunchExec performs every hop launch step before the exec itself
@@ -59,9 +72,15 @@ type LaunchExecPlan struct {
 // --resume with the pre-assigned native reference, and Codex/opencode
 // cold resume reports the Phase 2 unsupported state); resolves the
 // harness executable to
-// an absolute path using the sanitized environment's PATH; and records the
-// launch claim (exec_pending) with that exact executable, the argv digest
-// and the launcher's own pid. Any failure returns before the claim is
+// an absolute path using the sanitized environment's PATH; applies the
+// workspace-trust pre-seed (PlanTrustSeed over the sanitized environment
+// and the launcher's resolved working directory, written through the
+// TrustSeeder port — an absent or unparsable profile config is a
+// not-seeded outcome and the launch proceeds, while a seeding failure
+// refuses the launch fail-closed); and records the
+// launch claim (exec_pending) with that exact executable, the argv digest,
+// the launcher's own pid and the seed outcome as evidence — evidence only,
+// never a decision input. Any failure returns before the claim is
 // written — no claim, no exec — except a failed claim write itself, which
 // is the store's refusal. Error messages name environment variables but
 // never echo their values.
@@ -80,8 +99,14 @@ func (c *Controller) PrepareLaunchExec(ctx context.Context, req LaunchExecReques
 	if !filepath.IsAbs(req.HOPPath) {
 		return LaunchExecPlan{}, fmt.Errorf("app: hop executable path is not absolute; the initial prompt carries only absolute paths")
 	}
+	if !filepath.IsAbs(req.WorkerDir) {
+		return LaunchExecPlan{}, fmt.Errorf("app: the launcher working directory is not absolute; the workspace-trust seed key must be the resolved worktree path")
+	}
 	if req.LookupExecutable == nil {
 		return LaunchExecPlan{}, fmt.Errorf("app: no executable lookup supplied")
+	}
+	if req.ResolvePath == nil {
+		return LaunchExecPlan{}, fmt.Errorf("app: no path resolver supplied")
 	}
 
 	lc, err := c.Read.LoadLaunchContext(ctx, runID, attemptID)
@@ -127,13 +152,23 @@ func (c *Controller) PrepareLaunchExec(ctx context.Context, req LaunchExecReques
 	digest := launchArgvDigest(argv)
 	// An existing same-pid exec_pending claim authorizes only the exact
 	// invocation it recorded: the corroboration predicate settles a claim
-	// by its recorded executable and argv identity, and the store keeps
-	// the existing row on an idempotent same-pid rewrite, so executing a
-	// differently composed plan under it would run an invocation the claim
+	// by its recorded executable and argv identity, and a same-pid retry
+	// keeps every identity field of the existing row (the store refreshes
+	// its seed evidence only), so executing a differently composed plan
+	// under it would run an invocation the claim
 	// does not describe. Identical retries stay idempotent; anything else
 	// fails closed before exec.
 	if lc.Claim != nil && (lc.Claim.Executable != executable || lc.Claim.ArgvDigest != digest) {
 		return LaunchExecPlan{}, fmt.Errorf("app: the existing launch claim for this incarnation records a different executable or argv than this invocation composed; a claim is never rewritten and this launcher never execs")
+	}
+
+	workerDir, err := resolveWorkerDirAgainstWorktree(req.ResolvePath, req.WorkerDir, lc.WorktreePath)
+	if err != nil {
+		return LaunchExecPlan{}, err
+	}
+	seedEvidence, err := c.seedWorkspaceTrust(ctx, lc.Snapshot.Harness, env, workerDir)
+	if err != nil {
+		return LaunchExecPlan{}, err
 	}
 
 	claim := LaunchClaim{
@@ -145,17 +180,73 @@ func (c *Controller) PrepareLaunchExec(ctx context.Context, req LaunchExecReques
 		PID:           req.PID,
 		State:         LaunchClaimExecPending,
 		ClaimedAt:     c.Clock.Now(),
+		SeedEvidence:  seedEvidence,
 	}
 	if err := c.Submissions.ClaimLaunch(ctx, claim); err != nil {
 		return LaunchExecPlan{}, fmt.Errorf("app: claim launch: %w", err)
 	}
-	return LaunchExecPlan{Argv: argv, Env: env, IncarnationID: lc.IncarnationID.String()}, nil
+	return LaunchExecPlan{Argv: argv, Env: env, IncarnationID: lc.IncarnationID.String(), SeedEvidence: seedEvidence}, nil
+}
+
+// resolveWorkerDirAgainstWorktree canonically resolves the launcher's
+// working directory and the run's recorded worktree path through the
+// composition-supplied resolver and requires them to be one directory: the
+// workspace-trust seed grants trust and the exec runs work, so both must
+// target the attempt's own recorded worktree, never whatever directory a
+// launcher happens to run in. It returns the resolved directory — the
+// exact seed key. A missing recorded path, a resolution failure on either
+// side, and a disagreement all refuse the launch fail-closed; resolver
+// errors may carry a path and are never echoed.
+func resolveWorkerDirAgainstWorktree(resolve func(string) (string, error), workerDir, recordedWorktree string) (string, error) {
+	if recordedWorktree == "" {
+		return "", fmt.Errorf("app: the run has no recorded worktree path; the launcher directory cannot be validated and is never seeded or execed")
+	}
+	resolvedWorker, err := resolve(workerDir)
+	if err != nil {
+		return "", fmt.Errorf("app: the launcher working directory could not be canonically resolved; an unresolvable directory is never seeded or execed")
+	}
+	resolvedRecorded, err := resolve(recordedWorktree)
+	if err != nil {
+		return "", fmt.Errorf("app: the recorded worktree path could not be canonically resolved; the launch is refused rather than run against unverified evidence")
+	}
+	if resolvedWorker != resolvedRecorded {
+		return "", fmt.Errorf("app: the launcher working directory does not resolve to the attempt's recorded worktree; a foreign directory is never seeded or execed")
+	}
+	return resolvedWorker, nil
+}
+
+// seedWorkspaceTrust applies the launch's workspace-trust pre-seed and
+// renders its claim evidence. The step is planned by PlanTrustSeed over
+// the launched harness, the sanitized environment and the launcher's
+// resolved working directory; a planned seed is written through the Trust
+// port immediately before the claim, while the profile's harness is
+// guaranteed not to be running for this incarnation yet. A not-seeded
+// outcome (no seed applies, or the profile config is absent or
+// unparsable) is evidence and the launch proceeds — the interactive trust
+// dialog stays the surfaced fallback — but a seeding write failure is an
+// error and the caller refuses the launch before any claim exists.
+func (c *Controller) seedWorkspaceTrust(ctx context.Context, harness string, sanitizedEnv []string, workerDir string) (string, error) {
+	step := PlanTrustSeed(harness, sanitizedEnv, workerDir)
+	if !step.Seeds() {
+		return "workspace trust not seeded: " + step.Reason, nil
+	}
+	if c.Trust == nil {
+		return "", fmt.Errorf("app: no workspace-trust seeder supplied")
+	}
+	outcome, err := c.Trust.SeedWorkspaceTrust(ctx, step.ConfigPath, step.ProjectKey)
+	if err != nil {
+		return "", fmt.Errorf("app: seed workspace trust: %w", err)
+	}
+	if !outcome.Seeded {
+		return "workspace trust not seeded: " + outcome.Reason, nil
+	}
+	return "workspace trust seeded for " + step.ProjectKey + " (verified; best-effort against external profile writers)", nil
 }
 
 // FailLaunchExec settles the launch claim of incarnationID to exec_failed
 // with reason: the launcher's own error path once its claim is written and
 // the exec — or any step after the claim — fails
-// (docs/plan/phase-2-design.md section 6, step 6).
+// (docs/plan/phase-2-design.md section 6, step 7).
 func (c *Controller) FailLaunchExec(ctx context.Context, incarnationID, reason string) error {
 	id, err := identity.ParseIncarnationID(incarnationID)
 	if err != nil {
