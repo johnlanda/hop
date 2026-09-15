@@ -1,0 +1,351 @@
+package app
+
+import (
+	"context"
+	"fmt"
+	"path/filepath"
+
+	"github.com/johnlanda/hop/internal/domain/identity"
+	"github.com/johnlanda/hop/internal/domain/run"
+)
+
+// SendMessageRequest is `hop msg send`'s CLI-facing input, exactly as
+// parsed from flags and the caller's HOP_* environment: identities as
+// plain strings (composition never imports domain or identity types,
+// docs/plan/phase-2-design.md section 8), and Body already read from
+// --file or --body by the caller, with Inline recording which flag was
+// used (the two carry different size bounds). To and ReplyTo/RelayOf are
+// "" when not applicable to Kind.
+type SendMessageRequest struct {
+	RunID         string
+	SessionID     string
+	IncarnationID string
+	StateRoot     string
+	To            string // "manager" | "human" | "task:<uuid>"; ignored for Kind "answer"
+	Kind          string // "question" | "info" | "answer"
+	ReplyTo       string // required for Kind "answer", forbidden otherwise
+	RelayOf       string // optional, Kind "question" only
+	Body          []byte
+	Inline        bool // true when Body came from --body, false from --file
+	RequestID     string
+}
+
+// SendMessageResult is SendMessage's outcome, string-only per the driving
+// API convention.
+type SendMessageResult struct {
+	Outcome   string
+	MessageID string
+	Detail    string
+}
+
+// SendMessage is `hop msg send`'s driving use case: resolves the caller's
+// logical address, bounds and writes the body durably (temp-file-then-
+// rename via ArtifactStore, digest computed here — the file-first
+// protocol, before any store call), then delegates validation and
+// acceptance to MessagingStore.SendMessage, which owns the section 7
+// addressing/eligibility rules and the request-ID receipt.
+func (c *Controller) SendMessage(ctx context.Context, req SendMessageRequest) (SendMessageResult, error) { //nolint:gocritic // hugeParam: SendMessageRequest is the driving DTO for hop msg send, carrying a message body; a pointer would only complicate composition's call site.
+	if c.Messages == nil {
+		return SendMessageResult{}, fmt.Errorf("%w: SendMessage", ErrFeatureModeUnsupported)
+	}
+	wf, err := RequireWorkflowReadStore(c.Read, "SendMessage")
+	if err != nil {
+		return SendMessageResult{}, err
+	}
+
+	runID, err := identity.ParseRunID(req.RunID)
+	if err != nil {
+		return SendMessageResult{}, fmt.Errorf("app: parse run id: %w", err)
+	}
+	sessionID, err := identity.ParseSessionID(req.SessionID)
+	if err != nil {
+		return SendMessageResult{}, fmt.Errorf("app: parse session id: %w", err)
+	}
+	incarnationID, err := identity.ParseIncarnationID(req.IncarnationID)
+	if err != nil {
+		return SendMessageResult{}, fmt.Errorf("app: parse incarnation id: %w", err)
+	}
+
+	kind, err := parseMessageKind(req.Kind)
+	if err != nil {
+		return SendMessageResult{Outcome: string(MessageMalformed), Detail: err.Error()}, nil
+	}
+	limit := MessageBodyFileLimit
+	if req.Inline {
+		limit = MessageBodyInlineLimit
+	}
+	if len(req.Body) == 0 || len(req.Body) > limit {
+		return SendMessageResult{Outcome: string(MessageMalformed), Detail: "body is empty or exceeds the size bound"}, nil
+	}
+
+	var recipient run.Address
+	if kind != run.MessageAnswer {
+		if recipient, err = parseAddress(req.To); err != nil {
+			return SendMessageResult{Outcome: string(MessageMalformed), Detail: err.Error()}, nil
+		}
+	}
+	var replyTo, relayOf *identity.MessageID
+	if req.ReplyTo != "" {
+		id, parseErr := identity.ParseMessageID(req.ReplyTo)
+		if parseErr != nil {
+			return SendMessageResult{Outcome: string(MessageMalformed), Detail: "invalid reply-to"}, nil
+		}
+		replyTo = &id
+	}
+	if req.RelayOf != "" {
+		id, parseErr := identity.ParseMessageID(req.RelayOf)
+		if parseErr != nil {
+			return SendMessageResult{Outcome: string(MessageMalformed), Detail: "invalid relay-of"}, nil
+		}
+		relayOf = &id
+	}
+
+	msgCtx, err := wf.LoadMessagingContext(ctx, sessionID)
+	if err != nil {
+		return SendMessageResult{}, fmt.Errorf("app: load messaging context: %w", err)
+	}
+
+	msgID, err := identity.ParseMessageID(c.IDs.NewID())
+	if err != nil {
+		return SendMessageResult{}, fmt.Errorf("app: generate message id: %w", err)
+	}
+	bodyPath := messageBodyPath(req.StateRoot, runID, msgID)
+	bodyDigest := sha256Hex(req.Body)
+	if err = c.Artifacts.WriteArtifact(ctx, bodyPath, req.Body); err != nil {
+		return SendMessageResult{}, fmt.Errorf("app: write message body: %w", err)
+	}
+
+	outcome, err := c.Messages.SendMessage(ctx, MessageSend{
+		ID: msgID, RunID: runID, Sender: run.SessionPrincipal(sessionID), SenderAddress: msgCtx.Address,
+		IncarnationID: incarnationID, Recipient: recipient, Kind: kind, ReplyTo: replyTo, RelayedFrom: relayOf,
+		RequestID: req.RequestID, BodyPath: bodyPath, BodyDigest: bodyDigest, BodyBytes: int64(len(req.Body)),
+	})
+	if err != nil {
+		return SendMessageResult{}, fmt.Errorf("app: send message: %w", err)
+	}
+	return SendMessageResult{Outcome: string(outcome.Kind), MessageID: outcome.MessageID.String(), Detail: outcome.Detail}, nil
+}
+
+// FetchMessageRequest is `hop msg next`'s driving input (also the single
+// fetch `hop msg wait`'s CLI-side 1s poll loop repeats until its own
+// timeout — the loop and the timeout both live in cmd/hop, never here).
+type FetchMessageRequest struct {
+	RunID         string
+	SessionID     string
+	IncarnationID string
+}
+
+// FetchMessageResult is FetchMessage's outcome. Delivered is false for an
+// empty queue (the section 7 "commits nothing" case); every other field
+// is meaningful only when Delivered is true. SenderSession is set only
+// when SenderKind is "session". Origin is set only for an answer whose
+// reply-to question carries relay provenance (the grammar's "origin"
+// field, section 7).
+type FetchMessageResult struct {
+	Delivered     bool
+	MessageID     string
+	Kind          string
+	SenderKind    string
+	SenderSession string
+	ReplyTo       string
+	RelayOf       string
+	Origin        string
+	BodyPath      string
+}
+
+// FetchMessage is `hop msg next`'s driving use case: resolves the
+// caller's logical address (lineage-based — a cold-relaunched or retried
+// successor session fetches its predecessor's queue with no re-addressing
+// write) and delegates to MessagingStore.FetchNextMessage.
+func (c *Controller) FetchMessage(ctx context.Context, req FetchMessageRequest) (FetchMessageResult, error) {
+	if c.Messages == nil {
+		return FetchMessageResult{}, fmt.Errorf("%w: FetchMessage", ErrFeatureModeUnsupported)
+	}
+	wf, err := RequireWorkflowReadStore(c.Read, "FetchMessage")
+	if err != nil {
+		return FetchMessageResult{}, err
+	}
+	runID, err := identity.ParseRunID(req.RunID)
+	if err != nil {
+		return FetchMessageResult{}, fmt.Errorf("app: parse run id: %w", err)
+	}
+	sessionID, err := identity.ParseSessionID(req.SessionID)
+	if err != nil {
+		return FetchMessageResult{}, fmt.Errorf("app: parse session id: %w", err)
+	}
+	incarnationID, err := identity.ParseIncarnationID(req.IncarnationID)
+	if err != nil {
+		return FetchMessageResult{}, fmt.Errorf("app: parse incarnation id: %w", err)
+	}
+	msgCtx, err := wf.LoadMessagingContext(ctx, sessionID)
+	if err != nil {
+		return FetchMessageResult{}, fmt.Errorf("app: load messaging context: %w", err)
+	}
+
+	delivery, ok, err := c.Messages.FetchNextMessage(ctx, MessageFetch{
+		RunID: runID, SessionID: sessionID, IncarnationID: incarnationID, Address: msgCtx.Address,
+	})
+	if err != nil {
+		return FetchMessageResult{}, fmt.Errorf("app: fetch message: %w", err)
+	}
+	if !ok {
+		return FetchMessageResult{}, nil
+	}
+	result := FetchMessageResult{
+		Delivered: true, MessageID: delivery.Message.ID.String(), Kind: string(delivery.Message.Kind),
+		SenderKind: string(delivery.Message.Sender.Kind), BodyPath: delivery.Message.BodyPath,
+	}
+	if delivery.Message.Sender.Kind == run.PrincipalSession {
+		result.SenderSession = delivery.Message.Sender.SessionID.String()
+	}
+	if delivery.Message.ReplyTo != nil {
+		result.ReplyTo = delivery.Message.ReplyTo.String()
+	}
+	if delivery.Message.RelayedFrom != nil {
+		result.RelayOf = delivery.Message.RelayedFrom.String()
+	}
+	if delivery.Origin != nil {
+		result.Origin = delivery.Origin.String()
+	}
+	return result, nil
+}
+
+// AckMessageRequest is `hop msg ack`'s driving input.
+type AckMessageRequest struct {
+	RunID         string
+	MessageID     string
+	SessionID     string
+	IncarnationID string
+}
+
+// AckMessageResult is AckMessage's outcome.
+type AckMessageResult struct {
+	Outcome string
+	Detail  string
+}
+
+// AckMessage is `hop msg ack`'s driving use case.
+func (c *Controller) AckMessage(ctx context.Context, req AckMessageRequest) (AckMessageResult, error) {
+	if c.Messages == nil {
+		return AckMessageResult{}, fmt.Errorf("%w: AckMessage", ErrFeatureModeUnsupported)
+	}
+	runID, err := identity.ParseRunID(req.RunID)
+	if err != nil {
+		return AckMessageResult{}, fmt.Errorf("app: parse run id: %w", err)
+	}
+	messageID, err := identity.ParseMessageID(req.MessageID)
+	if err != nil {
+		return AckMessageResult{}, fmt.Errorf("app: parse message id: %w", err)
+	}
+	sessionID, err := identity.ParseSessionID(req.SessionID)
+	if err != nil {
+		return AckMessageResult{}, fmt.Errorf("app: parse session id: %w", err)
+	}
+	incarnationID, err := identity.ParseIncarnationID(req.IncarnationID)
+	if err != nil {
+		return AckMessageResult{}, fmt.Errorf("app: parse incarnation id: %w", err)
+	}
+	outcome, err := c.Messages.AckMessage(ctx, MessageAck{
+		RunID: runID, MessageID: messageID, SessionID: sessionID, IncarnationID: incarnationID,
+	})
+	if err != nil {
+		return AckMessageResult{}, fmt.Errorf("app: ack message: %w", err)
+	}
+	return AckMessageResult{Outcome: string(outcome.Kind), Detail: outcome.Detail}, nil
+}
+
+// AnswerRequest is `hop answer`'s driving input: a controller-machine
+// command, never a session (no HOP_* env, no lease, no incarnation).
+type AnswerRequest struct {
+	RunID      string
+	QuestionID string
+	StateRoot  string
+	Body       []byte
+	Inline     bool
+	RequestID  string
+}
+
+// AnswerResult is Answer's outcome.
+type AnswerResult struct {
+	Outcome   string
+	MessageID string
+	Detail    string
+}
+
+// Answer is `hop answer`'s driving use case: writes the answer body
+// durably before the call (file-first), then delegates to
+// MessagingStore.AnswerQuestion.
+func (c *Controller) Answer(ctx context.Context, req AnswerRequest) (AnswerResult, error) { //nolint:gocritic // hugeParam: AnswerRequest is the driving DTO for hop answer, carrying an answer body; a pointer would only complicate composition's call site.
+	if c.Messages == nil {
+		return AnswerResult{}, fmt.Errorf("%w: Answer", ErrFeatureModeUnsupported)
+	}
+	runID, err := identity.ParseRunID(req.RunID)
+	if err != nil {
+		return AnswerResult{}, fmt.Errorf("app: parse run id: %w", err)
+	}
+	questionID, err := identity.ParseMessageID(req.QuestionID)
+	if err != nil {
+		return AnswerResult{}, fmt.Errorf("app: parse question id: %w", err)
+	}
+	limit := MessageBodyFileLimit
+	if req.Inline {
+		limit = MessageBodyInlineLimit
+	}
+	if len(req.Body) == 0 || len(req.Body) > limit {
+		return AnswerResult{Outcome: string(MessageMalformed), Detail: "body is empty or exceeds the size bound"}, nil
+	}
+
+	answerID, err := identity.ParseMessageID(c.IDs.NewID())
+	if err != nil {
+		return AnswerResult{}, fmt.Errorf("app: generate message id: %w", err)
+	}
+	bodyPath := messageBodyPath(req.StateRoot, runID, answerID)
+	bodyDigest := sha256Hex(req.Body)
+	if err = c.Artifacts.WriteArtifact(ctx, bodyPath, req.Body); err != nil {
+		return AnswerResult{}, fmt.Errorf("app: write answer body: %w", err)
+	}
+
+	outcome, err := c.Messages.AnswerQuestion(ctx, HumanAnswer{
+		ID: answerID, RunID: runID, QuestionID: questionID, RequestID: req.RequestID,
+		BodyPath: bodyPath, BodyDigest: bodyDigest, BodyBytes: int64(len(req.Body)),
+	})
+	if err != nil {
+		return AnswerResult{}, fmt.Errorf("app: answer question: %w", err)
+	}
+	return AnswerResult{Outcome: string(outcome.Kind), MessageID: outcome.MessageID.String(), Detail: outcome.Detail}, nil
+}
+
+// messageBodyPath is the deterministic artifact path for one message or
+// answer body, under the run's artifact directory.
+func messageBodyPath(stateRoot string, runID identity.RunID, messageID identity.MessageID) string {
+	return filepath.Join(stateRoot, "runs", runID.String(), "messages", messageID.String()+".md")
+}
+
+// parseMessageKind validates s as one of the section 7 message kinds.
+func parseMessageKind(s string) (run.MessageKind, error) {
+	switch run.MessageKind(s) {
+	case run.MessageQuestion, run.MessageInfo, run.MessageAnswer:
+		return run.MessageKind(s), nil
+	default:
+		return "", fmt.Errorf("app: %q is not one of question, info, answer", s)
+	}
+}
+
+// parseAddress parses s as one of the section 7 logical addresses:
+// "manager", "human" or "task:<uuid>".
+func parseAddress(s string) (run.Address, error) {
+	switch {
+	case s == "manager":
+		return run.ManagerAddress(), nil
+	case s == "human":
+		return run.HumanAddress(), nil
+	case len(s) > len("task:") && s[:len("task:")] == "task:":
+		taskID, err := identity.ParseTaskID(s[len("task:"):])
+		if err != nil {
+			return run.Address{}, fmt.Errorf("app: invalid task address %q: %w", s, err)
+		}
+		return run.TaskAddress(taskID), nil
+	default:
+		return run.Address{}, fmt.Errorf("app: %q is not a recognized address (manager, human, task:<uuid>)", s)
+	}
+}

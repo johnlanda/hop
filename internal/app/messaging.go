@@ -71,6 +71,11 @@ type MessageSend struct {
 	RunID         identity.RunID
 	Sender        run.Principal
 	SenderAddress run.Address
+	// IncarnationID is the sending session's current incarnation: section
+	// 7 requires eligibility (current incarnation; run running; for a
+	// task:<id> destination, an open mailbox) before an ordinary send is
+	// accepted.
+	IncarnationID identity.IncarnationID
 	Recipient     run.Address
 	Kind          run.MessageKind
 	// ReplyTo is set only for Kind MessageAnswer: the question being

@@ -14,9 +14,10 @@ import (
 // featureRun bundles a seeded feature-mode run's identities for scheduler
 // and messaging scenarios.
 type featureRun struct {
-	RunID     identity.RunID
-	ManagerID identity.SessionID
-	Handle    app.RunHandle
+	RunID              identity.RunID
+	ManagerID          identity.SessionID
+	ManagerIncarnation identity.IncarnationID
+	Handle             app.RunHandle
 }
 
 // fakeHeadCommitOID is the base commit object id classifyWorktreeProvenance
@@ -67,10 +68,17 @@ func seedFeatureRun(t *testing.T, tc *testController, maxWorkers int) featureRun
 	}
 	tc.Store.Sessions[managerID] = &entityRow[run.Session]{value: manager, revision: 1}
 
+	managerIncarnation, err := identity.ParseIncarnationID(tc.IDs.NewID())
+	if err != nil {
+		t.Fatalf("parse manager incarnation id: %v", err)
+	}
+	binding := run.NewRuntimeBinding(managerID, managerIncarnation, "", "peer-pid:1", "workspace-mgr", "tab-mgr", "pane-mgr", "label-mgr", run.LaunchInitial, now)
+	tc.Store.Bindings[managerID] = append(tc.Store.Bindings[managerID], binding)
+
 	lease := app.Lease{Run: runID, ControllerID: "controller-1", Generation: 1, ExpiresAt: now.Add(leaseTTL)}
 	tc.Store.Leases[runID] = &leaseRow{lease: lease, held: true, repoID: repoID, created: true}
 
-	return featureRun{RunID: runID, ManagerID: managerID, Handle: app.NewRunHandleForTest(runID, lease)}
+	return featureRun{RunID: runID, ManagerID: managerID, ManagerIncarnation: managerIncarnation, Handle: app.NewRunHandleForTest(runID, lease)}
 }
 
 // seedImplementTask inserts an implement task directly, in the given
@@ -329,15 +337,10 @@ func TestAssignReadyTasks(t *testing.T) {
 		}
 		tc.Store.Attempts[firstAttemptID] = &entityRow[run.Attempt]{value: firstAttempt, revision: 1}
 
-		retryReq := app.RetryRequest{TaskID: taskID, RunID: fr.RunID, Session: fr.ManagerID, RequestID: "retry-1", Reason: "flaky"}
-		binding := run.NewRuntimeBinding(fr.ManagerID, "", "", "", "ws", "tab", "pane", "label", run.LaunchInitial, now)
-		incarnationID, err := identity.ParseIncarnationID(tc.IDs.NewID())
-		if err != nil {
-			t.Fatalf("parse incarnation id: %v", err)
+		retryReq := app.RetryRequest{
+			TaskID: taskID, RunID: fr.RunID, Session: fr.ManagerID, RequestID: "retry-1", Reason: "flaky",
+			IncarnationID: fr.ManagerIncarnation,
 		}
-		binding.IncarnationID = incarnationID
-		tc.Store.Bindings[fr.ManagerID] = append(tc.Store.Bindings[fr.ManagerID], binding)
-		retryReq.IncarnationID = incarnationID
 
 		accepted, err := tc.Store.RequestRetry(context.Background(), retryReq)
 		if err != nil {

@@ -399,7 +399,11 @@ func (s *fakeStore) SendMessage(_ context.Context, send app.MessageSend) (app.Me
 				return app.MessageOutcome{Kind: app.MessageMalformed, Detail: "corrupt receipt"}, nil
 			}
 			if prior.digest == digest {
-				return out, nil
+				// The grammar reports an identical request-ID retry as
+				// "duplicate", distinct from the original "accepted" line
+				// (docs/plan/phase-3-design.md section 7's worker protocol
+				// grammar), even though the underlying entity is unchanged.
+				return app.MessageOutcome{Kind: app.MessageDuplicate, MessageID: out.MessageID}, nil
 			}
 			return app.MessageOutcome{Kind: app.MessageRefused, Detail: "request id reused with different content"}, nil
 		}
@@ -408,6 +412,10 @@ func (s *fakeStore) SendMessage(_ context.Context, send app.MessageSend) (app.Me
 	rRow, ok := s.Runs[send.RunID]
 	if !ok {
 		return app.MessageOutcome{Kind: app.MessageMalformed, Detail: "unknown run"}, nil
+	}
+	binding, hasBinding := s.currentBindingLocked(send.Sender.SessionID)
+	if !hasBinding || binding.IncarnationID != send.IncarnationID || binding.Superseded {
+		return app.MessageOutcome{Kind: app.MessageRefused, Detail: "incarnation is not current"}, nil
 	}
 
 	var outcome app.MessageOutcome
@@ -607,7 +615,7 @@ func (s *fakeStore) AnswerQuestion(_ context.Context, answer app.HumanAnswer) (a
 				return app.MessageOutcome{Kind: app.MessageMalformed, Detail: "corrupt receipt"}, nil
 			}
 			if prior.digest == digest {
-				return out, nil
+				return app.MessageOutcome{Kind: app.MessageDuplicate, MessageID: out.MessageID}, nil
 			}
 			return app.MessageOutcome{Kind: app.MessageRefused, Detail: "request id reused with different content"}, nil
 		}
