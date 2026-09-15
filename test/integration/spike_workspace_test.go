@@ -109,6 +109,16 @@ func TestSpikeWorkspaceCreateResponseShapeAndEnv(t *testing.T) {
 	if recoveredPane != created.RootPane.PaneID {
 		t.Errorf("session.snapshot's sole pane for tab %q is %q, want the root pane %q", recoveredTab, recoveredPane, created.RootPane.PaneID)
 	}
+
+	// The grouping observation, recorded explicitly: a workspace.create'd
+	// workspace carries exactly one tab and that tab exactly one pane at
+	// EVERY point in this descent, so a label -> workspace lookup alone
+	// suffices to recover the root pane -- there is never a need to
+	// disambiguate among several tabs or panes the way S9's worktree
+	// workspaces (which can gain additional S6 command panes later) might.
+	descent := "workspace " + recoveredWorkspace + " -> sole tab " + recoveredTab + " -> sole pane " + recoveredPane
+	t.Logf("S8 recovery descent: %s", descent)
+	artifacts.save(t, "s8-recovery-descent.txt", descent+"\n")
 }
 
 // TestSpikeWorkspaceCreateNoFocus is the S8 follow-up: workspace.create's

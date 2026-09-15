@@ -7,10 +7,29 @@ import (
 	"testing"
 )
 
-// TestSpikeConcurrentWorktreeCreate is spike item S9: two worktree.create
-// calls issued concurrently against one repository, each with its own
-// explicit branch and `base` object id, prove per-attempt worktree creation
-// under the shapes Phase 3's worker/reviewer launch path depends on.
+// worktreeAttempt is one worktree.create call's request shape plus its
+// eventual response, for TestSpikeConcurrentWorktreeCreate's slice-driven
+// full-family scenario.
+type worktreeAttempt struct {
+	name       string // "t1a1", "t2a1", "t3a1" -- the attempt's own family suffix
+	branch     string
+	base       string
+	path       string
+	label      string
+	wantIgnore bool // true for the pre-existing branch: base must be IGNORED
+	response   worktreeCreatedResponse
+}
+
+// TestSpikeConcurrentWorktreeCreate is spike item S9: three worktree.create
+// calls -- implement task 1, implement task 2 and the REVIEW task, all
+// sharing the ordinary `hop/r1/t<t>a1` naming with no separate review-branch
+// scheme -- issued CONCURRENTLY against one repository, prove per-attempt
+// worktree creation under the shapes Phase 3's worker/reviewer launch path
+// depends on, and cover BOTH `base` cases side by side: t1a1/t2a1 are
+// genuinely new branches (base honored), t3a1 reuses a branch created ahead
+// of time (base silently ignored, TestSpikeWorktreeCreateExistingBranchIgnoresBase's
+// FINDING, repeated here as part of the full family rather than in
+// isolation).
 //
 // worktree.create's response is the same {workspace, tab, root_pane} triple
 // as workspace.create (S8) and tab.create (S7), plus a fourth `worktree`
@@ -20,12 +39,6 @@ import (
 // repo_key/repo_root identity that lets Herdr and HOP group sibling
 // checkouts of one repository by adjacency, independent of workspace
 // numbering.
-//
-// `--base <oid>` is honored (git worktree add -b <branch> <path> <base>,
-// repos/herdr/src/worktree.rs build_worktree_add_new_branch_command) only
-// when the requested branch does not already exist; the existing-branch case
-// is pinned separately by TestSpikeWorktreeCreateExistingBranchIgnoresBase as
-// a FINDING, since it silently ignores base.
 func TestSpikeConcurrentWorktreeCreate(t *testing.T) {
 	fixtures := buildSpikeFixtures(t)
 	artifacts := newArtifactDir(t)
@@ -39,6 +52,12 @@ func TestSpikeConcurrentWorktreeCreate(t *testing.T) {
 		t.Fatal("the second commit did not change HEAD; the two bases below would be indistinguishable")
 	}
 
+	// The review task's branch is created AHEAD of time, at repo.Base, so its
+	// worktree.create call below reuses an existing branch -- the "base
+	// ignored" case -- rather than creating a new one.
+	const reviewBranch = "hop/r1/t3a1"
+	repo.git(t, "branch", reviewBranch, repo.Base)
+
 	// Manager placement (design section 6): a plain workspace.create at the
 	// repository root. This is the workspace worktree.create's own
 	// parent-grouping mechanism (find_parent_workspace_for_space,
@@ -47,87 +66,104 @@ func TestSpikeConcurrentWorktreeCreate(t *testing.T) {
 	var manager workspaceCreatedResponse
 	server.call(t, "workspace.create", map[string]any{"cwd": repo.Root, "focus": true}, &manager)
 
-	branchA, branchB := "hop/r1/t1a1", "hop/r1/t2a1"
-	pathA := filepath.Join(artifacts.dir(t, "worktrees"), "attempt-a")
-	pathB := filepath.Join(artifacts.dir(t, "worktrees"), "attempt-b")
-	markerA, markerB := "hop-spike-wt-a", "hop-spike-wt-b"
-
-	resultA := server.callWorktreeCreateAsync(map[string]any{
-		"cwd": repo.Root, "branch": branchA, "base": repo.Base, "path": pathA, "label": markerA, "focus": false,
-	})
-	resultB := server.callWorktreeCreateAsync(map[string]any{
-		"cwd": repo.Root, "branch": branchB, "base": secondOID, "path": pathB, "label": markerB, "focus": false,
-	})
-	a := <-resultA
-	b := <-resultB
-	if a.err != nil {
-		t.Fatalf("worktree.create (attempt a): %v", a.err)
+	attempts := []*worktreeAttempt{
+		{
+			name: "t1a1", branch: "hop/r1/t1a1", base: repo.Base,
+			path: filepath.Join(artifacts.dir(t, "worktrees"), "attempt-t1a1"), label: "hop-spike-wt-t1a1",
+		},
+		{
+			name: "t2a1", branch: "hop/r1/t2a1", base: secondOID,
+			path: filepath.Join(artifacts.dir(t, "worktrees"), "attempt-t2a1"), label: "hop-spike-wt-t2a1",
+		},
+		{
+			// The review task: an EXISTING branch, given a base that differs
+			// from its own current tip so an honored base would be
+			// distinguishable from an ignored one.
+			name: "t3a1", branch: reviewBranch, base: secondOID,
+			path: filepath.Join(artifacts.dir(t, "worktrees"), "attempt-t3a1"), label: "hop-spike-wt-t3a1",
+			wantIgnore: true,
+		},
 	}
-	if b.err != nil {
-		t.Fatalf("worktree.create (attempt b): %v", b.err)
-	}
 
-	// Response shape, and identity distinct per call.
-	for name, resp := range map[string]worktreeCreatedResponse{"a": a.response, "b": b.response} {
-		if resp.Type != "worktree_created" {
-			t.Errorf("worktree.create (%s) result type = %q, want worktree_created", name, resp.Type)
+	results := make([]<-chan worktreeCreateAsyncResult, len(attempts))
+	for i, attempt := range attempts {
+		results[i] = server.callWorktreeCreateAsync(map[string]any{
+			"cwd": repo.Root, "branch": attempt.branch, "base": attempt.base, "path": attempt.path,
+			"label": attempt.label, "focus": false,
+		})
+	}
+	for i, ch := range results {
+		result := <-ch
+		if result.err != nil {
+			t.Fatalf("worktree.create (%s): %v", attempts[i].name, result.err)
 		}
-		if resp.Worktree.IsLinkedWorktree != true {
-			t.Errorf("worktree.create (%s) worktree.is_linked_worktree = false, want true for a created attempt checkout", name)
+		attempts[i].response = result.response
+	}
+
+	// Response shape, and identity distinct per call and from the manager.
+	workspaceIDs := map[string]string{"manager": manager.Workspace.WorkspaceID}
+	for _, attempt := range attempts {
+		resp := attempt.response
+		if resp.Type != "worktree_created" {
+			t.Errorf("worktree.create (%s) result type = %q, want worktree_created", attempt.name, resp.Type)
+		}
+		if !resp.Worktree.IsLinkedWorktree {
+			t.Errorf("worktree.create (%s) worktree.is_linked_worktree = false, want true for a created attempt checkout", attempt.name)
 		}
 		if resp.Workspace.Worktree == nil {
-			t.Fatalf("worktree.create (%s) workspace carries no worktree membership", name)
+			t.Fatalf("worktree.create (%s) workspace carries no worktree membership", attempt.name)
+		}
+		if resp.Worktree.Branch == nil || *resp.Worktree.Branch != attempt.branch {
+			t.Errorf("worktree.create (%s) worktree.branch = %v, want %q", attempt.name, resp.Worktree.Branch, attempt.branch)
+		}
+		if !samePath(t, resp.Worktree.Path, attempt.path) {
+			t.Errorf("worktree.create (%s) worktree.path = %q, want %q", attempt.name, resp.Worktree.Path, attempt.path)
+		}
+		if resp.RootPane.WorkspaceID != resp.Workspace.WorkspaceID || resp.RootPane.TabID != resp.Tab.TabID {
+			t.Errorf("worktree.create (%s) root pane %+v does not cross-reference its own workspace/tab", attempt.name, resp.RootPane)
+		}
+		if existing, ok := workspaceIDs[resp.Workspace.WorkspaceID]; ok {
+			t.Fatalf("worktree.create (%s) returned workspace id %s, already used by %s", attempt.name, resp.Workspace.WorkspaceID, existing)
+		}
+		workspaceIDs[resp.Workspace.WorkspaceID] = attempt.name
+	}
+
+	// Base-commit provenance, BOTH cases side by side: t1a1/t2a1's new
+	// branches honor the requested base; t3a1's pre-existing branch ignores
+	// it, checked out at its own tip (repo.Base) instead of the requested
+	// secondOID.
+	for _, attempt := range attempts {
+		got := worktreeHead(t, repo, attempt.path)
+		want := attempt.base
+		if attempt.wantIgnore {
+			want = repo.Base
+		}
+		if got != want {
+			verb := "honors"
+			if attempt.wantIgnore {
+				verb = "ignores (reused an existing branch)"
+			}
+			t.Errorf("attempt %s worktree HEAD = %s, want %s (base %s %s)", attempt.name, got, want, attempt.base, verb)
 		}
 	}
-	if a.response.Workspace.WorkspaceID == b.response.Workspace.WorkspaceID {
-		t.Fatal("two worktree.create calls returned the same workspace id")
-	}
-	if a.response.Workspace.WorkspaceID == manager.Workspace.WorkspaceID || b.response.Workspace.WorkspaceID == manager.Workspace.WorkspaceID {
-		t.Fatal("a worktree.create call reused the manager's own workspace id")
-	}
-	if a.response.Worktree.Branch == nil || *a.response.Worktree.Branch != branchA {
-		t.Errorf("worktree.create (a) worktree.branch = %v, want %q", a.response.Worktree.Branch, branchA)
-	}
-	if b.response.Worktree.Branch == nil || *b.response.Worktree.Branch != branchB {
-		t.Errorf("worktree.create (b) worktree.branch = %v, want %q", b.response.Worktree.Branch, branchB)
-	}
-	if !samePath(t, a.response.Worktree.Path, pathA) {
-		t.Errorf("worktree.create (a) worktree.path = %q, want %q", a.response.Worktree.Path, pathA)
-	}
-	if !samePath(t, b.response.Worktree.Path, pathB) {
-		t.Errorf("worktree.create (b) worktree.path = %q, want %q", b.response.Worktree.Path, pathB)
-	}
-	if a.response.RootPane.WorkspaceID != a.response.Workspace.WorkspaceID || a.response.RootPane.TabID != a.response.Tab.TabID {
-		t.Errorf("worktree.create (a) root pane %+v does not cross-reference its own workspace/tab", a.response.RootPane)
-	}
-	if b.response.RootPane.WorkspaceID != b.response.Workspace.WorkspaceID || b.response.RootPane.TabID != b.response.Tab.TabID {
-		t.Errorf("worktree.create (b) root pane %+v does not cross-reference its own workspace/tab", b.response.RootPane)
-	}
 
-	// Base-commit provenance: each new branch's HEAD equals the base it was
-	// given, proving --base <oid> is honored for a genuinely new branch.
-	if got := worktreeHead(t, repo, pathA); got != repo.Base {
-		t.Errorf("attempt a worktree HEAD = %s, want its requested base %s", got, repo.Base)
-	}
-	if got := worktreeHead(t, repo, pathB); got != secondOID {
-		t.Errorf("attempt b worktree HEAD = %s, want its requested base %s", got, secondOID)
-	}
-
-	// Grouping with the parent workspace: both new checkouts, AND the
-	// manager's own workspace (now the resolved source), carry the SAME
+	// Grouping with the parent workspace: every checkout, AND the manager's
+	// own workspace (now the resolved source), carries the SAME
 	// repo_key/repo_root -- the mechanism Herdr and HOP use to associate
 	// sibling checkouts of one repository, independent of workspace order.
-	if a.response.Workspace.Worktree.RepoKey != b.response.Workspace.Worktree.RepoKey {
-		t.Errorf("attempt a/b repo_key differ (%q vs %q); both are worktrees of the same repository",
-			a.response.Workspace.Worktree.RepoKey, b.response.Workspace.Worktree.RepoKey)
+	repoKey := attempts[0].response.Workspace.Worktree.RepoKey
+	for _, attempt := range attempts[1:] {
+		if attempt.response.Workspace.Worktree.RepoKey != repoKey {
+			t.Errorf("attempt %s repo_key = %q, want %q (every attempt is a worktree of the same repository)",
+				attempt.name, attempt.response.Workspace.Worktree.RepoKey, repoKey)
+		}
 	}
 	managerInfo := server.workspaceGet(t, manager.Workspace.WorkspaceID)
 	if managerInfo.Worktree == nil {
 		t.Fatal("the manager's own workspace carries no worktree membership after worktree.create resolved it as the parent")
 	}
-	if managerInfo.Worktree.RepoKey != a.response.Workspace.Worktree.RepoKey {
-		t.Errorf("manager workspace repo_key %q does not match the created worktrees' repo_key %q",
-			managerInfo.Worktree.RepoKey, a.response.Workspace.Worktree.RepoKey)
+	if managerInfo.Worktree.RepoKey != repoKey {
+		t.Errorf("manager workspace repo_key %q does not match the created worktrees' repo_key %q", managerInfo.Worktree.RepoKey, repoKey)
 	}
 	if managerInfo.Worktree.IsLinkedWorktree {
 		t.Errorf("the manager's own (parent, non-worktree) workspace reports is_linked_worktree=true")
@@ -136,28 +172,20 @@ func TestSpikeConcurrentWorktreeCreate(t *testing.T) {
 	// Creation-label round trip through session.snapshot, per call (S8's
 	// recovery pattern): worktree.create's label names the new WORKSPACE, not
 	// a pane, exactly like workspace.create.
-	if got := server.snapshotWorkspaceByLabel(t, markerA); got != a.response.Workspace.WorkspaceID {
-		t.Errorf("session.snapshot recovers workspace %q by label %q, want %q", got, markerA, a.response.Workspace.WorkspaceID)
-	}
-	if got := server.snapshotWorkspaceByLabel(t, markerB); got != b.response.Workspace.WorkspaceID {
-		t.Errorf("session.snapshot recovers workspace %q by label %q, want %q", got, markerB, b.response.Workspace.WorkspaceID)
+	for _, attempt := range attempts {
+		if got := server.snapshotWorkspaceByLabel(t, attempt.label); got != attempt.response.Workspace.WorkspaceID {
+			t.Errorf("session.snapshot recovers workspace %q by label %q, want %q", got, attempt.label, attempt.response.Workspace.WorkspaceID)
+		}
 	}
 
 	// Coexistence with the S6 command-pane launch mechanism: each freshly
 	// created worktree workspace accepts a layout.apply command pane exactly
 	// like any other workspace, running at the worktree's own checkout path.
-	for _, attempt := range []struct {
-		name        string
-		workspaceID string
-		path        string
-	}{
-		{"a", a.response.Workspace.WorkspaceID, pathA},
-		{"b", b.response.Workspace.WorkspaceID, pathB},
-	} {
+	for _, attempt := range attempts {
 		runID := newSpikeUUID(t)
 		var applied workerPaneAppliedResponse
 		server.call(t, "layout.apply", map[string]any{
-			"workspace_id": attempt.workspaceID,
+			"workspace_id": attempt.response.Workspace.WorkspaceID,
 			"focus":        false,
 			"root": map[string]any{
 				"type":    "pane",
@@ -169,7 +197,7 @@ func TestSpikeConcurrentWorktreeCreate(t *testing.T) {
 		}, &applied)
 		pane := applied.Layout.Root.PaneID
 		if pane == "" {
-			t.Fatalf("layout.apply into worktree workspace %s (%s) returned no pane id", attempt.workspaceID, attempt.name)
+			t.Fatalf("layout.apply into worktree workspace %s (%s) returned no pane id", attempt.response.Workspace.WorkspaceID, attempt.name)
 		}
 		server.waitForPaneText(t, pane, "SPIKE-HARNESS-STARTED name=[claude]")
 		info := server.waitForForegroundProcess(t, pane)
