@@ -25,6 +25,11 @@ type fakeRuntime struct {
 	CreateWorktreeErr error
 	CreateWorktreeFn  func(app.WorktreeRequest) (app.WorktreeInfo, error)
 
+	// CreateWorktreeRequests records every request as received, so a test
+	// can assert on fields (like Label) that no scripted response echoes
+	// back.
+	CreateWorktreeRequests []app.WorktreeRequest
+
 	OpenWorkerPaneErr error
 	OpenWorkerPaneFn  func(app.WorkerPaneRequest) (app.PaneHandle, error)
 
@@ -77,6 +82,7 @@ func (r *fakeRuntime) CreateWorktree(_ context.Context, req app.WorktreeRequest)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.CreateWorktreeRequests = append(r.CreateWorktreeRequests, req)
 	if r.CreateWorktreeFn != nil {
 		return r.CreateWorktreeFn(req)
 	}

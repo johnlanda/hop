@@ -100,6 +100,26 @@ func TestRuntimeCreateWorktree(t *testing.T) {
 	assertRequestParams(t, <-got, "worktree.create", `{"cwd":"/repo/root","branch":"feature-x","base":"HEAD"}`)
 }
 
+// TestRuntimeCreateWorktreeSendsLabelWhenSet proves the S9 creation label
+// round-trips onto the wire only when the caller supplies one; no landed
+// call site sets it yet (label-driven callers land in slices 2b/6), so the
+// unlabeled shape above must stay byte-identical.
+func TestRuntimeCreateWorktreeSendsLabelWhenSet(t *testing.T) {
+	runtime, got := startFakeRuntime(t, `{"type":"worktree_created",`+
+		`"workspace":{"workspace_id":"w9"},"tab":{"tab_id":"t1"},"root_pane":{"pane_id":"w9:p1"},`+
+		`"worktree":{"path":"/work/tree","branch":"feature-x"}}`)
+
+	_, err := runtime.CreateWorktree(testContext(t), app.WorktreeRequest{
+		RepositoryRoot: "/repo/root", Branch: "feature-x", BaseRef: "HEAD", Label: "hop-op-42",
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree: %v", err)
+	}
+
+	assertRequestParams(t, <-got, "worktree.create",
+		`{"cwd":"/repo/root","branch":"feature-x","base":"HEAD","label":"hop-op-42"}`)
+}
+
 func TestRuntimeCreateWorktreeBranchOmittedIsEmpty(t *testing.T) {
 	// branch is schema-optional (a detached checkout has none); its
 	// absence must decode to an empty string, not a decode error.
@@ -808,6 +828,14 @@ func TestRuntimeHonorsCancellation(t *testing.T) {
 		{"ReadPane", func(ctx context.Context) error { _, err := runtime.ReadPane(ctx, "w1:p1", 10); return err }},
 		{"InspectPane", func(ctx context.Context) error { _, err := runtime.InspectPane(ctx, "w1:p1"); return err }},
 		{"ClosePane", func(ctx context.Context) error { return runtime.ClosePane(ctx, "w1:p1") }},
+		{"CreateWorkspace", func(ctx context.Context) error {
+			_, err := runtime.CreateWorkspace(ctx, app.WorkspaceRequest{Cwd: "/repo"})
+			return err
+		}},
+		{"FindWorkspaceByLabel", func(ctx context.Context) error {
+			_, _, err := runtime.FindWorkspaceByLabel(ctx, "label")
+			return err
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
