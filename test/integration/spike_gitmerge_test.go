@@ -262,6 +262,48 @@ func TestSpikeMergeRepoLocalHooksFire(t *testing.T) {
 	}
 }
 
+// TestSpikeMergeHooksPathSuppressesRepoLocalHooks is G2's hook-suppression
+// verification: `-c core.hooksPath=<dir>` redirects git's hook lookup away
+// from the repository's own .git/hooks entirely, so a hostile or
+// accidental repo-local pre-merge-commit/post-merge script never runs --
+// confirmed for both an EMPTY existing temp directory and a directory path
+// that does not exist at all (git treats a missing hooksPath as "no hooks
+// configured there", not an error). This is recorded as a verified
+// suppression OPTION; adopting it is a design decision left to the human
+// (see docs/plan/phase-3-design.md section 11).
+func TestSpikeMergeHooksPathSuppressesRepoLocalHooks(t *testing.T) {
+	artifacts := newArtifactDir(t)
+	repo := newFixtureRepo(t, artifacts, "repo")
+
+	hooksDir := filepath.Join(repo.Root, ".git", "hooks")
+	preMergeCommitMarker := filepath.Join(artifacts.dir(t, "hook-evidence"), "pre-merge-commit-fired")
+	postMergeMarker := filepath.Join(artifacts.dir(t, "hook-evidence"), "post-merge-fired")
+	writeHookScript(t, hooksDir, "pre-merge-commit", preMergeCommitMarker)
+	writeHookScript(t, hooksDir, "post-merge", postMergeMarker)
+
+	repo.writeFile(t, "source.txt", "source change\n", 0o644)
+	source := repo.commit(t, "source change")
+
+	emptyHooksDir := artifacts.dir(t, "empty-hooks-path")
+	missingHooksDir := filepath.Join(artifacts.dir(t, "hooks-path-parent"), "does-not-exist")
+
+	for _, hooksPath := range []string{emptyHooksDir, missingHooksDir} {
+		scratch := detachedScratch(t, repo, artifacts, "scratch-hookspath-"+filepath.Base(hooksPath), repo.Base)
+		args := append(append([]string{}, mergeIdentityArgs()...), "-c", "core.hooksPath="+hooksPath,
+			"merge", "--no-ff", "--no-edit", source)
+		if out, err := runGitWithEnv(t, scratch, mergeEnviron(repo.gitHome), args...); err != nil {
+			t.Fatalf("git merge --no-ff --no-edit %s with core.hooksPath=%s: %v\n%s", source, hooksPath, err, out)
+		}
+		if _, err := os.Stat(preMergeCommitMarker); err == nil {
+			t.Errorf("pre-merge-commit hook fired despite core.hooksPath=%s", hooksPath)
+		}
+		if _, err := os.Stat(postMergeMarker); err == nil {
+			t.Errorf("post-merge hook fired despite core.hooksPath=%s", hooksPath)
+		}
+		t.Logf("core.hooksPath=%s (exists=%v) suppressed both hooks", hooksPath, hooksPath == emptyHooksDir)
+	}
+}
+
 // writeHookScript installs an executable git hook at hooksDir/name that
 // touches markerPath when it runs, so a test can observe whether git invoked
 // it.
