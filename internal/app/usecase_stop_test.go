@@ -2,6 +2,7 @@ package app_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/johnlanda/hop/internal/app"
@@ -519,4 +520,64 @@ func TestStopUnboundLaunch(t *testing.T) {
 			t.Fatalf("ClosePane was dispatched with no recorded identity: %v", tc.Runtime.ClosedPanes)
 		}
 	})
+}
+
+// TestStopUnboundLaunchUnusableIdentity proves an unresolved launch row
+// whose persisted identity is unusable — undecodable, or label-less — is
+// named outstanding and never skipped into a stopped report.
+func TestStopUnboundLaunchUnusableIdentity(t *testing.T) {
+	seed := func(t *testing.T, tc *testController, runID identity.RunID, intent any) identity.OperationID {
+		t.Helper()
+		tc.Store.Bindings = map[identity.SessionID][]run.RuntimeBinding{}
+		for id, op := range tc.Store.Operations {
+			if op.Kind == app.OpPaneOpen {
+				delete(tc.Store.Operations, id)
+			}
+		}
+		opID, err := identity.ParseOperationID(tc.IDs.NewID())
+		if err != nil {
+			t.Fatalf("parse operation id: %v", err)
+		}
+		tc.Store.Operations[opID] = app.Operation{
+			ID: opID, RunID: runID, Generation: tc.Store.Leases[runID].lease.Generation,
+			Kind: app.OpPaneOpen, State: app.OperationPending, Intent: intent,
+			CreatedAt: tc.Clock.Now(), UpdatedAt: tc.Clock.Now(),
+		}
+		return opID
+	}
+
+	cases := map[string]any{
+		"undecodable persisted intent": "garbage, not an object",
+		"label-less persisted intent":  map[string]any{"incarnation_id": "44444444-4444-4444-8444-444444444444", "session_id": "55555555-5555-4555-8555-555555555555"},
+	}
+	for name, intent := range cases {
+		t.Run(name, func(t *testing.T) {
+			tc := newTestController(defaultPolicy())
+			handle, started := startedRun(t, tc)
+			opID := seed(t, tc, started.RunID, intent)
+
+			if err := tc.Controller.RequestStop(context.Background(), started.RunID.String()); err != nil {
+				t.Fatalf("RequestStop() error = %v", err)
+			}
+			report, err := tc.Controller.DriveStop(context.Background(), handle)
+			if err != nil {
+				t.Fatalf("DriveStop() error = %v", err)
+			}
+			if report.Terminated {
+				t.Fatalf("report = %+v; an unusable launch identity must never be skipped into stopped", report)
+			}
+			named := false
+			for _, line := range report.Outstanding {
+				if strings.Contains(line, opID.String()) {
+					named = true
+				}
+			}
+			if !named {
+				t.Fatalf("Outstanding = %v, want the unusable launch operation named", report.Outstanding)
+			}
+			if got := tc.Store.Runs[started.RunID].value.State; got != run.RunStopping {
+				t.Fatalf("Run.State = %s, want %s", got, run.RunStopping)
+			}
+		})
+	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/johnlanda/hop/internal/domain/identity"
@@ -337,9 +338,49 @@ func (c *Controller) retireWorker(ctx context.Context, handle RunHandle, detail 
 // outstanding, because a launch that may still be in flight is never
 // absence and a stop must not report stopped over it.
 func (c *Controller) retireUnboundLaunch(ctx context.Context, handle RunHandle, detail RunDetail) (string, error) { //nolint:gocritic // hugeParam: RunHandle and RunDetail are per-call DTOs; this runs once per stop round.
+	// "No pending launch rows" and "pending rows with unusable identity"
+	// are different facts: an undecodable or label-less persisted intent
+	// still names a launch that may have created a worker, so it is named
+	// outstanding and never skipped into a stopped report.
+	var (
+		launchOps []identity.OperationID
+		unusable  []string
+	)
+	for i := range detail.PendingOperations {
+		pendingOp := &detail.PendingOperations[i]
+		if pendingOp.Kind != OpPaneOpen && pendingOp.Kind != OpLaunchSend {
+			continue
+		}
+		launchOps = append(launchOps, pendingOp.ID)
+		decoded, ok := decodeOperationPayload[paneOpenIntent](pendingOp.Intent)
+		if !ok || decoded.Label == "" {
+			unusable = append(unusable, fmt.Sprintf("launch operation %s has an undecodable or label-less intent", pendingOp.ID))
+		}
+	}
+	if len(launchOps) == 0 {
+		return "", nil
+	}
+	if len(unusable) > 0 {
+		return "unresolved launch rows with unusable identity; failing closed: " + strings.Join(unusable, "; "), nil
+	}
+
 	op, intent, found := newestPendingPaneOpen(detail.PendingOperations)
 	if !found {
-		return "", nil
+		return "unresolved launch rows could not be selected; failing closed", nil
+	}
+	var others []string
+	for _, id := range launchOps {
+		if id != op.ID {
+			others = append(others, id.String())
+		}
+	}
+	if len(others) > 0 {
+		// Any additional unresolved launch mechanism keeps the stop open:
+		// the newest row alone cannot prove the others started nothing.
+		return "additional unresolved launch operations block stop completion: " + strings.Join(others, ", "), nil
+	}
+	if detail.Claim != nil && detail.Claim.IncarnationID != intent.IncarnationID {
+		return fmt.Sprintf("launch claim incarnation %s does not correspond to the newest launch intent %s; failing closed", detail.Claim.IncarnationID, intent.IncarnationID), nil
 	}
 	if detail.Claim == nil {
 		return fmt.Sprintf("launch operation %s is unresolved with no claim; the launch may still be in flight — failing closed", op.ID), nil
