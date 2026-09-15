@@ -451,7 +451,7 @@ New operation kinds and their decision-table rows (Phase 2 rows unchanged):
 | Operation | Crash between intent and act | Crash between act and outcome | Takeover with the intent unresolved |
 | --- | --- | --- | --- |
 | `workspace.create` (manager placement) | Adoption by unique creation label — a WORKSPACE attribute on 0.9.0 (S8-confirmed by executed round-trip), so recovery resolves the labeled workspace and then its sole tab and sole root pane (more than one of either fails closed); label absent → bounded wait for the in-flight request, then `reconciling`; never a second create | same | same |
-| `integration.merge` (scratch merge; never touches the ref) | One merge EXECUTION per operation, with the operation ID fixing all three identities immutably: the exec claim (one row, one pid, never re-armed or overwritten), the frozen merge argv, and the private tree path `runs/<run-uuid>/integrations/<operation-uuid>/tree`. The act is two recorded steps: (i) MATERIALIZE — `git worktree add --detach <tree> <premerge-oid>` run to OBSERVED completion under `CommandRunner`, then verify the new tree's HEAD equals the recorded pre-merge head and record the materialization-complete evidence (path + verified HEAD) in act evidence. Adoption of a materialized directory requires that recorded completion evidence, NEVER a HEAD observation alone: `git worktree add` writes HEAD before it finishes populating the checkout and index, and a preparer surviving a dead controller can still be writing a directory whose HEAD already reads correctly — so a recovery that finds the directory without the completion evidence settles the operation failed and allocates a FRESH operation and directory (the ambiguous directory is abandoned, never entered, its possible surviving preparer confined to it, and it is removed only after settlement plus the ordinary retirement checks); (ii) SPAWN the merge through the generalized exec boundary — `hop check-exec --op <operation-uuid> -- git … merge …` (section 8 fixes the argv) — so a durable pre-exec claim (own pid = group id) exists exactly as for checks, and a Git child surviving a dead controller is retired by the group-retirement rule (argv-matched listing, never a blind signal). A conflict exits non-zero and leaves the tree; no `merge --abort` is ever needed because an operation's tree is never reused. Recovery: no claim after step (ii) dispatched → ambiguous, bounded wait then reconciling (never absence); claim present → retire the group FIRST, settle this operation with the retirement evidence (the old claim row is retained forever as history), THEN read the scratch HEAD — parents exactly {pre-merge head, source} → adopt M; the up-to-date no-op outcome (section 8) → adopt as no-op; anything else → the operation settles failed and any re-act is a NEW `integration.merge` operation under the same integration row, with its own fresh operation ID, claim, argv record, tree path and the takeover's current generation — allocated only AFTER the old operation is settled; the abandoned directory is never adopted and is removed only after settlement | same | same; an unresolved merge blocks further integration (the serial index already prevents a second one) |
+| `integration.merge` (scratch merge; never touches the ref) | One merge EXECUTION per operation, with the operation ID fixing all three identities immutably: the exec claim (one row, one pid, never re-armed or overwritten), the frozen merge argv, and the private tree path `runs/<run-uuid>/integrations/<operation-uuid>/tree`. The act is two recorded steps: (i) MATERIALIZE — `git worktree add --detach <tree> <premerge-oid>` run to OBSERVED completion under `CommandRunner`, then verify the new tree's HEAD equals the recorded pre-merge head and record the materialization-complete evidence (path + verified HEAD) in act evidence. Adoption of a materialized directory requires that recorded completion evidence, NEVER a HEAD observation alone: `git worktree add` writes HEAD before it finishes populating the checkout and index, and a preparer surviving a dead controller can still be writing a directory whose HEAD already reads correctly — so a recovery that finds the directory without the completion evidence settles the operation failed and allocates a FRESH operation and directory (the ambiguous directory is abandoned, never entered, its possible surviving preparer confined to it, and it is removed only after settlement plus the ordinary retirement checks); (ii) SPAWN the merge through the generalized exec boundary — `hop check-exec --op <operation-uuid> -- git … merge …` (section 8 fixes the argv, including the repo-local hook suppression via `-c core.hooksPath=<empty existing dir under the operation's artifact dir>`) — so a durable pre-exec claim (own pid = group id) exists exactly as for checks, and a Git child surviving a dead controller is retired by the group-retirement rule (argv-matched listing, never a blind signal). A conflict exits non-zero and leaves the tree; no `merge --abort` is ever needed because an operation's tree is never reused. Recovery: no claim after step (ii) dispatched → ambiguous, bounded wait then reconciling (never absence); claim present → retire the group FIRST, settle this operation with the retirement evidence (the old claim row is retained forever as history), THEN read the scratch HEAD — parents exactly {pre-merge head, source} → adopt M; the up-to-date no-op outcome (section 8) → adopt as no-op; anything else → the operation settles failed and any re-act is a NEW `integration.merge` operation under the same integration row, with its own fresh operation ID, claim, argv record, tree path and the takeover's current generation — allocated only AFTER the old operation is settled; the abandoned directory is never adopted and is removed only after settlement | same | same; an unresolved merge blocks further integration (the serial index already prevents a second one) |
 | `integration.publish` | The act is `git update-ref refs/heads/hop/r<seq>/integration <M> <expected-head>` — a compare-and-swap on the expected old value, executed directly by the controller. The CAS alone does NOT fence stop or takeover when the head has not moved — a paused controller's publish dispatched after a stop request would still match its expected-old — so the publish carries three explicit layers: (i) PRE-ACT, the Phase 2 revalidation (heartbeat CAS + stop re-read) runs immediately before the `update-ref` dispatch specifically, not merely before the operation; (ii) POST-ACT, the outcome transaction is lease-fenced and re-reads stop — a landed publish can never settle `checking` past either, and a refused outcome routes the published candidate to the stop/rollback path (the reconciliation rule for the pause window); (iii) EXTERNALLY, stop, takeover and terminal-failure settlement retire any unresolved ref-move intent by moving the ref first (the fencing rule below), so a zombie CAS dispatched after that retirement fails at the ref store. Recovery: ref == M → adopt; ref == expected head → re-act (retry-idempotent); any other value → `reconciling` with the observed ref as evidence | same | same, via the fencing rule |
 | `integration.reset` (combined-check failure rollback, section 8; also the stop path's retirement of a published-but-unsettled candidate) | The act is two steps with the identity persisted BETWEEN them: (i) create the ROLLBACK COMMIT R (`git commit-tree <premerge>^{tree} -p <M>` — R carries the pre-merge content and keeps the rejected M reachable as its parent) and record R's object ID in `act_evidence` — a plain store write — BEFORE any ref move; (ii) `git update-ref … <R> <M>`. Recovery is decidable in every window: R recorded and ref == R → adopt; R recorded and ref == M → re-act step (ii) only (idempotent CAS); no R recorded and ref == M → re-act from step (i) (a prior orphaned commit-tree object is unreferenced and harmless); anything else → `reconciling` | same | same |
 | `worktree.create` (now per attempt) | Phase 2 row verbatim; provenance = repository common-directory equality plus the recorded base commit (now the integration head frozen into the intent) | same | same |
@@ -921,8 +921,19 @@ integrated prerequisite work; that is why dependency release requires
 the retry assignment artifact carries the prior attempt's result commit,
 check output and (where present) review reasons paths so the worker can
 recover useful work deliberately. HOP never pushes, never merges into the
-user's own branches, and never deletes `hop/*` branches or superseded
-worktrees; publication of the integration branch is the human's act.
+user's own branches, and never deletes `hop/*` branches; publication of
+the integration branch is the human's act. Worktrees are retained
+evidence for as long as it is undecided, not forever (human decision,
+2026-09-15): a run's attempt worktrees stay visible until the run's
+integration branch has merged into the target branch, after which HOP
+removes the WORKTREES — the branches are kept (`hop clean` for branches
+is future work). The mechanism is lazy: on the next controller start or
+`hop status` for that repository, HOP detects that the integration head
+is an ancestor of the target branch (checked under an exec claim),
+removes the run's attempt worktrees under a fresh exec claim, and
+persists a "worktrees retired" run fact so the detection never repeats.
+The section 12 worktree-retirement slice owns the implementation; no
+earlier slice removes anything.
 
 ## 7. Durable messages and delivery safety
 
@@ -1329,7 +1340,8 @@ and its argv is fixed and fully noninteractive:
 
 ```text
 git -C <scratch tree> -c user.name=hop -c user.email=hop@invalid
-    -c core.editor=true merge --no-ff --no-edit <source-oid>
+    -c core.editor=true -c core.hooksPath=<hooks dir>
+    merge --no-ff --no-edit <source-oid>
 ```
 
 with `GIT_TERMINAL_PROMPT=0` and `GIT_EDITOR=true` in the sanitized spawn
@@ -1337,14 +1349,22 @@ environment, PLUS explicit suppression of inherited configuration —
 `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_SYSTEM=/dev/null`,
 `-c commit.gpgsign=false -c merge.verifysignatures=false` — since editor
 and prompt variables alone cannot neutralize a user's global hooks,
-signing or merge drivers. Repository-LOCAL configuration and hooks are
-the target repository's own policy and remain in effect, honestly: they
-are supported input, the merge is bounded by the frozen check timeout,
-and a non-zero exit that is not a content conflict (a failing local
-hook, a driver error) is CLASSIFIED with the conflict outcome —
+signing or merge drivers. Repository-LOCAL hooks are suppressed too
+(human decision, 2026-09-15): `<hooks dir>` is an empty existing
+directory under the operation's own artifact directory, created by the
+controller before the spawn, so no repository-local hook runs during the
+merge (G2 verified `core.hooksPath` to an empty or nonexistent directory
+suppresses BOTH `pre-merge-commit` and `post-merge`, where `--no-verify`
+skips only the former) — a failing local hook is therefore no longer a
+merge input. Repository-local CONFIGURATION other than hooks remains in
+effect, the merge is bounded by the frozen check timeout, and a non-zero
+exit that is not a content conflict (a driver error, an unwritable
+object database) is still CLASSIFIED with the conflict outcome —
 `conflicted`, full output as evidence — because both mean "this
 combination did not merge cleanly under repository policy" and both
-route to the manager with the evidence. G2 exercises the matrix
+route to the manager with the evidence. A later switch to HONORING
+repository-local hooks is a configuration decision, not a design change
+(the human has said "configurable later"). G2 exercises the matrix
 including a signing-configured and a hook-configured repository, and G2
 also fixes the rollback/fencing `commit-tree` inputs (the deterministic
 identity/date/message of section 4). Ordinary Git
@@ -1411,8 +1431,11 @@ Workers and reviewers are already retired at their per-attempt boundaries
 the manager and any straggling session under the Phase 2 close rule with
 scrollback captured first, re-validates readiness inside the final
 transaction (plan closure section above), and only then records
-`completed`. Worktrees, the `hop/r<seq>/*` branches and every artifact
-are preserved. Stop precedence still applies: a stop request observed in
+`completed`. Completion preserves the worktrees, the `hop/r<seq>/*`
+branches and every artifact; the worktrees are removed only later, by
+the lazy post-merge retirement of section 6 (once the run's integration
+branch has merged into the target branch), while branches and artifacts
+are always kept. Stop precedence still applies: a stop request observed in
 any of these transactions yields `interrupted`/`stopping`, never
 `completed`. `hop review submit`'s CLI takes the subject COMMIT only; the
 application resolves its tree object ID against the recorded repository
@@ -1515,7 +1538,7 @@ contracts; the exit scenarios are real-process.
 | S9 concurrent worktrees (herdr) | Three CONCURRENT `worktree.create` calls (the full family: t1a1, t2a1 new branches, t3a1 the review task's branch, pre-existing) driven on the RAW request with the `label` field included (the landed Go adapter still sends cwd/branch/base only today — see slice 5). Response shape `{type: "worktree_created", workspace, tab, root_pane, worktree}`. `--base` honored for each new branch (worktree HEAD == the given base) and SILENTLY IGNORED for the pre-existing branch (worktree HEAD == its own prior tip) — confirming refuse-if-exists is load-bearing, not merely defensive. Label round-trip per call. `WorkspaceInfo.worktree.repo_key` matches across every worktree workspace AND the manager's own plain `workspace.create`d parent workspace (Herdr resolves and marks it as the non-linked source on the first `worktree.create` call). Each worktree workspace coexists with an S6 command-pane launch at its own checkout path | Per-attempt worktree creation, the refuse-if-exists + verify-HEAD-after-create rule of section 6, label recovery, and reviewer worktrees |
 | S10 multi-pane env isolation (herdr) | Three command panes created CONCURRENTLY (manager-shaped, worker-shaped ×2) each observe exactly their own `HOP_SESSION_ID`/`HOP_ROLE`, checked pairwise against the other two — zero cross-contamination. Creation labels resolve to the correct pane per call. `agent.list` returns exactly three records, each independently keyed to its own pane | That concurrent launches cannot cross-contaminate identity — the multi-session corroboration and close rules rest on it. S10 deliberately does NOT claim to validate the session-keyed claim queries (that is the sqlite raced suite's job) |
 | G1 ref namespace and branch family (local git, no herdr) | The complete `hop/r1/integration` + `hop/r1/t1a1`/`t2a1`/`t3a1` family coexists (`git for-each-ref` lists all four). Create-only `update-ref <ref> <new> ""` succeeds only when `<ref>` does not yet exist and is refused (ref unchanged) once it does. NEGATIVE CONTROL, the exact reason the `/integration` suffix is required: a bare `hop/r1` branch collides with any `hop/r1/t<t>a<n>` sibling — `fatal: update_ref failed for ref 'refs/heads/hop/r1/t1a1': cannot lock ref 'refs/heads/hop/r1/t1a1': 'refs/heads/hop/r1' exists; cannot create 'refs/heads/hop/r1/t1a1'` (git's ref storage cannot treat one path as both a file and a directory) | B3's scheme against real Git ref-store behavior |
-| G2 merge outcome matrix (local git, no herdr) | Under the frozen argv `git -c user.name=... -c user.email=... -c commit.gpgsign=false -c merge.verifysignatures=false merge --no-ff --no-edit <source>` (env: `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM=/dev/null`, `GIT_TERMINAL_PROMPT=0`), in a DETACHED scratch checkout throughout (the ref stays untouched in every case): two-parent merge (parents == {base, source}); conflict (non-zero exit, `UU` index entries, clean `merge --abort`); already-up-to-date no-op (nothing created, HEAD unchanged); `--no-ff` forces a genuine merge commit on an otherwise fast-forwardable head; `git commit-tree` with pinned tree/parent/identity/dates/message is byte-stable across two invocations (the G3 rollback's precondition). A repository with `commit.gpgsign=true` set LOCALLY does not block the merge — the frozen argv's own `-c commit.gpgsign=false` wins over every config file, local included (testing GLOBAL config is moot: the frozen env already redirects it to `/dev/null`). A non-conflict failure (an unwritable shared object database) is distinguished from a conflict by OUTPUT TEXT and INDEX STATE, never by abortability — `merge --abort` still succeeds after this failure too. HOOKS FIRE under the current argv (no `--no-verify`); suppression options verified: `--no-verify` skips only `pre-merge-commit`; `-c core.hooksPath=<dir>` (an empty existing directory, or one that does not exist at all — both behave identically) suppresses BOTH `pre-merge-commit` and `post-merge`. Which mitigation, if any, the design adopts is a pending human decision | The `integration.merge` adoption predicate including the no-op row, the noninteractive argv/env with configuration suppression, and the failure classification |
+| G2 merge outcome matrix (local git, no herdr) | Under the frozen argv `git -c user.name=... -c user.email=... -c commit.gpgsign=false -c merge.verifysignatures=false merge --no-ff --no-edit <source>` (env: `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM=/dev/null`, `GIT_TERMINAL_PROMPT=0`), in a DETACHED scratch checkout throughout (the ref stays untouched in every case): two-parent merge (parents == {base, source}); conflict (non-zero exit, `UU` index entries, clean `merge --abort`); already-up-to-date no-op (nothing created, HEAD unchanged); `--no-ff` forces a genuine merge commit on an otherwise fast-forwardable head; `git commit-tree` with pinned tree/parent/identity/dates/message is byte-stable across two invocations (the G3 rollback's precondition). A repository with `commit.gpgsign=true` set LOCALLY does not block the merge — the frozen argv's own `-c commit.gpgsign=false` wins over every config file, local included (testing GLOBAL config is moot: the frozen env already redirects it to `/dev/null`). A non-conflict failure (an unwritable shared object database) is distinguished from a conflict by OUTPUT TEXT and INDEX STATE, never by abortability — `merge --abort` still succeeds after this failure too. HOOKS FIRE under a hooksPath-less argv (no `--no-verify`); suppression options verified: `--no-verify` skips only `pre-merge-commit`; `-c core.hooksPath=<dir>` (an empty existing directory, or one that does not exist at all — both behave identically) suppresses BOTH `pre-merge-commit` and `post-merge`. Adopted (human decision, 2026-09-15): the frozen argv carries `-c core.hooksPath=<empty existing dir under the operation's artifact dir>` (section 8); honoring local hooks again would be a configuration decision, deferred | The `integration.merge` adoption predicate including the no-op row, the noninteractive argv/env with configuration suppression, and the failure classification |
 | G3 fenced publish/reset (local git, no herdr) | `update-ref <ref> <new> <old>` succeeds and moves the ref only when `<old>` matches its actual current value; a stale `<old>` is refused, ref left exactly where it was. `""` as `<old>` is create-only (see G1). The rollback construction — `git commit-tree <pre-merge-tree> -p <rejected-merge> -m <message>`, CAS-published in turn — keeps the rejected merge REACHABLE (`git merge-base --is-ancestor <rejected> <ref>` holds; `git log <ref>` lists it) rather than orphaning it via a destructive reset+force | The `integration.publish`/`integration.reset` CAS rows and the never-revisit rule's mechanics |
 | S11 request-log observability (herdr) | Location: `<the server's own socket directory>/herdr-server.log`. Format: plain text (`tracing_subscriber`'s default formatter, no JSON/ANSI), one line per event, e.g. `... DEBUG herdr::logging: api request received event="api.request.start" ... request_id="hop-1" method="ping" changes_ui=false`. LEVEL splits exactly by method: `pane.send_text`/`pane.send_keys`/`pane.send_input` log their start/complete pair at DEBUG ONLY when they succeed (invisible at the default `herdr=info` filter) — a FAILED or erroring call among these still completes via the SAME `event="api.request.complete"` record, never a distinct fail event, but at INFO, since the server forces INFO whenever `outcome != "ok"`; `agent.prompt`/`agent.send_keys`/`agent.start` log both their start AND completion records at INFO regardless of outcome — confirmed for all six methods on a SEPARATE client connection, none needing to succeed or need a live/matching agent to reach the log. `event="api.request.fail"` (WARN) is a SEPARATE event reserved for a failure WRITING the response back to the client socket itself (e.g. a disconnect mid-write) — it never fires for an ordinary business-logic refusal, and no Phase 3 scenario relies on it. Every line carries `method` and `request_id` but NEVER the pane/agent target or any request parameter (confirmed: neither a sent marker string nor a target pane id ever appears) — the injection-free claim is therefore honestly method-level, never per-pane. `request_id` is a CLIENT-chosen label the server only echoes, NOT a server-assigned global sequence: two independent client connections to the same server both start counting from `"hop-1"`, and that exact value was observed logged against two unrelated methods in one capture — correlation must locate a call's own line by something unique to it (method name, confirmed) and read the id back from there. A capture window is bracketed by two otherwise-unused methods' own log lines (`pane.list`/`tab.list` in the probe) — never by a chosen label, which the log never carries at all | The `InjectionFreeDelivery` scenario's evidence channel: what a forbidden request WOULD look like in the log, so a zero count over the whole capture is meaningful |
 
@@ -1690,6 +1713,7 @@ untouched (no new dependency anywhere in this phase).
 | 5 | Herdr adapter: `CreateWorkspace` and `FindWorkspaceByLabel` per S8 (new methods — additive), and the `CreateWorktree` request extension carrying the operation LABEL (S9; the landed request sends cwd/branch/base only, and the launch decision table requires label recovery) with its full-structural request fixtures | `internal/adapters/herdr` | new methods/fields + protocol tests; nothing existing removed | 2a | with 2b, 3, 4 | Sonnet |
 | 6 | Integrator flip: new verbs and flags in `cmd/hop`, loop scheduling pass, status rendering, `hop view`, real-binary grammar contract tests; the non-additive flips — retarget `hop launch` internals onto the session context through slice 4's shim, delete `Runtime.SendText` (port, consumers and the staged allowlist exception), delete `LoadLaunchContext`, switch claim/context consumers to the session-keyed methods — across app, adapters, fakes and commands in one landing. Mechanical by design: every correctness-bearing behavior it wires (session queries, the shim, retirement, guards) was implemented and tested in Fable-owned slices 2b/3/4; this slice moves call sites and deletes deprecated members, and its tests are the dispatch/grammar/exit-code tables | `cmd/hop`, plus the flip's touch-points | whole-repo `make check` after the single flip landing, including the updated allowlist test asserting `SendText` is gone | 3, 4, 5 | — | Sonnet |
 | 7 | Scenario integration: fixture principal behaviors, the seven exit scenarios plus the five additional real-process scenarios, live opt-in test, Makefile target updates if any | `test/integration`, `Makefile` | real-process rows green (or skipped-with-reason where no herdr) | 6 | — | Sonnet |
+| 8 | Post-merge worktree retirement (open question 6's resolution): lazy detection on the next controller start or `hop status` for the repository — the run's integration head is an ancestor of the target branch, checked under an exec claim — removal of that run's attempt worktrees under a fresh exec claim, and a persisted "worktrees retired" run fact so detection never repeats; branches are never deleted (`hop clean` is future work) | `internal/app`, `internal/adapters/sqlite` (the run fact), `cmd/hop` | detection and removal green against fixture repositories: a merged integration branch retires the run's worktrees exactly once with the fact persisted, and a run whose integration branch has not merged retires nothing | 5, 6 | with 7 | Sonnet |
 
 Fable owns the three correctness-critical cores, per the tier rule: the
 guard/integration/completion enforcement (2b — the phase's genuinely
@@ -1705,7 +1729,7 @@ the unchanged Phase 2 suite.
 
 Landing order: 0 and 1; then 2a; then 2b, 3, 4, 5 (2b before 3 and 4,
 which depend on it; 5 needs only 2a); then 6 (the one
-interface-non-additive landing); then 7.
+interface-non-additive landing); then 7 and 8 (8 with 7, after 5 and 6).
 
 ## 13. Decisions assumed, spike dependencies, open questions, risks
 
@@ -1779,11 +1803,18 @@ Open questions for the human, each with a recommendation:
 5. **Retry limit default.** Recommendation: 3 attempts per task
    (`[retry] max_attempts`), after which the task and run fail with the
    evidence retained (the defined exhausted path of section 5).
-6. **Integration branch visibility.** The `hop/r<seq>/*` branches
-   (`integration` and the per-attempt `t<t>a<n>` family) live in the
-   user's repository and are never auto-deleted; rollback commits keep
-   rejected merges reachable. Recommendation: accept; document; a
-   `hop clean` command is future work.
+6. **Integration branch visibility.** RESOLVED (human decision,
+   2026-09-15). The `hop/r<seq>/*` branches (`integration` and the
+   per-attempt `t<t>a<n>` family) live in the user's repository and are
+   never auto-deleted; rollback commits keep rejected merges reachable;
+   a `hop clean` command for branches is future work. Attempt WORKTREES
+   are not permanent: they stay visible until the run's integration
+   branch has merged into the target branch, and are then removed by
+   the lazy post-merge retirement (section 6 — detection on the next
+   controller start or `hop status` for the repository, ancestry checked
+   under an exec claim, removal under a fresh exec claim, a persisted
+   "worktrees retired" run fact), owned by the section 12
+   worktree-retirement slice.
 7. **Human question channel.** CLI-only (`hop status` + `hop answer`)
    until the Phase 6 board. Recommendation: yes.
 

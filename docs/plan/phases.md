@@ -110,7 +110,10 @@ Require a configured deterministic check for the initial coding workflow. Persis
 result artifacts, state transitions and interrupted-operation evidence.
 
 Stopping halts new work and deliberately interrupts owned active work, reporting
-stopping until termination is observed. It preserves worktrees and artifacts.
+stopping until termination is observed. It preserves worktrees and artifacts;
+Phase 3 adds the one later exception — once a run's integration branch has
+merged into the target branch, HOP lazily removes that run's worktrees, while
+branches and artifacts are always kept (phase-3 design, section 12).
 Resume reattaches/reconciles surviving processes and only relaunches when absence
 and supported resume semantics are established. It does not promise every native
 conversation can survive a cold server restart.
