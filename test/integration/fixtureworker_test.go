@@ -78,26 +78,46 @@ func main() {
 
 	env := requireEnv("HOP_STATE_DIR", "HOP_RUN_ID", "HOP_TASK_ID", "HOP_ATTEMPT_ID", "HOP_INCARNATION_ID")
 	assignmentPath := filepath.Join(env["HOP_STATE_DIR"], "runs", env["HOP_RUN_ID"], "artifacts", "assignment.md")
+	// hopPathFile persists the hop path a first launch's prompt named, so a
+	// later cold-relaunch incarnation (argv "--resume <native-ref>", no
+	// prompt at all — a real harness recalls its instructions from its own
+	// persisted session transcript, which this fixture has no equivalent of)
+	// can recover it without one.
+	hopPathFile := assignmentPath + ".hop-path"
 
-	prompt := ""
-	if len(os.Args) > 0 {
-		prompt = os.Args[len(os.Args)-1]
-	}
-	promptAssignmentPath := extractMarked(prompt, "Read your assignment at ", " and complete it.")
-	hopPath := extractMarked(prompt, "submit it by running: ", " result submit --summary")
-	if hopPath == "" {
-		fatalf("prompt does not carry the %q marker naming the hop path", "submit it by running: ")
-	}
-	if promptAssignmentPath == "" {
-		fatalf("prompt does not carry the %q marker naming the assignment path", "Read your assignment at ")
-	}
-	// The StateRoot-derived path is what this worker actually reads, but the
-	// prompt's own path is cross-validated against it rather than merely
-	// logged: a mismatch means the launch delivered a different assignment
-	// than the one this run's own state root computes, which must fail the
-	// scenario loudly, never silently prefer one source over the other.
-	if promptAssignmentPath != assignmentPath {
-		fatalf("prompt's assignment path (%s) does not match the path computed from HOP_STATE_DIR/HOP_RUN_ID (%s)", promptAssignmentPath, assignmentPath)
+	var promptAssignmentPath, hopPath string
+	if isResumeInvocation(os.Args) {
+		promptAssignmentPath = assignmentPath
+		persisted, err := os.ReadFile(hopPathFile)
+		if err != nil {
+			fatalf("resumed with no hop path persisted by a first launch at %s: %v", hopPathFile, err)
+		}
+		hopPath = strings.TrimSpace(string(persisted))
+	} else {
+		prompt := ""
+		if len(os.Args) > 0 {
+			prompt = os.Args[len(os.Args)-1]
+		}
+		promptAssignmentPath = extractMarked(prompt, "Read your assignment at ", " and complete it.")
+		hopPath = extractMarked(prompt, "submit it by running: ", " result submit --summary")
+		if hopPath == "" {
+			fatalf("prompt does not carry the %q marker naming the hop path", "submit it by running: ")
+		}
+		if promptAssignmentPath == "" {
+			fatalf("prompt does not carry the %q marker naming the assignment path", "Read your assignment at ")
+		}
+		// The StateRoot-derived path is what this worker actually reads, but
+		// the prompt's own path is cross-validated against it rather than
+		// merely logged: a mismatch means the launch delivered a different
+		// assignment than the one this run's own state root computes, which
+		// must fail the scenario loudly, never silently prefer one source
+		// over the other.
+		if promptAssignmentPath != assignmentPath {
+			fatalf("prompt's assignment path (%s) does not match the path computed from HOP_STATE_DIR/HOP_RUN_ID (%s)", promptAssignmentPath, assignmentPath)
+		}
+		if err := os.WriteFile(hopPathFile, []byte(hopPath), 0o600); err != nil {
+			fatalf("persist hop path for a future cold relaunch: %v", err)
+		}
 	}
 
 	assignmentContent, err := os.ReadFile(assignmentPath)
@@ -132,6 +152,19 @@ func main() {
 		// scenario that only needs a settled, idle worker still gets one.
 	}
 	idle()
+}
+
+// isResumeInvocation reports whether argv is a cold-relaunch invocation
+// (harness argv "--resume <native-ref>", design section 6 item 3) rather
+// than a first-launch invocation carrying the fixed initial prompt as its
+// final argument.
+func isResumeInvocation(argv []string) bool {
+	for _, a := range argv {
+		if a == "--resume" {
+			return true
+		}
+	}
+	return false
 }
 
 func requireEnv(keys ...string) map[string]string {
