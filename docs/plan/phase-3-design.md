@@ -43,8 +43,10 @@ Flow (the built-in feature workflow, section 8): `hop run "<brief>"` with
 the workflow policy and the role-instruction artifacts), creates the run
 integration branch at the frozen base commit, launches the manager session
 through the sanitizing launcher, and enters the controller loop. The
-manager plans by creating tasks (`hop task create`, with dependencies);
-the controller releases tasks whose prerequisites are integrated, launches
+manager plans by creating tasks (`hop task create`, with dependencies) and
+closing its plan (`hop plan close`, section 8 — creating a later fix task
+reopens it); the controller releases tasks whose prerequisites are
+integrated, launches
 one worker per released task (bounded by the concurrency slots) in a fresh
 worktree branched from the current integration head, and consumes results
 exactly as in Phase 2 (result protocol, per-task deterministic check).
@@ -66,8 +68,8 @@ proved):
 
 | Criterion | Evidence |
 | --- | --- |
-| Manager + two workers exercised | `TestRealProcessFeatureRunEndToEnd` (section 11): fixture manager plans three tasks (one dependent), two fixture workers run concurrently, the third task waits for a slot, all integrate serially, reviewer approves, run completes |
-| Dependency release | Same scenario: the dependent task is not launched until its prerequisite is `integrated` (not merely `completed`), asserted against the store and the launch journal |
+| Manager + two workers exercised | `TestRealProcessFeatureRunEndToEnd` (section 11): fixture manager plans four tasks — three initially eligible (t1, t3, t4) plus t2 depending on t1 — under `MaxWorkers=2`; t1 and t3 launch immediately and are held alive at an observable message barrier, t4 (eligible the whole time) launches only after a slot frees on an observed session termination, all integrate serially, reviewer approves, run completes |
+| Dependency release | Same scenario: t2 is not launched until t1 is `integrated` (not merely `completed`) — a distinct assertion from t4's slot wait — proved against the store and the launch journal |
 | A relayed question | `TestRealProcessRelayedQuestion`: worker question → manager fetch → manager question to human → `hop answer` → manager answer to the task → worker fetch/ack → work continues; every hop is a journaled row |
 | Duplicate / ambiguous message delivery | `TestRealProcessDuplicateAndAmbiguousDelivery`: a worker killed between fetch and ack refetches the same message after relaunch; a duplicate ack is idempotent; a stale-incarnation first ack is refused; the delivery journal shows every attempt |
 | Worker interruption | `TestRealProcessWorkerInterruption`: a worker killed mid-attempt is reconciled (Phase 2 machinery), the manager receives the controller's info notice, retries the task, and attempt 2 completes with full provenance |
@@ -95,22 +97,25 @@ Entity changes and additions (states in section 5):
 
 | Entity | Phase 3 change | Invariants |
 | --- | --- | --- |
-| `Run` | No new states. Completion context widens (section 8): a run completes only through `EvaluateReadiness`, a pure function over the full guard context | Stop precedence and monotonicity unchanged; a feature run's `running` covers planning, execution and integration — rendered conditions, not states |
+| `Run` | No new states. Gains the plan flag (feature mode): `PlanClosed`, set by the manager's `hop plan close` and cleared by any accepted `CreateTask` (section 8). Completion context widens: a run completes only through `EvaluateReadiness`, a pure function over the full guard context including the plan flag | Stop precedence and monotonicity unchanged; a feature run's `running` covers planning, execution and integration — rendered conditions, not states; closing an empty plan (zero implement tasks) is refused |
 | `Task` | Gains `Kind` (implement, review), `Seq` (dense per run), title, instructions digest, and the extended machine: `pending → ready → active → checking → completed → integrating → integrated`, plus `needs-rework` | Dependencies are edges to same-run tasks; the graph is acyclic (validated at every `hop task create` against the persisted edge set); `ready` requires every prerequisite `integrated`; at most one active attempt (Phase 2 index); a review task never enters `integrating`/`integrated` — its verdict acceptance completes it |
 | `TaskDependency` | New value: (task, prerequisite), unique, same run | Immutable once created; edges are created only with their task (a task's dependency set is fixed at creation — simpler than graph edits, and sufficient for this workflow) |
 | `Attempt` | Multiple attempts per task: `NewAttempt(number)` with dense numbers from 1; a retry (`hop task retry`) reserves attempt n+1 only when attempt n is terminal | The Phase 2 machine is unchanged; each attempt has its own worktree, session lineage, claims and results; a stale prior-attempt submission is `ErrStaleSubmission` by attempt state (already in the Phase 2 acceptance context) |
 | `Session` | `AttemptID` becomes optional (the manager session has none — the revisit recorded in [internal/domain/run/AGENTS.md](../../internal/domain/run/AGENTS.md)); gains `ParentSessionID` (nil for the manager) and the role values `manager`, `implementer`, `reviewer` | Parent and child belong to the same run; a parent must be the run's manager session (one-level delegation — a session with a parent can never itself be a parent); at most one non-terminal manager session per run; the state machine is Phase 2's, identical for all roles |
-| `Message` | New: run ID, sender principal (session ID, or the reserved principals `controller` and `human`), recipient address (`manager`, `task:<task-id>`, `human`), kind (`question`, `answer`, `info`), optional `ReplyTo` (answer only), body artifact path + digest, created-at | Immutable envelope; an answer references exactly one question addressed to the sender's own address; one accepted answer per question (equal-digest resubmission idempotent, different-digest conflicting and rejected — the Phase 2 receipt rule transplanted); addressing by role/task, never by pane or pid |
+| `Message` | New: run ID, sender principal (session ID, or the reserved principals `controller` and `human`), recipient address (`manager`, `task:<task-id>`, `human`), kind (`question`, `answer`, `info`), optional `ReplyTo` (answer only), optional `RelayedFrom` (a question relaying another question — the section 7 relay provenance), a durable per-recipient-address enqueue sequence assigned inside the send transaction, an optional caller-stable request ID (section 7 idempotency), body artifact path + digest, created-at | Immutable envelope; an answer's DESTINATION is derived from the original question's sender (never caller-chosen) and references exactly one same-run question addressed to the sender's own address; one accepted answer per question (equal-digest resubmission idempotent, different-digest conflicting and rejected — the Phase 2 receipt rule transplanted); addressing by role/task, never by pane or pid; FIFO is by enqueue sequence, never by caller timestamps |
 | `Delivery` / `Ack` | New: append-only delivery observations (message, fetching session, incarnation, at) and a single ack per message (session, incarnation, at) | Delivery is at-least-once: an unacknowledged delivered message is re-served; the FIRST ack requires the recipient's current, non-superseded incarnation (the Phase 2 result eligibility rule); a repeat ack of an acknowledged message is idempotent regardless of incarnation |
-| `Review` | New immutable verdict: run, review task, attempt, subject commit + tree object IDs, verdict (`approve`, `reject`), reasons digest, submitted-at | At most one accepted verdict per attempt; acceptance follows the section 8 validation order; a verdict never mutates — a new candidate gets a new review task |
-| `Integration` | New: task, source commit (the accepted result), pre-merge integration head, merge commit (once observed), state (`merging`, `checking`, `integrated`, `conflicted`, `check-failed`, `rolled-back`) | One integration per (task, attempt-that-produced-the-result); serial: at most one non-terminal integration per run (application-scheduled, store-enforced by partial unique index); every state change carries recorded object IDs, never branch names alone |
+| `Review` | New immutable verdict: run, review task, attempt, subject commit + tree object IDs (the tree resolved by the application from the submitted commit against the recorded repository, before the accepting transaction), verdict (`approve`, `reject`), reasons digest, submitted-at | At most one accepted verdict per attempt; acceptance follows the section 8 validation order; a verdict never mutates — a new candidate gets a new review task |
+| `Integration` | New: task, source commit (the accepted result), pre-merge integration head, merge commit (once observed), state (`merging`, `checking`, `integrated`, `conflicted`, `check-failed`, `rolled-back`, `interrupted`) | One integration per (task, attempt-that-produced-the-result); serial: at most one non-terminal integration per run (application-scheduled, store-enforced by partial unique index); every state change carries recorded object IDs, never branch names alone; an ancestor/no-op merge is a defined outcome (section 8), not an error or a retry loop |
 | `Worktree` | One per attempt (Phase 2 had one per run): branched from the integration head current at attempt creation, base commit recorded | Preserved by stop, failure and retry (a retry's fresh worktree never deletes its predecessor — evidence) |
 
 Pure transition functions keep the Phase 2 shape (explicit `now`, typed
 errors). New typed errors: `ErrDependencyCycle`, `ErrDependencyNotIntegrated`,
 `ErrDelegationDepth`, `ErrDuplicateAnswer`, `ErrConflictingAnswer`,
-`ErrStaleAck`, `ErrVerdictSubjectMismatch`, `ErrRetryNotTerminal`,
-`ErrRetryLimit`.
+`ErrStaleAck`, `ErrNotDelivered` (an ack of a never-delivered message),
+`ErrVerdictSubjectMismatch`, `ErrRetryNotTerminal`, `ErrRetryLimit`,
+`ErrRunNotAccepting` (a manager verb against a run past `running`),
+`ErrEmptyPlan` (closing a plan with no implement task) and
+`ErrRequestConflict` (a reused request ID with different content).
 
 New pure functions of note, all in the domain or (where they aggregate
 cross-entity context assembled by the application) shaped like Phase 2's
@@ -140,12 +145,25 @@ package.
 
 ## 3. Ports (consumer-owned, in internal/app)
 
-Reused unchanged: `StateStore`/`UnitOfWork` lease lifecycle, `Runtime`
-(all Phase 2 methods and their contracts, including the close rule and
-`ServerInstance`), `AgentPresentation`, `Observer`, `Clock`, `IDGenerator`,
-`CommandRunner`, `ProcessGroupInspector`, `ArtifactStore`,
-`ConfigurationSource` (extended value, same port). `SendText` remains the
-documented launch fallback only; no new caller.
+Reused unchanged: `StateStore`/`UnitOfWork` lease lifecycle, `Runtime`'s
+Phase 2 contracts (close rule, `ServerInstance`, corroboration inputs),
+`AgentPresentation`, `Observer`, `Clock`, `IDGenerator`, `CommandRunner`,
+`ProcessGroupInspector`, `ArtifactStore`, `ConfigurationSource` (extended
+value, same port). One removal: `Runtime.SendText` is DELETED from the
+port (section 7) — the send-text launch fallback was never invoked by
+`hop run` and an unused typed-input method on a production port is exactly
+what the injection invariant must not carry; the S1-verified transport
+knowledge stays recorded in the Phase 2 design and the adapter's `Client`
+keeps the low-level method for probes only.
+
+Packaging rule for every port change in this phase (the green-boundary
+rule of section 12): changes are expressed ADDITIVELY — new standalone
+interfaces and new struct fields, never a changed method signature on an
+existing interface outside the integrator slice. The blocks below show
+the target shapes; where a Phase 2 interface would change (`LaunchClaim`
+fields, `LoadLaunchContext` addressing, the `SendText` removal), the
+addition lands first and the integrator slice flips consumers and deletes
+the deprecated member in one landing.
 
 Extensions:
 
@@ -158,53 +176,73 @@ repositories, domain values, `Save(entity, expectedRevision)` where
 mutable; messages, dependencies, deliveries, acks and verdicts are
 append-only/immutable and have no revision.
 
-### SubmissionStore (worker and non-controller writes)
+### Worker-authority stores (SubmissionStore and the new sibling interfaces)
 
-The worker authority widens. Every method is one internal transaction, no
-controller lease, generation-NULL evidence, exactly as Phase 2 defines:
+The worker authority widens through NEW standalone interfaces implemented
+by the same SQLite `Store` (the additive packaging rule above), consumed
+via new `Controller` fields. Every method is one internal transaction, no
+controller lease, generation-NULL evidence, exactly as Phase 2 defines.
+
+`SubmissionStore` itself changes only additively: `LaunchClaim` gains
+`SessionID` (required) and its `AttemptID` becomes optional (B2/section 4 —
+NULL only for an attempt-less session); `ClaimCheckExec` generalizes to
+claim any pending exec-claimable operation of the current generation —
+kinds `check.run` and `integration.merge` (section 8) — keeping its
+pid-before-exec contract; `SubmitResult` and `RequestStop` are untouched.
+The pending-launch-intent fallback that authorizes a pre-binding claim is
+re-keyed from "the run's newest pending launch operation" to "the CLAIMED
+SESSION's newest pending launch operation", so two concurrently pending
+launches (two workers, or manager plus worker) validate independently and
+an earlier launch can never fail currency because a later one's intent is
+newer.
 
 ```go
-type SubmissionStore interface {
-    // Phase 2, unchanged:
-    ClaimLaunch(ctx, claim LaunchClaim) error
-    SettleLaunchFailure(ctx, incarnation IncarnationID, reason string) error
-    ClaimCheckExec(ctx, op OperationID, pid int) error
-    SubmitResult(ctx, submission ResultSubmission) (SubmissionOutcome, error)
-    RequestStop(ctx, run RunID) error
-
-    // Phase 3 messaging (section 7). All validate the caller's session and
-    // incarnation currency; every outcome, refusals included, commits a
-    // receipt.
+type MessagingStore interface {
+    // Section 7. All validate the caller's session and incarnation
+    // currency; every outcome except an empty fetch commits a receipt.
+    // Mutating verbs carry an optional caller-stable RequestID: an
+    // identical retry returns the original outcome, a conflicting reuse
+    // is refused (ErrRequestConflict).
     SendMessage(ctx, send MessageSend) (MessageOutcome, error)
     FetchNextMessage(ctx, fetch MessageFetch) (MessageDelivery, bool, error)
     AckMessage(ctx, ack MessageAck) (AckOutcome, error)
+    // AnswerQuestion records the human's answer to a human-addressed
+    // question (controller-machine context, no HOP_* env, no lease).
+    AnswerQuestion(ctx, ans HumanAnswer) (MessageOutcome, error)
+}
 
-    // Phase 3 manager verbs (section 8): durable requests the controller
-    // consumes by polling, exactly as check requests are consumed. The
-    // caller must be the run's current manager session (current
-    // incarnation); CreateTask validates titles/instructions bounds, the
-    // dependency edges against the persisted graph (acyclic, same run) and
-    // writes the task with its edges and instructions-artifact reference
-    // atomically. RequestRetry is legal only against a terminal attempt of
-    // a non-terminal implement task and below the frozen retry limit.
+type PlanStore interface {
+    // Section 8. Callers must be the run's current manager session
+    // (current incarnation), and the run must be `running`
+    // (ErrRunNotAccepting otherwise — validated INSIDE the transaction,
+    // so a create can never race completion). CreateTask validates
+    // title/instructions bounds and the dependency edges against the
+    // persisted graph (acyclic, same run), writes the task with its
+    // edges and instructions-artifact reference atomically, and clears
+    // the run's plan flag. RequestRetry is legal only against a terminal
+    // attempt of a needs-rework task below the frozen retry limit.
+    // ClosePlan sets the plan flag; closing a plan with zero implement
+    // tasks is ErrEmptyPlan. All three take the caller-stable RequestID.
     CreateTask(ctx, req TaskCreate) (TaskCreated, error)
     RequestRetry(ctx, req RetryRequest) (RetryAccepted, error)
+    ClosePlan(ctx, req PlanClose) (PlanClosed, error)
+}
 
-    // Phase 3 review (section 8): the reviewer's verdict submission,
-    // validated like SubmitResult (receipt before eligibility).
+type ReviewStore interface {
+    // Section 8: the reviewer's verdict submission, validated like
+    // SubmitResult (receipt before eligibility).
     SubmitReview(ctx, submission ReviewSubmission) (ReviewOutcome, error)
-
-    // Human answer (section 7): records the answer to a human-addressed
-    // question; runs in a controller-machine context (no HOP_* env) but
-    // still without the run lease.
-    AnswerQuestion(ctx, ans HumanAnswer) (MessageOutcome, error)
 }
 ```
 
 ### ReadStore
 
-`LoadLaunchContext` widens to sessions without attempts (the manager) and
-carries the session's role and — for workers — the task assignment path.
+A new `LoadSessionLaunchContext(ctx, run RunID, session SessionID)`
+addresses launch context by session — covering sessions without attempts
+(the manager) — and carries the session's role and, for workers, the task
+assignment path; its pending-intent resolution is session-keyed like the
+claim fallback above. The Phase 2 `LoadLaunchContext` stays until the
+integrator slice removes it with the `hop launch --run --attempt` flip.
 `RunDetail` gains the task table (states, dependencies, attempt counts),
 per-address message queue depths and in-flight message age, pending
 human questions, the integration head and guard shortfalls
@@ -214,15 +252,27 @@ human questions, the integration head and guard shortfalls
 
 ### Runtime
 
-One new method:
+Two new methods (and the `SendText` deletion above):
 
 ```go
 // CreateWorkspace creates a plain workspace (workspace.create) with an
 // explicit cwd, additive env and a unique creation label, without focus,
-// returning workspace/tab/root-pane IDs. Used only for the manager's
-// placement; worker and reviewer placement continues to come from
-// worktree.create's returned workspace. Shapes frozen against S8.
+// returning workspace/tab/root-pane IDs. The label names the WORKSPACE
+// itself (WorkspaceInfo.label — source-confirmed on 0.9.0), NOT the root
+// pane, unlike layout.apply/tab.create labels. Used only for the
+// manager's placement; worker and reviewer placement continues to come
+// from worktree.create's returned workspace. Shapes pending S8 executed
+// evidence.
 CreateWorkspace(ctx context.Context, req WorkspaceRequest) (WorkspaceHandle, error)
+
+// FindWorkspaceByLabel is the workspace.create decision row's recovery
+// lookup: resolves a workspace by its unique creation LABEL (a workspace
+// attribute), then descends workspace → its sole tab → that tab's sole
+// pane to recover the root-pane identity — a fresh recovered workspace
+// has exactly one of each, and more than one of either is an error, not
+// a guess. Zero matches is (zero, false, nil); two or more workspaces
+// with the label is an error. Pending S8 executed evidence.
+FindWorkspaceByLabel(ctx context.Context, label string) (WorkspaceRef, bool, error)
 ```
 
 The manager pane itself is then opened with the Phase 2 `OpenWorkerPane`
@@ -246,6 +296,7 @@ type RunPolicy struct {
     ReviewerRole    string        // [roles.reviewer] instructions; required in feature mode
     ReviewerHarness string        // [roles.reviewer] harness; default = [worker] harness
     MessageAttention time.Duration // [messages] attention_after; default 120s (section 7's status surface)
+    MessageWait      time.Duration // [messages] wait_timeout; default 50s — hop msg wait's default bound
 }
 ```
 
@@ -287,19 +338,48 @@ files changes nothing (snapshot immutability, as with the Phase 2 brief).
 
 ### Migration 002
 
-Forward-only, embedded, applied by the Phase 2 migrator
+Forward-only, embedded
 (`internal/adapters/sqlite/migrations/002_manager_workers_messages.sql`).
 Same conventions: UUID TEXT ids, fixed-width canonical UTC times, STRICT
-tables, `revision` on mutable rows, foreign keys enforced.
+tables, `revision` on mutable rows, foreign keys enforced. "Additive"
+means DATA- and BEHAVIOR-preserving for Phase 2 rows, not
+`ALTER TABLE ADD COLUMN`-only: relaxing a NOT NULL column in a STRICT
+table requires a physical rebuild (create the new table, copy, drop the
+old, rename), and the Phase 2 migrator gains explicit rebuild support for
+this migration — it runs 002 on a dedicated connection with
+`foreign_keys` OFF (the pragma is connection-scoped and a no-op inside a
+transaction, so the migrator must set it before BEGIN), performs the
+rebuilds, runs `PRAGMA foreign_key_check` and fails the migration on any
+violation before commit. 001 is not edited.
 
-Altered tables:
+Changes to landed tables, enumerated against the actual 001 schema
+([001_initial_schema.sql](../../internal/adapters/sqlite/migrations/001_initial_schema.sql)):
 
-| Table | Change |
-| --- | --- |
-| `tasks` | add `kind` (implement, review), `seq` (dense per run, UNIQUE(run_id, seq)), `title`, `instructions_path`, `instructions_digest`, `retry_count` |
-| `sessions` | `attempt_id` becomes NULLable; add `parent_session_id` FK NULL (must reference a same-run session; the one-level rule is application-validated and belt-and-braces enforced by a trigger-free partial-index design: see `session_roles` note below); add partial UNIQUE index: one session per run WHERE `role='manager'` AND state not in the terminal set |
-| `run_snapshots` | add `workflow JSON` (mode, max workers, retry limit, reviewer harness, role artifact paths + digests, integration branch name) — immutable like the rest of the snapshot |
-| `worktrees` | add `attempt_id` FK NULL (Phase 2 rows keep NULL; new rows are per attempt), `base_commit` already exists |
+| Table | 001 → 002 change | Backfill / old-row meaning |
+| --- | --- | --- |
+| `tasks` | add `kind`, `seq`, `title`, `instructions_path`, `retry_count`, `subject_commit_oid` NULL, `subject_tree_oid` NULL (review tasks only), `created_at`; UNIQUE(run_id, seq). (`instructions_digest` already exists in 001 and is unchanged) | existing solo rows: `kind='implement'`, `seq=1`, `title=''`, `instructions_path=''` (the solo assignment lives in the run snapshot), `retry_count=0`, subjects NULL, `created_at` copied from `updated_at` |
+| `sessions` | REBUILD: `attempt_id` relaxed to NULL (001 has it NOT NULL), `parent_session_id` FK NULL added (same-run; one-level rule application-validated as below); new partial UNIQUE index one session per run WHERE `role='manager'` AND state NOT IN ('lost','terminated'). The existing `sessions_one_current_per_attempt` index is preserved (SQLite treats NULL attempt IDs as distinct, so attempt-less sessions never collide in it) | rows copied verbatim; `parent_session_id` NULL (solo workers have no manager) |
+| `launch_claims` | REBUILD: `attempt_id` relaxed to NULL, `session_id` FK NOT NULL added. NULL `attempt_id` legal only for a claim whose session has no attempt — application-validated inside `ClaimLaunch`'s transaction, since SQLite cannot express the cross-table tie declaratively | `session_id` backfilled from `runtime_bindings` by `incarnation_id`; a claim with no binding row yet backfills from its attempt's current session; a claim resolving to neither fails the migration (it cannot exist under the Phase 2 contracts) |
+| `check_requests` | REBUILD for the typed check subject (M4/section 8): new shape `id PK, subject_kind ('result','integration'), result_id FK NULL, attempt_id FK NULL, integration_id FK NULL, state, created_at, claimed_generation`, CHECK exactly one subject reference set per kind, partial UNIQUE(result_id) and partial UNIQUE(integration_id) | existing rows copied with `id = result_id` (already a UUID, deterministic), `subject_kind='result'`, `integration_id` NULL |
+| `worktrees` | add `attempt_id` FK NULL and `base_commit` NULL (001 has NEITHER column — the Phase 2 base commit lives in the worktree.create operation intent, not the row) | existing rows keep NULL for both; their base remains readable from the operation journal exactly as Phase 2 left it |
+| `run_snapshots` | add `workflow` JSON NULL (mode, max workers, retry limit, reviewer harness, message policy, role artifact paths + digests, integration branch name) — immutable like the rest of the snapshot | NULL means solo (Phase 2 rows) |
+
+Every reader that assumed a non-null claim `attempt_id` or a single
+pending launch is re-keyed to the session, explicitly: `app.LaunchClaim`
+gains `SessionID` and makes `AttemptID` optional; `ClaimLaunch`'s
+agreement check validates the claimed SESSION's persisted owning run
+(and, when an attempt is claimed, that the attempt belongs to that
+session) instead of attempt-owning-run alone; the pre-binding
+pending-intent authority (`pendingLaunchIntent`) changes from "the RUN's
+newest pending launch operation" to "the claimed SESSION's newest pending
+launch operation" — the Phase 2 lookup is a single-worker contract, and
+under concurrent launches it would let a later launch's intent invalidate
+an earlier claim's currency; `LoadSessionLaunchContext` (section 3) uses
+the same session-keyed resolution; the corroboration predicate, result
+acceptance, stop retirement and the decision table key claims by
+incarnation and are untouched. Solo-mode rows keep a non-null
+`attempt_id`, so the Phase 2 suite passes against the rebuilt table; the
+different-pid duplicate-launch rejection is preserved verbatim.
 
 The one-level delegation rule is enforced in the application transaction
 that creates a child session (parent must be the run's manager session and
@@ -314,14 +394,14 @@ New tables:
 | Table | Columns (abridged) | Constraints |
 | --- | --- | --- |
 | `task_dependencies` | task_id FK, prerequisite_id FK, created_at | UNIQUE(task_id, prerequisite_id); both same run (application-validated with the acyclicity check inside the creating transaction) |
-| `messages` | id PK, run_id FK, sender_kind (session, controller, human), sender_session_id FK NULL, recipient_address (`manager`, `task:<uuid>`, `human`), kind (question, answer, info), reply_to FK NULL, body_path, body_digest, body_bytes, created_at | immutable; partial UNIQUE(reply_to) WHERE kind='answer' (one accepted answer per question); answers additionally validated against the question's address in the accepting transaction |
+| `messages` | id PK, run_id FK, sender_kind (session, controller, human), sender_session_id FK NULL, recipient_address (`manager`, `task:<uuid>`, `human`), kind (question, answer, info), reply_to FK NULL, relayed_from FK NULL (question relaying a question — section 7), enqueue_seq INTEGER (per (run, recipient_address), assigned inside the send transaction; FIFO authority), request_id TEXT NULL, body_path, body_digest, body_bytes, created_at | immutable; partial UNIQUE(reply_to) WHERE kind='answer' (one accepted answer per question); UNIQUE(run_id, recipient_address, enqueue_seq); partial UNIQUE(request_id); answer destination and same-run agreement validated in the accepting transaction |
 | `message_deliveries` | id PK, message_id FK, session_id FK, incarnation_id, delivered_at | append-only; every fetch that served the message, including re-serves |
 | `message_acks` | message_id PK FK, session_id FK NULL (NULL for a human ack via `hop answer`), incarnation_id NULL, acked_at | at most one; insertion is the acknowledgement |
-| `message_receipts` | id PK, op (send, fetch, ack, answer), claimed ids (plain TEXT, no FKs), outcome (accepted, duplicate, conflicting, stale, refused, malformed), detail, at | the messaging analogue of `result_submissions`: every outcome leaves evidence, malformed included |
+| `message_receipts` | id PK, op (send, fetch, ack, answer), claimed ids (plain TEXT, no FKs), request_id TEXT NULL, request_digest TEXT NULL (canonical digest of the mutating request's content, for idempotent-retry matching), outcome (accepted, duplicate, conflicting, stale, refused, malformed), created_entity_id TEXT NULL (what an identical retry gets back), detail, at | the messaging analogue of `result_submissions`; every outcome leaves evidence EXCEPT an empty fetch (`none:`), which is deliberately receipt-free — a 1s poll loop must not grow the store (section 13 risks) |
 | `reviews` | id PK, run_id FK, task_id FK, attempt_id FK, subject_commit_oid, subject_tree_oid, verdict (approve, reject), reasons_path, reasons_digest, submitted_at | partial UNIQUE(attempt_id) — one accepted verdict per attempt; UNIQUE(attempt_id, reasons_digest) supports idempotent duplicates |
 | `review_submissions` | id PK, claimed ids TEXT, outcome, detail, submitted_at | receipts, as for results |
 | `integrations` | id PK, run_id FK, task_id FK, result_id FK, source_commit_oid, premerge_head_oid, merge_commit_oid NULL, state, operation_id NULL, revision, created_at, updated_at | UNIQUE(task_id, result_id); partial UNIQUE(run_id) WHERE state in the non-terminal set — serial integration is store-enforced, not just scheduled |
-| `retry_requests` | id PK, task_id FK, requested_by_session FK, reason, state (pending, consumed, refused), created_at | UNIQUE(task_id) WHERE state='pending'; consumed by the controller's polling loop |
+| `retry_requests` | id PK, task_id FK, requested_by_session FK, request_id TEXT NULL, reason, state (pending, consumed, refused), created_at | UNIQUE(task_id) WHERE state='pending'; partial UNIQUE(request_id); consumed by the controller's polling loop — a retry retried by request ID after consumption returns the original acceptance (attempt number) from its receipt, never a second pending row |
 
 ### Transaction authorities
 
@@ -360,26 +440,57 @@ New operation kinds and their decision-table rows (Phase 2 rows unchanged):
 
 | Operation | Crash between intent and act | Crash between act and outcome | Takeover with the intent unresolved |
 | --- | --- | --- | --- |
-| `workspace.create` (manager placement) | Adoption by unique creation label via `session.snapshot` (S8 pins the round-trip); label absent → bounded wait for the in-flight request, then `reconciling`; never a second create | same | same |
-| `integration.merge` | Recovery by recorded object IDs, never branch names: integration branch head == recorded pre-merge head AND the integration checkout is clean → re-act; head == a commit whose parents are exactly {pre-merge head, source commit} → adopt as the merge commit; a dirty integration checkout whose path and branch match the intent → `git merge --abort` (the checkout is controller-owned plumbing), verify head unchanged, then re-act; any other head or a provenance mismatch → `reconciling` with the observed head as evidence | same | same; an unresolved merge blocks any further integration (the serial index already prevents a second one) |
-| `integration.reset` (combined-check failure rollback, section 8) | Head == recorded merge commit → re-act (`git reset --hard <premerge>` in the integration checkout, plus `git branch -f` provenance-checked); head == pre-merge head → adopt; anything else → `reconciling` | same | same |
+| `workspace.create` (manager placement) | Adoption by unique creation label — a WORKSPACE attribute on 0.9.0 (source-confirmed; executed round-trip pending S8), so recovery resolves the labeled workspace and then its sole tab and sole root pane (more than one of either fails closed); label absent → bounded wait for the in-flight request, then `reconciling`; never a second create | same | same |
+| `integration.merge` (scratch merge; never touches the ref) | The act spawns the merge through the generalized exec boundary — `hop check-exec --op <operation-uuid> -- git … merge …` (section 8 fixes the argv) — so a durable pre-exec claim (own pid = group id) exists exactly as for checks, and a Git child surviving a dead controller is retired by the existing group-retirement rule (argv-matched listing, never a blind signal) before any re-act. The merge runs in a PRIVATE detached checkout, `runs/<run-uuid>/integrations/<operation-uuid>/tree-<k>` at the recorded pre-merge head, producing merge commit M on the detached HEAD (a conflict exits non-zero and leaves the tree; no `merge --abort` is ever needed because a tree is never reused). Recovery: no claim → ambiguous, bounded wait then reconciling (never absence); claim present → retire the group, then read the scratch HEAD — a commit whose parents are exactly {pre-merge head, source} → adopt M; the up-to-date no-op outcome (section 8) → adopt as no-op; anything else → abandon that tree and re-act in a FRESH `tree-<k+1>` recorded in act evidence — a prior surviving writer can only touch its own abandoned directory, which is never adopted and removed only after the operation settles | same | same; an unresolved merge blocks further integration (the serial index already prevents a second one) |
+| `integration.publish` | The act is `git update-ref refs/heads/hop/r<seq>/integration <M> <expected-head>` — a compare-and-swap on the expected old value, executed directly by the controller (near-instant, no spawn identity needed BECAUSE of the never-revisit rule below: a delayed duplicate dispatch always fails its CAS). Recovery: ref == M → adopt; ref == expected head → re-act (retry-idempotent); any other value → `reconciling` with the observed ref as evidence | same | same |
+| `integration.reset` (combined-check failure rollback, section 8) | The act publishes a fresh ROLLBACK COMMIT R (created in the operation's scratch space with `git commit-tree <premerge>^{tree} -p <M>` — R carries the pre-merge content and keeps the rejected M reachable as its parent), then `git update-ref … <R> <M>`. Recovery: ref == R → adopt; ref == M → re-act; anything else → `reconciling` | same | same |
 | `worktree.create` (now per attempt) | Phase 2 row verbatim; provenance = repository common-directory equality plus the recorded base commit (now the integration head frozen into the intent) | same | same |
 | `pane.open` (manager, worker, reviewer) | Phase 2 row verbatim — one predicate, one close rule, all roles | same | same |
 | `session.close` (completion retirement, section 8) | Phase 2 `pane.close` row verbatim | same | same |
 
-The integration checkout is `runs/<run-uuid>/integration/tree`, a
-`git worktree add` of the integration branch under the state root, created
-once per run at freeze (journaled), used by every merge and reset, and
-never a Herdr workspace — it is controller plumbing, inspectable by path
-from `hop status`, not a pane. Merges and resets run `git -C` with the
-absolute `Controller.GitExecutable`, per the Phase 2 invariant.
+There is no standing integration checkout: each integration operation
+gets its own scratch detached checkouts under
+`runs/<run-uuid>/integrations/<operation-uuid>/` (the check pipeline's
+isolation pattern), removed after the operation settles, and the
+integration branch is moved ONLY by the `update-ref` compare-and-swap
+operations above. Phase 2's honesty about fencing ("fencing the outcome
+commit does not fence the act") is answered here in two parts: scratch
+merges carry a durable exec claim and are retired by the group rule
+before any re-act, and ref moves carry the CAS plus the NEVER-REVISIT
+rule — because every rollback publishes a fresh rollback commit R rather
+than returning the ref to its previous value, the integration ref never
+holds the same object ID twice, so an expected-old value is current at
+most once and a delayed publish or reset dispatched by a stale controller
+after takeover ALWAYS fails its CAS instead of replaying (the barrier
+test in section 11 pins exactly this: A resumes after B has rolled back
+and advanced the branch, and A's zombie CAS fails). R's parent is the
+rejected M, so rejected merges stay reachable — no gc-pruning caveat.
+Every git invocation runs the absolute `Controller.GitExecutable`, per
+the Phase 2 invariant, and no worktree ever has the integration branch
+checked out (scratch trees are detached), so `update-ref` never fights
+Git's checked-out-branch protections.
 
 ## 5. State machines and decision tables
 
 All transitions remain pure domain functions driven through the journal.
-Tables are exhaustive: an unlisted pair is invalid. The Attempt and
-Session tables are Phase 2's verbatim (attempts now recur per task;
-sessions now carry roles and optional parents with no machine change).
+Tables are exhaustive: an unlisted pair is invalid. The Session table is
+Phase 2's verbatim (sessions now carry roles and optional parents with no
+machine change). The Attempt table is Phase 2's verbatim for implement
+tasks (attempts now recur per task) plus exactly ONE review-only row:
+
+| From | To | Cause |
+| --- | --- | --- |
+| submitted | completed | review attempts only (`Attempt.CompleteReview`): the accepted verdict, applied atomically inside the verdict-acceptance transaction |
+
+`CompleteReview` is a distinct, independently validated transition (the
+`Attempt.Reattach` precedent — it does not share the implement table,
+which reaches `completed` only from `checking`). It differs deliberately:
+a review attempt's settling evidence is the verdict row itself; there is
+no check phase, and fabricating a no-op check receipt to reuse the
+implement path would make "check receipt" mean something other than a
+deterministic execution — corrupting exactly the evidence class the
+section 8 guards depend on. The transition takes the task kind as an
+explicit input and is invalid for an implement-task attempt.
 The Run table keeps Phase 2's exact state set and pairs, with two causes
 re-scoped for feature mode (solo mode is untouched): `running →
 completing` fires when `EvaluateReadiness` first holds and the completion
@@ -387,8 +498,28 @@ transaction begins child-session retirement — never on an individual
 task's check being claimed, which in feature mode leaves the run
 `running`; and `completing → completed` fires when retirement of every
 live session is observed with no stop requested. `launching → running`
-is the manager's settled launch claim. Only the changed/new tables are
+is the manager's settled launch claim. Phase 2's `running → failed`
+("terminal failure") cause explicitly includes, in feature mode, any task
+reaching `failed` (retry exhaustion or an unretryable terminal attempt):
+readiness can never hold again, no verb revives a failed task, and the
+run fails fast with evidence once its owned work's termination is
+observed — restarting is a new run. Only the changed/new tables are
 printed below.
+
+One boundary two implementers would otherwise resolve differently — retry
+(new attempt) versus same-attempt recovery — is fixed here: same-attempt
+cold relaunch remains EXCLUSIVELY a `hop resume` recovery action for
+attempts left `reconciling` by controller loss (the Phase 2 machinery,
+per session). A LIVE controller that establishes a worker's absence
+(Phase 2 evidence rules) with no accepted result marks the attempt
+`interrupted` and notifies the manager — a self-exiting worker is a
+behavioral failure and retrying it is manager judgment, never an
+automatic same-attempt relaunch. The operation journal separates the two
+by cause (worker-exit observation vs takeover reconciliation). In feature
+mode `hop resume --confirm-absent` takes a required session argument
+(`--confirm-absent <session-id>`), and each attestation is journaled per
+session with its own continuity evidence — the Phase 2 single-worker flag
+has no meaning across several sessions.
 
 ### Task (kind = implement)
 
@@ -401,11 +532,11 @@ printed below.
 | checking | completed | passing per-task check |
 | completed | integrating | integration claimed (serial slot free, dependency order) |
 | integrating | integrated | merge committed AND combined-candidate check passed |
-| integrating | needs-rework | merge conflict, or combined check failed (branch rolled back per the `integration.reset` row) |
+| integrating | needs-rework | merge conflict, or combined check failed (branch rolled back per the `integration.reset` row), with the retry limit not yet reached |
 | active, checking | needs-rework | the attempt reached a terminal non-completed state (failed per-task check, interrupted worker, exec failure) with the retry limit not yet reached; the task then waits for a manager retry request — the retry, once consumed, is what re-arms it |
 | needs-rework | ready | retry consumed: attempt n+1 reserved (below the frozen retry limit), fresh worktree from the current integration head |
 | active, checking, completed, integrating, needs-rework | interrupted | stop |
-| active, checking, needs-rework | failed | retry limit reached, or terminal attempt failure with no retry path |
+| active, checking, integrating, needs-rework | failed | retry limit reached (the settling transaction moves the task directly to `failed` when no retries remain — it never parks in `needs-rework` with no legal exit), or a terminal attempt failure with no retry path; a failed implement task fails the run (intro above) |
 
 ### Task (kind = review)
 
@@ -434,21 +565,28 @@ artifact and its row; `hop task create` refuses `kind=review`.
 Per-recipient serialization: for each recipient address (`manager`,
 `task:<id>`, `human`) at most one message is `delivered`-unacknowledged at
 a time; `FetchNextMessage` serves the in-flight message again if one
-exists, else the oldest `queued` message, FIFO by created-at with the
-message ID as the deterministic tie-break. There is no message TTL and no
-expiry in Phase 3; an unfetched queue ages visibly in `hop status`
-(section 9's attention condition).
+exists, else the queued message with the lowest `enqueue_seq` — the
+durable per-address sequence assigned inside the send transaction, so
+FIFO means commit order, never caller clocks (a delayed writer or a clock
+adjustment cannot jump the queue). The table above is exhaustive about
+acks too: `queued → acknowledged` exists ONLY for the human-answer row —
+a session's ack of a message that was never delivered to its lineage is
+refused (`ErrNotDelivered`), so a message can never be silently skipped.
+There is no message TTL and no expiry in Phase 3; an unfetched queue ages
+visibly in `hop status` (section 7's attention condition).
 
 ### Integration
 
 | From | To | Cause |
 | --- | --- | --- |
-| merging | checking | merge commit observed (outcome recorded with the commit + tree object IDs) |
-| merging | conflicted | merge conflict observed; abort evidence recorded |
-| checking | integrated | passing combined-candidate check receipt for the merge commit |
+| merging | checking | merge commit M produced in the scratch tree AND published to the integration ref by compare-and-swap (the `integration.merge` and `integration.publish` operations of section 4, both outcomes recorded with commit + tree object IDs) |
+| merging | checking | the ancestor/no-op outcome (section 8): the source commit is already an ancestor of (or equal to) the pre-merge head — `git merge` reports up-to-date and creates nothing; no publish runs (the ref is already the candidate) and the check subject is the unchanged head, satisfied by an existing settled receipt for exactly that head or by a fresh execution |
+| merging | conflicted | merge conflict observed (non-zero exit, conflicted scratch tree retained as evidence until settlement; no abort step exists — the tree is simply never reused) |
+| checking | integrated | passing combined-candidate check receipt for the candidate head |
 | checking | check-failed | failing combined check; triggers the `integration.reset` operation |
-| check-failed | rolled-back | reset outcome observed (branch back at the pre-merge head) |
-| merging, checking | interrupted | stop (an in-flight merge is retired like a check group: the merge command runs under `CommandRunner` cancellation; recovery uses the `integration.merge` row) |
+| check-failed | rolled-back | reset outcome observed: the ref moved to the fresh rollback commit R (section 4), which carries the pre-merge content and keeps the rejected M reachable |
+| merging, checking | interrupted | stop before a candidate was published or settled: the merge's claimed group is retired under the group rule; recovery uses the `integration.merge` row. A published-but-unchecked candidate is recorded in status with its exact head |
+| check-failed | rolled-back | stop with a rollback pending: `DriveStop` completes the reset CAS before reporting `stopped` (a single fenced, evidence-preserving act — a half-published rejected candidate is retired, not abandoned); the task then settles `interrupted`, not `needs-rework`, by stop precedence in the same transaction |
 
 `conflicted` and `rolled-back` settle the integration; the task moves to
 `needs-rework` in the same outcome transaction, and the controller's info
@@ -462,17 +600,23 @@ of Phase 2 section 5; each trace is a complete multi-entity scenario):
 
 1. **Feature happy path, dependency release.** Manager launched (Phase 2
    launch trace verbatim for the manager session); manager `CreateTask` A
-   (no deps → `ready`) and B (depends on A → `pending`); controller
-   assigns A (Task A ready→active, Attempt A1 reserved→launching, Session
-   reserved→launching, atomically); A submits, per-task check passes
-   (Phase 2 trace) → A `completed`; integration A claimed → A
-   `integrating`, merge observed → integration `checking`, combined check
+   (no deps → `ready`) and B (depends on A → `pending`), then `ClosePlan`
+   (plan closed); controller assigns A (Task A ready→active, Attempt A1
+   reserved→launching, Session reserved→launching, atomically); A
+   submits, and the acceptance commits with it the retirement intent for
+   A's session (section 6: an accepted result ends the worker's job — the
+   close-rule retirement frees the slot on OBSERVED termination, while
+   the fixture stays alive at its composer until closed); per-task check
+   passes (Phase 2 trace) → A `completed`; integration A claimed → A
+   `integrating`, scratch merge produced and published (CAS) →
+   integration `checking`, combined check
    passes → A `integrated` AND — same transaction — B `pending→ready` and
    the controller info message to the manager commits; B assigned and
-   completes the same way; review task R created `ready` → reviewer
-   assigned → verdict approve accepted (R active→completed) →
-   `EvaluateReadiness` true → Run completing→completed after child-session
-   retirement (section 8).
+   completes the same way; review task R created `ready` (plan closed,
+   all implement tasks integrated) → reviewer assigned → verdict approve
+   accepted (R active→completed, reviewer session retired the same way) →
+   `EvaluateReadiness` re-validated inside the completion transaction →
+   Run completing→completed after manager retirement (section 8).
 2. **Relayed question, no lifecycle movement.** Worker (task B) sends
    `question` q1 to `manager` (queued); manager fetch (q1 delivered);
    manager sends `question` q2 to `human` (queued) and acks q1; human
@@ -495,7 +639,11 @@ of Phase 2 section 5; each trace is a complete multi-entity scenario):
    manager `RequestRetry`; controller consumes it: Attempt B2 reserved
    (number 2), fresh worktree from the current integration head, new
    session — Task B ready→active; B2 completes; the store shows both
-   attempts, both worktrees, both session lineages.
+   attempts, both worktrees, both session lineages. Exhaustion variant,
+   pinned in the same suite: the identical interruption with the retry
+   limit already consumed moves Task B directly to `failed` in the
+   settling transaction (never a parked `needs-rework`), and the run to
+   `failed` once owned-work termination is observed.
 5. **Reviewer rejection and re-review.** Review R1 verdict reject accepted
    (R1 completed; `EvaluateReadiness` false — shortfall names the reject);
    controller info to manager with the reasons artifact path; manager
@@ -521,20 +669,50 @@ with status events only ever wakeups: pending manager requests (new tasks,
 retry requests), released-and-assignable tasks, pending integrations,
 review-task creation, and the message-age attention condition. One
 scheduling pass per poll tick, deterministic order: consume manager
-requests → recompute releases → claim at most one integration → create the
-review task when due → assign released tasks into free slots (task `seq`
-order) → corroborate launches → drive checks. Every dispatch revalidates
-(heartbeat CAS + stop re-read) exactly as Phase 2 requires.
+requests → retire sessions whose attempts have settled (below) →
+recompute releases → claim at most one integration → create the review
+task when due (plan closed, all implement tasks integrated, no review
+task for the current head) → assign released tasks into free slots (task
+`seq` order) → corroborate launches → drive checks. Every dispatch
+revalidates (heartbeat CAS + stop re-read) exactly as Phase 2 requires.
+
+### Per-attempt session retirement
+
+An interactive harness does not exit when its model turn ends: the landed
+launcher starts Claude at its composer, and a command pane closes only
+when the PROCESS exits. Without retirement, two submitted workers would
+hold both slots forever and readiness could never be reached. So a
+session is retired by the controller — the Phase 2 close-rule procedure
+verbatim (scrollback captured, occupant verified against the recorded
+claim evidence, `ClosePane`, absence observed) — at each of these
+boundaries, journaled with the boundary as the reason: an implement
+attempt's ACCEPTED result (the recipient contract has the worker drain
+its queue before submitting, so nothing is owed to it afterwards); a
+review attempt's accepted verdict, approve or reject; and any terminal
+attempt outcome (failed check settling the attempt, exec failure,
+interruption). The slot frees only on the close's observed-absence
+outcome, never on dispatch. The fixture principals deliberately stay
+alive at a composer-like idle loop after submitting, so the suite proves
+retirement actually terminates them rather than relying on process exit.
 
 ### Bounded concurrency
 
 `MaxWorkers` (default 2) bounds the count of non-terminal, non-manager
 sessions (implementers and the reviewer share the bound — open question 2).
-The bound is enforced in the assignment transaction by counting live
-child-session rows inside it, so two controllers can never overshoot (and
-there is only one controller per run anyway — the lease); a slot frees
-when a session reaches a terminal state, never merely when a pane event
-arrives (Phase 2's evidence rules decide termination).
+The bound is enforced in the assignment transaction by counting
+non-terminal child-session rows inside it, so it can never overshoot even
+across a takeover (the count and the new session row commit under the
+same fenced transaction); a slot frees only when a session's row reaches
+a terminal state (`terminated`, `lost`), which Phase 2's evidence rules
+grant only on observed absence or attested retirement — never on a pane
+event, a lease expiry or a guess. Stated consequence, deliberate: a
+crashed-but-unreconciled worker still occupies its slot, and sessions in
+`reconciling` or `stopping` count as occupied, so an unlucky run can sit
+at zero free slots until reconciliation establishes termination; `hop
+status` renders the occupied slots with each session's state so the human
+can see exactly which reconciliation is holding the bound. Freeing a slot
+on weaker evidence would let the bound overshoot the real process count,
+which is the one thing it exists to prevent.
 
 ### One-level delegation
 
@@ -562,7 +740,7 @@ role:
 | --- | --- | --- | --- |
 | manager | `CreateWorkspace` (label = the operation ID), cwd = repository root | `HOP_STATE_DIR`, `HOP_RUN_ID`, `HOP_SESSION_ID`, `HOP_ROLE=manager`, `HOP_INCARNATION_ID` | the brief assignment artifact, the frozen manager role artifact, and the worker-protocol crib (section 7's grammar, rendered as a fixed artifact at freeze) |
 | implementer | `worktree.create` per attempt (branch `hop/r<seq>/t<tseq>a<n>`, base = current integration head, label = the operation ID), cwd = the worktree | Phase 2 set plus `HOP_SESSION_ID`, `HOP_ROLE=implementer` | the task assignment artifact (manager-authored instructions + acceptance criteria + the frozen implementer role artifact reference + prior-attempt feedback paths on retry) |
-| reviewer | `worktree.create` (branch `hop/r<seq>/review<n>`, base = the subject integration head), cwd = the worktree | Phase 2 set plus `HOP_SESSION_ID`, `HOP_ROLE=reviewer` | the review assignment artifact: the frozen subject (commit + tree oid), the diff scope (base..head), the reviewer role artifact, and the verdict submission instruction |
+| reviewer | `worktree.create` (branch `hop/r<seq>/t<tseq>a<n>` — review tasks have a `seq` and attempts like any task, so ONE branch scheme covers every role; base = the subject integration head), cwd = the worktree | Phase 2 set plus `HOP_SESSION_ID`, `HOP_ROLE=reviewer` | the review assignment artifact: the frozen subject (commit + tree oid), the diff scope (base..head), the reviewer role artifact, and the verdict submission instruction |
 
 `hop launch` takes `--run` and `--session` (the attempt, where one exists,
 resolves from the session row); the launch context fails closed on any
@@ -575,12 +753,52 @@ composition unchanged. The Phase 2 restore policy applies to every session
 including the manager: a Herdr-restored occupant is never adopted;
 positive-evidence retirement or attestation, then cold relaunch.
 
+Manager lineage, defined: the run's manager is a SUCCESSION of manager
+sessions — the manager-uniqueness index admits a successor only once its
+predecessor is terminal, and a cold relaunch of the manager creates the
+successor bound to the same native reference (the manager conversation
+continues; there is no manager attempt to rebind). A child session's
+`parent_session_id` permanently references the manager session that was
+current AT ITS CREATION — historical provenance, never rewritten — while
+"the run's current manager" (the session `CreateTask`/`RequestRetry`/
+`ClosePlan` validate against, and the recipient of the `manager` address)
+is always the run's sole non-terminal manager-role session. A retired
+manager incarnation's verbs and acks fail the ordinary
+incarnation-currency checks; nothing special is added for it.
+
 ### Integration branch and worktree bases
 
+One ref-namespace scheme, used everywhere (a git ref cannot be both a
+leaf and a directory, so every HOP ref for the run lives UNDER
+`hop/r<seq>/`): the integration branch is `hop/r<seq>/integration`, and
+every task-attempt worktree branch — implement and review tasks alike,
+since both have a task `seq` and attempt numbers — is
+`hop/r<seq>/t<tseq>a<n>`. G1 exercises exactly this family.
+
 At freeze the controller records the base commit (repository HEAD at
-freeze, resolved to an object ID) and creates branch `hop/r<seq>` — the
-integration branch — at that commit, plus the state-root integration
-checkout (section 4). Task worktrees branch from the integration head
+freeze, resolved to an object ID) and creates the integration branch at
+that commit with a create-only compare-and-swap
+(`git update-ref refs/heads/hop/r<seq>/integration <base-oid> ""` — the
+empty expected-old value makes a second creation fail instead of moving
+an existing ref).
+
+Worktree base honesty (source-confirmed on 0.9.0, executed evidence
+pending S9): `worktree.create` honors `--base <oid>` ONLY when the branch
+is new — an existing branch is checked out at its current tip and the
+base is silently ignored. Branch-name uniqueness per attempt is therefore
+a hard invariant, held three ways: the `t<tseq>a<n>` scheme is unique by
+construction (run seq, task seq and attempt number are each unique in
+their scope); the worktree.create intent is preceded by a refuse-if-exists
+check of the exact ref (`git rev-parse --verify`, failing the assignment
+with the collision named rather than launching on the wrong base); and
+the Phase 2 provenance rule is applied immediately after create as well
+as at adoption — the new worktree's HEAD must equal the frozen base
+object ID, never trusted from the request. Sibling grouping (the
+worktree workspaces grouping with the manager's repository workspace)
+rides Herdr's shared repo key in the workspace's worktree info; S8/S9
+record the observed grouping but nothing in the design depends on it.
+
+Task worktrees branch from the integration head
 current at their attempt's creation, so dependent work always builds on
 integrated prerequisite work; that is why dependency release requires
 `integrated`, not `completed`. Retry worktrees re-base the same way, and
@@ -621,21 +839,27 @@ keys to any live pane, ever:
 Consequences, stated as invariants the implementation and tests must hold —
 each CHECKED, not merely documented:
 
-- No `app` use case calls `Runtime.SendText`; no `agent.prompt`,
-  `agent.send_keys` or `pane.send_keys` method exists on any port. The
-  send-text launch fallback remains declared and remains unused by
-  `hop run` (already the Phase 2 status quo, recorded in
-  [test/integration/AGENTS.md](../../test/integration/AGENTS.md)).
-  Checked three ways (section 11): the existing narrow AST forbidden-call
-  checker in `internal` (the mechanism
-  [engineering.md](../architecture/engineering.md) already uses for
-  ambient clock/ID calls) gains a rule that `internal/app` production code
-  never references `Runtime.SendText`; a port-surface test asserts
-  `app.Runtime`'s exact method set (a typed-pane-input method appearing on
-  any port fails the build's tests, not just review); and the fake Runtime
-  records every call so the feature scenarios assert zero `SendText`
-  invocations. The invariant is also recorded in the `internal/app` and
-  herdr-adapter guides in the changes that land it.
+- No production HOP code path can deliver terminal input: `SendText` is
+  REMOVED from the `app.Runtime` port (section 3), and no port carries
+  any typed-input method (`agent.prompt`, `send_keys` shapes included).
+  The mechanically enforced scope is precise (section 11): (i) a
+  port-surface test asserts the exact method set of EVERY `internal/app`
+  port interface against a reviewed allowlist, so a typed-input method
+  appearing on any port — not just Runtime — fails tests; (ii) the
+  `internal` checker gains a TYPE-AWARE forbidden-call rule (go/types,
+  not the package-selector pattern used for `time.Now` — that pattern
+  would miss `c.Runtime.SendText`, aliases and method values): production
+  code in `internal/app` and `cmd/hop` may not reference a method named
+  `SendText`, `SendKeys` or `Prompt` on any type declared in
+  `internal/adapters/herdr` or on any `internal/app` port, with negative
+  fixtures for chained selectors, interface and type aliases, method
+  values and a raw adapter call from composition; (iii) the herdr
+  adapter's own tests pin a transport-method allowlist — the `Runtime`
+  TYPE exposes no typed-input method; the low-level `Client.SendText`
+  survives for probes and tests only and no production type embeds or
+  re-exports it. The recording fakes still assert zero typed-input calls
+  in every feature scenario, and the invariant is recorded in the
+  `internal/app` and herdr-adapter guides in the changes that land it.
 - Message bodies are never printed raw to a terminal-bound stream: the CLI
   prints the body artifact path, and body files are written
   temp-file-then-rename with digests. A body containing ANSI escapes,
@@ -660,7 +884,12 @@ written.
   `hop msg wait --timeout 50s` in a loop as its ONLY idle activity. On a
   `message` response it must, before the next wait: read the body file;
   then (kind `question`) send the `answer` — or relay to the human as a
-  new `question` to `human` — and `hop msg ack` the question; (kind
+  new `question` to `human` with `--relay-of <the question>` — and
+  `hop msg ack` the question; (kind `answer` from `human`) locate the
+  relayed worker question through the answer's reply-to chain (the
+  human's answer replies to the manager's relay question, whose
+  `relayed_from` names the original), send the `answer` to that original
+  question, and `hop msg ack` the human's answer; (kind
   `info`) act on the notice if it requires planning (a `needs-rework`
   notice, a reject verdict) and `hop msg ack` it. On the
   `none: no message within <timeout>; run hop msg wait again` line it
@@ -708,17 +937,18 @@ fields, then asserts the line clears after the relaunch acks.
 
 Deferred capability — a dialog-safe nudge: a typed wake-up for an idle
 recipient stays out of HOP until Herdr offers a surface that removes the
-misdetection window, none of which exists on 0.9.0. Facts that would
-unblock it, each needing its own capability probe first: (i) a prompt API
-whose delivery is server-side conditional on the pane's status authority
-being a complete lifecycle integration rather than a screen manifest
-(Claude Code and Codex are `session`-only integrations today, so their
-`blocked` remains screen-detected and strict — [agents.mdx](../../repos/herdr/docs/versions/0.9.0/website/src/content/docs/agents.mdx));
-(ii) a submission mode that delivers text without Enter and reports what
-the composer contained, so a misdirected delivery is inert and detectable;
-or (iii) a compare-and-swap input guard (refuse unless the screen state
-the caller inspected is still current). Until one is verified, the
-attention surface above is the whole answer.
+misdetection window, none of which exists on 0.9.0. Research leads a
+future phase would have to probe — none is sufficient on its own, and
+each has a known gap: (i) delivery conditional on the pane's status
+authority being a complete lifecycle integration rather than a screen
+manifest (Claude Code and Codex are `session`-only integrations today —
+[agents.mdx](../../repos/herdr/docs/versions/0.9.0/website/src/content/docs/agents.mdx));
+(ii) an Enter-less submission with composer read-back — though a dialog
+that accepts single keys is not made safe by omitting Enter; (iii) a
+compare-and-swap input guard — though an unrecognized screen that has not
+changed remains exactly as unsafe as before. Reintroducing any typed
+input would be a new safety decision for the human, not an implementation
+option; until then the attention surface above is the whole answer.
 
 Acknowledgment semantics, stated honestly (the Phase 2 formulation): a
 delivery row proves the recipient's harness ran `hop msg next` and
@@ -735,49 +965,92 @@ rule) except `hop answer`, which is a human/controller-machine command.
 Validation orders are normative and mirror section 7 of the Phase 2
 design (receipt before eligibility):
 
-- **Send** (`hop msg send --to manager|task:<id>|human --kind
-  question|info|answer [--reply-to <id>] --file <path>`): parse and bound
-  (kind/address legality by role: workers → `manager` only; manager →
-  `task:<id>`, `human`; `answer` requires `reply-to` naming an
-  unanswered question addressed to the sender's own address); duplicate
-  answer (equal body digest for the same question) → idempotent success;
-  conflicting answer → refused, receipt, the accepted answer undisturbed;
-  eligibility (current incarnation, run not stopping/stopped); accept:
-  body artifact written BEFORE the row's transaction (a file write is not
-  an external call in the journal sense, but the row commits only after
-  the bytes are durable — temp-file-then-rename, digest recorded), then
-  envelope row + receipt in one transaction.
-- **Fetch** (`hop msg next`, and `hop msg wait [--timeout 50s]` — the same
-  fetch in a bounded store poll loop, 1s interval, sleeping in the CLI
-  process, not the store): resolve the caller's address (`manager` for the
-  manager session; `task:<id>` for a worker or reviewer via its attempt's
-  task; lineage-based, so a cold-relaunched or retried successor session
-  fetches its predecessors' queue without any re-addressing write);
-  serve the in-flight delivered-unacknowledged message if one exists, else
-  the oldest queued; write the delivery row and receipt in the same
-  transaction that decides; print the envelope and body path. `wait`
-  prints the protocol line `none: no message within <timeout>; run hop msg
-  wait again` on expiry — bounded below the harness's own tool timeout
-  (default 50s; L1 in section 11 pins the live constraint).
+Every mutating verb here and in section 8 (`msg send`, `answer`,
+`task create`, `task retry`, `plan close`; `review submit` already has
+per-attempt digest idempotency) takes a caller-stable
+`--request-id <uuid>`: the receipt row records it with a canonical digest
+of the request's content, an identical retry (same ID, same digest)
+returns the ORIGINAL outcome and entity (message ID, task ID and `t<seq>`,
+attempt number) from the receipt — surviving consumption, relaunch and
+retirement, since receipts are permanent — and a reused ID with different
+content is refused (`ErrRequestConflict`). At-least-once fetch covers a
+lost fetch response; the request ID covers a lost MUTATION response,
+which re-running would otherwise duplicate (a second question, a second
+task). The flag is optional at the CLI (omitted → server-minted, retry
+then not idempotent) but the templates and fixtures ALWAYS pass it; a
+duplicate lookup by request ID runs before any other validation
+(receipt-before-eligibility, as everywhere).
+
+- **Send** (`hop msg send --to manager|task:<id> --kind question|info
+  [--relay-of <id>] --file <path>`, or `--kind answer --reply-to <id>
+  --file <path>` with NO `--to`): parse and bound. Kind/address legality
+  by role: workers and reviewers → `question`/`info` to `manager` only;
+  the manager → `question` to `human` or `question`/`info` to `task:<id>`;
+  an `answer` is legal from ANY session answering a question addressed to
+  its own address — no `--to` legality applies, since the destination is
+  derived; `info` to `human` is refused at send — humans have no fetch or ack verb,
+  so a human-addressed info could never settle (the only human-addressed
+  kind is `question`, settled by its answer). An `answer`'s destination is
+  never caller-chosen: it is DERIVED from the referenced question's
+  sender — the question originator's logical address (`manager` for the
+  manager session, `task:<its task>` for a worker/reviewer session) — and
+  the accepting transaction validates same-run existence and agreement of
+  the reply-to row, the derived recipient and any `--relay-of` reference.
+  `--relay-of <q>` on a question records immutable relay provenance
+  (`relayed_from`), linking the manager's human-facing question to the
+  worker question it relays so the chain is reconstructible after any
+  interruption. Duplicate answer (equal body digest for the same
+  question) → idempotent success; conflicting answer → refused, receipt,
+  the accepted answer undisturbed; eligibility (current incarnation, run
+  not stopping/stopped); accept: body artifact written durably BEFORE the
+  row's transaction (temp-file-then-rename, digest recorded), then
+  envelope row (enqueue sequence assigned here) + receipt in one
+  transaction. Controller info notices follow the same file-first
+  protocol: the body file is written before the transition transaction
+  that commits their envelope.
+- **Fetch** (`hop msg next`, and `hop msg wait [--timeout <dur>]`, default
+  from `[messages] wait_timeout` (50s) — the same fetch in a bounded store
+  poll loop, 1s interval, sleeping in the CLI process, not the store):
+  resolve the caller's address (`manager` for the manager session;
+  `task:<id>` for a worker or reviewer via its attempt's task;
+  lineage-based, so a cold-relaunched or retried successor session fetches
+  its predecessors' queue without any re-addressing write); serve the
+  in-flight delivered-unacknowledged message if one exists, else the
+  lowest-enqueue-sequence queued message; write the delivery row and
+  receipt in the same transaction that decides; print the envelope and
+  body path. An empty fetch prints `none: …` and commits NOTHING — no
+  receipt, no row (the poll loop must not grow the store). `wait`'s expiry
+  line instructs re-invocation; the bound sits below the harness's own
+  tool timeout (L1 pins the live constraint).
 - **Ack** (`hop msg ack <message-id>`): already-acknowledged → duplicate,
-  idempotent exit 0; first ack requires the caller to resolve to the
-  message's recipient address with a current incarnation — a stale
+  idempotent exit 0; a FIRST ack requires delivery evidence — at least one
+  delivery row to the message's recipient lineage — AND the caller
+  resolving to that recipient address with a current incarnation. An ack
+  of a queued, never-delivered message is refused (`ErrNotDelivered`,
+  receipt recorded): a successor session must fetch (and thereby re-serve)
+  before it can acknowledge, so no message is ever skipped unseen. A stale
   incarnation or a foreign session is refused with a receipt; the ack row
   commits with its receipt.
 - **Answer** (`hop answer <question-id> --file <path> | --body "<text>"`):
-  validates the question is `human`-addressed and unanswered; writes the
-  answer body artifact, the answer message row (sender `human`, recipient
-  `manager`), the question's ack and the receipt in one transaction.
-  Duplicate (equal digest) idempotent; conflicting refused.
+  validates the question is `human`-addressed and unanswered; the answer
+  body artifact is written durably BEFORE the transaction (the same
+  file-first protocol as Send), then the answer message row (sender
+  `human`, recipient `manager`), the question's acknowledgement and the
+  receipt commit in one transaction. Duplicate (equal digest) idempotent;
+  conflicting refused.
 
 ### Exactly what is journaled
 
 For every message: the immutable envelope row (sender principal, recipient
-address, kind, reply-to, body path, digest, size, created-at); one
-delivery row per serve (session, incarnation, time — re-serves included);
-at most one ack row; and a receipt row for EVERY verb outcome including
-refusals and malformed input (claimed ids as plain text, no FKs — the
-Phase 2 `result_submissions` pattern). Controller info notices are
+address, kind, reply-to, relay provenance, enqueue sequence, request ID,
+body path, digest, size, created-at); one delivery row per serve (session,
+incarnation, time — re-serves included; a delivery row proves the serve
+COMMITTED, not that the CLI's stdout ever reached the model, which is why
+delivery is re-servable until acked); at most one ack row; and a receipt
+row for every verb outcome including refusals and malformed input
+(claimed ids as plain text, no FKs — the Phase 2 `result_submissions`
+pattern), with ONE deliberate exception: an empty fetch commits nothing.
+Controller info notices are
 ordinary message rows committed inside the transitions they report, so the
 journal of what the manager was told is exact and totally ordered with the
 lifecycle evidence. Nothing about delivery lives only in memory or only in
@@ -798,8 +1071,9 @@ parsing those same lines (section 11):
 | `hop msg wait` | as `next` | `none: no message within <timeout>; run hop msg wait again` |
 | `hop msg ack` | `acknowledged <uuid>` / `duplicate <uuid>` | — |
 | `hop msg send` | `sent <uuid>` / `duplicate <uuid>` | — |
-| `hop task create` | `task <uuid> t<seq> created` | — |
-| `hop task retry` | `retry accepted t<seq> attempt <n>` | — |
+| `hop task create` | `task <uuid> t<seq> created` / `duplicate <uuid> t<seq>` (request-ID retry) | — |
+| `hop task retry` | `retry accepted t<seq> attempt <n>` / `duplicate t<seq> attempt <n>` | — |
+| `hop plan close` | `plan closed` / `duplicate plan closed` | — |
 | `hop review submit` | `verdict accepted <review-uuid>` / `duplicate <review-uuid>` | — |
 
 Refusals exit 1 with one first line `refused: <reason-token>` and detail
@@ -810,11 +1084,32 @@ silently.
 
 ## 8. The built-in feature workflow: review, guards, serial integration
 
+### Plan closure
+
+Readiness needs a durable statement that the manager finished submitting
+its plan — otherwise "every implement task integrated" is vacuously or
+transiently true (an empty graph, or the gap between two `task create`
+calls). The plan flag provides it: `hop plan close` sets it (refused for
+a plan with zero implement tasks — `ErrEmptyPlan`; a zero-work feature
+run is a usage error surfaced to the manager); any accepted `CreateTask`
+clears it, reopening the plan (the reject-verdict fix-task path closes it
+again afterwards). Review-task creation and `EvaluateReadiness` both
+require the plan closed. Racing creation against completion is
+impossible by construction: `CreateTask`/`RequestRetry`/`ClosePlan`
+validate the run is `running` INSIDE their store transaction
+(`ErrRunNotAccepting` with a receipt otherwise — the defined fate of a
+late request), the run leaves `running` for `completing` only in the
+transaction that first establishes readiness, and the final
+`completing → completed` transaction RE-VALIDATES `EvaluateReadiness`
+against the then-current task set and plan flag, so nothing created in
+between can be silently skipped.
+
 ### Guards are application behavior, not prose
 
 Run completion is a single controller transaction that calls
 `EvaluateReadiness` over evidence rows only:
 
+0. the plan is closed (above);
 1. every implement task `integrated`;
 2. a passing check receipt (the Phase 2 check pipeline's settled outcome)
    whose candidate is the CURRENT integration head (commit and tree object
@@ -828,11 +1123,28 @@ There is no verb that writes any of these except their own pipelines:
 check receipts come only from `hop check-exec` executions through the
 Phase 2 operation journal; verdict rows come only from
 `SubmitReview` under the reviewer-session validation below; integration
-states come only from the controller's journaled merge/check/reset
-operations. `hop task create`, `hop task retry`, `hop msg send` and the
-read/ack side of messaging (`hop msg next`/`wait`/`ack`) are the manager's
-complete verb set. A manager that writes "all checks passed" in a message
-has changed nothing.
+states come only from the controller's journaled merge/publish/check/reset
+operations. `hop task create`, `hop task retry`, `hop plan close`,
+`hop msg send` and the read/ack side of messaging
+(`hop msg next`/`wait`/`ack`) are the manager's complete verb set. A
+manager that writes "all checks passed" in a message has changed nothing.
+
+The combined check runs through a GENERALIZED check pipeline, not the
+result-bound Phase 2 one unchanged: the landed `check_requests` table is
+one row per accepted result, so a merge commit — which has no accepted
+worker result — needs its own typed subject. Migration 002 rebuilds
+`check_requests` with `subject_kind` (`result` | `integration`) and
+exactly one subject reference (section 4); `ClaimAndRunCheck` resolves
+its candidate object ID by subject (a result's commit, or an
+integration's merge commit — for the no-op outcome, the unchanged head),
+and its outcome transaction dispatches by subject: result subjects apply
+the Phase 2 attempt/task/run consequences verbatim, integration subjects
+move the integration `checking → integrated` or `check-failed`. Exec,
+capture, evidence retention, the frozen timeout, `check.repeatable` and
+the unknown-outcome rule are shared verbatim across both subjects; the
+uniqueness contract is one request per result and one per integration
+(partial unique indexes). No synthetic result row is ever forged for a
+combined candidate.
 
 Per-task guards are Phase 2's, applied per task: acceptance requires the
 result protocol; task completion requires the accepted result plus a
@@ -843,15 +1155,35 @@ anything.
 
 Integrations are claimed one at a time (store-enforced partial unique
 index, section 4), in dependency order then task `seq` order, each as the
-journaled operation pair of section 4: merge (`git merge --no-ff
-<source-commit>` in the integration checkout; conflict → abort, evidence,
-`conflicted`) then the frozen check against the merge commit through the
-UNCHANGED Phase 2 check pipeline (detached checkout of the merge commit
-under the check operation's directory — the integration checkout itself is
-never the check target). A failing combined check triggers the journaled
-reset (branch back to the recorded pre-merge head) and `needs-rework`;
-passing per-task checks on separate branches never substitute — this is
-the exit criterion's revalidation, mechanically.
+journaled operation sequence of section 4: the scratch merge, the
+compare-and-swap publish of the merge commit to `hop/r<seq>/integration`,
+then the frozen check against the candidate through the generalized
+pipeline above (its own detached checkout under the check operation's
+directory — a scratch merge tree is never the check target). The merge is
+spawned through the generalized exec boundary (`hop check-exec --op
+<uuid> -- <merge argv>`) so it carries a durable pre-exec group claim,
+and its argv is fixed and fully noninteractive:
+
+```text
+git -C <scratch tree> -c user.name=hop -c user.email=hop@invalid
+    -c core.editor=true merge --no-ff --no-edit <source-oid>
+```
+
+with `GIT_TERMINAL_PROMPT=0` and `GIT_EDITOR=true` in the sanitized spawn
+environment, so no configuration or prompt can block it. Ordinary Git
+outcomes are all defined: a two-parent merge commit (the normal case); a
+conflict (non-zero exit, `conflicted`, evidence retained); and the
+ancestor/no-op case — a legitimate no-change task whose accepted commit
+is already an ancestor of (or equal to) the head succeeds with "already
+up to date" and creates nothing, which settles the integration through
+the no-op row of section 5 (no publish; the check subject is the
+unchanged head, satisfied by an existing settled receipt for exactly that
+head or a fresh execution). Recovery never loops on a no-op: the
+adoption predicate recognizes it explicitly (section 4). A failing
+combined check triggers the journaled compare-and-swap reset (a fresh
+rollback commit, section 4) and `needs-rework`; passing per-task checks
+on separate branches never substitute — this is the exit criterion's
+revalidation, mechanically.
 
 ### Review as a task
 
@@ -870,10 +1202,10 @@ stopping/stopped, attempt `running` (or `launching`/`relaunching` with a
 settled claim — the Phase 2 early-submission rule), AND the submitted
 subject equals the review task's frozen subject (`ErrVerdictSubjectMismatch`
 → refused: the reviewer reviewed the wrong candidate); accept atomically —
-verdict row, receipt, attempt `submitted`→`completed` collapse (review
-attempts skip `checking`; the acceptance transaction applies
-Attempt→submitted→completed and Task→completed with their evidence rows),
-and the controller info message to the manager.
+verdict row, receipt, `Attempt.Submit` then the review-only
+`Attempt.CompleteReview` transition (section 5: review attempts never
+enter `checking`) and `Task→completed`, with their evidence rows, and the
+controller info message to the manager.
 
 A `reject` verdict completes the review task but fails the readiness
 guard; the shortfall (with the reasons artifact path) is what the manager
@@ -894,13 +1226,19 @@ provider.
 
 ### Completion retirement
 
-After `EvaluateReadiness` passes and before the run records `completed`,
-the controller retires the run's live sessions (workers are normally
-already gone — their panes close on exit; the manager and any idle
-survivor are closed under the Phase 2 close rule with scrollback captured
-first). Worktrees, the integration branch and every artifact are
-preserved. Stop precedence still applies: a stop request observed in the
-completion transaction yields `interrupted`/`stopping`, never `completed`.
+Workers and reviewers are already retired at their per-attempt boundaries
+(section 6), so completion retirement is normally just the manager: after
+`EvaluateReadiness` passes (entering `completing`) the controller retires
+the manager and any straggling session under the Phase 2 close rule with
+scrollback captured first, re-validates readiness inside the final
+transaction (plan closure section above), and only then records
+`completed`. Worktrees, the `hop/r<seq>/*` branches and every artifact
+are preserved. Stop precedence still applies: a stop request observed in
+any of these transactions yields `interrupted`/`stopping`, never
+`completed`. `hop review submit`'s CLI takes the subject COMMIT only; the
+application resolves its tree object ID against the recorded repository
+before the accepting transaction, so the stored verdict always carries
+both IDs the guard compares.
 
 ## 9. Controller ownership and the native Agent view
 
@@ -913,8 +1251,9 @@ the manager session row is created inside `InitializeRun`'s transaction
 (feature mode), and the partial unique index (one non-terminal manager
 session per run) makes a second manager unrepresentable regardless of
 controller behavior. `hop resume` reconciles the manager exactly as it
-reconciles workers (same predicate, same restore policy, same
-`--confirm-absent` contract); a takeover therefore recovers ownership of
+reconciles workers (same predicate, same restore policy, the
+per-session `--confirm-absent <session-id>` contract of section 5); a
+takeover therefore recovers ownership of
 the manager conversation (warm reattach) or cold-relaunches it
 (`claude --resume <manager-native-ref>`) without ever minting a second
 manager lineage. A second concurrent `hop resume` loses the lease CAS and
@@ -961,13 +1300,14 @@ Existing commands keep their Phase 2 contracts (`run`, `status`, `stop`,
 | `hop run "<brief>"` | Phase 2 flags plus `--workflow solo\|feature` (overrides `[workflow] mode`; default remains solo — open question 1) | Feature mode: freezes the workflow snapshot and role artifacts, creates the integration branch and checkout, launches the manager, runs the extended loop. Solo mode: Phase 2 verbatim |
 | `hop status` | unchanged flags | Detail block gains: task table (seq, kind, state, deps, attempt count, worktree), integration head and per-integration states, message queue depth and in-flight age per address, pending human questions (`question <uuid> …` with the body path and the `hop answer` invocation), guard shortfalls verbatim from `EvaluateReadiness`, per-session roles/bindings |
 | `hop stop <run-id>` | unchanged | Now retires manager + workers + reviewer + check and merge groups; same observed-termination contract |
-| `hop resume <run-id>` | unchanged, incl. `--confirm-absent` | Reconciles every session under the one predicate; the attestation contract applies per session |
-| `hop task create` | `--title`, `--file <instructions>`, `--depends-on <task>` (repeatable); identities from the manager's `HOP_*` env | Manager-only (validated); prints `task <uuid> t<seq> created`; refuses cycles, cross-run deps, non-manager callers, `kind=review` |
-| `hop task retry <task>` | `--reason <text>` | Manager-only; legal only for a terminal attempt of a `needs-rework` task under the retry limit; prints `retry accepted t<seq> attempt <n>` |
-| `hop msg send` | `--to`, `--kind`, `--reply-to`, `--file` (or `--body` ≤ 4 KiB) | Section 7 validation; worker/manager contexts |
-| `hop msg next` / `hop msg wait` | `wait`: `--timeout` (default 50s) | Section 7 grammar; `next` never blocks |
+| `hop resume <run-id>` | unchanged, except `--confirm-absent <session-id>` takes a required session argument in feature mode | Reconciles every session under the one predicate; each attestation is journaled per session with its own continuity evidence |
+| `hop task create` | `--title`, `--file <instructions>`, `--depends-on <task>` (repeatable), `--request-id <uuid>`; identities from the manager's `HOP_*` env | Manager-only (validated); prints `task <uuid> t<seq> created`; refuses cycles, cross-run deps, non-manager callers, `kind=review`, and any manager verb once the run leaves `running` |
+| `hop task retry <task>` | `--reason <text>`, `--request-id <uuid>` | Manager-only; legal only for a terminal attempt of a `needs-rework` task under the retry limit; prints `retry accepted t<seq> attempt <n>` |
+| `hop plan close` | `--request-id <uuid>` | Manager-only; refuses an empty plan; prints `plan closed` (section 8) |
+| `hop msg send` | `--to`, `--kind`, `--reply-to` (answer only, `--to` forbidden — the destination is derived), `--relay-of` (relayed questions), `--request-id <uuid>`, `--file` (or `--body` ≤ 4 KiB) | Section 7 validation; worker/manager contexts |
+| `hop msg next` / `hop msg wait` | `wait`: `--timeout` (default `[messages] wait_timeout`, 50s) | Section 7 grammar; `next` never blocks; an empty fetch writes nothing |
 | `hop msg ack <message-id>` | — | Section 7 ack rules |
-| `hop answer <question-id>` | `--file` or `--body` | Human command (controller-machine state root); acks the question atomically with the accepted answer |
+| `hop answer <question-id>` | `--file` or `--body`, `--request-id <uuid>` | Human command (controller-machine state root); acks the question atomically with the accepted answer |
 | `hop review submit` | `--verdict approve\|reject`, `--subject <commit-oid>`, `--reasons-file <path>` | Reviewer-only; section 8 validation; `verdict accepted <uuid>` |
 | `hop view set` / `hop view clear` | `set`: `--run <id\|r<seq>>` | Owned native-view selection/clear (section 9); exit 0 on server acknowledgement |
 
@@ -991,14 +1331,20 @@ contracts; the exit scenarios are real-process.
 
 | Probe | Question | Pins |
 | --- | --- | --- |
-| S8 `workspace.create` | Response shape (workspace/tab/root-pane IDs), creation label round-trip through `session.snapshot`, cwd/env delivery to the root pane, no-focus behavior | The `WorkspaceRequest`/`WorkspaceHandle` shapes and the workspace.create decision-table row's label recovery |
-| S9 concurrent worktrees | Two+ `worktree.create` calls against one repository: `--base <oid>` honored (HEAD of the new branch equals the base), branch-exists behavior, returned workspace/path/branch per call, grouping with the parent workspace, label round-trip, coexistence with the S6 command-pane launch in each | Per-attempt worktree creation, the base-commit provenance rule against integration heads, and reviewer worktrees |
-| S10 multi-pane env isolation | Three command panes created back-to-back with distinct env maps and labels (manager-shaped, worker-shaped ×2): each process observes exactly its own additive env (`HOP_SESSION_ID`/`HOP_ROLE` differ), labels resolve to the right panes, agent detection per pane independent | That concurrent launches cannot cross-contaminate identity — the multi-session corroboration and close rules rest on it |
+| S8 `workspace.create` (herdr) | Response shape (workspace/tab/root-pane IDs), the creation label as a WORKSPACE attribute (source-confirmed; executed round-trip here) and the workspace → sole tab → sole pane recovery descent, cwd/env delivery to the root pane, no-focus behavior, sibling repo-key grouping observed | The `WorkspaceRequest`/`WorkspaceHandle` shapes and the workspace.create decision-table row's recovery rule |
+| S9 concurrent worktrees (herdr) | Two+ `worktree.create` calls against one repository using the full `hop/r<seq>/*` branch family: `--base <oid>` honored for a NEW branch (created HEAD equals the base), the existing-branch case demonstrably IGNORING base (pinning why refuse-if-exists is mandatory), returned workspace/path/branch per call, grouping, coexistence with the S6 command-pane launch in each | Per-attempt worktree creation, the refuse-if-exists + verify-HEAD-after-create rule of section 6, and reviewer worktrees |
+| S10 multi-pane env isolation (herdr) | Three command panes created back-to-back with distinct env maps and labels (manager-shaped, worker-shaped ×2): each process observes exactly its own additive env (`HOP_SESSION_ID`/`HOP_ROLE` differ), labels resolve to the right panes, agent detection per pane independent | That concurrent launches cannot cross-contaminate identity — the multi-session corroboration and close rules rest on it. S10 deliberately does NOT claim to validate the session-keyed claim queries (that is the sqlite raced suite's job) |
+| G1 ref namespace and branch family (local git, no herdr) | Create the complete `hop/r<seq>/*` family (`integration`, several `t<t>a<n>`) in one repository; verify the create-only `update-ref … ""` refusal on an existing ref | B3's scheme against real Git ref-store behavior |
+| G2 merge outcome matrix (local git, no herdr) | The exact frozen merge argv/env of section 8 against: divergent histories (two-parent commit), a conflict (exit code, tree state), an ancestor/equal source ("already up to date", nothing created), and `--no-ff` of a fast-forwardable source (merge commit anyway) | The `integration.merge` adoption predicate including the no-op row, and the noninteractive argv/env |
+| G3 fenced publish/reset (local git, no herdr) | `update-ref <ref> <new> <expected-old>` semantics: success on match, failure on a moved old value, create-only with empty old, behavior with the ref never checked out anywhere, and `commit-tree` rollback-commit construction | The `integration.publish`/`integration.reset` CAS rows and the never-revisit rule's mechanics |
+| S11 request-log observability (herdr) | Enable Herdr's API request logging (`src/logging.rs` — info/debug levels exist; the executed probe pins level, location and line format), drive one `pane.send_text` to a disposable raw pane as a positive control, and confirm the request appears in the captured log with its method and pane target | The `InjectionFreeDelivery` scenario's evidence channel: what a forbidden request WOULD look like in the log, so its absence is meaningful |
 
 Deliberately not probed, with the reason recorded: `agent.prompt`,
 `agent.wait`, `agent.send_keys`, `pane.send_keys` — no Phase 3 decision
 rule consumes them (section 7); probing them would imply a channel this
-design forbids. L1 (opt-in, live): a real Claude session executing
+design forbids (S11's single positive-control send_text targets a
+test-owned raw pane that never hosts a session, through the test's own
+client). L1 (opt-in, live): a real Claude session executing
 `hop msg wait --timeout 50s` inside its shell tool, pinning that the
 bounded wait returns within the harness's tool timeout and the model can
 loop on the `none:` line; informs the default only, never CI.
@@ -1011,7 +1357,7 @@ structural countermeasure, not just a test:
 
 | Escaped-defect class | Phase 3 countermeasure |
 | --- | --- |
-| A fake accepted arguments the real adapter refuses (bare `git` argv vs the runner's absolute-path contract) | Every new fake mirrors the real adapter's argument validation, extending `TestFakeStoreContracts`/`TestFakePortsRefuseCallsInsideTransactions`: the fake store enforces the message/review/task contracts (serialization, one answer per question, ack incarnation rule, manager-only verbs, serial-integration index) with a contract test proving fake and real store refuse the SAME inputs — the sqlite suite and the app fakes share one table of refused-input vectors (a Go slice both packages' tests import from a tiny internal test-support constant set in `internal/app`, as the existing contract tests do) |
+| A fake accepted arguments the real adapter refuses (bare `git` argv vs the runner's absolute-path contract) | Every new fake mirrors the real adapter's argument validation, extending `TestFakeStoreContracts`/`TestFakePortsRefuseCallsInsideTransactions`: the fake store enforces the message/review/task contracts (serialization, one answer per question, delivery-before-ack, manager-only verbs, request-ID idempotency, serial-integration index) with a contract test proving fake and real store refuse the SAME inputs. The shared refused-input vectors live in a dedicated test-support package, `internal/testsupport/storevectors` — exported Go declarations importable by BOTH packages' `_test.go` files (cross-package tests cannot import another package's `_test.go` declarations, and shipping vectors as `internal/app` production code would break test-support isolation); the checker gains a `test-support` rule row for it whose production-closure check proves only test files import it |
 | A protocol field's real shape differed from the assumed one (argv0 as basename) | No new identity or matching rule is introduced anywhere in Phase 3 — every occupant decision reuses `CorroborateSettlement` verbatim; the only new wire shapes (`workspace.create`, second-worktree responses) are S8/S9-pinned before the port freeze, and the herdr adapter's `assertRequestParams` full-structural fixtures cover the new methods |
 | A worker-facing protocol line was never rendered by the real binary | The section 7 grammar is one constant set; `cmd/hop` contract tests execute the REAL built binary for every verb and assert each first line against the constants; the fixture worker/manager/reviewer parse ONLY those constants; a golden-grammar test fails if a constant, a rendered line or a template quotation drifts |
 
@@ -1020,11 +1366,12 @@ structural countermeasure, not just a test:
 | Layer | Tests |
 | --- | --- |
 | Domain (`internal/domain/run`, `identity`) | Independent transcription tables for the extended Task machines (both kinds), Message delivery, Integration; multi-attempt density and `ErrRetryNotTerminal`/`ErrRetryLimit`; dependency acyclicity and `ReleaseEligible`; delegation-depth and manager-uniqueness rules; `AcceptVerdict`, `AcceptAck`, `NextDeliverable` orders (receipt-before-eligibility, duplicate/conflicting/stale vectors); `EvaluateReadiness` shortfall vectors (missing integration, stale-subject approve, reject present, head moved); the six section 5 reference traces as complete multi-entity traces; new ID parsing with fuzz |
-| Application (`internal/app`) | Extended fakes with the shared refused-input vectors; scheduler scenarios: slot bound enforced inside the assignment transaction, release only on `integrated`, deterministic pass order, retry consumption, review-task creation exactly once per head; integration decision-table rows (all three crash columns for merge and reset, conflict evidence, stop mid-merge); guard enforcement (no verb reaches the guard rows; a scripted "manager" calling every verb cannot complete a run without real receipts); messaging scenarios (serialization per address, re-serve, stale ack, duplicate ack, answer-acks-question atomicity, lineage fetch after relaunch and retry); the no-injection invariant checked (section 7): the `internal` AST forbidden-call rule (`internal/app` production code never references `Runtime.SendText`), the `app.Runtime` port-surface method-set test, and every feature scenario asserting the recording fake saw zero SendText calls; presentation republication on transitions and rehydration on resume; completion retirement under the close rule; six reference traces at app level |
-| SQLite (`internal/adapters/sqlite`) | Migration 002 applied over a populated 001 store (Phase 2 rows intact, new columns defaulted) and from empty; the shared refused-input vectors against the real store; raced contracts across separate handles: fetch/fetch (one delivery row winner per serve), ack/ack (one ack), answer/answer (one accepted), CreateTask cycle check under concurrent edge inserts, serial-integration index raced, manager-uniqueness index raced, retry-request unique-pending raced; lineage fetch queries; receipts for every refusal path; `RunDetail` extensions |
-| Herdr adapter | `CreateWorkspace` protocol tests (S8 shapes, full-structural request fixture, partial-response tables, label recovery, cancellation); no other adapter change expected |
-| Process/config/system | TOML tables for the new policy keys (defaults, feature-mode requireds, unknown keys); no new process-adapter behavior (merge/reset ride the existing `CommandRunner`) |
-| cmd/hop | New verb tables (dispatch, flags, exit codes, worker/human state-root rules); the real-binary grammar contract tests (above); loop scheduling-pass ordering with the fake clock; `hop view` commands |
+| Application (`internal/app`) | Extended fakes with the shared refused-input vectors; scheduler scenarios: slot bound enforced inside the assignment transaction, release only on `integrated`, deterministic pass order, per-attempt session retirement freeing slots only on observed absence, retry consumption and exhaustion (direct-to-failed), plan closure (empty-plan refusal, reopen-on-create, late create/retry refused by run state, readiness re-validated in the final transaction), review-task creation exactly once per head; integration decision-table rows (all crash columns for merge/publish/reset, the no-op adoption, conflict evidence, stop mid-merge, stop completing a pending rollback) and the INTEGRATION BARRIER: controller A resumes after B has taken over, rolled back and advanced the branch — A's zombie publish/reset CAS fails and its scratch group is retired by claim; guard enforcement (no verb reaches the guard rows; a scripted "manager" calling every verb cannot complete a run without real receipts); messaging scenarios (serialization per enqueue sequence, re-serve, delivery-before-ack refusal of a queued ack, stale/duplicate ack, derived answer destination incl. a wrong-task answer refused, relay-chain reconstruction across a restart, answer-acks-question atomicity, lineage fetch after relaunch and retry, request-ID idempotency for every mutating verb incl. an accepted-write/lost-response retry — distinct from fetch-before-ack); the no-injection invariant checked at its section 7 scope (port-surface allowlist over every port, the type-aware forbidden-call rule's fixtures, zero typed-input calls in every scenario); presentation republication and rehydration; manager lineage (historical parents preserved, successor validation, stale-manager verb refusal); six reference traces at app level |
+| SQLite (`internal/adapters/sqlite`) | Migration 002 applied over a POPULATED 001 store — every rebuild preserves rows byte-for-byte where unchanged: bindings and claims intact with backfilled session IDs, solo sessions/roles intact, task seq/kind defaults, check requests re-keyed with `subject_kind='result'`, foreign_key_check clean — and from empty; the migrator's rebuild support (foreign_keys off + check before commit); the shared refused-input vectors against the real store; raced contracts across separate handles: fetch/fetch (exactly ONE serialized in-flight message; a delivery row per successful serve, so two rows when both fetches served it — the at-least-once contract stated unambiguously), ack/ack (one ack), answer/answer (one accepted), request-ID reuse raced (one created entity, the loser reading the winner's receipt), CreateTask cycle check under concurrent edge inserts, serial-integration index raced, manager-uniqueness index raced, retry-request unique-pending raced, two concurrent pending launch intents validating independently under the session-keyed lookup (B2); enqueue-sequence FIFO under interleaved writers (an inverted caller timestamp cannot jump the queue); lineage fetch queries; receipts for every refusal path and none for empty fetches; `RunDetail` extensions |
+| Herdr adapter | `CreateWorkspace` + `FindWorkspaceByLabel` protocol tests (S8 shapes: the label as a workspace attribute, the sole-tab/sole-pane descent, ambiguity errors, full-structural request fixtures, partial-response tables, cancellation); the `SendText` port removal (the adapter type's method set pinned — the transport allowlist of section 7) |
+| Process/config/system | TOML tables for the new policy keys (defaults, feature-mode requireds, unknown keys) in `internal/adapters/config` (owned by slice 4); no new process-adapter behavior (merges ride `hop check-exec` + the existing `CommandRunner`) |
+| internal (checker) | The type-aware forbidden-call rule with its negative fixtures (chained selector `c.Runtime.SendText`, interface/type aliases, method values, a raw adapter call in composition) and positive fixtures; the `test-support` rule row for `internal/testsupport/storevectors` |
+| cmd/hop | New verb tables (dispatch, flags, exit codes, worker/human state-root rules, `--request-id` pass-through, answer's forbidden `--to`, `--confirm-absent <session>`); the real-binary grammar contract tests (above); loop scheduling-pass ordering with the fake clock; `hop view` commands |
 | Real process (`test/integration`) | The exit scenarios below, plus: `TestRealProcessIntegrationConflict` (two tasks touching one file; conflict → needs-rework → retry from the new base → completes), `TestRealProcessCombinedCheckFailure` (per-task checks pass, combined check fails, branch reset verified by object ID, rework), `TestRealProcessStopDuringFeatureRun` (stop mid-integration: merge group retired, every session terminated, `stopped` only on observed absence), `TestRealProcessManagerColdRelaunch` (manager killed; resume cold-relaunches the manager lineage via `--resume`, task state undisturbed) |
 | Live (opt-in) | `TestLiveClaudeFeatureRun`, gated on `HOP_LIVE_HARNESS=1`: real Claude as manager, one worker task and review on a fixture repository — plus L1. Never in CI or `make check`; the deterministic fixture suite is the gate |
 
@@ -1033,22 +1380,35 @@ structural countermeasure, not just a test:
 The fixture worker generalizes into a fixture principal: one deterministic
 Go program installed as `claude`, dispatching on `FIXTURE-BEHAVIOR:`
 directives delivered through its assignment artifact — new behaviors
-`manager-feature` (create scripted tasks with a dependency, poll
-`hop msg wait`, answer questions from a scripted table, retry on
-interruption notices, relay one question to the human when scripted),
-`worker-implement`, `worker-question` (asks, waits, applies the answer's
-file content, submits), `worker-fetch-crash` (fetches then exits before
-ack), `reviewer-approve`, `reviewer-reject-once`. Every behavior keeps the
-Phase 2 contract: dump observations to files, never judge itself, retry on
-the `transient` line, parse only the section 7 grammar.
+`manager-feature` (create scripted tasks with a dependency, close the
+plan, poll `hop msg wait`, answer questions from a scripted table, handle
+a human answer through the relay chain, retry on interruption notices,
+relay one question to the human when scripted), `worker-implement`,
+`worker-hold` (implements, then blocks at a message barrier — a question
+whose answer the test or fixture manager releases deliberately — before
+submitting, so slot saturation is observable), `worker-question` (asks,
+waits, applies the answer's file content, submits), `worker-fetch-crash`
+(fetches then exits before ack), `reviewer-approve`,
+`reviewer-reject-once`. Every behavior keeps the Phase 2 contract: dump
+observations to files, never judge itself, retry on the `transient` line,
+parse only the section 7 grammar — and every behavior IDLES at a
+composer-like loop after submitting rather than exiting, so the suite
+proves per-attempt retirement (section 6) actually closes interactive
+survivors instead of relying on process exit.
 
 Scenarios (all `TestRealProcess*`, disposable server, private roots — the
 user's live server at `~/.config/herdr/herdr.sock` is never touched):
 
-1. `FeatureRunEndToEnd` — the section 1 evidence row: three tasks
-   (t2 depends on t1; t3 independent), `MaxWorkers=2`, assert t3 launches
-   only after a slot frees and t2 only after t1 is `integrated`; serial
-   integration order; review; completion; every guard row present in the
+1. `FeatureRunEndToEnd` — the section 1 evidence row: four tasks — t1,
+   t3, t4 initially eligible, t2 depending on t1 — with `MaxWorkers=2`
+   and `worker-hold` barriers keeping t1's and t3's sessions alive at
+   will. Asserted separately: t1 and t3 launch immediately (the intended
+   two-worker concurrency); t4, eligible throughout, launches only after
+   a barrier is released and that session's retirement is OBSERVED (the
+   slot assertion, decoupled from process-exit assumptions); t2 launches
+   only after t1 is `integrated` (the dependency assertion); serial
+   integration order; plan closed before the review task appears; review;
+   completion with the manager retired; every guard row present in the
    store; token metadata published manager-first (asserted via
    `agent.list` as in Phase 1).
 2. `RelayedQuestion` — trace 2 end to end, with `hop answer` driven as a
@@ -1071,10 +1431,16 @@ user's live server at `~/.config/herdr/herdr.sock` is never touched):
 7. `InjectionFreeDelivery` — brief, task instructions and a manager
    answer seeded with hostile bytes (ANSI escapes, bracketed-paste
    open/close, `y` + newline, control characters); fixture principals
-   validate byte-exact file delivery; the worker pane's scrollback and the
-   server's request log (the suite drives its own client, so every request
-   HOP made is observable) contain no `pane.send_text`/`agent.prompt` to
-   any live session pane; the only send_text anywhere is none.
+   validate byte-exact file delivery. The input-absence evidence is the
+   S11 channel, stated honestly (the test's own client does NOT see the
+   production subprocesses' requests — they hold separate connections):
+   the disposable server runs with API request logging enabled at the
+   S11-pinned level; the test first performs the positive control (its
+   own `pane.send_text` to a test-owned raw pane, asserted PRESENT in the
+   captured log, proving forbidden requests would be visible), then
+   asserts the log contains zero `pane.send_text`, `pane.send_keys`,
+   `agent.prompt` or `agent.send_keys` requests addressing any session
+   pane of the run, across the entire scenario.
 
 Claim-protocol race cases that Phase 2 recorded as inexpressible without a
 production pause/injection hook (launcher killed between claim write and
@@ -1088,55 +1454,92 @@ must be designed explicitly then.
 
 ## 12. Work breakdown
 
-Ordered implementer tasks; each lands with its guides and tests, each
-branch self-contained (own checker rows where any, `make check` and
-`make docs-check` green at every boundary). Integrator role as in Phase 2:
-the task 6 implementer owns cross-branch conflict resolution (notably
-`internal/app/AGENTS.md` and the sqlite guide) and lands branches one at a
-time. `go.mod` is untouched (no new dependency anywhere in this phase).
+Ordered implementer tasks; each lands with its guides and tests, and each
+slice has an explicit GREEN BOUNDARY: the whole-repo `make check` and
+`make docs-check` pass at its landing, which the additive packaging rule
+of section 3 makes possible — a slice never changes an existing method
+signature or removes a member; new capability arrives as new standalone
+interfaces (`MessagingStore`, `PlanStore`, `ReviewStore`), new methods on
+new types, and new struct fields, so existing implementers keep compiling
+untouched. Non-additive flips (retargeting `hop launch`, deleting
+`Runtime.SendText` and `LoadLaunchContext`, switching the claim queries)
+happen ONLY in the integrator slice 6, which updates every implementer,
+fake and command in one landing. Cross-slice ownership is frozen before
+parallel work: slice 2a owns every new DTO and port declaration, slice 4
+owns the grammar constant set, and no other slice edits those files.
+Integrator role as in Phase 2: the slice 6 implementer owns cross-branch
+conflict resolution and lands branches one at a time. `go.mod` is
+untouched (no new dependency anywhere in this phase).
 
-| # | Task | Packages / files | Tests | Depends on | Parallel | Tier |
+| # | Task | Packages / files | Green boundary | Depends on | Parallel | Tier |
 | --- | --- | --- | --- | --- | --- | --- |
-| 0 | Spike S8–S10; findings reported before task 2 freezes shapes | `test/integration` (probe tests + evidence) | the probes | — | with 1 | Sonnet |
-| 1 | Domain extension: task kinds/graph/release, multi-attempt, session roles/parent/optional attempt, Message/Delivery/Ack, Review, Integration, `EvaluateReadiness`, typed errors, the six traces | `internal/domain/run`, `internal/domain/identity` | Domain rows of section 11 | — | with 0 | Sonnet |
-| 2a | Application: scheduler (slots, release, assignment transaction), messaging use cases, task-create/retry consumption, presentation integration, DTOs; fake extensions with the shared refused-input vectors | `internal/app` | App rows except guards/integration | 0, 1 | with 2b | Sonnet |
-| 2b | Application enforcement core: guard evaluation wiring, serial integration operations (merge/check/reset decision rows), review acceptance, completion + retirement, stop/resume extension across roles; the no-injection checks (the `internal` forbidden-call rule for `Runtime.SendText` in app production code, and the port-surface method-set test) | `internal/app`, `internal` (checker rule) | Guard, integration, stop/resume and trace rows; the forbidden-call rule's positive/negative fixtures | 0, 1 | with 2a (disjoint files; 2b owns `usecase_integrate.go`, `usecase_review.go`, completion) | Fable |
-| 3 | SQLite: migration 002, new/extended repositories, messaging/review/task/retry submission contracts, raced suites, shared vectors against the real store | `internal/adapters/sqlite` | SQLite rows of section 11 | 2a, 2b | with 4, 5 | Fable |
-| 4 | Exec-boundary and template extension: `hop launch --session`, role-aware launch contexts, assignment/role/review templates quoting the grammar constants, the grammar constant set | `internal/app` (exec-boundary + grammar files), templates | Exec-boundary tables; grammar golden tests | 2a, 2b | with 3, 5 | Fable |
-| 5 | Herdr adapter: `CreateWorkspace` per S8 | `internal/adapters/herdr` | Adapter row | 2a | with 3, 4 | Sonnet |
-| 6 | Command wiring (integrator): new verbs, loop scheduling pass, status rendering, `hop view`, real-binary grammar contract tests | `cmd/hop` | cmd rows | 3, 4, 5 | — | Sonnet |
-| 7 | Scenario integration: fixture principal behaviors, the seven exit scenarios plus the four additional real-process scenarios, live opt-in test, Makefile target updates if any | `test/integration`, `Makefile` | Real-process rows | 6 | — | Sonnet |
+| 0 | Spike: S8–S10 (herdr), G1–G3 (local git), S11 (request-log observability); findings reported before slice 2a freezes shapes | `test/integration` (probe tests + evidence) | probes green or skipped-with-reason; no production change | — | with 1 | Sonnet |
+| 1 | Domain extension: task kinds/graph/release, multi-attempt, session roles/parent/optional attempt (solo paths proven unchanged by the existing Phase 2 domain suite), Message/Delivery/Ack, Review, Integration, `CompleteReview`, `EvaluateReadiness`, typed errors, the six traces | `internal/domain/run`, `internal/domain/identity` | additive types + new transitions; Phase 2 domain tests untouched and green | — | with 0 | Sonnet |
+| 2a | Application ports and coordination: the new store interfaces and every Phase 3 DTO, scheduler (slots, release, assignment transaction), messaging use cases, plan/task/retry consumption, presentation integration; fake extensions; the `internal/testsupport/storevectors` package with its checker rule row | `internal/app`, `internal/testsupport/storevectors`, `internal` (test-support rule) | new files + additive fields only; app suite green against fakes; no existing port member changed | 0, 1 | with 2b | Sonnet |
+| 2b | Application enforcement core: guard evaluation wiring, integration operations (merge via the generalized exec claim, publish/reset CAS, no-op adoption, the integration barrier), review acceptance, per-attempt retirement, completion + re-validation, stop/resume extension across roles and per-session attestation; the no-injection checks (the type-aware forbidden-call rule with fixtures, the all-ports surface allowlist test) | `internal/app`, `internal` (checker rule) | new files + the checker rule with fixtures; whole repo compiles because nothing existing changed | 0, 1 | with 2a (disjoint files; 2b owns `usecase_integrate.go`, `usecase_review.go`, `usecase_retire.go`, completion) | Fable |
+| 3 | SQLite: migration 002 (rebuilds, backfills, migrator rebuild support), implementations of the new interfaces and the session-keyed queries as NEW methods, raced suites, shared vectors against the real store | `internal/adapters/sqlite` | 002 + new methods; existing methods and the Phase 2 sqlite suite untouched and green | 2a, 2b | with 4, 5 | Fable |
+| 4 | Exec-boundary, config and templates: `PrepareLaunchExec` session addressing as a new use case, generalized check-exec claim kinds, assignment/role/review templates, the grammar constant set; `internal/adapters/config` policy parsing (new keys, feature-mode requireds) | `internal/app` (exec-boundary + grammar files), `internal/adapters/config` | additive use cases + config keys with defaults preserving solo behavior; both suites green | 2a, 2b | with 3, 5 | Fable |
+| 5 | Herdr adapter: `CreateWorkspace` and `FindWorkspaceByLabel` per S8 (new methods on the existing `Runtime` type — additive) | `internal/adapters/herdr` | new methods + protocol tests; nothing existing changed | 2a | with 3, 4 | Sonnet |
+| 6 | Integrator flip: new verbs and flags in `cmd/hop`, loop scheduling pass, status rendering, `hop view`, real-binary grammar contract tests; the non-additive flips — `hop launch --session`, delete `Runtime.SendText` (port and consumers), delete `LoadLaunchContext`, switch claim/context queries to the session-keyed methods — across app, adapters, fakes and commands in one landing | `cmd/hop`, plus the flip's touch-points | whole-repo `make check` after the single flip landing | 3, 4, 5 | — | Sonnet |
+| 7 | Scenario integration: fixture principal behaviors, the seven exit scenarios plus the four additional real-process scenarios, live opt-in test, Makefile target updates if any | `test/integration`, `Makefile` | real-process rows green (or skipped-with-reason where no herdr) | 6 | — | Sonnet |
 
 Fable owns the three correctness-critical cores, per the tier rule: the
 guard/integration/completion enforcement (2b — the phase's genuinely
-difficult logic and its central promise), the SQLite atomicity/racing
-contracts (3), and the exec-boundary extension (4 — it touches the
-sanitized launch path). Everything else is ordinary generation against
-this document.
+difficult logic and its central promise), the SQLite atomicity/racing/
+migration-rebuild contracts (3), and the exec-boundary/config extension
+(4 — it touches the sanitized launch path and policy validation).
+Everything else is ordinary generation against this document.
 
-Landing order: 0 and 1; then 2a and 2b; then 3, 4, 5 in any order; then 6;
-then 7.
+Landing order: 0 and 1; then 2a and 2b; then 3, 4, 5 in any order; then 6
+(the one non-additive landing); then 7.
 
 ## 13. Decisions assumed, spike dependencies, open questions, risks
 
-Assumed decisions (directed by this design, pending human override):
+Assumed decisions (directed by this design, pending human override). The
+first is a consequence of the selected safety invariant, not a
+preference — reversing it would be a new safety decision, never an
+implementation option:
 
-1. Pull-only delivery; HOP never types into a live pane (section 7).
+1. Pull-only delivery; HOP never types into a live pane, and an idle
+   recipient that stops polling is surfaced as needs-attention, never
+   nudged (section 7).
 2. Dependency release requires `integrated`, and worktrees base on the
-   integration head at attempt creation (section 6).
+   integration head at attempt creation, with branch-uniqueness enforced
+   before create and HEAD verified after (section 6).
 3. Reviews are tasks; one reviewer evaluates the combined candidate; the
    guard binds verdicts to head object IDs (section 8).
 4. Retry creates a new attempt with a fresh worktree; predecessors are
-   preserved as evidence (sections 2, 6).
-5. Messaging is store-only with at-least-once delivery and receipt-first
-   validation orders mirroring the Phase 2 result protocol (section 7).
+   preserved as evidence; exhaustion fails the task and run directly; a
+   live controller never auto-relaunches a self-exited worker's attempt —
+   retry is manager judgment, same-attempt recovery is `hop resume`'s
+   (sections 2, 5, 6).
+5. Messaging is store-only with at-least-once delivery, delivery-before-
+   ack, enqueue-sequence FIFO, derived answer destinations, relay
+   provenance, request-ID idempotency for every mutating verb, and
+   receipt-first validation orders mirroring the Phase 2 result protocol
+   (section 7).
+6. The manager's plan is explicitly closed and reopened (`hop plan
+   close`, reopen-on-create), an empty plan cannot close, and readiness
+   is re-validated inside the final completion transaction (section 8).
+7. Sessions are retired at per-attempt boundaries under the close rule;
+   slots free only on observed termination (section 6).
+8. Integration publishes and rolls back through compare-and-swap ref
+   moves with the never-revisit rule; merges run under the generalized
+   exec claim; the ancestor/no-op merge is a defined integrated outcome
+   (sections 4, 8).
 
-Spike dependencies: S8 gates the `CreateWorkspace` port shape and the
-manager-placement decision row; S9 gates per-attempt worktree provenance
-against `--base <oid>`; S10 gates nothing structural but must pass before
-multi-session launch lands (a failure would force serialized pane
-creation, a loop change, not a model change). L1 informs the `msg wait`
-default only.
+Spike dependencies: S8 gates the `CreateWorkspace`/`FindWorkspaceByLabel`
+shapes and the manager-placement decision row (the label-names-the-
+workspace fact and the sole-tab descent are source-confirmed, execution
+pending); S9 gates per-attempt worktree provenance — including executing
+the existing-branch-ignores-base case that makes refuse-if-exists
+mandatory; S10 must pass before multi-session launch lands (a failure
+would force serialized pane creation, a loop change, not a model change)
+and explicitly does NOT validate the session-keyed claim queries — the
+sqlite raced suite does; G1–G3 gate the ref scheme, the merge outcome
+matrix and the CAS publish mechanics; S11 gates the injection scenario's
+evidence channel (log level, format, positive control). L1 informs the
+`msg wait` default only.
 
 Open questions for the human, each with a recommendation:
 
@@ -1147,41 +1550,39 @@ Open questions for the human, each with a recommendation:
 2. **Does the reviewer count against the worker bound?** Recommendation:
    yes — one bound (`[workers] max`, default 2) over all non-manager
    sessions; predictable resource use, no second knob.
-3. **Accept the no-nudge consequence?** An idle recipient that stops
-   polling is surfaced as needs-attention, never woken by typed input.
-   Recommendation: yes — Herdr's own docs make status-gated injection
-   unsafe (section 7); revisit only if a future Herdr version ships a
-   guarded, dialog-proof prompt surface, which would then get its own
-   probe.
-4. **Message/answer body bound.** Recommendation: 64 KiB per body file
+3. **Message/answer body bound.** Recommendation: 64 KiB per body file
    (4 KiB for inline `--body`); larger content belongs in repository files
    the message references by path.
-5. **Reviewer harness.** Recommendation: same harness as workers by
-   default with `[roles.reviewer] harness` available; provider-diverse
-   review is a later option once a second harness's launch contract is
-   spike-verified end to end (Codex/opencode cold resume is still
-   unsupported, so a non-Claude reviewer loses cold relaunch — acceptable
-   for a reviewer, but say so in status).
-6. **Retry limit default.** Recommendation: 3 attempts per task
-   (`[retry] max_attempts`), after which the task fails and the run needs
-   the human.
-7. **Integration branch visibility.** `hop/r<seq>` and the
-   `hop/r<seq>/t<t>a<n>` branches live in the user's repository and are
-   never auto-deleted. Recommendation: accept; document; a `hop clean`
-   command is future work.
-8. **Human question channel.** CLI-only (`hop status` + `hop answer`)
+4. **Reviewer harness.** Recommendation: same harness as workers by
+   default with `[roles.reviewer] harness` available. Choosing a
+   non-Claude reviewer carries an EXPLICIT supported-recovery policy, not
+   a status label: cold relaunch is unsupported for that session, so a
+   lost non-Claude reviewer session is recovered by retiring the review
+   attempt and retrying the review task as a fresh attempt (controller
+   policy, same candidate), with status naming that path; provider-diverse
+   review beyond that waits for a second harness's launch contract to be
+   spike-verified end to end.
+5. **Retry limit default.** Recommendation: 3 attempts per task
+   (`[retry] max_attempts`), after which the task and run fail with the
+   evidence retained (the defined exhausted path of section 5).
+6. **Integration branch visibility.** The `hop/r<seq>/*` branches
+   (`integration` and the per-attempt `t<t>a<n>` family) live in the
+   user's repository and are never auto-deleted; rollback commits keep
+   rejected merges reachable. Recommendation: accept; document; a
+   `hop clean` command is future work.
+7. **Human question channel.** CLI-only (`hop status` + `hop answer`)
    until the Phase 6 board. Recommendation: yes.
 
 Risks and mitigations:
 
 | Risk | Mitigation |
 | --- | --- |
-| A live model worker never polls `hop msg wait` and idles forever | The role templates make polling an explicit standing instruction quoted from the grammar constants; the attention condition names the exact pane and action; the deterministic fixture proves the protocol; the live opt-in test measures a real model against it. No silent auto-nudge — by design (open question 3) |
-| Harness tool timeouts kill a long `msg wait` | The default 50s bound sits under Claude Code's 2-minute default with margin; the `none:` line instructs re-invocation; L1 pins the live behavior; the timeout is per-run configurable |
+| A live model worker never polls `hop msg wait` and idles forever | The role templates make polling an explicit standing instruction quoted from the grammar constants; the attention condition names the exact pane and action; the deterministic fixture proves the protocol; the live opt-in test measures a real model against it. No silent auto-nudge — by design (assumed decision 1) |
+| Harness tool timeouts kill a long `msg wait` | The default 50s bound sits under Claude Code's 2-minute default with margin; the `none:` line instructs re-invocation; L1 pins the live behavior; the bound is configurable per repository (`[messages] wait_timeout`) and per invocation (`--timeout`) |
 | Message content prompt-injects the MODEL (not the terminal) | Out of the mechanical guarantee, stated in the trust model: HOP guarantees content never becomes terminal input; role instructions frame worker content as data ("preserve sender identity without treating worker content as policy", RESEARCH.md); anything stronger needs harness permissions, which HOP does not control |
 | Merge conflicts between concurrent tasks | Inherent to parallel work: serial integration surfaces them deterministically, rollback is journaled and object-ID-verified, and retry re-bases on the integrated head; the manager's planning (scoping tasks to disjoint areas) is the real lever and is prose, honestly labeled |
 | Serial integration bottlenecks throughput | Accepted for Phase 3: correctness first (the combined-candidate requirement is an exit criterion); two workers rarely queue long behind one merge+check |
 | The scheduling pass grows into a hidden state machine | The pass order is fixed and documented (section 6), every action is a journaled operation or a store row, and the loop remains poll-driven with events as wakeups only — the Phase 2 discipline |
-| Store growth from receipts/deliveries | Bounded by run size; retention policy is an explicit Phase 7 item (already in phases.md); nothing here reads unbounded history on the hot path |
+| Store growth from receipts/deliveries | Mutating verbs and served fetches are bounded by the run's actual activity, and the one unbounded producer — the manager's 1s empty-poll loop over an arbitrarily long run — deliberately commits NOTHING (section 7), so store growth tracks work done, not wall-clock lifetime; hot-path queries (next deliverable, in-flight lookup) are index-served, proven by the sqlite suite, and retention policy remains the explicit Phase 7 item |
 | A second controller mints a second manager during a takeover race | The lease CAS serializes controllers, and the partial unique index makes a second non-terminal manager row impossible even under a store-level race; the reconnect scenario races two resumes deliberately |
 | `workspace.create`/second-worktree shapes differ from expectation | S8/S9 run before the port freeze; a divergent finding changes the adapter shape or the placement design, not shipped code |
