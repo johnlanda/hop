@@ -224,11 +224,20 @@ func TestAcceptAnswer(t *testing.T) {
 		}
 	})
 
-	t.Run("already answered and unanswerable state", func(t *testing.T) {
-		q := question(run.MessageAcknowledged, run.HumanAddress())
-		_, err := run.AcceptAnswer(q, nil, run.ManagerAddress(), run.HumanPrincipal(), submission, 1, epoch())
-		if !errors.Is(err, run.ErrInvalidTransition) {
-			t.Fatalf("AcceptAnswer(already acknowledged, no prior recorded): error = %v, want ErrInvalidTransition", err)
+	t.Run("an ordinary question's own ack state is orthogonal to answering it", func(t *testing.T) {
+		// The manager typically acks q1 upon reading it, well before
+		// composing and forwarding its answer (trace 2): answering an
+		// already-acknowledged, non-human question is not itself an
+		// error — "unanswered" is governed entirely by prior, checked
+		// above.
+		q := question(run.MessageAcknowledged, run.ManagerAddress())
+
+		outcome, err := run.AcceptAnswer(q, nil, run.TaskAddress(testTaskID), run.SessionPrincipal(testManagerSessionID), submission, 1, epoch())
+		if err != nil {
+			t.Fatalf("AcceptAnswer(already acknowledged, ordinary question): unexpected error: %v", err)
+		}
+		if outcome.Question.State != run.MessageAcknowledged {
+			t.Fatalf("AcceptAnswer(already acknowledged, ordinary question): Question.State = %s, want unchanged", outcome.Question.State)
 		}
 	})
 

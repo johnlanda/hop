@@ -310,11 +310,13 @@ type AnswerOutcome struct {
 // must be a MessageQuestion (ErrInvalidTransition otherwise); any prior
 // accepted answer is resolved first — an equal body digest is
 // ErrDuplicateAnswer (idempotent, the accepted answer returned unchanged),
-// an unequal one is ErrConflictingAnswer (the accepted answer undisturbed)
-// — before checking that question is still open (queued or delivered;
-// ErrInvalidTransition otherwise, since an unanswered question is never
-// anything else). destination is the question's ORIGINATOR's logical
-// address, resolved by the application from the original sender's
+// an unequal one is ErrConflictingAnswer (the accepted answer undisturbed).
+// "Unanswered" is entirely governed by prior: an ordinary (non-human)
+// question's own delivery/ack status is orthogonal to answering it — the
+// manager typically acks q1 upon reading it, well before composing and
+// forwarding its answer, so this function imposes no delivery-state
+// precondition of its own. destination is the question's ORIGINATOR's
+// logical address, resolved by the application from the original sender's
 // role/task at question time — the new answer's derived recipient, never
 // caller-chosen. sender is the answering principal. enqueueSeq is the new
 // answer's durable per-recipient-address position, assigned by the
@@ -330,9 +332,6 @@ func AcceptAnswer(question Message, prior *Message, destination Address, sender 
 			return unchanged, fmt.Errorf("%w: question %s: answer %s", ErrDuplicateAnswer, question.ID, prior.ID)
 		}
 		return unchanged, fmt.Errorf("%w: question %s: answer %s", ErrConflictingAnswer, question.ID, prior.ID)
-	}
-	if question.State != MessageQueued && question.State != MessageDelivered {
-		return unchanged, fmt.Errorf("%w: question %s: %s cannot be answered", ErrInvalidTransition, question.ID, question.State)
 	}
 
 	ackedQuestion := question
