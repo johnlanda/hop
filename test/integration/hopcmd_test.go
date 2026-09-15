@@ -461,22 +461,19 @@ func paneIDFromBinding(binding string) string {
 
 // waitForRunState polls `hop status -C <repoRoot> -run <runID>` until the
 // reported state is one of want, bounded by deadline, and returns the last
-// parsed detail fields. It fails the test with the last rendering on
-// timeout, never silently returning a stale or absent state.
-func waitForRunState(t *testing.T, env []string, repoRoot, runID string, deadline time.Duration, want ...string) map[string]string {
+// parsed detail fields plus whether one of the wanted states was reached.
+// It never fails the test itself: a caller that wants pane or process
+// evidence captured before reporting a failure — scrollback is ephemeral,
+// gone with the pane, so it must be captured before any t.Fatal — needs the
+// chance to do that first with the returned fields.
+func waitForRunState(t *testing.T, env []string, repoRoot, runID string, deadline time.Duration, want ...string) (fields map[string]string, reached bool) {
 	t.Helper()
-	var fields map[string]string
-	var lastOut string
-	found := waitUntilDeadline(deadline, func() bool {
+	reached = waitUntilDeadline(deadline, func() bool {
 		result := runHop(t, env, repoRoot, "status", "-C", repoRoot, "-run", runID)
-		lastOut = result.Stdout
 		fields = parseStatusDetail(result.Stdout)
 		return slices.Contains(want, fields["state"])
 	})
-	if !found {
-		t.Fatalf("run %s never reached state %v; last hop status:\n%s", runID, want, lastOut)
-	}
-	return fields
+	return fields, reached
 }
 
 // readControllerLog reads a hop controller's captured stdout or stderr log

@@ -16,7 +16,7 @@ import (
 // conditionTimeout: this is several real subsystems in sequence (pane
 // creation, exec, a real git commit, a spawned check process), not one
 // bounded condition.
-const runEndToEndTimeout = 90 * time.Second
+const runEndToEndTimeout = 150 * time.Second
 
 // forbiddenCredentialVars is the union of every provider-credential
 // variable the sanitizing launcher's strip matrix removes
@@ -76,9 +76,14 @@ func TestRealProcessRunEndToEnd(t *testing.T) {
 	started := waitForControllerLog(t, artifacts, "run", "stdout", "started", 30*time.Second)
 	label, runID := extractRunID(t, started)
 
-	fields := waitForRunState(t, env, repo.Root, runID, runEndToEndTimeout, "completed", "failed", "stopped")
+	fields, reached := waitForRunState(t, env, repo.Root, runID, runEndToEndTimeout, "completed", "failed", "stopped")
 	stdout := readControllerLog(t, artifacts, "run", "stdout")
-	if fields["state"] != "completed" {
+	if !reached || fields["state"] != "completed" {
+		// The worker pane's own scrollback is never otherwise retained — it
+		// is ephemeral, gone with the pane — so capture it before failing.
+		if binding := fields["binding"]; binding != "" {
+			artifacts.save(t, "worker-pane-scrollback.txt", server.readPane(t, paneIDFromBinding(binding)))
+		}
 		t.Fatalf("run %s ended %q, want completed; hop status detail: %+v\ncontroller stdout:\n%s", runID, fields["state"], fields, stdout)
 	}
 

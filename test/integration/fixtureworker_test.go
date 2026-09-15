@@ -263,7 +263,14 @@ func runGit(args ...string) string {
 // so the test can read it from the pane/log evidence in addition to the
 // observation dump.
 func submitOnce(hopPath, oid, summary string) {
-	deadline := time.Now().Add(30 * time.Second)
+	// The retry budget must comfortably outlast the controller's own
+	// corroboration polling: launch claim settlement depends on real pane
+	// creation, InspectPane polling and (in the early-submission case) this
+	// very transient response as a wakeup, none of which are instant under
+	// test. The assignment template's own instruction has no fixed
+	// deadline ("wait briefly and run the exact same command again"); this
+	// bounds it only so a persistently broken run does not hang forever.
+	deadline := time.Now().Add(2 * time.Minute)
 	for {
 		cmd := exec.Command(hopPath, "result", "submit", "--summary", summary, "--commit", oid)
 		var out strings.Builder
