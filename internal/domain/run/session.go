@@ -36,8 +36,18 @@ var sessionTransitions = newTransitionTable(concatPairs( //nolint:gochecknogloba
 // per incarnation and no manager session.
 type Role string
 
-// RoleWorker is the only role Phase 2 creates.
+// RoleWorker is the only role Phase 2 creates: a solo run's single
+// attempt-bound session.
 const RoleWorker Role = "worker"
+
+// Phase 3 feature-mode roles: RoleManager plans and delegates and has no
+// bound attempt; RoleImplementer and RoleReviewer are attempt-bound
+// children the manager delegates to, one level deep.
+const (
+	RoleManager     Role = "manager"
+	RoleImplementer Role = "implementer"
+	RoleReviewer    Role = "reviewer"
+)
 
 // Harness is the native agent a session runs.
 type Harness string
@@ -63,11 +73,17 @@ const (
 // Session is a HOP identity for one manager/worker harness lifecycle,
 // including its launch reservation. One session executes at most one
 // attempt; a cold relaunch is a new session bound to the same attempt,
-// never a revived old one.
+// never a revived old one. AttemptID is optional: it is empty for a
+// manager session, the only role with none. ParentSessionID is nil for
+// the manager and for every Phase 2 (RoleWorker) session; a Phase 3 child
+// (RoleImplementer or RoleReviewer) carries the run's manager session ID
+// that was current at its own creation — historical provenance, never
+// rewritten even once a successor manager takes over.
 type Session struct {
 	ID               identity.SessionID
 	RunID            identity.RunID
 	AttemptID        identity.AttemptID
+	ParentSessionID  *identity.SessionID
 	Role             Role
 	Harness          Harness
 	NativeSessionRef string
@@ -78,7 +94,7 @@ type Session struct {
 
 // NewSession constructs a worker session in its initial reserved state,
 // bound to attempt. Manager sessions, and therefore a session with no bound
-// attempt, are out of Phase 2's scope (Phase 3).
+// attempt, are out of Phase 2's scope (Phase 3's NewManagerSession).
 func NewSession(id identity.SessionID, runID identity.RunID, attemptID identity.AttemptID, harness Harness, now time.Time) Session {
 	return Session{
 		ID:        id,
@@ -89,6 +105,50 @@ func NewSession(id identity.SessionID, runID identity.RunID, attemptID identity.
 		State:     SessionReserved,
 		UpdatedAt: now,
 	}
+}
+
+// NewManagerSession constructs a run's manager session in its initial
+// reserved state. A manager session has no bound attempt and no parent —
+// the only role for which both are true.
+func NewManagerSession(id identity.SessionID, runID identity.RunID, harness Harness, now time.Time) Session {
+	return Session{
+		ID:        id,
+		RunID:     runID,
+		Role:      RoleManager,
+		Harness:   harness,
+		State:     SessionReserved,
+		UpdatedAt: now,
+	}
+}
+
+// NewChildSession constructs an implementer or reviewer session in its
+// initial reserved state, bound to attemptID and delegated by parent — the
+// run's manager session at creation time. One-level delegation is enforced
+// here for the part this package can check unaided: parent must itself
+// carry no parent (ErrDelegationDepth otherwise — a session with a parent
+// can never itself be a parent). That parent is actually the run's
+// CURRENT manager session is a cross-session fact only the application,
+// with visibility into every session, can validate before calling this
+// constructor. role must be RoleImplementer or RoleReviewer; any other
+// role is ErrInvalidTransition.
+func NewChildSession(id identity.SessionID, runID identity.RunID, attemptID identity.AttemptID, role Role, parent Session, harness Harness, now time.Time) (Session, error) { //nolint:gocritic // hugeParam: Session is passed by value everywhere in this package; this constructor mirrors that convention.
+	if role != RoleImplementer && role != RoleReviewer {
+		return Session{}, fmt.Errorf("%w: session %s: %q is not a delegable role", ErrInvalidTransition, id, role)
+	}
+	if parent.ParentSessionID != nil {
+		return Session{}, fmt.Errorf("%w: session %s: parent %s already has a parent", ErrDelegationDepth, id, parent.ID)
+	}
+	parentID := parent.ID
+	return Session{
+		ID:              id,
+		RunID:           runID,
+		AttemptID:       attemptID,
+		ParentSessionID: &parentID,
+		Role:            role,
+		Harness:         harness,
+		State:           SessionReserved,
+		UpdatedAt:       now,
+	}, nil
 }
 
 // AssignNativeRef records the session's native reference and its source.

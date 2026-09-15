@@ -103,6 +103,87 @@ func TestNewSession(t *testing.T) {
 	}
 }
 
+// TestNewManagerSession proves the manager session's distinguishing shape:
+// no attempt, no parent.
+func TestNewManagerSession(t *testing.T) {
+	session := run.NewManagerSession(testManagerSessionID, testRunID, run.HarnessClaude, epoch())
+
+	if session.State != run.SessionReserved {
+		t.Fatalf("NewManagerSession State = %s, want reserved", session.State)
+	}
+	if session.Role != run.RoleManager {
+		t.Fatalf("NewManagerSession Role = %s, want manager", session.Role)
+	}
+	if session.AttemptID != "" {
+		t.Fatalf("NewManagerSession AttemptID = %q, want empty", session.AttemptID)
+	}
+	if session.ParentSessionID != nil {
+		t.Fatalf("NewManagerSession ParentSessionID = %v, want nil", session.ParentSessionID)
+	}
+}
+
+// TestNewChildSession proves the delegation rules: only implementer/
+// reviewer roles are delegable, and a parent that already has a parent of
+// its own can never itself be named as a parent.
+func TestNewChildSession(t *testing.T) {
+	manager := run.NewManagerSession(testManagerSessionID, testRunID, run.HarnessClaude, epoch())
+
+	t.Run("implementer child of the manager", func(t *testing.T) {
+		child, err := run.NewChildSession(testSessionID, testRunID, testAttemptID, run.RoleImplementer, manager, run.HarnessClaude, epoch())
+		if err != nil {
+			t.Fatalf("NewChildSession: unexpected error: %v", err)
+		}
+		if child.Role != run.RoleImplementer {
+			t.Fatalf("NewChildSession Role = %s, want implementer", child.Role)
+		}
+		if child.AttemptID != testAttemptID {
+			t.Fatalf("NewChildSession AttemptID = %s, want %s", child.AttemptID, testAttemptID)
+		}
+		if child.ParentSessionID == nil || *child.ParentSessionID != manager.ID {
+			t.Fatalf("NewChildSession ParentSessionID = %v, want %s", child.ParentSessionID, manager.ID)
+		}
+		if child.State != run.SessionReserved {
+			t.Fatalf("NewChildSession State = %s, want reserved", child.State)
+		}
+	})
+
+	t.Run("reviewer child of the manager", func(t *testing.T) {
+		child, err := run.NewChildSession(testReviewerSessionID, testRunID, testAttemptID, run.RoleReviewer, manager, run.HarnessClaude, epoch())
+		if err != nil {
+			t.Fatalf("NewChildSession: unexpected error: %v", err)
+		}
+		if child.Role != run.RoleReviewer {
+			t.Fatalf("NewChildSession Role = %s, want reviewer", child.Role)
+		}
+	})
+
+	t.Run("manager role is not delegable", func(t *testing.T) {
+		_, err := run.NewChildSession(testSessionID, testRunID, testAttemptID, run.RoleManager, manager, run.HarnessClaude, epoch())
+		if !errors.Is(err, run.ErrInvalidTransition) {
+			t.Fatalf("NewChildSession(role=manager): error = %v, want ErrInvalidTransition", err)
+		}
+	})
+
+	t.Run("worker role is not delegable", func(t *testing.T) {
+		_, err := run.NewChildSession(testSessionID, testRunID, testAttemptID, run.RoleWorker, manager, run.HarnessClaude, epoch())
+		if !errors.Is(err, run.ErrInvalidTransition) {
+			t.Fatalf("NewChildSession(role=worker): error = %v, want ErrInvalidTransition", err)
+		}
+	})
+
+	t.Run("one-level delegation: a session with a parent cannot itself be a parent", func(t *testing.T) {
+		implementer, err := run.NewChildSession(testSessionID, testRunID, testAttemptID, run.RoleImplementer, manager, run.HarnessClaude, epoch())
+		if err != nil {
+			t.Fatalf("NewChildSession: %v", err)
+		}
+
+		_, err = run.NewChildSession(testReviewerSessionID, testRunID, testSecondAttemptID, run.RoleReviewer, implementer, run.HarnessClaude, epoch())
+		if !errors.Is(err, run.ErrDelegationDepth) {
+			t.Fatalf("NewChildSession(parent has a parent): error = %v, want ErrDelegationDepth", err)
+		}
+	})
+}
+
 // TestSessionAssignNativeRefIsImmutable proves that a session's native
 // reference, once assigned, refuses a second assignment — even an
 // identical one.
