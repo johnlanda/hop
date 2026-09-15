@@ -59,7 +59,44 @@ type RunSnapshot struct {
 	StateRoot        string // absolute
 	AssignmentPath   string // absolute
 	AssignmentDigest string
+	// Workflow is the run's frozen feature-mode policy: the zero value
+	// means solo (docs/plan/phase-3-design.md section 4, run_snapshots
+	// "workflow JSON NULL means solo"). Solo-mode code never reads it.
+	Workflow WorkflowSnapshot
 }
+
+// WorkflowSnapshot is a feature-mode run's frozen [workflow]/[workers]/
+// [retry]/[roles]/[messages] policy plus the integration branch name
+// derived from the run's sequence at freeze (docs/plan/phase-3-design.md
+// sections 3, 6). The role artifact fields are the frozen COPIES'
+// path/digest under the run's artifact directory — never the repository's
+// own role files, which a mid-run edit must not affect (the Phase 2
+// assignment-artifact snapshot-immutability rule extended to roles).
+type WorkflowSnapshot struct {
+	// Mode is "feature"; solo runs carry the zero WorkflowSnapshot instead
+	// of a Mode of "solo", so a zero value alone means solo.
+	Mode                  string
+	MaxWorkers            int
+	RetryLimit            int
+	ManagerRolePath       string
+	ManagerRoleDigest     string
+	ImplementerRolePath   string
+	ImplementerRoleDigest string
+	ReviewerRolePath      string
+	ReviewerRoleDigest    string
+	ReviewerHarness       string
+	MessageAttention      time.Duration
+	MessageWait           time.Duration
+	// IntegrationBranch is "hop/r<seq>/integration" (section 6): one
+	// ref-namespace scheme, computed once at freeze from the run's
+	// sequence and frozen so every later reference uses the identical
+	// name.
+	IntegrationBranch string
+}
+
+// Feature is true when the snapshot describes a feature-mode run. A solo
+// run's zero WorkflowSnapshot always reports false.
+func (w WorkflowSnapshot) Feature() bool { return w.Mode == "feature" } //nolint:gocritic // hugeParam: WorkflowSnapshot is a small value type read throughout the codebase by value, mirroring RunSnapshot's own convention; called at most a few times per controller pass, never a hot loop.
 
 // NewRunSpec is the complete, application-assembled input to InitializeRun:
 // every identity, digest and frozen value the run's first transaction

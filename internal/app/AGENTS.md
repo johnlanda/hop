@@ -22,18 +22,22 @@ sides together. `cmd/hop` never imports domain or identity types: every
 | [invocation.go](invocation.go) | `Invocation`, `InvocationFromEnviron`, `Trigger`, `Validate`, `Describe`, `ErrNotPluginInvocation` | Reads the `HERDR_*` plugin environment into a value, names the trigger, validates it and renders deterministic report lines |
 | [presentation.go](presentation.go) | `AgentPresentation`, `Presenter`, `AgentDisplay`, `PaneMetadata`, `ViewSelection`, `Role`, `SortDisplays`, token constants | Consumer-owned presentation port and its ordering: a display's manager-first `hop_order` key and padded token map, and the view selection HOP installs |
 | [observation.go](observation.go) | `Observer`, `StatusStream`, `PaneObservation`, `StatusEvent`, `Reconcile`, `ReconcileState`, `AgentStatus` | Consumer-owned observation port and the no-replay reconciliation: subscribe first, snapshot second, fold buffered events plus `StatusStream.DrainRemaining()`'s accepted backlog onto the snapshot |
-| [store.go](store.go) | `StateStore`, `UnitOfWork`, `Lease`, `NewRunSpec`, `RunSnapshot`, `<Entity>Repository` (Runs, Tasks, Attempts, Sessions, Worktrees, Results, Artifacts, Bindings, LaunchClaims, CheckExecClaims, Operations, Transitions, CheckRequests), `Operation`, `OperationKind`/`OperationState`, `Transition`, `CheckRequest`, `CheckExecClaim`, `ErrRevisionConflict`, `ErrFenced`, `ErrNotFound`, `ErrLeaseHeld` | The controller's authority: lease lifecycle (`InitializeRun`, `AcquireLease`, `Heartbeat`, `ReleaseLease`, CAS-fenced) and fenced units of work over typed repositories; the operation journal's shapes. `OperationRepository.ByKind` lists a run's operations of one kind, newest first, for recovery evidence |
-| [readstore.go](readstore.go) | `ReadStore`, `RunStatus`, `RunDetail`, `CheckExecutionSummary`, `FrozenRun`, `LaunchContext`, `CheckExecutionContext` | Lease-free reads for `hop status` and both exec boundaries. `RunDetail` carries the identities stop and resume need, the frozen `StateRoot` for evidence capture, and `LastCheck` (the newest check execution's identity, state and retained evidence); `FrozenRun` is the check use case's frozen-input source; `LaunchContext` is resolvable from the run snapshot, the recorded launch intent and the worktree row alone — it carries the recorded worktree path (or "" before the row exists) for the launch boundary's directory cross-check — never from a binding that may not exist yet |
-| [submission.go](submission.go) | `SubmissionStore`, `LaunchClaim`, `LaunchClaimState`, `LaunchClaimSettlement`, `LaunchClaimRepository`, `ResultSubmission`, `SubmissionOutcome`, `SubmissionOutcomeKind`, `ClaimedSubmission`, `ClaimedSubmissionFieldLimit` | Worker-authority writes with no controller lease: launch/check-exec claims, `SubmitResult`'s atomic section 7 handoff, `RecordMalformed` for a submission that failed parsing before any typed identity existed, monotonic stop requests |
-| [runtime.go](runtime.go) | `Runtime`, `ErrPaneNotFound`, `WorktreeRequest`/`WorktreeInfo`, `WorkerPaneRequest`, `PaneHandle`/`PaneRef`, `ProcessInfo`, `PaneProcess` | Herdr's pane and worktree surface: `CreateWorktree`, `OpenWorkerPane` (a `layout.apply` command pane), `FindPaneByLabel` recovery, `SendText` fallback, `ReadPane` evidence, `InspectPane` occupant identity (reporting the typed `ErrPaneNotFound` for a pane that positively does not exist — distinct from any inspection failure), `ClosePane`, and `ServerInstance` — the opaque identity scoped to both the configured socket and the server process behind it, compared by equality only |
+| [store.go](store.go) | `StateStore`, `UnitOfWork`, `Lease`, `NewRunSpec`, `RunSnapshot`, `WorkflowSnapshot`, `<Entity>Repository` (Runs, Tasks, Attempts, Sessions, Worktrees, Results, Artifacts, Bindings, LaunchClaims, CheckExecClaims, Operations, Transitions, CheckRequests), `Operation`, `OperationKind`/`OperationState`, `Transition`, `CheckRequest`, `CheckExecClaim`, `ErrRevisionConflict`, `ErrFenced`, `ErrNotFound`, `ErrLeaseHeld` | The controller's authority: lease lifecycle (`InitializeRun`, `AcquireLease`, `Heartbeat`, `ReleaseLease`, CAS-fenced) and fenced units of work over typed repositories; the operation journal's shapes. `OperationRepository.ByKind` lists a run's operations of one kind, newest first, for recovery evidence. `RunSnapshot.Workflow` (`WorkflowSnapshot`) is a feature-mode run's frozen `[workflow]`/`[workers]`/`[retry]`/`[roles]`/`[messages]` policy plus the computed integration branch name; the zero value means solo |
+| [workflow.go](workflow.go) | `WorkflowRepositories`, `WorkflowReadStore`, `RequireWorkflowRepositories`, `RequireWorkflowReadStore`, `ErrWorkflowRepositoriesUnsupported`, `ErrWorkflowReadStoreUnsupported`, `ErrFeatureModeUnsupported`, `TaskDependencyRepository`, `TaskIndexRepository`, `AttemptIndexRepository`, `SessionIndexRepository`, `MessageRepository`, `ReviewRepository`, `IntegrationRepository`, `RetryRequestRepository`, `RetryRequestRecord`, `SessionLaunchContext`, `MessagingContext`, `MessageDetail` | The Phase 3 controller-side capability extensions: `WorkflowRepositories` and `WorkflowReadStore` are declared as SEPARATE interfaces from `UnitOfWork`/`ReadStore` (never new methods on them) so the existing SQLite adapter keeps compiling until it also implements them; every feature-mode use case type-asserts to reach them and fails closed with the typed sentinel errors on a mismatch, never a nil-interface panic. Solo-mode code never performs the assertion. `WorkflowReadStore.LoadMessageDetail` is `hop msg show`'s entire lookup (envelope plus full delivery/ack history, `MessageDetail`): read-only, no lease, callable by any of the run's sessions or the human context — deliberately NOT on `MessageRepository`/`WorkflowRepositories`, which is the worker-authority, controller-transaction-only path `ShowMessage` (usecase_message.go) never uses. `MessagingContext.RunID` is the session's OWN run, never the caller-supplied one: every driving messaging use case (`SendMessage`/`FetchMessage`/`AckMessage`) compares it against its own parsed RunID and refuses a mismatch before any side effect — the use-case half of the section 7 cross-run authorization check `MessagingStore`'s own methods independently re-enforce (messaging.go) |
+| [messaging.go](messaging.go) | `MessagingStore`, `MessageSend`, `MessageFetch`, `MessageDelivery`, `MessageAck`, `MessageOutcome`/`MessageOutcomeKind`, `MessageAckOutcome`/`MessageAckOutcomeKind`, `HumanAnswer`, `AddressString`, `MessageBodyFileLimit`, `MessageBodyInlineLimit`, `ErrMessagingUnauthorized` | Section 7's worker-authority messaging port and its DTOs: send/fetch/ack/answer, request-ID idempotency, relay provenance, the `origin` resolution for a forwarded human answer. Every method independently re-derives the caller session's own run (and, for fetch, its current incarnation and resolved address) rather than trusting the request's caller-supplied fields — `ErrMessagingUnauthorized` is `FetchNextMessage`'s refusal signal (it has no outcome-kind field); `SendMessage`/`AckMessage` express the identical check through their own outcome kind (`MessageRefused`/`AckRefused`) |
+| [plan.go](plan.go) | `PlanStore`, `TaskCreate`/`TaskCreated`, `RetryRequest`/`RetryAccepted`, `PlanClose`/`PlanCloseResult`, `WorkflowOutcomeKind`, `TaskTitleLimit`, `TaskInstructionsLimit` | Section 8's worker-authority manager-plan port and its DTOs: `hop task create`/`hop task retry`/`hop plan close`, each manager-only and run-state-gated inside its own transaction |
+| [review.go](review.go) | `ReviewStore`, `ReviewSubmission`, `ReviewOutcome`/`ReviewOutcomeKind` | Section 8's worker-authority review-verdict port and its DTOs; the accepting transaction's guard/retirement wiring is driving-controller behavior owned by a later slice |
+| [readstore.go](readstore.go) | `ReadStore`, `RunStatus`, `RunDetail`, `CheckExecutionSummary`, `FrozenRun`, `LaunchContext`, `CheckExecutionContext`, `TaskSummary`, `IntegrationSummary`, `MailboxStatus`, `InFlightMessage`, `PendingQuestion` | Lease-free reads for `hop status` and both exec boundaries. `RunDetail` carries the identities stop and resume need, the frozen `StateRoot` for evidence capture, and `LastCheck` (the newest check execution's identity, state and retained evidence); `FrozenRun` is the check use case's frozen-input source; `LaunchContext` is resolvable from the run snapshot, the recorded launch intent and the worktree row alone — it carries the recorded worktree path (or "" before the row exists) for the launch boundary's directory cross-check — never from a binding that may not exist yet. Phase 3 additions to `RunDetail`, all additive fields, empty for a solo run: `Tasks` (the feature-mode task table), `LatestIntegration` (the run's most recently CREATED integration row — reading exactly what is recorded, never resolving the live git ref, which is 2b's integration-operations concern), `GuardShortfalls` (`EvaluateReadiness`'s missing list, rendered verbatim), `Mailboxes` (section 7's per-address queue-depth/in-flight-age status surface, `Attention` computed once here against the frozen `[messages] attention_after` threshold) and `PendingQuestions` |
+| [submission.go](submission.go) | `SubmissionStore`, `LaunchClaim`, `LaunchClaimState`, `LaunchClaimSettlement`, `LaunchClaimRepository`, `ResultSubmission`, `SubmissionOutcome`, `SubmissionOutcomeKind`, `ClaimedSubmission`, `ClaimedSubmissionFieldLimit` | Worker-authority writes with no controller lease: launch/check-exec claims, `SubmitResult`'s atomic section 7 handoff, `RecordMalformed` for a submission that failed parsing before any typed identity existed, monotonic stop requests. `LaunchClaim.SessionID` (required; `AttemptID` now optional, empty for an attempt-less session) is the Phase 3 session-keyed claim addition; `LaunchClaim.SeedEvidence` records the workspace-trust pre-seeding outcome (evidence only — no decision ever reads it) |
+| [runtime.go](runtime.go) | `Runtime`, `ErrPaneNotFound`, `WorktreeRequest`/`WorktreeInfo`, `WorkerPaneRequest`, `PaneHandle`/`PaneRef`, `ProcessInfo`, `PaneProcess`, `WorkspaceRuntime`, `WorkspaceRequest`/`WorkspaceHandle`/`WorkspaceRef` | Herdr's pane and worktree surface: `CreateWorktree`, `OpenWorkerPane` (a `layout.apply` command pane), `FindPaneByLabel` recovery, `SendText` fallback, `ReadPane` evidence, `InspectPane` occupant identity (reporting the typed `ErrPaneNotFound` for a pane that positively does not exist — distinct from any inspection failure), `ClosePane`, and `ServerInstance` — the opaque identity scoped to both the configured socket and the server process behind it, compared by equality only. `WorkspaceRuntime` (manager placement, S8-pinned shapes) is a SEPARATE interface from `Runtime`, consumed through the optional `Controller.Workspaces` field, for the same reason `WorkflowRepositories` is separate from `UnitOfWork` |
 | [artifactstore.go](artifactstore.go) | `ArtifactStore` | Durable local file writes/reads under the run's artifact directories (assignment, pane scrollback, check stdout/stderr), temp-file-then-rename, never called from inside a `StateStore` transaction |
 | [system.go](system.go) | `Clock`, `IDGenerator` | Explicit time and identity generation |
 | [process.go](process.go) | `CommandRunner`, `Command`, `CommandResult`, `ProcessGroupInspector`, `GroupProcess` | Process-group-leader execution with cancellation (git operations, spawning `hop check-exec`) and local process-table listing/signaling for group retirement |
-| [configuration.go](configuration.go) | `ConfigurationSource`, `RunPolicy` | Loads and validates one repository's `.herdr-orchestrator/config.toml`-decoded policy: check contract, env strip/passthrough, profile dir, harness |
-| [digest.go](digest.go) | `ResultDigestTag`, `ComputeResultDigest` | The canonical `"hop-result-v1"` result digest: length-prefixed fields, SHA-256 hex, computed only here — the domain receives it as an opaque validated string |
+| [configuration.go](configuration.go) | `ConfigurationSource`, `RunPolicy` | Loads and validates one repository's `.herdr-orchestrator/config.toml`-decoded policy: check contract, env strip/passthrough, profile dir, harness, and (Phase 3, zero value for solo) the `[workflow]`/`[workers]`/`[retry]`/`[roles]`/`[messages]` keys; the config adapter owns defaults and feature-mode-required validation |
+| [digest.go](digest.go) | `ResultDigestTag`, `ComputeResultDigest`, `RequestDigestTag`, `ComputeRequestDigest` | The canonical `"hop-result-v1"` result digest and the canonical `"hop-request-v1"` messaging/plan request digest: length-prefixed fields, SHA-256 hex, computed only here — the domain receives each as an opaque validated string |
 | [decision.go](decision.go) | `LaunchClaimDeadline`, `LaunchDeadlineExpired`, `LaunchSettlement`, `CorroborateSettlement`, `FirstMarkerMatch`, `OccupantMatches`, `ServerContinuityEstablished`, `GroupRetirementOutcome`, `ClassifyGroupRetirement`, `ArgvUnavailable` | The section 6 claim-corroboration predicate (claim-derived executable identity, durable marker set, explicit `hop launch` exclusion, fail-closed on missing identity), close-rule occupant matching, the server-continuity predicate, and the four-outcome process-group-retirement classifier matching both the frozen check argv and its check-exec invocation |
 | [operation_payload.go](operation_payload.go) | `decodeOperationPayload` | Reads a persisted operation intent/evidence/outcome payload without relying on Go type identity: a value of the target type passes through, anything else round-trips through JSON. Callers still validate required fields and fail closed on a failed decode |
-| [controller.go](controller.go) | `Controller`, `RunHandle`, `Heartbeat`, `Detach`, `ErrStopRequested` | The driving service composition calls; ports as fields, plus `GitExecutable` (the absolute path of the git binary every repository/worktree command runs, resolved once by composition). `RunHandle` is an opaque per-run token (run identity, the held lease and a dispatch scope) so composition never touches identity types. `Heartbeat` extends the lease on the design's interval and cancels in-flight external calls on failure; `Detach` journals, cancels and releases without stopping; `revalidateForDispatch` is the section 4 step 2 revalidation every external mutation runs first |
+| [controller.go](controller.go) | `Controller`, `RunHandle`, `Heartbeat`, `Detach`, `ErrStopRequested` | The driving service composition calls; ports as fields, plus `GitExecutable` (the absolute path of the git binary every repository/worktree command runs, resolved once by composition). `RunHandle` is an opaque per-run token (run identity, the held lease and a dispatch scope) so composition never touches identity types. `Heartbeat` extends the lease on the design's interval and cancels in-flight external calls on failure; `Detach` journals, cancels and releases without stopping; `revalidateForDispatch` is the section 4 step 2 revalidation every external mutation runs first. `Messages`/`Plan`/`Reviews`/`Workspaces` are optional Phase 3 fields, nil for a solo-only Controller |
 | [assignment.go](assignment.go) | `renderAssignment` | Deterministic assignment-artifact content: brief, identities and absolute paths only, referenced by the launch argv, never typed into a dialog |
 | [usecase_run.go](usecase_run.go) | `StartRun`, `StartRunRequest`, `StartRunResult`, `ErrStartRefused`, `classifyWorktreeProvenance` | Refuses unsupported repositories (SHA-256 object format, launch-line-hostile HOP paths) and unusable policies before any side effect — every such refusal wraps `ErrStartRefused`, hop run's usage exit — freezes the run snapshot, calls `InitializeRun`, writes/records the assignment artifact, then drives `worktree.create` (base commit resolved to an object id before the intent commits; canonical common-directory EQUALITY plus frozen-base HEAD comparison validate provenance) and `pane.open` as record-intent/act/record-outcome units |
 | [usecase_launch.go](usecase_launch.go) | `CorroborateLaunch`, `LaunchProgress` | One inspection round toward settling a launch claim under the section 6 predicate: settled, needs-interaction (forking wrapper), failed (`exec_failed`, terminating the session), already-settled (early acceptance; activates a still-launching session) or still pending — recovers a lost binding by creation label, never sleeps or resends |
@@ -43,10 +47,43 @@ sides together. `cmd/hop` never imports domain or identity types: every
 | [usecase_check.go](usecase_check.go) | `ClaimAndRunCheck`, `CheckReport`, `CheckClaimDeadline` | Recovers unresolved executions first (claim/group retirement, confirmed absence, then the unknown-outcome rule; bounded no-claim ambiguity), reopens orphaned claimed requests, then claims the oldest pending request atomically with its execution intent and lifecycle transitions, validates and materializes the detached checkout (submodule candidates fail clearly), spawns `hop check-exec` bounded by the frozen timeout, retains stdout/stderr evidence, and applies the section 7 outcome transaction including stop precedence and request settlement |
 | [usecase_execboundary.go](usecase_execboundary.go) | `PrepareLaunchExec`, `LaunchExecRequest`/`LaunchExecPlan`, `FailLaunchExec`, `PrepareCheckExec`, `CheckExecRequest`/`CheckExecPlan`, `CheckSpawnEnvironment`, `ExecutableLookup` | The string-facing exec-boundary use cases behind `hop launch` and `hop check-exec` (composition passes raw strings; typed IDs are parsed here): section 6 launch preparation — fail-closed HOP_* environment validation against the launch context (every pane-provided variable present and agreeing: state root, run, task, attempt, incarnation), sanitization under the frozen policy, per-harness argv composition (first launches for Claude `--session-id <ref>` + fixed prompt, Codex `<prompt>` and opencode `--prompt <prompt>`; cold relaunch is Claude-only `--resume <ref>`, and Codex/opencode cold resume reports the Phase 2 unsupported state), executable resolution through the composition-supplied `ExecutableLookup`, the worktree cross-check (`resolveWorkerDirAgainstWorktree`: the launcher's cwd and the recorded worktree path both canonically resolved through the request's `ResolvePath` seam and required equal — a missing recorded path, an unresolvable side or a disagreement refuses fail-closed with resolver errors never echoed, and the resolved directory is the seed key), the workspace-trust pre-seed (`seedWorkspaceTrust` over the sanitized environment and the request's resolved `WorkerDir`, written through the `Trust` port immediately before the claim; not-seeded outcomes are evidence and the launch proceeds, a seeding write failure refuses before any claim), then `ClaimLaunch` recording the seed evidence — and section 7 check-exec preparation (group-leadership check, `ClaimCheckExec` BEFORE anything else, frozen-argv verification, sanitized env). The exec itself stays in `cmd/hop` through the process adapter; `FailLaunchExec` is the post-claim failure path and `CheckSpawnEnvironment` composes ClaimAndRunCheck's sanitized spawn env |
 | [trustseed.go](trustseed.go) | `TrustSeeder`, `TrustSeedOutcome`, `TrustSeedStep`, `PlanTrustSeed`, `SeedTrustEdit` | Workspace-trust pre-seeding (verified against Claude Code 2.1.270): `PlanTrustSeed` purely resolves the profile trust file from the launched harness, the SANITIZED environment (`CLAUDE_CONFIG_DIR`, else `HOME`) and the resolved worktree path — codex/opencode and every unresolvable case are not-seeded reasons, never errors — and `SeedTrustEdit` computes the byte-surgical `.claude.json` edit setting exactly `projects[<worktree>].hasTrustDialogAccepted = true` (overwrite false→true, compact insertions only, every other byte preserved, last duplicate key wins, unparsable documents are errors the caller maps to not-seeded). `TrustSeeder` is the consumer-owned port for the locked atomic file write |
-| [usecase_status.go](usecase_status.go) | `Status`, `StatusRequest`, `StatusResult`, `RunSummaryView`, `RunDetailView` | Renders `ReadStore` into string-only view DTOs for `hop status`, including the last check execution's identity, evidence paths and the human's options for an unknown outcome |
+| [usecase_status.go](usecase_status.go) | `Status`, `StatusRequest`, `StatusResult`, `RunSummaryView`, `RunDetailView`, `TaskSummaryView`, `IntegrationView`, `GuardShortfallView`, `MailboxView`, `PendingQuestionView` | Renders `ReadStore` into string-only (plus `time.Time`/`time.Duration`, matching `RunSummaryView.UpdatedAt`'s existing precedent) view DTOs for `hop status`, including the last check execution's identity, evidence paths and the human's options for an unknown outcome (`SeedEvidence` among them, from the launch claim). `RunDetailView`'s Phase 3 additions mirror `RunDetail`'s one-for-one (`runDetailView` converts identity/domain values to their string forms); `RunSummaryView.NeedsAttention` is derived by OR-reducing `Mailboxes[].Attention` — populated only by the `-run` detail render, never the bare listing, which has no per-address message data to compute it from. The exact `attention: …` line text (section 7) is deliberately NOT composed here: it stays structured data for `cmd/hop` (slice 6) to render, since slice 4 owns the grammar constant set |
+| [usecase_schedule.go](usecase_schedule.go) | `RecomputeReleases`, `AssignReadyTasks`, `AssignmentOptions`, `AssignedTask`, `AssignmentReport`, `ReleasedTask`, `ReleaseReport` | The section 6 scheduling pass's dependency-release and assignment steps: `RecomputeReleases` moves a dependent task pending→ready once every prerequisite is integrated; `AssignReadyTasks` claims the lowest-seq ready task into a free worker slot (task ready→active, a fresh or already-reserved-by-retry attempt launched, a delegated implementer/reviewer session, the per-attempt worktree and launch intents), one committed transaction per task, the slot bound counted inside it. A pending `hop task retry`'s bookkeeping row (reserved immediately by `PlanStore.RequestRetry`, worker-authority) is marked consumed in the SAME transaction that launches its already-reserved attempt. Resolving "the current integration head" for an implement task's worktree base is 2b's integration-operations concern; this file only consumes `AssignmentOptions.IntegrationHeadCommitOID` as given |
+| [usecase_message.go](usecase_message.go) | `SendMessage`, `FetchMessage`, `AckMessage`, `Answer`, `ShowMessage`, `SendMessageRequest`/`Result`, `FetchMessageRequest`/`Result`, `AckMessageRequest`/`Result`, `AnswerRequest`/`Result`, `ShowMessageRequest`/`Result`, `ShowMessageDelivery` | Section 7's driving messaging use cases behind `hop msg send`/`next`/`ack`/`show` and `hop answer`: resolve the caller's logical address via `WorkflowReadStore.LoadMessagingContext`, bound and write the body durably (file-first, digest computed here) before delegating validation/acceptance to `MessagingStore`, which owns addressing legality, eligibility and the request-ID receipt. `hop msg wait`'s 1s poll loop and timeout live in `cmd/hop`, never here — `FetchMessage` is one non-blocking attempt. `ShowMessage` is the one message verb with no caller identity at all (any session, or the human context, per the grammar table): `WorkflowReadStore.LoadMessageDetail` is its entire lookup — read-only, no lease, never delivers or acks, `ErrNotFound` (translated to `Found: false`) for an unknown id or one from a different run. `SendMessage`/`FetchMessage`/`AckMessage` each compare `LoadMessagingContext`'s returned `RunID` against their own parsed `RunID` and refuse a cross-run mismatch before any side effect (before the body artifact write, for `SendMessage`) — `AckMessage` calls `LoadMessagingContext` for exactly this check even though it needs no address from it |
+| [usecase_plan.go](usecase_plan.go) | `CreateTask`, `RequestRetry`, `ClosePlan`, `CreateTaskRequest`/`Result`, `RequestRetryRequest`/`Result`, `ClosePlanRequest`/`Result` | Section 8's driving manager-plan use cases behind `hop task create`/`hop task retry`/`hop plan close`: `CreateTask` bounds and writes the instructions body durably (file-first, digest computed here) before delegating to `PlanStore.CreateTask`, which owns manager/run-state validation, acyclicity, the plan-flag reopen and the request-ID receipt; `RequestRetry` and `ClosePlan` delegate directly, since neither writes a file. `RequestRetry`'s acceptance reserves the new attempt IMMEDIATELY inside `PlanStore` (see the invariant above) — this use case is a thin wrapper, not where that reservation happens |
 
 ## Invariants
 
+- Phase 3's additive packaging rule for an EXISTING port: new capability
+  never arrives as a new method on `UnitOfWork`, `ReadStore` or `Runtime`
+  directly, since each already has a concrete out-of-package implementer
+  (the SQLite adapter, the Herdr adapter) that a widened interface would
+  stop compiling before that adapter is updated. Instead, the new surface
+  is a SEPARATE interface (`WorkflowRepositories`, `WorkflowReadStore`,
+  `WorkspaceRuntime`) a caller reaches either by type-asserting the value
+  an existing method already returned (`RequireWorkflowRepositories`,
+  `RequireWorkflowReadStore` against the `UnitOfWork`/`ReadStore` a
+  `Begin`/method call returned) or, where the port is a plain `Controller`
+  struct field rather than a per-call value (`Runtime`), through a new
+  optional field (`Workspaces`) instead. Every such assertion or nil
+  field is checked and failed closed (the typed `ErrWorkflow*Unsupported`
+  / `ErrFeatureModeUnsupported` errors) before any side effect; solo-mode
+  code never performs the check. The SQLite adapter (slice 3) adds
+  `var _ app.WorkflowRepositories = (*unitOfWork)(nil)` (and the
+  `WorkflowReadStore` equivalent on its `ReadStore` implementer) once it
+  implements the new getters, at which point the assertions also succeed
+  in production; a later slice (6) may fold the getters into
+  `UnitOfWork`/`ReadStore` proper as one of its non-additive flips, once
+  every implementer is updated together.
+- A `hop task retry` reserves its new attempt IMMEDIATELY inside
+  `PlanStore.RequestRetry`'s own worker-authority transaction (terminal-
+  prior-attempt and retry-limit validation, `Task.Reopen` +
+  `ReopenMailbox`), matching the CLI grammar's `retry accepted t<seq>
+  attempt <n>` naming the attempt number in that same response — never
+  deferred to a later controller step. The `retry_requests` bookkeeping
+  row it also writes (state pending) is consumed by
+  `AssignReadyTasks` in the SAME transaction that launches the
+  already-reserved attempt; nothing else ever creates a retry's attempt.
 - The doctor reports observations, never guesses: a capability that could not
   be checked is `skipped` or `unavailable` with the reason, and a feature is
   `ok` only when the schema advertises every required method. `unsupported`
@@ -235,7 +272,10 @@ sides together. `cmd/hop` never imports domain or identity types: every
 
 - Allowed inward imports: [internal/domain/identity](../domain/identity/AGENTS.md),
   [internal/domain/run](../domain/run/AGENTS.md) (application code;
-  standard library only beyond these, no third-party dependencies).
+  standard library only beyond these, no third-party dependencies). Test
+  files additionally import
+  [internal/testsupport/storevectors](../testsupport/storevectors/AGENTS.md)
+  (the shared refused-input vectors) — production code never does.
 - Consumed ports and their adapters: `Probe`, `AgentPresentation`,
   `Observer` and `Runtime` (including `ServerInstance`) are implemented by
   [internal/adapters/herdr](../adapters/herdr/AGENTS.md); `StateStore`,
@@ -348,6 +388,83 @@ sides together. `cmd/hop` never imports domain or identity types: every
   the canonical digest vectors (`digest_test.go`) and the persisted-payload
   decode contract (`operation_payload_internal_test.go`, a same-package
   test of `decodeOperationPayload`'s typed and JSON-generic paths).
+- Phase 3 scenario suite, against the same `fakeStore` extended with
+  `fakeUnitOfWork`'s `WorkflowRepositories` implementation and
+  `fakeStore`'s own `MessagingStore`/`PlanStore`/`ReviewStore`/
+  `WorkflowReadStore` implementations (`fakes_workflow_test.go`), wired
+  into `newTestController` alongside the Phase 2 fakes
+  (`usecase_run_test.go`); `seedFeatureRun`/`seedImplementTask`/
+  `seedWorkerSession` (`usecase_schedule_test.go`,
+  `usecase_message_test.go`) build feature-mode fixtures directly (a
+  running `Run` with a `WorkflowSnapshot`, an active manager session and a
+  legitimate `RunHandle`), bypassing `StartRun`'s Phase 2 one-task/
+  one-attempt bootstrap, which feature mode does not use:
+  - `go test ./internal/app -run 'TestRecomputeReleases|TestAssignReadyTasks'` —
+    the section 6 scheduling pass: dependency release only once every
+    prerequisite is integrated; assignment claims the lowest-seq ready
+    task into a free slot (task/attempt/session/worktree/pane, a review
+    task's own frozen subject rather than the integration head,
+    `MaxWorkers` bounded inside the assignment transaction, a consumed
+    retry's already-reserved attempt launched rather than recreated); a
+    stop racing between release and assignment creates nothing — the
+    assignment transaction reads the run fresh and checks
+    `CanAcceptManagerVerb()`/`StopRequested` before any task/attempt/
+    session write, not merely before the later external worktree/pane
+    act.
+  - `go test ./internal/app -run TestRequireWorkflowRepositoriesFailsClosed` —
+    the `WorkflowRepositories` fail-closed table test via
+    `plainStore`/`plainUnitOfWork` (a `StateStore` implementing exactly
+    `UnitOfWork`, deliberately not also `WorkflowRepositories`): every
+    feature-mode use case refuses with `ErrWorkflowRepositoriesUnsupported`
+    before any side effect, never a nil-interface panic.
+  - `go test ./internal/app -run 'TestCreateTask|TestClosePlanReopenOnCreate|TestClosePlanRefusesEmptyPlan|TestRequestRetry'` —
+    section 8's manager-plan verbs: zero- and chained-dependency creation,
+    self-dependency and cross-run dependency refusal, non-manager caller
+    refusal, request-ID idempotency (identical retry returns the original
+    acceptance), an oversized title malformed before any side effect
+    (`TaskCreate`'s own file-first write included), plan reopen-on-create,
+    empty-plan refusal, and a full retry cycle (terminal needs-rework
+    attempt, below the retry limit, the new attempt reserved immediately
+    inside `RequestRetry` itself).
+  - `go test ./internal/app -run 'TestMessagingReferenceTraceRelayedQuestion|TestSendMessageValidation|TestAckMessageRequiresOwnDelivery|TestAckMessageRequiresCurrentIncarnation|TestShowMessage|TestFetchMessageEmptyQueueCommitsNothing|TestFetchMessageCrossRunRefused|TestAckMessageCrossRunRefused'` —
+    section 7's messaging verbs: the complete relayed-question reference
+    trace end to end (worker question → manager relay to human with
+    `--relay-of` → human answer → manager forwards using only the
+    `origin` envelope field → worker acks, incl. forward-before-ack redo
+    idempotency); send addressing/kind legality, mailbox-closed refusal,
+    an oversized inline body malformed before any store call; ack refused
+    for a message never delivered to the ACKING session itself (a
+    predecessor's delivery proves nothing), then accepted after fetch,
+    then idempotently duplicate on repeat; ack refused for a delivery
+    served to an earlier, now-superseded incarnation of the SAME session
+    (a warm reattach), then accepted once the current incarnation is
+    itself served; `ShowMessage` (the envelope plus full delivery/ack
+    history incl. a re-serve, writing/delivering/acking nothing itself,
+    not-found for an unknown id or one from a different run, and its own
+    `WorkflowReadStore` fail-closed case via `plainReadStore`, a
+    `ReadStore` deliberately not also `WorkflowReadStore`); an empty
+    fetch committing neither a delivery row nor a receipt; a session
+    claiming a run other than its own is refused by send (before the
+    body artifact is ever written), fetch and ack alike.
+  - `go test ./internal/app -run TestStatus` — the presentation/status
+    integration: the feature-mode task table (seq, kind, state,
+    dependencies, attempt count); the run's most recently created
+    integration row; guard shortfalls (`EvaluateReadiness`'s missing list)
+    across an open plan, an unintegrated task once the plan closes, and
+    every verdict shortfall (reject, stale-subject) against an integrated
+    head — `check-missing` never clears in this suite, since no fake
+    tracks a combined-candidate check receipt yet (documented on
+    `guardShortfallsLocked`, not a bug); the section 7 attention surface
+    (queued vs. in-flight ages, the `[messages] attention_after`
+    threshold, `AddressLive` gating on the manager session's own state,
+    `NeedsAttention`'s OR-reduction over `Mailboxes`); pending human
+    questions clearing once answered; a solo run rendering every Phase 3
+    field at its zero value.
+  - `go test ./internal/app -run TestStoreVectors` — every
+    `internal/testsupport/storevectors` vector
+    ([its own guide](../testsupport/storevectors/AGENTS.md)) driven
+    against `fakeStore` through the ordinary `PlanStore`/`MessagingStore`
+    ports, confirming each documented refusal.
 - Test fixtures: none on disk; the fakes and environ slices live in the
   test files. No real process, file, socket or SQLite access anywhere in
   this package's tests.

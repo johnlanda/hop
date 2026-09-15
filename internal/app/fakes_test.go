@@ -133,6 +133,60 @@ type fakeStore struct {
 	// call and then cleared. Runtime hooks like this live on fakeRuntime;
 	// this one lives here only for tests that assert on store-recorded
 	// operation outcomes without a full fakeRuntime wiring.
+
+	// Phase 3 feature-mode state, additive to the Phase 2 shape above.
+	// TaskDependencies is every persisted edge, immutable once appended.
+	TaskDependencies []run.TaskDependency
+	// Messages is every immutable envelope by id; MessageDeliveries and
+	// MessageAcks are its append-only delivery/ack rows.
+	Messages          map[identity.MessageID]run.Message
+	MessageDeliveries map[identity.MessageID][]run.Delivery
+	MessageAcks       map[identity.MessageID]run.Ack
+	// enqueueSeq is the durable per-(run, recipient address) sequence
+	// counter SendMessage/AnswerQuestion assign from.
+	enqueueSeq map[string]int
+
+	// Reviews is the run's accepted verdicts, at most one per attempt.
+	Reviews map[identity.AttemptID]run.Review
+
+	// Integrations is the controller's own integration journal.
+	Integrations map[identity.IntegrationID]*entityRow[run.Integration]
+
+	// RetryRequests holds pending and consumed retry requests, keyed by
+	// task (UNIQUE(task_id) WHERE state='pending' in the real schema, so
+	// a task's later retry after consumption reuses the same key).
+	RetryRequests map[identity.TaskID]app.RetryRequestRecord
+	// RetryRequestStates tracks each request's own small lifecycle,
+	// separately from RetryRequestRecord (a plain read value).
+	RetryRequestStates map[identity.TaskID]app.RetryRequestState
+	// taskSeqByRun assigns dense per-run task sequence numbers, mirroring
+	// seqByRepo's role for run sequences.
+	taskSeqByRun map[identity.RunID]int
+
+	// RequestReceipts is the shared (run, verb, requestID) acceptance-key
+	// idempotency store for every request-ID-bearing verb (send, answer,
+	// task-create, retry, plan-close): the digest of the accepted
+	// request's content and its outcome, so an identical retry (same ID,
+	// same digest) returns the ORIGINAL outcome and a reused ID with
+	// different content is refused. Ack has no request-ID (its own
+	// message-id-keyed duplicate-ack rule already covers idempotency);
+	// review submission has its own per-attempt digest idempotency
+	// (ReviewStore.SubmitReview, no requestID field).
+	RequestReceipts map[requestReceiptKey]requestReceipt
+}
+
+// requestReceiptKey identifies one (run, verb, requestID) acceptance key.
+type requestReceiptKey struct {
+	run       identity.RunID
+	verb      string
+	requestID string
+}
+
+// requestReceipt is one accepted request-ID-bearing verb's remembered
+// digest and outcome.
+type requestReceipt struct {
+	digest  string
+	outcome any
 }
 
 func newFakeStore(clock interface{ Now() time.Time }) *fakeStore {
@@ -156,7 +210,33 @@ func newFakeStore(clock interface{ Now() time.Time }) *fakeStore {
 		Leases:          map[identity.RunID]*leaseRow{},
 		TaskByRun:       map[identity.RunID]identity.TaskID{},
 		AttemptByRun:    map[identity.RunID]identity.AttemptID{},
+
+		Messages:           map[identity.MessageID]run.Message{},
+		MessageDeliveries:  map[identity.MessageID][]run.Delivery{},
+		MessageAcks:        map[identity.MessageID]run.Ack{},
+		enqueueSeq:         map[string]int{},
+		Reviews:            map[identity.AttemptID]run.Review{},
+		Integrations:       map[identity.IntegrationID]*entityRow[run.Integration]{},
+		RetryRequests:      map[identity.TaskID]app.RetryRequestRecord{},
+		RetryRequestStates: map[identity.TaskID]app.RetryRequestState{},
+		RequestReceipts:    map[requestReceiptKey]requestReceipt{},
+		taskSeqByRun:       map[identity.RunID]int{},
 	}
+}
+
+// nextTaskSeqLocked assigns the next dense per-run task sequence number.
+// Callers hold s.mu.
+func (s *fakeStore) nextTaskSeqLocked(runID identity.RunID) int {
+	s.taskSeqByRun[runID]++
+	return s.taskSeqByRun[runID]
+}
+
+// nextEnqueueSeq assigns the next durable per-(run, recipient address)
+// message sequence number — the FIFO authority (section 7).
+func nextEnqueueSeq(s *fakeStore, runID identity.RunID, address run.Address) int {
+	key := runID.String() + "|" + app.AddressString(address)
+	s.enqueueSeq[key]++
+	return s.enqueueSeq[key]
 }
 
 // --- StateStore ---
@@ -399,6 +479,18 @@ func (s *fakeStore) LoadRunStatus(_ context.Context, runID identity.RunID) (app.
 		last := s.Submissions[len(s.Submissions)-1]
 		detail.LastSubmission = &last
 	}
+
+	detail.Tasks = s.tasksSummaryLocked(runID)
+	if integration, ok := s.latestIntegrationLocked(runID); ok {
+		detail.LatestIntegration = &app.IntegrationSummary{
+			ID: integration.ID, TaskID: integration.TaskID, SourceCommitOID: integration.SourceCommitOID,
+			PremergeHeadOID: integration.PremergeHeadOID, MergeCommitOID: integration.MergeCommitOID, State: integration.State,
+		}
+	}
+	detail.GuardShortfalls = s.guardShortfallsLocked(runID)
+	detail.Mailboxes = s.mailboxesLocked(runID, s.clock.Now())
+	detail.PendingQuestions = s.pendingQuestionsLocked(runID, s.clock.Now())
+
 	return detail, nil
 }
 

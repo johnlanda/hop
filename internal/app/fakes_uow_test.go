@@ -140,6 +140,16 @@ type fakeUnitOfWork struct {
 	artifactsSaved []run.Artifact
 	transitions    []app.Transition
 
+	// Phase 3 feature-mode staged writes, additive to the Phase 2 shape
+	// above: WorkflowRepositories methods stage here exactly as the
+	// Phase 2 repositories stage above, merged into the store atomically
+	// on Commit.
+	attemptCreated     []run.Attempt
+	messagesCreated    []run.Message
+	integrationCreated map[identity.IntegrationID]run.Integration
+	integrationSaved   map[identity.IntegrationID]stagedRow[run.Integration]
+	retryConsumed      map[identity.TaskID]int
+
 	done bool
 }
 
@@ -207,18 +217,23 @@ func (u *fakeUnitOfWork) Commit() error {
 	for id, row := range u.attempts {
 		s.Attempts[id] = &entityRow[run.Attempt]{value: row.value, revision: row.revision}
 	}
-	for id, row := range u.sessions {
-		s.Sessions[id] = &entityRow[run.Session]{value: row.value, revision: row.revision}
-	}
 	for id, row := range u.worktrees {
 		s.Worktrees[id] = &entityRow[run.Worktree]{value: row.value, revision: row.revision}
 	}
 	for _, w := range u.worktreeCreated {
 		s.Worktrees[w.ID] = &entityRow[run.Worktree]{value: w, revision: 1}
 	}
+	// sessionCreated merges BEFORE the staged sessions saves below: a
+	// transaction that creates a session and then immediately transitions
+	// it (Phase 3's assignment transaction — create, then Launch) stages
+	// both the bare Create and a subsequent Save for the SAME id, and the
+	// later logical write (the save) must win.
 	for _, sess := range u.sessionCreated { //nolint:gocritic // rangeValCopy: test fake; the domain snapshot is small and read-only here, and indexing would only obscure the loop.
 		s.Sessions[sess.ID] = &entityRow[run.Session]{value: sess, revision: 1}
 		s.AttemptByRun[sess.RunID] = sess.AttemptID // Phase 2: one attempt per run
+	}
+	for id, row := range u.sessions {
+		s.Sessions[id] = &entityRow[run.Session]{value: row.value, revision: row.revision}
 	}
 	for _, b := range u.bindingCreated { //nolint:gocritic // rangeValCopy: test fake; the domain snapshot is small and read-only here, and indexing would only obscure the loop.
 		s.Bindings[b.SessionID] = append(s.Bindings[b.SessionID], b)
@@ -251,6 +266,26 @@ func (u *fakeUnitOfWork) Commit() error {
 	maps.Copy(s.CheckRequests, u.checkRequestSaved)
 	s.Artifacts = append(s.Artifacts, u.artifactsSaved...)
 	s.Transitions = append(s.Transitions, u.transitions...)
+
+	for _, a := range u.attemptCreated {
+		s.Attempts[a.ID] = &entityRow[run.Attempt]{value: a, revision: 1}
+	}
+	for _, m := range u.messagesCreated { //nolint:gocritic // rangeValCopy: test fake; the domain snapshot is small and read-only here, and indexing would only obscure the loop.
+		s.Messages[m.ID] = m
+	}
+	for id, i := range u.integrationCreated { //nolint:gocritic // rangeValCopy: test fake; map iteration has no indexing alternative, and the domain snapshot is small and read-only here.
+		s.Integrations[id] = &entityRow[run.Integration]{value: i, revision: 1}
+	}
+	for id, row := range u.integrationSaved {
+		s.Integrations[id] = &entityRow[run.Integration]{value: row.value, revision: row.revision}
+	}
+	for taskID := range u.retryConsumed {
+		// The attempt number was already recorded by
+		// PlanStore.RequestRetry's own accepted receipt; consuming only
+		// clears the pending bookkeeping row.
+		delete(s.RetryRequests, taskID)
+		s.RetryRequestStates[taskID] = app.RetryRequestConsumed
+	}
 	return nil
 }
 
@@ -293,6 +328,11 @@ func (u *fakeUnitOfWork) validateStagedLocked() error {
 	}
 	for id, row := range u.worktrees {
 		if base, ok := s.Worktrees[id]; ok && base.revision != row.baseRevision {
+			return app.ErrRevisionConflict
+		}
+	}
+	for id, row := range u.integrationSaved {
+		if base, ok := s.Integrations[id]; ok && base.revision != row.baseRevision {
 			return app.ErrRevisionConflict
 		}
 	}
