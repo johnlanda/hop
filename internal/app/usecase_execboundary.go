@@ -204,7 +204,7 @@ func (c *Controller) seedWorkspaceTrust(ctx context.Context, harness string, san
 // FailLaunchExec settles the launch claim of incarnationID to exec_failed
 // with reason: the launcher's own error path once its claim is written and
 // the exec — or any step after the claim — fails
-// (docs/plan/phase-2-design.md section 6, step 6).
+// (docs/plan/phase-2-design.md section 6, step 7).
 func (c *Controller) FailLaunchExec(ctx context.Context, incarnationID, reason string) error {
 	id, err := identity.ParseIncarnationID(incarnationID)
 	if err != nil {

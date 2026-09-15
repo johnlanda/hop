@@ -81,7 +81,16 @@ user-prepared alternate profile directory; HOP only passes the harness's own
 profile variables through (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `HOME` plus the
 four `XDG_*_HOME` variables for opencode) and never bootstraps, seeds or
 verifies that profile beyond reporting the harness's own login status in
-`hop doctor`. Multi-account pools, round-robin selection, account-capacity
+`hop doctor`. One narrow exception was decided by the human on 2026-09-15
+after a verified spike: HOP pre-seeds Claude's per-worktree WORKSPACE-TRUST
+key (`projects["<resolved worktree path>"].hasTrustDialogAccepted = true`
+in the profile's `.claude.json`) at the launcher exec boundary, because an
+unattended worker otherwise stalls on the trust dialog for every fresh git
+worktree (the dialog defaults to "No, exit"). The seed touches exactly
+that key, never creates or rewrites an absent or unparsable config, and is
+recorded as launch evidence; onboarding, theme, login and every credential
+remain never-seeded, and Codex/opencode trust is not seeded (unverified /
+unknown). Multi-account pools, round-robin selection, account-capacity
 leases and cross-account resume are deferred to a later, optional phase. Every
 HOP-launched worker still passes through the sanitizing launcher described
 above at the harness exec boundary, stripping provider credential variables
@@ -155,6 +164,32 @@ alternate-profile/pools work; they are not re-verified here.
   is recorded per project as the `hasTrustDialogAccepted` key of the
   `projects` entry in the profile's `.claude.json` (key observed in a real
   configuration; values not read).
+- Workspace-trust pre-seeding (verified 2026-09-15 against 2.1.270, PTY
+  probes in an isolated unauthenticated profile). Setting
+  `projects["<path>"] = {"hasTrustDialogAccepted": true}` in the profile's
+  `.claude.json` before launch suppresses the interactive trust dialog for
+  exactly that working directory; no other key is needed. The path key must
+  be the ABSOLUTE working directory as Claude resolves it — macOS resolves
+  `/var` and `/tmp` symlinks to `/private/...`, and the dialog echoes the
+  resolved form. A trusted ANCESTOR entry suppresses the dialog for plain
+  subdirectories at any depth but is NOT honored when the cwd is itself a
+  git repository or git worktree root — every HOP attempt worktree is one —
+  so per-worktree exact entries are required. The dialog's pointer defaults
+  to "No, exit", and a run that ends with the dialog unanswered persists a
+  full default project entry with `hasTrustDialogAccepted: false`; a
+  pre-seed must therefore overwrite `false`, never only add-if-absent.
+  Interactive acceptance flips only that one key. Both the trust dialog and
+  the ready prompt render before login, so the probes needed no
+  authentication. These are undocumented internals pinned to 2.1.270: a
+  version drift needs re-verification, and the needs-interaction fallback
+  (surfacing a dialog that appeared anyway) stays in place.
+- Keychain side effect of any launch (observed during the same spike):
+  merely starting claude under a fresh `CLAUDE_CONFIG_DIR` — no login —
+  creates the keychain item
+  `Claude Code-credentials-<first 8 hex of sha256(config dir)>`, owned by
+  claude with no interactive prompt. HOP-managed profile directories will
+  accumulate one item per profile; retiring a profile should delete its
+  derived item as a cleanup step.
 - Onboarding. A fresh profile's first interactive launch renders a theme
   selection screen (`Welcome to Claude Code v2.1.259` … `Choose the text style
   that looks best with your terminal`) before any prompt can be delivered.
@@ -180,21 +215,24 @@ alternate-profile/pools work; they are not re-verified here.
   transcript are untested.
 - Live limit and quota behavior (what a running session shows when an account
   hits its limit) was not reproduced.
-- The exact post-theme onboarding sequence (login screen, trust dialog
-  ordering) was not captured.
+- The exact post-theme onboarding sequence (login screen ordering) was not
+  captured; the 2026-09-15 trust spike established only that the trust
+  dialog and the ready prompt render before login on 2.1.270.
 
 ### Launch recipe
 
 For a worker in a Herdr pane using account profile `<dir>`:
 
 1. Create `<dir>` (once per account) and bootstrap it interactively: a human
-   runs the first launch in the workspace, answering the onboarding, login
-   and trust prompts for exactly that workspace root — no ancestor-path
-   trust. Automated pre-seeding of `.claude.json` (`hasCompletedOnboarding`,
-   theme, per-project `hasTrustDialogAccepted`) is a pending design option:
-   the key names exist, but no verified seed contents suppress every
-   first-run prompt, so it must not be relied on yet. Print-mode launches
-   skip the trust dialog and need no bootstrap.
+   runs the first launch, answering the onboarding and login prompts.
+   Workspace trust needs no bootstrap: HOP pre-seeds
+   `projects["<resolved worktree path>"].hasTrustDialogAccepted = true`
+   into the profile's `.claude.json` at the launcher exec boundary
+   (verified against 2.1.270, see the workspace-trust pre-seeding item
+   above; the per-worktree exact entry is required because ancestor trust
+   is not honored for git roots). Onboarding pre-seeding
+   (`hasCompletedOnboarding`, theme) remains unverified and is not seeded.
+   Print-mode launches skip the trust dialog and need no bootstrap.
 2. Perform the account login once, interactively, in that profile
    (`CLAUDE_CONFIG_DIR=<dir> claude` then `/login`); this is a human step and
    can be part of the same bootstrap session.
@@ -620,10 +658,14 @@ Code-inspection facts cite `strings` output of the named installed binaries
    always strip provider key variables from worker environments, or is there
    a workflow that intentionally relies on them?
 
-Resolved by the 2026-09-14 decision (see [Adopted policy](#adopted-policy)):
-question 3 is moot — HOP never pre-seeds or bootstraps a profile; HOP does
-not answer or pre-seed onboarding or trust, and any required interactive
-preparation is performed by the human; question 4 is no — a dedicated Herdr
+Resolved by the 2026-09-14 decision (see [Adopted policy](#adopted-policy)),
+amended on 2026-09-15: question 3 is settled — HOP does not pre-seed
+onboarding or theme and never bootstraps a profile, but Claude
+workspace-trust pre-seeding for the exact worktree path was verified by
+spike and adopted (the adopted-policy exception above); Codex
+`trust_level = "trusted"` remains unverified and is not seeded. Any other
+required interactive preparation is performed by the human. Question 4 is
+no — a dedicated Herdr
 server/session is a later opt-in, not the default. That server choice is
 separate from whether native restore is account/profile-correct for HOP's
 sanitized launch/result contract, which remains not established either way
@@ -667,9 +709,11 @@ untrusted even under a logged-in profile) and neither harness's onboarding
 state has a verified cross-harness readiness probe, so `hop doctor` does
 not infer either from login status. A separately versioned readiness
 capability could add that later; this phase does not claim it. It performs
-no bootstrap, pre-seeding or trust decision itself: the human runs the
-harness's own normal interactive first-launch for the specific workspace,
-exactly as they would without HOP.
+no bootstrap, pre-seeding or trust decision itself: onboarding and login
+stay the human's own interactive first-launch, and the only profile write
+HOP performs anywhere is the launcher's Claude workspace-trust pre-seed
+(the adopted-policy exception above), which the exec-boundary launcher —
+not this port — applies and records as evidence.
 
 None of the three may ever: read, write or verify credential state in any
 profile — default or the configured alternate-profile directory — beyond
