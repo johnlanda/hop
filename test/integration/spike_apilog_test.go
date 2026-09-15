@@ -252,7 +252,7 @@ func runAPILogCase(t *testing.T, server *testServer, c *apiLogCase) {
 // forbidden string from both lines.
 func assertAPILogCase(t *testing.T, lines []string, startIdx, endIdx int, c *apiLogCase) {
 	t.Helper()
-	startLine := requireLine(t, lines, startIdx, endIdx, `event="api.request.start"`, `method="`+c.method+`"`)
+	startLine := requireLine(t, lines, startIdx, endIdx, `event="api.request.start"`, `method="`+c.method+`"`, `request_id="hop-1"`)
 	if got := logLevel(startLine); got != c.startLevel {
 		t.Errorf("%s start record level = %s, want %s: %s", c.method, got, c.startLevel, startLine)
 	}
@@ -260,7 +260,7 @@ func assertAPILogCase(t *testing.T, lines []string, startIdx, endIdx int, c *api
 	if !c.succeeds {
 		secondEvent, wantOutcome = `event="api.request.fail"`, "error"
 	}
-	secondLine := requireLine(t, lines, startIdx, endIdx, secondEvent, `method="`+c.method+`"`)
+	secondLine := requireLine(t, lines, startIdx, endIdx, secondEvent, `method="`+c.method+`"`, `request_id="hop-1"`)
 	if got := logLevel(secondLine); got != c.secondLevel {
 		t.Errorf("%s second record level = %s, want %s: %s", c.method, got, c.secondLevel, secondLine)
 	}

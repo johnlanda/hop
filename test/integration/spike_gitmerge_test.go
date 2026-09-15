@@ -295,9 +295,7 @@ func TestSpikeMergeNoVerifySkipsPreMergeCommitOnly(t *testing.T) {
 // accidental repo-local pre-merge-commit/post-merge script never runs --
 // confirmed for both an EMPTY existing temp directory and a directory path
 // that does not exist at all (git treats a missing hooksPath as "no hooks
-// configured there", not an error). This is recorded as a verified
-// suppression OPTION; adopting it is a design decision left to the human
-// (see docs/plan/phase-3-design.md section 11).
+// configured there", not an error).
 func TestSpikeMergeHooksPathSuppressesRepoLocalHooks(t *testing.T) {
 	artifacts := newArtifactDir(t)
 	repo := newFixtureRepo(t, artifacts, "repo")
