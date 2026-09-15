@@ -37,7 +37,7 @@ const (
 var runTransitions = newTransitionTable(concatPairs( //nolint:gochecknoglobals // runTransitions is the exhaustive, immutable Run state table of section 5; it never mutates after init.
 	fromAny(RunLaunching, RunCreated, RunResuming),
 	fromAny(RunRunning, RunLaunching, RunResuming, RunCompleting),
-	fromAny(RunCompleting, RunRunning),
+	fromAny(RunCompleting, RunRunning, RunResuming),
 	fromAny(RunCompleted, RunCompleting),
 	fromAny(RunStopping, RunCreated, RunLaunching, RunRunning, RunCompleting, RunResuming),
 	fromAny(RunStopped, RunStopping),
