@@ -11,11 +11,15 @@ import (
 // RunStatus is one line of `hop status` without `-run`: a run's identity,
 // position and current condition.
 type RunStatus struct {
-	RunID       identity.RunID
-	Sequence    int
-	State       run.RunState
-	Reconciling bool // at least one operation for the run is OperationReconciling
-	UpdatedAt   time.Time
+	RunID    identity.RunID
+	Sequence int
+	State    run.RunState
+	// StopRequested mirrors the run's monotonic stop flag: a held stop
+	// request routes resume back to stop handling before any adoption or
+	// new dispatch.
+	StopRequested bool
+	Reconciling   bool // at least one operation for the run is OperationReconciling
+	UpdatedAt     time.Time
 }
 
 // RunDetail is the full detail block `hop status -run` renders, and the

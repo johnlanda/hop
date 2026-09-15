@@ -292,7 +292,7 @@ func (s *fakeStore) runStatusLocked(runID identity.RunID) app.RunStatus {
 			break
 		}
 	}
-	return app.RunStatus{RunID: runID, Sequence: r.Sequence, State: r.State, Reconciling: reconciling, UpdatedAt: r.UpdatedAt}
+	return app.RunStatus{RunID: runID, Sequence: r.Sequence, State: r.State, StopRequested: r.StopRequested, Reconciling: reconciling, UpdatedAt: r.UpdatedAt}
 }
 
 func (s *fakeStore) LoadRunStatus(_ context.Context, runID identity.RunID) (app.RunDetail, error) {

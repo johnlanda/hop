@@ -1235,3 +1235,98 @@ func TestRetirementTargetImmutability(t *testing.T) {
 		t.Fatalf("the unresolved close was not marked reconciling on the occupant mismatch")
 	}
 }
+
+// TestReconciliationClaimSettlement is the M4 pending→reconciling→
+// claim-appears trace: a launch that went ambiguous (attempt reconciling)
+// is settled once the claim appears and its worker corroborates under the
+// inspected predicate, instead of staying stuck or being mistaken for a
+// restoration.
+func TestReconciliationClaimSettlement(t *testing.T) {
+	tc := newTestController(defaultPolicy())
+	_, detail := startedRun(t, tc)
+
+	// Round 1: an unidentified occupant with no claim fails closed and the
+	// attempt enters reconciling.
+	tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+		return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "/usr/bin/hop", Argv: []string{"hop", "launch", "--attempt", detail.AttemptID.String()}}}}, nil
+	}
+	tc.Clock.Advance(leaseTTL + time.Second)
+	first, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String()))
+	if err != nil {
+		t.Fatalf("first Resume() error = %v", err)
+	}
+	if first.Outcome != app.ResumeFailedClosed {
+		t.Fatalf("first Outcome = %s, want %s", first.Outcome, app.ResumeFailedClosed)
+	}
+	if got := tc.Store.Attempts[detail.AttemptID].value.State; got != run.AttemptReconciling {
+		t.Fatalf("Attempt.State = %s, want %s", got, run.AttemptReconciling)
+	}
+
+	// The launcher then writes its claim and execs; the live worker now
+	// corroborates under the predicate on the next round.
+	claimLaunch(t, tc, detail, 4242)
+	tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+		return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "/usr/bin/claude", Argv: []string{"claude", detail.AttemptID.String()}}}}, nil
+	}
+	tc.Clock.Advance(leaseTTL + time.Second)
+	second, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String()))
+	if err != nil {
+		t.Fatalf("second Resume() error = %v", err)
+	}
+	if second.Outcome != app.ResumeWarmReattached {
+		t.Fatalf("second Outcome = %s, want %s", second.Outcome, app.ResumeWarmReattached)
+	}
+	if got := tc.Store.LaunchClaims[detail.Binding.IncarnationID].State; got != app.LaunchClaimExeced {
+		t.Fatalf("claim state = %s, want %s (settled from reconciliation)", got, app.LaunchClaimExeced)
+	}
+	updated, err := tc.Store.LoadRunStatus(context.Background(), detail.RunID)
+	if err != nil {
+		t.Fatalf("LoadRunStatus() error = %v", err)
+	}
+	if updated.State != run.RunRunning || updated.AttemptState != run.AttemptRunning {
+		t.Fatalf("Run/Attempt = %s/%s, want running/running", updated.State, updated.AttemptState)
+	}
+}
+
+// TestResumeRoutesHeldStop is the M4 stop-requested→Resume→DriveStop
+// trace: a run holding a stop request is never restored to running by
+// resume; it is routed to stop handling, which retires the worker and
+// observes termination.
+func TestResumeRoutesHeldStop(t *testing.T) {
+	tc := newTestController(defaultPolicy())
+	_, detail := runningRun(t, tc)
+	if err := tc.Controller.RequestStop(context.Background(), detail.RunID.String()); err != nil {
+		t.Fatalf("RequestStop() error = %v", err)
+	}
+
+	tc.Clock.Advance(leaseTTL + time.Second)
+	result, handle, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String()))
+	if err != nil {
+		t.Fatalf("Resume() error = %v", err)
+	}
+	if result.Outcome != app.ResumeStopPending {
+		t.Fatalf("Outcome = %s, want %s", result.Outcome, app.ResumeStopPending)
+	}
+	if got := tc.Store.Runs[detail.RunID].value.State; got != run.RunStopping {
+		t.Fatalf("Run.State = %s, want %s (never turned back into resuming)", got, run.RunStopping)
+	}
+
+	// Stop handling then retires the worker and observes termination.
+	report, err := tc.Controller.DriveStop(context.Background(), handle)
+	if err != nil {
+		t.Fatalf("DriveStop() error = %v", err)
+	}
+	if report.Terminated {
+		t.Fatalf("report = %+v; the dispatched close is not yet observed termination", report)
+	}
+	tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+		return app.PaneProcess{}, app.ErrPaneNotFound
+	}
+	final, err := tc.Controller.DriveStop(context.Background(), handle)
+	if err != nil {
+		t.Fatalf("second DriveStop() error = %v", err)
+	}
+	if !final.Terminated || final.RunState != string(run.RunStopped) {
+		t.Fatalf("final report = %+v, want terminated/stopped", final)
+	}
+}

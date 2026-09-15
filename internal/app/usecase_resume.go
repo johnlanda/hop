@@ -51,6 +51,10 @@ const (
 	// recovered: the worktree was adopted or re-created and the worker pane
 	// was opened, continuing the original launch.
 	ResumeStartupContinued ResumeOutcome = "startup-continued"
+	// ResumeStopPending means the run holds a stop request: resume routes
+	// it back to stop handling (hop stop / DriveStop) before any worker
+	// adoption or new dispatch, and never restores it to running.
+	ResumeStopPending ResumeOutcome = "stop-pending"
 )
 
 // ResumeResult is one Resume call's outcome.
@@ -88,10 +92,18 @@ func (c *Controller) Resume(ctx context.Context, req ResumeRequest) (ResumeResul
 	switch entry.State {
 	case run.RunCompleted, run.RunFailed, run.RunStopped:
 		return ResumeResult{Outcome: ResumeNothingToDo, Detail: fmt.Sprintf("run is already %s", entry.State)}, handle, nil
+	case run.RunStopping:
+		// A stopping run is never turned back into a resuming one: recover
+		// pending operations (retirement acts are stop-compatible) and
+		// route the caller to stop handling, which observes termination.
+		if _, recoverErr := c.recoverPendingOperations(ctx, handle, entry); recoverErr != nil {
+			return ResumeResult{}, handle, recoverErr
+		}
+		return ResumeResult{Outcome: ResumeStopPending, Detail: "the run is stopping; drive hop stop to observe termination"}, handle, nil
 	case run.RunResuming:
 		// A previous resume round already entered resuming; entry is
 		// idempotent and reconciliation just continues.
-	case run.RunCreated, run.RunLaunching, run.RunRunning, run.RunCompleting, run.RunStopping:
+	case run.RunCreated, run.RunLaunching, run.RunRunning, run.RunCompleting:
 		if enterErr := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 			r, rRev, getErr := uow.Runs().Get(ctx, runID)
 			if getErr != nil {
@@ -130,6 +142,12 @@ func (c *Controller) Resume(ctx context.Context, req ResumeRequest) (ResumeResul
 // reconcile dispatches by the attempt's state, per the section 5 tables.
 // An unknown attempt state fails closed rather than passing as terminal.
 func (c *Controller) reconcile(ctx context.Context, handle RunHandle, detail RunDetail, req ResumeRequest, blocked []string) (ResumeResult, error) { //nolint:gocritic // hugeParam: RunHandle, RunDetail and ResumeRequest are per-call DTOs; this runs once per resume round.
+	if detail.StopRequested {
+		// A held stop request wins over adoption and every new dispatch:
+		// request the stop transition (monotonic; it moves a resuming run
+		// to stopping) and hand the run to stop handling.
+		return ResumeResult{Outcome: ResumeStopPending, Detail: "the run holds a stop request; run hop stop to retire its work and observe termination"}, nil
+	}
 	switch detail.AttemptState {
 	case run.AttemptReserved:
 		return c.continueStartup(ctx, handle, detail, req, blocked)
@@ -643,6 +661,31 @@ func (c *Controller) reconcileActive(ctx context.Context, handle RunHandle, deta
 	}
 
 	if !occupantAbsent {
+		// An exec_pending claim on an already-reconciling attempt settles
+		// here, under the same inspected predicate — the ordinary
+		// launching-state path no longer applies once the attempt entered
+		// reconciling, and a live matching worker must not stay stuck.
+		if detail.Claim != nil && detail.Claim.State == LaunchClaimExecPending && detail.AttemptState == run.AttemptReconciling {
+			markers, markerErr := c.launchMarkers(ctx, handle, detail)
+			if markerErr != nil {
+				return ResumeResult{}, markerErr
+			}
+			paneMatches := detail.Binding.IncarnationID == detail.Claim.IncarnationID && !detail.Binding.Superseded
+			if CorroborateSettlement(paneMatches, pane, markers, *detail.Claim) == SettlementSettled {
+				now := c.Clock.Now()
+				matched := FirstMarkerMatch(pane, markers)
+				if settleErr := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+					return uow.LaunchClaims().Settle(ctx, detail.Claim.IncarnationID, LaunchClaimSettlement{
+						State: LaunchClaimExeced, PaneID: detail.Binding.PaneID, PID: firstForeground(pane).PID,
+						Executable: detail.Claim.Executable, ArgvMarker: matched, At: now,
+					})
+				}); settleErr != nil {
+					return ResumeResult{}, fmt.Errorf("app: settle launch claim from reconciliation: %w", settleErr)
+				}
+				return c.warmReattach(ctx, handle, detail, priorAttemptState, pane, matched)
+			}
+		}
+
 		// Warm adoption goes through the one corroboration predicate,
 		// against a settled claim only; an exec_pending claim was already
 		// routed through the ordinary settlement path above.
