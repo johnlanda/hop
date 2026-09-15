@@ -164,28 +164,38 @@ func TestRealProcessRunEndToEnd(t *testing.T) {
 		t.Error("hop status does not report a last check execution")
 	}
 
-	// Pin the early-submission/transient round trip (section 7 step 4):
-	// the worker's very first hop result submit races the launch claim's
-	// settlement and is rejected transient, and — because hop result
-	// submit's first stdout line is the fixed section 7 protocol text
-	// (cmd/hop/resultcmd.go's transientRetrySignal), never the store's own
-	// Detail — the worker recognizes it and retries until accepted.
-	if !strings.Contains(server.readPane(t, paneIDFromBinding(fields["binding"])), "first-line=[transient") {
-		t.Error("the worker pane's scrollback never shows a first line beginning with \"transient\"; the early-submission race was not exercised")
-	}
+	// Section 7 step 4's early-submission contract: the worker's first hop
+	// result submit races the launch claim's settlement. The design's own
+	// reference trace 1 makes both orderings legitimate — a submission
+	// observed before settlement is rejected transient and retried; a
+	// submission observed after settlement (the claim already settled by
+	// the time the acceptance transaction runs) is accepted immediately,
+	// atomically advancing the run's lifecycle as part of that same
+	// transaction — so the receipt history is asserted as the invariant
+	// both orderings satisfy: zero or more transient receipts followed by
+	// exactly one accepted receipt, nothing else. hop result submit's
+	// first stdout line is the fixed section 7 protocol text
+	// (cmd/hop/resultcmd.go's transientRetrySignal, never the store's own
+	// Detail) that the worker recognizes to retry, so its pane scrollback
+	// shows a first line beginning with "transient" if and only if a
+	// transient receipt exists in that history.
 	history := querySQLite(t, filepath.Join(stateDir, "hop.db"), "SELECT outcome FROM result_submissions ORDER BY submitted_at;")
 	outcomes := strings.Split(history, "\n")
-	transientAt, acceptedAt := -1, -1
+	sawTransient := false
 	for i, outcome := range outcomes {
+		last := i == len(outcomes)-1
 		switch {
-		case outcome == "transient" && transientAt == -1:
-			transientAt = i
-		case outcome == "accepted" && acceptedAt == -1:
-			acceptedAt = i
+		case outcome == "transient" && !last:
+			sawTransient = true
+		case outcome == "accepted" && last:
+			// The required terminal receipt.
+		default:
+			t.Errorf("result_submissions outcome history = %q, want zero or more transient receipts followed by exactly one accepted receipt", outcomes)
 		}
 	}
-	if transientAt == -1 || acceptedAt == -1 || transientAt >= acceptedAt {
-		t.Errorf("result_submissions outcome history = %q, want a transient receipt followed by an accepted one", outcomes)
+	scrollback := server.readPane(t, paneIDFromBinding(fields["binding"]))
+	if sawTransientLine := strings.Contains(scrollback, "first-line=[transient"); sawTransient != sawTransientLine {
+		t.Errorf("transient receipt present=%v but worker scrollback shows a transient first line=%v, want them to agree; scrollback:\n%s", sawTransient, sawTransientLine, scrollback)
 	}
 }
 

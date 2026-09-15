@@ -109,6 +109,13 @@ deliberately via `make test-live`.
 
 ## Section 9 real-process scenario coverage
 
+The transient early-submission path (design section 7 step 4) is exercised
+opportunistically by `TestRealProcessRunEndToEnd` — the design's own
+reference trace 1 makes either submission ordering legitimate, so that
+scenario asserts the receipt-history invariant both orderings satisfy
+rather than forcing one — and deterministically by `cmd/hop`'s own
+`result submit` tests and the sqlite store's submission tests.
+
 Every design section 9 real-process row this task could express against
 the unmodified `hop` binary and current landed code is a scenario listed
 above. The following were evaluated and are **not expressible** without
