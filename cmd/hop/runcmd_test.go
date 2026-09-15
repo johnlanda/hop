@@ -137,6 +137,52 @@ func TestRunRun(t *testing.T) {
 		}
 	})
 
+	t.Run("a signal during an in-flight app call still prints the resume instruction", func(t *testing.T) {
+		ctrl := &fakeController{}
+		ctrl.startRun = func(app.StartRunRequest) (app.StartRunResult, app.RunHandle, error) {
+			return app.StartRunResult{RunID: testRunID, Sequence: 1}, app.RunHandle{}, nil
+		}
+		td := newTestDeps(ctrl, env, t.TempDir())
+		statusCalls := 0
+		ctrl.status = func(app.StatusRequest) (app.StatusResult, error) {
+			statusCalls++
+			if statusCalls == 2 {
+				// The signal lands while this Status call is in flight; the
+				// call observes its own context's cancellation and returns
+				// the canceled error, exactly as the real store would.
+				td.signals <- syscall.SIGINT
+				<-ctrl.statusCtx().Done()
+				return app.StatusResult{}, fmt.Errorf("load run status: %w", ctrl.statusCtx().Err())
+			}
+			return detailStep("running", "running", false), nil
+		}
+		var stdout, stderr bytes.Buffer
+
+		code, err := runRun([]string{"brief"}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+
+		if code != exitFailure {
+			t.Errorf("exit code = %d, want %d", code, exitFailure)
+		}
+		if !strings.Contains(stdout.String(), "resume with: hop resume "+testRunID) {
+			t.Errorf("output lacks the resume instruction:\n%s", stdout.String())
+		}
+		if strings.Contains(stderr.String(), "context canceled") {
+			t.Errorf("the detach was misclassified as an ordinary failure:\n%s", stderr.String())
+		}
+		detached := false
+		for _, call := range ctrl.recorded() {
+			if call == "Detach" {
+				detached = true
+			}
+		}
+		if !detached {
+			t.Error("Detach was not called on the in-flight cancellation path")
+		}
+	})
+
 	usage := []struct {
 		name string
 		args []string

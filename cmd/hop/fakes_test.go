@@ -17,6 +17,10 @@ import (
 type fakeController struct {
 	mu    sync.Mutex
 	calls []string
+	// lastStatusCtx is the context of the newest Status call, so a
+	// scripted status fake can observe the foreground cancellation the
+	// command created (the fake signature itself carries no context).
+	lastStatusCtx context.Context //nolint:containedctx // test-only capture of the call's context for deterministic cancellation scripting.
 
 	startRun         func(req app.StartRunRequest) (app.StartRunResult, app.RunHandle, error)
 	resume           func(req app.ResumeRequest) (app.ResumeResult, app.RunHandle, error)
@@ -63,12 +67,22 @@ func (f *fakeController) Resume(_ context.Context, req app.ResumeRequest) (app.R
 	return f.resume(req)
 }
 
-func (f *fakeController) Status(_ context.Context, req app.StatusRequest) (app.StatusResult, error) {
+func (f *fakeController) Status(ctx context.Context, req app.StatusRequest) (app.StatusResult, error) {
+	f.mu.Lock()
+	f.lastStatusCtx = ctx
+	f.mu.Unlock()
 	f.record("Status")
 	if f.status == nil {
 		return app.StatusResult{}, errors.New("unexpected Status")
 	}
 	return f.status(req)
+}
+
+// statusCtx returns the newest Status call's context.
+func (f *fakeController) statusCtx() context.Context {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastStatusCtx
 }
 
 func (f *fakeController) RequestStop(_ context.Context, runID string) error {

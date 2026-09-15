@@ -161,10 +161,19 @@ func runRun(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 
 // finishControllerLoop runs the shared foreground loop and maps its ending
 // to the design's exit codes: the terminal state's code, or a detach (exit
-// 1) that releases the lease and prints the resume instruction.
+// 1) that releases the lease and prints the resume instruction. A canceled
+// foreground signal context is classified BEFORE ordinary errors: the
+// cancellation surfaces through whichever app call was in flight (status,
+// corroboration, a check), and that is still the detach path — the resume
+// instruction is owed either way. Ordinary failures (a heartbeat fencing
+// loss included) keep their error report when the foreground context is
+// live.
 func finishControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, handle app.RunHandle, runID, label, hopPath string, stdout, stderr io.Writer, command string) (int, error) { //nolint:gocritic // hugeParam: RunHandle is the app-defined opaque token, passed by value as every Controller method takes it.
 	result, err := runControllerLoop(ctx, d, ctrl, handle, runID, label, hopPath, stdout)
 	if err != nil {
+		if ctx.Err() != nil {
+			return exitFailure, detachAndReport(ctx, ctrl, handle, runID, stdout)
+		}
 		releaseQuietly(ctx, ctrl, handle)
 		_, werr := fmt.Fprintf(stderr, "%s: %v\n", command, err)
 		return exitFailure, werr
