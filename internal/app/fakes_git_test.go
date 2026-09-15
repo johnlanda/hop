@@ -3,6 +3,7 @@ package app_test
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 
@@ -169,6 +170,11 @@ subcommand:
 	rest := args[i+1:]
 	switch sub {
 	case "rev-parse":
+		// The single-repository world: every checkout shares one common
+		// directory, matching fakeCommands' default stub.
+		if slices.Contains(rest, "--git-common-dir") {
+			return app.CommandResult{ExitCode: 0, Stdout: []byte("/repo/.git\n")}
+		}
 		var revs []string
 		for _, a := range rest {
 			if strings.HasPrefix(a, "--") {
@@ -361,4 +367,17 @@ func (g *fakeGitRepo) isAncestorLocked(ancestor, descendant string) bool {
 		queue = append(queue, g.commits[oid].parents...)
 	}
 	return false
+}
+
+// registerWorktree records a checkout at path for a resolvable rev — the
+// stand-in for Runtime.CreateWorktree's real materialization.
+func (g *fakeGitRepo) registerWorktree(path, rev string) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	oid, err := g.resolveLocked(rev, "")
+	if err != nil {
+		return err
+	}
+	g.worktrees[path] = oid
+	return nil
 }

@@ -2,7 +2,9 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"slices"
 	"sort"
 
 	"github.com/johnlanda/hop/internal/domain/identity"
@@ -55,7 +57,7 @@ func (c *Controller) RetireSettledSessions(ctx context.Context, handle RunHandle
 		return RetirementReport{}, fmt.Errorf("app: load run status: %w", err)
 	}
 
-	candidates, anyTaskFailed, err := c.retirementCandidates(ctx, handle)
+	candidates, inFlight, anyTaskFailed, err := c.retirementCandidates(ctx, handle)
 	if err != nil {
 		return RetirementReport{}, err
 	}
@@ -74,6 +76,22 @@ func (c *Controller) RetireSettledSessions(ctx context.Context, handle RunHandle
 		}
 	}
 
+	// A LIVE controller that establishes an in-flight worker's absence
+	// (the strict positive rule) with no accepted result marks the
+	// attempt interrupted and notifies the manager: a self-exiting worker
+	// is a behavioral failure, and retrying it is manager judgment, never
+	// an automatic same-attempt relaunch (section 5). Ambiguity changes
+	// nothing.
+	for i := range inFlight {
+		exited, err := c.observeWorkerExit(ctx, handle, &frozen, &inFlight[i].Session)
+		if err != nil {
+			return report, err
+		}
+		if exited {
+			report.Retired = append(report.Retired, inFlight[i].Session.ID.String())
+		}
+	}
+
 	if anyTaskFailed && len(report.Outstanding) == 0 {
 		failed, outstanding, err := c.driveFeatureTerminalFailure(ctx, handle, &frozen)
 		if err != nil {
@@ -88,10 +106,13 @@ func (c *Controller) RetireSettledSessions(ctx context.Context, handle RunHandle
 }
 
 // retirementCandidates reads the run's child sessions and decides which
-// have reached a retirement boundary.
-func (c *Controller) retirementCandidates(ctx context.Context, handle RunHandle) ([]retirementCandidate, bool, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
+// have reached a retirement boundary; inFlight lists sessions whose
+// attempt is still in flight under a settled claim — the self-exit
+// observation probes them for positive absence.
+func (c *Controller) retirementCandidates(ctx context.Context, handle RunHandle) ([]retirementCandidate, []retirementCandidate, bool, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
 	var (
 		candidates    []retirementCandidate
+		inFlight      []retirementCandidate
 		anyTaskFailed bool
 	)
 	err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
@@ -155,13 +176,153 @@ func (c *Controller) retirementCandidates(ctx context.Context, handle RunHandle)
 				boundary = "run terminal failure"
 			}
 			if boundary == "" {
+				if attempt.State == run.AttemptLaunching || attempt.State == run.AttemptRunning {
+					inFlight = append(inFlight, retirementCandidate{Session: s})
+				}
 				continue
 			}
 			candidates = append(candidates, retirementCandidate{Session: s, Boundary: boundary})
 		}
 		return nil
 	})
-	return candidates, anyTaskFailed, err
+	return candidates, inFlight, anyTaskFailed, err
+}
+
+// observeWorkerExit probes one in-flight worker for a self-exit: only a
+// POSITIVELY absent pane (by id and by label, under a settled claim)
+// establishes it; ambiguity and a live occupant change nothing. On
+// establishment, one transaction interrupts the attempt, settles the
+// task by budget (a failure closure journals the orphaned obligations),
+// terminates the session and commits the manager notice.
+func (c *Controller) observeWorkerExit(ctx context.Context, handle RunHandle, frozen *FrozenRun, session *run.Session) (bool, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per in-flight session per round.
+	binding, bindingFound, claim, claimFound, _, err := c.sessionCloseEvidence(ctx, handle, session)
+	if err != nil {
+		return false, err
+	}
+	if !bindingFound || binding.PaneID == "" || !claimFound || claim.State != LaunchClaimExeced {
+		return false, nil // pre-claim launches stay the launch machinery's.
+	}
+	_, absent, ambiguous := c.observePaneAbsence(ctx, binding.PaneID, binding.CreationLabel)
+	if ambiguous != "" || !absent {
+		return false, nil
+	}
+	return true, c.settleWorkerInterruption(ctx, handle, frozen, session)
+}
+
+// settleWorkerInterruption settles an observed self-exit.
+func (c *Controller) settleWorkerInterruption(ctx context.Context, handle RunHandle, frozen *FrozenRun, session *run.Session) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per established self-exit.
+	var task run.Task
+	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		attempt, _, attErr := uow.Attempts().Get(ctx, session.AttemptID)
+		if attErr != nil {
+			return attErr
+		}
+		t, _, taskErr := uow.Tasks().Get(ctx, attempt.TaskID)
+		if taskErr != nil {
+			return taskErr
+		}
+		task = t
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	for round := 0; round < settlementNoticeRetries; round++ {
+		prediction, obligations, err := c.predictTaskConsequence(ctx, handle, frozen, task.ID, false)
+		if err != nil {
+			return err
+		}
+		body := renderTaskNotice(&task, prediction, "worker exited without an accepted result (observed absent under its settled claim)", obligations)
+		notice, err := c.prepareControllerNotice(ctx, handle, frozen.Snapshot.StateRoot, body)
+		if err != nil {
+			return err
+		}
+		err = c.applyWorkerInterruption(ctx, handle, frozen, session, &task, prediction, obligations, notice)
+		if errors.Is(err, errSettlementRetry) {
+			continue
+		}
+		return err
+	}
+	return fmt.Errorf("app: worker %s interruption settlement kept racing concurrent sends", session.ID)
+}
+
+// applyWorkerInterruption is one interruption-settlement transaction.
+func (c *Controller) applyWorkerInterruption(ctx context.Context, handle RunHandle, frozen *FrozenRun, session *run.Session, task *run.Task, prediction taskConsequence, obligations []string, notice controllerNotice) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
+	now := c.Clock.Now()
+	return c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		wf, wfErr := RequireWorkflowRepositories(uow, "worker interruption")
+		if wfErr != nil {
+			return wfErr
+		}
+		r, _, runErr := uow.Runs().Get(ctx, handle.runID)
+		if runErr != nil {
+			return runErr
+		}
+		a, aRev, attErr := uow.Attempts().Get(ctx, session.AttemptID)
+		if attErr != nil {
+			return attErr
+		}
+		t, tRev, taskErr := uow.Tasks().Get(ctx, task.ID)
+		if taskErr != nil {
+			return taskErr
+		}
+		attempts, listErr := wf.AttemptIndex().ByTask(ctx, task.ID)
+		if listErr != nil {
+			return listErr
+		}
+		consequence := decideTaskConsequence(r.StopRequested, len(attempts), retryLimitFor(&frozen.Snapshot))
+		if consequence != prediction {
+			return errSettlementRetry
+		}
+		generation := gen(handle.lease.Generation)
+
+		aFrom := a.State
+		aNext, trErr := a.Interrupt(now)
+		if trErr != nil {
+			return trErr
+		}
+		if _, saveErr := uow.Attempts().Save(ctx, aNext, aRev); saveErr != nil {
+			return saveErr
+		}
+		if err := recordTransition(ctx, uow, EntityAttempt, a.ID.String(), string(aFrom), string(aNext.State), "worker exited without an accepted result", generation, now); err != nil {
+			return err
+		}
+
+		tFrom := t.State
+		var tNext run.Task
+		switch consequence {
+		case taskConsequenceInterrupted:
+			tNext, trErr = t.Interrupt(now)
+		case taskConsequenceFailed:
+			tNext, trErr = t.Fail(now)
+		default:
+			tNext, trErr = t.NeedsRework(now)
+		}
+		if trErr != nil {
+			return trErr
+		}
+		if consequence == taskConsequenceFailed {
+			current, oblErr := c.pendingTaskObligations(ctx, wf, handle.runID, task.ID)
+			if oblErr != nil {
+				return oblErr
+			}
+			if !slices.Equal(current, obligations) {
+				return errSettlementRetry
+			}
+			tNext = tNext.CloseMailbox(now)
+		}
+		if _, saveErr := uow.Tasks().Save(ctx, tNext, tRev); saveErr != nil {
+			return saveErr
+		}
+		if err := recordTransition(ctx, uow, EntityTask, t.ID.String(), string(tFrom), string(tNext.State), "worker exited without an accepted result", generation, now); err != nil {
+			return err
+		}
+
+		if err := terminateSession(ctx, uow, session.ID, "worker exited without an accepted result; observed absent", generation, now); err != nil {
+			return err
+		}
+		return commitControllerNotice(ctx, wf, handle.runID, notice, now)
+	})
 }
 
 // sessionCloseEvidence resolves one session's recorded close-target

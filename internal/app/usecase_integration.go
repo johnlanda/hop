@@ -880,8 +880,9 @@ func (c *Controller) advanceChecking(ctx context.Context, handle RunHandle, froz
 	if err != nil {
 		return report, err
 	}
-	report.Interrupted = interrupted
-	return c.reportCurrentIntegrationState(ctx, handle, integ.ID)
+	final, reportErr := c.reportCurrentIntegrationState(ctx, handle, integ.ID)
+	final.Interrupted = interrupted
+	return final, reportErr
 }
 
 // settledIntegrationCheckReceipt scans settled combined-check executions

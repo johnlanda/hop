@@ -50,20 +50,39 @@ func (c *Controller) resolveGuardHead(ctx context.Context, handle RunHandle, fro
 		if taskErr != nil {
 			return taskErr
 		}
-		var newest *run.Integration
+		var integrated []run.Integration
 		for i := range tasks {
 			integrations, intErr := wf.Integrations().ByTask(ctx, tasks[i].ID)
 			if intErr != nil {
 				return intErr
 			}
 			for j := range integrations {
-				if integrations[j].State != run.IntegrationIntegrated {
-					continue
+				if integrations[j].State == run.IntegrationIntegrated {
+					integrated = append(integrated, integrations[j])
 				}
-				if newest == nil || integrations[j].UpdatedAt.After(newest.UpdatedAt) {
-					v := integrations[j]
-					newest = &v
+			}
+		}
+		// Serial integration makes the head derivable from the recorded
+		// chain alone, clock-free: each integration's pre-merge head is
+		// its predecessor's candidate, so the CURRENT head is the
+		// integrated candidate no OTHER integrated row consumed as its
+		// pre-merge base. Timestamps only break a tie the chain cannot
+		// (which a serial journal never produces).
+		var newest *run.Integration
+		for i := range integrated {
+			consumed := false
+			for j := range integrated {
+				if i != j && integrated[j].PremergeHeadOID == integrated[i].MergeCommitOID {
+					consumed = true
+					break
 				}
+			}
+			if consumed {
+				continue
+			}
+			if newest == nil || integrated[i].UpdatedAt.After(newest.UpdatedAt) {
+				v := integrated[i]
+				newest = &v
 			}
 		}
 		if newest != nil {
