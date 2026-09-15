@@ -183,9 +183,11 @@ func TestClaimAndRunCheck(t *testing.T) {
 			t.Fatalf("Run.State = %s (err %v), want %s (no unknown outcome was declared)", updated.State, loadErr, run.RunCompleting)
 		}
 
-		// The next round retires the claimed group; only its observed
-		// absence (the default empty listing) permits the unknown-outcome
-		// rule, which is terminal for an unrepeatable check.
+		// The next round retires the claimed group; its observed absence
+		// (the default empty listing) permits the unknown-outcome rule,
+		// which fails the task and attempt — but the run fails only after
+		// its worker's termination is observed, so this round dispatches
+		// the worker close and leaves the run untouched.
 		tc.Commands.CheckExecFn = nil
 		blockedReport, err := tc.Controller.ClaimAndRunCheck(context.Background(), handle, "/usr/local/bin/hop", nil)
 		if err != nil {
@@ -198,13 +200,34 @@ func TestClaimAndRunCheck(t *testing.T) {
 		if err != nil {
 			t.Fatalf("LoadRunStatus() error = %v", err)
 		}
-		if updated.State != run.RunFailed || updated.AttemptState != run.AttemptFailed {
-			t.Fatalf("Run/Attempt = %s/%s, an unrepeatable unknown outcome must never complete", updated.State, updated.AttemptState)
+		if updated.AttemptState != run.AttemptFailed {
+			t.Fatalf("Attempt.State = %s, want %s", updated.AttemptState, run.AttemptFailed)
+		}
+		if updated.State == run.RunFailed || updated.State == run.RunCompleted {
+			t.Fatalf("Run.State = %s; the run must not go terminal while its worker may be live", updated.State)
+		}
+		if len(tc.Runtime.ClosedPanes) != 1 {
+			t.Fatalf("ClosePane calls = %d, want the worker close dispatched once", len(tc.Runtime.ClosedPanes))
 		}
 		for _, cr := range tc.Store.CheckRequests {
 			if cr.State != app.CheckRequestSettled {
 				t.Fatalf("check request state = %s, want settled after the terminal unknown outcome", cr.State)
 			}
+		}
+
+		// Once the worker's termination is observed, the run fails.
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			return app.PaneProcess{}, app.ErrPaneNotFound
+		}
+		if _, thirdErr := tc.Controller.ClaimAndRunCheck(context.Background(), handle, "/usr/local/bin/hop", nil); thirdErr != nil {
+			t.Fatalf("third ClaimAndRunCheck() error = %v", thirdErr)
+		}
+		final, err := tc.Store.LoadRunStatus(context.Background(), detail.RunID)
+		if err != nil {
+			t.Fatalf("LoadRunStatus() error = %v", err)
+		}
+		if final.State != run.RunFailed {
+			t.Fatalf("Run.State = %s, want %s after the worker's observed termination", final.State, run.RunFailed)
 		}
 	})
 
@@ -506,5 +529,141 @@ func TestOrphanedClaimedCheckRequest(t *testing.T) {
 	}
 	if !report.Ran || !report.Passed {
 		t.Fatalf("report = %+v, want the reopened request claimed and run to completion", report)
+	}
+}
+
+// TestStopPrecedenceInUnknownRecovery covers M7's stop-side windows: a
+// stop request held during unknown-outcome recovery interrupts rather
+// than terminally fails, and a stop-retired check execution settles its
+// request.
+func TestStopPrecedenceInUnknownRecovery(t *testing.T) {
+	t.Run("stopped during unknown recovery: interrupted, request settled, stop completes", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		handle, detail := runningRun(t, tc)
+		if _, err := tc.Controller.SubmitResult(context.Background(), defaultSubmitRequest(detail)); err != nil {
+			t.Fatalf("SubmitResult() error = %v", err)
+		}
+		tc.Commands.CheckExecFn = func(ctx context.Context, cmd app.Command) (app.CommandResult, error) {
+			if err := tc.Store.ClaimCheckExec(ctx, checkExecOpID(t, cmd), 5150); err != nil {
+				t.Errorf("ClaimCheckExec() error = %v", err)
+			}
+			return app.CommandResult{}, context.DeadlineExceeded
+		}
+		if _, err := tc.Controller.ClaimAndRunCheck(context.Background(), handle, "/usr/local/bin/hop", nil); err == nil {
+			t.Fatalf("ClaimAndRunCheck() succeeded despite the lost execution")
+		}
+		tc.Commands.CheckExecFn = nil
+		if err := tc.Controller.RequestStop(context.Background(), detail.RunID.String()); err != nil {
+			t.Fatalf("RequestStop() error = %v", err)
+		}
+
+		// Recovery under the held stop: the group's observed absence
+		// settles the execution as unknown, interrupts task and attempt,
+		// and leaves the run to stop handling.
+		if _, err := tc.Controller.ClaimAndRunCheck(context.Background(), handle, "/usr/local/bin/hop", nil); err != nil {
+			t.Fatalf("recovery ClaimAndRunCheck() error = %v", err)
+		}
+		updated, err := tc.Store.LoadRunStatus(context.Background(), detail.RunID)
+		if err != nil {
+			t.Fatalf("LoadRunStatus() error = %v", err)
+		}
+		if updated.AttemptState != run.AttemptInterrupted || updated.TaskState != run.TaskInterrupted {
+			t.Fatalf("Attempt/Task = %s/%s, want both interrupted (stop precedence)", updated.AttemptState, updated.TaskState)
+		}
+		if updated.State != run.RunStopping {
+			t.Fatalf("Run.State = %s, want %s (left for stop handling)", updated.State, run.RunStopping)
+		}
+		for _, cr := range tc.Store.CheckRequests {
+			if cr.State != app.CheckRequestSettled {
+				t.Fatalf("check request state = %s, want settled", cr.State)
+			}
+		}
+
+		// Stop handling then retires the worker and observes termination.
+		if _, driveErr := tc.Controller.DriveStop(context.Background(), handle); driveErr != nil {
+			t.Fatalf("DriveStop() error = %v", driveErr)
+		}
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			return app.PaneProcess{}, app.ErrPaneNotFound
+		}
+		final, err := tc.Controller.DriveStop(context.Background(), handle)
+		if err != nil {
+			t.Fatalf("final DriveStop() error = %v", err)
+		}
+		if !final.Terminated {
+			t.Fatalf("final report = %+v, want terminated", final)
+		}
+	})
+
+	t.Run("a stop-retired check settles its request through DriveStop", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		handle, detail := runningRun(t, tc)
+		if _, err := tc.Controller.SubmitResult(context.Background(), defaultSubmitRequest(detail)); err != nil {
+			t.Fatalf("SubmitResult() error = %v", err)
+		}
+		tc.Commands.CheckExecFn = func(ctx context.Context, cmd app.Command) (app.CommandResult, error) {
+			if err := tc.Store.ClaimCheckExec(ctx, checkExecOpID(t, cmd), 5150); err != nil {
+				t.Errorf("ClaimCheckExec() error = %v", err)
+			}
+			return app.CommandResult{}, context.DeadlineExceeded
+		}
+		if _, err := tc.Controller.ClaimAndRunCheck(context.Background(), handle, "/usr/local/bin/hop", nil); err == nil {
+			t.Fatalf("ClaimAndRunCheck() succeeded despite the lost execution")
+		}
+		if err := tc.Controller.RequestStop(context.Background(), detail.RunID.String()); err != nil {
+			t.Fatalf("RequestStop() error = %v", err)
+		}
+
+		// DriveStop retires the claimed group (observed empty) and settles
+		// both the operation and its request.
+		if _, driveErr := tc.Controller.DriveStop(context.Background(), handle); driveErr != nil {
+			t.Fatalf("DriveStop() error = %v", driveErr)
+		}
+		for _, cr := range tc.Store.CheckRequests {
+			if cr.State != app.CheckRequestSettled {
+				t.Fatalf("check request state = %s, want settled by the stop-retired execution", cr.State)
+			}
+		}
+	})
+}
+
+// TestBlockedCheckRefusesColdRelaunch is the M7 cold branch: an
+// uninspectable or foreign old check group blocks a newly authorized cold
+// worker launch.
+func TestBlockedCheckRefusesColdRelaunch(t *testing.T) {
+	tc := newTestController(defaultPolicy())
+	handle, detail := runningRun(t, tc)
+	if _, err := tc.Controller.SubmitResult(context.Background(), defaultSubmitRequest(detail)); err != nil {
+		t.Fatalf("SubmitResult() error = %v", err)
+	}
+	tc.Commands.CheckExecFn = func(ctx context.Context, cmd app.Command) (app.CommandResult, error) {
+		if err := tc.Store.ClaimCheckExec(ctx, checkExecOpID(t, cmd), 5150); err != nil {
+			t.Errorf("ClaimCheckExec() error = %v", err)
+		}
+		return app.CommandResult{}, context.DeadlineExceeded
+	}
+	if _, err := tc.Controller.ClaimAndRunCheck(context.Background(), handle, "/usr/local/bin/hop", nil); err == nil {
+		t.Fatalf("ClaimAndRunCheck() succeeded despite the lost execution")
+	}
+	// The recorded group now holds a foreign process: retirement stays
+	// blocked, never signaled.
+	tc.Groups.Processes[5150] = []app.GroupProcess{{PID: 6000, Argv: []string{"unrelated"}}}
+	// The worker pane is positively gone and the human attests absence.
+	tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+		return app.PaneProcess{}, app.ErrPaneNotFound
+	}
+
+	req := defaultResumeRequest(detail.RunID.String())
+	req.ConfirmAbsent = true
+	tc.Clock.Advance(leaseTTL + time.Second)
+	result, _, err := tc.Controller.Resume(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Resume() error = %v", err)
+	}
+	if result.Outcome != app.ResumeReconciling {
+		t.Fatalf("Outcome = %s, want %s (an unresolved check group blocks the cold relaunch)", result.Outcome, app.ResumeReconciling)
+	}
+	if got := tc.Store.Attempts[detail.AttemptID].value.State; got == run.AttemptRelaunching {
+		t.Fatalf("the attempt relaunched over an unresolved check group")
 	}
 }

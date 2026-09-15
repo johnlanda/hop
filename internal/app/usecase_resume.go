@@ -216,8 +216,15 @@ func (c *Controller) recoverPendingOperations(ctx context.Context, handle RunHan
 				frozen = &loaded
 			}
 			// Takeover reads the check-exec claim and retires its process
-			// group; confirmed absence applies the unknown-outcome rule.
-			_, err = c.recoverCheckExecution(ctx, handle, op, frozen)
+			// group; confirmed absence applies the unknown-outcome rule. A
+			// still-unresolved execution blocks new acts: an uninspectable
+			// or live old check group must never coexist with a newly
+			// authorized cold worker launch.
+			var still string
+			still, err = c.recoverCheckExecution(ctx, handle, op, frozen)
+			if still != "" {
+				blocked = append(blocked, still)
+			}
 		case OpPaneClose, OpAbsenceAttested:
 			// Resolved by their own drivers; attestations are journal-only.
 		default:

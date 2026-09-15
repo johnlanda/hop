@@ -237,6 +237,9 @@ func (c *Controller) recoverCheckState(ctx context.Context, handle RunHandle, fr
 	if blocked != "" {
 		return blocked, nil
 	}
+	if err := c.driveTerminalUnknownFailure(ctx, handle); err != nil {
+		return "", err
+	}
 	return "", c.reopenOrphanedCheckRequest(ctx, handle)
 }
 
@@ -294,12 +297,16 @@ func (c *Controller) recoverCheckExecution(ctx context.Context, handle RunHandle
 }
 
 // applyUnknownOutcome settles a retired check execution under the
-// section 7 unknown-outcome rule: the operation fails with outcome
-// unknown; with `check.repeatable = true` the request returns to
-// requested for a fresh execution (a new operation, a fresh checkout)
-// against the same accepted result, and a completing run returns to
-// running; otherwise the unknown outcome is terminal for automation and
-// the run, task and attempt fail with the execution named.
+// section 7 unknown-outcome rule with stop precedence applied INSIDE the
+// transaction: with a stop request held, the execution settles and the
+// task and attempt are interrupted, never terminally failed, and the run
+// is left for stop handling. With `check.repeatable = true` the request
+// returns to requested for a fresh execution (a new operation, a fresh
+// checkout) against the same accepted result, and a completing run
+// returns to running. Otherwise the unknown outcome is terminal for
+// automation: the task and attempt fail with the execution named, and the
+// run fails only after its worker's termination has been observed
+// (driveTerminalUnknownFailure) — never while the worker may be live.
 func (c *Controller) applyUnknownOutcome(ctx context.Context, handle RunHandle, op *Operation, frozen *FrozenRun) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per retired execution.
 	now := c.Clock.Now()
 	return c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
@@ -328,15 +335,38 @@ func (c *Controller) applyUnknownOutcome(ctx context.Context, handle RunHandle, 
 		}
 		generation := gen(handle.lease.Generation)
 
+		r, rRev, getErr := uow.Runs().Get(ctx, handle.runID)
+		if getErr != nil {
+			return getErr
+		}
+		if r.StopRequested {
+			// Stop precedence: the execution settles as unknown and the
+			// task and attempt are interrupted; the run belongs to stop
+			// handling, which retires the worker and observes termination.
+			request.State = CheckRequestSettled
+			if err := uow.CheckRequests().Save(ctx, request); err != nil {
+				return err
+			}
+			a, aRev, aErr := uow.Attempts().Get(ctx, request.AttemptID)
+			if aErr != nil {
+				return aErr
+			}
+			t, tRev, tErr := uow.Tasks().Get(ctx, a.TaskID)
+			if tErr != nil {
+				return tErr
+			}
+			return finishCheckEntities(ctx, uow, &checkOutcomeArgs{
+				Run: r, RunRevision: rRev, Attempt: a, AttemptRev: aRev, Task: t, TaskRev: tRev,
+				Generation: generation, Now: now, Kind: entityInterrupt,
+				Reason: "stop precedence over an unknown check outcome",
+			})
+		}
+
 		if frozen.Snapshot.CheckRepeatable {
 			request.State = CheckRequestRequested
 			request.ClaimedGeneration = nil
 			if err := uow.CheckRequests().Save(ctx, request); err != nil {
 				return err
-			}
-			r, rRev, getErr := uow.Runs().Get(ctx, handle.runID)
-			if getErr != nil {
-				return getErr
 			}
 			if r.State == run.RunCompleting {
 				rFrom := r.State
@@ -356,10 +386,6 @@ func (c *Controller) applyUnknownOutcome(ctx context.Context, handle RunHandle, 
 		if err := uow.CheckRequests().Save(ctx, request); err != nil {
 			return err
 		}
-		r, rRev, getErr := uow.Runs().Get(ctx, handle.runID)
-		if getErr != nil {
-			return getErr
-		}
 		a, aRev, getErr := uow.Attempts().Get(ctx, request.AttemptID)
 		if getErr != nil {
 			return getErr
@@ -370,9 +396,61 @@ func (c *Controller) applyUnknownOutcome(ctx context.Context, handle RunHandle, 
 		}
 		return finishCheckEntities(ctx, uow, &checkOutcomeArgs{
 			Run: r, RunRevision: rRev, Attempt: a, AttemptRev: aRev, Task: t, TaskRev: tRev,
-			Generation: generation, Now: now, Kind: entityFail,
+			Generation: generation, Now: now, Kind: entityFailKeepRun,
 			Reason: fmt.Sprintf("unrepeatable unknown outcome of check execution %s", latest.ID),
 		})
+	})
+}
+
+// driveTerminalUnknownFailure finishes a terminal unknown outcome: with
+// the task and attempt already failed and the run not yet terminal, the
+// worker is retired through the shared close procedure and the run fails
+// only once its termination has been observed — section 5's run table
+// permits the failure only "after stop of its worker".
+func (c *Controller) driveTerminalUnknownFailure(ctx context.Context, handle RunHandle) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per check round.
+	detail, err := c.Read.LoadRunStatus(ctx, handle.runID)
+	if err != nil {
+		return err
+	}
+	if detail.AttemptState != run.AttemptFailed {
+		return nil
+	}
+	if detail.State != run.RunCompleting && detail.State != run.RunResuming && detail.State != run.RunRunning {
+		return nil
+	}
+	if detail.LastCheck == nil || !detail.LastCheck.Unknown {
+		return nil
+	}
+	outstanding, err := c.retireWorker(ctx, handle, detail)
+	if err != nil {
+		return err
+	}
+	if outstanding != "" {
+		return nil // termination not yet observed; the run stays actionable.
+	}
+	now := c.Clock.Now()
+	return c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		r, rRev, getErr := uow.Runs().Get(ctx, handle.runID)
+		if getErr != nil {
+			return getErr
+		}
+		if r.State != run.RunCompleting && r.State != run.RunResuming && r.State != run.RunRunning {
+			return nil
+		}
+		rFrom := r.State
+		next, failErr := r.Fail(now)
+		if failErr != nil {
+			return failErr
+		}
+		if _, saveErr := uow.Runs().Save(ctx, next, rRev); saveErr != nil {
+			return saveErr
+		}
+		if detail.SessionID != "" {
+			if termErr := terminateSession(ctx, uow, detail.SessionID, "unrepeatable unknown check outcome; worker retired", gen(handle.lease.Generation), now); termErr != nil {
+				return termErr
+			}
+		}
+		return recordTransition(ctx, uow, EntityRun, handle.runID.String(), string(rFrom), string(next.State), "unrepeatable unknown check outcome after worker retirement", gen(handle.lease.Generation), now)
 	})
 }
 
@@ -698,6 +776,10 @@ type entityOutcomeKind int
 const (
 	entityComplete entityOutcomeKind = iota
 	entityFail
+	// entityFailKeepRun fails the task and attempt but leaves the run
+	// untouched: a terminal unknown outcome fails the run only after its
+	// worker's termination has been observed.
+	entityFailKeepRun
 	entityInterrupt
 )
 
@@ -750,6 +832,11 @@ func finishCheckEntities(ctx context.Context, uow UnitOfWork, args *checkOutcome
 			if tNext, err = args.Task.Fail(args.Now); err == nil {
 				aNext, err = args.Attempt.Fail(args.Now)
 			}
+		}
+	case entityFailKeepRun:
+		rNext = args.Run
+		if tNext, err = args.Task.Fail(args.Now); err == nil {
+			aNext, err = args.Attempt.Fail(args.Now)
 		}
 	case entityInterrupt:
 		rNext = args.Run

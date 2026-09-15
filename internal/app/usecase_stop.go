@@ -221,9 +221,10 @@ func (c *Controller) retireCheckOperation(ctx context.Context, handle RunHandle,
 	}
 }
 
-// settleInterruptedCheck records a stop-retired check execution's outcome:
-// the operation failed with an unknown result after its group was observed
-// absent under a stop.
+// settleInterruptedCheck records a stop-retired check execution's outcome
+// — the operation failed with an unknown result after its group was
+// observed absent under a stop — and settles its check request, so the
+// stop leaves no claimed request behind.
 func (c *Controller) settleInterruptedCheck(ctx context.Context, handle RunHandle, opID identity.OperationID) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per retired check execution.
 	now := c.Clock.Now()
 	return c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
@@ -237,7 +238,22 @@ func (c *Controller) settleInterruptedCheck(ctx context.Context, handle RunHandl
 		op.State = OperationFailed
 		op.Outcome = checkRunOutcome{Unknown: true}
 		op.UpdatedAt = now
-		return uow.Operations().Save(ctx, op)
+		if saveErr := uow.Operations().Save(ctx, op); saveErr != nil {
+			return saveErr
+		}
+		intent, ok := decodeOperationPayload[CheckRunIntent](op.Intent)
+		if !ok || intent.ResultID == "" {
+			return nil // an execution with no recorded result linkage leaves no request to settle.
+		}
+		request, getErr := uow.CheckRequests().Get(ctx, identity.ResultID(intent.ResultID))
+		if getErr != nil {
+			return getErr
+		}
+		if request.State == CheckRequestSettled {
+			return nil
+		}
+		request.State = CheckRequestSettled
+		return uow.CheckRequests().Save(ctx, request)
 	})
 }
 
