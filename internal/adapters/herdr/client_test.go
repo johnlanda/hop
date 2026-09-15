@@ -116,6 +116,35 @@ func readRequestLine(t *testing.T, reader *bufio.Reader) map[string]any {
 	return request
 }
 
+// readCancelableRequestLine is readRequestLine for a fake endpoint whose
+// handler exists to be canceled out from under: the caller's context can be
+// canceled in the narrow window after connect(2) on a Unix socket already
+// completed synchronously but before (*netFD).connect's own post-connect
+// ctx.Done() check runs, so net's dial code discards and closes that
+// already-established connection without ever writing a request to it. This
+// endpoint's Accept loop still receives that connection, and reading from it
+// sees a clean, zero-byte io.EOF -- a legitimate outcome of cancellation
+// racing dial completion, not a protocol violation, so unlike
+// readRequestLine it must not fail the test for that specific case. Any
+// other read error (a non-empty partial line, for instance) still does.
+func readCancelableRequestLine(t *testing.T, reader *bufio.Reader) map[string]any {
+	t.Helper()
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		if errors.Is(err, io.EOF) && line == "" {
+			return nil
+		}
+		t.Errorf("fake endpoint: read request: %v", err)
+		return nil
+	}
+	var request map[string]any
+	if err := json.Unmarshal([]byte(line), &request); err != nil {
+		t.Errorf("fake endpoint: decode request %q: %v", line, err)
+		return nil
+	}
+	return request
+}
+
 // readRequestLoop decodes the next request on a long-lived connection,
 // returning nil when the peer has closed it. Unlike readRequestLine it does
 // not fail the test on a clean EOF, so a handler can loop over the several
@@ -423,7 +452,9 @@ func TestClientCallReportsDisconnects(t *testing.T) {
 func TestClientCallHonorsCancellation(t *testing.T) {
 	blocked := make(chan struct{})
 	endpoint := startFakeEndpoint(t, func(t *testing.T, conn net.Conn) {
-		_ = readRequestLine(t, bufio.NewReader(conn))
+		if readCancelableRequestLine(t, bufio.NewReader(conn)) == nil {
+			return // The dial itself was abandoned before any request was written.
+		}
 		<-blocked // Never respond until the test ends.
 	})
 	t.Cleanup(func() { close(blocked) })
