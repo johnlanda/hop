@@ -1,6 +1,9 @@
 package app
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
 // WorktreeRequest is CreateWorktree's input: the repository to check out
 // from, the branch to create and the base ref to create it at.
@@ -76,6 +79,13 @@ type PaneProcess struct {
 	Foreground        []ProcessInfo
 }
 
+// ErrPaneNotFound is the typed result Runtime.InspectPane reports (wrapped
+// or directly) when the pane POSITIVELY does not exist on the server — a
+// successful observation of absence, as opposed to a transport, timeout or
+// permission failure, which is an ordinary error and never absence
+// evidence. Absence decisions require this exact distinction.
+var ErrPaneNotFound = errors.New("app: pane not found")
+
 // Runtime is the consumer-owned port over Herdr's pane and worktree
 // surface. The Herdr adapter (internal/adapters/herdr) implements it.
 //
@@ -105,8 +115,26 @@ type Runtime interface {
 	// action.
 	ReadPane(ctx context.Context, paneID string, lines int) (string, error)
 	// InspectPane returns the occupant identity used by every launch,
-	// stop and adoption decision.
+	// stop and adoption decision. A pane that positively does not exist is
+	// reported as an error wrapping ErrPaneNotFound; any other error is an
+	// inspection failure and never counts as absence.
 	InspectPane(ctx context.Context, paneID string) (PaneProcess, error)
 	// ClosePane requests pane closure; callers apply the close rule above.
 	ClosePane(ctx context.Context, paneID string) error
+	// ServerInstance returns an opaque, adapter-formatted identity scoped
+	// to BOTH the configured socket path and the server process behind it:
+	// the adapter derives the token from its own connection to that
+	// socket (for example the socket peer pid), so equality of two
+	// non-empty tokens implies the same socket and the same server
+	// process. An empty string means the identity could not be
+	// established — unknown, never fabricated — and is not an error; the
+	// application compares tokens by equality only and treats unknown as
+	// ambiguous. Peer-pid recycling is not detected (a documented residual
+	// limitation; start-time hardening is a Phase 7 recovery item). The
+	// token is captured immediately before pane creation, frozen into the
+	// pane.open intent and recorded in the creation binding; resume
+	// observes it again to establish server continuity: a deferred native
+	// restore fires only after a server restart, so an unchanged server
+	// process with the pane gone cannot have a restore pending.
+	ServerInstance(ctx context.Context) (string, error)
 }

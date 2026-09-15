@@ -38,10 +38,13 @@ type StartRunResult struct {
 }
 
 // worktreeCreateIntent is the OpWorktreeCreate operation's intent payload.
+// BaseRef is the intended base commit resolved to an immutable object ID
+// BEFORE the intent commits — never a mutable ref name — so takeover
+// validation compares the candidate against exactly what was intended.
 type worktreeCreateIntent struct {
-	RepositoryRoot string
-	Branch         string
-	BaseRef        string
+	RepositoryRoot string `json:"repository_root"`
+	Branch         string `json:"branch"`
+	BaseRef        string `json:"base_ref"`
 }
 
 // worktreeCreateOutcome is the OpWorktreeCreate operation's outcome
@@ -49,16 +52,30 @@ type worktreeCreateIntent struct {
 // afterward — Herdr's response carries no commit, so the base commit an
 // adoption decision validates against is resolved separately.
 type worktreeCreateOutcome struct {
-	Info       WorktreeInfo
-	BaseCommit string
+	Info       WorktreeInfo `json:"info"`
+	BaseCommit string       `json:"base_commit"`
 }
 
 // paneOpenIntent is the OpPaneOpen operation's intent payload.
 type paneOpenIntent struct {
-	Command     []string
-	Cwd         string
-	WorkspaceID string
-	Label       string
+	Command []string `json:"command"`
+	Cwd     string   `json:"cwd"`
+	// WorkspaceID is the workspace the pane joins.
+	WorkspaceID string `json:"workspace_id"`
+	// Label is the pane's unique creation label (the operation ID).
+	Label string `json:"label"`
+	// IncarnationID and SessionID are what SubmissionStore.ClaimLaunch
+	// validates a pre-binding launcher against: json_extract on the newest
+	// pending pane.open operation for the current attempt binds the claim
+	// to both, before falling back to the binding once one exists.
+	IncarnationID identity.IncarnationID `json:"incarnation_id"`
+	SessionID     identity.SessionID     `json:"session_id"`
+	// ServerInstance is the server-process identity observed immediately
+	// before the pane was created — creation evidence frozen into the
+	// durable intent so a recovery after the outcome commit was lost can
+	// restore it instead of stamping a recovery-time observation. Empty
+	// means unknown, which fails the continuity check closed.
+	ServerInstance string `json:"server_instance"`
 }
 
 // StartRun freezes a new run and drives it through worktree creation and
@@ -84,6 +101,16 @@ func (c *Controller) StartRun(ctx context.Context, req StartRunRequest) (StartRu
 	harness, err := parseHarness(policy.Harness)
 	if err != nil {
 		return StartRunResult{}, RunHandle{}, err
+	}
+	// SHA-256-object-format repositories are out of Phase 2 scope and are
+	// refused here, before any side effect: result submission validates
+	// 40-hex object ids and the check pipeline assumes them.
+	objectFormat, err := c.runGit(ctx, req.RepositoryRoot, "rev-parse", "--show-object-format")
+	if err != nil {
+		return StartRunResult{}, RunHandle{}, fmt.Errorf("app: resolve repository object format: %w", err)
+	}
+	if objectFormat != "sha1" {
+		return StartRunResult{}, RunHandle{}, fmt.Errorf("app: repository object format %q is unsupported in Phase 2 (sha1 only)", objectFormat)
 	}
 
 	ids, err := c.generateRunIdentities()
@@ -149,7 +176,7 @@ func (c *Controller) StartRun(ctx context.Context, req StartRunRequest) (StartRu
 	if err != nil {
 		return StartRunResult{}, RunHandle{}, fmt.Errorf("app: initialize run: %w", err)
 	}
-	handle := RunHandle{runID: runID, lease: lease}
+	handle := newRunHandle(runID, lease)
 
 	detail, err := c.Read.LoadRunStatus(ctx, runID)
 	if err != nil {
@@ -182,35 +209,103 @@ func (c *Controller) StartRun(ctx context.Context, req StartRunRequest) (StartRu
 	return result, handle, nil
 }
 
-// resolveWorktreeProvenance resolves the base commit a freshly created
-// worktree checked out, and validates it shares the repository at
-// repositoryRoot: Herdr's worktree.create response carries no commit, so
-// this is the provenance an adoption decision later validates against
-// (docs/plan/phase-2-design.md section 4). git-common-dir ties the
-// worktree back to its repository regardless of the worktree's own path.
-func (c *Controller) resolveWorktreeProvenance(ctx context.Context, worktreePath, repositoryRoot string) (string, error) {
-	commonDir, err := c.runGit(ctx, worktreePath, "rev-parse", "--git-common-dir")
-	if err != nil {
-		return "", fmt.Errorf("resolve worktree repository: %w", err)
+// worktreeProvenance classifies a candidate checkout against the intended
+// repository and frozen base commit (docs/plan/phase-2-design.md
+// section 4, worktree.create adoption rule).
+type worktreeProvenance int
+
+const (
+	// worktreeValid: the candidate shares the intended repository's
+	// canonical common directory and its HEAD is the frozen base commit.
+	worktreeValid worktreeProvenance = iota
+	// worktreeAbsent: no git checkout answers at the candidate path.
+	worktreeAbsent
+	// worktreeUnrelated: a checkout of a different repository, or of the
+	// intended repository at a different commit — a failure, not adoption.
+	worktreeUnrelated
+	// worktreeAmbiguous: the inspection itself could not be made; never
+	// treated as absence or as failure.
+	worktreeAmbiguous
+)
+
+// classifyWorktreeProvenance establishes whether the checkout at
+// candidatePath is the intended one: canonical absolute git common
+// directories of the intended repository and the candidate must be EQUAL
+// (a path prefix is never provenance), and the candidate's HEAD commit
+// must equal the frozen base object ID.
+func (c *Controller) classifyWorktreeProvenance(ctx context.Context, candidatePath, repositoryRoot, expectedBaseOID string) (provenance worktreeProvenance, detail string) {
+	repoCommon, repoStatus := c.gitCommonDir(ctx, repositoryRoot)
+	if repoStatus != gitOK {
+		return worktreeAmbiguous, fmt.Sprintf("intended repository %q common directory could not be resolved", repositoryRoot)
 	}
-	if !strings.HasPrefix(commonDir, repositoryRoot) {
-		return "", fmt.Errorf("worktree at %q shares repository %q, not %q", worktreePath, commonDir, repositoryRoot)
+	candCommon, candStatus := c.gitCommonDir(ctx, candidatePath)
+	switch candStatus {
+	case gitTransportError:
+		return worktreeAmbiguous, fmt.Sprintf("candidate %q could not be inspected", candidatePath)
+	case gitNonZero:
+		return worktreeAbsent, fmt.Sprintf("no git checkout answers at %q", candidatePath)
+	case gitOK:
 	}
-	commit, err := c.runGit(ctx, worktreePath, "rev-parse", "HEAD")
-	if err != nil {
-		return "", fmt.Errorf("resolve worktree base commit: %w", err)
+	if repoCommon != candCommon {
+		return worktreeUnrelated, fmt.Sprintf("candidate at %q shares repository %q, not %q", candidatePath, candCommon, repoCommon)
 	}
-	return commit, nil
+
+	head, headStatus := c.gitOutput(ctx, candidatePath, "rev-parse", "HEAD^{commit}")
+	if headStatus != gitOK {
+		return worktreeAmbiguous, fmt.Sprintf("candidate %q HEAD could not be resolved", candidatePath)
+	}
+	if head != expectedBaseOID {
+		return worktreeUnrelated, fmt.Sprintf("candidate at %q is at commit %s, not the frozen base %s", candidatePath, head, expectedBaseOID)
+	}
+	return worktreeValid, ""
 }
 
-// runGit runs one git subcommand in dir and returns its trimmed stdout.
+// gitStatus classifies one git invocation's result.
+type gitStatus int
+
+const (
+	gitOK gitStatus = iota
+	gitNonZero
+	gitTransportError
+)
+
+// gitOutput runs one git subcommand against dir (via `git -C`, so the
+// invocation is fully identified by its argv) and returns its trimmed
+// stdout with a typed status.
+func (c *Controller) gitOutput(ctx context.Context, dir string, args ...string) (string, gitStatus) {
+	result, err := c.Commands.Run(ctx, Command{Argv: append([]string{"git", "-C", dir}, args...)})
+	if err != nil {
+		return "", gitTransportError
+	}
+	if result.ExitCode != 0 {
+		return "", gitNonZero
+	}
+	return strings.TrimSpace(string(result.Stdout)), gitOK
+}
+
+// gitCommonDir resolves dir's canonical absolute git common directory. A
+// relative answer (an older git ignoring --path-format) is resolved
+// against dir before comparison.
+func (c *Controller) gitCommonDir(ctx context.Context, dir string) (string, gitStatus) {
+	out, status := c.gitOutput(ctx, dir, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if status != gitOK {
+		return "", status
+	}
+	if !filepath.IsAbs(out) {
+		out = filepath.Join(dir, out)
+	}
+	return filepath.Clean(out), gitOK
+}
+
+// runGit runs one git subcommand against dir and returns its trimmed
+// stdout, folding a non-zero exit into the error.
 func (c *Controller) runGit(ctx context.Context, dir string, args ...string) (string, error) {
-	result, err := c.Commands.Run(ctx, Command{Argv: append([]string{"git"}, args...), Dir: dir})
+	result, err := c.Commands.Run(ctx, Command{Argv: append([]string{"git", "-C", dir}, args...)})
 	if err != nil {
 		return "", err
 	}
 	if result.ExitCode != 0 {
-		return "", fmt.Errorf("git %s: exit %d: %s", strings.Join(args, " "), result.ExitCode, string(result.Stderr))
+		return "", fmt.Errorf("git -C %s %s: exit %d: %s", dir, strings.Join(args, " "), result.ExitCode, string(result.Stderr))
 	}
 	return strings.TrimSpace(string(result.Stdout)), nil
 }
@@ -238,15 +333,19 @@ func (c *Controller) recordAssignmentArtifact(ctx context.Context, lease Lease, 
 // createWorktree drives the OpWorktreeCreate operation: intent, then the
 // external call, then outcome. Worktree.create is never retried blindly
 // while a prior intent is unresolved (the operation decision table); a
-// controller crash recovery path that finds a pending worktree.create
-// operation is resume's job (Advance), not StartRun's, since StartRun only
-// ever runs at the moment a run is first created.
+// controller crash that leaves a pending worktree.create operation is
+// recovered by Resume (recoverWorktreeCreate), not StartRun, since
+// StartRun only ever runs at the moment a run is first created.
 func (c *Controller) createWorktree(ctx context.Context, handle RunHandle, ids generatedIdentities, repositoryRoot, branch string, now time.Time) (WorktreeInfo, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design (see Lease's own doc comment); this path runs once per run start, never in a hot loop.
 	opID, err := c.newOperationID()
 	if err != nil {
 		return WorktreeInfo{}, err
 	}
-	intent := worktreeCreateIntent{RepositoryRoot: repositoryRoot, Branch: branch, BaseRef: "HEAD"}
+	baseOID, err := c.runGit(ctx, repositoryRoot, "rev-parse", "HEAD^{commit}")
+	if err != nil {
+		return WorktreeInfo{}, fmt.Errorf("app: resolve intended base commit: %w", err)
+	}
+	intent := worktreeCreateIntent{RepositoryRoot: repositoryRoot, Branch: branch, BaseRef: baseOID}
 	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 		return uow.Operations().Create(ctx, Operation{
 			ID: opID, RunID: handle.runID, Generation: handle.lease.Generation,
@@ -257,13 +356,19 @@ func (c *Controller) createWorktree(ctx context.Context, handle RunHandle, ids g
 		return WorktreeInfo{}, fmt.Errorf("app: record worktree.create intent: %w", err)
 	}
 
-	info, actErr := c.Runtime.CreateWorktree(ctx, WorktreeRequest{
-		RepositoryRoot: repositoryRoot, Branch: branch, BaseRef: intent.BaseRef,
-	})
-	var baseCommit string
-	if actErr == nil {
-		baseCommit, actErr = c.resolveWorktreeProvenance(ctx, info.Path, repositoryRoot)
+	if err := c.revalidateForDispatch(ctx, handle, false); err != nil {
+		return WorktreeInfo{}, fmt.Errorf("app: revalidate before worktree.create: %w", err)
 	}
+	actCtx, release := handle.actContext(ctx)
+	info, actErr := c.Runtime.CreateWorktree(actCtx, WorktreeRequest{
+		RepositoryRoot: repositoryRoot, Branch: branch, BaseRef: baseOID,
+	})
+	provenance := worktreeAmbiguous
+	provenanceDetail := ""
+	if actErr == nil {
+		provenance, provenanceDetail = c.classifyWorktreeProvenance(actCtx, info.Path, repositoryRoot, baseOID)
+	}
+	release()
 
 	outcomeErr := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 		op, getErr := uow.Operations().Get(ctx, opID)
@@ -271,39 +376,76 @@ func (c *Controller) createWorktree(ctx context.Context, handle RunHandle, ids g
 			return getErr
 		}
 		op.UpdatedAt = c.Clock.Now()
-		if actErr != nil {
-			op.State = OperationFailed
+		switch {
+		case actErr != nil:
+			// A transport error is ambiguous, never failure: the creation
+			// may still have happened, and recovery validates provenance.
+			op.State = OperationReconciling
 			op.Outcome = actErr.Error()
 			return uow.Operations().Save(ctx, op)
+		case provenance == worktreeValid:
+			r, _, runErr := uow.Runs().Get(ctx, handle.runID)
+			if runErr != nil {
+				return runErr
+			}
+			if _, createErr := uow.Worktrees().Create(ctx, run.NewWorktree(ids.Worktree, r.RepositoryID, handle.runID, info.Path, info.Branch)); createErr != nil {
+				return createErr
+			}
+			op.State = OperationSucceeded
+			op.ActEvidence = worktreeCreateOutcome{Info: info, BaseCommit: baseOID}
+			return uow.Operations().Save(ctx, op)
+		case provenance == worktreeUnrelated:
+			op.State = OperationFailed
+			op.Outcome = provenanceDetail
+			return uow.Operations().Save(ctx, op)
+		default:
+			// Absent or ambiguous immediately after a successful create
+			// response: reconciling, never a second create.
+			op.State = OperationReconciling
+			op.Outcome = provenanceDetail
+			return uow.Operations().Save(ctx, op)
 		}
-		r, _, runErr := uow.Runs().Get(ctx, handle.runID)
-		if runErr != nil {
-			return runErr
-		}
-		if _, createErr := uow.Worktrees().Create(ctx, run.NewWorktree(ids.Worktree, r.RepositoryID, handle.runID, info.Path, info.Branch)); createErr != nil {
-			return createErr
-		}
-		op.State = OperationSucceeded
-		op.ActEvidence = worktreeCreateOutcome{Info: info, BaseCommit: baseCommit}
-		return uow.Operations().Save(ctx, op)
 	})
+	var resultErr error
 	switch {
-	case actErr != nil && outcomeErr != nil:
-		return WorktreeInfo{}, fmt.Errorf("app: worktree.create failed (%w) and recording the outcome failed (%w)", actErr, outcomeErr)
 	case actErr != nil:
-		return WorktreeInfo{}, fmt.Errorf("app: worktree.create: %w", actErr)
+		resultErr = fmt.Errorf("app: worktree.create: %w (operation %s is reconciling)", actErr, opID)
+	case provenance == worktreeUnrelated:
+		resultErr = fmt.Errorf("app: worktree.create provenance: %s", provenanceDetail)
+	case provenance != worktreeValid:
+		resultErr = fmt.Errorf("app: worktree.create provenance ambiguous: %s (operation %s is reconciling)", provenanceDetail, opID)
+	}
+	switch {
+	case resultErr != nil && outcomeErr != nil:
+		return WorktreeInfo{}, fmt.Errorf("%w; recording the outcome also failed: %w", resultErr, outcomeErr)
 	case outcomeErr != nil:
 		return WorktreeInfo{}, fmt.Errorf("app: record worktree.create outcome: %w", outcomeErr)
+	case resultErr != nil:
+		return WorktreeInfo{}, resultErr
 	}
 	return info, nil
 }
 
-// openWorkerPane drives the OpPaneOpen operation, which is also the single
-// "launch intent" moment: Run, Task, Attempt and Session all transition
-// together in the intent transaction (the section 5 reference traces'
-// "intent → launching/active/launching/launching" line), before the pane is
-// actually created.
+// openWorkerPane drives the OpPaneOpen operation for a run's first launch,
+// which is also the single "launch intent" moment: Run, Task, Attempt and
+// Session all transition together in the intent transaction (the section 5
+// reference traces' "intent → launching/active/launching/launching" line),
+// before the pane is actually created.
 func (c *Controller) openWorkerPane(ctx context.Context, handle RunHandle, ids generatedIdentities, worktree WorktreeInfo, hopPath, stateRoot string) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; this path runs once per run start, never in a hot loop.
+	return c.openPane(ctx, handle, ids, worktree, hopPath, stateRoot, run.LaunchInitial)
+}
+
+// openRelaunchPane drives the OpPaneOpen operation for a cold relaunch. The
+// resume use case's own transaction already applied the Run/Attempt/Session
+// transitions the relaunch needs (Run.Launch, Attempt.Relaunch, the new
+// Session's own Launch), so this only journals the operation intent —
+// applying them again here would be a second, invalid transition on values
+// already at their target state.
+func (c *Controller) openRelaunchPane(ctx context.Context, handle RunHandle, ids generatedIdentities, worktree WorktreeInfo, hopPath, stateRoot string) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; this path runs once per relaunch.
+	return c.openPane(ctx, handle, ids, worktree, hopPath, stateRoot, run.LaunchResume)
+}
+
+func (c *Controller) openPane(ctx context.Context, handle RunHandle, ids generatedIdentities, worktree WorktreeInfo, hopPath, stateRoot string, kind run.LaunchKind) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; this path runs once per launch or relaunch.
 	opID, err := c.newOperationID()
 	if err != nil {
 		return err
@@ -316,40 +458,58 @@ func (c *Controller) openWorkerPane(ctx context.Context, handle RunHandle, ids g
 		"HOP_ATTEMPT_ID":     ids.Attempt.String(),
 		"HOP_INCARNATION_ID": ids.Incarnation.String(),
 	}
-	intent := paneOpenIntent{Command: argv, Cwd: worktree.Path, WorkspaceID: worktree.WorkspaceID, Label: opID.String()}
+	// The server-process identity is observed before the intent commits
+	// and frozen into it as creation evidence; the same value lands in the
+	// creation binding at the outcome, and recovery copies it from the
+	// intent rather than observing anew.
+	serverInstance := c.observeServerInstance(ctx)
+	intent := paneOpenIntent{Command: argv, Cwd: worktree.Path, WorkspaceID: worktree.WorkspaceID, Label: opID.String(), IncarnationID: ids.Incarnation, SessionID: ids.Session, ServerInstance: serverInstance}
 	now := c.Clock.Now()
 
 	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
-		return applyLaunchIntent(ctx, uow, handle, ids, opID, intent, now)
+		if kind == run.LaunchInitial {
+			return applyLaunchIntent(ctx, uow, handle, ids, opID, intent, now)
+		}
+		return uow.Operations().Create(ctx, Operation{
+			ID: opID, RunID: handle.runID, Generation: handle.lease.Generation,
+			Kind: OpPaneOpen, State: OperationPending, Intent: intent,
+			CreatedAt: now, UpdatedAt: now,
+		})
 	}); err != nil {
 		return fmt.Errorf("app: record pane.open intent: %w", err)
 	}
 
-	paneHandle, actErr := c.Runtime.OpenWorkerPane(ctx, WorkerPaneRequest{
+	if err := c.revalidateForDispatch(ctx, handle, false); err != nil {
+		return fmt.Errorf("app: revalidate before pane.open: %w", err)
+	}
+	actCtx, release := handle.actContext(ctx)
+	paneHandle, actErr := c.Runtime.OpenWorkerPane(actCtx, WorkerPaneRequest{
 		WorkspaceID: worktree.WorkspaceID, Cwd: worktree.Path, Command: argv, Env: env, Label: opID.String(),
 	})
 	if actErr != nil {
-		if ref, found, findErr := c.Runtime.FindPaneByLabel(ctx, opID.String()); findErr == nil && found {
+		if ref, found, findErr := c.Runtime.FindPaneByLabel(actCtx, opID.String()); findErr == nil && found {
 			paneHandle = PaneHandle(ref)
 			actErr = nil
 		}
 	}
+	release()
 
-	return c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+	outcomeErr := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 		op, getErr := uow.Operations().Get(ctx, opID)
 		if getErr != nil {
 			return getErr
 		}
 		op.UpdatedAt = c.Clock.Now()
 		if actErr != nil {
+			// A commit here must succeed even though the pane.open act
+			// itself failed: recording "reconciling" as the outcome is the
+			// whole point, so the closure returns nil (a successful save)
+			// and actErr is surfaced to the caller below, after commit.
 			op.State = OperationReconciling
 			op.Outcome = actErr.Error()
-			if saveErr := uow.Operations().Save(ctx, op); saveErr != nil {
-				return saveErr
-			}
-			return fmt.Errorf("app: pane.open: %w (operation %s is reconciling)", actErr, opID)
+			return uow.Operations().Save(ctx, op)
 		}
-		binding := run.NewRuntimeBinding(ids.Session, ids.Incarnation, "", paneHandle.WorkspaceID, paneHandle.TabID, paneHandle.PaneID, opID.String(), run.LaunchInitial, op.UpdatedAt)
+		binding := run.NewRuntimeBinding(ids.Session, ids.Incarnation, "", serverInstance, paneHandle.WorkspaceID, paneHandle.TabID, paneHandle.PaneID, opID.String(), kind, op.UpdatedAt)
 		if bindErr := uow.Bindings().Create(ctx, binding); bindErr != nil {
 			return bindErr
 		}
@@ -357,6 +517,13 @@ func (c *Controller) openWorkerPane(ctx context.Context, handle RunHandle, ids g
 		op.ActEvidence = paneHandle
 		return uow.Operations().Save(ctx, op)
 	})
+	if outcomeErr != nil {
+		return fmt.Errorf("app: record pane.open outcome: %w", outcomeErr)
+	}
+	if actErr != nil {
+		return fmt.Errorf("app: pane.open: %w (operation %s is reconciling)", actErr, opID)
+	}
+	return nil
 }
 
 // applyLaunchIntent commits the launch-intent transitions shared by a first
@@ -368,6 +535,7 @@ func applyLaunchIntent(ctx context.Context, uow UnitOfWork, handle RunHandle, id
 	if err != nil {
 		return err
 	}
+	runFrom := r.State
 	if r, err = r.Launch(now); err != nil {
 		return err
 	}
@@ -412,7 +580,7 @@ func applyLaunchIntent(ctx context.Context, uow UnitOfWork, handle RunHandle, id
 	}
 
 	generation := gen(handle.lease.Generation)
-	if err := recordTransition(ctx, uow, EntityRun, handle.runID.String(), string(run.RunCreated), string(r.State), "launch intent journaled", generation, now); err != nil {
+	if err := recordTransition(ctx, uow, EntityRun, handle.runID.String(), string(runFrom), string(r.State), "launch intent journaled", generation, now); err != nil {
 		return err
 	}
 	if err := recordTransition(ctx, uow, EntityTask, ids.Task.String(), string(taskFrom), string(t.State), "attempt launched", generation, now); err != nil {
