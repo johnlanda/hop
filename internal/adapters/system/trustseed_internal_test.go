@@ -24,12 +24,12 @@ func externalAtomicWrite(t *testing.T, config, content string) {
 	}
 }
 
-// TestTrustSeederRetriesOverInterleavedExternalWrite proves the covered
+// TestTrustSeederRetriesOverInterleavedExternalWrite proves the detected
 // half of the best-effort contract deterministically: an external atomic
 // write landing between the seed's edit computation and its pre-rename
-// freshness check is never lost — the seeder discards its stale edit,
-// redoes it on the fresh content, and the final document carries both the
-// external update and the seed.
+// freshness check is observed by that check — the seeder discards its
+// stale edit, redoes it on the fresh content, and the final document
+// carries both the external update and the seed.
 func TestTrustSeederRetriesOverInterleavedExternalWrite(t *testing.T) {
 	dir := t.TempDir()
 	config := filepath.Join(dir, ".claude.json")

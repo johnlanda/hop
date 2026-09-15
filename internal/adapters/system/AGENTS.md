@@ -60,20 +60,26 @@ filesystem ambiently; it consumes these ports.
   already carrying true writes nothing at all. Every hard error carries a
   fixed category established through errors.Is only; the profile path
   derives from environment values and is never echoed.
-- Against EXTERNAL writers of the same profile (a running Claude rewrites
-  its config; the lock cannot coordinate with it) the seed is optimistic
-  and best-effort, in bounded rounds (`trustSeedAttempts`): each round
-  reads, computes the edit, re-stats AND re-reads immediately before the
-  publishing rename — discarding the stale edit and redoing it on fresh
-  content when anything changed — and reports seeded only after a
-  post-publish re-read verifies the key is present. Guaranteed: an
-  external atomic write landing before the pre-rename check, or after the
-  rename, is never lost (the round retries on the fresh content). Not
-  guaranteed: a write landing in the residual window between the
-  pre-rename check and the rename itself is overwritten — the same
-  last-writer-wins race Claude Code's own concurrent sessions of one
-  profile have with each other. A config rewritten inside every round's
-  window is a not-seeded outcome, external content left intact.
+- Against EXTERNAL writers of the same profile (a running Claude can
+  rewrite its config; the lock cannot coordinate with it) the seed is
+  optimistic and best-effort, in at most `trustSeedAttempts` (three)
+  attempts. Each attempt checks metadata (size and mtime) and, when
+  metadata matches, rereads and compares the original bytes before
+  publishing; a detected change discards the stale edit and retries on
+  fresh content. After publishing, the seeder rereads the file and
+  reports seeded only if that read observes the trust key as true; an
+  initial read that already observes true also succeeds without writing
+  (and without a second verification read). A verification read that
+  observes a missing or invalid trust key triggers another attempt. Read,
+  stat or I/O errors are hard failures. An external atomic replacement
+  after the freshness-check snapshot is acquired and before the rename
+  can be overwritten; this interval has no guaranteed duration
+  (scheduling and I/O latency can widen it). External changes after the
+  verification snapshot may go undetected and may remove the seed.
+  Exhausting the attempt budget on detected changes is the not-seeded
+  contention outcome, the last external content left intact. Successful
+  evidence records an observation, not a guarantee that trust remains
+  set at exec.
 
 ## Dependencies and ports
 

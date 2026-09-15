@@ -44,16 +44,22 @@ const trustSeedAttempts = 3
 //
 // The write is BEST-EFFORT against external writers of the same profile,
 // which the lock cannot coordinate with (a running Claude of the profile
-// rewrites the file from its own state). Each attempt re-stats and
-// re-reads the config immediately before the publishing rename and redoes
-// the edit on fresh content when anything changed, and a seeded success is
-// returned only after a post-publish re-read verifies the key is present —
-// so an external ATOMIC write landing before that pre-rename check is
-// never lost, and one landing after the rename is detected and retried
-// into. What is NOT guaranteed: an external write landing in the residual
-// window between the pre-rename check and the rename itself is overwritten
-// (the same last-writer-wins class of race Claude Code's own concurrent
-// sessions of one profile have with each other). An absent or unparsable
+// can rewrite the file). At most trustSeedAttempts attempts run. Each
+// attempt checks metadata and, when metadata matches, rereads and
+// compares the original bytes before publishing; a detected change
+// discards the stale edit and retries on fresh content. After publishing,
+// the file is reread and seeded is reported only if that read observes
+// the trust key as true; an initial read that already observes true also
+// succeeds without writing. A verification read that observes a missing
+// or invalid trust key triggers another attempt. Read or I/O errors are
+// hard failures. An external atomic replacement after the freshness-check
+// snapshot is acquired and before the rename can be overwritten; this
+// interval has no guaranteed duration (scheduling and I/O latency can
+// widen it). External changes after the verification snapshot may go
+// undetected and may remove the seed. Exhausting the attempt budget on
+// detected changes yields the not-seeded contention outcome. Successful
+// evidence records an observation, not a guarantee that trust remains
+// set at exec. An absent or unparsable
 // config is a not-seeded outcome and the
 // file is not created or rewritten; every returned error carries a fixed
 // category only, never the config path (which derives from environment
@@ -70,8 +76,9 @@ var _ app.TrustSeeder = TrustSeeder{}
 
 // SeedWorkspaceTrust applies one workspace-trust seed to configPath under
 // the advisory lock, honoring ctx while waiting for the lock. A document
-// already carrying true is a verified seeded outcome with no write at all;
-// a config that keeps changing under an external writer for every attempt
+// whose initial read already observes true is a seeded outcome with no
+// write and no second verification read; a config whose observed changes
+// exhaust the attempt budget
 // is a not-seeded outcome — the launch proceeds and the interactive
 // fallback stays — never an error.
 func (s TrustSeeder) SeedWorkspaceTrust(ctx context.Context, configPath, projectKey string) (app.TrustSeedOutcome, error) {
@@ -134,9 +141,9 @@ func (s TrustSeeder) seedAttempt(configPath, projectKey string, attempt int) (ou
 	if !published {
 		return app.TrustSeedOutcome{}, true, nil
 	}
-	// Verify the key actually reads back from the published file: an
-	// external writer that won the residual post-rename window is detected
-	// here and the next attempt redoes the edit on its content.
+	// Re-read after publication. If this read observes that the key still
+	// needs seeding or the document is unparsable, retry on fresh content.
+	// A later external write may go undetected; this is snapshot evidence.
 	final, err := os.ReadFile(configPath) //nolint:gosec // G304: the same application-composed config path, re-read for verification.
 	if err != nil {
 		return app.TrustSeedOutcome{}, false, trustSeedFailure("verify profile config", err)

@@ -80,8 +80,12 @@ this package never resolves environment variables or defaults.
   persisted owning run must be the claimed run, so a mixed tuple never has
   its stop or currency questions answered against the wrong run — then
   refuses when the run is stopping or stopped, the incarnation is not
-  current, or a claim exists with a different run, attempt or pid; a
-  same-pid rewrite on the same tuple is idempotent. Currency: the
+  current, or a claim exists with a different run, attempt or pid. A
+  same-pid retry on the same tuple is accepted only while the claim is
+  exec_pending and its executable and argv digest match. It refreshes
+  only seed_evidence to the retry's outcome; all invocation identity
+  fields remain unchanged, and settled claims refuse retries. Currency:
+  the
   attempt's current session's current binding decides when one exists;
   before ANY binding row exists for that session (the launcher is the
   pane's own command and can claim before the controller records the

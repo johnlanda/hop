@@ -183,17 +183,23 @@ alternate-profile/pools work; they are not re-verified here.
   authentication. These are undocumented internals pinned to 2.1.270: a
   version drift needs re-verification, and the needs-interaction fallback
   (surfacing a dialog that appeared anyway) stays in place. HOP's seed
-  write cannot coordinate with a RUNNING Claude of the same profile,
-  which rewrites `.claude.json` from its own state; the seeder is
-  therefore optimistic and best-effort — it redoes its edit on freshly
-  read content when the file changed before its publishing rename and
-  verifies the key by re-read before reporting seeded, so an external
-  atomic write landing before that pre-rename check or after the rename
-  is never lost, while one landing in the residual check-to-rename
-  microsecond window is overwritten (the same last-writer-wins class of
-  race Claude Code's own concurrent sessions of one profile have with
-  each other). A config that keeps changing under an external writer
-  yields "not seeded" evidence and the dialog fallback.
+  write cannot coordinate with a running Claude of the same profile,
+  which can rewrite `.claude.json`; the seed is optimistic and
+  best-effort. HOP makes at most three attempts. Each attempt checks
+  metadata and, when metadata matches, rereads and compares the original
+  bytes before publishing. A detected change discards the stale edit and
+  retries on fresh content. After publishing, HOP rereads the file and
+  reports seeded only if that read observes the trust key as true; an
+  initial read that already observes true also succeeds without writing.
+  A verification read that observes a missing or invalid trust key
+  triggers another attempt. Read or I/O errors still refuse the launch.
+  An external atomic replacement after the freshness-check snapshot is
+  acquired and before HOP's rename can be overwritten; this interval has
+  no guaranteed duration. External changes after the verification
+  snapshot may go undetected and may remove the seed. Exhausting the
+  attempt budget on detected changes yields not-seeded evidence and the
+  dialog fallback. Successful evidence records an observation, not a
+  guarantee that trust remains set at exec.
 - Keychain side effect of any launch (observed during the same spike):
   merely starting claude under a fresh `CLAUDE_CONFIG_DIR` — no login —
   creates the keychain item
