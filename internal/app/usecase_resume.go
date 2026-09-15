@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -755,19 +756,34 @@ func (c *Controller) reconcileActive(ctx context.Context, handle RunHandle, deta
 			}
 		}
 
-		// A different, present occupant. Positive evidence (the run's
-		// pre-assigned native session reference in the argv of SOME
-		// foreground member — the restored occupant spawns its own MCP
-		// children into its own group, so it holds no particular index)
-		// authorizes guarded retirement and cold relaunch, targeted at the
-		// member that carried the reference; anything else fails closed.
+		// A different, present occupant. Positive evidence authorizes guarded
+		// retirement and cold relaunch only through the restored-harness
+		// predicate: exactly one foreground member that is the session
+		// harness's native restore invocation for the durable native
+		// reference, with executable identity and the exact resume argument
+		// on that same member (the restored occupant spawns its own MCP
+		// children into its own group, so it holds no particular index).
+		// Retirement targets that member; more than one candidate, or none,
+		// fails closed with nothing closed or superseded.
+		harness, harnessErr := c.sessionHarness(ctx, handle, detail.SessionID)
 		nativeRef, nativeErr := c.sessionNativeRef(ctx, handle, detail.SessionID)
-		if nativeErr == nil && nativeRef != "" {
-			if bearer, _, found := markerBearer(pane, []string{nativeRef}); found {
+		if harnessErr == nil && nativeErr == nil {
+			switch outcome, candidates := MatchRestoredHarness(pane, harness, nativeRef); outcome {
+			case RestoredHarnessMatched:
 				if len(blocked) > 0 {
 					return ResumeResult{Outcome: ResumeReconciling, Detail: "unresolved work blocks the retirement: " + strings.Join(blocked, "; ")}, nil
 				}
-				return c.retireAndRelaunch(ctx, handle, detail, req, bearer, nativeRef)
+				return c.retireAndRelaunch(ctx, handle, detail, req, candidates[0], nativeRef)
+			case RestoredHarnessAmbiguous:
+				pids := make([]string, 0, len(candidates))
+				for _, candidate := range candidates {
+					pids = append(pids, strconv.Itoa(candidate.PID))
+				}
+				return ResumeResult{
+					Outcome: ResumeFailedClosed, ObservedPaneID: detail.Binding.PaneID,
+					Detail: fmt.Sprintf("more than one foreground member (pids %s) matches the restored harness invocation for this run's native session; no single occupant is identified, so nothing is retired; inspect the pane, then close it or hop stop the run, and rerun hop resume", strings.Join(pids, ", ")),
+				}, nil
+			case RestoredHarnessNone, RestoredHarnessUnsupported:
 			}
 		}
 		return ResumeResult{
@@ -1128,9 +1144,10 @@ func (c *Controller) completedRetirement(ctx context.Context, handle RunHandle, 
 // is never reused — supersedes the launch binding with that evidence,
 // retires the occupant through the shared pane.close operation procedure,
 // and proceeds to cold relaunch only once its termination was observed.
-// occupant is the foreground member whose own argv or cmdline carried
-// nativeRef (markerBearer): the close target records THAT member's pid,
-// never the pid of whichever member the listing reported first.
+// occupant is the one foreground member MatchRestoredHarness identified as
+// the restored harness for nativeRef: the close target records THAT
+// member's pid, never the pid of whichever member the listing reported
+// first.
 func (c *Controller) retireAndRelaunch(ctx context.Context, handle RunHandle, detail RunDetail, req ResumeRequest, occupant ProcessInfo, nativeRef string) (ResumeResult, error) { //nolint:gocritic // hugeParam: RunHandle, RunDetail, ResumeRequest and ProcessInfo are per-call values; this runs once per resume round.
 	now := c.Clock.Now()
 	evidence := fmt.Sprintf("observed process argv carries native session reference %s", nativeRef)

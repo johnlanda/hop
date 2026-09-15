@@ -824,9 +824,16 @@ per the decision table (section 4) before any new act.
    that a different process occupies the old pane — it equally matches a
    human's unrelated replacement shell — and NEVER authorizes retirement.
    Automatic retirement requires positive evidence tying the occupant to
-   the run's native session and server instance: the concrete candidate is
-   an observed process command line carrying the run's pre-assigned native
-   session reference (`--resume <uuid>` / `--session-id <uuid>`) — S2
+   the run's native session and server instance: exactly one foreground
+   member that is the harness's native restore invocation for the run's
+   pre-assigned native session reference — for Claude, executable
+   identity `claude` (argv[0] basename) and an argv element `--resume`
+   immediately followed by an argv element exactly equal to the reference,
+   both on that same member (`app.MatchRestoredHarness`). The reference
+   merely appearing in some member's command line (a transcript path, a
+   foreign tool's argument) is never evidence, argv elements are matched
+   exactly whenever argv is reported (a space-delimited cmdline match is
+   only the fallback when it is not), and two candidates fail closed. S2
    established that full process argv IS observable through pane
    inspection, and S3 established that a recorded native session makes
    Herdr auto-relaunch exactly as `claude --resume <id>` (bypassing

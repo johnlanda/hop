@@ -95,8 +95,15 @@ type paneCloseTarget struct {
 // evidence alone, and the target holds no particular index in the
 // listing (the recorded worker spawns its own MCP children into its own
 // process group); a pid match on one member with a marker only on
-// another is never a match.
-func matchesCloseTarget(target *paneCloseTarget, pane PaneProcess) bool {
+// another is never a match. A positive-evidence retirement target is
+// rechecked under the predicate that authorized it instead: the member
+// with the recorded pid must still be harness's restored-harness
+// invocation for a recorded native reference, argv elements matched
+// exactly (restoredHarnessTargetMatches), never a cmdline substring.
+func matchesCloseTarget(target *paneCloseTarget, pane PaneProcess, harness run.Harness) bool {
+	if target.Reason == closeReasonRetirement {
+		return restoredHarnessTargetMatches(pane, harness, target.PID, target.Markers)
+	}
 	for _, fg := range pane.Foreground {
 		if fg.PID == target.PID && processMarkerMatch(fg, target.Markers) != "" {
 			return true
@@ -491,7 +498,14 @@ func (c *Controller) closePaneOperation(ctx context.Context, handle RunHandle, d
 		}
 		return true, "", nil
 	}
-	if !matchesCloseTarget(target, pane) {
+	var harness run.Harness
+	if target.Reason == closeReasonRetirement {
+		var harnessErr error
+		if harness, harnessErr = c.sessionHarness(ctx, handle, target.SessionID); harnessErr != nil {
+			return false, "", harnessErr
+		}
+	}
+	if !matchesCloseTarget(target, pane, harness) {
 		if err := c.markOperationReconciling(ctx, handle, opID, "occupant does not match the recorded close target; failing closed"); err != nil {
 			return false, "", err
 		}

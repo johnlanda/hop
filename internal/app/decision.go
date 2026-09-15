@@ -119,6 +119,165 @@ func CorroborateSettlement(paneMatches bool, pane PaneProcess, markers []string,
 	}
 }
 
+// RestoredHarnessOutcome classifies a pane's foreground members against a
+// harness's native restore invocation for the session's durable native
+// reference.
+type RestoredHarnessOutcome string
+
+// Restored-harness outcomes.
+const (
+	// RestoredHarnessMatched means exactly one member is the restored
+	// harness: positive evidence tying that member to the run's native
+	// session.
+	RestoredHarnessMatched RestoredHarnessOutcome = "matched"
+	// RestoredHarnessNone means no member is the restored harness.
+	RestoredHarnessNone RestoredHarnessOutcome = "none"
+	// RestoredHarnessAmbiguous means more than one member is the restored
+	// harness: no single occupant is identified, so the caller fails closed.
+	RestoredHarnessAmbiguous RestoredHarnessOutcome = "ambiguous"
+	// RestoredHarnessUnsupported means no restore invocation shape is known
+	// for the harness, or the native reference is empty: nothing can match.
+	RestoredHarnessUnsupported RestoredHarnessOutcome = "unsupported"
+)
+
+// restoreInvocation is a harness's native restore command shape: the
+// executable name Herdr's restore plan runs and the flag whose immediately
+// following argument is the native session reference.
+type restoreInvocation struct {
+	Executable string
+	ResumeFlag string
+}
+
+// restoreInvocationFor returns a harness's native restore invocation for
+// retiring restored occupants: Herdr's native restore plan (repos/herdr/src/agent_resume.rs, `plan`:
+// `["claude", "--resume", <id>]`, run by bare name through a login shell).
+// The shape is pinned by the executed S3 probe
+// (test/integration/spike_restore_test.go,
+// TestSpikeRestoreAutoRelaunchBypassesLauncher: a restored process's argv
+// is exactly `[claude --resume <id>]`, argv[0] basename `claude`). Only
+// Claude Code has an invocation: it is the only harness HOP pre-assigns a
+// native reference for and the only Phase 2 cold resume, so every other
+// harness reports false and never authorizes a retirement.
+func restoreInvocationFor(harness run.Harness) (restoreInvocation, bool) {
+	if harness == run.HarnessClaude {
+		return restoreInvocation{Executable: "claude", ResumeFlag: "--resume"}, true
+	}
+	return restoreInvocation{}, false
+}
+
+// MatchRestoredHarness is the restored-harness predicate: the positive
+// evidence that authorizes retiring a present occupant which is not the
+// claim's corroborated process. A member is the restored harness only when,
+// on that SAME member, both hold:
+//
+//   - executable identity equals the harness's restore executable: when
+//     Herdr reports argv, the basename of argv[0] (verbatim argv[0] is a
+//     bare name under Herdr's restore and an absolute path under a launch);
+//     when it reports none, argv0 or name, the only identity fields left;
+//   - the native resume argument shape: when argv is reported, an argv
+//     element equal to the resume flag immediately followed by an argv
+//     element EXACTLY equal to nativeRef — never a substring, so a child
+//     whose argument merely embeds the reference (a transcript path, say)
+//     is not evidence. Only when Herdr reports no argv does the documented
+//     fallback apply: cmdline carries `<flag> <nativeRef>` delimited by the
+//     string's ends or spaces. On herdr 0.9.0 cmdline is argv joined by
+//     spaces on both platforms (repos/herdr/src/platform/{macos,linux}.rs),
+//     so the fallback is reachable only through a server that reports
+//     cmdline without argv, which the schema permits.
+//
+// Exactly one matching member is RestoredHarnessMatched and is returned;
+// two or more are RestoredHarnessAmbiguous, and every candidate is returned
+// as the fail-closed evidence. A harness with no restore invocation, or an
+// empty nativeRef, is RestoredHarnessUnsupported. Listing order carries no
+// semantics and is never consulted.
+func MatchRestoredHarness(pane PaneProcess, harness run.Harness, nativeRef string) (RestoredHarnessOutcome, []ProcessInfo) {
+	invocation, ok := restoreInvocationFor(harness)
+	if !ok || nativeRef == "" {
+		return RestoredHarnessUnsupported, nil
+	}
+	var candidates []ProcessInfo
+	for _, fg := range pane.Foreground {
+		if restoredHarnessMember(fg, invocation, nativeRef) {
+			candidates = append(candidates, fg)
+		}
+	}
+	switch len(candidates) {
+	case 0:
+		return RestoredHarnessNone, nil
+	case 1:
+		return RestoredHarnessMatched, candidates
+	default:
+		return RestoredHarnessAmbiguous, candidates
+	}
+}
+
+// restoredHarnessMember reports whether one foreground member is the
+// restored harness for nativeRef under invocation (MatchRestoredHarness's
+// per-member conjuncts).
+func restoredHarnessMember(fg ProcessInfo, invocation restoreInvocation, nativeRef string) bool { //nolint:gocritic // hugeParam: ProcessInfo is the decision file's pure-value member shape, examined once per member per resume round, never a hot loop.
+	if nativeRef == "" {
+		return false
+	}
+	if len(fg.Argv) > 0 {
+		if filepath.Base(fg.Argv[0]) != invocation.Executable {
+			return false
+		}
+		for i := 1; i+1 < len(fg.Argv); i++ {
+			if fg.Argv[i] == invocation.ResumeFlag && fg.Argv[i+1] == nativeRef {
+				return true
+			}
+		}
+		return false
+	}
+	if fg.Argv0 != invocation.Executable && fg.Name != invocation.Executable {
+		return false
+	}
+	return containsDelimited(fg.Cmdline, invocation.ResumeFlag+" "+nativeRef)
+}
+
+// restoredHarnessTargetMatches reports whether the member with pid is the
+// restored harness for one of markers under harness: the close-time recheck
+// of a positive-evidence retirement target, applying the same per-member
+// conjuncts that authorized the retirement to the recorded pid's member.
+func restoredHarnessTargetMatches(pane PaneProcess, harness run.Harness, pid int, markers []string) bool {
+	invocation, ok := restoreInvocationFor(harness)
+	if !ok {
+		return false
+	}
+	for _, fg := range pane.Foreground {
+		if fg.PID != pid {
+			continue
+		}
+		for _, marker := range markers {
+			if restoredHarnessMember(fg, invocation, marker) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// containsDelimited reports whether s contains needle bounded on each side
+// by the start or end of s or a space.
+func containsDelimited(s, needle string) bool {
+	if needle == "" {
+		return false
+	}
+	for offset := 0; offset+len(needle) <= len(s); {
+		idx := strings.Index(s[offset:], needle)
+		if idx < 0 {
+			return false
+		}
+		start := offset + idx
+		end := start + len(needle)
+		if (start == 0 || s[start-1] == ' ') && (end == len(s) || s[end] == ' ') {
+			return true
+		}
+		offset = start + 1
+	}
+	return false
+}
+
 // executableMatches reports whether an observed foreground process's
 // executable identity matches expected (the claim's recorded absolute
 // path), against the real, platform-specific pane.process_info surface:
@@ -147,35 +306,13 @@ func executableMatches(fg ProcessInfo, expected string) bool { //nolint:gocritic
 	return fg.Name != "" && fg.Name == base
 }
 
-// FirstMarkerMatch returns the first non-empty marker ANY of the pane's
-// foreground members carries in its argv or cmdline, or "" when none
-// does — the any-member predicate: it reports pane-level positive
-// evidence and never identifies WHICH process carried it (markerBearer
-// does, and per-member decisions such as CorroborateSettlement and the
-// close-target match never combine a marker from one member with the
-// identity of another).
-func FirstMarkerMatch(pane PaneProcess, markers []string) string {
-	_, marker, _ := markerBearer(pane, markers)
-	return marker
-}
-
-// markerBearer returns the first foreground member whose argv or cmdline
-// carries one of markers, together with the marker it carried. Members
-// are scanned in Herdr's reported listing order, which carries no
-// semantics (macOS reports raw proc_listpids order, Linux ascending pid;
-// the launched process holds no particular index), so a caller uses the
-// returned member's own identity — never its position.
-func markerBearer(pane PaneProcess, markers []string) (ProcessInfo, string, bool) {
-	for _, fg := range pane.Foreground {
-		if marker := processMarkerMatch(fg, markers); marker != "" {
-			return fg, marker, true
-		}
-	}
-	return ProcessInfo{}, "", false
-}
-
 // processMarkerMatch returns the first non-empty marker fg's own argv or
-// cmdline carries, or "" when none matches.
+// cmdline carries, or "" when none matches. It serves the launch-marker
+// conjunct of settlement and the stop close rule, where the run, attempt
+// and incarnation markers legitimately sit INSIDE the larger prompt
+// argument, so a cmdline substring is accepted. It is never the authority
+// for retiring an occupant that is not the claim's corroborated process;
+// that is MatchRestoredHarness, which matches argv elements exactly.
 func processMarkerMatch(fg ProcessInfo, markers []string) string { //nolint:gocritic // hugeParam: ProcessInfo is the decision file's pure-value member shape, examined a handful of times per corroboration round, never a hot loop.
 	for _, marker := range markers {
 		if marker == "" {

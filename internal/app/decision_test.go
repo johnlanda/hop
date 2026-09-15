@@ -2,6 +2,7 @@ package app_test
 
 import (
 	"errors"
+	"slices"
 	"testing"
 
 	"github.com/johnlanda/hop/internal/app"
@@ -180,55 +181,148 @@ func TestCorroborateSettlement(t *testing.T) {
 	}
 }
 
-// TestFirstMarkerMatch pins the any-member marker predicate: positive
-// evidence is accepted from ANY member of the reported foreground group,
-// in listing order, since the listing order itself carries no semantics
-// (macOS raw proc_listpids order, Linux ascending pid).
-func TestFirstMarkerMatch(t *testing.T) {
+// TestMatchRestoredHarness pins the restored-harness predicate, the only
+// positive evidence that authorizes retiring an occupant which is not the
+// claim's corroborated process. The legitimate shape is Herdr's native
+// restore plan for Claude Code, `[claude --resume <id>]`, pinned by the
+// executed S3 probe (TestSpikeRestoreAutoRelaunchBypassesLauncher);
+// executable identity and the exact adjacent `--resume <ref>` argv
+// elements must hold on the SAME member, exactly one member may match,
+// and the cmdline substring fallback applies only when Herdr reports no
+// argv at all.
+func TestMatchRestoredHarness(t *testing.T) {
+	const ref = "0d9c7a52-5d0e-4c55-9d63-2f1b8a7e6c41"
+	member := func(pid int, argv0, name string, argv ...string) app.ProcessInfo {
+		return app.ProcessInfo{PID: pid, Argv0: argv0, Name: name, Argv: argv}
+	}
+	restored := member(7777, "claude", "claude", "claude", "--resume", ref)
+	npmMember := member(7840, "npm", "npm", "npm", "exec", "@executeautomation/playwright-mcp-server")
+	group := func(members ...app.ProcessInfo) app.PaneProcess {
+		return app.PaneProcess{Foreground: members}
+	}
+
 	tests := map[string]struct {
 		pane    app.PaneProcess
-		markers []string
-		want    string
+		harness run.Harness
+		ref     string
+		want    app.RestoredHarnessOutcome
+		// wantPIDs pins the returned candidates: the one matched member,
+		// or every ambiguous candidate in listing order.
+		wantPIDs []int
 	}{
-		"found on the sole member's argv": {
-			pane:    app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 1, Argv: []string{"x", "marker-1"}}}},
-			markers: []string{"marker-1"}, want: "marker-1",
+		"matched: Herdr's bare-name restore argv": {
+			pane: group(restored), harness: run.HarnessClaude, ref: ref,
+			want: app.RestoredHarnessMatched, wantPIDs: []int{7777},
 		},
-		"found on a later member behind a foreign index 0": {
-			pane: app.PaneProcess{Foreground: []app.ProcessInfo{
-				{PID: 1, Argv: []string{"npm", "exec", "some-mcp-server"}},
-				{PID: 2, Cmdline: "/usr/bin/claude --resume marker-1"},
-			}},
-			markers: []string{"marker-1"}, want: "marker-1",
+		"matched: an absolute argv[0] with the claude basename": {
+			pane: group(member(7777, "claude", "claude", "/usr/bin/claude", "--resume", ref)), harness: run.HarnessClaude, ref: ref,
+			want: app.RestoredHarnessMatched, wantPIDs: []int{7777},
 		},
-		"the first bearing member's first matching marker wins": {
-			pane: app.PaneProcess{Foreground: []app.ProcessInfo{
-				{PID: 1, Argv: []string{"x", "marker-2"}},
-				{PID: 2, Argv: []string{"y", "marker-1"}},
-			}},
-			markers: []string{"marker-1", "marker-2"}, want: "marker-2",
+		"matched: listed behind its own MCP child": {
+			pane: group(npmMember, restored), harness: run.HarnessClaude, ref: ref,
+			want: app.RestoredHarnessMatched, wantPIDs: []int{7777},
 		},
-		"absent from every member": {
-			pane: app.PaneProcess{Foreground: []app.ProcessInfo{
-				{PID: 1, Argv: []string{"x"}},
-				{PID: 2, Argv: []string{"y"}},
-			}},
-			markers: []string{"marker-1"}, want: "",
+		"matched: listed ahead of its own MCP child": {
+			pane: group(restored, npmMember), harness: run.HarnessClaude, ref: ref,
+			want: app.RestoredHarnessMatched, wantPIDs: []int{7777},
 		},
-		"empty markers never match": {
-			pane:    app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 1, Argv: []string{"x"}}}},
-			markers: []string{""}, want: "",
+		"none: an unrelated member whose argument embeds the reference in a path": {
+			pane: group(
+				member(9001, "bash", "bash", "/bin/bash"),
+				app.ProcessInfo{PID: 9002, Argv0: "node", Name: "node", Argv: []string{"node", "viewer.js", "/logs/" + ref + ".jsonl"}, Cmdline: "node viewer.js /logs/" + ref + ".jsonl"},
+			),
+			harness: run.HarnessClaude, ref: ref, want: app.RestoredHarnessNone,
 		},
-		"no foreground members": {
-			pane:    app.PaneProcess{},
-			markers: []string{"marker-1"}, want: "",
+		"none: a foreign executable carrying the exact resume argument pair": {
+			pane: group(
+				member(9001, "bash", "bash", "/bin/bash"),
+				member(9002, "viewer", "viewer", "/usr/local/bin/viewer", "--resume", ref),
+			),
+			harness: run.HarnessClaude, ref: ref, want: app.RestoredHarnessNone,
+		},
+		"none: the claude executable carrying the reference outside the resume shape": {
+			pane:    group(member(7777, "claude", "claude", "/usr/bin/claude", "--session-id", ref)),
+			harness: run.HarnessClaude, ref: ref, want: app.RestoredHarnessNone,
+		},
+		"none: the resume flag is the last argument": {
+			pane:    group(member(7777, "claude", "claude", "claude", ref, "--resume")),
+			harness: run.HarnessClaude, ref: ref, want: app.RestoredHarnessNone,
+		},
+		"none: the resume value only starts with the reference": {
+			pane:    group(member(7777, "claude", "claude", "claude", "--resume", ref+".jsonl")),
+			harness: run.HarnessClaude, ref: ref, want: app.RestoredHarnessNone,
+		},
+		"none: the joined --resume=<ref> form is not the native shape": {
+			pane:    group(member(7777, "claude", "claude", "claude", "--resume="+ref)),
+			harness: run.HarnessClaude, ref: ref, want: app.RestoredHarnessNone,
+		},
+		"none: with argv reported, a cmdline substring is never consulted": {
+			pane:    group(app.ProcessInfo{PID: 7777, Argv0: "claude", Name: "claude", Argv: []string{"claude", "--continue"}, Cmdline: "claude --resume " + ref}),
+			harness: run.HarnessClaude, ref: ref, want: app.RestoredHarnessNone,
+		},
+		"none: identity and resume shape never combine across members": {
+			pane: group(
+				member(7777, "claude", "claude", "claude"),
+				member(7840, "npm", "npm", "npm", "--resume", ref),
+			),
+			harness: run.HarnessClaude, ref: ref, want: app.RestoredHarnessNone,
+		},
+		"ambiguous: two members each match, both returned as evidence": {
+			pane:    group(restored, npmMember, member(7778, "claude", "claude", "/usr/bin/claude", "--resume", ref)),
+			harness: run.HarnessClaude, ref: ref,
+			want: app.RestoredHarnessAmbiguous, wantPIDs: []int{7777, 7778},
+		},
+		"matched: argv-absent fallback, darwin shape — argv0 and token-bounded cmdline": {
+			pane:    group(app.ProcessInfo{PID: 7777, Argv0: "claude", Name: "claude", Cmdline: "claude --resume " + ref}),
+			harness: run.HarnessClaude, ref: ref,
+			want: app.RestoredHarnessMatched, wantPIDs: []int{7777},
+		},
+		"matched: argv-absent fallback, linux shape — name alone with the pair mid-cmdline": {
+			pane:    group(app.ProcessInfo{PID: 7777, Name: "claude", Cmdline: "/usr/bin/claude --resume " + ref + " --verbose"}),
+			harness: run.HarnessClaude, ref: ref,
+			want: app.RestoredHarnessMatched, wantPIDs: []int{7777},
+		},
+		"none: argv-absent fallback requires the token boundary after the reference": {
+			pane:    group(app.ProcessInfo{PID: 7777, Argv0: "claude", Name: "claude", Cmdline: "claude --resume " + ref + ".jsonl"}),
+			harness: run.HarnessClaude, ref: ref, want: app.RestoredHarnessNone,
+		},
+		"none: argv-absent fallback requires the token boundary before the flag": {
+			pane:    group(app.ProcessInfo{PID: 7777, Argv0: "claude", Name: "claude", Cmdline: "claude x--resume " + ref}),
+			harness: run.HarnessClaude, ref: ref, want: app.RestoredHarnessNone,
+		},
+		"none: argv-absent fallback still requires the harness identity": {
+			pane:    group(app.ProcessInfo{PID: 9002, Argv0: "node", Name: "node", Cmdline: "node --resume " + ref}),
+			harness: run.HarnessClaude, ref: ref, want: app.RestoredHarnessNone,
+		},
+		"none: neither argv nor cmdline reported": {
+			pane:    group(app.ProcessInfo{PID: 7777, Argv0: "claude", Name: "claude"}),
+			harness: run.HarnessClaude, ref: ref, want: app.RestoredHarnessNone,
+		},
+		"none: no foreground members": {
+			pane: app.PaneProcess{}, harness: run.HarnessClaude, ref: ref, want: app.RestoredHarnessNone,
+		},
+		"unsupported: a harness with no known restore invocation": {
+			pane:    group(member(7777, "codex", "codex", "codex", "resume", ref)),
+			harness: run.HarnessCodex, ref: ref, want: app.RestoredHarnessUnsupported,
+		},
+		"unsupported: an empty native reference never matches": {
+			pane:    group(member(7777, "claude", "claude", "claude", "--resume", "")),
+			harness: run.HarnessClaude, ref: "", want: app.RestoredHarnessUnsupported,
 		},
 	}
 
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
-			if got := app.FirstMarkerMatch(tc.pane, tc.markers); got != tc.want {
-				t.Fatalf("FirstMarkerMatch() = %q, want %q", got, tc.want)
+			got, candidates := app.MatchRestoredHarness(tc.pane, tc.harness, tc.ref)
+			if got != tc.want {
+				t.Fatalf("MatchRestoredHarness() = %s, want %s", got, tc.want)
+			}
+			pids := make([]int, 0, len(candidates))
+			for _, candidate := range candidates {
+				pids = append(pids, candidate.PID)
+			}
+			if !slices.Equal(pids, tc.wantPIDs) {
+				t.Fatalf("MatchRestoredHarness() candidates = %v, want %v", pids, tc.wantPIDs)
 			}
 		})
 	}

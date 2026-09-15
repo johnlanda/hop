@@ -228,7 +228,10 @@ alternate-profile/pools work; they are not re-verified here.
   decision over a pane occupant (settlement, adoption, close-target
   match, positive-evidence retirement) must scan ALL members and must
   never depend on member position — the orderings above are observed
-  facts about the current implementations, not guarantees. The
+  facts about the current implementations, not guarantees. A positive
+  retirement is authorized only by the restored-harness predicate over
+  one member (see
+  [Herdr cold-restore interaction](#herdr-cold-restore-interaction)). The
   per-member predicate rules live in `internal/app/decision.go` and
   internal/app/AGENTS.md, and the executed real-process probe under the
   production transport is `TestRealProcessSettlementWithMCPGroupMembers`
@@ -517,6 +520,23 @@ installed `herdr 0.9.0` documentation):
   ([`agent_resume::plan`](../../repos/herdr/src/agent_resume.rs)) — so
   nothing in the plan itself re-runs a sanitizing launcher or reselects a
   profile.
+- HOP's positive evidence for retiring such a restored occupant is this
+  exact plan shape, never the reference appearing somewhere in a process
+  command line: the restored-harness predicate
+  (`MatchRestoredHarness`, `internal/app/decision.go`) requires, on ONE
+  foreground-group member, the harness's restore executable (for Claude
+  Code the basename of argv[0] is `claude`) AND an argv element
+  `--resume` immediately followed by an argv element exactly equal to the
+  session's durable native reference, and exactly one such member —
+  two candidates fail closed. Argv elements are matched exactly whenever
+  Herdr reports argv. Herdr 0.9.0 derives `cmdline` by joining argv with
+  spaces on both platforms and omits both together, so the cmdline
+  fallback (identity from argv0/name, a space-delimited `--resume <id>`)
+  applies only to a server that reports cmdline without argv. Only Claude
+  Code has an entry: it is the only harness HOP pre-assigns a native
+  reference for and the only Phase 2 cold resume. The shape is pinned by
+  `TestSpikeRestoreAutoRelaunchBypassesLauncher` (argv exactly
+  `[claude --resume <id>]`).
 - The cold-restore path constructs its launch environment as
   `PaneLaunchEnv::from_extra(Vec::new())`
   ([restore implementation](../../repos/herdr/src/persist/restore.rs)), as

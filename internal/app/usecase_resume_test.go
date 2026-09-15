@@ -1251,6 +1251,196 @@ func TestRetirementTargetImmutability(t *testing.T) {
 	}
 }
 
+// assertNothingRetired fails unless a resume round left the session's
+// pane, binding and lineage untouched: no ClosePane call, no pane.close
+// operation journaled, the launch binding neither superseded nor joined by
+// an observed-restoration binding, and no replacement session.
+func assertNothingRetired(t *testing.T, tc *testController, detail app.RunDetail) { //nolint:gocritic // hugeParam: detail is the test's already-loaded RunDetail, passed once per assertion.
+	t.Helper()
+	if n := len(tc.Runtime.ClosedPanes); n != 0 {
+		t.Fatalf("ClosePane calls = %d, want 0 (nothing may be retired)", n)
+	}
+	for id := range tc.Store.Operations {
+		if tc.Store.Operations[id].Kind == app.OpPaneClose {
+			t.Fatalf("a pane.close operation was journaled; nothing may be retired")
+		}
+	}
+	history := tc.Store.Bindings[detail.SessionID]
+	if len(history) != 1 || history[0].Superseded || history[0].IncarnationID != detail.Binding.IncarnationID {
+		t.Fatalf("binding history = %+v, want the one launch binding, unsuperseded", history)
+	}
+	updated, err := tc.Store.LoadRunStatus(context.Background(), detail.RunID)
+	if err != nil {
+		t.Fatalf("LoadRunStatus() error = %v", err)
+	}
+	if updated.SessionID != detail.SessionID {
+		t.Fatalf("a replacement session %s was bound; no relaunch may follow", updated.SessionID)
+	}
+	if got := tc.Store.Sessions[detail.SessionID].value.State; got == run.SessionLost {
+		t.Fatalf("Session.State = %s; the session was retired", got)
+	}
+}
+
+// TestResumeRestoredHarnessPredicate proves positive-evidence retirement is
+// authorized only by the restored-harness predicate: exactly one
+// foreground member that is Claude Code's native restore invocation for the
+// session's durable native reference, harness identity and the exact
+// `--resume <ref>` argv elements on that same member. Every other shape —
+// an unrelated member whose argument merely embeds the reference, a foreign
+// executable carrying the exact pair, two competing candidates — fails
+// closed with nothing closed, superseded or relaunched, behind a
+// marker-free foreign first member.
+func TestResumeRestoredHarnessPredicate(t *testing.T) {
+	shell := app.ProcessInfo{PID: 9001, Argv0: "bash", Name: "bash", Argv: []string{"/bin/bash"}, Cmdline: "/bin/bash"}
+
+	failClosed := map[string]struct {
+		members    func(nativeRef string) []app.ProcessInfo
+		wantDetail []string
+	}{
+		"a marker-bearing unrelated child whose argument embeds the reference": {
+			members: func(nativeRef string) []app.ProcessInfo {
+				path := "/logs/" + nativeRef + ".jsonl"
+				return []app.ProcessInfo{shell, {PID: 9002, Argv0: "node", Name: "node", Argv: []string{"node", "viewer.js", path}, Cmdline: "node viewer.js " + path}}
+			},
+			wantDetail: []string{"no positive evidence"},
+		},
+		"a foreign executable carrying the reference as the exact resume argument": {
+			members: func(nativeRef string) []app.ProcessInfo {
+				return []app.ProcessInfo{shell, {PID: 9002, Argv0: "viewer", Name: "viewer", Argv: []string{"/usr/local/bin/viewer", "--resume", nativeRef}, Cmdline: "/usr/local/bin/viewer --resume " + nativeRef}}
+			},
+			wantDetail: []string{"no positive evidence"},
+		},
+		"the reference in a cmdline substring while argv lacks the resume pair": {
+			members: func(nativeRef string) []app.ProcessInfo {
+				return []app.ProcessInfo{shell, {PID: 7777, Argv0: "claude", Name: "claude", Argv: []string{"claude", "--continue"}, Cmdline: "claude --resume " + nativeRef}}
+			},
+			wantDetail: []string{"no positive evidence"},
+		},
+		"two restored-harness candidates are ambiguous": {
+			members: func(nativeRef string) []app.ProcessInfo {
+				return []app.ProcessInfo{
+					shell,
+					{PID: 7777, Argv0: "claude", Name: "claude", Argv: []string{"claude", "--resume", nativeRef}},
+					{PID: 7778, Argv0: "claude", Name: "claude", Argv: []string{"/usr/bin/claude", "--resume", nativeRef}},
+				}
+			},
+			wantDetail: []string{"more than one", "7777", "7778"},
+		},
+	}
+	for name, vector := range failClosed {
+		t.Run("fail closed: "+name, func(t *testing.T) {
+			tc := newTestController(defaultPolicy())
+			_, detail := runningRun(t, tc)
+			nativeRef := tc.Store.Sessions[detail.SessionID].value.NativeSessionRef
+			members := vector.members(nativeRef)
+			tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+				return app.PaneProcess{ForegroundGroupID: 9001, Foreground: members}, nil
+			}
+
+			tc.Clock.Advance(leaseTTL + time.Second)
+			result, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String()))
+			if err != nil {
+				t.Fatalf("Resume() error = %v", err)
+			}
+			if result.Outcome != app.ResumeFailedClosed {
+				t.Fatalf("Outcome = %s, want %s", result.Outcome, app.ResumeFailedClosed)
+			}
+			if result.ObservedPaneID != detail.Binding.PaneID {
+				t.Fatalf("ObservedPaneID = %q, want the bound pane %q", result.ObservedPaneID, detail.Binding.PaneID)
+			}
+			for _, want := range vector.wantDetail {
+				if !strings.Contains(result.Detail, want) {
+					t.Fatalf("Detail = %q, want it to name %q", result.Detail, want)
+				}
+			}
+			assertNothingRetired(t, tc, detail)
+		})
+	}
+
+	retired := map[string]func(nativeRef string) []app.ProcessInfo{
+		"the restored harness listed ahead of its MCP child": func(nativeRef string) []app.ProcessInfo {
+			return []app.ProcessInfo{
+				{PID: 7777, Argv0: "claude", Name: "claude", Argv: []string{"claude", "--resume", nativeRef}, Cmdline: "claude --resume " + nativeRef},
+				{PID: 7840, Argv0: "npm", Name: "npm", Argv: []string{"npm", "exec", "@executeautomation/playwright-mcp-server"}},
+			}
+		},
+		"argv-absent fallback: identity by argv0/name, the token-bounded resume pair in cmdline": func(nativeRef string) []app.ProcessInfo {
+			return []app.ProcessInfo{
+				{PID: 7840, Name: "npm", Cmdline: "npm exec @executeautomation/playwright-mcp-server"},
+				{PID: 7777, Argv0: "claude", Name: "claude", Cmdline: "claude --resume " + nativeRef},
+			}
+		},
+	}
+	for name, members := range retired {
+		t.Run("retired: "+name, func(t *testing.T) {
+			tc := newTestController(defaultPolicy())
+			_, detail := runningRun(t, tc)
+			nativeRef := tc.Store.Sessions[detail.SessionID].value.NativeSessionRef
+			observed := members(nativeRef)
+			tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+				return app.PaneProcess{ForegroundGroupID: 7777, Foreground: observed}, nil
+			}
+
+			tc.Clock.Advance(leaseTTL + time.Second)
+			result, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String()))
+			if err != nil {
+				t.Fatalf("Resume() error = %v", err)
+			}
+			if result.Outcome != app.ResumeReconciling {
+				t.Fatalf("Outcome = %s (%s), want %s (close dispatched, termination not yet observed)", result.Outcome, result.Detail, app.ResumeReconciling)
+			}
+			if n := len(tc.Runtime.ClosedPanes); n != 1 {
+				t.Fatalf("ClosePane calls = %d, want 1 guarded close of the restored harness", n)
+			}
+			history := tc.Store.Bindings[detail.SessionID]
+			if len(history) != 2 || history[1].Occupant == nil || history[1].Occupant.PID != 7777 || history[1].Occupant.ArgvMarker != nativeRef {
+				t.Fatalf("binding history = %+v, want the observed restoration of pid 7777", history)
+			}
+		})
+	}
+
+	t.Run("fail closed: the close-time recheck refuses a retirement target no longer the restored harness", func(t *testing.T) {
+		// The restored harness authorizes the retirement, but by the time
+		// the close procedure re-inspects, its pid is held by an unrelated
+		// process whose argument merely embeds the reference. The recorded
+		// pid plus a cmdline substring must never pass the recheck.
+		tc := newTestController(defaultPolicy())
+		_, detail := runningRun(t, tc)
+		nativeRef := tc.Store.Sessions[detail.SessionID].value.NativeSessionRef
+		path := "/logs/" + nativeRef + ".jsonl"
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			tc.Store.mu.Lock()
+			recorded := len(tc.Store.Bindings[detail.SessionID]) == 2
+			tc.Store.mu.Unlock()
+			if recorded {
+				return app.PaneProcess{Foreground: []app.ProcessInfo{shell, {PID: 7777, Argv0: "node", Name: "node", Argv: []string{"node", "viewer.js", path}, Cmdline: "node viewer.js " + path}}}, nil
+			}
+			return app.PaneProcess{Foreground: []app.ProcessInfo{shell, {PID: 7777, Argv0: "claude", Name: "claude", Argv: []string{"claude", "--resume", nativeRef}}}}, nil
+		}
+
+		tc.Clock.Advance(leaseTTL + time.Second)
+		result, _, err := tc.Controller.Resume(context.Background(), defaultResumeRequest(detail.RunID.String()))
+		if err != nil {
+			t.Fatalf("Resume() error = %v", err)
+		}
+		if result.Outcome == app.ResumeColdRelaunched {
+			t.Fatalf("Outcome = %s; a changed occupant must never be retired", result.Outcome)
+		}
+		if n := len(tc.Runtime.ClosedPanes); n != 0 {
+			t.Fatalf("ClosePane calls = %d, want 0 (the recheck must fail closed)", n)
+		}
+		reconciling := false
+		for id := range tc.Store.Operations {
+			if op := tc.Store.Operations[id]; op.Kind == app.OpPaneClose && op.State == app.OperationReconciling {
+				reconciling = true
+			}
+		}
+		if !reconciling {
+			t.Fatalf("the retirement close was not marked reconciling on the recheck mismatch")
+		}
+	})
+}
+
 // TestReconciliationClaimSettlement is the M4 pending→reconciling→
 // claim-appears trace: a launch that went ambiguous (attempt reconciling)
 // is settled once the claim appears and its worker corroborates under the
