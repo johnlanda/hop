@@ -61,16 +61,37 @@ func ValidateAcyclic(existing []TaskDependency, candidate TaskDependency) error 
 	return nil
 }
 
-// ReleaseEligible reports whether task is eligible to move pending->ready:
-// every one of prerequisites has reached integrated. A task with no
-// dependencies is vacuously eligible (it is created ready directly and
-// never actually calls Release, but the predicate stays true for it by
-// definition).
-func ReleaseEligible(task Task, prerequisites []Task) bool { //nolint:gocritic // hugeParam: Task is passed by value everywhere in this package; this predicate mirrors that convention.
-	if !task.HasDependencies {
-		return true
+// ReleaseEligible reports whether task is eligible to move pending->ready.
+// edges is task's own persisted dependency set: a caller-supplied edge
+// whose TaskID does not equal task.ID is rejected outright (false), never
+// silently ignored, since it would otherwise let a foreign task's edges
+// stand in for task's own. prerequisites carries the CURRENT state of
+// every prerequisite edges names. Eligible only when prerequisites
+// accounts for EXACTLY the prerequisite IDs edges names — no missing, no
+// foreign (an ID edges never named), no duplicate — and every one has
+// reached integrated. Zero edges is vacuously eligible (0 required, 0
+// given); Release's own pending-only source-state guard is what actually
+// prevents this from misfiring on a task created with real dependencies,
+// since such a task never even reaches pending without a caller
+// separately establishing edges for it.
+func ReleaseEligible(task Task, edges []TaskDependency, prerequisites []Task) bool { //nolint:gocritic // hugeParam: Task is passed by value everywhere in this package; this predicate mirrors that convention.
+	want := make(map[identity.TaskID]bool, len(edges))
+	for _, e := range edges {
+		if e.TaskID != task.ID {
+			return false
+		}
+		want[e.PrerequisiteID] = true
 	}
+	if len(prerequisites) != len(want) {
+		return false
+	}
+	seen := make(map[identity.TaskID]bool, len(want))
 	for i := range prerequisites {
+		id := prerequisites[i].ID
+		if !want[id] || seen[id] {
+			return false
+		}
+		seen[id] = true
 		if prerequisites[i].State != TaskIntegrated {
 			return false
 		}

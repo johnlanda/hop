@@ -72,10 +72,15 @@ var reviewTaskTransitions = newTransitionTable(concatPairs( //nolint:gochecknogl
 ))
 
 // Task is a scoped unit of work with acceptance criteria and dependencies.
-// Kind, Seq, Title and HasDependencies are fixed at creation (a task's
-// dependency set is immutable once created); SubjectCommitOID and
-// SubjectTreeOID are set only for a review task, frozen to the integration
-// head it was created against.
+// Kind, Seq, Title and HasDependencies are fixed at creation.
+// HasDependencies is a plain, comparable flag Activate dispatches on
+// (zero-dependency tasks activate directly from pending); it is NOT the
+// ground truth Release verifies against — that is the task's persisted
+// TaskDependency edges, supplied explicitly to Release/ReleaseEligible
+// (never stored on Task itself: a []identity.TaskID field would make Task
+// incomparable, breaking every Phase 2 test's `==`/`!=` use of it).
+// SubjectCommitOID and SubjectTreeOID are set only for a review task,
+// frozen to the integration head it was created against.
 type Task struct {
 	ID                 identity.TaskID
 	RunID              identity.RunID
@@ -108,8 +113,9 @@ func NewTask(id identity.TaskID, runID identity.RunID, instructionsDigest string
 
 // NewImplementTask constructs an implement task: ready immediately when
 // hasDependencies is false (a task with no prerequisites is created
-// ready), pending otherwise — Release then gates its move to ready on
-// ReleaseEligible.
+// ready), pending otherwise — Release then gates its move to ready on the
+// task's actual persisted TaskDependency edges (see Release), never on
+// this flag.
 func NewImplementTask(id identity.TaskID, runID identity.RunID, seq int, title, instructionsDigest string, hasDependencies bool, now time.Time) Task {
 	state := TaskPending
 	if !hasDependencies {
@@ -182,17 +188,23 @@ func (t Task) Activate(now time.Time) (Task, error) { //nolint:gocritic // hugeP
 	return t.transition(TaskActive, now)
 }
 
-// Release moves a dependent task from pending to ready. eligible is
-// ReleaseEligible's verdict for t against its current prerequisite set, an
-// application-assembled fact this package cannot check unaided; false is
-// ErrDependencyNotIntegrated. Any source state other than pending is
-// ErrInvalidTransition — a task with no dependencies is created ready
-// directly and never calls Release.
-func (t Task) Release(eligible bool, now time.Time) (Task, error) { //nolint:gocritic // hugeParam: Task is an immutable domain value returned by every transition; a pointer receiver would let a caller's original be mutated through it, breaking the pure-transition contract.
+// Release moves a dependent task from pending to ready. edges must be
+// EXACTLY t's own persisted TaskDependency set (every row naming t.ID as
+// the dependent task; a caller-supplied edge naming a different task is
+// rejected, never silently ignored) and prerequisites the current state
+// of every task edges names. Release computes eligibility itself via
+// ReleaseEligible — it never accepts a bare caller-asserted boolean, which
+// is exactly what would let an incomplete or empty evidence set slip
+// through unnoticed. ErrDependencyNotIntegrated when the evidence is
+// incomplete, contains a foreign or duplicate prerequisite, or any named
+// prerequisite has not reached integrated. Any source state other than
+// pending is ErrInvalidTransition — a task with no dependencies is
+// created ready directly and never calls Release.
+func (t Task) Release(edges []TaskDependency, prerequisites []Task, now time.Time) (Task, error) { //nolint:gocritic // hugeParam: Task is an immutable domain value returned by every transition; a pointer receiver would let a caller's original be mutated through it, breaking the pure-transition contract.
 	if t.State != TaskPending || t.Kind == TaskKindReview {
 		return t, fmt.Errorf("%w: task %s: %s to %s", ErrInvalidTransition, t.ID, t.State, TaskReady)
 	}
-	if !eligible {
+	if !ReleaseEligible(t, edges, prerequisites) {
 		return t, fmt.Errorf("%w: task %s", ErrDependencyNotIntegrated, t.ID)
 	}
 	t.State = TaskReady

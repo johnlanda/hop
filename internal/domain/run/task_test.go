@@ -188,37 +188,55 @@ func TestTaskActivateDependentRefusesDirectFromPending(t *testing.T) {
 }
 
 // TestTaskRelease proves Release's own rule: only from pending, and only
-// when eligible — the caller-supplied ReleaseEligible verdict — is true.
+// when the actual edge/prerequisite evidence establishes eligibility —
+// never a bare caller assertion.
 func TestTaskRelease(t *testing.T) {
+	edges := []run.TaskDependency{{TaskID: testTaskID, PrerequisiteID: testSecondTaskID}}
+	integratedPrereqs := []run.Task{{ID: testSecondTaskID, State: run.TaskIntegrated}}
+	incompletePrereqs := []run.Task{{ID: testSecondTaskID, State: run.TaskCompleted}}
+
 	t.Run("eligible", func(t *testing.T) {
 		task := run.Task{ID: testTaskID, RunID: testRunID, Kind: run.TaskKindImplement, HasDependencies: true, State: run.TaskPending}
 
-		got, err := task.Release(true, epoch())
+		got, err := task.Release(edges, integratedPrereqs, epoch())
 		if err != nil {
-			t.Fatalf("Release(eligible=true): unexpected error: %v", err)
+			t.Fatalf("Release(eligible): unexpected error: %v", err)
 		}
 		if got.State != run.TaskReady {
-			t.Fatalf("Release(eligible=true): State = %s, want ready", got.State)
+			t.Fatalf("Release(eligible): State = %s, want ready", got.State)
 		}
 	})
 
 	t.Run("not eligible", func(t *testing.T) {
 		task := run.Task{ID: testTaskID, RunID: testRunID, Kind: run.TaskKindImplement, HasDependencies: true, State: run.TaskPending}
 
-		got, err := task.Release(false, epoch())
+		got, err := task.Release(edges, incompletePrereqs, epoch())
 
 		if !errors.Is(err, run.ErrDependencyNotIntegrated) {
-			t.Fatalf("Release(eligible=false): error = %v, want ErrDependencyNotIntegrated", err)
+			t.Fatalf("Release(not eligible): error = %v, want ErrDependencyNotIntegrated", err)
 		}
 		if got.State != run.TaskPending {
-			t.Fatalf("Release(eligible=false): State = %s, want unchanged", got.State)
+			t.Fatalf("Release(not eligible): State = %s, want unchanged", got.State)
+		}
+	})
+
+	t.Run("empty evidence against a dependent task is refused, never a bare assertion", func(t *testing.T) {
+		task := run.Task{ID: testTaskID, RunID: testRunID, Kind: run.TaskKindImplement, HasDependencies: true, State: run.TaskPending}
+
+		got, err := task.Release(edges, nil, epoch())
+
+		if !errors.Is(err, run.ErrDependencyNotIntegrated) {
+			t.Fatalf("Release(empty evidence): error = %v, want ErrDependencyNotIntegrated", err)
+		}
+		if got.State != run.TaskPending {
+			t.Fatalf("Release(empty evidence): State = %s, want unchanged", got.State)
 		}
 	})
 
 	t.Run("wrong source state", func(t *testing.T) {
 		task := run.Task{ID: testTaskID, RunID: testRunID, Kind: run.TaskKindImplement, State: run.TaskReady}
 
-		got, err := task.Release(true, epoch())
+		got, err := task.Release(edges, integratedPrereqs, epoch())
 
 		if !errors.Is(err, run.ErrInvalidTransition) {
 			t.Fatalf("Release from ready: error = %v, want ErrInvalidTransition", err)
@@ -231,7 +249,7 @@ func TestTaskRelease(t *testing.T) {
 	t.Run("review task refused regardless of eligibility", func(t *testing.T) {
 		task := run.Task{ID: testTaskID, RunID: testRunID, Kind: run.TaskKindReview, State: run.TaskPending}
 
-		got, err := task.Release(true, epoch())
+		got, err := task.Release(nil, nil, epoch())
 
 		if !errors.Is(err, run.ErrInvalidTransition) {
 			t.Fatalf("Release a review task: error = %v, want ErrInvalidTransition", err)

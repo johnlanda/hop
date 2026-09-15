@@ -76,33 +76,90 @@ func TestValidateAcyclic(t *testing.T) {
 	})
 }
 
+// TestReleaseEligible exercises every bypass vector Terra's round-1 review
+// named: missing, foreign and duplicate prerequisites, a foreign edge (one
+// naming a different task entirely), and a non-integrated prerequisite —
+// each must refuse, not vacuously pass through an incomplete or
+// mismatched evidence set.
 func TestReleaseEligible(t *testing.T) {
+	task := run.Task{ID: testTaskID, RunID: testRunID, HasDependencies: true}
+	edges := []run.TaskDependency{
+		{TaskID: testTaskID, PrerequisiteID: testSecondTaskID},
+		{TaskID: testTaskID, PrerequisiteID: testReviewTaskID},
+	}
+
 	t.Run("no dependencies is vacuously eligible", func(t *testing.T) {
-		task := run.Task{ID: testTaskID, RunID: testRunID, HasDependencies: false}
-		if !run.ReleaseEligible(task, nil) {
+		noDeps := run.Task{ID: testTaskID, RunID: testRunID, HasDependencies: false}
+		if !run.ReleaseEligible(noDeps, nil, nil) {
 			t.Fatal("ReleaseEligible(no dependencies) = false, want true")
 		}
 	})
 
-	t.Run("every prerequisite integrated", func(t *testing.T) {
-		task := run.Task{ID: testTaskID, RunID: testRunID, HasDependencies: true}
+	t.Run("every named prerequisite integrated", func(t *testing.T) {
 		prereqs := []run.Task{
 			{ID: testSecondTaskID, State: run.TaskIntegrated},
 			{ID: testReviewTaskID, State: run.TaskIntegrated},
 		}
-		if !run.ReleaseEligible(task, prereqs) {
+		if !run.ReleaseEligible(task, edges, prereqs) {
 			t.Fatal("ReleaseEligible(all integrated) = false, want true")
 		}
 	})
 
-	t.Run("one prerequisite not integrated", func(t *testing.T) {
-		task := run.Task{ID: testTaskID, RunID: testRunID, HasDependencies: true}
+	t.Run("one named prerequisite not integrated", func(t *testing.T) {
 		prereqs := []run.Task{
 			{ID: testSecondTaskID, State: run.TaskIntegrated},
 			{ID: testReviewTaskID, State: run.TaskCompleted},
 		}
-		if run.ReleaseEligible(task, prereqs) {
+		if run.ReleaseEligible(task, edges, prereqs) {
 			t.Fatal("ReleaseEligible(one not integrated) = true, want false")
+		}
+	})
+
+	t.Run("missing prerequisite: fewer than the edges name", func(t *testing.T) {
+		prereqs := []run.Task{
+			{ID: testSecondTaskID, State: run.TaskIntegrated},
+		}
+		if run.ReleaseEligible(task, edges, prereqs) {
+			t.Fatal("ReleaseEligible(missing prerequisite) = true, want false")
+		}
+	})
+
+	t.Run("empty prerequisites against a dependent task never vacuously passes", func(t *testing.T) {
+		// The exact bypass the round-1 review found: an empty evidence
+		// slice must never look like "nothing to check" when edges
+		// name real prerequisites.
+		if run.ReleaseEligible(task, edges, nil) {
+			t.Fatal("ReleaseEligible(empty prerequisites, real edges) = true, want false")
+		}
+	})
+
+	t.Run("foreign prerequisite: not among the named edges", func(t *testing.T) {
+		prereqs := []run.Task{
+			{ID: testSecondTaskID, State: run.TaskIntegrated},
+			{ID: testFixTaskID, State: run.TaskIntegrated}, // never named by edges
+		}
+		if run.ReleaseEligible(task, edges, prereqs) {
+			t.Fatal("ReleaseEligible(foreign prerequisite) = true, want false")
+		}
+	})
+
+	t.Run("duplicate prerequisite masking a missing one", func(t *testing.T) {
+		prereqs := []run.Task{
+			{ID: testSecondTaskID, State: run.TaskIntegrated},
+			{ID: testSecondTaskID, State: run.TaskIntegrated}, // duplicate, not testReviewTaskID
+		}
+		if run.ReleaseEligible(task, edges, prereqs) {
+			t.Fatal("ReleaseEligible(duplicate prerequisite) = true, want false")
+		}
+	})
+
+	t.Run("foreign edge: naming a different task is rejected outright", func(t *testing.T) {
+		foreignEdges := []run.TaskDependency{
+			{TaskID: testSecondTaskID, PrerequisiteID: testReviewTaskID}, // not task.ID
+		}
+		prereqs := []run.Task{{ID: testReviewTaskID, State: run.TaskIntegrated}}
+		if run.ReleaseEligible(task, foreignEdges, prereqs) {
+			t.Fatal("ReleaseEligible(foreign edge) = true, want false")
 		}
 	})
 }
