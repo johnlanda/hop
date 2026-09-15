@@ -49,10 +49,10 @@ type LaunchExecPlan struct {
 
 // PrepareLaunchExec performs every hop launch step before the exec itself
 // (docs/plan/phase-2-design.md section 6): it loads the launch context
-// lease-free, validates the HOP_* environment against it — the provided
-// HOP_INCARNATION_ID must match the incarnation the launch intent recorded
-// — together with attempt currency, the stop state and the different-pid
-// claim rule; sanitizes the launcher's inherited environment under the
+// lease-free, validates the HOP_* environment against it fail-closed —
+// every pane-provided variable must be present and agree with the context
+// (validateLaunchEnvironment) — together with attempt currency, the stop
+// state and the different-pid claim rule; sanitizes the launcher's inherited environment under the
 // snapshot's frozen, versioned policy; composes the harness argv from the
 // frozen snapshot (Claude only in Phase 2: the pre-assigned native session
 // reference via --session-id plus the fixed initial prompt on first
@@ -86,7 +86,7 @@ func (c *Controller) PrepareLaunchExec(ctx context.Context, req LaunchExecReques
 	if err != nil {
 		return LaunchExecPlan{}, fmt.Errorf("app: load launch context: %w", err)
 	}
-	if envErr := validateLaunchEnvironment(req.Environ, &lc, req.RunID, req.AttemptID); envErr != nil {
+	if envErr := validateLaunchEnvironment(req.Environ, &lc, runID.String(), attemptID.String()); envErr != nil {
 		return LaunchExecPlan{}, envErr
 	}
 	if lc.StopRequested {
@@ -155,21 +155,29 @@ func (c *Controller) FailLaunchExec(ctx context.Context, incarnationID, reason s
 }
 
 // validateLaunchEnvironment checks the pane-provided HOP_* variables
-// against the loaded launch context: HOP_INCARNATION_ID must be present
-// and match the incarnation the launch intent recorded, and HOP_RUN_ID and
-// HOP_ATTEMPT_ID, when present, must agree with the command's own flags.
+// against the loaded launch context, fail closed: every variable the
+// design's pane environment carries — HOP_STATE_DIR, HOP_RUN_ID,
+// HOP_TASK_ID, HOP_ATTEMPT_ID, HOP_INCARNATION_ID — must be PRESENT and
+// must agree with the frozen state root, the command's own parsed flags,
+// the attempt's task and the incarnation the launch intent recorded. A
+// missing or disagreeing variable refuses the launch before any claim.
 // Errors name the variable and what disagreed, never the value.
 func validateLaunchEnvironment(environ []string, lc *LaunchContext, runID, attemptID string) error {
-	if got := environValue(environ, "HOP_INCARNATION_ID"); got == "" {
-		return fmt.Errorf("app: HOP_INCARNATION_ID is not set; hop launch runs only in a HOP-created worker pane, which provides it")
-	} else if got != lc.IncarnationID.String() {
-		return fmt.Errorf("app: HOP_INCARNATION_ID does not match the incarnation of the current launch intent; a stale or foreign pane environment never execs")
+	expected := []struct{ name, want string }{
+		{"HOP_STATE_DIR", lc.Snapshot.StateRoot},
+		{"HOP_RUN_ID", runID},
+		{"HOP_TASK_ID", lc.Attempt.TaskID.String()},
+		{"HOP_ATTEMPT_ID", attemptID},
+		{"HOP_INCARNATION_ID", lc.IncarnationID.String()},
 	}
-	if got := environValue(environ, "HOP_RUN_ID"); got != "" && got != runID {
-		return fmt.Errorf("app: HOP_RUN_ID does not match the --run flag")
-	}
-	if got := environValue(environ, "HOP_ATTEMPT_ID"); got != "" && got != attemptID {
-		return fmt.Errorf("app: HOP_ATTEMPT_ID does not match the --attempt flag")
+	for _, v := range expected {
+		got := environValue(environ, v.name)
+		if got == "" {
+			return fmt.Errorf("app: %s is not set; hop launch runs only in a HOP-created worker pane, which provides it", v.name)
+		}
+		if got != v.want {
+			return fmt.Errorf("app: %s does not agree with the run's launch context; a stale or foreign pane environment never execs", v.name)
+		}
 	}
 	return nil
 }

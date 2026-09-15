@@ -140,6 +140,10 @@ func ebLaunchContext(t *testing.T) LaunchContext {
 	if err != nil {
 		t.Fatal(err)
 	}
+	taskID, err := identity.ParseTaskID(ebTaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	return LaunchContext{
 		Snapshot: RunSnapshot{
 			EnvPolicy: EnvPolicy{Version: EnvPolicyVersion1, Harness: HarnessClaude},
@@ -149,7 +153,7 @@ func ebLaunchContext(t *testing.T) LaunchContext {
 				"/artifacts/assignment.md",
 		},
 		Harness:       run.HarnessClaude,
-		Attempt:       run.Attempt{ID: attemptID, State: run.AttemptLaunching},
+		Attempt:       run.Attempt{ID: attemptID, TaskID: taskID, State: run.AttemptLaunching},
 		Session:       run.Session{NativeSessionRef: ebNativeRef},
 		IncarnationID: incarnationID,
 	}
@@ -167,6 +171,18 @@ func ebEnviron() []string {
 		"HOP_ATTEMPT_ID=" + ebAttemptID,
 		"HOP_INCARNATION_ID=" + ebIncarnationID,
 	}
+}
+
+// environWithout returns environ minus every entry of name.
+func environWithout(environ []string, name string) []string {
+	var kept []string
+	for _, entry := range environ {
+		entryName, _, _ := strings.Cut(entry, "=")
+		if entryName != name {
+			kept = append(kept, entry)
+		}
+	}
+	return kept
 }
 
 // ebLookup returns an ExecutableLookup resolving every name under /resolved.
@@ -293,23 +309,65 @@ func TestPrepareLaunchExec(t *testing.T) {
 		{
 			name: "missing HOP_INCARNATION_ID",
 			mutate: func(_ *LaunchContext, req *LaunchExecRequest, _ *ebSubmissionStub) {
-				req.Environ = []string{"PATH=/bin", "HOP_RUN_ID=" + ebRunID}
+				req.Environ = environWithout(req.Environ, "HOP_INCARNATION_ID")
 			},
 			wantErr: "HOP_INCARNATION_ID is not set",
+		},
+		{
+			name: "missing HOP_STATE_DIR",
+			mutate: func(_ *LaunchContext, req *LaunchExecRequest, _ *ebSubmissionStub) {
+				req.Environ = environWithout(req.Environ, "HOP_STATE_DIR")
+			},
+			wantErr: "HOP_STATE_DIR is not set",
+		},
+		{
+			name: "missing HOP_RUN_ID",
+			mutate: func(_ *LaunchContext, req *LaunchExecRequest, _ *ebSubmissionStub) {
+				req.Environ = environWithout(req.Environ, "HOP_RUN_ID")
+			},
+			wantErr: "HOP_RUN_ID is not set",
+		},
+		{
+			name: "missing HOP_TASK_ID",
+			mutate: func(_ *LaunchContext, req *LaunchExecRequest, _ *ebSubmissionStub) {
+				req.Environ = environWithout(req.Environ, "HOP_TASK_ID")
+			},
+			wantErr: "HOP_TASK_ID is not set",
+		},
+		{
+			name: "missing HOP_ATTEMPT_ID",
+			mutate: func(_ *LaunchContext, req *LaunchExecRequest, _ *ebSubmissionStub) {
+				req.Environ = environWithout(req.Environ, "HOP_ATTEMPT_ID")
+			},
+			wantErr: "HOP_ATTEMPT_ID is not set",
 		},
 		{
 			name: "mismatched incarnation",
 			mutate: func(_ *LaunchContext, req *LaunchExecRequest, _ *ebSubmissionStub) {
 				req.Environ = append(req.Environ, "HOP_INCARNATION_ID="+ebNativeRef)
 			},
-			wantErr: "HOP_INCARNATION_ID does not match",
+			wantErr: "HOP_INCARNATION_ID does not agree",
 		},
 		{
 			name: "mismatched HOP_RUN_ID",
 			mutate: func(_ *LaunchContext, req *LaunchExecRequest, _ *ebSubmissionStub) {
 				req.Environ = append(req.Environ, "HOP_RUN_ID="+ebTaskID)
 			},
-			wantErr: "HOP_RUN_ID does not match",
+			wantErr: "HOP_RUN_ID does not agree",
+		},
+		{
+			name: "mismatched HOP_TASK_ID",
+			mutate: func(_ *LaunchContext, req *LaunchExecRequest, _ *ebSubmissionStub) {
+				req.Environ = append(req.Environ, "HOP_TASK_ID="+ebRunID)
+			},
+			wantErr: "HOP_TASK_ID does not agree",
+		},
+		{
+			name: "mismatched HOP_STATE_DIR never opens a foreign run's exec",
+			mutate: func(_ *LaunchContext, req *LaunchExecRequest, _ *ebSubmissionStub) {
+				req.Environ = append(req.Environ, "HOP_STATE_DIR=/some/other/root")
+			},
+			wantErr: "HOP_STATE_DIR does not agree",
 		},
 		{
 			name:    "stop requested",
