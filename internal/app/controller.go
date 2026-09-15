@@ -44,6 +44,12 @@ type Controller struct {
 	// (docs/plan/phase-3-design.md section 3). Nil for a Controller that
 	// only ever runs solo-mode runs.
 	Workspaces WorkspaceRuntime
+	// Presentation is the Phase 1 AgentPresentation port, consumed by the
+	// Phase 3 run-state token publication (docs/plan/phase-3-design.md
+	// section 9). Nil for a Controller that only ever runs solo-mode
+	// runs; every feature-mode use case that consumes it checks for nil
+	// and fails closed before any side effect.
+	Presentation AgentPresentation
 	// Trust applies the workspace-trust pre-seed at the launch exec
 	// boundary (PrepareLaunchExec); no controller use case calls it.
 	Trust TrustSeeder
