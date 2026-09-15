@@ -73,7 +73,7 @@ func TestRealProcessRunEndToEnd(t *testing.T) {
 	brief := fixtureWorkerBrief("submit-valid")
 	sp := server.startHopController(t, stateDir, "run", "run", "-C", repo.Root, brief)
 
-	started := waitForControllerLog(t, artifacts, "run", "stdout", "started", 30*time.Second)
+	started := waitForControllerLog(t, artifacts, "run", "started")
 	label, runID := extractRunID(t, started)
 
 	fields, reached := waitForRunState(t, env, repo.Root, runID, runEndToEndTimeout, "completed", "failed", "stopped")
@@ -83,7 +83,7 @@ func TestRealProcessRunEndToEnd(t *testing.T) {
 		if binding := fields["binding"]; binding != "" {
 			artifacts.save(t, "worker-pane-scrollback.txt", server.readPane(t, paneIDFromBinding(binding)))
 		}
-		t.Fatalf("run %s ended %q, want completed; hop status detail: %+v\ncontroller stdout:\n%s", runID, fields["state"], fields, readControllerLog(t, artifacts, "run", "stdout"))
+		t.Fatalf("run %s ended %q, want completed; hop status detail: %+v\ncontroller stdout:\n%s", runID, fields["state"], fields, readControllerLog(t, artifacts, "run"))
 	}
 
 	// hop status (a separate reader) can observe "completed" in the store a
@@ -95,7 +95,7 @@ func TestRealProcessRunEndToEnd(t *testing.T) {
 	if !status.Exited() || status.ExitCode() != 0 {
 		t.Errorf("hop run exit status = %v, want a clean exit(0)", status)
 	}
-	stdout := readControllerLog(t, artifacts, "run", "stdout")
+	stdout := readControllerLog(t, artifacts, "run")
 
 	for _, want := range []string{
 		"run " + label + " " + runID + " started",
@@ -214,7 +214,7 @@ func TestRealProcessSanitizedLaunchExec(t *testing.T) {
 	brief := fixtureWorkerBrief("exit-without-submitting")
 	server.startHopController(t, stateDir, "run", "run", "-C", repo.Root, brief)
 
-	started := waitForControllerLog(t, artifacts, "run", "stdout", "started", 30*time.Second)
+	started := waitForControllerLog(t, artifacts, "run", "started")
 	_, runID := extractRunID(t, started)
 
 	observedPath := filepath.Join(stateDir, "runs", runID, "artifacts", "worker-observed.txt")
@@ -222,7 +222,7 @@ func TestRealProcessSanitizedLaunchExec(t *testing.T) {
 		_, statErr := os.Stat(observedPath)
 		return statErr == nil
 	}) {
-		t.Fatalf("worker observation dump %s never appeared; controller stdout:\n%s", observedPath, readControllerLog(t, artifacts, "run", "stdout"))
+		t.Fatalf("worker observation dump %s never appeared; controller stdout:\n%s", observedPath, readControllerLog(t, artifacts, "run"))
 	}
 	observed := readWorkerObservation(t, observedPath)
 	assertExecutableIsFixtureStub(t, server, &observed)

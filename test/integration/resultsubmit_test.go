@@ -15,14 +15,22 @@ import (
 // to the caller, since scenarios sharing this setup diverge immediately
 // afterward.
 type fixtureRun struct {
-	artifacts  *artifactDir
-	server     *testServer
-	repo       *fixtureRepo
-	stateDir   string
-	env        []string
-	controller *serverProcess
-	label      string
-	runID      string
+	artifacts *artifactDir
+	server    *testServer
+	repo      *fixtureRepo
+	stateDir  string
+	env       []string
+	// controller is the currently live controller process, and
+	// controllerName the log-file name it was started under
+	// (startHopController's name argument) — a scenario that kills and
+	// replaces the controller (a resume after a crash) reassigns both
+	// together, so later log reads and failure diagnostics always address
+	// the CURRENT controller's own log files, never a stale "run" name once
+	// a "resume" has taken over.
+	controller     *serverProcess
+	controllerName string
+	label          string
+	runID          string
 }
 
 // newFixtureRunEnv builds a disposable, started herdr server and the fixture
@@ -51,18 +59,19 @@ func startRun(t *testing.T, artifacts *artifactDir, server *testServer, repo *fi
 
 	brief := fixtureWorkerBrief(behavior)
 	sp := server.startHopController(t, stateDir, "run", "run", "-C", repo.Root, brief)
-	started := waitForControllerLog(t, artifacts, "run", "stdout", "started", 30*time.Second)
+	started := waitForControllerLog(t, artifacts, "run", "started")
 	label, runID := extractRunID(t, started)
 
 	return &fixtureRun{
-		artifacts:  artifacts,
-		server:     server,
-		repo:       repo,
-		stateDir:   stateDir,
-		env:        env,
-		controller: sp,
-		label:      label,
-		runID:      runID,
+		artifacts:      artifacts,
+		server:         server,
+		repo:           repo,
+		stateDir:       stateDir,
+		env:            env,
+		controller:     sp,
+		controllerName: "run",
+		label:          label,
+		runID:          runID,
 	}
 }
 
@@ -111,18 +120,18 @@ func (f *fixtureRun) currentIncarnationID(t *testing.T, attemptID string) string
 		attemptID))
 }
 
-// requireRunState drives waitForRunState to deadline and fails the test on
-// anything but one of want, capturing the worker pane's scrollback first —
-// it is ephemeral, gone with the pane — exactly as TestRealProcessRunEndToEnd
-// does.
-func (f *fixtureRun) requireRunState(t *testing.T, deadline time.Duration, want ...string) map[string]string {
+// requireRunState drives waitForRunState to runEndToEndTimeout and fails the
+// test on anything but one of want, capturing the worker pane's scrollback
+// first — it is ephemeral, gone with the pane — exactly as
+// TestRealProcessRunEndToEnd does.
+func (f *fixtureRun) requireRunState(t *testing.T, want ...string) map[string]string {
 	t.Helper()
-	fields, reached := waitForRunState(t, f.env, f.repo.Root, f.runID, deadline, want...)
+	fields, reached := waitForRunState(t, f.env, f.repo.Root, f.runID, runEndToEndTimeout, want...)
 	if !reached || !containsState(want, fields["state"]) {
 		if binding := fields["binding"]; binding != "" {
 			f.artifacts.save(t, "worker-pane-scrollback.txt", f.server.readPane(t, paneIDFromBinding(binding)))
 		}
-		t.Fatalf("run %s ended %q, want one of %v; hop status detail: %+v\ncontroller stdout:\n%s", f.runID, fields["state"], want, fields, readControllerLog(t, f.artifacts, "run", "stdout"))
+		t.Fatalf("run %s ended %q, want one of %v; hop status detail: %+v\ncontroller stdout:\n%s", f.runID, fields["state"], want, fields, readControllerLog(t, f.artifacts, f.controllerName))
 	}
 	return fields
 }
@@ -145,7 +154,7 @@ func containsState(want []string, state string) bool {
 // nor the accepted result.
 func TestRealProcessDuplicateSubmissionAfterCompletion(t *testing.T) {
 	fx := startFixtureRun(t, "submit-valid")
-	fx.requireRunState(t, runEndToEndTimeout, "completed")
+	fx.requireRunState(t, "completed")
 	waitForControllerExit(t, fx.controller, 30*time.Second)
 
 	taskID, attemptID := fx.taskAndAttemptIDs(t)

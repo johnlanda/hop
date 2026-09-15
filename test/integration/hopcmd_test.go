@@ -495,29 +495,39 @@ func querySQLite(t *testing.T, dbPath, query string) string {
 	return strings.TrimSpace(string(out))
 }
 
-// readControllerLog reads a hop controller's captured stdout or stderr log
-// (as started by startHopController) from the test's artifact directory.
-func readControllerLog(t *testing.T, artifacts *artifactDir, name, stream string) string {
+// readControllerLog reads a hop controller's captured stdout log (as
+// started by startHopController) from the test's artifact directory. Every
+// current scenario reads the controller's own transition/report lines; a
+// scenario needing its stderr instead reads
+// "<artifacts.path>/<name>-stderr.log" directly.
+func readControllerLog(t *testing.T, artifacts *artifactDir, name string) string {
 	t.Helper()
-	content, err := os.ReadFile(filepath.Join(artifacts.path, name+"-"+stream+".log")) //nolint:gosec // G304: a path this test constructed itself, under its own artifact directory.
+	content, err := os.ReadFile(filepath.Join(artifacts.path, name+"-stdout.log")) //nolint:gosec // G304: a path this test constructed itself, under its own artifact directory.
 	if err != nil {
-		t.Fatalf("read %s %s log: %v", name, stream, err)
+		t.Fatalf("read %s stdout log: %v", name, err)
 	}
 	return string(content)
 }
 
-// waitForControllerLog polls a hop controller's captured log stream until
-// its content contains want, bounded by deadline, and returns the content.
-// It fails the test with the accumulated content on timeout.
-func waitForControllerLog(t *testing.T, artifacts *artifactDir, name, stream, want string, deadline time.Duration) string {
+// controllerLogTimeout bounds every current waitForControllerLog wait: the
+// controller's own next transition/report line, never a full run round trip
+// (callers waiting on a terminal run state poll hop status instead, via
+// waitForRunState/requireRunState, since the controller's stdout is not a
+// reliable real-time mirror of it — see runEndToEndTimeout's doc comment).
+const controllerLogTimeout = 30 * time.Second
+
+// waitForControllerLog polls a hop controller's captured stdout log until
+// its content contains want, bounded by controllerLogTimeout, and returns
+// the content. It fails the test with the accumulated content on timeout.
+func waitForControllerLog(t *testing.T, artifacts *artifactDir, name, want string) string {
 	t.Helper()
 	var content string
-	found := waitUntilDeadline(deadline, func() bool {
-		content = readControllerLog(t, artifacts, name, stream)
+	found := waitUntilDeadline(controllerLogTimeout, func() bool {
+		content = readControllerLog(t, artifacts, name)
 		return strings.Contains(content, want)
 	})
 	if !found {
-		t.Fatalf("%s %s log never contained %q; content:\n%s", name, stream, want, content)
+		t.Fatalf("%s stdout log never contained %q; content:\n%s", name, want, content)
 	}
 	return content
 }

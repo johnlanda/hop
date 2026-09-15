@@ -8,6 +8,55 @@ import (
 	"time"
 )
 
+// leaseTimeLayout mirrors internal/adapters/sqlite's unexported timeLayout
+// (sqlite.go): fixed-width canonical UTC, nine fractional digits, trailing
+// Z. test/integration may not import internal/adapters/sqlite (its allowed
+// inward imports are internal/app and internal/adapters/herdr only), so a
+// scenario reading a lease's own recorded expiry duplicates the literal
+// layout rather than the package.
+const leaseTimeLayout = "2006-01-02T15:04:05.000000000Z"
+
+// killControllerLeader SIGKILLs a hop run/hop resume controller's own
+// leader process without touching its process group's anchor or any other
+// process — a hard crash with no graceful shutdown, so the lease is never
+// released (design section 5: recovery must wait out the TTL, never a
+// fast reclaim). It waits for the leader to actually be reaped before
+// returning.
+func killControllerLeader(t *testing.T, sp *serverProcess) {
+	t.Helper()
+	if err := sp.leaderCmd.Process.Kill(); err != nil {
+		t.Fatalf("kill controller leader: %v", err)
+	}
+	waitForControllerExit(t, sp, 10*time.Second)
+}
+
+// waitForLeaseExpiry polls a run's own lease row until it is no longer held
+// past its recorded expiry — the real, unavoidable cost of recovering from
+// a hard-killed controller that never released its lease (design section 5;
+// heartbeatInterval 10s, leaseTTL 30s, cmd/hop/loop.go), bounded so a
+// genuinely stuck lease still fails the test rather than hanging it.
+func waitForLeaseExpiry(t *testing.T, dbPath, runID string) {
+	t.Helper()
+	ok := waitUntilDeadline(90*time.Second, func() bool {
+		row := querySQLite(t, dbPath, fmt.Sprintf("SELECT state, expires_at FROM run_leases WHERE run_id = '%s';", runID))
+		state, expiresAt, found := strings.Cut(row, "|")
+		if !found {
+			return false
+		}
+		if state != "held" {
+			return true
+		}
+		expires, err := time.Parse(leaseTimeLayout, expiresAt)
+		if err != nil {
+			return false
+		}
+		return time.Now().UTC().After(expires)
+	})
+	if !ok {
+		t.Fatalf("lease for run %s never expired within the deadline", runID)
+	}
+}
+
 // TestRealProcessDetachDistinctFromStop proves the design's "Controller
 // signals (detach, distinct from stop)" contract directly: a SIGINT to a
 // live `hop run` controller is a detach, never a stop. It releases the
@@ -17,7 +66,7 @@ import (
 // is untouched, and the run never records stopping or stopped.
 func TestRealProcessDetachDistinctFromStop(t *testing.T) {
 	fx := startFixtureRun(t, "") // empty behavior: the worker settles, then idles without ever submitting.
-	fields := fx.requireRunState(t, runEndToEndTimeout, "running")
+	fields := fx.requireRunState(t, "running")
 
 	paneID := paneIDFromBinding(fields["binding"])
 	before := fx.server.processInfo(t, paneID)
@@ -34,7 +83,7 @@ func TestRealProcessDetachDistinctFromStop(t *testing.T) {
 		t.Errorf("hop run exit status after detach = %v, want a clean exit(1)", status)
 	}
 
-	stdout := readControllerLog(t, fx.artifacts, "run", "stdout")
+	stdout := readControllerLog(t, fx.artifacts, "run")
 	if want := "detached; the run keeps its state and the worker keeps running — resume with: hop resume " + fx.runID; !strings.Contains(stdout, want) {
 		t.Errorf("controller stdout missing the detach resume instruction %q; got:\n%s", want, stdout)
 	}
