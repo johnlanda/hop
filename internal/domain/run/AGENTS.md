@@ -31,7 +31,7 @@ integration — without changing any Phase 2 transition's legality.
 | [message.go](message.go) | `Message`, `MessageKind`, `MessageState`, `Principal`, `Address`, `Delivery`, `Ack`, `AckContext`, `AckOutcome`, `AnswerSubmission`, `AnswerOutcome`, `NewQuestion`, `NewInfo`, `Deliver`, `AcceptAck`, `NextDeliverable`, `AcceptAnswer`, `ResolveOrigin`, `ValidateSendAddressing` | The durable message/delivery/ack model (section 7): the `queued`→`delivered`→`acknowledged` machine, FIFO selection, ack eligibility and the derived-destination answer rule |
 | [review.go](review.go) | `Review`, `Verdict`, `ReviewSubmission`, `ReviewAcceptanceContext`, `VerdictOutcome`, `AcceptVerdict` | The section 8 review-verdict acceptance rule, mirroring `AcceptResult`'s receipt-before-eligibility order |
 | [integration.go](integration.go) | `Integration`, `IntegrationState`, `NewIntegration`, `EnterChecking`, `Conflict`, `Integrate`, `FailCheck`, `RollBack`, `Interrupt` | Serial per-task integration's state machine (section 5, "Integration") |
-| [readiness.go](readiness.go) | `GuardContext`, `GuardShortfall`, `ShortfallKind`, `EvaluateReadiness` | The run-completion guard (section 8): the ONLY path to `Run.Complete` in feature mode |
+| [readiness.go](readiness.go) | `GuardContext`, `CheckReceipt`, `GuardShortfall`, `ShortfallKind`, `EvaluateReadiness` | The run-completion guard (section 8): a pure function meant to gate `Run.Complete` in feature mode (the actual wiring is a later application slice — see Invariants) |
 | [artifact.go](artifact.go) | `Artifact`, `ArtifactKind`, `NewArtifact`, `NewResultArtifact` | File references owned by a run or a result |
 | [errors.go](errors.go) | `ErrInvalidTransition`, `ErrStaleSubmission`, `ErrConflictingResult`, `ErrDuplicateResult`, `ErrTransientNotRunning`, `ErrDependencyCycle`, `ErrDependencyNotIntegrated`, `ErrDelegationDepth`, `ErrDuplicateAnswer`, `ErrConflictingAnswer`, `ErrStaleAck`, `ErrNotDelivered`, `ErrVerdictSubjectMismatch`, `ErrRetryNotTerminal`, `ErrRetryLimit`, `ErrRunNotAccepting`, `ErrEmptyPlan`, `ErrMailboxClosed`, `ErrMailboxNotClear`, `ErrRequestConflict`, `ErrTaskNotReleased` | Typed errors every transition and cross-entity acceptance function returns |
 | [transition.go](transition.go) | `transitionTable`, `fromAny`, `concatPairs` | The generic, table-driven legality check shared by every entity's state machine |
@@ -80,12 +80,23 @@ integration — without changing any Phase 2 transition's legality.
   dependencies (`HasDependencies == false`, the Phase 2/solo shape, since
   Phase 2 never populates `HasDependencies` at all); for a DEPENDENT task,
   refused (`ErrTaskNotReleased`) until `Task.Release` has moved it to
-  `ready` first. `Release` itself only ever moves `pending`→`ready`, and
-  only when its `eligible` argument — the application-computed
-  `ReleaseEligible` verdict — is true (`ErrDependencyNotIntegrated`
-  otherwise); a zero-dependency task is created `ready` directly
-  (`NewImplementTask`) and never calls `Release` in practice, though
-  calling it anyway is harmless (vacuously eligible).
+  `ready` first. `HasDependencies` is a plain, comparable flag Activate
+  dispatches on ONLY — it is deliberately not the release gate's ground
+  truth, and not the task's actual prerequisite ID set: `Task` stores no
+  `[]identity.TaskID` field (that would make `Task` incomparable, breaking
+  every Phase 2 test's `==`/`!=` use of it). `Release` instead takes edges
+  (the task's own persisted `TaskDependency` rows — an edge naming a
+  different `TaskID` is rejected outright) and prerequisites (their
+  current state) DIRECTLY, computing eligibility itself via
+  `ReleaseEligible` rather than accepting a bare caller-asserted boolean —
+  the exact shape that let an incomplete or empty evidence set slip
+  through in the round-1 review. `ReleaseEligible` requires prerequisites
+  to account for EXACTLY the IDs edges name — no missing, no foreign (an
+  ID edges never named), no duplicate — with every one `integrated`
+  (`ErrDependencyNotIntegrated` otherwise, from `Release`); a
+  zero-dependency task is created `ready` directly (`NewImplementTask`)
+  and never calls `Release` in practice, though calling it with empty
+  edges is harmless (vacuously eligible — 0 required, 0 given).
 - `TaskDependency` edges are immutable once created (a task's dependency
   set is fixed at creation); `ValidateAcyclic` checks one candidate edge
   against the run's persisted edge set by graph reachability, not by
@@ -122,14 +133,19 @@ integration — without changing any Phase 2 transition's legality.
   value, never through a pointer. `Session.ParentSessionID` (`*identity.
   SessionID`) is genuinely nilable: nil for the manager and for every
   Phase 2 `RoleWorker` session, set for a Phase 3 child. `NewChildSession`
-  enforces the part of one-level delegation this package can check
-  unaided — parent must itself carry no parent (`ErrDelegationDepth`
-  otherwise: a session with a parent can never itself be a parent) and
-  role must be `RoleImplementer` or `RoleReviewer`. That a candidate parent
-  is actually the run's CURRENT (non-terminal) manager session is a
-  cross-session fact only the application, with visibility into every
-  session, can validate before calling this constructor — this package
-  has no such visibility.
+  enforces every fact about a candidate parent that a single `Session`
+  value can attest to on its own: no parent of its own
+  (`ErrDelegationDepth` otherwise — a session with a parent can never
+  itself be a parent), `RoleManager`, the SAME `RunID` as the child, a
+  well-formed manager shape (empty `AttemptID`, nil `ParentSessionID`) and
+  a non-terminal state — any of the latter four is `ErrInvalidTransition`.
+  The new child's own role must be `RoleImplementer` or `RoleReviewer`
+  (also `ErrInvalidTransition`). That the supplied parent is actually the
+  run's SOLE current (non-terminal) manager among every session — as
+  opposed to merely A well-formed, same-run, non-terminal manager, which
+  is everything one `Session` value can ever prove — is a cross-session
+  uniqueness fact only the application, querying every session, can
+  validate before calling this constructor.
 - A runtime binding's observations and supersession are valid only against
   a current (non-superseded) binding; supersession requires non-empty
   recorded evidence and succeeds at most once.
@@ -164,13 +180,22 @@ integration — without changing any Phase 2 transition's legality.
   its raw `Principal`.
 - `EvaluateReadiness` is a pure function over an application-assembled
   `GuardContext` (the plan flag, every implement task, the current
-  integration head's object IDs, whether a passing check exists for
-  exactly that head, and the most recently accepted review verdict,
-  whatever its subject or value). It computes subject-staleness itself by
-  comparing object IDs — an approve verdict bound to a superseded head is
-  never trusted from a stored flag — and reports EVERY unsatisfied guard,
-  not just the first. It is the sole path to `Run.Complete` in feature
-  mode; solo mode's `Run.Complete` needs no such guard.
+  integration head's object IDs, the most recent `CheckReceipt`, if any,
+  and the most recently accepted review verdict, whatever either one's
+  subject or value). It computes BOTH the check's and the verdict's
+  subject match itself by comparing object IDs against the head — never
+  trusting a bare `Passed`/pre-filtered boolean, and never trusting a
+  passing receipt or an approve bound to a superseded head — and reports
+  EVERY unsatisfied guard, not just the first. `Task.transition`'s tables
+  and `AcceptResult`/`AcceptVerdict` are themselves domain-enforced;
+  `EvaluateReadiness` being THE gate `Run.Complete` actually goes through
+  is application wiring this slice does not build — `Run.Complete`
+  (run.go) has no feature-mode or readiness argument of its own and
+  remains callable directly from `completing` exactly as Phase 2 left it.
+  A later slice wires the controller's completion transaction to call
+  `EvaluateReadiness` before ever calling `Run.Complete`; this package
+  only guarantees that the FUNCTION ITSELF is a correct, evidence-based
+  guard, not that every caller of `Run.Complete` uses it.
 - No entity carries a persistence revision/version field: optimistic-
   concurrency bookkeeping is the SQLite adapter's job (section 4's
   `revision INTEGER NOT NULL` schema column). Repositories are expected to
@@ -205,18 +230,22 @@ integration — without changing any Phase 2 transition's legality.
   test), for BOTH `Task` kinds; stop monotonicity and precedence;
   `Attempt.Reattach`'s restricted target set and `Attempt.CompleteReview`'s
   kind/state restriction; `NewRetryAttempt`'s terminal/limit rules; the
-  dependency graph's acyclicity and `ReleaseEligible`; `NewChildSession`'s
-  delegation-depth and role checks; runtime binding observation/
-  supersession; `AcceptResult`'s and `AcceptVerdict`'s outcomes (ordinary
-  and early-submission acceptance in both race orders, transient, stale by
+  dependency graph's acyclicity and `ReleaseEligible`'s bypass vectors
+  (missing, foreign and duplicate prerequisites, a foreign edge naming a
+  different task, an empty evidence set against a real dependency);
+  `NewChildSession`'s delegation-depth, role and full parent-shape checks
+  (worker parent, cross-run manager, malformed attempt-bound manager,
+  terminated manager); runtime binding observation/supersession;
+  `AcceptResult`'s and `AcceptVerdict`'s outcomes (ordinary and
+  early-submission acceptance in both race orders, transient, stale by
   incarnation/stop/state, duplicate in every state including terminal,
   conflicting never disturbing the accepted row, plus `AcceptVerdict`'s own
   mailbox-clear and subject-match guards); `AcceptAck`/`NextDeliverable`/
   `AcceptAnswer` order and vectors (duplicate/conflicting, stale/not-
   delivered, the human-question ack bundling); `EvaluateReadiness`'s
-  shortfall vectors (plan open, missing integration, check missing, no
-  verdict, reject present, stale-subject approve, every shortfall reported
-  together).
+  shortfall vectors (plan open, missing integration, check missing, a
+  failing check, a stale/head-moved passing check, no verdict, reject
+  present, stale-subject approve, every shortfall reported together).
 - `go test -run TestReferenceTrace ./internal/domain/run` — the Phase 2
   section 5 "Reference traces" (four exact event orders, plus trace 1's
   controller-observes-first/acceptance-wins-first race) AND the Phase 3
