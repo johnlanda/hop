@@ -80,10 +80,15 @@ func requireInt(method string, value *int, field string) (int, error) {
 // worktreeCreateParams is the wire shape of worktree.create. It carries no
 // env: the launch environment is set by opening a pane inside the created
 // worktree, not by this call (docs/architecture/launch-environment.md).
+// label is a creation label naming the new workspace, exactly like
+// workspace.create's (S9-confirmed); it is schema-optional and omitted
+// when the request carries none, so every caller that predates label
+// support sends the identical request it always has.
 type worktreeCreateParams struct {
 	Cwd    string `json:"cwd"`
 	Branch string `json:"branch"`
 	Base   string `json:"base"`
+	Label  string `json:"label,omitempty"`
 }
 
 // worktreeCreatedResult is the worktree.create result: the workspace Herdr
@@ -107,7 +112,7 @@ type worktreeCreatedResult struct {
 // that provenance is resolved by application code through CommandRunner,
 // not by this adapter.
 func (r *Runtime) CreateWorktree(ctx context.Context, req app.WorktreeRequest) (app.WorktreeInfo, error) {
-	params := worktreeCreateParams{Cwd: req.RepositoryRoot, Branch: req.Branch, Base: req.BaseRef}
+	params := worktreeCreateParams{Cwd: req.RepositoryRoot, Branch: req.Branch, Base: req.BaseRef, Label: req.Label}
 	var result worktreeCreatedResult
 	if err := r.client.Call(ctx, "worktree.create", params, &result); err != nil {
 		return app.WorktreeInfo{}, fmt.Errorf("create worktree for %s branch %s: %w", req.RepositoryRoot, req.Branch, err)

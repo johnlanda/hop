@@ -6,11 +6,19 @@ import (
 )
 
 // WorktreeRequest is CreateWorktree's input: the repository to check out
-// from, the branch to create and the base ref to create it at.
+// from, the branch to create, the base ref to create it at, and a unique
+// creation label (S9-confirmed: worktree.create accepts the same kind of
+// creation label as workspace.create, naming the new workspace, and it
+// round-trips through session.snapshot exactly like a CreateWorkspace
+// label). Label is optional here — the adapter sends it only when
+// non-empty — because no call site sets it yet; per-attempt labeling (the
+// operation UUID) and the label-recovery decision row for worktree.create
+// land with the application-layer work in slices 2b/6, not this one.
 type WorktreeRequest struct {
 	RepositoryRoot string
 	Branch         string
 	BaseRef        string
+	Label          string
 }
 
 // WorktreeInfo is what Herdr created: the workspace it lives in, the

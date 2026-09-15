@@ -6,8 +6,8 @@ HOP's narrow client of the Herdr boundary. It speaks newline-delimited JSON
 over the server's local Unix socket with response-ID correlation and typed
 error mapping, probes the installed binary (version, bundled API schema,
 harness executables) for the application's doctor use case, and drives
-worktree creation, worker-pane lifecycle and occupant inspection for the
-worker-launch use case.
+worktree creation, plain-workspace creation, worker-pane lifecycle and
+occupant inspection for the worker-launch use case.
 
 ## Quick reference
 
@@ -18,7 +18,8 @@ worker-launch use case.
 | [probe.go](probe.go) | `InstallationProbe`, `parseSchema` | Implements `app.Probe`: resolves executables, reads `--version` lines, extracts protocol and method constants from `herdr api schema --json`, pings the configured socket |
 | [presentation.go](presentation.go) | `Presentation`, `NewPresentation` | Implements `app.AgentPresentation`: `pane.report_metadata` token patches, `agent.view.set` with a manager-first token sort and `agent.view.clear` — all under HOP's fixed source so its view is owned and clearable |
 | [observation.go](observation.go) | `Observer`, `NewObserver`, `statusStream`, `DrainRemaining`, `flushBacklog` | Implements `app.Observer`: one `pane.agent_status_changed` subscription per watched pane, normalized into `app.StatusEvent`, and a `session.snapshot` reduced to `app.PaneObservation`; on stop-intake, the decode pump moves its pending event and the rest of the raw backlog into an overflow slice that `DrainRemaining` exposes |
-| [runtime.go](runtime.go) | `Runtime`, `NewRuntime`, `ErrPaneNotFound`, `ErrWorkspaceIDRequired` | Implements `app.Runtime`: `worktree.create`, `layout.apply` worker-pane creation, pane recovery by creation label via `session.snapshot`, the `pane.send_text` fallback transport, `pane.read` scrollback capture, `pane.process_info` occupant inspection, `pane.close`, and `ServerInstance`'s dial-inspect-close socket-peer-pid lookup |
+| [runtime.go](runtime.go) | `Runtime`, `NewRuntime`, `ErrPaneNotFound`, `ErrWorkspaceIDRequired` | Implements `app.Runtime`: `worktree.create` (cwd/branch/base, plus an S9 creation label sent only when the caller supplies one), `layout.apply` worker-pane creation, pane recovery by creation label via `session.snapshot`, the `pane.send_text` fallback transport, `pane.read` scrollback capture, `pane.process_info` occupant inspection, `pane.close`, and `ServerInstance`'s dial-inspect-close socket-peer-pid lookup |
+| [workspace.go](workspace.go) | `Runtime.CreateWorkspace`, `Runtime.FindWorkspaceByLabel` | Implements `app.WorkspaceRuntime` on the same `Runtime` type: `workspace.create` (explicit cwd, additive env, a unique creation label, focus always false) and its S8 recovery lookup — resolve the labeled workspace via `session.snapshot`, then descend to its sole tab and that tab's sole pane |
 | [runtime_darwin.go](runtime_darwin.go), [runtime_linux.go](runtime_linux.go), [runtime_other.go](runtime_other.go) | `peerPID` | GOOS-selected: `peerPID` reads a dialed connection's socket peer pid — `getsockopt(SOL_LOCAL, LOCAL_PEERPID)` on darwin, `getsockopt(SOL_SOCKET, SO_PEERCRED)` on linux, unconditionally unavailable elsewhere |
 
 ## Invariants
@@ -84,6 +85,41 @@ worker-launch use case.
   (workspace, path, branch); it runs no git itself. Herdr's response has no
   base-commit field, so that provenance is resolved by application code
   through `CommandRunner`, never by this adapter.
+- `worktree.create`'s wire request also carries a creation `label` (S9:
+  Herdr accepts the same kind of creation label on `worktree.create` as on
+  `workspace.create`, naming the new workspace), sent only when
+  `app.WorktreeRequest.Label` is non-empty — every existing caller leaves it
+  empty, so the wire shape is byte-identical to before this field existed.
+  No `internal/app` call site sets it yet: per-attempt labeling (the
+  operation UUID) and the worktree.create label-recovery decision row are
+  application-layer work landing in slices 2b/6, not this adapter.
+- `Runtime.CreateWorkspace` and `Runtime.FindWorkspaceByLabel` implement
+  `app.WorkspaceRuntime` on the same `Runtime` type (a separate interface
+  from `app.Runtime`, per that port's own doc comment) — no new adapter
+  type, no change to `NewRuntime`. `CreateWorkspace` calls `workspace.create`
+  with an explicit cwd, additive env and a unique creation label, `focus`
+  always `false` regardless of anything the caller supplies (the port
+  carries no focus field at all): S8-confirmed, this never steals the
+  session's active workspace except that session's very first-ever one,
+  which Herdr always activates regardless of the request. Label and env are
+  wire-optional and omitted when the request carries none.
+  `FindWorkspaceByLabel` reads a single `session.snapshot` and resolves the
+  label against `snapshot.workspaces` — the label names the WORKSPACE
+  (`WorkspaceInfo.label`), never a pane, unlike `FindPaneByLabel`'s
+  pane-level labels — then descends to the resolved workspace's tabs
+  (matched by `workspace_id`) and that tab's panes (matched by `tab_id`).
+  An empty lookup label is refused before any request is sent, since Herdr
+  never assigns one. Zero matching workspaces is `(zero value, false, nil)`;
+  more than one workspace carrying the label, or anything other than
+  exactly one tab or exactly one pane at either descent step (including
+  zero — a workspace Herdr created always has both), is an error, never a
+  guess. Every schema-required field the descent filters on — a workspace's
+  label, a tab's `workspace_id`, a pane's `tab_id` — is decoded as a
+  pointer and validated on EVERY record scanned, not only the eventual
+  match: these fields are read to decide what matches, so an absent or
+  empty one anywhere is a `ProtocolError`, never a silently-skipped
+  non-match (an absent label decoding as `""` could otherwise let an
+  empty lookup label match a malformed workspace).
 - `ErrPaneNotFound` is a typed, `errors.Is`-checkable sentinel every
   pane-addressed `Runtime` method (`SendText`, `ReadPane`, `InspectPane`,
   `ClosePane`) maps Herdr's `pane_not_found` API error onto, through the
@@ -137,7 +173,8 @@ worker-launch use case.
 - Allowed inward imports: [internal/app](../../app/AGENTS.md).
 - Implemented ports: `app.Probe` by `InstallationProbe`,
   `app.AgentPresentation` by `Presentation`, `app.Observer` by `Observer`,
-  `app.Runtime` by `Runtime`.
+  `app.Runtime` by `Runtime`, `app.WorkspaceRuntime` by the same `Runtime`
+  (a deliberately separate port interface — see `workspace.go`).
 - External libraries: none; standard library only.
 
 ## Verification
@@ -178,12 +215,57 @@ worker-launch use case.
   `TestRuntimeInspectPaneAppErrPaneNotFoundClassification` (a table proving
   `errors.Is(err, app.ErrPaneNotFound)` holds only for the `pane_not_found`
   case, never for a transport, unrelated-API-code or protocol failure).
+  `TestRuntimeCreateWorktreeSendsLabelWhenSet` proves the S9 label is sent
+  only when the request carries one, alongside the pre-existing unlabeled
+  fixture asserted byte-identical.
+- `TestRuntimeCreateWorkspace*` and `TestRuntimeFindWorkspaceByLabel*` in
+  [workspace_test.go](workspace_test.go) cover `CreateWorkspace` and
+  `FindWorkspaceByLabel` the same way: full-structural request fixtures
+  (including that `focus` is always sent as `false`, and that `label`/`env`
+  are omitted when unset), `*MapsPartialResponse` tables, an unrelated API
+  error passing through, and `FindWorkspaceByLabel`'s empty-input-label
+  refusal (asserted to send no request at all), not-found, ambiguous label,
+  ambiguous OR ZERO tab/pane at either descent step, transport-error,
+  matched-record missing-required-id, and — separately — a missing or
+  explicitly empty label/`workspace_id`/`tab_id` on a record the descent
+  merely SCANS (not necessarily the eventual match), proving those
+  schema-required filter fields fail closed rather than silently acting as
+  a non-match; both methods are included in `TestRuntimeHonorsCancellation`.
 - [runtime_internal_test.go](runtime_internal_test.go) (`package herdr`,
   same-package per the internal-algorithm testing guidance) —
   `TestPeerPIDUnavailableForNonSocketConn` proves `peerPID` reports
   `(0, false)` for a `net.Pipe` connection, which implements no
   `syscall.Conn` on any platform: portable, no build tag, and exercises
   every `peerPID` implementation's defensive type check identically.
+- [callsites_test.go](callsites_test.go) is the herdr-adapter half of the
+  no-injection mechanism (docs/plan/phase-3-design.md section 11, part iii).
+  `TestProductionCallSitesUseAllowlistedStringLiterals` type-checks every
+  non-test `.go` file in this package with `go/types` (a stub importer
+  resolves this package's own sibling import, `internal/app`, to an empty
+  stand-in package, since only `Client`/`Call` — which depend on nothing
+  from it — need to resolve correctly) and finds every reference this
+  package makes to `(*Client).Call` BY TYPE — not by name or shape — so a
+  method value assigned to a variable, a method expression, or any other
+  indirection cannot hide from it the way a purely syntactic "is this a
+  4-argument `Call(...)`" walk could (the P1 review finding this replaced).
+  A method-expression reference is always rejected; a method value is
+  accepted only when it is the immediate callee of a direct, 4-argument
+  call whose `method` argument is a string literal on the reviewed
+  allowlist. The six terminal-input methods (`pane.send_text`,
+  `pane.send_keys`, `pane.send_input`, `agent.prompt`, `agent.send_keys`,
+  `agent.start`, S11-confirmed as Herdr 0.9.0's complete real input
+  surface) are never on that allowlist except the one staged exception,
+  `pane.send_text` for `SendText` itself, which slice 6 removes together
+  with the port member. The test cross-checks its own reference count
+  against a plain syntactic count of `.Call`-named selectors and fails if
+  they disagree, so a type-checking gap cannot silently under-cover.
+  `TestCallSiteAllowlistRuleCatchesViolations` proves the rule actually
+  catches what it claims to — including the method-value escape itself,
+  both with a dynamic method and with an otherwise-allowed literal, a bare
+  method-expression reference, a forbidden terminal-input method, an
+  unlisted literal and a direct call with the wrong arity — against a
+  synthetic self-contained package (its own `Client` type and `Call`
+  method), rather than only passing vacuously against today's clean tree.
 - Test fixtures: none on disk; stubs and wire lines are written by the tests.
 
 ## Related guides
