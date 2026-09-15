@@ -198,7 +198,7 @@ func (c *Controller) seedWorkspaceTrust(ctx context.Context, harness string, san
 	if !outcome.Seeded {
 		return "workspace trust not seeded: " + outcome.Reason, nil
 	}
-	return "workspace trust seeded for " + step.ProjectKey, nil
+	return "workspace trust seeded for " + step.ProjectKey + " (verified; best-effort against external profile writers)", nil
 }
 
 // FailLaunchExec settles the launch claim of incarnationID to exec_failed

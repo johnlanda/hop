@@ -34,8 +34,11 @@ type LaunchClaim struct {
 	SettledAt          time.Time
 	SettlementEvidence string
 	// SeedEvidence records the launch's workspace-trust pre-seeding outcome
-	// ("workspace trust seeded for <worktree path>", or "workspace trust
-	// not seeded: <reason>"). It is evidence only — no decision ever reads
+	// ("workspace trust seeded for <worktree path> (verified; best-effort
+	// against external profile writers)", or "workspace trust not seeded:
+	// <reason>" — the seed write is verified by a post-publish re-read but
+	// remains best-effort against a running harness rewriting the same
+	// profile). It is evidence only — no decision ever reads
 	// it — and never carries an environment value or profile path.
 	SeedEvidence string
 }

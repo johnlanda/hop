@@ -182,7 +182,18 @@ alternate-profile/pools work; they are not re-verified here.
   the ready prompt render before login, so the probes needed no
   authentication. These are undocumented internals pinned to 2.1.270: a
   version drift needs re-verification, and the needs-interaction fallback
-  (surfacing a dialog that appeared anyway) stays in place.
+  (surfacing a dialog that appeared anyway) stays in place. HOP's seed
+  write cannot coordinate with a RUNNING Claude of the same profile,
+  which rewrites `.claude.json` from its own state; the seeder is
+  therefore optimistic and best-effort — it redoes its edit on freshly
+  read content when the file changed before its publishing rename and
+  verifies the key by re-read before reporting seeded, so an external
+  atomic write landing before that pre-rename check or after the rename
+  is never lost, while one landing in the residual check-to-rename
+  microsecond window is overwritten (the same last-writer-wins class of
+  race Claude Code's own concurrent sessions of one profile have with
+  each other). A config that keeps changing under an external writer
+  yields "not seeded" evidence and the dialog fallback.
 - Keychain side effect of any launch (observed during the same spike):
   merely starting claude under a fresh `CLAUDE_CONFIG_DIR` — no login —
   creates the keychain item

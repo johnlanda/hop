@@ -70,7 +70,7 @@ func TestRealProcessLaunchSeedsWorkspaceTrust(t *testing.T) {
 		t.Errorf("seeded profile config:\n%s\nwant:\n%s", content, want)
 	}
 
-	wantEvidence := "workspace trust seeded for " + worktreePath
+	wantEvidence := "workspace trust seeded for " + worktreePath + " (verified; best-effort against external profile writers)"
 	if evidence := fx.seedEvidence(t); evidence != wantEvidence {
 		t.Errorf("launch claim seed evidence = %q, want %q", evidence, wantEvidence)
 	}

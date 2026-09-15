@@ -332,7 +332,7 @@ func TestPrepareLaunchExec(t *testing.T) {
 		if len(order) != 2 || order[0] != "SeedWorkspaceTrust" || order[1] != "ClaimLaunch" {
 			t.Errorf("order = %v, want the seed immediately before the claim", order)
 		}
-		want := "workspace trust seeded for /private/var/worktrees/hop-run-1"
+		want := "workspace trust seeded for /private/var/worktrees/hop-run-1 (verified; best-effort against external profile writers)"
 		if len(subs.claims) != 1 || subs.claims[0].SeedEvidence != want {
 			t.Errorf("claim seed evidence = %+v, want %q", subs.claims, want)
 		}

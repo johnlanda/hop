@@ -60,6 +60,20 @@ filesystem ambiently; it consumes these ports.
   already carrying true writes nothing at all. Every hard error carries a
   fixed category established through errors.Is only; the profile path
   derives from environment values and is never echoed.
+- Against EXTERNAL writers of the same profile (a running Claude rewrites
+  its config; the lock cannot coordinate with it) the seed is optimistic
+  and best-effort, in bounded rounds (`trustSeedAttempts`): each round
+  reads, computes the edit, re-stats AND re-reads immediately before the
+  publishing rename — discarding the stale edit and redoing it on fresh
+  content when anything changed — and reports seeded only after a
+  post-publish re-read verifies the key is present. Guaranteed: an
+  external atomic write landing before the pre-rename check, or after the
+  rename, is never lost (the round retries on the fresh content). Not
+  guaranteed: a write landing in the residual window between the
+  pre-rename check and the rename itself is overwritten — the same
+  last-writer-wins race Claude Code's own concurrent sessions of one
+  profile have with each other. A config rewritten inside every round's
+  window is a not-seeded outcome, external content left intact.
 
 ## Dependencies and ports
 
@@ -97,7 +111,12 @@ filesystem ambiently; it consumes these ports.
   the open file description, so a second descriptor contends exactly as a
   second process would), value-free permission-failure errors on both
   sides of the lock, no temp residue, mode 0600, and a canceled context
-  writing nothing.
+  writing nothing. The internal `trustseed_internal_test.go` cases drive
+  the `beforePublishCheck` seam to interleave a controlled external atomic
+  writer deterministically inside the covered window: one interleaved
+  write survives alongside the seed via a retry on fresh content, and a
+  writer rewriting inside every round exhausts the bounded budget into a
+  not-seeded outcome with the external content untouched.
 - Test fixtures: none on disk; paths live under t.TempDir.
 
 ## Related guides
