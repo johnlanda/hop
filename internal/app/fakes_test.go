@@ -163,6 +163,10 @@ type fakeStore struct {
 	// seqByRepo's role for run sequences.
 	taskSeqByRun map[identity.RunID]int
 
+	// WorktreesRetiredAt is the per-run worktrees-retired fact (migration
+	// 004's runs.worktrees_retired_at), absent until set, set once.
+	WorktreesRetiredAt map[identity.RunID]time.Time
+
 	// RequestReceipts is the shared (run, verb, requestID) acceptance-key
 	// idempotency store for every request-ID-bearing verb (send, answer,
 	// task-create, retry, plan-close): the digest of the accepted
@@ -221,6 +225,7 @@ func newFakeStore(clock interface{ Now() time.Time }) *fakeStore {
 		RetryRequestStates: map[identity.TaskID]app.RetryRequestState{},
 		RequestReceipts:    map[requestReceiptKey]requestReceipt{},
 		taskSeqByRun:       map[identity.RunID]int{},
+		WorktreesRetiredAt: map[identity.RunID]time.Time{},
 	}
 }
 
@@ -442,6 +447,9 @@ func (s *fakeStore) LoadRunStatus(_ context.Context, runID identity.RunID) (app.
 		TaskID:       taskID,
 		AttemptID:    attemptID,
 		StateRoot:    s.Snapshots[runID].StateRoot,
+	}
+	if at, retired := s.WorktreesRetiredAt[runID]; retired {
+		detail.WorktreesRetiredAt = &at
 	}
 	if t, ok := s.Tasks[taskID]; ok {
 		detail.TaskState = t.value.State

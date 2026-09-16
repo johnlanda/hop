@@ -4,7 +4,8 @@
 
 The persistence adapter behind the application's `StateStore`, `UnitOfWork`
 (with `WorkflowRepositories`), `ReadStore` (with `WorkflowReadStore`),
-`SubmissionStore`, `MessagingStore`, `PlanStore` and `ReviewStore` ports:
+`SubmissionStore`, `MessagingStore`, `PlanStore` and `ReviewStore` ports
+(plus `WorktreeRetirementRepositories` on the same unit of work):
 one SQLite database at
 `<state root>/hop.db` shared by every repository and run, holding runs,
 their frozen snapshots (incl. the feature-mode workflow policy), tasks
@@ -39,7 +40,7 @@ this package never resolves environment variables or defaults.
 | [entities.go](entities.go) | `getRun`, `getTask`, `getAttempt`, `getSession`, `currentSession`, `currentBinding`, `getLaunchClaim`, `acceptedResult`, `incarnationCurrent`, `launchIncarnationCurrent`, `pendingLaunchIntent` | Row ↔ domain-value mapping shared by all three authorities through the `querier` interface |
 | [submission.go](submission.go) | `SubmitResult`, `RecordMalformed`, `ClaimLaunch`, `SettleLaunchFailure`, `ClaimCheckExec`, `RequestStop`, `insertReceipt` | The worker authority: the section 7 validation order with the domain's `AcceptResult` inside one transaction, receipts for every outcome, the pre-exec claim contracts, the monotonic stop request |
 | [readstore.go](readstore.go) | `ListRuns`, `LoadRunStatus`, `LoadFrozenRun`, `LoadCheckExecutionContext`, `lastCheckSummary`, `retirementIntentExecution` | Lease-free reads, each inside one deferred read transaction for a consistent WAL snapshot; `LoadRunStatus` carries the snapshot's frozen `TargetBranch` and the run's `worktrees_retired_at` fact |
-| [worktreeretirement.go](worktreeretirement.go) | `runWorktreesRetiredAt` | Reads migration 004's worktrees-retired run fact: NULL is nil, a stored value must be the canonical time format (anything else fails closed) |
+| [worktreeretirement.go](worktreeretirement.go) | `unitOfWork` as `app.WorktreeRetirementRepositories`: `MarkWorktreesRetired`; `runWorktreesRetiredAt` | Migration 004's worktrees-retired run fact: written once inside the fenced unit of work (the leased run only; the UPDATE applies only while NULL, so a repeat keeps the first value; a set-once housekeeping column that does not move `runs.revision`), read back as nil for NULL or the canonical time (anything else fails closed) |
 
 ## Invariants
 
@@ -174,7 +175,8 @@ this package never resolves environment variables or defaults.
   [internal/domain/identity](../../domain/identity/AGENTS.md).
 - Implemented ports: `app.StateStore`, `app.UnitOfWork` (with every typed
   repository including `LaunchClaimRepository` and
-  `CheckExecClaimRepository`) plus `app.WorkflowRepositories`,
+  `CheckExecClaimRepository`) plus `app.WorkflowRepositories` and
+  `app.WorktreeRetirementRepositories`,
   `app.ReadStore` plus `app.WorkflowReadStore`, `app.SubmissionStore`,
   `app.MessagingStore`, `app.PlanStore` and `app.ReviewStore`, all by
   `*Store` and its unit of work. Test files additionally import
@@ -280,6 +282,11 @@ this package never resolves environment variables or defaults.
   `TestLoadCheckExecutionContextRetirementKinds` (the intent's argv and
   spawn directory verbatim; missing argv, a non-string element, an empty
   argv, a missing directory and a non-object intent each fail closed).
+- `TestMarkWorktreesRetired` (same command): the fact set once through
+  a committed unit of work, a repeat keeping the first value with the run
+  revision unchanged, another run fenced before any write, a rollback
+  leaving nothing, and a commit after lease expiry fenced with nothing
+  recorded.
 - Worktree-retirement reads (same command):
   `TestFrozenWorkflowWithoutTargetBranch` (a snapshot frozen before the
   field existed loads with no target; the key round-trips, and

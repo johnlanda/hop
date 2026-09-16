@@ -1,5 +1,14 @@
 package app
 
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/johnlanda/hop/internal/domain/identity"
+)
+
 // The post-merge worktree retirement operation kinds and their frozen
 // exec shapes (docs/plan/phase-3-worktree-retirement.md section 7). Both
 // are exec-claimable: hop check-exec claims either exactly as it claims a
@@ -58,4 +67,33 @@ func worktreeRetirementCheckArgv(git, repositoryRoot, headOID, targetOID string)
 // `no` otherwise lets the removal delete them).
 func worktreeRetireArgv(git, repositoryRoot, path string) []string {
 	return []string{git, "-C", repositoryRoot, "-c", "status.showUntrackedFiles=all", "worktree", "remove", path}
+}
+
+// WorktreeRetirementRepositories is the controller-transaction surface
+// worktree retirement adds to a unit of work. It is declared separately
+// from UnitOfWork and WorkflowRepositories under the additive packaging
+// rule, and reached through RequireWorktreeRetirementRepositories.
+type WorktreeRetirementRepositories interface {
+	// MarkWorktreesRetired sets the run's worktrees-retired fact to at when
+	// it is unset; a fact already set keeps its first value and the call
+	// succeeds. A run other than the unit of work's leased run is refused
+	// with ErrFenced before anything is written, and an unknown run with
+	// ErrNotFound.
+	MarkWorktreesRetired(ctx context.Context, runID identity.RunID, at time.Time) error
+}
+
+// ErrWorktreeRetirementUnsupported reports that a unit of work does not
+// implement WorktreeRetirementRepositories: the retirement pass fails
+// closed before any side effect, never a nil-interface panic.
+var ErrWorktreeRetirementUnsupported = errors.New("app: unit of work does not implement WorktreeRetirementRepositories")
+
+// RequireWorktreeRetirementRepositories asserts that uow also implements
+// WorktreeRetirementRepositories, returning
+// ErrWorktreeRetirementUnsupported (wrapped with reason) when it does not.
+func RequireWorktreeRetirementRepositories(uow UnitOfWork, reason string) (WorktreeRetirementRepositories, error) {
+	repos, ok := uow.(WorktreeRetirementRepositories)
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrWorktreeRetirementUnsupported, reason)
+	}
+	return repos, nil
 }
