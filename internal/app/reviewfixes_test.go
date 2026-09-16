@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/johnlanda/hop/internal/app"
 	"github.com/johnlanda/hop/internal/domain/identity"
@@ -262,6 +263,138 @@ func TestReviewFixGuardHeadIsObservedNotInferred(t *testing.T) {
 			t.Fatalf("readiness reported no shortfalls on an unvouched head")
 		}
 	})
+}
+
+// TestReviewFixFenceIdentityIsStable pins the round-2 residual (P2): a
+// transiently failed fence must be recovered through its OWN journal
+// row — never duplicated by the publish it retires. Before the fix,
+// the next round visited the pending publish first and unconditionally
+// allocated a second fence; the second fence moved the head, and the
+// first stayed reconciling forever at a ref equal to neither its
+// recorded head, its persisted OID, nor the publish's candidate — so
+// the quiescence guard refused a terminal commit indefinitely. The fix
+// is idempotence per retired operation ID, dependency-first recovery
+// order, and per-turn re-reads; the quiescence guard itself is kept.
+// Three faults — a one-time commit-tree failure, a one-time CAS
+// failure with the head unchanged, and a crash right after the fence
+// intent was journaled — each under both stop and terminal failure:
+// exactly one fence identity ever exists, it settles succeeded, and
+// the run terminates once the fault clears.
+func TestReviewFixFenceIdentityIsStable(t *testing.T) {
+	type fault struct {
+		name string
+		arm  func(t *testing.T, f *integrationFixture, publishID identity.OperationID)
+	}
+	faults := []fault{
+		{name: "one-time commit-tree failure", arm: func(_ *testing.T, f *integrationFixture, _ identity.OperationID) {
+			failed := false
+			f.tc.Commands.RunHook = func(ctx context.Context, cmd app.Command) (app.CommandResult, bool, error) {
+				if !failed && slices.Contains(cmd.Argv, "commit-tree") {
+					failed = true
+					return app.CommandResult{ExitCode: 128, Stderr: []byte("transient object write failure")}, true, nil
+				}
+				return f.git.Hook(ctx, cmd)
+			}
+		}},
+		{name: "one-time CAS failure, head unchanged", arm: func(_ *testing.T, f *integrationFixture, _ identity.OperationID) {
+			failed := false
+			f.tc.Commands.RunHook = func(ctx context.Context, cmd app.Command) (app.CommandResult, bool, error) {
+				if !failed && slices.Contains(cmd.Argv, "update-ref") {
+					failed = true // the ref is NOT moved: the store refused transiently.
+					return app.CommandResult{ExitCode: 128, Stderr: []byte("transient ref lock failure")}, true, nil
+				}
+				return f.git.Hook(ctx, cmd)
+			}
+		}},
+		{name: "crash after fence intent creation", arm: func(t *testing.T, f *integrationFixture, publishID identity.OperationID) {
+			// The fence row exists journaled pending with NO act evidence
+			// — the crash column between record-intent and act.
+			f.seedOperation(t, app.OpIntegrationFence, app.OperationPending, map[string]any{
+				"ref":                    integrationRefName,
+				"observed_head_oid":      f.base,
+				"retired_operation_id":   publishID.String(),
+				"retired_operation_kind": string(app.OpIntegrationPublish),
+			}, nil)
+		}},
+	}
+
+	seed := func(t *testing.T) (*integrationFixture, identity.OperationID) {
+		f := newIntegrationFixture(t, false)
+		id := f.seedIntegrationRow(t, run.IntegrationMerging, "")
+		merged := f.git.newCommit("tree-merged", f.base, f.src)
+		publishID := f.seedOperation(t, app.OpIntegrationPublish, app.OperationPending, map[string]any{
+			"integration_id":   id.String(),
+			"ref":              integrationRefName,
+			"new_oid":          merged,
+			"expected_old_oid": f.base,
+		}, nil)
+		f.tc.Clock.Advance(time.Millisecond)
+		f.tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) { return app.PaneProcess{}, app.ErrPaneNotFound }
+		return f, publishID
+	}
+
+	assertOneSettledFence := func(t *testing.T, f *integrationFixture) {
+		t.Helper()
+		fences := f.opsOfKind(app.OpIntegrationFence)
+		if len(fences) != 1 {
+			t.Fatalf("fence operations = %d, want exactly one journal identity per retired intent", len(fences))
+		}
+		if fences[0].State != app.OperationSucceeded {
+			t.Fatalf("fence state = %s, want succeeded through its own row", fences[0].State)
+		}
+	}
+
+	for _, fc := range faults {
+		t.Run("stop: "+fc.name, func(t *testing.T) {
+			f, publishID := seed(t)
+			row := f.tc.Store.Runs[f.fr.RunID]
+			row.value = row.value.RequestStop(f.tc.Clock.Now())
+			row.revision++
+			fc.arm(t, f, publishID)
+
+			var report app.StopReport
+			for i := 0; i < 6 && !report.Terminated; i++ {
+				var err error
+				report, err = f.tc.Controller.DriveFeatureStop(context.Background(), f.fr.Handle)
+				if err != nil {
+					t.Fatalf("DriveFeatureStop() round %d error = %v", i+1, err)
+				}
+				if fences := f.opsOfKind(app.OpIntegrationFence); len(fences) > 1 {
+					t.Fatalf("round %d allocated a duplicate fence: %d rows", i+1, len(fences))
+				}
+				f.tc.Clock.Advance(time.Millisecond)
+			}
+			if !report.Terminated {
+				t.Fatalf("stop never recovered after the fault cleared; report=%+v", report)
+			}
+			assertOneSettledFence(t, f)
+		})
+		t.Run("terminal failure: "+fc.name, func(t *testing.T) {
+			f, publishID := seed(t)
+			seedImplementTask(t, f.tc, f.fr.RunID, 2, "exhausted independent task", false, run.TaskFailed)
+			fc.arm(t, f, publishID)
+
+			var report app.RetirementReport
+			for i := 0; i < 6 && !report.RunFailed; i++ {
+				var err error
+				report, err = f.tc.Controller.RetireSettledSessions(context.Background(), f.fr.Handle)
+				if err != nil {
+					t.Fatalf("RetireSettledSessions() round %d error = %v", i+1, err)
+				}
+				if fences := f.opsOfKind(app.OpIntegrationFence); len(fences) > 1 {
+					t.Fatalf("round %d allocated a duplicate fence: %d rows", i+1, len(fences))
+				}
+				f.tc.Clock.Advance(time.Millisecond)
+			}
+			if !report.RunFailed {
+				t.Fatalf("terminal failure never recovered after the fault cleared; report=%+v", report)
+			}
+			assertOneSettledFence(t, f)
+			if got := f.tc.Store.Runs[f.fr.RunID].value.State; got != run.RunFailed {
+				t.Fatalf("run state = %s, want failed", got)
+			}
+		})
+	}
 }
 
 // TestReviewFixRetentionFailure pins finding 2: a zero-exit check whose

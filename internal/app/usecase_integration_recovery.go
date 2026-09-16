@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/johnlanda/hop/internal/domain/identity"
@@ -45,7 +46,16 @@ func (c *Controller) recoverIntegrationOperations(ctx context.Context, handle Ru
 		}
 	}
 	for i := range unresolved {
-		op := unresolved[i]
+		// Re-read at each turn: recovering an earlier operation can
+		// settle a later one (a fence settles the publish it retires),
+		// and a stale pending snapshot must never re-drive it.
+		op, opErr := c.currentOperation(ctx, handle, unresolved[i].ID)
+		if opErr != nil {
+			return "", opErr
+		}
+		if op.State != OperationPending && op.State != OperationReconciling {
+			continue
+		}
 		var (
 			still string
 			err   error
@@ -514,9 +524,16 @@ func (c *Controller) applyIntegrationCheckUnknown(ctx context.Context, handle Ru
 // while an UNRESOLVED ref-move intent exists, it first retires that
 // intent by moving the ref itself. Retirement distinguishes the intent
 // kind — the invariant is "the ref rests on the last VALIDATED tree",
-// not "the ref moved". outstanding is non-empty while any ref-move
-// intent stays unresolved; a run never reports stopped or failed over
-// it.
+// not "the ref moved". Dependencies recover FIRST: every unresolved
+// fence row (each one names the publish it retires) is recovered before
+// any publish is visited, so a transiently failed fence resumes its own
+// journal row rather than a second fence being allocated for the same
+// intent — one fence identity per retired operation. Each operation is
+// re-read at its turn, because recovering an earlier intent settles
+// dependents (a landed fence settles its publish) and a stale pending
+// snapshot must never re-drive a settled operation. outstanding is
+// non-empty while any ref-move intent stays unresolved; a run never
+// reports stopped or failed over it.
 func (c *Controller) retireUnresolvedRefIntents(ctx context.Context, handle RunHandle, frozen *FrozenRun) (string, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per stop or terminal-failure round.
 	var refOps []Operation
 	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
@@ -534,10 +551,18 @@ func (c *Controller) retireUnresolvedRefIntents(ctx context.Context, handle RunH
 	}); err != nil {
 		return "", err
 	}
+	rank := map[OperationKind]int{OpIntegrationFence: 0, OpIntegrationReset: 1, OpIntegrationPublish: 2}
+	slices.SortStableFunc(refOps, func(a, b Operation) int { return rank[a.Kind] - rank[b.Kind] })
 
 	outstanding := ""
 	for i := range refOps {
-		op := refOps[i]
+		op, opErr := c.currentOperation(ctx, handle, refOps[i].ID)
+		if opErr != nil {
+			return "", opErr
+		}
+		if op.State != OperationPending && op.State != OperationReconciling {
+			continue // settled by an earlier intent's recovery this round.
+		}
 		var (
 			still string
 			err   error
@@ -558,6 +583,50 @@ func (c *Controller) retireUnresolvedRefIntents(ctx context.Context, handle RunH
 		}
 	}
 	return outstanding, nil
+}
+
+// currentOperation re-reads one operation row: dispatch loops that hold
+// a snapshot re-read each row at its turn so a settlement made earlier
+// in the round is seen, never re-driven.
+func (c *Controller) currentOperation(ctx context.Context, handle RunHandle, opID identity.OperationID) (Operation, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
+	var op Operation
+	err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		var getErr error
+		op, getErr = uow.Operations().Get(ctx, opID)
+		return getErr
+	})
+	return op, err
+}
+
+// unresolvedFenceFor finds the unresolved integration.fence operation
+// retiring publish opID, if one exists — the oldest such row, so
+// recovery always resumes the same journal identity.
+func (c *Controller) unresolvedFenceFor(ctx context.Context, handle RunHandle, publishOpID identity.OperationID) (Operation, bool, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
+	var (
+		fence Operation
+		found bool
+	)
+	err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		ops, opErr := uow.Operations().ByKind(ctx, handle.runID, OpIntegrationFence)
+		if opErr != nil {
+			return opErr
+		}
+		for i := range ops {
+			if ops[i].State != OperationPending && ops[i].State != OperationReconciling {
+				continue
+			}
+			intent, ok := decodeOperationPayload[integrationFenceIntent](ops[i].Intent)
+			if !ok || intent.RetiredOperationID != publishOpID.String() {
+				continue
+			}
+			if !found || ops[i].CreatedAt.Before(fence.CreatedAt) {
+				fence = ops[i]
+				found = true
+			}
+		}
+		return nil
+	})
+	return fence, found, err
 }
 
 // retirePublishIntent retires one unresolved publish intent. Head still
@@ -585,6 +654,19 @@ func (c *Controller) retirePublishIntent(ctx context.Context, handle RunHandle, 
 		// candidate through the standard reset.
 		return "", c.adoptPublishOutcome(ctx, handle, op.ID, &intent)
 	case intent.ExpectedOldOID:
+		// Idempotence per retired operation: an unresolved fence already
+		// standing for THIS publish (a transient commit-tree or CAS
+		// failure left it journaled) is recovered through its own row and
+		// persisted OID — a second fence is never allocated while one
+		// stands, or the abandoned one could stay reconciling forever
+		// against a ref the duplicate moved.
+		existing, found, fenceErr := c.unresolvedFenceFor(ctx, handle, op.ID)
+		if fenceErr != nil {
+			return "", fenceErr
+		}
+		if found {
+			return c.recoverIntegrationFence(ctx, handle, frozen, &existing)
+		}
 		return c.fencePublishIntent(ctx, handle, frozen, op, &intent, observed)
 	default:
 		return "", c.settleOperation(ctx, handle, op.ID, OperationFailed, fmt.Sprintf("expected-old %s is no longer current (ref at %s); the CAS is dead and the intent retired by observation", intent.ExpectedOldOID, observed))
