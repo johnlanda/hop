@@ -163,7 +163,7 @@ func TestRunControllerLoop(t *testing.T) {
 		}
 		td := newTestDeps(ctrl, map[string]string{"PATH": "/bin"}, t.TempDir())
 		td.useCheckBarriers()
-		ctrl.claimAndRunCheck = func(ctx context.Context, _ string, _ []string) (app.CheckReport, error) {
+		ctrl.claimAndRunCheck = func(_ context.Context, _ string, _ []string) (app.CheckReport, error) {
 			checkClaimed.Store(true)
 			td.checkStarted <- struct{}{}
 			return app.CheckReport{Ran: true, OperationID: "op-1", Passed: true}, nil
@@ -195,7 +195,7 @@ func TestRunControllerLoop(t *testing.T) {
 		if settledIdx == -1 || runningIdx == -1 || completedIdx == -1 {
 			t.Fatalf("output missing an expected line; got:\n%s", out)
 		}
-		if !(settledIdx < runningIdx && runningIdx < completedIdx) {
+		if settledIdx >= runningIdx || runningIdx >= completedIdx {
 			t.Errorf("want \"launch settled\" < \"run r1 running\" < \"run r1 completed\"; got:\n%s", out)
 		}
 	})

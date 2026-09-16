@@ -236,8 +236,8 @@ func runControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, handle 
 		if detail == nil {
 			return loopResult{}, errors.Join(fmt.Errorf("run %s has no status detail", runID), drainChecks())
 		}
-		if err := printRunState(detail.State); err != nil {
-			return loopResult{}, errors.Join(err, drainChecks())
+		if printErr := printRunState(detail.State); printErr != nil {
+			return loopResult{}, errors.Join(printErr, drainChecks())
 		}
 		if isTerminalRunState(detail.State) {
 			if drainErr := drainChecks(); drainErr != nil {
@@ -298,8 +298,8 @@ func runControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, handle 
 					if settledDetail == nil {
 						return loopResult{}, errors.Join(fmt.Errorf("run %s has no status detail", runID), drainChecks())
 					}
-					if err := printRunState(settledDetail.State); err != nil {
-						return loopResult{}, errors.Join(err, drainChecks())
+					if printErr := printRunState(settledDetail.State); printErr != nil {
+						return loopResult{}, errors.Join(printErr, drainChecks())
 					}
 				}
 			}

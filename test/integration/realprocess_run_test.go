@@ -127,7 +127,7 @@ func TestRealProcessRunEndToEnd(t *testing.T) {
 	if settledAt == -1 || runningAt == -1 || completedAt == -1 {
 		t.Fatalf("controller stdout missing an expected transition line; got:\n%s", stdout)
 	}
-	if !(settledAt < runningAt && runningAt < completedAt) {
+	if settledAt >= runningAt || runningAt >= completedAt {
 		t.Errorf("want \"launch settled\" < \"run %s running\" < \"run %s completed\" in controller stdout; got:\n%s", label, label, stdout)
 	}
 
