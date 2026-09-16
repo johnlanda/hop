@@ -696,11 +696,26 @@ func (s *fakeStore) ClaimCheckExec(_ context.Context, op identity.OperationID, p
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	operation, ok := s.Operations[op]
-	if !ok || operation.Kind != app.OpCheckRun || operation.State != app.OperationPending {
-		return fmt.Errorf("app_test: operation %s is not a pending check execution; check-exec claim refused", op)
+	// The real store's Phase 3 contract (design section 3): any pending
+	// exec-claimable operation of the current generation — exactly the
+	// kinds check.run and integration.merge. Publish, reset and fence are
+	// executed directly by the controller and are never claimable.
+	execClaimable := operation.Kind == app.OpCheckRun || operation.Kind == app.OpIntegrationMerge
+	if !ok || !execClaimable || operation.State != app.OperationPending {
+		return fmt.Errorf("app_test: operation %s is not a pending exec-claimable execution; check-exec claim refused", op)
 	}
 	if row, ok := s.Leases[operation.RunID]; !ok || operation.Generation != row.lease.Generation {
 		return fmt.Errorf("app_test: operation %s is not of the current generation; check-exec claim refused", op)
+	}
+	// The real store's pid-before-exec contract (sqlite submission.go's
+	// ClaimCheckExec): one row, one pid, never re-armed or overwritten — a
+	// same-pid retry is an idempotent no-op that preserves the original
+	// row, and a different pid is refused.
+	if existing, claimed := s.CheckExecClaims[op]; claimed {
+		if existing.PID != pid {
+			return fmt.Errorf("app_test: operation %s already has a check-exec claim by another pid; a claim is never overwritten", op)
+		}
+		return nil
 	}
 	s.CheckExecClaims[op] = app.CheckExecClaim{OperationID: op, PID: pid, ClaimedAt: s.clock.Now()}
 	return nil

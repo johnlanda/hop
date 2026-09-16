@@ -933,6 +933,73 @@ func TestPrepareCheckExec(t *testing.T) {
 		}
 	})
 
+	t.Run("integration.merge: the frozen merge argv passes through byte-identically", func(t *testing.T) {
+		// The generalized boundary (design sections 3 and 8): the context
+		// resolved for an integration.merge operation carries the intent's
+		// frozen noninteractive merge argv, and the boundary treats it
+		// exactly like a check.run's — claim first, argv equality, verbatim
+		// pass-through (group retirement matches the running argv), env
+		// sanitized, only the executed path resolved.
+		mergeArgv := []string{
+			"/usr/bin/git", "-C", "/state/runs/r/integrations/op/tree",
+			"-c", "user.name=hop", "-c", "user.email=hop@invalid",
+			"-c", "core.editor=true", "-c", "core.hooksPath=/state/runs/r/integrations/op/hooks",
+			"-c", "commit.gpgsign=false", "-c", "merge.verifysignatures=false",
+			"merge", "--no-ff", "--no-edit", "0123456789abcdef0123456789abcdef01234567",
+		}
+		var calls []string
+		mergeCtx := newContext()
+		mergeCtx.CheckArgv = append([]string(nil), mergeArgv...)
+		mergeCtx.CheckoutPath = "/state/runs/r/integrations/op/tree"
+		read := &ebReadStub{checkCtx: mergeCtx, calls: &calls}
+		subs := &ebSubmissionStub{calls: &calls}
+		c := &Controller{Read: read, Submissions: subs}
+
+		req := baseRequest()
+		req.CheckArgv = append([]string(nil), mergeArgv...)
+		plan, err := c.PrepareCheckExec(context.Background(), req)
+		if err != nil {
+			t.Fatalf("PrepareCheckExec: %v", err)
+		}
+
+		if len(calls) < 2 || calls[0] != "ClaimCheckExec" || calls[1] != "LoadCheckExecutionContext" {
+			t.Fatalf("call order = %v, want the claim before the context load", calls)
+		}
+		if len(plan.Argv) != len(mergeArgv) {
+			t.Fatalf("argv length = %d, want %d", len(plan.Argv), len(mergeArgv))
+		}
+		for i := range mergeArgv {
+			if plan.Argv[i] != mergeArgv[i] {
+				t.Fatalf("argv[%d] = %q, want %q verbatim", i, plan.Argv[i], mergeArgv[i])
+			}
+		}
+		if plan.ExecPath != "/resolved//usr/bin/git" {
+			t.Errorf("exec path = %q, want the lookup's resolution of the frozen argv[0]", plan.ExecPath)
+		}
+		if strings.Contains(strings.Join(plan.Env, "\n"), "ANTHROPIC_API_KEY") {
+			t.Errorf("sanitized env still carries a strip-matrix variable")
+		}
+	})
+
+	t.Run("integration.merge: a rearranged merge argv is refused after the claim", func(t *testing.T) {
+		mergeArgv := []string{"/usr/bin/git", "merge", "--no-ff", "--no-edit", "abc"}
+		mergeCtx := newContext()
+		mergeCtx.CheckArgv = mergeArgv
+		read := &ebReadStub{checkCtx: mergeCtx}
+		subs := &ebSubmissionStub{}
+
+		req := baseRequest()
+		req.CheckArgv = []string{"/usr/bin/git", "merge", "--no-edit", "--no-ff", "abc"}
+		_, err := (&Controller{Read: read, Submissions: subs}).PrepareCheckExec(context.Background(), req)
+
+		if err == nil || !strings.Contains(err.Error(), "does not equal the frozen check argv") {
+			t.Fatalf("err = %v, want the frozen-argv refusal", err)
+		}
+		if len(subs.checkClaims) != 1 {
+			t.Errorf("claim count = %d, want the pre-verification claim recorded", len(subs.checkClaims))
+		}
+	})
+
 	refusals := []struct {
 		name      string
 		mutate    func(req *CheckExecRequest, read *ebReadStub, subs *ebSubmissionStub)

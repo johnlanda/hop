@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/johnlanda/hop/internal/app"
@@ -50,7 +51,14 @@ func seedFeatureRun(t *testing.T, tc *testController, maxWorkers int) featureRun
 		StateRoot: "/state",
 		Workflow: app.WorkflowSnapshot{
 			Mode: "feature", MaxWorkers: maxWorkers, RetryLimit: 3,
-			IntegrationBranch: "hop/r1/integration",
+			// The frozen role-artifact copies every assignment references
+			// (FreezeWorkflowArtifacts writes them under the run's artifact
+			// directory in production; the scheduler only requires absolute
+			// paths).
+			ManagerRolePath:     "/state/runs/" + runID.String() + "/artifacts/roles/manager.md",
+			ImplementerRolePath: "/state/runs/" + runID.String() + "/artifacts/roles/implementer.md",
+			ReviewerRolePath:    "/state/runs/" + runID.String() + "/artifacts/roles/reviewer.md",
+			IntegrationBranch:   "hop/r1/integration",
 		},
 	}
 	tc.Store.Briefs[runID] = "feature brief"
@@ -250,18 +258,56 @@ func TestAssignReadyTasks(t *testing.T) {
 		if binding.PaneID == "" {
 			t.Fatalf("binding has no pane id")
 		}
+
+		// The task assignment artifact was written at the app-derived
+		// per-attempt path before the pane opened: the launch prompt
+		// references exactly this path.
+		path := "/state/runs/" + fr.RunID.String() + "/attempts/" + assigned.AttemptID.String() + "/assignment.md"
+		content, readErr := tc.Artifacts.ReadArtifact(context.Background(), path)
+		if readErr != nil {
+			t.Fatalf("task assignment artifact not written: %v", readErr)
+		}
+		for _, want := range []string{
+			"Title: A",
+			"/state/runs/" + fr.RunID.String() + "/tasks/" + taskA.String() + ".md",
+			"/artifacts/roles/implementer.md",
+			"result submit --summary",
+		} {
+			if !strings.Contains(string(content), want) {
+				t.Errorf("task assignment is missing %q:\n%s", want, content)
+			}
+		}
+		if strings.Contains(string(content), "Prior attempt") {
+			t.Errorf("a first attempt's assignment carries retry feedback:\n%s", content)
+		}
 	})
 
 	t.Run("a review task branches from its own frozen subject, not the integration head", func(t *testing.T) {
 		tc := newTestController(defaultPolicy())
 		fr := seedFeatureRun(t, tc, 2)
 		now := tc.Clock.Now()
+
+		// An integrated implement task with its integration row: the review
+		// assignment's diff-scope base is the FIRST integration's recorded
+		// pre-merge head.
+		implementID := seedImplementTask(t, tc, fr.RunID, 1, "A", false, run.TaskIntegrated)
+		integrationID, err := identity.ParseIntegrationID(tc.IDs.NewID())
+		if err != nil {
+			t.Fatalf("parse integration id: %v", err)
+		}
+		resultID, err := identity.ParseResultID(tc.IDs.NewID())
+		if err != nil {
+			t.Fatalf("parse result id: %v", err)
+		}
+		integ := run.NewIntegration(integrationID, fr.RunID, implementID, resultID, "source-oid", "base-premerge-oid", now)
+		tc.Store.Integrations[integrationID] = &entityRow[run.Integration]{value: integ, revision: 1}
+
 		reviewID, err := identity.ParseTaskID(tc.IDs.NewID())
 		if err != nil {
 			t.Fatalf("parse task id: %v", err)
 		}
 		subjectOID := fakeHeadCommitOID
-		review := run.NewReviewTask(reviewID, fr.RunID, 1, subjectOID, "tttttttttttttttttttttttttttttttttttttttt", now)
+		review := run.NewReviewTask(reviewID, fr.RunID, 2, subjectOID, "tttttttttttttttttttttttttttttttttttttttt", now)
 		tc.Store.Tasks[reviewID] = &entityRow[run.Task]{value: review, revision: 1}
 
 		opts := defaultAssignmentOptions()
@@ -277,6 +323,25 @@ func TestAssignReadyTasks(t *testing.T) {
 		}
 		if report.Assigned[0].Role != run.RoleReviewer {
 			t.Fatalf("assigned role = %s, want reviewer", report.Assigned[0].Role)
+		}
+
+		// The review assignment artifact was written at the app-derived
+		// per-attempt path with the frozen subject and the diff scope.
+		path := "/state/runs/" + fr.RunID.String() + "/attempts/" + report.Assigned[0].AttemptID.String() + "/assignment.md"
+		content, readErr := tc.Artifacts.ReadArtifact(context.Background(), path)
+		if readErr != nil {
+			t.Fatalf("review assignment artifact not written: %v", readErr)
+		}
+		for _, want := range []string{
+			"Commit: " + subjectOID,
+			"Tree: tttttttttttttttttttttttttttttttttttttttt",
+			"Diff scope: base-premerge-oid.." + subjectOID,
+			"/artifacts/roles/reviewer.md",
+			"review submit --verdict <approve|reject> --subject " + subjectOID,
+		} {
+			if !strings.Contains(string(content), want) {
+				t.Errorf("review assignment is missing %q:\n%s", want, content)
+			}
 		}
 	})
 
@@ -376,6 +441,17 @@ func TestAssignReadyTasks(t *testing.T) {
 		}
 		tc.Store.Attempts[firstAttemptID] = &entityRow[run.Attempt]{value: firstAttempt, revision: 1}
 
+		// The prior attempt's accepted result: the retry assignment's
+		// feedback section names its commit.
+		priorResultID, err := identity.ParseResultID(tc.IDs.NewID())
+		if err != nil {
+			t.Fatalf("parse result id: %v", err)
+		}
+		tc.Store.Results[firstAttemptID] = run.Result{
+			ID: priorResultID, AttemptID: firstAttemptID,
+			CommitOID: "1111111111111111111111111111111111111111", Accepted: true,
+		}
+
 		retryReq := app.RetryRequest{
 			TaskID: taskID, RunID: fr.RunID, Session: fr.ManagerID, RequestID: "retry-1", Reason: "flaky",
 			IncarnationID: fr.ManagerIncarnation,
@@ -407,6 +483,22 @@ func TestAssignReadyTasks(t *testing.T) {
 		}
 		if _, stillPending := tc.Store.RetryRequests[taskID]; stillPending {
 			t.Fatalf("retry request row still present after consumption")
+		}
+
+		// The retry assignment carries the prior attempt's feedback: the
+		// section header and the accepted result commit (design section 6).
+		path := "/state/runs/" + fr.RunID.String() + "/attempts/" + report.Assigned[0].AttemptID.String() + "/assignment.md"
+		content, readErr := tc.Artifacts.ReadArtifact(context.Background(), path)
+		if readErr != nil {
+			t.Fatalf("retry assignment artifact not written: %v", readErr)
+		}
+		for _, want := range []string{
+			"Prior attempt 1 (retry feedback)",
+			"Accepted result commit: 1111111111111111111111111111111111111111",
+		} {
+			if !strings.Contains(string(content), want) {
+				t.Errorf("retry assignment is missing %q:\n%s", want, content)
+			}
 		}
 	})
 }

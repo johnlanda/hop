@@ -402,10 +402,16 @@ func environValue(environ []string, name string) string {
 }
 
 // CheckExecRequest is hop check-exec's input: the --op flag value, the
-// check argv the controller passed after `--` (validated against the
-// frozen argv, which is the one executed), the supervisor's complete
-// spawned environment, its own pid, whether it leads its own process
-// group, and the composition-supplied executable lookup.
+// argv the controller passed after `--` (validated against the frozen
+// argv, which is the one executed), the supervisor's complete spawned
+// environment, its own pid, whether it leads its own process group, and
+// the composition-supplied executable lookup. The operation may be either
+// exec-claimable kind (docs/plan/phase-3-design.md sections 3 and 8): a
+// check.run execution, whose frozen argv is the run's check command, or
+// an integration.merge execution, whose frozen argv is the intent's
+// noninteractive merge command — LoadCheckExecutionContext resolves the
+// frozen argv by operation kind, and this boundary treats both
+// identically.
 type CheckExecRequest struct {
 	OperationID       string
 	CheckArgv         []string
@@ -427,16 +433,20 @@ type CheckExecPlan struct {
 }
 
 // PrepareCheckExec performs every hop check-exec step before the exec
-// itself (docs/plan/phase-2-design.md section 7): it requires the
-// supervisor to lead its own process group, durably records its pid as the
-// check-exec claim BEFORE anything else can spawn — refusing to run when
-// the write fails or the operation is not a current pending check
-// execution — then loads the frozen execution context, verifies the argv
-// the controller passed equals the frozen check argv, sanitizes the
-// spawned environment under the frozen policy and resolves the check
-// executable through the sanitized PATH. A failure after the claim exits
-// without running the check; the recorded group id remains the retirement
-// handle.
+// itself (docs/plan/phase-2-design.md section 7; generalized to both
+// exec-claimable kinds by docs/plan/phase-3-design.md sections 3 and 8):
+// it requires the supervisor to lead its own process group, durably
+// records its pid as the check-exec claim BEFORE anything else can
+// spawn — refusing to run when the write fails or the operation is not a
+// pending check.run or integration.merge execution of the current
+// generation — then loads the frozen execution context (argv resolved by
+// operation kind: check.run's frozen check command, or the merge intent's
+// frozen noninteractive merge argv), verifies the argv the controller
+// passed equals that frozen argv byte for byte (group retirement matches
+// the running argv, so it is never rewritten), sanitizes the spawned
+// environment under the frozen policy and resolves the executable through
+// the sanitized PATH. A failure after the claim exits without running
+// anything; the recorded group id remains the retirement handle.
 func (c *Controller) PrepareCheckExec(ctx context.Context, req CheckExecRequest) (CheckExecPlan, error) { //nolint:gocritic // hugeParam: CheckExecRequest is the driving DTO for hop check-exec, called once per supervisor process.
 	opID, err := identity.ParseOperationID(req.OperationID)
 	if err != nil {
