@@ -15,20 +15,29 @@ prepare use cases and then exec through the process adapter.
 
 | File | Entities / functions | Responsibility |
 | --- | --- | --- |
-| [main.go](main.go) | `main`, `run`, `dispatch`, `printUsage`, `exitOK`, `exitFailure`, `exitUsage` | Entry point; maps a command name to its handler (worker plumbing listed under its own usage heading) and a failed write to `exitFailure` |
-| [compose.go](compose.go) | `controllerAPI`, `controllerConfig`, `deps`, `defaultDeps`, `openController`, `describeStoreOpenFailure`, `waitInterval`, `lookupExecutable` | The composition root proper: resolves the controller's own `git` executable once against its own PATH (`os.Getenv("PATH")`, never the sanitized worker environment) and sets `Controller.GitExecutable`, opens the SQLite store under the resolved state root, wires the system/process/config adapters (including `system.TrustSeeder` into the `Trust` port), the same SQLite store into `Messages`/`Plan`/`Reviews` unconditionally, and — for pane-acting commands — the Herdr runtime (compile-time `app.Runtime` assertion) plus `Workspaces` (the same `herdr.Runtime` value, a separate port) and `Presentation` into one `app.Controller`; `deps` carries every effectful seam (env, clock, wait, signals, exec, store opening) so command tests substitute fakes; `lookupExecutable` implements `app.ExecutableLookup` over the sanitized PATH. `controllerAPI` is slice 6's complete driving surface: every Phase 2 method, hop run's feature bootstrap (`StartFeatureRun`, `ResolveRunWorkflow`), plus the Phase 3 worker-plumbing verbs (`SendMessage`/`FetchMessage`/`AckMessage`/`ShowMessage`/`Answer`/`CreateTask`/`RequestRetry`/`ClosePlan`/`SubmitReviewVerdict`), the feature-mode scheduling pass (`RetireSettledSessions`/`RecomputeReleases`/`DriveIntegration`/`EnsureReviewTask`/`AssignReadyTasks`/`DriveCompletion`/`CorroborateSessionLaunches`/`DriveFeatureChecks`), feature-mode resume/stop (`ResumeFeature`/`DriveFeatureStop`), presentation (`PublishRunPresentation`) and `hop view` (`SelectRunView`/`ClearRunView`) |
+| [main.go](main.go) | `main`, `run`, `dispatch`, `printUsage`, `exitOK`, `exitFailure`, `exitUsage` | Entry point; maps a command name to its handler — Phase 2's `run`/`status`/`stop`/`resume`/`result`/`version`/`doctor`/`plugin-context`/`help`, worker plumbing `launch`/`check-exec` (listed under its own usage heading) and Phase 3's `task`/`plan`/`msg`/`answer`/`review`/`view` — and a failed write to `exitFailure` |
+| [compose.go](compose.go) | `controllerAPI`, `controllerConfig`, `deps`, `defaultDeps`, `openController`, `describeStoreOpenFailure`, `waitInterval`, `lookupExecutable` | The composition root proper: resolves the controller's own `git` executable once against its own PATH (`os.Getenv("PATH")`, never the sanitized worker environment) and sets `Controller.GitExecutable`, opens the SQLite store under the resolved state root, wires the system/process/config adapters (including `system.TrustSeeder` into the `Trust` port), the same SQLite store into `Messages`/`Plan`/`Reviews` unconditionally, and — for pane-acting commands — the Herdr runtime (compile-time `app.Runtime` assertion) plus `Workspaces` (the same `herdr.Runtime` value, a separate port) and `Presentation` into one `app.Controller`; `deps` carries every effectful seam (env, clock, wait, signals, exec, store opening) so command tests substitute fakes; `lookupExecutable` implements `app.ExecutableLookup` over the sanitized PATH. `controllerAPI` is slice 6's complete driving surface: every Phase 2 method, hop run's feature bootstrap (`StartFeatureRun`, `ResolveRunWorkflow`), plus the Phase 3 worker-plumbing verbs (`SendMessage`/`FetchMessage`/`AckMessage`/`ShowMessage`/`Answer`/`CreateTask`/`RequestRetry`/`ClosePlan`/`SubmitReviewVerdict`), the feature-mode scheduling pass (`RetireSettledSessions`/`RecomputeReleases`/`DriveIntegration`/`EnsureReviewTask`/`AssignReadyTasks`/`DriveCompletion`/`CorroborateSessionLaunches`/`DriveFeatureChecks`), feature-mode resume/stop (`ResumeFeature`/`DriveFeatureStop`), presentation (`PublishRunPresentation`), `hop view` (`SelectRunView`/`ClearRunView`) and three scheduling-pass support methods `featureloop.go` calls each tick: `MessageWaitDefault` (hop msg wait's frozen-default resolver), `AssignmentDefaults` (every run-fixed `AssignReadyTasks` field: frozen `MaxWorkers`/`Harness`/`ReviewerHarness` and the frozen `RepositoryRoot`/`StateRoot`) and `ResolveIntegrationHead` (the run's current integration branch head) |
 | [stateroot.go](stateroot.go) | `resolveStateRoot`, `requireWorkerStateRoot` | The design's single state-root rule: `${XDG_STATE_HOME:-$HOME/.local/state}/hop` with `HOP_STATE_DIR` as the only override (relative refused); worker contexts REQUIRE the launch-provided absolute `HOP_STATE_DIR` and never fall back |
 | [loop.go](loop.go) | `runControllerLoop`, `runHeartbeats`, `loopResult`, `detachAndReport`, `releaseQuietly`, `resolveRunArg`, `seqLabel`, `exitForRunState` | The foreground controller loop: concurrent 10s heartbeats under the 30s TTL, one line per run transition, launch corroboration, stop routing, 2s check polling; run arguments resolve as UUIDs or `r<seq>` labels |
 | [runcmd.go](runcmd.go) | `runRun`, `finishControllerLoop`, `watchDetachSignals`, `resolveRepositoryRoot`, `hopExecutablePath`, `stringList` | `hop run "<brief>" [--workflow solo\|feature]`: an unknown `--workflow` is usage before any store access; `ResolveRunWorkflow` picks StartRun + the Phase 2 loop or StartFeatureRun + the feature loop (`finishFeatureControllerLoop`); the start line, then the loop; SIGINT/SIGTERM detach (second signal force-exits); `ErrStartRefused` maps to exit 2 for both workflows |
-| [statuscmd.go](statuscmd.go) | `runStatus`, `renderRunListing`, `renderRunDetail` | `hop status`: non-terminal runs by default, `-all` includes completed/failed/stopped, `-run` renders the full detail block including the claim's trust-seed evidence line and the unknown-check options; state is data, not an exit code |
-| [stopcmd.go](stopcmd.go) | `runStop`, `driveStopRounds`, `observeStop` | `hop stop <run-id>`: monotonic stop request, then DriveStop rounds with the acquired lease or observation of a live controller's stop; exit 0 only on observed `stopped`, rerunnable otherwise |
-| [resumecmd.go](resumecmd.go) | `runResume`, `resumeDetailLine`, `runLabel` | `hop resume <run-id>` with `--confirm-absent`: prints what reconciliation established; continuable outcomes stay in the loop, fail-closed/reconciling/unsupported reports release the lease and exit 1 for the human to act and rerun |
+| [statuscmd.go](statuscmd.go) | `runStatus`, `renderRunListing`, `renderRunDetail`, `isFeatureMode`, `workflowLabel` | `hop status`: non-terminal runs by default, `-all` includes completed/failed/stopped, `-run` renders the full detail block including the claim's trust-seed evidence line, the unknown-check options and (Phase 3) a `workflow: solo|feature` line sourced only from `WorkflowSnapshot.Mode`; state is data, not an exit code |
+| [stopcmd.go](stopcmd.go) | `runStop`, `dispatchStopResume`, `driveStopRounds`, `observeStop`, `outstandingSummary` | `hop stop <run-id>`: monotonic stop request (lease-free, always reachable once the run is confirmed to exist), then dispatches by the run's frozen mode — `Resume`/`DriveStop` for solo, `ResumeFeature`/`DriveFeatureStop` for feature, never a fallback between them — with the acquired lease or observation of a live controller's stop; exit 0 only on observed `stopped`, rerunnable otherwise. Every step past `RequestStop` touches the Herdr runtime |
+| [resumecmd.go](resumecmd.go) | `confirmAbsentValue`, `runResume`, `runResumeFeature`, `resumeFeatureSessionLines`, `resumeDetailLine`, `runLabel` | `hop resume <run-id>`: loads the run's frozen mode via `Status` before any lease acquisition, then dispatches by mode — `Resume` for solo (`--confirm-absent` the bare Phase 2 boolean) or `ResumeFeature` for feature (`--confirm-absent=<session-id>`, one `confirmAbsentValue` flag.Value serving both forms); continuable outcomes stay in the matching loop (`finishControllerLoop`/`finishFeatureControllerLoop`; the caller's directory only scopes an `r<seq>` lookup — a feature run is scheduled in its frozen repository, whichever directory `hop resume` ran in), fail-closed/reconciling/unsupported reports release the lease and exit 1 for the human to act and rerun. The mode-load and both `--confirm-absent` usage refusals run before `Resume`/`ResumeFeature`, so they never touch Herdr; every outcome past that point does |
 | [resultcmd.go](resultcmd.go) | `runResult`, `runResultSubmit`, `submissionLine` | `hop result submit` (section 7): `--summary`/`--commit`, IDs defaulting from `HOP_*`, incarnation from `HOP_INCARNATION_ID`; accepted/duplicate exit 0, everything else 1 with the transient first line verbatim |
-| [launchcmd.go](launchcmd.go) | `runLaunch`, `launcherWorkerDir`, `resolveCanonicalPath` | `hop launch --run --attempt` (the permanent solo shim) and `hop launch --run --session` (every feature-mode pane), mutually exclusive, the worker exec boundary: worker state root, the launcher's own symlink-resolved working directory (refused with a diagnostic before any store access when unresolvable), `resolveCanonicalPath` as the request's `ResolvePath` seam for the recorded-worktree (or, for the manager, repository-root) cross-check whose resolved directory is the workspace-trust seed key, `PrepareSessionLaunchExec` (session context load → validate → sanitize → per-role/per-harness compose — all three harnesses launch, cold resume is Claude-only — resolve → worktree cross-check → trust-seed → session-keyed claim), `process.Exec`; a post-claim failure settles exec_failed via `FailLaunchExec`; one stderr line, never an environment value |
+| [launchcmd.go](launchcmd.go) | `runLaunch`, `launcherWorkerDir`, `resolveCanonicalPath` | `hop launch --run --attempt` (the permanent solo shim) and `hop launch --run --session` (every feature-mode pane), mutually exclusive, the worker exec boundary: worker state root, the launcher's own symlink-resolved working directory (refused with a diagnostic before any store access when unresolvable), `resolveCanonicalPath` as the request's `ResolvePath` seam for the recorded-worktree (or, for the manager, repository-root) cross-check whose resolved directory is the workspace-trust seed key, `PrepareSessionLaunchExec` (session context load → validate → sanitize → per-role/per-harness compose — all three harnesses launch, cold resume is Claude-only — resolve → worktree cross-check → trust-seed → session-keyed claim), `process.Exec`; a post-claim failure settles exec_failed via `FailLaunchExec`; one stderr line, never an environment value. Never wires a Runtime, so every refusal before the claim is store-only |
 | [checkexeccmd.go](checkexeccmd.go) | `runCheckExec` | `hop check-exec --op -- <argv>`, the check exec boundary: group-leadership fact, `PrepareCheckExec` (claim before exec), `process.ExecResolved` so the frozen argv runs verbatim and the check's exit status propagates through the exec |
+| [taskcmd.go](taskcmd.go) | `runTask`, `runTaskCreate`, `taskCreateLines`, `runTaskRetry`, `taskRetryLines`, `runPlan`, `runPlanClose`, `planCloseLines`, `managerEnvIdentities`, `readManagerEnvIdentities`, `writeLinesAndExit` | `hop task create/retry` and `hop plan close` (design section 8): manager-only, identities from `HOP_*` env (no flags name them — these verbs run only inside a HOP-launched manager pane), the instructions/file-first protocol before any store call; every success line renders through `internal/app/grammar.go` (`hop task retry`'s `retry accepted t<seq> attempt <n>` / `duplicate t<seq> attempt <n>` from the store-reported `TaskSeq`); `writeLinesAndExit` is every worker-plumbing verb's shared exit-code mapping (a `refused:` first line always exits 1) |
+| [msgcmd.go](msgcmd.go) | `runMsg`, `runMsgSend`, `sendMessageLines`, `runMsgNext`, `fetchOneMessage`, `deliveredMessageLines`, `runMsgWait`, `runMsgAck`, `ackMessageLines`, `runMsgShow`, `showMessageLines`, `runAnswer`, `answerLines`, `readBodyFlag` | `hop msg send/next/wait/ack/show` (design section 7) and `hop answer`: `readBodyFlag` resolves a body from `--file` xor `--body`; `fetchOneMessage` is the one non-blocking `FetchMessage` call both `hop msg next` and every round of `hop msg wait`'s CLI-side 1s poll loop share — the FIRST attempt validates the caller's `HOP_*` identity before `hop msg wait` ever reaches `MessageWaitDefault`, so a missing/malformed identity fails identically for both verbs; `hop msg wait`'s default `--timeout` resolves from the run's frozen `[messages] wait_timeout` only when `flag.Visit` finds no explicit flag. `hop answer` is a human/controller-machine command — no `HOP_*` env, no lease — resolving the repository and state root exactly like `hop stop`/`hop resume` |
+| [reviewcmd.go](reviewcmd.go) | `runReview`, `runReviewSubmit`, `writeReviewResultAndExit` | `hop review submit` (design section 8): reviewer-only, identities from `HOP_*` env including `HOP_TASK_ID`/`HOP_ATTEMPT_ID`, the reasons body read from `--reasons-file` before any store call; `writeReviewResultAndExit` renders the fixed transient retry line (store `Detail` to stderr, never the stdout protocol line) separately from `writeLinesAndExit`'s ordinary accepted/duplicate/refused handling |
+| [viewcmd.go](viewcmd.go) | `runView`, `runViewSet`, `runViewClear` | `hop view set --run <id\|r<seq>>` / `hop view clear` (design section 9): always wires the Herdr runtime (`withRuntime: true`) since `SelectRunView`/`ClearRunView` unconditionally dial the `Presentation` port — `resolveRunArg`/`runLabel` resolve and validate the run BEFORE that call, so only usage errors and an unknown run/label are store-only; every success line requires a live Herdr connection |
+| [grammarrender.go](grammarrender.go) | `refusalToken`, `reviewRefusalToken`, `renderRefusal` | Renders a worker-plumbing use case's refusal as the section 7 grammar's enumerated reason token: `refusalToken` renders a store-set `Reason` field directly (every `PlanStore`/`MessagingStore` outcome sets one at its own decision point — never Detail-text matched), falling back to `unauthorized` only on the empty-reason defect case; `reviewRefusalToken` classifies `SubmitReviewVerdict`'s outcome kind directly (`malformed`/`conflicting`/`stale` — the only three kinds that reach it; `not-reviewer` and `subject-mismatch` are real refusal SCENARIOS `internal/adapters/sqlite/review.go` distinguishes internally, but neither is a distinct `ReviewOutcomeKind` this function ever sees, so both render `refused: stale` — pinned by `TestReviewRefusalTokenIsExhaustive`) |
+| [featureloop.go](featureloop.go) | `featureCheckDriver`, `runFeatureControllerLoop`, `featurePassResult`, `managerLaunchLines`, `runFeatureSchedulingPass`, `describeFeatureCheckReport`, `finishFeatureControllerLoop` | The feature-mode foreground loop: one scheduling pass per tick (`RetireSettledSessions` → `RecomputeReleases` → `DriveIntegration` → `EnsureReviewTask` → `DriveCompletion` → `AssignReadyTasks` → `CorroborateSessionLaunches`), gated to `CorroborateSessionLaunches`-only while the run is launching (no settled manager session yet to schedule against) and to `DriveCompletion`-only while it is completing (completion retirement continues across ticks), plus async `DriveFeatureChecks` via `featureCheckDriver` (mirrors `checkDriver`'s solo shape). The pass honors its reports: retirement's `RunFailed`/`RunFailing` or a completion `RunState` other than running halts it — nothing further runs, no new check round is dispatched (`AssignReadyTasks` accepts only a running run) — and the loop observes the terminal state on a later tick and exits with its normal code. A manager whose launch exec failed fails the run in the app; the pass prints the solo loop's own `launch failed` line for it (`managerLaunchLines`, reusing `describeLaunchProgress`), and the loop then exits 1; `runFeatureSchedulingPass` populates every `AssignReadyTasks` field each pass: `AssignmentDefaults` for every run-fixed one (the frozen repository and state roots included — never the invoking directory), the running binary for `HOPPath`, `ResolveIntegrationHead` for `IntegrationHeadCommitOID` |
 | [doctor.go](doctor.go) | `runDoctor`, `renderReport`, `renderStateRoot`, `defaultDoctorTimeout` | `hop doctor`: the Phase 1 report plus the store-path line (resolved state root, source label, store presence) computed without opening the database |
 | [version.go](version.go), [plugincontext.go](plugincontext.go) | `runVersion`, `resolveVersion`, `recordingWriter`, `runPluginContext` | Unchanged Phase 0/1 commands |
-| [fakes_test.go](fakes_test.go) | `fakeController`, `testDeps`, `newTestDeps` | Scripted `controllerAPI` fake and the fully-faked `deps` (fixed clock, sleepless waits, recording exec seams) |
+| [fakes_test.go](fakes_test.go) | `fakeController`, `testDeps`, `newTestDeps` | Scripted `controllerAPI` fake (every Phase 2 and Phase 3 method, including `messageWaitDefault`/`assignmentDefaults`/`resolveIntegrationHead` script fields) enforcing the real use cases' contracts it scripts around: `AssignReadyTasks` refuses non-absolute roots, roots other than the scripted run's frozen ones (`frozenRoots`) and every run state but running (`runState`/`setRunState`, which the unscripted `DriveCompletion` also reports), and the fully-faked `deps` (fixed clock, sleepless waits, recording exec seams) |
+| [grammarcontract_fixture_test.go](grammarcontract_fixture_test.go) | `TestMain`, `buildHopBinary`, `buildInto`, `goBuildVars`, `runHop`, `hopResult`, `herdrCanary`, `canaryBase`, `isolatedEnvironment`, `isolatedTestEnv`, `isolatedHopEnv`, `execHop`, `runFixtureGit`, `freshStateDir`, `realDir`, `testUUID`, `TestIsolatedEnvironment`, `TestCanaryBaseFitsTheSocketLimit` | The real-binary grammar contract suite's build/exec/isolation harness (design section 11, L1569): builds this package once (`go test`'s cwd IS cmd/hop's source dir, so `go build .` needs no module-root discovery), runs every subprocess — the hop binary, the one `go build`, the fixture git commands (`runFixtureGit`, bounded by `callTimeout`) — under `isolatedEnvironment`: an explicit allowlist (`PATH`, optionally behind a prefix, and `TMPDIR` from the host, plus the caller's named variables), a fresh `HOME`, and a `herdrCanary` unix-socket listener at `HERDR_SOCKET_PATH` that fails the suite if anything ever connects (bound in its own `os.MkdirTemp` directory under `canaryBase` — the process temporary directory when even the longest generated socket path fits the platform's sockaddr_un limit (103 bytes on darwin, 107 on linux), else the short fixed base `/tmp` — never `t.TempDir()`, so a long `TMPDIR` never breaks the bind); a caller can override none of those fixed keys, and nothing else is inherited. The build carries only `GOCACHE`/`GOMODCACHE`/`GOPATH` plus `GOTOOLCHAIN`/`GOFLAGS` when set, resolved in-process by `goBuildVars` (the test process's environment, else the go command's documented defaults) — nothing is executed to find them, so every subprocess, the build included, runs under a temporary `HOME` — and its cache stays warm. cmd/hop's only `TestMain` (Go allows one per package) |
+| [grammarcontract_seed_test.go](grammarcontract_seed_test.go) | `openFixtureStore`, `freezeWorkflowSnapshot`, `featureWorkflowSnapshot`, `featureManager`, `newFeatureManager`, `newFeatureManagerAt`, `newFeatureManagerIn`, `addReworkTask`, `childSession`, `soloFixture`, `newSoloReserved`, `newSoloRunning`, `fixtureRowRevisions`, `TestHopfixturesLaunchBaseIsSingleUse` | Seeds fixture state through [internal/testsupport/hopfixtures](../../internal/testsupport/hopfixtures/AGENTS.md) — never through `hop run`, which would place a worker through Herdr — opening the real `internal/adapters/sqlite` Store directly (the same production call `compose.go` makes) and passing it to hopfixtures' string-typed API. `freezeWorkflowSnapshot` is the one raw `database/sql` write hopfixtures cannot perform itself (promotes a seeded run from solo to feature mode by writing JSON into `run_snapshots.workflow`; commented as the pre-6b legacy substitute 6b's merge can replace with the real feature `InitializeRun`). `newFeatureManagerIn` seeds a SECOND run into an already-open fixture's own store — the only way to build a genuine cross-run scenario, since two separate state roots make a foreign session merely unknown there, not foreign |
+| [grammarcontract_msg_test.go](grammarcontract_msg_test.go), [grammarcontract_plan_test.go](grammarcontract_plan_test.go), [grammarcontract_review_test.go](grammarcontract_review_test.go), [grammarcontract_view_test.go](grammarcontract_view_test.go), [grammarcontract_phase2_test.go](grammarcontract_phase2_test.go) | `TestGrammarContract*` | The real-binary grammar contract tests themselves, one file per verb-family group: msg send/next/wait/ack/show + answer (the hostile-body proof checks both streams of every producing and consuming invocation for exact permitted output, an empty stderr and independent canaries — ESC, both bracketed-paste markers, the SGR sequence, a body fragment); task create/retry + plan close; review submit (`initFixtureGitRepo`/`commitFixtureChange`/`gitRevParseTree` build an isolated real git repository, since `SubmitReviewVerdict` resolves `--subject`'s tree object id via a real `git rev-parse` against the run's recorded repository root); view set/clear; the five Phase 2 verbs never covered before (`status`/`stop`/`resume`/`launch`/`result submit`) — `launchEnv` builds a solo launch fixture's pane environment, `hopfixtures.LaunchBase` plus a deliberately mismatched or conflicting value constructs each refusal-before-exec shape without ever letting `hop launch` reach `d.exec`, and every `hop launch` invocation runs through `execLaunch`: a `launchExecCanary` executable under the configured harness name (`claude`) sits first on the launch's PATH and only creates a marker, which each test asserts never exists (`TestGrammarContractLaunchExecCanaryIsLive` proves the lookup resolves to it and that running it leaves the marker). Every test asserts the observed first line against an `internal/app/grammar.go` constant (or documents why a shape is unreachable without a live Herdr connection) — `TestGoldenGrammar` (`internal/app`) already pins that a constant's literal text is right; this suite answers only "does cmd/hop actually render it" |
 
 The repository root's [herdr-plugin.toml](../../herdr-plugin.toml) declares
 how Herdr invokes this binary: a startup hook and a `show-context` action run
@@ -42,6 +51,10 @@ commands expect the built binary at `.bin/hop` (see `make build`).
   the root came from (`HOP_STATE_DIR` for worker commands, the resolved
   state root for controller commands) — the raw sqlite/filesystem error
   chain carries the complete path and is never printed.
+- An operator-supplied file a worker-plumbing verb reads (`--file`,
+  `--reasons-file`) that cannot be read renders `pathErrorCategory`'s fixed
+  category, never the path; artifact-write failures reach stderr already
+  path-free from the artifact store (`internal/adapters/system`).
 - Exit codes: 0 success, 1 failure, 2 usage. `hop run`/`hop resume` exit 0
   only on a `completed` run; failed, stopped, detach and errors exit 1; a
   StartRun or StartFeatureRun refusal before any side effect
@@ -51,20 +64,36 @@ commands expect the built binary at `.bin/hop` (see `make build`).
   accepted and duplicate only. The exec boundaries exit 1 on every failure
   with one stderr line that never echoes an environment value; on success
   they never return. A write failure takes precedence, including flag
-  diagnostics through `recordingWriter`.
+  diagnostics through `recordingWriter`. Every worker-plumbing verb
+  (`hop task/plan/msg/answer/review`, design section 7) shares one
+  convention through `writeLinesAndExit`: exit 0 unless the rendered first
+  line begins `refused: ` (`app.GrammarRefusalPrefix`), which always exits
+  1 — a refusal is never a usage error, since the CLI syntax was fine and
+  the request itself was refused. `hop review submit`'s transient outcome
+  is the one exception, rendered by its own `writeReviewResultAndExit`
+  (also exit 1, the fixed retry line only, Detail to stderr).
 - One state-root rule (section 4): controller commands resolve
   XDG-with-`HOP_STATE_DIR`-override through `resolveStateRoot`; worker
-  commands (`launch`, `check-exec`, `result submit`) require the provided
-  absolute `HOP_STATE_DIR` and never fall back. The SQLite adapter receives
+  commands (`launch`, `check-exec`, `result submit`, and every
+  `hop task/plan/msg/review` worker-plumbing verb) require the provided
+  absolute `HOP_STATE_DIR` and never fall back. `hop answer` is the one
+  worker-plumbing-shaped verb that is NOT a worker context (no `HOP_*` env
+  at all) and resolves the CONTROLLER state-root rule instead, exactly
+  like `hop status`/`hop stop`/`hop resume`. The SQLite adapter receives
   the absolute root and creates it 0700.
 - Adapters are constructed only here, once per command; the Herdr runtime,
   `Workspaces` and `Presentation` are wired only for commands that act on
-  panes/worktrees (`run`, `stop`, `resume`). `hop status`, the exec
-  boundaries and `result submit` run store-only with a nil `Runtime`.
-  `Messages`, `Plan` and `Reviews` (the same SQLite store) are wired for
-  every command unconditionally: the worker-plumbing verbs they back
-  (`hop msg/task/plan/review`) are store-only, like `result submit`, and
-  never need a Runtime.
+  panes/worktrees or the native Agents view (`run`, `stop`, `resume`,
+  `view set`, `view clear`). `hop status`, the exec boundaries,
+  `result submit` and every `hop task/plan/msg/answer/review`
+  worker-plumbing verb run store-only with a nil `Runtime`. `Messages`,
+  `Plan` and `Reviews` (the same SQLite store) are wired for every command
+  unconditionally: the worker-plumbing verbs they back are store-only,
+  like `result submit`, and never need a Runtime. `hop view set/clear`
+  wiring `withRuntime: true` does NOT mean its store-only refusal shapes
+  touch Herdr — `SelectRunView`/`ClearRunView` are the only calls that
+  dial the Presentation port, and `resolveRunArg`/`runLabel` run and can
+  fail before either is ever called.
 - `openController` resolves `Controller.GitExecutable` before opening the
   store, for every command: `lookupExecutable("git", os.Getenv("PATH"))`
   against the controller process's own environment. A bare `"git"` is
@@ -94,6 +123,13 @@ commands expect the built binary at `.bin/hop` (see `make build`).
   [internal/adapters/sqlite](../../internal/adapters/sqlite/AGENTS.md),
   [internal/adapters/system](../../internal/adapters/system/AGENTS.md), per
   rule `cmd/hop` in [internal/arch_test.go](../../internal/arch_test.go).
+  `_test.go` files additionally import
+  [internal/testsupport/hopfixtures](../../internal/testsupport/hopfixtures/AGENTS.md)
+  (the checker's `testFirstParty` list, not the production import list —
+  production cmd/hop code never imports it, and never imports
+  `internal/domain/identity` or `internal/domain/run` even from a test
+  file; hopfixtures exists precisely so the grammar contract tests never
+  need to).
 - Consumed/implemented ports: wires the adapters into every `app.Controller`
   port; implements `app.ExecutableLookup` (`lookupExecutable`); constructs
   `herdr.InstallationProbe` for `app.Doctor`.
@@ -122,13 +158,38 @@ commands expect the built binary at `.bin/hop` (see `make build`).
   ever echoing the state-root value, and `TestOpenControllerGitExecutableNotFound`
   proves composition refuses with a fixed, value-free diagnostic when git
   cannot be resolved on its own PATH.
+- `fileerrors_test.go` proves the same value-free rule for file reads
+  and artifact writes: `TestFileReadFailuresNeverEchoThePath` (every
+  `--file`/`--reasons-file` verb, missing and unreadable, a path canary on
+  neither stream, no store opened) and
+  `TestArtifactWriteFailureNeverEchoesThePath` (a real artifact-store
+  failure rendered by `hop msg send`); the grammar contract suite's
+  `TestGrammarContractMsgSendArtifactWriteFailureEchoesNoPath` repeats it
+  against the real binary.
 - `make build && .bin/hop version` — builds the binary and prints the version
   the Go toolchain derived from version control.
 - `.bin/hop doctor` — probes the real installation on this machine.
-- Real-adapter, real-Herdr behavior is exercised only by the
-  `test/integration` suite (task 6b), never by these unit tests.
-- Test fixtures: stub shell scripts written to temporary directories; no
-  live Herdr session is contacted.
+- `go test ./cmd/hop -run TestGrammarContract` — the real-binary grammar
+  contract suite (design section 11, L1569;
+  `grammarcontract_*_test.go`): builds the actual `hop` binary once and
+  execs every verb this slice owns, plus the five Phase 2 verbs that
+  predate it, against a fixture state root seeded through
+  [internal/testsupport/hopfixtures](../../internal/testsupport/hopfixtures/AGENTS.md)
+  over the REAL `internal/adapters/sqlite` Store — real-adapter, but
+  never real-Herdr: every exec runs under `isolatedHopEnv`'s
+  `herdrCanary`, which fails the test if anything ever connects to
+  `HERDR_SOCKET_PATH`. This is a third tier distinct from both the
+  scripted-fake unit tests above (no real adapter) and
+  `test/integration` below (real adapter AND a real Herdr server); it
+  lives entirely under `cmd/hop`, never under `test/integration`, and
+  must never start a Herdr server itself.
+- Real-Herdr behavior (a live server, real panes, real worktrees) is
+  exercised only by the `test/integration` suite (task 6b), never by
+  anything in this package.
+- Test fixtures: stub shell scripts written to temporary directories for
+  the scripted-fake unit tests above; the grammar contract suite's own
+  fixtures are real SQLite state roots built through hopfixtures. No
+  live Herdr session is ever contacted by anything in this package.
 
 ## Related guides
 
@@ -137,6 +198,8 @@ commands expect the built binary at `.bin/hop` (see `make build`).
 - [Application layer](../../internal/app/AGENTS.md)
 - [Herdr adapter](../../internal/adapters/herdr/AGENTS.md)
 - [SQLite store](../../internal/adapters/sqlite/AGENTS.md)
+- [hopfixtures test-support package](../../internal/testsupport/hopfixtures/AGENTS.md):
+  the grammar contract suite's fixture seeder — `_test.go` files only.
 - [Process adapter](../../internal/adapters/process/AGENTS.md)
 - [System adapter](../../internal/adapters/system/AGENTS.md)
 - [Config adapter](../../internal/adapters/config/AGENTS.md)

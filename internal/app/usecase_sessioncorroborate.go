@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/johnlanda/hop/internal/domain/identity"
 	"github.com/johnlanda/hop/internal/domain/run"
@@ -26,7 +27,20 @@ type SessionLaunchProgress struct {
 // and its RunDetail-bound helpers (driveLaunchDeadline,
 // recoverBindingByLabel) are untouched — the solo path stays exactly as it
 // was.
+//
+// An exec_failed claim is a terminal launch outcome. A child's settles
+// through settleChildExecFailure (attempt failed, budgeted task
+// consequence, mailbox closure, manager notice, session terminated, one
+// transaction). A manager's fails the run: its session is terminated
+// here, and while the run is launching — the scheduling pass runs nothing
+// but this step then — the feature terminal failure is driven from here
+// on this and every later round until it settles (RetireSettledSessions
+// drives it for a running run).
 func (c *Controller) CorroborateSessionLaunches(ctx context.Context, handle RunHandle) ([]SessionLaunchProgress, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per scheduling pass.
+	frozen, err := c.Read.LoadFrozenRun(ctx, handle.runID)
+	if err != nil {
+		return nil, fmt.Errorf("app: load frozen run: %w", err)
+	}
 	sessions, err := c.featureRunSessions(ctx, handle)
 	if err != nil {
 		return nil, err
@@ -37,20 +51,57 @@ func (c *Controller) CorroborateSessionLaunches(ctx context.Context, handle RunH
 		if session.State != run.SessionLaunching {
 			continue
 		}
-		progress, corrErr := c.corroborateSessionLaunch(ctx, handle, &session)
+		progress, corrErr := c.corroborateSessionLaunch(ctx, handle, &frozen, &session)
 		if corrErr != nil {
 			return reports, corrErr
 		}
 		reports = append(reports, SessionLaunchProgress{SessionID: session.ID.String(), Role: string(session.Role), Progress: progress})
 	}
+	if err := c.driveLaunchingRunFailure(ctx, handle); err != nil {
+		return reports, err
+	}
 	return reports, nil
+}
+
+// driveLaunchingRunFailure drives the feature terminal failure of a
+// launching run whose manager lineage ended in an exec failure, through
+// RetireSettledSessions — the one routine that retires every live child
+// and group, quiesces ref moves and then marks the run failed with stop
+// precedence. Anything else is left to the ordinary pass.
+func (c *Controller) driveLaunchingRunFailure(ctx context.Context, handle RunHandle) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per scheduling pass.
+	due := false
+	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		wf, wfErr := RequireWorkflowRepositories(uow, "CorroborateSessionLaunches")
+		if wfErr != nil {
+			return wfErr
+		}
+		r, _, runErr := uow.Runs().Get(ctx, handle.runID)
+		if runErr != nil {
+			return runErr
+		}
+		if r.State != run.RunLaunching {
+			return nil
+		}
+		var failedErr error
+		due, failedErr = managerLaunchFailedLocked(ctx, uow, wf, handle.runID)
+		return failedErr
+	}); err != nil {
+		return err
+	}
+	if !due {
+		return nil
+	}
+	if _, err := c.RetireSettledSessions(ctx, handle); err != nil {
+		return fmt.Errorf("app: fail the run after the manager's exec failure: %w", err)
+	}
+	return nil
 }
 
 // corroborateSessionLaunch performs one inspection round for one session,
 // mirroring CorroborateLaunch's branches against session-keyed context
 // (sessionCloseEvidence) instead of RunDetail's single attempt/claim/
 // binding fields.
-func (c *Controller) corroborateSessionLaunch(ctx context.Context, handle RunHandle, session *run.Session) (LaunchProgress, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per session per scheduling pass.
+func (c *Controller) corroborateSessionLaunch(ctx context.Context, handle RunHandle, frozen *FrozenRun, session *run.Session) (LaunchProgress, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per session per scheduling pass.
 	binding, bindingFound, claim, claimFound, markers, err := c.sessionCloseEvidence(ctx, handle, session)
 	if err != nil {
 		return "", err
@@ -71,14 +122,27 @@ func (c *Controller) corroborateSessionLaunch(ctx context.Context, handle RunHan
 
 	switch claim.State {
 	case LaunchClaimExecFailed:
+		if session.Role != run.RoleManager {
+			if settleErr := c.settleChildExecFailure(ctx, handle, frozen, session); settleErr != nil {
+				return "", settleErr
+			}
+			return LaunchFailed, nil
+		}
+		// The manager has no attempt to settle; the run's terminal failure
+		// carries the consequence.
 		if termErr := c.terminateRetiredSession(ctx, handle, session.ID, "exec_failed claim"); termErr != nil {
 			return "", termErr
 		}
 		return LaunchFailed, nil
 	case LaunchClaimExeced:
 		// Already settled (an adoption path, or a prior round's settlement
-		// whose session activation was lost): apply what is still missing,
-		// idempotently. No fresh occupant evidence is available here.
+		// whose session activation — or, for the manager, the run's own
+		// launching->running consequence — was lost): apply what is still
+		// missing, idempotently. No fresh occupant evidence is available
+		// here.
+		if runErr := c.settleManagerRunRunningIfNeeded(ctx, handle, session); runErr != nil {
+			return "", runErr
+		}
 		if confirmErr := c.confirmSessionActive(ctx, handle, session.ID, "launch claim settled execed"); confirmErr != nil {
 			return "", confirmErr
 		}
@@ -120,17 +184,26 @@ func (c *Controller) corroborateSessionLaunch(ctx context.Context, handle RunHan
 }
 
 // settleSessionExeced records one feature-mode session's launch-claim
-// settlement: the claim's exec_pending -> execed transition with the
+// settlement: the run's own launching -> running transition (never
+// resuming, ResumeFeature's own gate — see applyManagerRunRunning) when
+// session is the manager (design L560 — "launching -> running is the
+// manager's settled launch claim"; worker and reviewer sessions launch
+// only once AssignReadyTasks/EnsureReviewTask have already observed the
+// run running, so applying the check for every role stays idempotent but
+// only the manager's own settlement can ever find the run still
+// launching), the claim's exec_pending -> execed transition with the
 // corroborated occupant's pid and marker as evidence (never an arbitrary
 // foreground member), that evidence also recorded on the session's current
 // binding, its bound attempt's launching/relaunching -> running transition
 // when it has one (the manager has none), and the session's own
-// activation — mirroring Phase 2's settleExeced without the Run-level
-// transition, which belongs to the scheduling pass driving the run
-// overall, never to one session's settlement.
+// activation — mirroring Phase 2's settleExeced, whose own Run-level
+// transition this now applies identically for the manager alone.
 func (c *Controller) settleSessionExeced(ctx context.Context, handle RunHandle, session *run.Session, claim *LaunchClaim, occupant *SettlementEvidence) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per session settlement.
 	now := c.Clock.Now()
 	err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		if runErr := applyManagerRunRunning(ctx, uow, handle, session, now); runErr != nil {
+			return runErr
+		}
 		if claim.State == LaunchClaimExecPending {
 			if settleErr := uow.LaunchClaims().Settle(ctx, claim.IncarnationID, LaunchClaimSettlement{
 				State: LaunchClaimExeced, PID: occupant.Occupant.PID, Executable: claim.Executable, ArgvMarker: occupant.Marker, At: now,
@@ -195,6 +268,62 @@ func (c *Controller) settleSessionExeced(ctx context.Context, handle RunHandle, 
 	})
 	if err != nil {
 		return fmt.Errorf("app: settle session launch claim: %w", err)
+	}
+	return nil
+}
+
+// applyManagerRunRunning moves handle's run from launching to running, in
+// uow, when session is the run's manager — the design L560 consequence
+// ("launching -> running is the manager's settled launch claim") that
+// neither the solo-mode settleExeced's mirror nor any step of the
+// feature-mode scheduling pass otherwise applies. Deliberately NEVER
+// resuming: resuming->running is ResumeFeature's own gate
+// (usecase_featureresume.go, markFeatureRunning) — every session warm,
+// relaunched or retired, and no blocked integration operation — and a
+// manager settlement alone must never bypass it, unlike solo's
+// settleExeced, which may accept a resuming run only because a solo run
+// has exactly one session. A no-op for every other role and for a run
+// already running, so calling it unconditionally from every settlement
+// path stays idempotent.
+func applyManagerRunRunning(ctx context.Context, uow UnitOfWork, handle RunHandle, session *run.Session, now time.Time) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per session settlement.
+	if session.Role != run.RoleManager {
+		return nil
+	}
+	r, rRev, err := uow.Runs().Get(ctx, handle.runID)
+	if err != nil {
+		return err
+	}
+	if r.State != run.RunLaunching {
+		return nil
+	}
+	rFrom := r.State
+	next, err := r.MarkRunning(now)
+	if err != nil {
+		return err
+	}
+	if _, err := uow.Runs().Save(ctx, next, rRev); err != nil {
+		return err
+	}
+	return recordTransition(ctx, uow, EntityRun, handle.runID.String(), string(rFrom), string(next.State), "manager launch claim settled execed", gen(handle.lease.Generation), now)
+}
+
+// settleManagerRunRunningIfNeeded applies applyManagerRunRunning's run
+// transition in its own unit of work, for the "claim already execed"
+// corroboration path: a prior round settled the claim through some other
+// route without ever finding the run launching (for example, a crash
+// between committing that settlement and this consequence), so it is
+// re-applied here, idempotently, exactly like confirmSessionActive's own
+// catch-up role in the same branch.
+func (c *Controller) settleManagerRunRunningIfNeeded(ctx context.Context, handle RunHandle, session *run.Session) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per corroboration round.
+	if session.Role != run.RoleManager {
+		return nil
+	}
+	now := c.Clock.Now()
+	err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		return applyManagerRunRunning(ctx, uow, handle, session, now)
+	})
+	if err != nil {
+		return fmt.Errorf("app: settle manager run running: %w", err)
 	}
 	return nil
 }

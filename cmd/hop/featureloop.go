@@ -102,7 +102,27 @@ func (c *featureCheckDriver) interrupt() (featureCheckOutcome, bool) {
 // Every dispatch inside these calls revalidates (heartbeat CAS + stop
 // re-read) exactly as Phase 2 requires; this loop adds no revalidation of
 // its own. Stop handling takes precedence over the scheduling pass,
-// mirroring the solo loop's own stop-first branch.
+// mirroring the solo loop's own stop-first branch. While the run is still
+// launching (design L560: launching -> running is the manager's settled
+// launch claim, applied by CorroborateSessionLaunches' own settlement
+// path, not a discrete step here), every other step above depends on a
+// live manager session that does not exist yet — RecomputeReleases has no
+// released work, DriveIntegration and DriveCompletion have no integrated
+// task, AssignReadyTasks has no manager to delegate from — so the pass
+// runs only session-launch corroboration until the run is observed
+// running.
+//
+// A manager whose launch exec failed fails the run through the app's
+// terminal-failure path; the pass prints the solo loop's `launch failed`
+// line for it, and the loop then observes the failed run and exits 1.
+//
+// The pass honors the reports it receives: once retirement reports a
+// terminal failure settled or still due, or completion reports the run
+// has left running, the rest of the pass is skipped and no new check
+// round is dispatched; while the run is completing, each tick drives only
+// completion retirement. The loop then observes the terminal state on a
+// later tick and returns it, so the caller maps it to the normal exit
+// code.
 func runFeatureControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, handle app.RunHandle, runID, label, hopPath string, stdout io.Writer) (loopResult, error) { //nolint:gocritic // hugeParam: RunHandle is the app-defined opaque token, passed by value as every Controller method takes it.
 	heartbeatFailed := runHeartbeats(ctx, d, ctrl, handle)
 	var (
@@ -187,7 +207,13 @@ func runFeatureControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, 
 					return loopResult{}, errors.Join(fmt.Errorf("compose check spawn environment: %w", err), drainChecks())
 				}
 			}
-			if err := runFeatureSchedulingPass(ctx, ctrl, handle, hopPath, spawnEnv); err != nil {
+			pass, err := runFeatureSchedulingPass(ctx, ctrl, handle, detail.State, hopPath, spawnEnv)
+			for _, line := range pass.lines {
+				if _, werr := fmt.Fprintln(stdout, line); werr != nil {
+					return loopResult{}, errors.Join(werr, err, drainChecks())
+				}
+			}
+			if err != nil {
 				return loopResult{}, errors.Join(err, drainChecks())
 			}
 			if outcome, ok := checks.poll(); ok {
@@ -195,7 +221,7 @@ func runFeatureControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, 
 					return loopResult{}, repErr
 				}
 			}
-			if !checks.running() {
+			if !pass.halted && !checks.running() {
 				checks.start(ctx, ctrl, handle, hopPath, spawnEnv, d.checkOutcomePosted)
 			}
 		}
@@ -206,6 +232,38 @@ func runFeatureControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, 
 	}
 }
 
+// featurePassResult reports how far one scheduling pass got.
+type featurePassResult struct {
+	// halted is true when the pass ended early because the run left
+	// ordinary scheduling: a terminal failure settled or still due, or
+	// completion under way or recorded. The loop dispatches no new check
+	// round after a halted pass.
+	halted bool
+	// lines are the transition lines the pass observed, for the loop to
+	// print: the solo loop's launch line for a failed manager launch.
+	lines []string
+}
+
+// roleManager is the manager session's role as SessionLaunchProgress
+// renders it.
+const roleManager = "manager"
+
+// managerLaunchLines renders, for every manager session whose launch
+// corroboration reported failed, the solo loop's own launch transition
+// line (`launch failed`, describeLaunchProgress): the run fails through
+// the terminal-failure path, and this line is the reason the loop shows
+// before it observes the failed run. Only the fixed category text is
+// printed.
+func managerLaunchLines(reports []app.SessionLaunchProgress) []string {
+	var lines []string
+	for _, report := range reports {
+		if report.Role == roleManager && report.Progress == app.LaunchFailed {
+			lines = append(lines, "launch "+describeLaunchProgress(report.Progress))
+		}
+	}
+	return lines
+}
+
 // runFeatureSchedulingPass runs one deterministic scheduling-pass round
 // (design section 6) up to, but not including, check-driving — which the
 // caller runs asynchronously through featureCheckDriver, mirroring the
@@ -213,32 +271,82 @@ func runFeatureControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, 
 // round. spawnEnv is the same sanitized environment the check driver
 // spawns hop check-exec with (computed once by the caller and cached
 // across ticks), reused here for the integration merge's own spawn.
-func runFeatureSchedulingPass(ctx context.Context, ctrl controllerAPI, handle app.RunHandle, hopPath string, spawnEnv []string) error { //nolint:gocritic // hugeParam: RunHandle is the app-defined opaque token, passed by value as every Controller method takes it.
-	if _, err := ctrl.RetireSettledSessions(ctx, handle); err != nil {
-		return fmt.Errorf("retire settled sessions: %w", err)
+// Every run-fixed AssignReadyTasks field — the frozen repository and
+// state roots included — comes from AssignmentDefaults: a known run
+// operates on its frozen repository, never on the directory hop was
+// invoked from, and AssignReadyTasks refuses any other root (fakes law
+// 06FD1A61 — cmd/hop's fakeController enforces the identical contract).
+// hopPath is the running binary, the one field the loop supplies itself.
+//
+// runState is the state the loop observed this tick. A launching run gets
+// session-launch corroboration alone (every other step requires a settled
+// manager session). A completing run gets completion retirement alone
+// (DriveCompletion continues a completion whose retirement is still
+// outstanding). A running run gets the full pass, cut short — halted —
+// as soon as a report says the run left ordinary scheduling:
+// RetireSettledSessions' RunFailed or RunFailing, or DriveCompletion's
+// RunState other than running. AssignReadyTasks accepts only a running
+// run, so it must never be reached past either report.
+func runFeatureSchedulingPass(ctx context.Context, ctrl controllerAPI, handle app.RunHandle, runState, hopPath string, spawnEnv []string) (featurePassResult, error) { //nolint:gocritic // hugeParam: RunHandle is the app-defined opaque token, passed by value as every Controller method takes it.
+	halted := featurePassResult{halted: true}
+	switch runState {
+	case runStateLaunching:
+		launches, err := ctrl.CorroborateSessionLaunches(ctx, handle)
+		if err != nil {
+			return featurePassResult{}, fmt.Errorf("corroborate session launches: %w", err)
+		}
+		return featurePassResult{lines: managerLaunchLines(launches)}, nil
+	case runStateCompleting:
+		if _, err := ctrl.DriveCompletion(ctx, handle); err != nil {
+			return halted, fmt.Errorf("drive completion: %w", err)
+		}
+		return halted, nil
 	}
-	if _, err := ctrl.RecomputeReleases(ctx, handle); err != nil {
-		return fmt.Errorf("recompute releases: %w", err)
+
+	retirement, err := ctrl.RetireSettledSessions(ctx, handle)
+	if err != nil {
+		return featurePassResult{}, fmt.Errorf("retire settled sessions: %w", err)
 	}
-	if _, err := ctrl.DriveIntegration(ctx, handle, hopPath, spawnEnv); err != nil {
-		return fmt.Errorf("drive integration: %w", err)
+	if retirement.RunFailed || retirement.RunFailing {
+		return halted, nil
 	}
-	if _, err := ctrl.EnsureReviewTask(ctx, handle); err != nil {
-		return fmt.Errorf("ensure review task: %w", err)
+	if _, err = ctrl.RecomputeReleases(ctx, handle); err != nil {
+		return featurePassResult{}, fmt.Errorf("recompute releases: %w", err)
 	}
-	if _, err := ctrl.DriveCompletion(ctx, handle); err != nil {
-		return fmt.Errorf("drive completion: %w", err)
+	if _, err = ctrl.DriveIntegration(ctx, handle, hopPath, spawnEnv); err != nil {
+		return featurePassResult{}, fmt.Errorf("drive integration: %w", err)
 	}
-	if _, err := ctrl.AssignReadyTasks(ctx, handle, app.AssignmentOptions{}); err != nil {
-		return fmt.Errorf("assign ready tasks: %w", err)
+	if _, err = ctrl.EnsureReviewTask(ctx, handle); err != nil {
+		return featurePassResult{}, fmt.Errorf("ensure review task: %w", err)
 	}
-	if _, err := ctrl.CorroborateSessionLaunches(ctx, handle); err != nil {
-		return fmt.Errorf("corroborate session launches: %w", err)
+	completion, err := ctrl.DriveCompletion(ctx, handle)
+	if err != nil {
+		return featurePassResult{}, fmt.Errorf("drive completion: %w", err)
 	}
-	if _, err := ctrl.PublishRunPresentation(ctx, handle); err != nil {
-		return fmt.Errorf("publish run presentation: %w", err)
+	if completion.RunState != runStateRunning {
+		return halted, nil
 	}
-	return nil
+	opts, err := ctrl.AssignmentDefaults(ctx, handle)
+	if err != nil {
+		return featurePassResult{}, fmt.Errorf("load assignment defaults: %w", err)
+	}
+	opts.HOPPath = hopPath
+	opts.IntegrationHeadCommitOID, err = ctrl.ResolveIntegrationHead(ctx, handle)
+	if err != nil {
+		return featurePassResult{}, fmt.Errorf("resolve integration head: %w", err)
+	}
+	if _, err = ctrl.AssignReadyTasks(ctx, handle, opts); err != nil {
+		return featurePassResult{}, fmt.Errorf("assign ready tasks: %w", err)
+	}
+	launches, err := ctrl.CorroborateSessionLaunches(ctx, handle)
+	if err != nil {
+		return featurePassResult{}, fmt.Errorf("corroborate session launches: %w", err)
+	}
+	result := featurePassResult{lines: managerLaunchLines(launches)}
+	if _, err = ctrl.PublishRunPresentation(ctx, handle); err != nil {
+		return result, fmt.Errorf("publish run presentation: %w", err)
+	}
+	return result, nil
 }
 
 // describeFeatureCheckReport renders one executed feature-mode check's

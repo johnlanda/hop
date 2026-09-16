@@ -171,7 +171,7 @@ type ruleTable map[string]rule
 // A new package fails the architecture check until it has an entry here.
 func productionRules() ruleTable {
 	return ruleTable{
-		"cmd/hop":                           {category: categoryComposition, firstParty: []string{"internal/app", "internal/adapters/config", "internal/adapters/herdr", "internal/adapters/process", "internal/adapters/sqlite", "internal/adapters/system"}},
+		"cmd/hop":                           {category: categoryComposition, firstParty: []string{"internal/app", "internal/adapters/config", "internal/adapters/herdr", "internal/adapters/process", "internal/adapters/sqlite", "internal/adapters/system"}, testFirstParty: []string{"internal/testsupport/hopfixtures"}},
 		"internal":                          {category: categoryArchitectureTest},
 		"internal/app":                      {category: categoryApplication, firstParty: []string{"internal/domain/identity", "internal/domain/run"}, testFirstParty: []string{"internal/testsupport/storevectors"}},
 		"internal/adapters/config":          {category: categoryDrivenAdapter, firstParty: []string{"internal/app"}, thirdParty: []string{"github.com/pelletier/go-toml/v2"}},
@@ -181,6 +181,7 @@ func productionRules() ruleTable {
 		"internal/adapters/system":          {category: categoryDrivenAdapter, firstParty: []string{"internal/app", "internal/domain/identity"}},
 		"internal/domain/identity":          {category: categoryDomainShared, standard: []string{"errors", "fmt", "strconv", "strings"}, testStandard: []string{"testing"}},
 		"internal/domain/run":               {category: categoryDomain, firstParty: []string{"internal/domain/identity"}, standard: []string{"errors", "fmt", "time"}, testStandard: []string{"testing"}},
+		"internal/testsupport/hopfixtures":  {category: categoryTestHelper, firstParty: []string{"internal/app", "internal/domain/identity", "internal/domain/run"}},
 		"internal/testsupport/storevectors": {category: categoryTestHelper, firstParty: []string{"internal/app", "internal/domain/identity", "internal/domain/run"}},
 		"test/integration":                  {category: categoryIntegrationTest, firstParty: []string{"internal/app", "internal/adapters/herdr"}, testThirdParty: []string{"github.com/creack/pty"}},
 	}

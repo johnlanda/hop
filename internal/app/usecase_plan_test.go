@@ -83,8 +83,8 @@ func TestCreateTask(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CreateTask() error = %v", err)
 		}
-		if result.Outcome != string(app.WorkflowRefused) {
-			t.Fatalf("CreateTask() with a cross-run dependency = %+v, want refused", result)
+		if result.Outcome != string(app.WorkflowRefused) || result.Reason != app.GrammarReasonDependencyCycle {
+			t.Fatalf("CreateTask() with a cross-run dependency = %+v, want refused/%s", result, app.GrammarReasonDependencyCycle)
 		}
 	})
 
@@ -101,8 +101,8 @@ func TestCreateTask(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CreateTask() error = %v", err)
 		}
-		if result.Outcome != string(app.WorkflowRefused) {
-			t.Fatalf("CreateTask() from a worker session = %+v, want refused", result)
+		if result.Outcome != string(app.WorkflowRefused) || result.Reason != app.GrammarReasonNotManager {
+			t.Fatalf("CreateTask() from a worker session = %+v, want refused/%s", result, app.GrammarReasonNotManager)
 		}
 	})
 
@@ -134,8 +134,8 @@ func TestCreateTask(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CreateTask() error = %v", err)
 		}
-		if result.Outcome != string(app.WorkflowMalformed) {
-			t.Fatalf("CreateTask() = %+v, want malformed", result)
+		if result.Outcome != string(app.WorkflowMalformed) || result.Reason != app.GrammarReasonMalformed {
+			t.Fatalf("CreateTask() = %+v, want malformed/%s", result, app.GrammarReasonMalformed)
 		}
 		if len(tc.Artifacts.files) != 0 {
 			t.Fatalf("a malformed title must not write an instructions artifact")
@@ -194,8 +194,8 @@ func TestClosePlanRefusesEmptyPlan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ClosePlan() error = %v", err)
 	}
-	if result.Outcome != string(app.WorkflowRefused) {
-		t.Fatalf("ClosePlan() over an empty plan = %+v, want refused", result)
+	if result.Outcome != string(app.WorkflowRefused) || result.Reason != app.GrammarReasonEmptyPlan {
+		t.Fatalf("ClosePlan() over an empty plan = %+v, want refused/%s", result, app.GrammarReasonEmptyPlan)
 	}
 }
 
@@ -248,4 +248,287 @@ func TestRequestRetry(t *testing.T) {
 	if again.Outcome != string(app.WorkflowDuplicate) || again.AttemptNumber != 2 {
 		t.Fatalf("RequestRetry() retry = %+v, want duplicate attempt 2", again)
 	}
+}
+
+// TestPlanRefusalReasonsAlwaysSet drives every remaining
+// CreateTask/RequestRetry/ClosePlan refusal shape not already asserted
+// above (ruling B: a refused/malformed outcome with an empty Reason is a
+// defect) and checks the exact grammar.go token each one sets — through
+// the driving Controller, exactly as cmd/hop renders it.
+func TestPlanRefusalReasonsAlwaysSet(t *testing.T) {
+	t.Run("a stale incarnation is refused", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		fr := seedFeatureRun(t, tc, 2)
+		stale, err := identity.ParseIncarnationID(tc.IDs.NewID())
+		if err != nil {
+			t.Fatalf("parse incarnation id: %v", err)
+		}
+		req := defaultCreateTaskRequest(fr, "A")
+		req.IncarnationID = stale.String()
+
+		result, err := tc.Controller.CreateTask(context.Background(), req)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		if result.Outcome != string(app.WorkflowRefused) || result.Reason != app.GrammarReasonStale {
+			t.Fatalf("CreateTask() with a stale incarnation = %+v, want refused/%s", result, app.GrammarReasonStale)
+		}
+	})
+
+	t.Run("a run that left running refuses every plan verb", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		fr := seedFeatureRun(t, tc, 2)
+		rRow := tc.Store.Runs[fr.RunID]
+		completing, err := rRow.value.EnterCompleting(tc.Clock.Now())
+		if err != nil {
+			t.Fatalf("EnterCompleting() error = %v", err)
+		}
+		rRow.value = completing
+
+		createResult, err := tc.Controller.CreateTask(context.Background(), defaultCreateTaskRequest(fr, "A"))
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		if createResult.Outcome != string(app.WorkflowRefused) || createResult.Reason != app.GrammarReasonRunNotAccepting {
+			t.Fatalf("CreateTask() over a non-running run = %+v, want refused/%s", createResult, app.GrammarReasonRunNotAccepting)
+		}
+
+		retryResult, err := tc.Controller.RequestRetry(context.Background(), app.RequestRetryRequest{
+			RunID: fr.RunID.String(), SessionID: fr.ManagerID.String(), IncarnationID: fr.ManagerIncarnation.String(),
+			TaskID: mustTaskID(t, tc.IDs.NewID()).String(), Reason: "flaky",
+		})
+		if err != nil {
+			t.Fatalf("RequestRetry() error = %v", err)
+		}
+		if retryResult.Outcome != string(app.WorkflowRefused) || retryResult.Reason != app.GrammarReasonRunNotAccepting {
+			t.Fatalf("RequestRetry() over a non-running run = %+v, want refused/%s", retryResult, app.GrammarReasonRunNotAccepting)
+		}
+
+		closeResult, err := tc.Controller.ClosePlan(context.Background(), app.ClosePlanRequest{
+			RunID: fr.RunID.String(), SessionID: fr.ManagerID.String(), IncarnationID: fr.ManagerIncarnation.String(),
+		})
+		if err != nil {
+			t.Fatalf("ClosePlan() error = %v", err)
+		}
+		if closeResult.Outcome != string(app.WorkflowRefused) || closeResult.Reason != app.GrammarReasonRunNotAccepting {
+			t.Fatalf("ClosePlan() over a non-running run = %+v, want refused/%s", closeResult, app.GrammarReasonRunNotAccepting)
+		}
+	})
+
+	t.Run("retrying a task that is not needs-rework is refused", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		fr := seedFeatureRun(t, tc, 2)
+		taskA := seedImplementTask(t, tc, fr.RunID, 1, "A", false, run.TaskReady)
+
+		result, err := tc.Controller.RequestRetry(context.Background(), app.RequestRetryRequest{
+			RunID: fr.RunID.String(), SessionID: fr.ManagerID.String(), IncarnationID: fr.ManagerIncarnation.String(),
+			TaskID: taskA.String(), Reason: "flaky",
+		})
+		if err != nil {
+			t.Fatalf("RequestRetry() error = %v", err)
+		}
+		if result.Outcome != string(app.WorkflowRefused) || result.Reason != app.GrammarReasonRetryNotTerminal {
+			t.Fatalf("RequestRetry() of a ready task = %+v, want refused/%s", result, app.GrammarReasonRetryNotTerminal)
+		}
+	})
+
+	t.Run("a retry against a task at its frozen limit is refused", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		fr := seedFeatureRun(t, tc, 2)
+		taskB := seedImplementTask(t, tc, fr.RunID, 1, "B", false, run.TaskReady)
+		workerID, _ := seedWorkerSession(t, tc, fr, taskB)
+
+		attemptID := tc.Store.Sessions[workerID].value.AttemptID
+		attempt := tc.Store.Attempts[attemptID].value
+		launched, err := attempt.MarkRunning(tc.Clock.Now())
+		if err != nil {
+			t.Fatalf("MarkRunning() error = %v", err)
+		}
+		interrupted, err := launched.Interrupt(tc.Clock.Now())
+		if err != nil {
+			t.Fatalf("Interrupt() error = %v", err)
+		}
+		// The snapshot's frozen retry limit is 3 (seedFeatureRun): pinning
+		// this terminal attempt's own number AT the limit is the cheapest
+		// way to reach NewRetryAttempt's ErrRetryLimit branch directly,
+		// without driving three real retry cycles.
+		interrupted.Number = 3
+		tc.Store.Attempts[attemptID].value = interrupted
+		needsRework, err := tc.Store.Tasks[taskB].value.NeedsRework(tc.Clock.Now())
+		if err != nil {
+			t.Fatalf("NeedsRework() error = %v", err)
+		}
+		tc.Store.Tasks[taskB].value = needsRework
+
+		result, err := tc.Controller.RequestRetry(context.Background(), app.RequestRetryRequest{
+			RunID: fr.RunID.String(), SessionID: fr.ManagerID.String(), IncarnationID: fr.ManagerIncarnation.String(),
+			TaskID: taskB.String(), Reason: "flaky",
+		})
+		if err != nil {
+			t.Fatalf("RequestRetry() error = %v", err)
+		}
+		if result.Outcome != string(app.WorkflowRefused) || result.Reason != app.GrammarReasonRetryLimit {
+			t.Fatalf("RequestRetry() at the retry limit = %+v, want refused/%s", result, app.GrammarReasonRetryLimit)
+		}
+	})
+
+	t.Run("a retry request while one is already pending is refused", func(t *testing.T) {
+		// This shape (a task still needs-rework with an UNCONSUMED pending
+		// retry_requests row already recorded for it) is not reachable
+		// through two ordinary RequestRetry calls: acceptance itself moves
+		// the task out of needs-rework in the same transaction that records
+		// the pending row, so a second ordinary call hits "task is not
+		// needs-rework" first. The check exists as defense in depth (the
+		// bookkeeping row and the task's own state could disagree after a
+		// future change); seeded directly, mirroring
+		// TestStoreVectors/AckMessageCrossRun's already-corrupt-row pattern.
+		tc := newTestController(defaultPolicy())
+		fr := seedFeatureRun(t, tc, 2)
+		taskB := seedImplementTask(t, tc, fr.RunID, 1, "B", false, run.TaskReady)
+		workerID, _ := seedWorkerSession(t, tc, fr, taskB)
+
+		attemptID := tc.Store.Sessions[workerID].value.AttemptID
+		attempt := tc.Store.Attempts[attemptID].value
+		launched, err := attempt.MarkRunning(tc.Clock.Now())
+		if err != nil {
+			t.Fatalf("MarkRunning() error = %v", err)
+		}
+		interrupted, err := launched.Interrupt(tc.Clock.Now())
+		if err != nil {
+			t.Fatalf("Interrupt() error = %v", err)
+		}
+		tc.Store.Attempts[attemptID].value = interrupted
+		needsRework, err := tc.Store.Tasks[taskB].value.NeedsRework(tc.Clock.Now())
+		if err != nil {
+			t.Fatalf("NeedsRework() error = %v", err)
+		}
+		tc.Store.Tasks[taskB].value = needsRework
+		tc.Store.RetryRequestStates[taskB] = app.RetryRequestPending
+
+		result, err := tc.Controller.RequestRetry(context.Background(), app.RequestRetryRequest{
+			RunID: fr.RunID.String(), SessionID: fr.ManagerID.String(), IncarnationID: fr.ManagerIncarnation.String(),
+			TaskID: taskB.String(), Reason: "flaky",
+		})
+		if err != nil {
+			t.Fatalf("RequestRetry() error = %v", err)
+		}
+		if result.Outcome != string(app.WorkflowRefused) || result.Reason != app.GrammarReasonConflicting {
+			t.Fatalf("RequestRetry() with a pending retry already reserved = %+v, want refused/%s", result, app.GrammarReasonConflicting)
+		}
+	})
+
+	t.Run("a conflicting request id is refused for retry and close", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		fr := seedFeatureRun(t, tc, 2)
+		taskB := seedImplementTask(t, tc, fr.RunID, 1, "B", false, run.TaskReady)
+		workerID, _ := seedWorkerSession(t, tc, fr, taskB)
+		attemptID := tc.Store.Sessions[workerID].value.AttemptID
+		attempt := tc.Store.Attempts[attemptID].value
+		launched, err := attempt.MarkRunning(tc.Clock.Now())
+		if err != nil {
+			t.Fatalf("MarkRunning() error = %v", err)
+		}
+		interrupted, err := launched.Interrupt(tc.Clock.Now())
+		if err != nil {
+			t.Fatalf("Interrupt() error = %v", err)
+		}
+		tc.Store.Attempts[attemptID].value = interrupted
+		needsRework, err := tc.Store.Tasks[taskB].value.NeedsRework(tc.Clock.Now())
+		if err != nil {
+			t.Fatalf("NeedsRework() error = %v", err)
+		}
+		tc.Store.Tasks[taskB].value = needsRework
+
+		firstRetry, err := tc.Controller.RequestRetry(context.Background(), app.RequestRetryRequest{
+			RunID: fr.RunID.String(), SessionID: fr.ManagerID.String(), IncarnationID: fr.ManagerIncarnation.String(),
+			TaskID: taskB.String(), Reason: "flaky", RequestID: "shared-retry-id",
+		})
+		if err != nil || firstRetry.Outcome != string(app.WorkflowAccepted) {
+			t.Fatalf("RequestRetry(first) = %+v, err = %v", firstRetry, err)
+		}
+		conflictingRetry, err := tc.Controller.RequestRetry(context.Background(), app.RequestRetryRequest{
+			RunID: fr.RunID.String(), SessionID: fr.ManagerID.String(), IncarnationID: fr.ManagerIncarnation.String(),
+			TaskID: taskB.String(), Reason: "a different reason entirely", RequestID: "shared-retry-id",
+		})
+		if err != nil {
+			t.Fatalf("RequestRetry(conflicting) error = %v", err)
+		}
+		if conflictingRetry.Outcome != string(app.WorkflowRefused) || conflictingRetry.Reason != app.GrammarReasonConflicting {
+			t.Fatalf("RequestRetry() with a reused, conflicting request id = %+v, want refused/%s", conflictingRetry, app.GrammarReasonConflicting)
+		}
+
+		firstClose, err := tc.Controller.ClosePlan(context.Background(), app.ClosePlanRequest{
+			RunID: fr.RunID.String(), SessionID: fr.ManagerID.String(), IncarnationID: fr.ManagerIncarnation.String(), RequestID: "shared-close-id",
+		})
+		if err != nil {
+			t.Fatalf("ClosePlan(first) error = %v", err)
+		}
+		// The plan still has zero implement tasks in run.ClosePlan's own
+		// terms (taskB is needs-rework, never an accepted implement task
+		// count check — ClosePlan only checks task KIND) — seedImplementTask
+		// already inserted an implement-kind row, so this closes cleanly.
+		if firstClose.Outcome != string(app.WorkflowAccepted) {
+			t.Fatalf("ClosePlan(first) = %+v, want accepted", firstClose)
+		}
+		conflictingClose, err := tc.Controller.ClosePlan(context.Background(), app.ClosePlanRequest{
+			RunID: fr.RunID.String(), SessionID: fr.ManagerID.String(), IncarnationID: fr.ManagerIncarnation.String(), RequestID: "shared-close-id-2",
+		})
+		if err != nil {
+			t.Fatalf("ClosePlan(second, different id) error = %v", err)
+		}
+		if conflictingClose.Outcome != string(app.WorkflowAccepted) {
+			t.Fatalf("ClosePlan(second, different id) = %+v, want accepted (a fresh close after reopen has no relation to the first)", conflictingClose)
+		}
+	})
+
+	t.Run("an unknown run is malformed", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		now := tc.Clock.Now()
+		unknownRunID, err := identity.ParseRunID(tc.IDs.NewID())
+		if err != nil {
+			t.Fatalf("parse run id: %v", err)
+		}
+		taskID, err := identity.ParseTaskID(tc.IDs.NewID())
+		if err != nil {
+			t.Fatalf("parse task id: %v", err)
+		}
+		// requireManagerCaller refuses "caller is not the run's manager"
+		// before CreateTask ever reaches the unknown-run lookup, so a
+		// legitimate manager session and current binding are seeded for a
+		// run that is never inserted into tc.Store.Runs at all — the only
+		// way to reach the unknown-run branch itself (unreachable through
+		// the driving Controller, whose own identity parsing never proves a
+		// run exists, but reachable directly against the store, exactly as
+		// internal/adapters/sqlite's storevectors test drives the identical
+		// shape against the real store).
+		managerID, err := identity.ParseSessionID(tc.IDs.NewID())
+		if err != nil {
+			t.Fatalf("parse session id: %v", err)
+		}
+		manager := run.NewManagerSession(managerID, unknownRunID, run.HarnessClaude, now)
+		if manager, err = manager.Launch(now); err != nil {
+			t.Fatalf("launch manager: %v", err)
+		}
+		if manager, err = manager.ConfirmActive(now); err != nil {
+			t.Fatalf("activate manager: %v", err)
+		}
+		tc.Store.Sessions[managerID] = &entityRow[run.Session]{value: manager, revision: 1}
+		incarnationID, err := identity.ParseIncarnationID(tc.IDs.NewID())
+		if err != nil {
+			t.Fatalf("parse incarnation id: %v", err)
+		}
+		tc.Store.Bindings[managerID] = append(tc.Store.Bindings[managerID],
+			run.NewRuntimeBinding(managerID, incarnationID, "", "peer-pid:9", "ws", "tab", "pane", "label", run.LaunchInitial, now))
+
+		got, err := tc.Store.CreateTask(context.Background(), app.TaskCreate{
+			ID: taskID, RunID: unknownRunID, Session: managerID, IncarnationID: incarnationID,
+			Title: "orphaned", InstructionsPath: "/state/instructions.md", InstructionsDigest: "digest",
+		})
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		if got.Outcome != app.WorkflowMalformed || got.Reason != app.GrammarReasonMalformed {
+			t.Fatalf("CreateTask() against an unknown run = %+v, want malformed/%s", got, app.GrammarReasonMalformed)
+		}
+	})
 }

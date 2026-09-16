@@ -262,3 +262,46 @@ func TestRetireSettledSessions(t *testing.T) {
 		}
 	})
 }
+
+// TestRetireSettledSessionsReportsRunFailing proves the due-but-blocked
+// report: while a failed task's terminal failure waits on owned work, the
+// round reports RunFailing (the caller schedules nothing more) and not
+// RunFailed; once the failure settles, RunFailed replaces it. A run with
+// no failure cause reports neither.
+func TestRetireSettledSessionsReportsRunFailing(t *testing.T) {
+	tc := newTestController(defaultPolicy())
+	fr := seedFeatureRun(t, tc, 2)
+	taskID := seedImplementTask(t, tc, fr.RunID, 1, "A", false, run.TaskReady)
+	w := seedSettledWorker(t, tc, fr, taskID, 4711)
+	composerOccupant(tc, w)
+
+	report, err := tc.Controller.RetireSettledSessions(context.Background(), fr.Handle)
+	if err != nil {
+		t.Fatalf("RetireSettledSessions() error = %v", err)
+	}
+	if report.RunFailing || report.RunFailed {
+		t.Fatalf("report = %+v, want neither flag without a failure cause", report)
+	}
+
+	tc.Store.Tasks[taskID].value.State = run.TaskFailed
+	tc.Store.Attempts[w.AttemptID].value.State = run.AttemptFailed
+	report, err = tc.Controller.RetireSettledSessions(context.Background(), fr.Handle)
+	if err != nil {
+		t.Fatalf("RetireSettledSessions() blocked round error = %v", err)
+	}
+	if !report.RunFailing || report.RunFailed || len(report.Outstanding) == 0 {
+		t.Fatalf("blocked round = %+v, want RunFailing with outstanding work", report)
+	}
+	if got := tc.Store.Runs[fr.RunID].value.State; got != run.RunRunning {
+		t.Fatalf("run state = %s, want still running while the failure is blocked", got)
+	}
+
+	tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) { return app.PaneProcess{}, app.ErrPaneNotFound }
+	report, err = tc.Controller.RetireSettledSessions(context.Background(), fr.Handle)
+	if err != nil {
+		t.Fatalf("RetireSettledSessions() settling round error = %v", err)
+	}
+	if !report.RunFailed || report.RunFailing {
+		t.Fatalf("settling round = %+v, want RunFailed and not RunFailing", report)
+	}
+}

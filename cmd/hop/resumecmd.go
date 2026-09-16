@@ -191,6 +191,8 @@ func runResume(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 // value is runtime state, not a usage error — the printed line names
 // exactly the id that session still requires), then dispatching to the
 // feature-mode loop or a status-based exit exactly like the solo branch.
+// The caller's directory only scopes an r<seq> lookup: the loop assigns in
+// the run's frozen repository, whichever directory hop resume ran in.
 func runResumeFeature(ctx context.Context, d *deps, ctrl controllerAPI, runID, confirmAbsentSession, hopPath, stateRoot string, stdout, stderr io.Writer) (int, error) {
 	result, handle, err := ctrl.ResumeFeature(ctx, app.ResumeFeatureRequest{
 		RunID:                runID,

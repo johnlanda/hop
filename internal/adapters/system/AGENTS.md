@@ -14,7 +14,7 @@ filesystem ambiently; it consumes these ports.
 | --- | --- | --- |
 | [clock.go](clock.go) | `Clock` | `app.Clock` over the wall clock, normalized to UTC |
 | [idgenerator.go](idgenerator.go) | `IDGenerator` | `app.IDGenerator`: crypto/rand UUIDv4 in canonical lowercase form |
-| [artifactstore.go](artifactstore.go) | `ArtifactStore` | `app.ArtifactStore`: temp-file-then-rename writes with fsync, parent-directory creation and 0600 files; whole-file reads |
+| [artifactstore.go](artifactstore.go) | `ArtifactStore`, `artifactFailure` | `app.ArtifactStore`: temp-file-then-rename writes with fsync, parent-directory creation and 0600 files; whole-file reads; every failure path-free |
 | [trustseed.go](trustseed.go) | `TrustSeeder` | `app.TrustSeeder`: a serialized, atomic read-modify-write of a Claude profile's `.claude.json` through `app.SeedTrustEdit` — exclusive flock of the advisory lock file beside the config, temp+rename at 0600 with file and directory fsync |
 
 ## Invariants
@@ -46,6 +46,12 @@ filesystem ambiently; it consumes these ports.
   after a failed parent fsync re-syncs exactly the directory whose sync
   failed. Paths are chosen by the application from the run's frozen
   artifact directories, never by this adapter.
+- Every artifact failure is an `artifactFailure`: its text names the
+  failed step and a fixed category established through errors.Is only,
+  never the path (an artifact lives under the operator's state root, and
+  the application prints these errors on the CLI and records them in the
+  journal); `Unwrap` keeps the chain, so callers still classify with
+  errors.Is (`fs.ErrNotExist`, context cancellation).
 - `WriteArtifact` is never called from inside a store transaction (the
   port's contract): the use case commits intent first, writes as the
   external act, then records the outcome.

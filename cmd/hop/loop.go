@@ -24,12 +24,25 @@ const (
 	loopPollInterval = 2 * time.Second
 )
 
-// Terminal run states, as the status view renders them.
+// Run states the loop dispatches on, as the status view renders them.
 const (
 	runStateCompleted = "completed"
 	runStateFailed    = "failed"
 	runStateStopped   = "stopped"
 	runStateStopping  = "stopping"
+	// runStateLaunching names the feature-mode run state before the
+	// manager's own launch claim has settled (design L560): the
+	// scheduling pass runs only session-launch corroboration during it,
+	// since every other step (release, integration, completion,
+	// assignment) depends on a live manager session that does not exist
+	// yet.
+	runStateLaunching = "launching"
+	// runStateRunning and runStateCompleting name the feature-mode states
+	// the scheduling pass dispatches on: only a running run takes the
+	// ordinary pass, and a completing run takes completion retirement
+	// alone.
+	runStateRunning    = "running"
+	runStateCompleting = "completing"
 )
 
 // isTerminalRunState reports whether state ends the foreground loop.

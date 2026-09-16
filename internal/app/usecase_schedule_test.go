@@ -38,7 +38,15 @@ func seedFeatureRun(t *testing.T, tc *testController, maxWorkers int) featureRun
 	if err != nil {
 		t.Fatalf("parse run id: %v", err)
 	}
-	repoID := identity.RepositoryID(tc.IDs.NewID())
+	// Every seeded feature run lives in the repository at /repo, the root
+	// defaultAssignmentOptions names: LoadFrozenRun serves it as the run's
+	// frozen repository root. A second run seeded into the same controller
+	// joins that repository.
+	repoID, known := tc.Store.repoByRoot["/repo"]
+	if !known {
+		repoID = identity.RepositoryID(tc.IDs.NewID())
+		tc.Store.repoByRoot["/repo"] = repoID
+	}
 	r := run.NewRun(runID, repoID, 1, "briefdigest", now)
 	if r, err = r.Launch(now); err != nil {
 		t.Fatalf("launch run: %v", err)
@@ -579,5 +587,107 @@ func TestRequireWorkflowRepositoriesFailsClosed(t *testing.T) {
 	// transaction that would have read/written it: the task is untouched.
 	if got := tc.Store.Tasks[taskID].value.State; got != run.TaskPending {
 		t.Fatalf("task state = %s, want unchanged pending", got)
+	}
+}
+
+// TestAssignmentDefaults proves the application serves every run-fixed
+// assignment field from the frozen run, the repository and state roots
+// included: a known run operates on its frozen repository, never on the
+// caller's working directory.
+func TestAssignmentDefaults(t *testing.T) {
+	tc := newTestController(defaultPolicy())
+	fr := seedFeatureRun(t, tc, 3)
+	snapshot := tc.Store.Snapshots[fr.RunID]
+	snapshot.Harness = string(run.HarnessClaude)
+	snapshot.Workflow.ReviewerHarness = string(run.HarnessCodex)
+	tc.Store.Snapshots[fr.RunID] = snapshot
+
+	got, err := tc.Controller.AssignmentDefaults(context.Background(), fr.Handle)
+	if err != nil {
+		t.Fatalf("AssignmentDefaults() error = %v", err)
+	}
+	want := app.AssignmentOptions{
+		MaxWorkers:      3,
+		Harness:         run.HarnessClaude,
+		ReviewerHarness: run.HarnessCodex,
+		RepositoryRoot:  "/repo",
+		StateRoot:       "/state",
+	}
+	if got != want {
+		t.Fatalf("AssignmentDefaults() = %+v, want %+v", got, want)
+	}
+}
+
+// TestAssignReadyTasksRefusesForeignRoots proves the defensive barrier: an
+// options RepositoryRoot or StateRoot other than the run's frozen value is
+// refused before any task is reserved — no task, attempt, session,
+// worktree request, operation or transition is written, and the refusal
+// never echoes either path.
+func TestAssignReadyTasksRefusesForeignRoots(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		mutate func(*app.AssignmentOptions)
+		field  string
+	}{
+		{name: "repository root", mutate: func(o *app.AssignmentOptions) { o.RepositoryRoot = "/other-repository" }, field: "repository root"},
+		{name: "state root", mutate: func(o *app.AssignmentOptions) { o.StateRoot = "/other-state" }, field: "state root"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			tc := newTestController(defaultPolicy())
+			fr := seedFeatureRun(t, tc, 2)
+			taskID := seedImplementTask(t, tc, fr.RunID, 1, "A", false, run.TaskReady)
+			attempts, sessions, operations, transitions := len(tc.Store.Attempts), len(tc.Store.Sessions), len(tc.Store.Operations), len(tc.Store.Transitions)
+
+			opts := defaultAssignmentOptions()
+			tt.mutate(&opts)
+			report, err := tc.Controller.AssignReadyTasks(context.Background(), fr.Handle, opts)
+			if err == nil {
+				t.Fatalf("AssignReadyTasks(foreign %s) = %+v, want a refusal", tt.name, report)
+			}
+			if !strings.Contains(err.Error(), tt.field) {
+				t.Errorf("error = %v, want it to name the %s", err, tt.field)
+			}
+			for _, path := range []string{"/other-repository", "/other-state", "/repo", "/state"} {
+				if strings.Contains(err.Error(), path) {
+					t.Errorf("error = %v echoes the path %s", err, path)
+				}
+			}
+			if len(report.Assigned) != 0 {
+				t.Errorf("Assigned = %+v, want none", report.Assigned)
+			}
+			if got := tc.Store.Tasks[taskID].value.State; got != run.TaskReady {
+				t.Errorf("task state = %s, want untouched ready", got)
+			}
+			if len(tc.Store.Attempts) != attempts || len(tc.Store.Sessions) != sessions || len(tc.Store.Operations) != operations || len(tc.Store.Transitions) != transitions {
+				t.Errorf("rows written: attempts %d->%d, sessions %d->%d, operations %d->%d, transitions %d->%d",
+					attempts, len(tc.Store.Attempts), sessions, len(tc.Store.Sessions), operations, len(tc.Store.Operations), transitions, len(tc.Store.Transitions))
+			}
+			if len(tc.Runtime.CreateWorktreeRequests) != 0 {
+				t.Errorf("worktree requests = %+v, want none", tc.Runtime.CreateWorktreeRequests)
+			}
+		})
+	}
+}
+
+// TestAssignmentOptionRefusalsNameNoPath proves the not-absolute refusals
+// name the field and never echo the refused value.
+func TestAssignmentOptionRefusalsNameNoPath(t *testing.T) {
+	const canary = "relative-path-canary"
+	for _, mutate := range []func(*app.AssignmentOptions){
+		func(o *app.AssignmentOptions) { o.RepositoryRoot = canary },
+		func(o *app.AssignmentOptions) { o.HOPPath = canary },
+		func(o *app.AssignmentOptions) { o.StateRoot = canary },
+	} {
+		tc := newTestController(defaultPolicy())
+		fr := seedFeatureRun(t, tc, 2)
+		opts := defaultAssignmentOptions()
+		mutate(&opts)
+		_, err := tc.Controller.AssignReadyTasks(context.Background(), fr.Handle, opts)
+		if err == nil || !strings.Contains(err.Error(), "is not absolute") {
+			t.Fatalf("AssignReadyTasks(relative) error = %v, want the not-absolute refusal", err)
+		}
+		if strings.Contains(err.Error(), canary) {
+			t.Errorf("error = %v echoes the refused value", err)
+		}
 	}
 }

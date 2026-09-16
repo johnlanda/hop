@@ -260,7 +260,17 @@ func (c *Controller) reconcileFeatureSession(ctx context.Context, handle RunHand
 		return report, nil
 	}
 	if claimFound && claim.State == LaunchClaimExecFailed {
-		if err := c.terminateRetiredSession(ctx, handle, session.ID, "resume: exec failed, no process"); err != nil {
+		// Nothing is live for this incarnation. A child's exec failure is a
+		// terminal attempt outcome settled exactly as launch corroboration
+		// settles it (attempt failed, budgeted task consequence, mailbox
+		// closure, manager notice, session terminated); the attempt-less
+		// manager's session is only terminated, and the manager-lineage
+		// failure cause then fails the run on the next retirement pass.
+		if session.Role != run.RoleManager {
+			if err := c.settleChildExecFailure(ctx, handle, frozen, session); err != nil {
+				return report, err
+			}
+		} else if err := c.terminateRetiredSession(ctx, handle, session.ID, "resume: exec failed, no process"); err != nil {
 			return report, err
 		}
 		report.Disposition = SessionRetiredNoProcess

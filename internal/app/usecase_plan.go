@@ -24,11 +24,14 @@ type CreateTaskRequest struct {
 }
 
 // CreateTaskResult is CreateTask's outcome, string-only per the driving
-// API convention.
+// API convention. Reason is one of grammar.go's GrammarReason* tokens on
+// every refused/malformed outcome (cmd/hop renders it directly, never
+// re-deriving one from Detail text); empty on accepted/duplicate.
 type CreateTaskResult struct {
 	Outcome string
 	TaskID  string
 	Seq     int
+	Reason  string
 	Detail  string
 }
 
@@ -55,16 +58,16 @@ func (c *Controller) CreateTask(ctx context.Context, req CreateTaskRequest) (Cre
 		return CreateTaskResult{}, fmt.Errorf("app: parse incarnation id: %w", err)
 	}
 	if req.Title == "" || len(req.Title) > TaskTitleLimit {
-		return CreateTaskResult{Outcome: string(WorkflowMalformed), Detail: "title is empty or exceeds the size bound"}, nil
+		return CreateTaskResult{Outcome: string(WorkflowMalformed), Reason: GrammarReasonMalformed, Detail: "title is empty or exceeds the size bound"}, nil
 	}
 	if len(req.InstructionsBody) == 0 || len(req.InstructionsBody) > TaskInstructionsLimit {
-		return CreateTaskResult{Outcome: string(WorkflowMalformed), Detail: "instructions are empty or exceed the size bound"}, nil
+		return CreateTaskResult{Outcome: string(WorkflowMalformed), Reason: GrammarReasonMalformed, Detail: "instructions are empty or exceed the size bound"}, nil
 	}
 	dependsOn := make([]identity.TaskID, len(req.DependsOn))
 	for i, raw := range req.DependsOn {
 		id, parseErr := identity.ParseTaskID(raw)
 		if parseErr != nil {
-			return CreateTaskResult{Outcome: string(WorkflowMalformed), Detail: fmt.Sprintf("invalid dependency %q", raw)}, nil
+			return CreateTaskResult{Outcome: string(WorkflowMalformed), Reason: GrammarReasonMalformed, Detail: fmt.Sprintf("invalid dependency %q", raw)}, nil
 		}
 		dependsOn[i] = id
 	}
@@ -87,7 +90,7 @@ func (c *Controller) CreateTask(ctx context.Context, req CreateTaskRequest) (Cre
 	if err != nil {
 		return CreateTaskResult{}, fmt.Errorf("app: create task: %w", err)
 	}
-	return CreateTaskResult{Outcome: string(outcome.Outcome), TaskID: outcome.TaskID.String(), Seq: outcome.Seq, Detail: outcome.Detail}, nil
+	return CreateTaskResult{Outcome: string(outcome.Outcome), TaskID: outcome.TaskID.String(), Seq: outcome.Seq, Reason: outcome.Reason, Detail: outcome.Detail}, nil
 }
 
 // RequestRetryRequest is `hop task retry`'s driving input.
@@ -100,10 +103,15 @@ type RequestRetryRequest struct {
 	RequestID     string
 }
 
-// RequestRetryResult is RequestRetry's outcome.
+// RequestRetryResult is RequestRetry's outcome. TaskSeq (the retried
+// task's t<seq>) and AttemptNumber name the grammar's accepted and
+// duplicate lines. Reason is one of grammar.go's GrammarReason* tokens on
+// every refused/malformed outcome; empty on accepted/duplicate.
 type RequestRetryResult struct {
 	Outcome       string
+	TaskSeq       int
 	AttemptNumber int
+	Reason        string
 	Detail        string
 }
 
@@ -139,7 +147,7 @@ func (c *Controller) RequestRetry(ctx context.Context, req RequestRetryRequest) 
 	if err != nil {
 		return RequestRetryResult{}, fmt.Errorf("app: request retry: %w", err)
 	}
-	return RequestRetryResult{Outcome: string(outcome.Outcome), AttemptNumber: outcome.AttemptNumber, Detail: outcome.Detail}, nil
+	return RequestRetryResult{Outcome: string(outcome.Outcome), TaskSeq: outcome.TaskSeq, AttemptNumber: outcome.AttemptNumber, Reason: outcome.Reason, Detail: outcome.Detail}, nil
 }
 
 // ClosePlanRequest is `hop plan close`'s driving input.
@@ -150,9 +158,12 @@ type ClosePlanRequest struct {
 	RequestID     string
 }
 
-// ClosePlanResult is ClosePlan's outcome.
+// ClosePlanResult is ClosePlan's outcome. Reason is one of grammar.go's
+// GrammarReason* tokens on every refused/malformed outcome; empty on
+// accepted/duplicate.
 type ClosePlanResult struct {
 	Outcome string
+	Reason  string
 	Detail  string
 }
 
@@ -179,7 +190,7 @@ func (c *Controller) ClosePlan(ctx context.Context, req ClosePlanRequest) (Close
 	if err != nil {
 		return ClosePlanResult{}, fmt.Errorf("app: close plan: %w", err)
 	}
-	return ClosePlanResult{Outcome: string(outcome.Outcome), Detail: outcome.Detail}, nil
+	return ClosePlanResult{Outcome: string(outcome.Outcome), Reason: outcome.Reason, Detail: outcome.Detail}, nil
 }
 
 // taskInstructionsPath is the deterministic artifact path for one task's

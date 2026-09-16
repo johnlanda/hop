@@ -170,6 +170,92 @@ func TestRunFeatureControllerLoop(t *testing.T) {
 	})
 }
 
+// TestRunFeatureControllerLoopWhileLaunching proves the reported defect
+// fix: while the run is still launching, the scheduling pass runs only
+// CorroborateSessionLaunches and skips every other step, since none of
+// them has a settled manager session to work from yet.
+func TestRunFeatureControllerLoopWhileLaunching(t *testing.T) {
+	ctrl := &fakeController{}
+	td := newTestDeps(ctrl, map[string]string{"PATH": "/bin"}, t.TempDir())
+	statusCalls := 0
+	ctrl.status = func(app.StatusRequest) (app.StatusResult, error) {
+		statusCalls++
+		if statusCalls == 1 {
+			return detailStep("launching", "", false), nil
+		}
+		return detailStep("completed", "", false), nil
+	}
+	var stdout bytes.Buffer
+
+	result, err := runFeatureControllerLoop(context.Background(), td.deps, ctrl, app.RunHandle{}, testRunID, "r1", "/opt/hop/bin/hop", &stdout)
+	if err != nil {
+		t.Fatalf("runFeatureControllerLoop: %v", err)
+	}
+	if result.FinalState != "completed" {
+		t.Errorf("result = %+v", result)
+	}
+
+	calls := ctrl.recorded()
+	seen := map[string]bool{}
+	for _, name := range calls {
+		seen[name] = true
+	}
+	if !seen["CorroborateSessionLaunches"] {
+		t.Errorf("CorroborateSessionLaunches was never called; calls = %v", calls)
+	}
+	skipped := []string{
+		"RetireSettledSessions", "RecomputeReleases", "DriveIntegration",
+		"EnsureReviewTask", "DriveCompletion", "AssignReadyTasks",
+		"AssignmentDefaults", "ResolveIntegrationHead", "PublishRunPresentation",
+	}
+	for _, name := range skipped {
+		if seen[name] {
+			t.Errorf("%s ran while the run was still launching; calls = %v", name, calls)
+		}
+	}
+}
+
+// TestRunFeatureSchedulingPassPopulatesAssignmentOptions proves the
+// scheduling pass never calls AssignReadyTasks with a zero
+// app.AssignmentOptions{}: MaxWorkers/Harness/ReviewerHarness and the
+// frozen RepositoryRoot/StateRoot come from AssignmentDefaults, HOPPath is
+// the running binary, and IntegrationHeadCommitOID comes from
+// ResolveIntegrationHead, every pass.
+func TestRunFeatureSchedulingPassPopulatesAssignmentOptions(t *testing.T) {
+	ctrl := &fakeController{frozenRepositoryRoot: "/frozen/repo", frozenStateRoot: "/frozen/state-root"}
+	ctrl.assignmentDefaults = func() (app.AssignmentOptions, error) {
+		return app.AssignmentOptions{
+			MaxWorkers: 3, Harness: "claude", ReviewerHarness: "codex",
+			RepositoryRoot: "/frozen/repo", StateRoot: "/frozen/state-root",
+		}, nil
+	}
+	ctrl.resolveIntegrationHead = func() (string, error) {
+		return "cccccccccccccccccccccccccccccccccccccccc", nil
+	}
+	var gotOpts app.AssignmentOptions
+	ctrl.assignReadyTasks = func(opts app.AssignmentOptions) (app.AssignmentReport, error) {
+		gotOpts = opts
+		return app.AssignmentReport{}, nil
+	}
+
+	pass, err := runFeatureSchedulingPass(context.Background(), ctrl, app.RunHandle{}, "running", "/opt/hop/bin/hop", []string{"KEY=value"})
+	if err != nil {
+		t.Fatalf("runFeatureSchedulingPass() error = %v", err)
+	}
+	if pass.halted {
+		t.Errorf("pass = %+v, want the full pass on a running run", pass)
+	}
+
+	want := app.AssignmentOptions{
+		MaxWorkers: 3, Harness: "claude", ReviewerHarness: "codex",
+		RepositoryRoot: "/frozen/repo", HOPPath: "/opt/hop/bin/hop", StateRoot: "/frozen/state-root",
+		IntegrationHeadCommitOID: "cccccccccccccccccccccccccccccccccccccccc",
+	}
+	if gotOpts != want {
+		t.Errorf("AssignReadyTasks options = %+v, want %+v", gotOpts, want)
+	}
+}
+
 // TestFinishFeatureControllerLoop proves the exit-code mapping mirrors
 // finishControllerLoop's solo shape: completed exits 0, everything else 1,
 // a detach prints the resume instruction.
@@ -207,4 +293,224 @@ func TestFinishFeatureControllerLoop(t *testing.T) {
 			t.Errorf("exit code = %d, want %d", code, exitFailure)
 		}
 	})
+}
+
+// statusFromFakeRunState serves the fake's own durable run state, so the
+// loop observes exactly the state the scripted use cases moved the run to.
+func statusFromFakeRunState(ctrl *fakeController) func(app.StatusRequest) (app.StatusResult, error) {
+	return func(app.StatusRequest) (app.StatusResult, error) {
+		return detailStep(ctrl.currentRunState(), "", false), nil
+	}
+}
+
+// callsAfterFirst returns the calls recorded after the first call named
+// name, and whether that call happened at all.
+func callsAfterFirst(calls []string, name string) ([]string, bool) {
+	for i, call := range calls {
+		if call == name {
+			return calls[i+1:], true
+		}
+	}
+	return nil, false
+}
+
+// countCalls counts the recorded calls named name.
+func countCalls(calls []string, name string) int {
+	n := 0
+	for _, call := range calls {
+		if call == name {
+			n++
+		}
+	}
+	return n
+}
+
+// requireOnlyCalls fails the test when calls holds anything outside
+// allowed.
+func requireOnlyCalls(t *testing.T, calls []string, allowed ...string) {
+	t.Helper()
+	permitted := map[string]bool{}
+	for _, name := range allowed {
+		permitted[name] = true
+	}
+	for _, call := range calls {
+		if !permitted[call] {
+			t.Errorf("unexpected %s; calls = %v", call, calls)
+		}
+	}
+}
+
+// TestFeatureLoopHonorsRetirementAndCompletionReports proves the pass
+// stops as soon as retirement or completion reports that the run left
+// ordinary scheduling, against a fake whose AssignReadyTasks refuses every
+// state but running exactly as the real use case does: completion (with
+// retirement outstanding or in the same tick), a retirement round that
+// fails the run, and a terminal failure that is due but blocked on owned
+// work. In every case the loop observes the terminal state and maps it to
+// the normal exit code, with nothing on stderr.
+func TestFeatureLoopHonorsRetirementAndCompletionReports(t *testing.T) {
+	t.Run("completion with retirement outstanding drives only completion on later ticks, then exits 0", func(t *testing.T) {
+		ctrl := &fakeController{}
+		td := newTestDeps(ctrl, map[string]string{"PATH": "/bin"}, t.TempDir())
+		ctrl.status = statusFromFakeRunState(ctrl)
+		rounds := 0
+		ctrl.driveCompletion = func() (app.CompletionReport, error) {
+			rounds++
+			switch rounds {
+			case 1:
+				ctrl.setRunState("completing")
+				return app.CompletionReport{Ready: true, RunState: "completing", Outstanding: []string{"session m: close dispatched"}}, nil
+			case 2:
+				return app.CompletionReport{Ready: true, RunState: "completing", Outstanding: []string{"session m: close dispatched"}}, nil
+			default:
+				ctrl.setRunState("completed")
+				return app.CompletionReport{Ready: true, RunState: "completed", Completed: true}, nil
+			}
+		}
+		var stdout, stderr bytes.Buffer
+
+		code, err := finishFeatureControllerLoop(context.Background(), td.deps, ctrl, app.RunHandle{}, testRunID, "r1", "/opt/hop/bin/hop", &stdout, &stderr, "hop resume")
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitOK || stderr.Len() != 0 {
+			t.Fatalf("exit code = %d, stderr = %q; want 0 and nothing", code, stderr.String())
+		}
+		if got := stdout.String(); got != "run r1 running\nrun r1 completing\nrun r1 completed\n" {
+			t.Errorf("stdout = %q", got)
+		}
+		if rounds != 3 {
+			t.Errorf("DriveCompletion rounds = %d, want 3 (entry, outstanding retirement, completed)", rounds)
+		}
+		calls := ctrl.recorded()
+		after, ok := callsAfterFirst(calls, "DriveCompletion")
+		if !ok {
+			t.Fatalf("DriveCompletion never ran; calls = %v", calls)
+		}
+		requireOnlyCalls(t, after, "Status", "DriveCompletion", "Heartbeat", "Detach")
+		if countCalls(calls, "DriveFeatureChecks") != 0 {
+			t.Errorf("a check round was dispatched after the run left running; calls = %v", calls)
+		}
+	})
+
+	t.Run("completion recorded in the same tick stops the pass and exits 0", func(t *testing.T) {
+		ctrl := &fakeController{}
+		td := newTestDeps(ctrl, map[string]string{"PATH": "/bin"}, t.TempDir())
+		ctrl.status = statusFromFakeRunState(ctrl)
+		ctrl.driveCompletion = func() (app.CompletionReport, error) {
+			ctrl.setRunState("completed")
+			return app.CompletionReport{Ready: true, RunState: "completed", Completed: true}, nil
+		}
+		var stdout, stderr bytes.Buffer
+
+		code, err := finishFeatureControllerLoop(context.Background(), td.deps, ctrl, app.RunHandle{}, testRunID, "r1", "/opt/hop/bin/hop", &stdout, &stderr, "hop resume")
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitOK || stderr.Len() != 0 {
+			t.Fatalf("exit code = %d, stderr = %q; want 0 and nothing", code, stderr.String())
+		}
+		if got := stdout.String(); got != "run r1 running\nrun r1 completed\n" {
+			t.Errorf("stdout = %q", got)
+		}
+		calls := ctrl.recorded()
+		after, _ := callsAfterFirst(calls, "DriveCompletion")
+		requireOnlyCalls(t, after, "Status", "Heartbeat", "Detach")
+	})
+
+	t.Run("a retirement round that fails the run stops the pass and exits 1", func(t *testing.T) {
+		ctrl := &fakeController{}
+		td := newTestDeps(ctrl, map[string]string{"PATH": "/bin"}, t.TempDir())
+		ctrl.status = statusFromFakeRunState(ctrl)
+		ctrl.retireSettledSessions = func() (app.RetirementReport, error) {
+			ctrl.setRunState("failed")
+			return app.RetirementReport{Retired: []string{"session-1"}, RunFailed: true}, nil
+		}
+		var stdout, stderr bytes.Buffer
+
+		code, err := finishFeatureControllerLoop(context.Background(), td.deps, ctrl, app.RunHandle{}, testRunID, "r1", "/opt/hop/bin/hop", &stdout, &stderr, "hop resume")
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitFailure || stderr.Len() != 0 {
+			t.Fatalf("exit code = %d, stderr = %q; want 1 and nothing (a failed run is a state, not an error)", code, stderr.String())
+		}
+		if got := stdout.String(); got != "run r1 running\nrun r1 failed\n" {
+			t.Errorf("stdout = %q", got)
+		}
+		calls := ctrl.recorded()
+		after, _ := callsAfterFirst(calls, "RetireSettledSessions")
+		requireOnlyCalls(t, after, "Status", "Heartbeat", "Detach")
+	})
+
+	t.Run("a due-but-blocked terminal failure never claims an integration or assigns a task, then exits 1", func(t *testing.T) {
+		ctrl := &fakeController{}
+		td := newTestDeps(ctrl, map[string]string{"PATH": "/bin"}, t.TempDir())
+		ctrl.status = statusFromFakeRunState(ctrl)
+		rounds := 0
+		ctrl.retireSettledSessions = func() (app.RetirementReport, error) {
+			rounds++
+			if rounds < 3 {
+				return app.RetirementReport{Outstanding: []string{"session-1: close dispatched"}, RunFailing: true}, nil
+			}
+			ctrl.setRunState("failed")
+			return app.RetirementReport{Retired: []string{"session-1"}, RunFailed: true}, nil
+		}
+		ctrl.driveIntegration = func(context.Context, string, []string) (app.IntegrationReport, error) {
+			t.Error("DriveIntegration ran while a terminal failure was due")
+			return app.IntegrationReport{}, nil
+		}
+		ctrl.assignReadyTasks = func(app.AssignmentOptions) (app.AssignmentReport, error) {
+			t.Error("AssignReadyTasks ran while a terminal failure was due")
+			return app.AssignmentReport{}, nil
+		}
+		var stdout, stderr bytes.Buffer
+
+		code, err := finishFeatureControllerLoop(context.Background(), td.deps, ctrl, app.RunHandle{}, testRunID, "r1", "/opt/hop/bin/hop", &stdout, &stderr, "hop resume")
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitFailure || stderr.Len() != 0 {
+			t.Fatalf("exit code = %d, stderr = %q; want 1 and nothing", code, stderr.String())
+		}
+		if got := stdout.String(); got != "run r1 running\nrun r1 failed\n" {
+			t.Errorf("stdout = %q", got)
+		}
+		if rounds != 3 {
+			t.Errorf("retirement rounds = %d, want 3 (two blocked, one settling)", rounds)
+		}
+		requireOnlyCalls(t, ctrl.recorded(), "Status", "CheckSpawnEnvironment", "RetireSettledSessions", "Heartbeat", "Detach")
+	})
+}
+
+// TestFeatureLoopManagerExecFailure proves the loop's side of the manager
+// exec-failure rule: the failed manager launch prints the solo loop's own
+// `launch failed` line — the fixed category, no path, no environment value,
+// nothing on stderr — and the loop then observes the failed run and exits
+// 1. A child's failed launch prints nothing: it settles as a task
+// consequence, never a run transition.
+func TestFeatureLoopManagerExecFailure(t *testing.T) {
+	ctrl := &fakeController{runState: "launching"}
+	td := newTestDeps(ctrl, map[string]string{"PATH": "/bin"}, t.TempDir())
+	ctrl.status = statusFromFakeRunState(ctrl)
+	ctrl.corroborateSessions = func() ([]app.SessionLaunchProgress, error) {
+		ctrl.setRunState("failed")
+		return []app.SessionLaunchProgress{
+			{SessionID: "child-session", Role: "implementer", Progress: app.LaunchFailed},
+			{SessionID: "manager-session", Role: "manager", Progress: app.LaunchFailed},
+		}, nil
+	}
+	var stdout, stderr bytes.Buffer
+
+	code, err := finishFeatureControllerLoop(context.Background(), td.deps, ctrl, app.RunHandle{}, testRunID, "r1", "/opt/hop/bin/hop", &stdout, &stderr, "hop resume")
+	if err != nil {
+		t.Fatalf("write error: %v", err)
+	}
+	if code != exitFailure || stderr.Len() != 0 {
+		t.Fatalf("exit code = %d, stderr = %q; want 1 and nothing", code, stderr.String())
+	}
+	want := "run r1 launching\nlaunch " + describeLaunchProgress(app.LaunchFailed) + "\nrun r1 failed\n"
+	if got := stdout.String(); got != want || want != "run r1 launching\nlaunch failed\nrun r1 failed\n" {
+		t.Errorf("stdout = %q, want %q", got, want)
+	}
 }

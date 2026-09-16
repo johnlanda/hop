@@ -79,23 +79,25 @@ func acceptedWorkflowReceipt(ctx context.Context, q querier, runID, op, requestI
 // requireManagerCaller resolves the manager-verb caller checks shared by
 // every PlanStore method: the caller session must be the run's manager and
 // its claimed incarnation must be the session's current, non-superseded
-// binding. It returns a refusal detail ("" when the caller is legitimate).
-func requireManagerCaller(ctx context.Context, q querier, runID identity.RunID, sessionID identity.SessionID, incarnationID identity.IncarnationID) (string, error) {
+// binding. It returns the refusal's grammar reason token and detail ("",
+// "" when the caller is legitimate) — set directly at each decision point,
+// never derived from the detail text downstream.
+func requireManagerCaller(ctx context.Context, q querier, runID identity.RunID, sessionID identity.SessionID, incarnationID identity.IncarnationID) (reason, detail string, err error) {
 	session, _, err := getSession(ctx, q, sessionID)
 	if errors.Is(err, app.ErrNotFound) || (err == nil && (session.Role != run.RoleManager || session.RunID != runID)) {
-		return "caller is not the run's manager", nil
+		return app.GrammarReasonNotManager, "caller is not the run's manager", nil
 	}
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	binding, hasBinding, err := currentBinding(ctx, q, sessionID)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if !hasBinding || binding.IncarnationID != incarnationID || binding.Superseded {
-		return "incarnation is not current", nil
+		return app.GrammarReasonStale, "incarnation is not current", nil
 	}
-	return "", nil
+	return "", "", nil
 }
 
 // CreateTask validates title/instructions bounds and the dependency edges
@@ -118,8 +120,8 @@ func (s *Store) CreateTask(ctx context.Context, req app.TaskCreate) (app.TaskCre
 		sort.Strings(depIDs)
 		payload := append([]string{req.Title, req.InstructionsDigest}, depIDs...)
 		digest := app.ComputeRequestDigest(taskCreateVerb, req.RunID.String(), app.AddressString(run.ManagerAddress()), payload...)
-		record := func(kind app.WorkflowOutcomeKind, taskID identity.TaskID, seq int, detail string) error {
-			outcome = app.TaskCreated{Outcome: kind, TaskID: taskID, Seq: seq, Detail: detail}
+		record := func(kind app.WorkflowOutcomeKind, taskID identity.TaskID, seq int, reason, detail string) error {
+			outcome = app.TaskCreated{Outcome: kind, TaskID: taskID, Seq: seq, Reason: reason, Detail: detail}
 			receipt := &workflowReceipt{
 				runID: req.RunID.String(), op: taskCreateVerb,
 				sessionID: req.Session.String(), incarnationID: req.IncarnationID.String(),
@@ -145,31 +147,35 @@ func (s *Store) CreateTask(ctx context.Context, req app.TaskCreate) (app.TaskCre
 					if parseErr != nil {
 						return fmt.Errorf("sqlite: accepted task-create receipt entity id: %w", parseErr)
 					}
-					return record(app.WorkflowDuplicate, created, createdSeq, "")
+					return record(app.WorkflowDuplicate, created, createdSeq, "", "")
 				}
-				return record(app.WorkflowRefused, "", 0, "request id reused with different content")
+				return record(app.WorkflowRefused, "", 0, app.GrammarReasonConflicting, "request id reused with different content")
 			}
 		}
 
-		refusal, err := requireManagerCaller(ctx, tx, req.RunID, req.Session, req.IncarnationID)
+		reason, refusal, err := requireManagerCaller(ctx, tx, req.RunID, req.Session, req.IncarnationID)
 		if err != nil {
 			return err
 		}
 		if refusal != "" {
-			return record(app.WorkflowRefused, "", 0, refusal)
+			return record(app.WorkflowRefused, "", 0, reason, refusal)
 		}
 		runV, runRevision, err := getRun(ctx, tx, req.RunID)
 		if errors.Is(err, app.ErrNotFound) {
-			return record(app.WorkflowMalformed, "", 0, "unknown run")
+			return record(app.WorkflowMalformed, "", 0, app.GrammarReasonMalformed, "unknown run")
 		}
 		if err != nil {
 			return err
 		}
 		if acceptErr := runV.CanAcceptManagerVerb(); acceptErr != nil {
-			return record(app.WorkflowRefused, "", 0, acceptErr.Error())
+			acceptReason := app.GrammarReasonUnauthorized
+			if errors.Is(acceptErr, run.ErrRunNotAccepting) {
+				acceptReason = app.GrammarReasonRunNotAccepting
+			}
+			return record(app.WorkflowRefused, "", 0, acceptReason, acceptErr.Error())
 		}
 		if req.Title == "" || len(req.Title) > app.TaskTitleLimit || req.InstructionsDigest == "" {
-			return record(app.WorkflowMalformed, "", 0, "title is empty or exceeds the size bound, or the instructions digest is empty")
+			return record(app.WorkflowMalformed, "", 0, app.GrammarReasonMalformed, "title is empty or exceeds the size bound, or the instructions digest is empty")
 		}
 
 		existingEdges, edgesErr := taskDependenciesByRun(ctx, tx, req.RunID)
@@ -180,17 +186,17 @@ func (s *Store) CreateTask(ctx context.Context, req app.TaskCreate) (app.TaskCre
 		for _, dep := range req.DependsOn {
 			depTask, _, depErr := getTask(ctx, tx, dep)
 			if errors.Is(depErr, app.ErrNotFound) || (depErr == nil && depTask.RunID != req.RunID) {
-				return record(app.WorkflowRefused, "", 0, "dependency is not in this run")
+				return record(app.WorkflowRefused, "", 0, app.GrammarReasonDependencyCycle, "dependency is not in this run")
 			}
 			if depErr != nil {
 				return depErr
 			}
 			edge, edgeErr := run.NewTaskDependency(req.ID, dep, now)
 			if edgeErr != nil {
-				return record(app.WorkflowRefused, "", 0, edgeErr.Error())
+				return record(app.WorkflowRefused, "", 0, app.GrammarReasonDependencyCycle, edgeErr.Error())
 			}
 			if cycleErr := run.ValidateAcyclic(existingEdges, edge); cycleErr != nil {
-				return record(app.WorkflowRefused, "", 0, cycleErr.Error())
+				return record(app.WorkflowRefused, "", 0, app.GrammarReasonDependencyCycle, cycleErr.Error())
 			}
 			edges = append(edges, edge)
 		}
@@ -231,7 +237,7 @@ func (s *Store) CreateTask(ctx context.Context, req app.TaskCreate) (app.TaskCre
 		if err := requireCAS(result, fmt.Errorf("sqlite: run %s moved during task creation: %w", req.RunID, app.ErrRevisionConflict)); err != nil {
 			return err
 		}
-		return record(app.WorkflowAccepted, task.ID, task.Seq, "")
+		return record(app.WorkflowAccepted, task.ID, task.Seq, "", "")
 	})
 	if err != nil {
 		return app.TaskCreated{}, err
@@ -250,8 +256,8 @@ func (s *Store) RequestRetry(ctx context.Context, req app.RetryRequest) (app.Ret
 	err := s.inWriteTx(ctx, func(tx *sql.Tx) error {
 		now := s.now()
 		digest := app.ComputeRequestDigest(taskRetryVerb, req.RunID.String(), app.AddressString(run.ManagerAddress()), req.TaskID.String(), req.Reason)
-		record := func(kind app.WorkflowOutcomeKind, attemptID string, attemptNumber int, detail string) error {
-			outcome = app.RetryAccepted{Outcome: kind, AttemptNumber: attemptNumber, Detail: detail}
+		record := func(kind app.WorkflowOutcomeKind, attemptID string, taskSeq, attemptNumber int, reason, detail string) error {
+			outcome = app.RetryAccepted{Outcome: kind, TaskSeq: taskSeq, AttemptNumber: attemptNumber, Reason: reason, Detail: detail}
 			receipt := &workflowReceipt{
 				runID: req.RunID.String(), op: taskRetryVerb,
 				sessionID: req.Session.String(), incarnationID: req.IncarnationID.String(),
@@ -276,39 +282,48 @@ func (s *Store) RequestRetry(ctx context.Context, req app.RetryRequest) (app.Ret
 					// The original acceptance survives consumption, relaunch
 					// and manager succession: an identical retry reads the
 					// attempt number back from this receipt, never a second
-					// pending row.
-					return record(app.WorkflowDuplicate, createdEntity, createdSeq, "")
+					// pending row. The digest covers the task id, so the
+					// retried task is req.TaskID; its seq is immutable.
+					retried, _, taskErr := getTask(ctx, tx, req.TaskID)
+					if taskErr != nil {
+						return fmt.Errorf("sqlite: task of accepted retry receipt: %w", taskErr)
+					}
+					return record(app.WorkflowDuplicate, createdEntity, retried.Seq, createdSeq, "", "")
 				}
-				return record(app.WorkflowRefused, "", 0, "request id reused with different content")
+				return record(app.WorkflowRefused, "", 0, 0, app.GrammarReasonConflicting, "request id reused with different content")
 			}
 		}
 
-		refusal, err := requireManagerCaller(ctx, tx, req.RunID, req.Session, req.IncarnationID)
+		reason, refusal, err := requireManagerCaller(ctx, tx, req.RunID, req.Session, req.IncarnationID)
 		if err != nil {
 			return err
 		}
 		if refusal != "" {
-			return record(app.WorkflowRefused, "", 0, refusal)
+			return record(app.WorkflowRefused, "", 0, 0, reason, refusal)
 		}
 		runV, _, err := getRun(ctx, tx, req.RunID)
 		if errors.Is(err, app.ErrNotFound) {
-			return record(app.WorkflowMalformed, "", 0, "unknown run")
+			return record(app.WorkflowMalformed, "", 0, 0, app.GrammarReasonMalformed, "unknown run")
 		}
 		if err != nil {
 			return err
 		}
 		if acceptErr := runV.CanAcceptManagerVerb(); acceptErr != nil {
-			return record(app.WorkflowRefused, "", 0, acceptErr.Error())
+			acceptReason := app.GrammarReasonUnauthorized
+			if errors.Is(acceptErr, run.ErrRunNotAccepting) {
+				acceptReason = app.GrammarReasonRunNotAccepting
+			}
+			return record(app.WorkflowRefused, "", 0, 0, acceptReason, acceptErr.Error())
 		}
 		task, taskRevision, err := getTask(ctx, tx, req.TaskID)
 		if errors.Is(err, app.ErrNotFound) || (err == nil && task.RunID != req.RunID) {
-			return record(app.WorkflowMalformed, "", 0, "unknown task")
+			return record(app.WorkflowMalformed, "", 0, 0, app.GrammarReasonMalformed, "unknown task")
 		}
 		if err != nil {
 			return err
 		}
 		if task.State != run.TaskNeedsRework {
-			return record(app.WorkflowRefused, "", 0, "task is not needs-rework")
+			return record(app.WorkflowRefused, "", 0, 0, app.GrammarReasonRetryNotTerminal, "task is not needs-rework")
 		}
 		var pendingExists bool
 		if scanErr := tx.QueryRowContext(ctx,
@@ -318,7 +333,7 @@ func (s *Store) RequestRetry(ctx context.Context, req app.RetryRequest) (app.Ret
 			return fmt.Errorf("sqlite: read pending retry request of task %s: %w", req.TaskID, scanErr)
 		}
 		if pendingExists {
-			return record(app.WorkflowRefused, "", 0, "a retry request is already pending for this task")
+			return record(app.WorkflowRefused, "", 0, 0, app.GrammarReasonConflicting, "a retry request is already pending for this task")
 		}
 
 		attempts, attemptsErr := attemptsByTask(ctx, tx, req.TaskID)
@@ -326,7 +341,7 @@ func (s *Store) RequestRetry(ctx context.Context, req app.RetryRequest) (app.Ret
 			return attemptsErr
 		}
 		if len(attempts) == 0 {
-			return record(app.WorkflowMalformed, "", 0, "task has no attempts")
+			return record(app.WorkflowMalformed, "", 0, 0, app.GrammarReasonMalformed, "task has no attempts")
 		}
 		prior := attempts[len(attempts)-1]
 		limit := 3
@@ -349,9 +364,9 @@ func (s *Store) RequestRetry(ctx context.Context, req app.RetryRequest) (app.Ret
 		switch {
 		case err == nil:
 		case errors.Is(err, run.ErrRetryLimit):
-			return record(app.WorkflowRefused, "", 0, "retry limit reached")
+			return record(app.WorkflowRefused, "", 0, 0, app.GrammarReasonRetryLimit, "retry limit reached")
 		case errors.Is(err, run.ErrRetryNotTerminal):
-			return record(app.WorkflowRefused, "", 0, "prior attempt is not terminal")
+			return record(app.WorkflowRefused, "", 0, 0, app.GrammarReasonRetryNotTerminal, "prior attempt is not terminal")
 		default:
 			return fmt.Errorf("sqlite: reserve retry attempt: %w", err)
 		}
@@ -396,7 +411,7 @@ func (s *Store) RequestRetry(ctx context.Context, req app.RetryRequest) (app.Ret
 		); err != nil {
 			return fmt.Errorf("sqlite: insert retry request: %w", err)
 		}
-		return record(app.WorkflowAccepted, next.ID.String(), next.Number, "")
+		return record(app.WorkflowAccepted, next.ID.String(), task.Seq, next.Number, "", "")
 	})
 	if err != nil {
 		return app.RetryAccepted{}, err
@@ -411,8 +426,8 @@ func (s *Store) ClosePlan(ctx context.Context, req app.PlanClose) (app.PlanClose
 	err := s.inWriteTx(ctx, func(tx *sql.Tx) error {
 		now := s.now()
 		digest := app.ComputeRequestDigest(planCloseVerb, req.RunID.String(), app.AddressString(run.ManagerAddress()))
-		record := func(kind app.WorkflowOutcomeKind, detail string) error {
-			outcome = app.PlanCloseResult{Outcome: kind, Detail: detail}
+		record := func(kind app.WorkflowOutcomeKind, reason, detail string) error {
+			outcome = app.PlanCloseResult{Outcome: kind, Reason: reason, Detail: detail}
 			return insertWorkflowReceipt(ctx, tx, &workflowReceipt{
 				runID: req.RunID.String(), op: planCloseVerb,
 				sessionID: req.Session.String(), incarnationID: req.IncarnationID.String(),
@@ -428,22 +443,22 @@ func (s *Store) ClosePlan(ctx context.Context, req app.PlanClose) (app.PlanClose
 			}
 			if ok {
 				if priorDigest == digest {
-					return record(app.WorkflowDuplicate, "")
+					return record(app.WorkflowDuplicate, "", "")
 				}
-				return record(app.WorkflowRefused, "request id reused with different content")
+				return record(app.WorkflowRefused, app.GrammarReasonConflicting, "request id reused with different content")
 			}
 		}
 
-		refusal, err := requireManagerCaller(ctx, tx, req.RunID, req.Session, req.IncarnationID)
+		reason, refusal, err := requireManagerCaller(ctx, tx, req.RunID, req.Session, req.IncarnationID)
 		if err != nil {
 			return err
 		}
 		if refusal != "" {
-			return record(app.WorkflowRefused, refusal)
+			return record(app.WorkflowRefused, reason, refusal)
 		}
 		runV, runRevision, err := getRun(ctx, tx, req.RunID)
 		if errors.Is(err, app.ErrNotFound) {
-			return record(app.WorkflowMalformed, "unknown run")
+			return record(app.WorkflowMalformed, app.GrammarReasonMalformed, "unknown run")
 		}
 		if err != nil {
 			return err
@@ -459,9 +474,11 @@ func (s *Store) ClosePlan(ctx context.Context, req app.PlanClose) (app.PlanClose
 		switch {
 		case closeErr == nil:
 		case errors.Is(closeErr, run.ErrEmptyPlan):
-			return record(app.WorkflowRefused, "plan has no implement task")
+			return record(app.WorkflowRefused, app.GrammarReasonEmptyPlan, "plan has no implement task")
+		case errors.Is(closeErr, run.ErrRunNotAccepting):
+			return record(app.WorkflowRefused, app.GrammarReasonRunNotAccepting, closeErr.Error())
 		default:
-			return record(app.WorkflowRefused, closeErr.Error())
+			return record(app.WorkflowRefused, app.GrammarReasonUnauthorized, closeErr.Error())
 		}
 		result, err := tx.ExecContext(ctx,
 			`UPDATE runs SET plan_closed_at = ?, updated_at = ?, revision = revision + 1 WHERE id = ? AND revision = ?`,
@@ -473,7 +490,7 @@ func (s *Store) ClosePlan(ctx context.Context, req app.PlanClose) (app.PlanClose
 		if err := requireCAS(result, fmt.Errorf("sqlite: run %s moved during plan close: %w", req.RunID, app.ErrRevisionConflict)); err != nil {
 			return err
 		}
-		return record(app.WorkflowAccepted, "")
+		return record(app.WorkflowAccepted, "", "")
 	})
 	if err != nil {
 		return app.PlanCloseResult{}, err

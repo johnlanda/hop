@@ -68,10 +68,14 @@ const (
 )
 
 // MessageOutcome is the recorded result of one send or answer. MessageID is
-// set for Accepted and Duplicate.
+// set for Accepted and Duplicate. Reason is one of grammar.go's
+// GrammarReason* tokens, set by the store (or the driving use case, for a
+// refusal decided before any store call) at its exact decision point on
+// every non-accepted, non-duplicate outcome; empty on accepted/duplicate.
 type MessageOutcome struct {
 	Kind      MessageOutcomeKind
 	MessageID identity.MessageID
+	Reason    string
 	Detail    string
 }
 
@@ -150,9 +154,13 @@ const (
 	AckRefused   MessageAckOutcomeKind = "refused"
 )
 
-// MessageAckOutcome is the recorded result of one ack attempt.
+// MessageAckOutcome is the recorded result of one ack attempt. Reason is
+// one of grammar.go's GrammarReason* tokens, set by the store (or the
+// driving use case) at its exact decision point on every AckRefused
+// outcome; empty on accepted/duplicate.
 type MessageAckOutcome struct {
 	Kind   MessageAckOutcomeKind
+	Reason string
 	Detail string
 }
 

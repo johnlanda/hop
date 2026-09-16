@@ -25,6 +25,12 @@ type RetirementReport struct {
 	// completed this round: owned work observed terminated, ref intents
 	// quiesced, and the run marked failed.
 	RunFailed bool
+	// RunFailing is true when a terminal-failure cause is durable but its
+	// settlement has not completed this round (owned work still
+	// outstanding): the run is still running, yet it will never accept
+	// new work again, so the caller schedules nothing more until the
+	// failure settles.
+	RunFailing bool
 }
 
 // retirementCandidate is one child session due for retirement and the
@@ -58,7 +64,7 @@ func (c *Controller) RetireSettledSessions(ctx context.Context, handle RunHandle
 		return RetirementReport{}, fmt.Errorf("app: load run status: %w", err)
 	}
 
-	candidates, inFlight, anyTaskFailed, err := c.retirementCandidates(ctx, handle)
+	candidates, inFlight, failureCause, err := c.retirementCandidates(ctx, handle)
 	if err != nil {
 		return RetirementReport{}, err
 	}
@@ -93,8 +99,8 @@ func (c *Controller) RetireSettledSessions(ctx context.Context, handle RunHandle
 		}
 	}
 
-	if anyTaskFailed && len(report.Outstanding) == 0 {
-		failed, outstanding, err := c.driveFeatureTerminalFailure(ctx, handle, &frozen)
+	if failureCause != "" && len(report.Outstanding) == 0 {
+		failed, outstanding, err := c.driveFeatureTerminalFailure(ctx, handle, &frozen, failureCause)
 		if err != nil {
 			return report, err
 		}
@@ -103,18 +109,35 @@ func (c *Controller) RetireSettledSessions(ctx context.Context, handle RunHandle
 			report.Outstanding = append(report.Outstanding, outstanding)
 		}
 	}
+	report.RunFailing = failureCause != "" && !report.RunFailed
 	return report, nil
 }
+
+// The durable terminal-failure causes a feature run can carry, recorded as
+// the failing run transition's reason.
+const (
+	// taskFailureCause: a task reached failed, so readiness can never hold
+	// again.
+	taskFailureCause = "task failure with owned-work termination observed"
+	// managerLaunchFailureCause: the manager lineage's most recent session
+	// failed to exec. No design row covers it; like a solo exec failure in
+	// Phase 2, it fails the run.
+	managerLaunchFailureCause = "manager launch exec failed (exec_failed claim; no process) with owned-work termination observed"
+)
 
 // retirementCandidates reads the run's child sessions and decides which
 // have reached a retirement boundary; inFlight lists sessions whose
 // attempt is still in flight under a settled claim — the self-exit
-// observation probes them for positive absence.
-func (c *Controller) retirementCandidates(ctx context.Context, handle RunHandle) ([]retirementCandidate, []retirementCandidate, bool, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
+// observation probes them for positive absence. failureCause is the run's
+// durable terminal-failure cause, "" when it has none: a failed task
+// (taskFailureCause) or, failing that, a manager lineage that ended in an
+// exec failure (managerLaunchFailureCause). While a cause stands, every
+// live child is retired with the "run terminal failure" boundary.
+func (c *Controller) retirementCandidates(ctx context.Context, handle RunHandle) ([]retirementCandidate, []retirementCandidate, string, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
 	var (
-		candidates    []retirementCandidate
-		inFlight      []retirementCandidate
-		anyTaskFailed bool
+		candidates   []retirementCandidate
+		inFlight     []retirementCandidate
+		failureCause string
 	)
 	err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 		wf, wfErr := RequireWorkflowRepositories(uow, "RetireSettledSessions")
@@ -129,7 +152,16 @@ func (c *Controller) retirementCandidates(ctx context.Context, handle RunHandle)
 		for i := range tasks {
 			taskByID[tasks[i].ID] = tasks[i]
 			if tasks[i].State == run.TaskFailed {
-				anyTaskFailed = true
+				failureCause = taskFailureCause
+			}
+		}
+		if failureCause == "" {
+			managerFailed, mgrErr := managerLaunchFailedLocked(ctx, uow, wf, handle.runID)
+			if mgrErr != nil {
+				return mgrErr
+			}
+			if managerFailed {
+				failureCause = managerLaunchFailureCause
 			}
 		}
 		sessions, sessErr := wf.SessionIndex().ByRun(ctx, handle.runID)
@@ -173,7 +205,7 @@ func (c *Controller) retirementCandidates(ctx context.Context, handle RunHandle)
 					boundary = "implement attempt's accepted result"
 				}
 			}
-			if boundary == "" && anyTaskFailed {
+			if boundary == "" && failureCause != "" {
 				boundary = "run terminal failure"
 			}
 			if boundary == "" {
@@ -186,7 +218,70 @@ func (c *Controller) retirementCandidates(ctx context.Context, handle RunHandle)
 		}
 		return nil
 	})
-	return candidates, inFlight, anyTaskFailed, err
+	return candidates, inFlight, failureCause, err
+}
+
+// managerLaunchFailedLocked reports, inside the caller's transaction,
+// whether handle's run carries the manager exec-failure cause: the run is
+// launching or running, and the MOST RECENT session of its manager
+// lineage has a current binding whose launch claim is exec_failed. The
+// most recent session is the live manager, else the lineage's one member
+// never marked lost — a cold relaunch marks every predecessor lost in its
+// successor's creating transaction, so an earlier exec-failed member
+// followed by a working successor never counts, and neither does a
+// manager retired at completion, at stop or by an earlier terminal
+// failure (its claim settled execed, or the run is no longer launching or
+// running). Any other lineage shape — no manager, or more than one member
+// never marked lost — is no cause.
+func managerLaunchFailedLocked(ctx context.Context, uow UnitOfWork, wf WorkflowRepositories, runID identity.RunID) (bool, error) {
+	r, _, err := uow.Runs().Get(ctx, runID)
+	if err != nil {
+		return false, err
+	}
+	if r.State != run.RunLaunching && r.State != run.RunRunning {
+		return false, nil
+	}
+	head, found, err := latestManagerSessionLocked(ctx, wf, runID)
+	if err != nil || !found {
+		return false, err
+	}
+	binding, bindingFound, err := uow.Bindings().Current(ctx, head.ID)
+	if err != nil || !bindingFound {
+		return false, err
+	}
+	claim, claimFound, err := uow.LaunchClaims().Get(ctx, binding.IncarnationID)
+	if err != nil {
+		return false, err
+	}
+	return claimFound && claim.State == LaunchClaimExecFailed, nil
+}
+
+// latestManagerSessionLocked resolves the most recent session of runID's
+// manager lineage (see managerLaunchFailedLocked); found is false when no
+// single most recent member exists.
+func latestManagerSessionLocked(ctx context.Context, wf WorkflowRepositories, runID identity.RunID) (run.Session, bool, error) {
+	live, _, err := wf.ManagerSession(ctx, runID)
+	switch {
+	case err == nil:
+		return live, true, nil
+	case !errors.Is(err, ErrNotFound):
+		return run.Session{}, false, err
+	}
+	sessions, err := wf.SessionIndex().ByRun(ctx, runID)
+	if err != nil {
+		return run.Session{}, false, err
+	}
+	var (
+		head  run.Session
+		heads int
+	)
+	for i := range sessions {
+		if sessions[i].Role == run.RoleManager && sessions[i].State != run.SessionLost {
+			head = sessions[i]
+			heads++
+		}
+	}
+	return head, heads == 1, nil
 }
 
 // observeWorkerExit probes one in-flight worker for a self-exit: only a
@@ -210,8 +305,93 @@ func (c *Controller) observeWorkerExit(ctx context.Context, handle RunHandle, fr
 	return true, c.settleWorkerInterruption(ctx, handle, frozen, session)
 }
 
+// workerTermination describes one terminal attempt outcome a live
+// controller settles for a child session that has no accepted result:
+// the attempt's own terminal state and the reasons the settlement
+// records. The task consequence is never part of it — the section 5
+// budget rule decides that inside the settling transaction.
+type workerTermination struct {
+	// kind names the settlement in errors and the transaction label.
+	kind string
+	// failAttempt moves the attempt to failed; otherwise it is interrupted.
+	failAttempt bool
+	// reason is the attempt and task transition reason.
+	reason string
+	// sessionReason is the session termination reason.
+	sessionReason string
+	// noticeReason renders the manager notice's reason line for the
+	// decided task consequence.
+	noticeReason func(taskConsequence) string
+}
+
+// workerSelfExit is an observed self-exit: the attempt is interrupted.
+func workerSelfExit() workerTermination {
+	return workerTermination{
+		kind:          "interruption",
+		reason:        "worker exited without an accepted result",
+		sessionReason: "worker exited without an accepted result; observed absent",
+		noticeReason: func(taskConsequence) string {
+			return "worker exited without an accepted result (observed absent under its settled claim)"
+		},
+	}
+}
+
+// workerExecFailure is an exec_failed launch claim (design section 5's
+// "exec failure" terminal attempt outcome): the attempt failed, whatever
+// the task consequence — a held stop interrupts the task, never the
+// observed outcome.
+func workerExecFailure() workerTermination {
+	return workerTermination{
+		kind:          "exec failure",
+		failAttempt:   true,
+		reason:        "exec_failed claim",
+		sessionReason: "exec_failed claim; no process",
+		noticeReason: func(consequence taskConsequence) string {
+			if consequence == taskConsequenceInterrupted {
+				return "the attempt failed to launch (exec_failed claim; no process) while a stop was pending"
+			}
+			return "the attempt failed to launch (exec_failed claim; no process)"
+		},
+	}
+}
+
 // settleWorkerInterruption settles an observed self-exit.
 func (c *Controller) settleWorkerInterruption(ctx context.Context, handle RunHandle, frozen *FrozenRun, session *run.Session) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per established self-exit.
+	return c.settleWorkerTermination(ctx, handle, frozen, session, workerSelfExit())
+}
+
+// settleChildExecFailure settles one implementer or reviewer session
+// whose current launch claim is exec_failed, as the terminal attempt
+// outcome design section 5 names: in one transaction the attempt fails,
+// the task takes the budgeted consequence (needs-rework with retries
+// left, failed at the limit with its mailbox closed, interrupted under a
+// held stop), the session is terminated and the manager notice commits.
+// An attempt already past launching or relaunching carries no launch
+// outcome to settle; only the session is terminated. It assumes nothing
+// about its caller beyond a held lease: the scheduling pass's launch
+// corroboration and resume's reconciliation both settle through it.
+func (c *Controller) settleChildExecFailure(ctx context.Context, handle RunHandle, frozen *FrozenRun, session *run.Session) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per exec-failed child session.
+	if session.AttemptID == "" {
+		return fmt.Errorf("app: session %s has no attempt; an exec-failed manager fails the run instead", session.ID)
+	}
+	var attemptState run.AttemptState
+	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		a, _, err := uow.Attempts().Get(ctx, session.AttemptID)
+		attemptState = a.State
+		return err
+	}); err != nil {
+		return err
+	}
+	if attemptState != run.AttemptLaunching && attemptState != run.AttemptRelaunching {
+		return c.terminateRetiredSession(ctx, handle, session.ID, workerExecFailure().sessionReason)
+	}
+	return c.settleWorkerTermination(ctx, handle, frozen, session, workerExecFailure())
+}
+
+// settleWorkerTermination settles one child session's terminal attempt
+// outcome: the prediction, the file-first manager notice and the settling
+// transaction, retried while concurrent sends move the mailbox.
+func (c *Controller) settleWorkerTermination(ctx context.Context, handle RunHandle, frozen *FrozenRun, session *run.Session, outcome workerTermination) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per settled child session.
 	var task run.Task
 	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 		attempt, _, attErr := uow.Attempts().Get(ctx, session.AttemptID)
@@ -233,25 +413,25 @@ func (c *Controller) settleWorkerInterruption(ctx context.Context, handle RunHan
 		if err != nil {
 			return err
 		}
-		body := renderTaskNotice(&task, prediction, "worker exited without an accepted result (observed absent under its settled claim)", obligations)
+		body := renderTaskNotice(&task, prediction, outcome.noticeReason(prediction), obligations)
 		notice, err := c.prepareControllerNotice(ctx, handle, frozen.Snapshot.StateRoot, body)
 		if err != nil {
 			return err
 		}
-		err = c.applyWorkerInterruption(ctx, handle, frozen, session, &task, prediction, obligations, notice)
+		err = c.applyWorkerTermination(ctx, handle, frozen, session, &task, &outcome, prediction, obligations, notice)
 		if errors.Is(err, errSettlementRetry) {
 			continue
 		}
 		return err
 	}
-	return fmt.Errorf("app: worker %s interruption settlement kept racing concurrent sends", session.ID)
+	return fmt.Errorf("app: worker %s %s settlement kept racing concurrent sends", session.ID, outcome.kind)
 }
 
-// applyWorkerInterruption is one interruption-settlement transaction.
-func (c *Controller) applyWorkerInterruption(ctx context.Context, handle RunHandle, frozen *FrozenRun, session *run.Session, task *run.Task, prediction taskConsequence, obligations []string, notice controllerNotice) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
+// applyWorkerTermination is one worker-termination settlement transaction.
+func (c *Controller) applyWorkerTermination(ctx context.Context, handle RunHandle, frozen *FrozenRun, session *run.Session, task *run.Task, outcome *workerTermination, prediction taskConsequence, obligations []string, notice controllerNotice) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
 	now := c.Clock.Now()
 	return c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
-		wf, wfErr := RequireWorkflowRepositories(uow, "worker interruption")
+		wf, wfErr := RequireWorkflowRepositories(uow, "worker "+outcome.kind)
 		if wfErr != nil {
 			return wfErr
 		}
@@ -262,6 +442,12 @@ func (c *Controller) applyWorkerInterruption(ctx context.Context, handle RunHand
 		a, aRev, attErr := uow.Attempts().Get(ctx, session.AttemptID)
 		if attErr != nil {
 			return attErr
+		}
+		generation := gen(handle.lease.Generation)
+		if outcome.failAttempt && a.State != run.AttemptLaunching && a.State != run.AttemptRelaunching {
+			// Another settlement moved the attempt since the prediction:
+			// nothing launch-shaped is left to settle but the session.
+			return terminateSession(ctx, uow, session.ID, outcome.sessionReason, generation, now)
 		}
 		t, tRev, taskErr := uow.Tasks().Get(ctx, task.ID)
 		if taskErr != nil {
@@ -275,17 +461,22 @@ func (c *Controller) applyWorkerInterruption(ctx context.Context, handle RunHand
 		if consequence != prediction {
 			return errSettlementRetry
 		}
-		generation := gen(handle.lease.Generation)
 
 		aFrom := a.State
-		aNext, trErr := a.Interrupt(now)
+		var aNext run.Attempt
+		var trErr error
+		if outcome.failAttempt {
+			aNext, trErr = a.Fail(now)
+		} else {
+			aNext, trErr = a.Interrupt(now)
+		}
 		if trErr != nil {
 			return trErr
 		}
 		if _, saveErr := uow.Attempts().Save(ctx, aNext, aRev); saveErr != nil {
 			return saveErr
 		}
-		if err := recordTransition(ctx, uow, EntityAttempt, a.ID.String(), string(aFrom), string(aNext.State), "worker exited without an accepted result", generation, now); err != nil {
+		if err := recordTransition(ctx, uow, EntityAttempt, a.ID.String(), string(aFrom), string(aNext.State), outcome.reason, generation, now); err != nil {
 			return err
 		}
 
@@ -315,11 +506,11 @@ func (c *Controller) applyWorkerInterruption(ctx context.Context, handle RunHand
 		if _, saveErr := uow.Tasks().Save(ctx, tNext, tRev); saveErr != nil {
 			return saveErr
 		}
-		if err := recordTransition(ctx, uow, EntityTask, t.ID.String(), string(tFrom), string(tNext.State), "worker exited without an accepted result", generation, now); err != nil {
+		if err := recordTransition(ctx, uow, EntityTask, t.ID.String(), string(tFrom), string(tNext.State), outcome.reason, generation, now); err != nil {
 			return err
 		}
 
-		if err := terminateSession(ctx, uow, session.ID, "worker exited without an accepted result; observed absent", generation, now); err != nil {
+		if err := terminateSession(ctx, uow, session.ID, outcome.sessionReason, generation, now); err != nil {
 			return err
 		}
 		return commitControllerNotice(ctx, wf, handle.runID, notice, now)
@@ -460,8 +651,11 @@ func (c *Controller) terminateRetiredSession(ctx context.Context, handle RunHand
 // ref of a failed run). Only then, once every child session is
 // terminal, is the manager retired under the close rule and the run
 // marked failed — with stop precedence: a held stop leaves the terminal
-// state to stop handling.
-func (c *Controller) driveFeatureTerminalFailure(ctx context.Context, handle RunHandle, frozen *FrozenRun) (bool, string, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
+// state to stop handling. cause is the durable failure cause, recorded as
+// the run transition's reason. A launching run fails the same way: a
+// manager whose launch exec failed leaves a launching run nothing else to
+// reach.
+func (c *Controller) driveFeatureTerminalFailure(ctx context.Context, handle RunHandle, frozen *FrozenRun, cause string) (bool, string, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
 	detail, err := c.Read.LoadRunStatus(ctx, handle.runID)
 	if err != nil {
 		return false, "", err
@@ -469,7 +663,7 @@ func (c *Controller) driveFeatureTerminalFailure(ctx context.Context, handle Run
 	if detail.StopRequested {
 		return false, "", nil // stop precedence: stop handling owns the terminal state.
 	}
-	if detail.State != run.RunRunning && detail.State != run.RunResuming && detail.State != run.RunCompleting {
+	if !terminalFailureAccepts(detail.State) {
 		return false, "", nil
 	}
 	var stillOutstanding []string
@@ -545,7 +739,7 @@ func (c *Controller) driveFeatureTerminalFailure(ctx context.Context, handle Run
 		if r.StopRequested {
 			return nil
 		}
-		if r.State != run.RunRunning && r.State != run.RunResuming && r.State != run.RunCompleting {
+		if !terminalFailureAccepts(r.State) {
 			return nil
 		}
 		rFrom := r.State
@@ -556,7 +750,7 @@ func (c *Controller) driveFeatureTerminalFailure(ctx context.Context, handle Run
 		if _, saveErr := uow.Runs().Save(ctx, next, rRev); saveErr != nil {
 			return saveErr
 		}
-		return recordTransition(ctx, uow, EntityRun, handle.runID.String(), string(rFrom), string(next.State), "task failure with owned-work termination observed", gen(handle.lease.Generation), now)
+		return recordTransition(ctx, uow, EntityRun, handle.runID.String(), string(rFrom), string(next.State), cause, gen(handle.lease.Generation), now)
 	})
 	if errors.Is(err, errRunNotQuiesced) {
 		return false, "terminal failure blocked: " + err.Error(), nil
@@ -565,6 +759,18 @@ func (c *Controller) driveFeatureTerminalFailure(ctx context.Context, handle Run
 		return false, "", err
 	}
 	return true, "", nil
+}
+
+// terminalFailureAccepts reports whether a run in state may take the
+// feature terminal failure: every non-terminal, non-stopping state that
+// can reach failed.
+func terminalFailureAccepts(state run.RunState) bool {
+	switch state {
+	case run.RunLaunching, run.RunRunning, run.RunResuming, run.RunCompleting:
+		return true
+	default:
+		return false
+	}
 }
 
 // featureSessionsTerminal reports whether every session OTHER than the

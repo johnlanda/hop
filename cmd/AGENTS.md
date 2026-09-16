@@ -10,7 +10,7 @@ application services. Nothing imports a `cmd` package.
 
 | Directory | Guide | Binary |
 | --- | --- | --- |
-| `hop/` | [cmd/hop](hop/AGENTS.md) | The `hop` command: `version`, `doctor` and `plugin-context` |
+| `hop/` | [cmd/hop](hop/AGENTS.md) | The `hop` command: `run`/`status`/`stop`/`resume`/`result`/`version`/`doctor`/`plugin-context`/`view`/`answer`, worker plumbing `launch`/`check-exec`/`task`/`plan`/`msg`/`review` |
 
 ## Rules for this subtree
 

@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -43,26 +45,83 @@ type fakeController struct {
 	failLaunch           func(incarnationID, reason string) error
 	prepareCheck         func(req app.CheckExecRequest) (app.CheckExecPlan, error)
 
-	retireSettledSessions func() (app.RetirementReport, error)
-	recomputeReleases     func() (app.ReleaseReport, error)
-	driveIntegration      func(ctx context.Context, hopPath string, spawnEnv []string) (app.IntegrationReport, error)
-	ensureReviewTask      func() (bool, error)
-	assignReadyTasks      func(opts app.AssignmentOptions) (app.AssignmentReport, error)
-	driveCompletion       func() (app.CompletionReport, error)
-	publishPresentation   func() (app.PresentationReport, error)
+	retireSettledSessions  func() (app.RetirementReport, error)
+	recomputeReleases      func() (app.ReleaseReport, error)
+	driveIntegration       func(ctx context.Context, hopPath string, spawnEnv []string) (app.IntegrationReport, error)
+	ensureReviewTask       func() (bool, error)
+	assignReadyTasks       func(opts app.AssignmentOptions) (app.AssignmentReport, error)
+	assignmentDefaults     func() (app.AssignmentOptions, error)
+	resolveIntegrationHead func() (string, error)
+	driveCompletion        func() (app.CompletionReport, error)
+	publishPresentation    func() (app.PresentationReport, error)
 
-	sendMessage  func(req app.SendMessageRequest) (app.SendMessageResult, error)
-	fetchMessage func(req app.FetchMessageRequest) (app.FetchMessageResult, error)
-	ackMessage   func(req app.AckMessageRequest) (app.AckMessageResult, error)
-	showMessage  func(req app.ShowMessageRequest) (app.ShowMessageResult, error)
-	answer       func(req app.AnswerRequest) (app.AnswerResult, error)
-	createTask   func(req app.CreateTaskRequest) (app.CreateTaskResult, error)
-	requestRetry func(req app.RequestRetryRequest) (app.RequestRetryResult, error)
-	closePlan    func(req app.ClosePlanRequest) (app.ClosePlanResult, error)
-	submitReview func(req app.SubmitReviewRequest) (app.SubmitReviewResult, error)
+	sendMessage        func(req app.SendMessageRequest) (app.SendMessageResult, error)
+	fetchMessage       func(req app.FetchMessageRequest) (app.FetchMessageResult, error)
+	ackMessage         func(req app.AckMessageRequest) (app.AckMessageResult, error)
+	messageWaitDefault func(runID string) (time.Duration, error)
+	showMessage        func(req app.ShowMessageRequest) (app.ShowMessageResult, error)
+	answer             func(req app.AnswerRequest) (app.AnswerResult, error)
+	createTask         func(req app.CreateTaskRequest) (app.CreateTaskResult, error)
+	requestRetry       func(req app.RequestRetryRequest) (app.RequestRetryResult, error)
+	closePlan          func(req app.ClosePlanRequest) (app.ClosePlanResult, error)
+	submitReview       func(req app.SubmitReviewRequest) (app.SubmitReviewResult, error)
 
 	selectRunView func(label string) error
 	clearRunView  func() error
+
+	// frozenRepositoryRoot and frozenStateRoot are the scripted run's
+	// frozen roots: the unscripted AssignmentDefaults serves them, and
+	// AssignReadyTasks refuses any other value, exactly as the real
+	// Controller does. Empty selects fakeFrozenRepositoryRoot /
+	// fakeFrozenStateRoot.
+	frozenRepositoryRoot string
+	frozenStateRoot      string
+
+	// runState is the scripted run's durable state as the state-aware
+	// methods see it (guarded by mu; empty means running, the state every
+	// scheduling-pass test starts from). AssignReadyTasks refuses every
+	// state but running exactly as the real use case does, and the
+	// unscripted DriveCompletion reports it; a scripted method that moves
+	// the run calls setRunState.
+	runState string
+}
+
+// currentRunState returns the scripted run's durable state.
+func (f *fakeController) currentRunState() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.runState == "" {
+		return runStateRunning
+	}
+	return f.runState
+}
+
+// setRunState moves the scripted run to state.
+func (f *fakeController) setRunState(state string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.runState = state
+}
+
+// The scripted run's default frozen roots, deliberately distinct from
+// every directory a command test resolves from its own working directory
+// or environment.
+const (
+	fakeFrozenRepositoryRoot = "/frozen/repository"
+	fakeFrozenStateRoot      = "/frozen/state"
+)
+
+// frozenRoots returns the scripted run's frozen repository and state
+// roots.
+func (f *fakeController) frozenRoots() (repositoryRoot, stateRoot string) {
+	repositoryRoot, stateRoot = f.frozenRepositoryRoot, f.frozenStateRoot
+	if repositoryRoot == "" {
+		repositoryRoot = fakeFrozenRepositoryRoot
+	}
+	if stateRoot == "" {
+		stateRoot = fakeFrozenStateRoot
+	}
+	return repositoryRoot, stateRoot
 }
 
 func (f *fakeController) record(name string) {
@@ -287,18 +346,74 @@ func (f *fakeController) EnsureReviewTask(_ context.Context, _ app.RunHandle) (b
 	return f.ensureReviewTask()
 }
 
+// requireAbsoluteAssignmentPaths mirrors the real Controller's own
+// validateAssignmentOptions (internal/app/usecase_schedule.go), fakes law
+// 06FD1A61: this fake must refuse the exact same empty/relative
+// RepositoryRoot/HOPPath/StateRoot shape the real adapter refuses, so an
+// empty app.AssignmentOptions{} can never silently pass a scripted test
+// again.
+func requireAbsoluteAssignmentPaths(opts app.AssignmentOptions) error { //nolint:gocritic // hugeParam: AssignmentOptions is the per-call DTO the real port also takes by value.
+	if !filepath.IsAbs(opts.RepositoryRoot) {
+		return errors.New("assignment repository root is not absolute")
+	}
+	if !filepath.IsAbs(opts.HOPPath) {
+		return errors.New("assignment hop executable path is not absolute")
+	}
+	if !filepath.IsAbs(opts.StateRoot) {
+		return errors.New("assignment state root is not absolute")
+	}
+	return nil
+}
+
 func (f *fakeController) AssignReadyTasks(_ context.Context, _ app.RunHandle, opts app.AssignmentOptions) (app.AssignmentReport, error) { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.
 	f.record("AssignReadyTasks")
+	if err := requireAbsoluteAssignmentPaths(opts); err != nil {
+		return app.AssignmentReport{}, err
+	}
+	// The real use case's requireFrozenAssignmentRoots: a root other than
+	// the run's frozen one is refused before any task is reserved.
+	repositoryRoot, stateRoot := f.frozenRoots()
+	if opts.RepositoryRoot != repositoryRoot {
+		return app.AssignmentReport{}, errors.New("assignment repository root is not the run's frozen repository root")
+	}
+	if opts.StateRoot != stateRoot {
+		return app.AssignmentReport{}, errors.New("assignment state root is not the run's frozen state root")
+	}
+	// The real use case's Run.CanAcceptManagerVerb gate, checked inside the
+	// assignment transaction before any task is read: every state but
+	// running is refused, whether or not a task is ready.
+	if state := f.currentRunState(); state != runStateRunning {
+		return app.AssignmentReport{}, fmt.Errorf("run: run is not accepting this request: state %s", state)
+	}
 	if f.assignReadyTasks == nil {
 		return app.AssignmentReport{}, nil
 	}
 	return f.assignReadyTasks(opts)
 }
 
+func (f *fakeController) AssignmentDefaults(_ context.Context, _ app.RunHandle) (app.AssignmentOptions, error) { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.
+	f.record("AssignmentDefaults")
+	if f.assignmentDefaults == nil {
+		repositoryRoot, stateRoot := f.frozenRoots()
+		return app.AssignmentOptions{RepositoryRoot: repositoryRoot, StateRoot: stateRoot}, nil
+	}
+	return f.assignmentDefaults()
+}
+
+func (f *fakeController) ResolveIntegrationHead(_ context.Context, _ app.RunHandle) (string, error) { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.
+	f.record("ResolveIntegrationHead")
+	if f.resolveIntegrationHead == nil {
+		return "", nil
+	}
+	return f.resolveIntegrationHead()
+}
+
 func (f *fakeController) DriveCompletion(_ context.Context, _ app.RunHandle) (app.CompletionReport, error) { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.
 	f.record("DriveCompletion")
 	if f.driveCompletion == nil {
-		return app.CompletionReport{}, nil
+		// The real use case always reports the run's state after the
+		// round for a feature-mode run.
+		return app.CompletionReport{RunState: f.currentRunState()}, nil
 	}
 	return f.driveCompletion()
 }
@@ -333,6 +448,14 @@ func (f *fakeController) AckMessage(_ context.Context, req app.AckMessageRequest
 		return app.AckMessageResult{}, errors.New("unexpected AckMessage")
 	}
 	return f.ackMessage(req)
+}
+
+func (f *fakeController) MessageWaitDefault(_ context.Context, runID string) (time.Duration, error) {
+	f.record("MessageWaitDefault")
+	if f.messageWaitDefault == nil {
+		return 0, errors.New("unexpected MessageWaitDefault")
+	}
+	return f.messageWaitDefault(runID)
 }
 
 func (f *fakeController) ShowMessage(_ context.Context, req app.ShowMessageRequest) (app.ShowMessageResult, error) {

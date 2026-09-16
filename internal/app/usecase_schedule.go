@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -111,6 +112,66 @@ type AssignmentOptions struct {
 	StateRoot                string
 }
 
+// validateAssignmentOptions refuses an AssignmentOptions value the
+// scheduling-pass loop has not actually populated: RepositoryRoot,
+// HOPPath and StateRoot back every worktree, launch and artifact write
+// this step performs, so an empty or relative value here would silently
+// misdirect every git and file-write call at the controller process's own
+// working directory instead of the run's frozen locations, rather than
+// failing loudly the way a caller passing the zero AssignmentOptions{}
+// deserves. The refusals name the field, never its value.
+func validateAssignmentOptions(opts AssignmentOptions) error { //nolint:gocritic // hugeParam: AssignmentOptions is the per-call DTO already threaded through this file; a pointer would only complicate every call site.
+	if !filepath.IsAbs(opts.RepositoryRoot) {
+		return errors.New("app: assignment repository root is not absolute")
+	}
+	if !filepath.IsAbs(opts.HOPPath) {
+		return errors.New("app: assignment hop executable path is not absolute")
+	}
+	if !filepath.IsAbs(opts.StateRoot) {
+		return errors.New("app: assignment state root is not absolute")
+	}
+	return nil
+}
+
+// requireFrozenAssignmentRoots refuses an AssignmentOptions whose
+// RepositoryRoot or StateRoot is not the run's own frozen value. A known
+// run operates on its frozen repository, never on whatever directory the
+// caller happens to run in: a worktree created from another repository
+// would pass provenance against that same foreign root. The refusals name
+// the field, never either value.
+func requireFrozenAssignmentRoots(opts *AssignmentOptions, frozen *FrozenRun) error {
+	if opts.RepositoryRoot != frozen.RepositoryRoot {
+		return errors.New("app: assignment repository root is not the run's frozen repository root")
+	}
+	if opts.StateRoot != frozen.Snapshot.StateRoot {
+		return errors.New("app: assignment state root is not the run's frozen state root")
+	}
+	return nil
+}
+
+// AssignmentDefaults returns every AssignReadyTasks field the run itself
+// fixes, read from its frozen record: MaxWorkers, the default Harness and
+// ReviewerHarness from the frozen WorkflowSnapshot, and the frozen
+// RepositoryRoot and StateRoot — the repository a known run operates on
+// is its frozen repository, never the caller's working directory. The
+// scheduling-pass loop (cmd/hop) adds HOPPath (the running binary) and the
+// per-pass IntegrationHeadCommitOID (ResolveIntegrationHead). Composition
+// passes only primitives and app-defined DTOs; the domain Harness type
+// this returns is named only here, never in cmd/hop.
+func (c *Controller) AssignmentDefaults(ctx context.Context, handle RunHandle) (AssignmentOptions, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per scheduling pass.
+	frozen, err := c.Read.LoadFrozenRun(ctx, handle.runID)
+	if err != nil {
+		return AssignmentOptions{}, fmt.Errorf("app: load frozen run: %w", err)
+	}
+	return AssignmentOptions{
+		MaxWorkers:      frozen.Snapshot.Workflow.MaxWorkers,
+		Harness:         run.Harness(frozen.Snapshot.Harness),
+		ReviewerHarness: run.Harness(frozen.Snapshot.Workflow.ReviewerHarness),
+		RepositoryRoot:  frozen.RepositoryRoot,
+		StateRoot:       frozen.Snapshot.StateRoot,
+	}, nil
+}
+
 // AssignedTask is one task AssignReadyTasks launched.
 type AssignedTask struct {
 	TaskID        identity.TaskID
@@ -141,6 +202,9 @@ type AssignmentReport struct {
 // counted INSIDE each assignment transaction so it can never overshoot
 // even across a takeover.
 func (c *Controller) AssignReadyTasks(ctx context.Context, handle RunHandle, opts AssignmentOptions) (AssignmentReport, error) { //nolint:gocritic // hugeParam: RunHandle and AssignmentOptions are per-call DTOs; this runs once per scheduling pass, never a hot loop.
+	if err := validateAssignmentOptions(opts); err != nil {
+		return AssignmentReport{}, err
+	}
 	maxWorkers := opts.MaxWorkers
 	if maxWorkers <= 0 {
 		maxWorkers = 2
@@ -153,6 +217,11 @@ func (c *Controller) AssignReadyTasks(ctx context.Context, handle RunHandle, opt
 	frozen, err := c.Read.LoadFrozenRun(ctx, handle.runID)
 	if err != nil {
 		return AssignmentReport{}, fmt.Errorf("app: load frozen run: %w", err)
+	}
+	// Refused before any task is reserved: every worktree, provenance
+	// check and pane below would otherwise follow the supplied roots.
+	if err := requireFrozenAssignmentRoots(&opts, &frozen); err != nil {
+		return AssignmentReport{}, err
 	}
 	var report AssignmentReport
 	for {
