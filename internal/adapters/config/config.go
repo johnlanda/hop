@@ -36,12 +36,26 @@ var _ app.ConfigurationSource = Source{}
 
 // fileConfig is the policy file's wire shape; it stays inside this adapter
 // and callers receive app.RunPolicy values only. Check is a pointer so a
-// missing [check] table is distinguishable and rejected.
+// missing [check] table is distinguishable and rejected. The Phase 3
+// sections ([workflow], [workers], [retry], [messages], [roles.*]) are
+// shape-validated whenever PRESENT regardless of mode — `hop run
+// --workflow feature` can override a solo-mode file (design section 10),
+// so a file may carry them without setting mode = "feature" — while
+// their defaults and the feature-mode requireds are applied and enforced
+// only under mode = "feature", through the shared app helpers the
+// override path calls too (app.ApplyWorkflowDefaults,
+// app.ValidateFeaturePolicy). A file with none of them loads to the
+// exact Phase 2 policy, every Phase 3 field zero.
 type fileConfig struct {
-	Check   *checkSection  `toml:"check"`
-	Env     envSection     `toml:"env"`
-	Worker  workerSection  `toml:"worker"`
-	Profile profileSection `toml:"profile"`
+	Check    *checkSection    `toml:"check"`
+	Env      envSection       `toml:"env"`
+	Worker   workerSection    `toml:"worker"`
+	Profile  profileSection   `toml:"profile"`
+	Workflow *workflowSection `toml:"workflow"`
+	Workers  *workersSection  `toml:"workers"`
+	Retry    *retrySection    `toml:"retry"`
+	Messages *messagesSection `toml:"messages"`
+	Roles    *rolesSection    `toml:"roles"`
 }
 
 type checkSection struct {
@@ -66,6 +80,55 @@ type workerSection struct {
 
 type profileSection struct {
 	Dir string `toml:"dir"`
+}
+
+type workflowSection struct {
+	// Mode is a pointer so an absent key (solo semantics, the zero-value
+	// policy) is distinguishable from an explicitly supplied value, which
+	// is always validated — "" is a rejection, never a silent default.
+	Mode *string `toml:"mode"`
+}
+
+type workersSection struct {
+	// Max is a pointer so an absent key (defaulted to 2 in feature mode)
+	// is distinguishable from an explicit value, which is always
+	// validated — 0 is a rejection, never "absent".
+	Max *int `toml:"max"`
+}
+
+type retrySection struct {
+	// MaxAttempts is a pointer for the same absent-vs-explicit reason as
+	// workersSection.Max; the feature-mode default is 3.
+	MaxAttempts *int `toml:"max_attempts"`
+}
+
+type messagesSection struct {
+	// Both durations are pointers like checkSection.Timeout: an absent key
+	// defaults (120s / 50s, feature mode), an explicit value is validated.
+	AttentionAfter *string `toml:"attention_after"`
+	WaitTimeout    *string `toml:"wait_timeout"`
+}
+
+type rolesSection struct {
+	Manager     *roleSection         `toml:"manager"`
+	Implementer *roleSection         `toml:"implementer"`
+	Reviewer    *reviewerRoleSection `toml:"reviewer"`
+}
+
+type roleSection struct {
+	// Instructions is a pointer so a present-but-empty value is
+	// distinguishable from an absent key: a [roles.<role>] table without
+	// instructions is a rejection — the table exists only to name the
+	// role's instructions file.
+	Instructions *string `toml:"instructions"`
+}
+
+type reviewerRoleSection struct {
+	Instructions *string `toml:"instructions"`
+	// Harness is a pointer so an absent key (defaulted to the worker
+	// harness in feature mode) is distinguishable from an explicit value,
+	// which is always validated against the supported set.
+	Harness *string `toml:"harness"`
 }
 
 // Load reads and validates `<repositoryRoot>/.herdr-orchestrator/
@@ -134,12 +197,16 @@ func expectedShape(key string) string {
 	switch key {
 	case "check.command", "env.strip", "env.passthrough":
 		return "an array of strings"
-	case "check.timeout":
+	case "check.timeout", "messages.attention_after", "messages.wait_timeout":
 		return "a string holding a Go duration"
 	case "check.repeatable":
 		return "a boolean"
-	case "worker.harness", "profile.dir":
+	case "worker.harness", "profile.dir", "workflow.mode",
+		"roles.manager.instructions", "roles.implementer.instructions",
+		"roles.reviewer.instructions", "roles.reviewer.harness":
 		return "a string"
+	case "workers.max", "retry.max_attempts":
+		return "an integer"
 	}
 	return "the shape the package guide's example shows"
 }
@@ -179,7 +246,7 @@ func policyFromFile(file *fileConfig, repositoryRoot, path string) (app.RunPolic
 	if err != nil {
 		return app.RunPolicy{}, err
 	}
-	return app.RunPolicy{
+	policy := app.RunPolicy{
 		CheckArgv:       slices.Clone(file.Check.Command),
 		CheckTimeout:    timeout,
 		CheckRepeatable: file.Check.Repeatable,
@@ -187,7 +254,143 @@ func policyFromFile(file *fileConfig, repositoryRoot, path string) (app.RunPolic
 		EnvPassthrough:  slices.Clone(file.Env.Passthrough),
 		ProfileDir:      profileDir,
 		Harness:         harness,
-	}, nil
+	}
+	if err := applyWorkflowKeys(&policy, file, repositoryRoot, path); err != nil {
+		return app.RunPolicy{}, err
+	}
+	return policy, nil
+}
+
+// applyWorkflowKeys validates and applies the Phase 3 policy sections
+// (docs/plan/phase-3-design.md section 3). Every PRESENT key is validated
+// regardless of mode, so a solo-mode file carrying feature sections still
+// fails on a bad value and `hop run --workflow feature` can override the
+// mode later; the defaults and feature-mode requireds are applied only
+// under mode = "feature", through the shared app helpers the override
+// path calls too. A file with none of these sections leaves the policy's
+// Phase 3 fields at their zero values — the exact Phase 2 result.
+func applyWorkflowKeys(policy *app.RunPolicy, file *fileConfig, repositoryRoot, path string) error {
+	if file.Workflow != nil && file.Workflow.Mode != nil {
+		switch *file.Workflow.Mode {
+		case app.WorkflowModeSolo, app.WorkflowModeFeature:
+			policy.WorkflowMode = *file.Workflow.Mode
+		default:
+			return fmt.Errorf("%s: workflow.mode is not a supported mode; supported modes are %q and %q", path, app.WorkflowModeSolo, app.WorkflowModeFeature)
+		}
+	}
+	if file.Workers != nil && file.Workers.Max != nil {
+		if *file.Workers.Max < 1 {
+			return fmt.Errorf("%s: workers.max must be at least 1", path)
+		}
+		policy.MaxWorkers = *file.Workers.Max
+	}
+	if file.Retry != nil && file.Retry.MaxAttempts != nil {
+		if *file.Retry.MaxAttempts < 1 {
+			return fmt.Errorf("%s: retry.max_attempts must be at least 1", path)
+		}
+		policy.RetryLimit = *file.Retry.MaxAttempts
+	}
+	if file.Messages != nil {
+		attention, err := parseMessageDuration(file.Messages.AttentionAfter, "messages.attention_after", path)
+		if err != nil {
+			return err
+		}
+		policy.MessageAttention = attention
+		wait, err := parseMessageDuration(file.Messages.WaitTimeout, "messages.wait_timeout", path)
+		if err != nil {
+			return err
+		}
+		policy.MessageWait = wait
+	}
+	if file.Roles != nil {
+		manager, err := resolveRoleInstructions(file.Roles.Manager == nil, roleInstructions(file.Roles.Manager), "roles.manager", repositoryRoot, path)
+		if err != nil {
+			return err
+		}
+		policy.ManagerRole = manager
+		implementer, err := resolveRoleInstructions(file.Roles.Implementer == nil, roleInstructions(file.Roles.Implementer), "roles.implementer", repositoryRoot, path)
+		if err != nil {
+			return err
+		}
+		policy.ImplementerRole = implementer
+		if file.Roles.Reviewer != nil {
+			reviewer, err := resolveRoleInstructions(false, file.Roles.Reviewer.Instructions, "roles.reviewer", repositoryRoot, path)
+			if err != nil {
+				return err
+			}
+			policy.ReviewerRole = reviewer
+			if file.Roles.Reviewer.Harness != nil {
+				switch *file.Roles.Reviewer.Harness {
+				case app.HarnessClaude, app.HarnessCodex, app.HarnessOpencode:
+					policy.ReviewerHarness = *file.Roles.Reviewer.Harness
+				default:
+					return fmt.Errorf("%s: roles.reviewer.harness is not a supported harness; supported harnesses are %q, %q and %q", path, app.HarnessClaude, app.HarnessCodex, app.HarnessOpencode)
+				}
+			}
+		}
+	}
+	if policy.WorkflowMode != app.WorkflowModeFeature {
+		return nil
+	}
+	app.ApplyWorkflowDefaults(policy)
+	if err := app.ValidateFeaturePolicy(policy); err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	return nil
+}
+
+// roleInstructions reads a role table's instructions pointer, nil-safe.
+func roleInstructions(section *roleSection) *string {
+	if section == nil {
+		return nil
+	}
+	return section.Instructions
+}
+
+// resolveRoleInstructions validates one [roles.<role>] table: an absent
+// table stays "", a present table must name a non-empty instructions
+// path with no control byte, and a relative path resolves against the
+// repository's .herdr-orchestrator directory at load — like profile.dir,
+// so the frozen policy never carries a working-directory-dependent path.
+func resolveRoleInstructions(absent bool, instructions *string, key, repositoryRoot, path string) (string, error) {
+	if absent {
+		return "", nil
+	}
+	if instructions == nil || *instructions == "" {
+		return "", fmt.Errorf("%s: %s.instructions is required; the table exists only to name the role's instructions file", path, key)
+	}
+	dir := *instructions
+	if containsControlByte(dir) {
+		return "", fmt.Errorf("%s: %s.instructions contains a control byte, which HOP does not permit in a role path", path, key)
+	}
+	if !filepath.IsAbs(dir) {
+		dir = filepath.Join(repositoryRoot, ".herdr-orchestrator", dir)
+	}
+	if !filepath.IsAbs(dir) {
+		abs, err := filepath.Abs(dir)
+		if err != nil {
+			return "", fmt.Errorf("%s: resolve %s.instructions to an absolute path: %w", path, key, err)
+		}
+		dir = abs
+	}
+	return filepath.Clean(dir), nil
+}
+
+// parseMessageDuration validates one [messages] duration key: absent
+// stays zero (defaulted only in feature mode), an explicit value must be
+// a positive Go duration.
+func parseMessageDuration(value *string, key, path string) (time.Duration, error) {
+	if value == nil {
+		return 0, nil
+	}
+	parsed, err := time.ParseDuration(*value)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %s is not a Go duration string; use forms like \"120s\" or \"2m\"", path, key)
+	}
+	if parsed <= 0 {
+		return 0, fmt.Errorf("%s: %s must be a positive duration", path, key)
+	}
+	return parsed, nil
 }
 
 // resolveProfileDir resolves an optional profile.dir to an absolute,
