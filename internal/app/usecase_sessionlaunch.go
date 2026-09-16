@@ -125,7 +125,23 @@ func (c *Controller) PrepareSessionLaunchExec(ctx context.Context, req SessionLa
 		}
 	}
 
-	validated, err := slc.Snapshot.EnvPolicy.Validate()
+	// The frozen policy's Harness names the WORKER harness, but the
+	// session's own harness is authoritative for what execs here — a
+	// [roles.reviewer] harness may differ — and SanitizeEnvironment
+	// selects the profile assignment from the policy's harness.
+	// Sanitizing under the worker's harness hands a cross-harness
+	// reviewer the WRONG profile variable (a Claude worker policy with a
+	// profile directory would leave a Codex reviewer with
+	// CLAUDE_CONFIG_DIR set and no CODEX_HOME, so the configured profile
+	// would not govern the executed binary — it could run under the
+	// user's default account instead). The policy value is copied and its
+	// harness set to the session's before validation: the frozen snapshot
+	// is never mutated, the frozen strip/passthrough/profile-directory
+	// values are kept, and the resulting environment feeds the trust
+	// seed and the exec alike.
+	policy := slc.Snapshot.EnvPolicy
+	policy.Harness = string(slc.Harness)
+	validated, err := policy.Validate()
 	if err != nil {
 		return LaunchExecPlan{}, fmt.Errorf("app: frozen environment policy: %w", err)
 	}

@@ -692,3 +692,98 @@ func TestGoldenRolePrompts(t *testing.T) {
 		})
 	}
 }
+
+// TestPrepareSessionLaunchExecCrossHarnessProfile is the security
+// regression table for the pass-1 review's HIGH finding (the ported
+// overlay probe plus the reverse and opencode pairs): the frozen
+// policy's harness names the WORKER, but the session's own harness is
+// what execs, and the configured profile directory must govern THAT
+// binary — the profile assignment and the trust seed both follow the
+// session harness, while the strip matrix (always the union) still
+// removes every credential.
+func TestPrepareSessionLaunchExecCrossHarnessProfile(t *testing.T) {
+	newContext := func(workerHarness string, sessionHarness run.Harness) SessionLaunchContext {
+		slc := ebSessionContext(t, run.RoleReviewer)
+		slc.Snapshot.Harness = workerHarness
+		slc.Snapshot.EnvPolicy.Harness = workerHarness
+		slc.Snapshot.EnvPolicy.ProfileDir = "/profiles/isolated"
+		slc.Harness = sessionHarness
+		slc.Session.Harness = sessionHarness
+		return slc
+	}
+	prepare := func(t *testing.T, slc SessionLaunchContext, trust *ebTrustStub) (LaunchExecPlan, *ebSubmissionStub) {
+		t.Helper()
+		read := &ebSessionReadStub{session: slc}
+		subs := &ebSubmissionStub{}
+		c := &Controller{Read: read, Submissions: subs, Clock: ebClock{now: time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)}}
+		if trust != nil {
+			c.Trust = trust
+		}
+		req := ebSessionRequest()
+		req.Environ = ebSessionEnviron(run.RoleReviewer)
+		plan, err := c.PrepareSessionLaunchExec(context.Background(), req)
+		if err != nil {
+			t.Fatalf("PrepareSessionLaunchExec: %v", err)
+		}
+		return plan, subs
+	}
+
+	t.Run("codex reviewer under a claude worker policy gets CODEX_HOME (the overlay probe)", func(t *testing.T) {
+		plan, _ := prepare(t, newContext(HarnessClaude, run.HarnessCodex), nil)
+
+		if plan.Argv[0] != "/resolved/codex" {
+			t.Fatalf("argv0 = %q", plan.Argv[0])
+		}
+		if got := environValue(plan.Env, "CODEX_HOME"); got != "/profiles/isolated" {
+			t.Fatalf("reviewer profile isolation lost: CODEX_HOME=%q CLAUDE_CONFIG_DIR=%q argv0=%q",
+				got, environValue(plan.Env, "CLAUDE_CONFIG_DIR"), plan.Argv[0])
+		}
+		if got := environValue(plan.Env, "CLAUDE_CONFIG_DIR"); got != "" {
+			t.Errorf("the worker harness's profile variable leaked: CLAUDE_CONFIG_DIR=%q", got)
+		}
+		if strings.Contains(strings.Join(plan.Env, "\n"), "ANTHROPIC_API_KEY") {
+			t.Errorf("the strip union no longer removes a credential")
+		}
+	})
+
+	t.Run("claude reviewer under a codex worker policy gets CLAUDE_CONFIG_DIR and seeds under it", func(t *testing.T) {
+		trust := &ebTrustStub{outcome: TrustSeedOutcome{Seeded: true}}
+		plan, subs := prepare(t, newContext(HarnessCodex, run.HarnessClaude), trust)
+
+		if plan.Argv[0] != "/resolved/claude" {
+			t.Fatalf("argv0 = %q", plan.Argv[0])
+		}
+		if got := environValue(plan.Env, "CLAUDE_CONFIG_DIR"); got != "/profiles/isolated" {
+			t.Fatalf("reviewer profile isolation lost: CLAUDE_CONFIG_DIR=%q CODEX_HOME=%q", got, environValue(plan.Env, "CODEX_HOME"))
+		}
+		if got := environValue(plan.Env, "CODEX_HOME"); got != "" {
+			t.Errorf("the worker harness's profile variable leaked: CODEX_HOME=%q", got)
+		}
+		if len(trust.calls) != 1 || trust.calls[0] != "/profiles/isolated/.claude.json <- /private/var/worktrees/hop-run-1" {
+			t.Fatalf("trust seed did not follow the session harness's profile: %v", trust.calls)
+		}
+		if len(subs.claims) != 1 || !strings.Contains(subs.claims[0].SeedEvidence, "seeded") {
+			t.Errorf("claim seed evidence = %+v", subs.claims)
+		}
+	})
+
+	t.Run("opencode reviewer under a claude worker policy gets the HOME plus XDG profile shape", func(t *testing.T) {
+		plan, subs := prepare(t, newContext(HarnessClaude, run.HarnessOpenCode), nil)
+
+		if plan.Argv[0] != "/resolved/opencode" {
+			t.Fatalf("argv0 = %q", plan.Argv[0])
+		}
+		if got := environValue(plan.Env, "HOME"); got != "/profiles/isolated" {
+			t.Fatalf("opencode HOME = %q", got)
+		}
+		if got := environValue(plan.Env, "XDG_CONFIG_HOME"); got != "/profiles/isolated/.config" {
+			t.Fatalf("opencode XDG_CONFIG_HOME = %q", got)
+		}
+		if got := environValue(plan.Env, "CLAUDE_CONFIG_DIR"); got != "" {
+			t.Errorf("the worker harness's profile variable leaked: CLAUDE_CONFIG_DIR=%q", got)
+		}
+		if len(subs.claims) != 1 || !strings.Contains(subs.claims[0].SeedEvidence, "not seeded") {
+			t.Errorf("opencode must record a not-seeded outcome: %+v", subs.claims)
+		}
+	})
+}
