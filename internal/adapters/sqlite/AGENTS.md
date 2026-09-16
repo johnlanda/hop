@@ -33,7 +33,7 @@ this package never resolves environment variables or defaults.
 | [review.go](review.go) | `SubmitReview`, `persistVerdictAcceptance`, `reviewerSessionEligible` | The section 8 worker-authority verdict write: SubmitResult's order mirrored, acceptance persisting the review, completing attempt and task, closing the mailbox and committing the controller's reasons-bearing manager notice atomically |
 | [workflow_read.go](workflow_read.go) | `LoadSessionLaunchContext`, `LoadMessagingContext`, `LoadMessageDetail`, `featureRunDetail`, `mailboxStatuses`, `guardShortfalls`, `pendingQuestions` | The Phase 3 lease-free reads (`app.WorkflowReadStore`): session-addressed launch context (binding else the SESSION-keyed pending intent, fail closed; the attempt row, worktree path and Relaunch successor fact), the messaging context, hop msg show's detail, and RunDetail's feature extensions |
 | [messages.go](messages.go) | `parseAddress`, `scanMessage`, `getMessage`, `messagesByAddress`, `nextEnqueueSeq`, `insertMessage`, `messageDeliveries`, `messageAck`, `resolveSessionAddress` | Shared message row mapping: Message.State reconstructed from the delivery/ack rows in the same snapshot (never a persisted column), the per-(run, recipient) FIFO sequence, lineage-based address resolution |
-| [statestore.go](statestore.go) | `InitializeRun`, `AcquireLease`, `Heartbeat`, `ReleaseLease`, `Begin`, `validateLease` | The controller authority: run bootstrap in one transaction (the snapshot's workflow JSON round-tripped, NULL for solo), lease CAS with monotonic generations, fenced unit-of-work begin |
+| [statestore.go](statestore.go) | `InitializeRun`, `AcquireLease`, `Heartbeat`, `ReleaseLease`, `Begin`, `validateLease` | The controller authority: run bootstrap in one transaction (the snapshot's workflow JSON round-tripped, NULL for solo; a feature spec inserts the run, snapshot, manager session and lease only, refusing `app.ErrFeatureRunSpecInvalid` before the transaction and `app.ErrRunSequenceMismatch` inside it), lease CAS with monotonic generations, fenced unit-of-work begin |
 | [uow.go](uow.go) | `unitOfWork` and the typed repositories (`Runs`…`CheckExecClaims`), `OperationRepository.Pending`/`ByKind`, `Commit`, `Rollback` | One immediate transaction per unit of work; optimistic-concurrency saves; append-only bindings and transitions; journal payloads persisted as uninterpreted JSON; controller-side launch-claim settlement |
 | [entities.go](entities.go) | `getRun`, `getTask`, `getAttempt`, `getSession`, `currentSession`, `currentBinding`, `getLaunchClaim`, `acceptedResult`, `incarnationCurrent`, `launchIncarnationCurrent`, `pendingLaunchIntent` | Row ↔ domain-value mapping shared by all three authorities through the `querier` interface |
 | [submission.go](submission.go) | `SubmitResult`, `RecordMalformed`, `ClaimLaunch`, `SettleLaunchFailure`, `ClaimCheckExec`, `RequestStop`, `insertReceipt` | The worker authority: the section 7 validation order with the domain's `AcceptResult` inside one transaction, receipts for every outcome, the pre-exec claim contracts, the monotonic stop request |
@@ -251,6 +251,16 @@ this package never resolves environment variables or defaults.
   (`TestLoadSessionLaunchContext`, `TestLoadMessagingContext`,
   `TestLoadMessageDetail`, `TestRunDetailFeatureExtensions`,
   `TestRunDetailSoloZeroValues`, `TestLoadCheckExecutionContextByKind`);
+  the feature bootstrap (`bootstrap_test.go`:
+  `TestInitializeRunFeatureShape` — run, snapshot workflow JSON, a
+  reserved attempt-less parentless manager with its assigned native
+  reference, the lease, and no task/attempt/worktree row —
+  `TestInitializeRunFeatureSecondManagerUnrepresentable` raced from two
+  handles, `TestStoreVectorsFeatureBootstrap` and
+  `TestInitializeRunFeatureSequenceRace`); the Phase 3 repository suites
+  seed their feature runs through `initLegacyFeatureRun` (solo bootstrap
+  rows under a feature workflow column), since they address the solo
+  task/attempt/session as the run's first task;
   and `TestStoreVectors`, the real-store half of the shared
   refused-input contract, driving every
   [internal/testsupport/storevectors](../../testsupport/storevectors/AGENTS.md)
