@@ -106,6 +106,7 @@ func newFeatureStart(t *testing.T) *featureStart {
 		t.Fatalf("register repository HEAD: %v", err)
 	}
 	f := &featureStart{t: t, tc: tc, git: git, base: base, createdPanes: map[string]app.PaneRef{}}
+	t.Cleanup(func() { git.requireNoDerefUpdates(t) })
 	f.store = &initHookStore{fakeStore: tc.Store}
 	tc.Controller.Store = f.store
 	f.store.before = func(int, *app.NewRunSpec) { f.event("initialize") }

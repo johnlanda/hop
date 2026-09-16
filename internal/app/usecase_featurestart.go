@@ -65,6 +65,7 @@ type integrationInitEvidence struct {
 	ExitCode    int    `json:"exit_code"`
 	Stderr      string `json:"stderr,omitempty"`
 	ObservedRef string `json:"observed_ref,omitempty"`
+	SymbolicRef bool   `json:"symbolic_ref,omitempty"`
 	Adopted     bool   `json:"adopted,omitempty"`
 }
 
@@ -323,7 +324,7 @@ func (c *Controller) freezeAndInitialize(ctx context.Context, spec *NewRunSpec, 
 			return Lease{}, err
 		}
 		branch := IntegrationBranchName(seq)
-		if present, observed := c.observeRef(ctx, spec.RepositoryRoot, integrationRef(branch)); observed && present != "" {
+		if seen := c.observeRef(ctx, spec.RepositoryRoot, integrationRef(branch)); seen.symbolic || seen.value != "" {
 			return Lease{}, fmt.Errorf("%w: %w", ErrStartRefused, integrationBranchCollision(integrationRef(branch)))
 		}
 		workflow, err := c.FreezeWorkflowArtifacts(ctx, &WorkflowFreezeRequest{
@@ -359,23 +360,48 @@ func (c *Controller) predictRunSequence(ctx context.Context, repositoryRoot stri
 	return highest + 1, nil
 }
 
-// observeRef reads ref's current object ID with `git rev-parse --verify`,
-// exactly as the integration operations read the live ref. observed is
-// false when the read could not be made at all (a transport failure). A
-// successful read of an existing ref returns its object ID (G1/G3,
-// TestSpikeUpdateRefCreateOnlySemantics). A non-zero exit returns
-// ("", true): the ref was not observed present — never treated as proof
-// of absence, only as permission to attempt the create-only CAS, which is
-// itself the authoritative existence test.
-func (c *Controller) observeRef(ctx context.Context, repositoryRoot, ref string) (value string, observed bool) {
+// refObservation is one read of an integration ref.
+type refObservation struct {
+	// observed is false when either read could not be made at all.
+	observed bool
+	// symbolic is true for a symbolic ref, dangling or not: never HOP's,
+	// always a collision.
+	symbolic bool
+	// value is a direct ref's object ID; "" when the ref was not observed
+	// present.
+	value string
+}
+
+// observeRef reads ref in two pinned steps (the process adapter's real-git
+// probe TestGitRefSemanticsThroughRunner): `git symbolic-ref -q <ref>`
+// exits 0 with the target for a symbolic ref (dangling included) and 1
+// with no output for a direct or absent ref — any other status is an
+// unobservable read; then `git rev-parse --verify <ref>`, exactly as the
+// integration operations read the live ref, returns an existing direct
+// ref's object ID (G1/G3). A non-zero rev-parse is "not observed present":
+// never proof of absence, only permission to attempt the create-only
+// --no-deref CAS, which is itself the authoritative existence test.
+func (c *Controller) observeRef(ctx context.Context, repositoryRoot, ref string) refObservation {
+	if !filepath.IsAbs(c.GitExecutable) {
+		return refObservation{}
+	}
+	symbolic, err := c.Commands.Run(ctx, Command{Argv: []string{c.GitExecutable, "-C", repositoryRoot, "symbolic-ref", "-q", ref}})
+	switch {
+	case err != nil:
+		return refObservation{}
+	case symbolic.ExitCode == 0:
+		return refObservation{observed: true, symbolic: true}
+	case symbolic.ExitCode != 1:
+		return refObservation{}
+	}
 	out, status := c.gitOutput(ctx, repositoryRoot, "rev-parse", "--verify", ref)
 	switch status {
 	case gitOK:
-		return out, true
+		return refObservation{observed: true, value: out}
 	case gitNonZero:
-		return "", true
+		return refObservation{observed: true}
 	default:
-		return "", false
+		return refObservation{}
 	}
 }
 
@@ -409,9 +435,11 @@ func (c *Controller) initIntegrationBranch(ctx context.Context, handle RunHandle
 }
 
 // actIntegrationInit revalidates, runs the create-only CAS
-// `git update-ref <ref> <base> ""` and records the outcome
+// `git update-ref --no-deref <ref> <base> ""` and records the outcome
 // (G1/G3-pinned: it succeeds only when the ref does not exist and leaves
-// an existing ref unchanged). Exit 0 succeeds. A refused CAS reads the
+// an existing ref unchanged; --no-deref makes an existing symbolic ref,
+// dangling or not, refuse instead of creating its target). A symbolic ref
+// read back is always a collision, never adopted. Exit 0 succeeds. A refused CAS reads the
 // ref back: present at the base commit is adopted only when adoptAtBase
 // (a recovered intent whose earlier dispatch may have landed), any other
 // present value is a collision and fails; a ref still not observed fails a
@@ -427,17 +455,15 @@ func (c *Controller) actIntegrationInit(ctx context.Context, handle RunHandle, o
 		return errors.New("app: git executable is not configured as an absolute path")
 	}
 	actCtx, release := handle.actContext(ctx)
-	result, runErr := c.Commands.Run(actCtx, Command{Argv: []string{c.GitExecutable, "-C", intent.RepositoryRoot, "update-ref", intent.Ref, intent.BaseOID, ""}})
-	var (
-		readback string
-		observed bool
-	)
+	result, runErr := c.Commands.Run(actCtx, Command{Argv: []string{c.GitExecutable, "-C", intent.RepositoryRoot, "update-ref", "--no-deref", intent.Ref, intent.BaseOID, ""}})
+	var seen refObservation
 	if runErr == nil {
-		readback, observed = c.observeRef(actCtx, intent.RepositoryRoot, intent.Ref)
+		seen = c.observeRef(actCtx, intent.RepositoryRoot, intent.Ref)
 	}
 	release()
+	readback, observed := seen.value, seen.observed
 
-	evidence := integrationInitEvidence{ExitCode: result.ExitCode, Stderr: string(result.Stderr), ObservedRef: readback}
+	evidence := integrationInitEvidence{ExitCode: result.ExitCode, Stderr: string(result.Stderr), ObservedRef: readback, SymbolicRef: seen.symbolic}
 	state := OperationReconciling
 	outcome := ""
 	var resultErr error
@@ -445,9 +471,13 @@ func (c *Controller) actIntegrationInit(ctx context.Context, handle RunHandle, o
 	case runErr != nil:
 		outcome = "the create-only update-ref could not be run; it may or may not have landed"
 		resultErr = fmt.Errorf("%w: %s (operation %s is reconciling); run hop resume %s", errIntegrationInitUnresolved, intent.Ref, opID, handle.runID)
-	case result.ExitCode == 0:
+	case result.ExitCode == 0 && !seen.symbolic:
 		state = OperationSucceeded
 		outcome = "integration branch created at the frozen base commit"
+	case seen.symbolic:
+		state = OperationFailed
+		outcome = "integration branch collision: the ref is a symbolic ref, never HOP's"
+		resultErr = fmt.Errorf("%w; then run hop resume %s, or hop stop %s", integrationBranchCollision(intent.Ref), handle.runID, handle.runID)
 	case !observed:
 		outcome = "the create-only update-ref was refused and the ref could not be read back"
 		resultErr = fmt.Errorf("%w: %s (operation %s is reconciling); run hop resume %s", errIntegrationInitUnresolved, intent.Ref, opID, handle.runID)
@@ -873,8 +903,9 @@ func (c *Controller) continueIntegrationInit(ctx context.Context, handle RunHand
 }
 
 // recoverIntegrationInit resolves an unresolved integration.init per its
-// decision row: the ref at the intent's base commit is adopted; any other
-// present value fails the operation as a collision; a ref not observed
+// decision row: a symbolic ref (dangling or not) fails the operation as a
+// collision and is never dereferenced; the ref at the intent's base commit
+// is adopted; any other present value fails as a collision; a ref not observed
 // present re-acts the SAME operation (a dead controller's surviving
 // dispatch can only write the identical value, and the create-only CAS
 // lets exactly one land); a read that cannot be made leaves the operation
@@ -886,11 +917,15 @@ func (c *Controller) recoverIntegrationInit(ctx context.Context, handle RunHandl
 		detail := fmt.Sprintf("integration.init %s has an undecodable intent; failing closed", op.ID)
 		return detail, c.markOperationReconciling(ctx, handle, op.ID, detail)
 	}
-	value, observed := c.observeRef(ctx, intent.RepositoryRoot, intent.Ref)
+	seen := c.observeRef(ctx, intent.RepositoryRoot, intent.Ref)
+	value := seen.value
 	switch {
-	case !observed:
+	case !seen.observed:
 		detail := fmt.Sprintf("integration.init %s: the ref could not be observed; it stays reconciling", op.ID)
 		return detail, c.markOperationReconciling(ctx, handle, op.ID, "the ref could not be observed; never treated as absence")
+	case seen.symbolic:
+		collision := fmt.Errorf("%w; then run hop resume %s, or hop stop %s", integrationBranchCollision(intent.Ref), handle.runID, handle.runID)
+		return collision.Error(), c.settleOperation(ctx, handle, op.ID, OperationFailed, "integration branch collision: the ref is a symbolic ref, never HOP's")
 	case value == intent.BaseOID:
 		return "", c.settleOperation(ctx, handle, op.ID, OperationSucceeded, "adopted: the ref is at the frozen base commit")
 	case value != "":
