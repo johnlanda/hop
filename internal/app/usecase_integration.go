@@ -786,7 +786,7 @@ func (c *Controller) actAndSettlePublish(ctx context.Context, handle RunHandle, 
 		return fmt.Errorf("app: revalidate before publish CAS: %w", err)
 	}
 	actCtx, release := handle.actContext(ctx)
-	_, casErr := c.runGit(actCtx, frozen.RepositoryRoot, "update-ref", intent.Ref, intent.NewOID, intent.ExpectedOldOID)
+	_, casErr := c.runGit(actCtx, frozen.RepositoryRoot, "update-ref", "--no-deref", intent.Ref, intent.NewOID, intent.ExpectedOldOID)
 	release()
 
 	if casErr != nil {
@@ -1033,7 +1033,7 @@ func (c *Controller) actAndSettleReset(ctx context.Context, handle RunHandle, fr
 		return "", fmt.Errorf("app: revalidate before reset CAS: %w", err)
 	}
 	actCtx, release := handle.actContext(ctx)
-	_, casErr := c.runGit(actCtx, frozen.RepositoryRoot, "update-ref", intent.Ref, rollbackOID, expectedOld)
+	_, casErr := c.runGit(actCtx, frozen.RepositoryRoot, "update-ref", "--no-deref", intent.Ref, rollbackOID, expectedOld)
 	release()
 	if casErr != nil {
 		observed, obsErr := c.runGit(ctx, frozen.RepositoryRoot, "rev-parse", "--verify", intent.Ref)

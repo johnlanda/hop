@@ -29,8 +29,8 @@ func retirementGitEnv() []string {
 	return []string{"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null", "GIT_TERMINAL_PROMPT=0"}
 }
 
-// gitProbe is one throwaway repository plus the absolute git it runs.
-type gitProbe struct {
+// worktreeProbe is one throwaway repository plus the absolute git it runs.
+type worktreeProbe struct {
 	t    *testing.T
 	git  string
 	root string // symlink-resolved temporary root
@@ -38,7 +38,7 @@ type gitProbe struct {
 	base string // the repository's second commit
 }
 
-func newGitProbe(t *testing.T) *gitProbe {
+func newWorktreeProbe(t *testing.T) *worktreeProbe {
 	t.Helper()
 	found, err := exec.LookPath("git")
 	if err != nil {
@@ -52,7 +52,7 @@ func newGitProbe(t *testing.T) *gitProbe {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := &gitProbe{t: t, git: git, root: root, repo: filepath.Join(root, "repo")}
+	p := &worktreeProbe{t: t, git: git, root: root, repo: filepath.Join(root, "repo")}
 	p.must(root, "init", "-q", "--object-format=sha1", "-b", "main", "repo")
 	p.commitAll("empty base", true)
 	p.writeFile(filepath.Join(p.repo, ".gitignore"), "ignored.txt\nbuild/\n")
@@ -63,7 +63,7 @@ func newGitProbe(t *testing.T) *gitProbe {
 }
 
 // run executes `git -C dir args...` through the production runner.
-func (p *gitProbe) run(dir string, args ...string) app.CommandResult {
+func (p *worktreeProbe) run(dir string, args ...string) app.CommandResult {
 	p.t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -79,7 +79,7 @@ func (p *gitProbe) run(dir string, args ...string) app.CommandResult {
 
 // must runs git and fails the test on a non-zero exit, returning trimmed
 // stdout.
-func (p *gitProbe) must(dir string, args ...string) string {
+func (p *worktreeProbe) must(dir string, args ...string) string {
 	p.t.Helper()
 	result := p.run(dir, args...)
 	if result.ExitCode != 0 {
@@ -88,7 +88,7 @@ func (p *gitProbe) must(dir string, args ...string) string {
 	return strings.TrimSpace(string(result.Stdout))
 }
 
-func (p *gitProbe) commitAll(message string, allowEmpty bool) string {
+func (p *worktreeProbe) commitAll(message string, allowEmpty bool) string {
 	p.t.Helper()
 	p.must(p.repo, "add", "-A")
 	args := []string{"-c", "user.name=hop-probe", "-c", "user.email=probe@invalid", "commit", "-q", "-m", message}
@@ -99,7 +99,7 @@ func (p *gitProbe) commitAll(message string, allowEmpty bool) string {
 	return p.must(p.repo, "rev-parse", "HEAD^{commit}")
 }
 
-func (p *gitProbe) writeFile(path, content string) {
+func (p *worktreeProbe) writeFile(path, content string) {
 	p.t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		p.t.Fatal(err)
@@ -111,7 +111,7 @@ func (p *gitProbe) writeFile(path, content string) {
 
 // addWorktree creates a linked checkout on a new attempt-shaped branch at
 // the probe's base commit and returns its canonical path.
-func (p *gitProbe) addWorktree(name string) (path, branch string) {
+func (p *worktreeProbe) addWorktree(name string) (path, branch string) {
 	p.t.Helper()
 	path = filepath.Join(p.root, "wt-"+name)
 	branch = "hop/r1/" + name
@@ -154,7 +154,7 @@ func parseWorktreeListZ(t *testing.T, out []byte) []worktreeRecord {
 	return records
 }
 
-func (p *gitProbe) listRecord(path string) (worktreeRecord, bool) {
+func (p *worktreeProbe) listRecord(path string) (worktreeRecord, bool) {
 	p.t.Helper()
 	result := p.run(p.repo, "worktree", "list", "--porcelain", "-z")
 	if result.ExitCode != 0 {
@@ -181,7 +181,7 @@ func TestGitProbeWorktreeRemoveOutcomes(t *testing.T) {
 	cases := []struct {
 		name string
 		// setup dirties the checkout; it runs after the worktree exists.
-		setup func(p *gitProbe, wt string)
+		setup func(p *worktreeProbe, wt string)
 		// removeOverride are `-c` pairs placed before the subcommand.
 		removeOverride []string
 		wantStatus     string // exact trimmed porcelain output of the pre-check
@@ -194,25 +194,25 @@ func TestGitProbeWorktreeRemoveOutcomes(t *testing.T) {
 	}{
 		{
 			name:        "clean",
-			setup:       func(*gitProbe, string) {},
+			setup:       func(*worktreeProbe, string) {},
 			wantFlags:   "H .gitignore\nH f.txt\nH g.txt",
 			wantRemoved: true,
 		},
 		{
 			name:       "untracked",
-			setup:      func(p *gitProbe, wt string) { p.writeFile(filepath.Join(wt, "new.txt"), "x\n") },
+			setup:      func(p *worktreeProbe, wt string) { p.writeFile(filepath.Join(wt, "new.txt"), "x\n") },
 			wantStatus: "?? new.txt",
 			wantExit:   128, wantStderr: "fatal: '%s' " + dirtyRefusal + "\n",
 		},
 		{
 			name:       "modified",
-			setup:      func(p *gitProbe, wt string) { p.writeFile(filepath.Join(wt, "f.txt"), "changed\n") },
+			setup:      func(p *worktreeProbe, wt string) { p.writeFile(filepath.Join(wt, "f.txt"), "changed\n") },
 			wantStatus: "M f.txt",
 			wantExit:   128, wantStderr: "fatal: '%s' " + dirtyRefusal + "\n",
 		},
 		{
 			name: "staged",
-			setup: func(p *gitProbe, wt string) {
+			setup: func(p *worktreeProbe, wt string) {
 				p.writeFile(filepath.Join(wt, "s.txt"), "s\n")
 				p.must(wt, "add", "s.txt")
 			},
@@ -221,36 +221,36 @@ func TestGitProbeWorktreeRemoveOutcomes(t *testing.T) {
 		},
 		{
 			name:  "nested untracked repository",
-			setup: func(p *gitProbe, wt string) { p.must(wt, "init", "-q", "nested") },
+			setup: func(p *worktreeProbe, wt string) { p.must(wt, "init", "-q", "nested") },
 			// The nested repository is reported as one untracked directory.
 			wantStatus: "?? nested/",
 			wantExit:   128, wantStderr: "fatal: '%s' " + dirtyRefusal + "\n",
 		},
 		{
 			name:     "locked",
-			setup:    func(p *gitProbe, wt string) { p.must(p.repo, "worktree", "lock", wt) },
+			setup:    func(p *worktreeProbe, wt string) { p.must(p.repo, "worktree", "lock", wt) },
 			wantExit: 128, wantStderr: "fatal: cannot remove a locked working tree;\nuse 'remove -f -f' to override or unlock first\n",
 		},
 		{
 			name:     "locked with a reason",
-			setup:    func(p *gitProbe, wt string) { p.must(p.repo, "worktree", "lock", "--reason", "in use", wt) },
+			setup:    func(p *worktreeProbe, wt string) { p.must(p.repo, "worktree", "lock", "--reason", "in use", wt) },
 			wantExit: 128, wantStderr: "fatal: cannot remove a locked working tree, lock reason: in use\nuse 'remove -f -f' to override or unlock first\n",
 		},
 		{
 			name:        "empty directory only",
-			setup:       func(p *gitProbe, wt string) { mkdirAll(p.t, filepath.Join(wt, "emptydir")) },
+			setup:       func(p *worktreeProbe, wt string) { mkdirAll(p.t, filepath.Join(wt, "emptydir")) },
 			wantRemoved: true,
 		},
 		// Hazard: ignored files are not uncommitted changes to git; the
 		// checkout is removed and they are deleted with it.
 		{
 			name:        "HAZARD ignored file",
-			setup:       func(p *gitProbe, wt string) { p.writeFile(filepath.Join(wt, "ignored.txt"), "i\n") },
+			setup:       func(p *worktreeProbe, wt string) { p.writeFile(filepath.Join(wt, "ignored.txt"), "i\n") },
 			wantRemoved: true,
 		},
 		{
 			name:        "HAZARD ignored directory",
-			setup:       func(p *gitProbe, wt string) { p.writeFile(filepath.Join(wt, "build", "out"), "o\n") },
+			setup:       func(p *worktreeProbe, wt string) { p.writeFile(filepath.Join(wt, "build", "out"), "o\n") },
 			wantRemoved: true,
 		},
 		// Hazard: a repository-local status.showUntrackedFiles=no hides the
@@ -258,7 +258,7 @@ func TestGitProbeWorktreeRemoveOutcomes(t *testing.T) {
 		// pre-check's explicit --untracked-files=all still sees it.
 		{
 			name: "HAZARD untracked hidden by status.showUntrackedFiles=no",
-			setup: func(p *gitProbe, wt string) {
+			setup: func(p *worktreeProbe, wt string) {
 				p.must(p.repo, "config", "status.showUntrackedFiles", "no")
 				p.writeFile(filepath.Join(wt, "u.txt"), "u\n")
 			},
@@ -267,7 +267,7 @@ func TestGitProbeWorktreeRemoveOutcomes(t *testing.T) {
 		},
 		{
 			name: "untracked hidden by config, remove with -c status.showUntrackedFiles=all",
-			setup: func(p *gitProbe, wt string) {
+			setup: func(p *worktreeProbe, wt string) {
 				p.must(p.repo, "config", "status.showUntrackedFiles", "no")
 				p.writeFile(filepath.Join(wt, "u.txt"), "u\n")
 			},
@@ -280,7 +280,7 @@ func TestGitProbeWorktreeRemoveOutcomes(t *testing.T) {
 		// assume-unchanged, S for skip-worktree).
 		{
 			name: "HAZARD modification hidden by assume-unchanged",
-			setup: func(p *gitProbe, wt string) {
+			setup: func(p *worktreeProbe, wt string) {
 				p.must(wt, "update-index", "--assume-unchanged", "f.txt")
 				p.writeFile(filepath.Join(wt, "f.txt"), "changed\n")
 			},
@@ -289,7 +289,7 @@ func TestGitProbeWorktreeRemoveOutcomes(t *testing.T) {
 		},
 		{
 			name: "HAZARD modification hidden by skip-worktree",
-			setup: func(p *gitProbe, wt string) {
+			setup: func(p *worktreeProbe, wt string) {
 				p.must(wt, "update-index", "--skip-worktree", "g.txt")
 				p.writeFile(filepath.Join(wt, "g.txt"), "changed\n")
 			},
@@ -299,7 +299,7 @@ func TestGitProbeWorktreeRemoveOutcomes(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			p := newGitProbe(t)
+			p := newWorktreeProbe(t)
 			wt, branch := p.addWorktree("t1a1")
 			tc.setup(p, wt)
 
@@ -360,7 +360,7 @@ func mkdirAll(t *testing.T, path string) {
 // removes it; the listing always reports the symlink-resolved path.
 func TestGitProbeWorktreeRemoveMissingAndSymlinkedPaths(t *testing.T) {
 	t.Run("missing directory", func(t *testing.T) {
-		p := newGitProbe(t)
+		p := newWorktreeProbe(t)
 		wt, _ := p.addWorktree("t1a1")
 		if err := os.RemoveAll(wt); err != nil {
 			t.Fatal(err)
@@ -385,7 +385,7 @@ func TestGitProbeWorktreeRemoveMissingAndSymlinkedPaths(t *testing.T) {
 		}
 	})
 	t.Run("symlinked spelling", func(t *testing.T) {
-		p := newGitProbe(t)
+		p := newWorktreeProbe(t)
 		link := filepath.Join(p.root, "link")
 		if err := os.Symlink(p.root, link); err != nil {
 			t.Fatal(err)
@@ -415,7 +415,7 @@ func TestGitProbeWorktreeRemoveMissingAndSymlinkedPaths(t *testing.T) {
 // then `branch <full ref>` or `detached`, then optional `locked[ <reason>]`
 // and `prunable <reason>` attributes.
 func TestGitProbeWorktreeListPorcelainZ(t *testing.T) {
-	p := newGitProbe(t)
+	p := newWorktreeProbe(t)
 	onBranch, onBranchRef := p.addWorktree("t1a1")
 	locked, lockedRef := p.addWorktree("t2a1")
 	p.must(p.repo, "worktree", "lock", "--reason", "in use", locked)
@@ -476,7 +476,7 @@ func TestGitProbeWorktreeListPorcelainZ(t *testing.T) {
 // <integration head> <target oid>`): exit 0 is contained (including a
 // commit with itself), 1 is not contained, and 128 is an unknown object.
 func TestGitProbeTargetAndAncestry(t *testing.T) {
-	p := newGitProbe(t)
+	p := newWorktreeProbe(t)
 	first := p.must(p.repo, "rev-parse", "HEAD~1")
 
 	sym := p.run(p.repo, "symbolic-ref", "-q", "HEAD")

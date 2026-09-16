@@ -679,11 +679,7 @@ func TestHumanAnswerDigestVectors(t *testing.T) {
 func buildMessagingFixtureAt(t *testing.T, store *sqlite.Store, clock *fakeClock) *messagingFixture {
 	t.Helper()
 	spec := newSpec("/repos/feature", specStride, clock.Now())
-	spec.Snapshot.Workflow = featureWorkflow()
-	_, lease, err := store.InitializeRun(t.Context(), spec)
-	if err != nil {
-		t.Fatalf("InitializeRun: %v", err)
-	}
+	lease := initLegacyFeatureRun(t, store, &spec)
 	f := &featureFixture{
 		fixture:            &fixture{store: store, clock: clock, spec: spec, lease: lease},
 		ManagerID:          identity.SessionID(uid(offManager)),
@@ -700,11 +696,7 @@ func buildMessagingFixtureAt(t *testing.T, store *sqlite.Store, clock *fakeClock
 func buildSecondMessagingFixtureAt(t *testing.T, store *sqlite.Store, clock *fakeClock) *messagingFixture {
 	t.Helper()
 	spec := newSpec("/repos/feature-second", 3*specStride, clock.Now())
-	spec.Snapshot.Workflow = featureWorkflow()
-	_, lease, err := store.InitializeRun(t.Context(), spec)
-	if err != nil {
-		t.Fatalf("InitializeRun second: %v", err)
-	}
+	lease := initLegacyFeatureRun(t, store, &spec)
 	f := &featureFixture{
 		fixture:            &fixture{store: store, clock: clock, spec: spec, lease: lease},
 		ManagerID:          identity.SessionID(uid(7451)),

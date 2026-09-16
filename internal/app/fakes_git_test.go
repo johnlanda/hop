@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"testing"
 
 	"github.com/johnlanda/hop/internal/app"
 )
@@ -19,7 +20,8 @@ type fakeGitCommit struct {
 // fakeGitRepo is a stateful fake git: a ref store with the G1/G3-pinned
 // compare-and-swap semantics (`update-ref <ref> <new> <old>` moves the
 // ref only when <old> matches its actual current value; "" as <old> is
-// create-only), a commit graph, and detached worktrees keyed by path. It
+// create-only), symbolic refs with the real-git --no-deref behavior the
+// process adapter's probe pins, a commit graph, and detached worktrees keyed by path. It
 // is installed as fakeCommands.RunHook and simulates both direct git
 // invocations and the `hop check-exec --op <id> -- …` spawn (running the
 // inner argv; OnCheckExec is the test's stand-in for the child's
@@ -31,6 +33,7 @@ type fakeGitRepo struct {
 	hop string
 
 	refs      map[string]string
+	symrefs   map[string]string
 	commits   map[string]fakeGitCommit
 	worktrees map[string]string
 	counter   int
@@ -50,12 +53,16 @@ type fakeGitRepo struct {
 	CommitTreeCalls int
 	// CheckExecCalls counts simulated check-exec spawns.
 	CheckExecCalls int
+	// DerefUpdateRefCalls counts update-ref invocations WITHOUT
+	// --no-deref, which follow a symbolic ref to its target.
+	DerefUpdateRefCalls int
 }
 
 func newFakeGitRepo(git, hop string) *fakeGitRepo {
 	return &fakeGitRepo{
 		git: git, hop: hop,
 		refs:      map[string]string{},
+		symrefs:   map[string]string{},
 		commits:   map[string]fakeGitCommit{},
 		worktrees: map[string]string{},
 	}
@@ -70,23 +77,53 @@ func (g *fakeGitRepo) newCommit(tree string, parents ...string) string {
 
 func (g *fakeGitRepo) newCommitLocked(tree string, parents ...string) string {
 	g.counter++
-	oid := fmt.Sprintf("commit-%04d", g.counter)
+	// Real SHA-1 object IDs are 40 lowercase hex characters; the fake
+	// mints the same shape so object-ID validation sees what git reports.
+	oid := fmt.Sprintf("%040x", 0xc0de0000+g.counter)
 	g.commits[oid] = fakeGitCommit{tree: tree, parents: parents}
 	return oid
 }
 
 // ref reads a ref's current value ("" when unset).
-func (g *fakeGitRepo) ref(name string) string { //nolint:unparam // a general ref-store helper; every current scenario exercises the one integration ref.
+func (g *fakeGitRepo) ref(name string) string {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.refs[name]
 }
 
 // setRef sets a ref unconditionally (test seeding only).
-func (g *fakeGitRepo) setRef(name, oid string) { //nolint:unparam // a general ref-store helper; every current scenario exercises the one integration ref.
+func (g *fakeGitRepo) setRef(name, oid string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.refs[name] = oid
+}
+
+// setSymref makes name a symbolic ref to target (test seeding only); the
+// target may be absent (a dangling symref).
+func (g *fakeGitRepo) setSymref(name, target string) { //nolint:unparam // a general ref-store helper; every current scenario seeds the one integration ref.
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	delete(g.refs, name)
+	g.symrefs[name] = target
+}
+
+// requireNoDerefUpdates fails t when any update-ref ran without
+// --no-deref: every integration-ref CAS must refuse to write through a
+// symbolic ref to a foreign branch.
+func (g *fakeGitRepo) requireNoDerefUpdates(t *testing.T) {
+	t.Helper()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.DerefUpdateRefCalls != 0 {
+		t.Errorf("%d update-ref invocations ran without --no-deref", g.DerefUpdateRefCalls)
+	}
+}
+
+// symref reads name's symbolic target ("" when name is not symbolic).
+func (g *fakeGitRepo) symref(name string) string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.symrefs[name]
 }
 
 // treeOf returns a commit's tree.
@@ -175,6 +212,9 @@ subcommand:
 		if slices.Contains(rest, "--git-common-dir") {
 			return app.CommandResult{ExitCode: 0, Stdout: []byte("/repo/.git\n")}
 		}
+		if slices.Contains(rest, "--show-object-format") {
+			return app.CommandResult{ExitCode: 0, Stdout: []byte("sha1\n")}
+		}
 		var revs []string
 		for _, a := range rest {
 			if strings.HasPrefix(a, "--") {
@@ -199,7 +239,24 @@ subcommand:
 			out = append(out, resolved)
 		}
 		return app.CommandResult{ExitCode: 0, Stdout: []byte(strings.Join(out, "\n") + "\n")}
+	case "symbolic-ref":
+		// `symbolic-ref -q <ref>`, as the process adapter's real-git probe
+		// pins it: exit 0 with the target for a symbolic ref (dangling
+		// included), exit 1 with no output for a direct or absent ref.
+		if len(rest) != 2 || rest[0] != "-q" {
+			return app.CommandResult{ExitCode: 2, Stderr: []byte("symbolic-ref: usage")}
+		}
+		if target, ok := g.symrefs[rest[1]]; ok {
+			return app.CommandResult{ExitCode: 0, Stdout: []byte(target + "\n")}
+		}
+		return app.CommandResult{ExitCode: 1}
 	case "update-ref":
+		noDeref := len(rest) > 0 && rest[0] == "--no-deref"
+		if noDeref {
+			rest = rest[1:]
+		} else {
+			g.DerefUpdateRefCalls++
+		}
 		if len(rest) < 2 {
 			return app.CommandResult{ExitCode: 2, Stderr: []byte("update-ref: usage")}
 		}
@@ -214,6 +271,31 @@ subcommand:
 		if _, ok := g.commits[newOID]; !ok {
 			return app.CommandResult{ExitCode: 128, Stderr: []byte("update-ref: new value is not a commit")}
 		}
+		if target, symbolic := g.symrefs[ref]; symbolic {
+			// Without --no-deref git follows the symref and updates its
+			// target (a dangling one is created).
+			if !noDeref {
+				ref = target
+				goto direct
+			}
+			// With --no-deref, create-only is refused on any symref and a
+			// matching CAS replaces the symref itself with a direct ref;
+			// the target never moves.
+			if !hasOld || old == "" {
+				detail := "reference already exists"
+				if g.refs[target] == "" {
+					detail = "dangling symref already exists"
+				}
+				return app.CommandResult{ExitCode: 128, Stderr: []byte(fmt.Sprintf("fatal: update_ref failed for ref '%s': cannot lock ref '%s': %s", ref, ref, detail))}
+			}
+			if g.refs[target] != old {
+				return app.CommandResult{ExitCode: 128, Stderr: []byte(fmt.Sprintf("cannot lock ref '%s': is at %s but expected %s", ref, g.refs[target], old))}
+			}
+			delete(g.symrefs, ref)
+			g.refs[ref] = newOID
+			return app.CommandResult{ExitCode: 0}
+		}
+	direct:
 		current := g.refs[ref]
 		switch {
 		case hasOld && old == "":
@@ -328,6 +410,12 @@ func (g *fakeGitRepo) resolveLocked(rev, dir string) (string, error) {
 			return oid, nil
 		}
 		return "", fmt.Errorf("HEAD: not a worktree: %s", dir)
+	}
+	if target, ok := g.symrefs[rev]; ok {
+		if oid := g.refs[target]; oid != "" {
+			return oid, nil
+		}
+		return "", fmt.Errorf("warning: ignoring dangling symref %s; fatal: Needed a single revision", rev)
 	}
 	if oid, ok := g.refs[rev]; ok && oid != "" {
 		return oid, nil

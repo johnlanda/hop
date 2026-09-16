@@ -228,11 +228,7 @@ func TestSubmitReviewForeignReviewerRefused(t *testing.T) {
 		// A second feature run ON THE SAME STORE with its own live, bound
 		// reviewer.
 		spec2 := newSpec("/repos/second", 3*specStride, f.clock.Now())
-		spec2.Snapshot.Workflow = featureWorkflow()
-		_, lease2, err := f.store.InitializeRun(t.Context(), spec2)
-		if err != nil {
-			t.Fatalf("InitializeRun second: %v", err)
-		}
+		lease2 := initLegacyFeatureRun(t, f.store, &spec2)
 		f2 := &featureFixture{
 			fixture:            &fixture{store: f.store, clock: f.clock, spec: spec2, lease: lease2},
 			ManagerID:          identity.SessionID(uid(8201)),

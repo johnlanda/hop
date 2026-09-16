@@ -241,22 +241,57 @@ func nextEnqueueSeq(s *fakeStore, runID identity.RunID, address run.Address) int
 
 // --- StateStore ---
 
+// InitializeRun mirrors the SQLite adapter's bootstrap transaction. A
+// feature-mode spec reproduces the real store's feature shape — run,
+// snapshot, MANAGER session (no attempt, no parent, the pre-assigned
+// native reference, reserved) and lease, with no task, attempt or
+// worktree — and its two refusals: app.ValidateFeatureRunSpec before
+// anything, and app.RequireIntegrationBranchForSequence against the
+// sequence this call would assign, with nothing (not even the repository
+// row or the sequence counter) mutated on either refusal, exactly as the
+// real transaction rolls back.
 func (s *fakeStore) InitializeRun(_ context.Context, spec app.NewRunSpec) (identity.RunID, app.Lease, error) { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
+	feature := spec.Snapshot.Workflow.Feature()
+	if feature {
+		if err := app.ValidateFeatureRunSpec(&spec); err != nil {
+			return "", app.Lease{}, err
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	repoID, ok := s.repoByRoot[spec.RepositoryRoot]
 	if !ok {
 		repoID = identity.RepositoryID(fmt.Sprintf("repo-%d", len(s.repoByRoot)+1))
-		s.repoByRoot[spec.RepositoryRoot] = repoID
 	}
-	s.seqByRepo[repoID]++
-	seq := s.seqByRepo[repoID]
+	seq := s.seqByRepo[repoID] + 1
+	if feature {
+		if err := app.RequireIntegrationBranchForSequence(&spec.Snapshot.Workflow, seq); err != nil {
+			return "", app.Lease{}, err
+		}
+	}
+	s.repoByRoot[spec.RepositoryRoot] = repoID
+	s.seqByRepo[repoID] = seq
 
 	r := run.NewRun(spec.RunID, repoID, seq, spec.BriefDigest, spec.Now)
 	s.Runs[spec.RunID] = &entityRow[run.Run]{value: r, revision: 1}
 	s.Snapshots[spec.RunID] = spec.Snapshot
 	s.Briefs[spec.RunID] = spec.Brief
+
+	if feature {
+		manager := run.NewManagerSession(spec.SessionID, spec.RunID, spec.Harness, spec.Now)
+		if spec.NativeSessionRef != "" {
+			var assignErr error
+			manager, assignErr = manager.AssignNativeRef(spec.NativeSessionRef, run.NativeRefAssigned, spec.Now)
+			if assignErr != nil {
+				return "", app.Lease{}, assignErr
+			}
+		}
+		s.Sessions[spec.SessionID] = &entityRow[run.Session]{value: manager, revision: 1}
+		lease := app.Lease{Run: spec.RunID, ControllerID: spec.ControllerID, Generation: 1, ExpiresAt: spec.Now.Add(leaseTTL)}
+		s.Leases[spec.RunID] = &leaseRow{lease: lease, held: true, repoID: repoID, created: true}
+		return spec.RunID, lease, nil
+	}
 
 	t := run.NewTask(spec.TaskID, spec.RunID, spec.InstructionsDigest, spec.Now)
 	s.Tasks[spec.TaskID] = &entityRow[run.Task]{value: t, revision: 1}

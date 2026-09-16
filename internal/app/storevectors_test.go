@@ -432,3 +432,88 @@ func seedForeignReviewer(t *testing.T, tc *testController, fr featureRun, seq in
 	}
 	return sessionID, incarnationID
 }
+
+// validFeatureRunSpec is a feature-mode NewRunSpec any conforming store
+// accepts as the first run of root: the manager session identity, no solo
+// bootstrap identity, and an integration branch naming sequence 1.
+func validFeatureRunSpec(t *testing.T, tc *testController, root string) app.NewRunSpec {
+	t.Helper()
+	runID, err := identity.ParseRunID(tc.IDs.NewID())
+	if err != nil {
+		t.Fatalf("parse run id: %v", err)
+	}
+	managerID, err := identity.ParseSessionID(tc.IDs.NewID())
+	if err != nil {
+		t.Fatalf("parse session id: %v", err)
+	}
+	return app.NewRunSpec{
+		RepositoryRoot: root, RunID: runID, SessionID: managerID,
+		Brief: "feature brief", BriefDigest: "brief-digest",
+		Snapshot: app.RunSnapshot{
+			StateRoot: "/state", AssignmentPath: "/state/runs/" + runID.String() + "/artifacts/assignment.md", AssignmentDigest: "assignment-digest",
+			Harness: "claude",
+			Workflow: app.WorkflowSnapshot{
+				Mode: app.WorkflowModeFeature, MaxWorkers: 2, RetryLimit: 3,
+				ManagerRolePath: "/state/roles/manager.md", ManagerRoleDigest: "manager-digest",
+				ImplementerRolePath: "/state/roles/implementer.md", ImplementerRoleDigest: "implementer-digest",
+				ReviewerRolePath: "/state/roles/reviewer.md", ReviewerRoleDigest: "reviewer-digest",
+				ReviewerHarness: "claude", MessageAttention: app.DefaultMessageAttention, MessageWait: app.DefaultMessageWait,
+				IntegrationBranch: app.IntegrationBranchName(1), BaseCommitOID: "cccccccccccccccccccccccccccccccccccccccc",
+			},
+		},
+		Harness: run.HarnessClaude, NativeSessionRef: "native-ref-manager",
+		ControllerID: "controller-1", Now: tc.Clock.Now(),
+	}
+}
+
+// TestStoreVectorsFeatureBootstrap drives the feature-run bootstrap
+// vectors against fakeStore.InitializeRun: every refusal carries its
+// typed sentinel and leaves the store exactly as it was — no repository
+// row, no sequence consumed, no run, session or lease — and the valid spec
+// resubmitted afterward initializes at sequence 1.
+func TestStoreVectorsFeatureBootstrap(t *testing.T) {
+	const root = "/repo"
+	cases := []struct {
+		name   string
+		bend   func(tc *testController, valid app.NewRunSpec) app.NewRunSpec
+		target error
+	}{
+		{"FeatureRunSpecWithTask", func(tc *testController, v app.NewRunSpec) app.NewRunSpec {
+			return storevectors.FeatureRunSpecWithTask(v, identity.TaskID(tc.IDs.NewID()))
+		}, app.ErrFeatureRunSpecInvalid},
+		{"FeatureRunSpecWithAttempt", func(tc *testController, v app.NewRunSpec) app.NewRunSpec {
+			return storevectors.FeatureRunSpecWithAttempt(v, identity.AttemptID(tc.IDs.NewID()))
+		}, app.ErrFeatureRunSpecInvalid},
+		{"FeatureRunSpecWithWorktree", func(tc *testController, v app.NewRunSpec) app.NewRunSpec {
+			return storevectors.FeatureRunSpecWithWorktree(v, identity.WorktreeID(tc.IDs.NewID()))
+		}, app.ErrFeatureRunSpecInvalid},
+		{"FeatureRunSpecWithoutManager", func(_ *testController, v app.NewRunSpec) app.NewRunSpec {
+			return storevectors.FeatureRunSpecWithoutManager(v)
+		}, app.ErrFeatureRunSpecInvalid},
+		{"FeatureRunSpecSequenceMismatch", func(_ *testController, v app.NewRunSpec) app.NewRunSpec {
+			return storevectors.FeatureRunSpecSequenceMismatch(v, 1)
+		}, app.ErrRunSequenceMismatch},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			tc := newTestController(defaultPolicy())
+			valid := validFeatureRunSpec(t, tc, root)
+
+			_, _, err := tc.Store.InitializeRun(context.Background(), tt.bend(tc, valid))
+			if !errors.Is(err, tt.target) {
+				t.Fatalf("InitializeRun(%s) error = %v, want %v", tt.name, err, tt.target)
+			}
+			if len(tc.Store.Runs) != 0 || len(tc.Store.Sessions) != 0 || len(tc.Store.Leases) != 0 || len(tc.Store.Snapshots) != 0 || len(tc.Store.repoByRoot) != 0 || len(tc.Store.seqByRepo) != 0 {
+				t.Fatalf("a refused InitializeRun left state behind: runs=%d sessions=%d leases=%d snapshots=%d repos=%d seqs=%d",
+					len(tc.Store.Runs), len(tc.Store.Sessions), len(tc.Store.Leases), len(tc.Store.Snapshots), len(tc.Store.repoByRoot), len(tc.Store.seqByRepo))
+			}
+
+			if _, _, err := tc.Store.InitializeRun(context.Background(), valid); err != nil {
+				t.Fatalf("InitializeRun(valid) after the refusal error = %v", err)
+			}
+			if got := tc.Store.Runs[valid.RunID].value.Sequence; got != 1 {
+				t.Fatalf("valid run sequence = %d, want 1: the refused attempt must consume nothing", got)
+			}
+		})
+	}
+}

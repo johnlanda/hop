@@ -19,7 +19,7 @@ occupant inspection for the worker-launch use case.
 | [presentation.go](presentation.go) | `Presentation`, `NewPresentation` | Implements `app.AgentPresentation`: `pane.report_metadata` token patches, `agent.view.set` with a manager-first token sort and `agent.view.clear` — all under HOP's fixed source so its view is owned and clearable |
 | [observation.go](observation.go) | `Observer`, `NewObserver`, `statusStream`, `DrainRemaining`, `flushBacklog` | Implements `app.Observer`: one `pane.agent_status_changed` subscription per watched pane, normalized into `app.StatusEvent`, and a `session.snapshot` reduced to `app.PaneObservation`; on stop-intake, the decode pump moves its pending event and the rest of the raw backlog into an overflow slice that `DrainRemaining` exposes |
 | [runtime.go](runtime.go) | `Runtime`, `NewRuntime`, `ErrPaneNotFound`, `ErrWorkspaceIDRequired` | Implements `app.Runtime`: `worktree.create` (cwd/branch/base, plus an S9 creation label sent only when the caller supplies one), `layout.apply` worker-pane creation, pane recovery by creation label via `session.snapshot`, `pane.read` scrollback capture, `pane.process_info` occupant inspection, `pane.close`, and `ServerInstance`'s dial-inspect-close socket-peer-pid lookup |
-| [workspace.go](workspace.go) | `Runtime.CreateWorkspace`, `Runtime.FindWorkspaceByLabel` | Implements `app.WorkspaceRuntime` on the same `Runtime` type: `workspace.create` (explicit cwd, additive env, a unique creation label, focus always false) and its S8 recovery lookup — resolve the labeled workspace via `session.snapshot`, then descend to its sole tab and that tab's sole pane |
+| [workspace.go](workspace.go) | `Runtime.CreateWorkspace`, `Runtime.FindWorkspaceByLabel`, `ErrWorkspaceCwdNotAbsolute`, `ErrWorkspaceLabelRequired` | Implements `app.WorkspaceRuntime` on the same `Runtime` type: `workspace.create` (explicit absolute cwd, additive env, a required unique creation label — an empty or relative cwd and an empty label are refused with the typed errors before any request is sent — focus always false) and its S8 recovery lookup — resolve the labeled workspace via `session.snapshot`, then descend to its sole tab and that tab's sole pane |
 | [runtime_darwin.go](runtime_darwin.go), [runtime_linux.go](runtime_linux.go), [runtime_other.go](runtime_other.go) | `peerPID` | GOOS-selected: `peerPID` reads a dialed connection's socket peer pid — `getsockopt(SOL_LOCAL, LOCAL_PEERPID)` on darwin, `getsockopt(SOL_SOCKET, SO_PEERCRED)` on linux, unconditionally unavailable elsewhere |
 
 ## Invariants
@@ -94,7 +94,10 @@ occupant inspection for the worker-launch use case.
   operation UUID) and the worktree.create label-recovery decision row are
   application-layer work landing in slices 2b/6, not this adapter.
 - `Runtime.CreateWorkspace` and `Runtime.FindWorkspaceByLabel` implement
-  `app.WorkspaceRuntime` on the same `Runtime` type (a separate interface
+  `app.WorkspaceRuntime` on the same `Runtime` type (its argument refusals —
+  a non-absolute cwd, an empty label — are checked before any request and
+  are driven by the shared `storevectors.WorkspaceRequestsRefused` vectors
+  that internal/app's fake runtime refuses identically; a separate interface
   from `app.Runtime`, per that port's own doc comment) — no new adapter
   type, no change to `NewRuntime`. `CreateWorkspace` calls `workspace.create`
   with an explicit cwd, additive env and a unique creation label, `focus`
@@ -169,6 +172,11 @@ occupant inspection for the worker-launch use case.
   representation, not a decode error.
 
 ## Dependencies and ports
+
+- Test files additionally import
+  [internal/testsupport/storevectors](../../testsupport/storevectors/AGENTS.md)
+  (the shared `WorkspaceRequestsRefused` vectors); production code never
+  does.
 
 - Allowed inward imports: [internal/app](../../app/AGENTS.md).
 - Implemented ports: `app.Probe` by `InstallationProbe`,

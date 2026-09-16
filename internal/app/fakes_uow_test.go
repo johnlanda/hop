@@ -300,6 +300,49 @@ func (u *fakeUnitOfWork) Commit() error {
 	return nil
 }
 
+// validateOneManagerLocked mirrors the real schema's
+// sessions_one_manager_per_run partial unique index: for every run this
+// transaction writes a session of, the post-commit view (base sessions
+// overlaid with this transaction's creates, then its saves) holds at most
+// one manager-role session that is neither lost nor terminated. A cold
+// relaunch that marks the predecessor lost and creates the successor in
+// one transaction passes; a second live manager fails the whole commit.
+func (u *fakeUnitOfWork) validateOneManagerLocked() error {
+	s := u.store
+	merged := map[identity.SessionID]run.Session{}
+	touched := map[identity.RunID]bool{}
+	for i := range u.sessionCreated {
+		merged[u.sessionCreated[i].ID] = u.sessionCreated[i]
+		touched[u.sessionCreated[i].RunID] = true
+	}
+	for id, row := range u.sessions {
+		merged[id] = row.value
+		touched[row.value.RunID] = true
+	}
+	live := map[identity.RunID]int{}
+	count := func(v *run.Session) {
+		if touched[v.RunID] && v.Role == run.RoleManager && v.State != run.SessionLost && v.State != run.SessionTerminated {
+			live[v.RunID]++
+		}
+	}
+	for id, base := range s.Sessions {
+		if _, overlaid := merged[id]; overlaid {
+			continue
+		}
+		count(&base.value)
+	}
+	for id := range merged {
+		v := merged[id]
+		count(&v)
+	}
+	for runID, n := range live {
+		if n > 1 {
+			return fmt.Errorf("app_test: UNIQUE sessions_one_manager_per_run violated: run %s would hold %d non-terminal manager sessions", runID, n)
+		}
+	}
+	return nil
+}
+
 func (u *fakeUnitOfWork) Rollback() error {
 	if !u.done {
 		u.store.mu.Lock()
@@ -346,6 +389,10 @@ func (u *fakeUnitOfWork) validateStagedLocked() error {
 		if base, ok := s.Integrations[id]; ok && base.revision != row.baseRevision {
 			return app.ErrRevisionConflict
 		}
+	}
+
+	if err := u.validateOneManagerLocked(); err != nil {
+		return err
 	}
 
 	stagedKeys := map[bindingKey]bool{}

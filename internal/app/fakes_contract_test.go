@@ -9,6 +9,7 @@ import (
 	"github.com/johnlanda/hop/internal/app"
 	"github.com/johnlanda/hop/internal/domain/identity"
 	"github.com/johnlanda/hop/internal/domain/run"
+	"github.com/johnlanda/hop/internal/testsupport/storevectors"
 )
 
 // TestFakeStoreContracts proves the handwritten fakes enforce the store
@@ -309,6 +310,12 @@ func TestFakePortsRefuseCallsInsideTransactions(t *testing.T) {
 	if err := tc.Runtime.ClosePane(context.Background(), detail.Binding.PaneID); err == nil {
 		t.Fatalf("Runtime.ClosePane succeeded inside an open transaction")
 	}
+	if _, err := tc.Runtime.CreateWorkspace(context.Background(), app.WorkspaceRequest{Cwd: "/repo", Label: "label"}); err == nil {
+		t.Fatalf("WorkspaceRuntime.CreateWorkspace succeeded inside an open transaction")
+	}
+	if _, _, err := tc.Runtime.FindWorkspaceByLabel(context.Background(), "label"); err == nil {
+		t.Fatalf("WorkspaceRuntime.FindWorkspaceByLabel succeeded inside an open transaction")
+	}
 	if _, err := tc.Commands.Run(context.Background(), app.Command{Argv: []string{"/usr/bin/git", "-C", "/repo", "status"}}); err == nil {
 		t.Fatalf("CommandRunner.Run succeeded inside an open transaction")
 	}
@@ -432,6 +439,115 @@ func TestWorkerWritesMoveRevisions(t *testing.T) {
 		}
 		if got := len(tc.Store.Transitions); got != transitionsBefore {
 			t.Fatalf("transitions length = %d after failed commit, want %d (atomic rejection)", got, transitionsBefore)
+		}
+	})
+}
+
+// TestFakeFeatureBootstrapContracts proves the fakes reproduce the real
+// adapters' feature-bootstrap contracts: fakeStore.InitializeRun's
+// feature shape (the SQLite adapter's TestInitializeRunFeatureShape
+// asserts the same rows), the one-manager partial unique index at commit,
+// and the herdr adapter's WorkspaceRuntime argument refusals.
+func TestFakeFeatureBootstrapContracts(t *testing.T) {
+	t.Run("feature InitializeRun creates the run, snapshot, manager and lease only", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		spec := validFeatureRunSpec(t, tc, "/repo")
+		runID, lease, err := tc.Store.InitializeRun(context.Background(), spec)
+		if err != nil {
+			t.Fatalf("InitializeRun() error = %v", err)
+		}
+		if runID != spec.RunID || lease.Generation != 1 || lease.ControllerID != spec.ControllerID {
+			t.Fatalf("InitializeRun() = %s, %+v; want the spec's run at generation 1", runID, lease)
+		}
+		r := tc.Store.Runs[spec.RunID].value
+		if r.State != run.RunCreated || r.Sequence != 1 {
+			t.Fatalf("run = %+v, want created at sequence 1", r)
+		}
+		if got := tc.Store.Snapshots[spec.RunID].Workflow; got != spec.Snapshot.Workflow {
+			t.Fatalf("frozen workflow = %+v, want %+v", got, spec.Snapshot.Workflow)
+		}
+		manager := tc.Store.Sessions[spec.SessionID].value
+		if manager.Role != run.RoleManager || manager.AttemptID != "" || manager.ParentSessionID != nil ||
+			manager.State != run.SessionReserved || manager.NativeSessionRef != spec.NativeSessionRef ||
+			manager.NativeRefSource != run.NativeRefAssigned || manager.Harness != spec.Harness {
+			t.Fatalf("manager session = %+v, want a reserved attempt-less parentless manager with the assigned native reference", manager)
+		}
+		if len(tc.Store.Tasks) != 0 || len(tc.Store.Attempts) != 0 || len(tc.Store.Worktrees) != 0 || len(tc.Store.Sessions) != 1 {
+			t.Fatalf("feature InitializeRun created tasks=%d attempts=%d worktrees=%d sessions=%d, want 0/0/0/1",
+				len(tc.Store.Tasks), len(tc.Store.Attempts), len(tc.Store.Worktrees), len(tc.Store.Sessions))
+		}
+	})
+
+	t.Run("commit refuses a second non-terminal manager and admits a successor of a lost one", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		spec := validFeatureRunSpec(t, tc, "/repo")
+		_, lease, err := tc.Store.InitializeRun(context.Background(), spec)
+		if err != nil {
+			t.Fatalf("InitializeRun() error = %v", err)
+		}
+		now := tc.Clock.Now()
+		second := run.NewManagerSession(identity.SessionID(tc.IDs.NewID()), spec.RunID, run.HarnessClaude, now)
+
+		uow, err := tc.Store.Begin(context.Background(), lease)
+		if err != nil {
+			t.Fatalf("Begin() error = %v", err)
+		}
+		if _, createErr := uow.Sessions().Create(context.Background(), second); createErr != nil {
+			t.Fatalf("Create() error = %v", createErr)
+		}
+		if commitErr := uow.Commit(); commitErr == nil {
+			t.Fatalf("Commit() accepted a second non-terminal manager session")
+		}
+		if _, ok := tc.Store.Sessions[second.ID]; ok {
+			t.Fatalf("the refused commit applied the second manager")
+		}
+
+		uow, err = tc.Store.Begin(context.Background(), lease)
+		if err != nil {
+			t.Fatalf("Begin() error = %v", err)
+		}
+		first, rev, err := uow.Sessions().Get(context.Background(), spec.SessionID)
+		if err != nil {
+			t.Fatalf("Get() error = %v", err)
+		}
+		terminated, err := first.Terminate(now)
+		if err != nil {
+			t.Fatalf("Terminate() error = %v", err)
+		}
+		if _, err := uow.Sessions().Save(context.Background(), terminated, rev); err != nil {
+			t.Fatalf("Save() error = %v", err)
+		}
+		if _, err := uow.Sessions().Create(context.Background(), second); err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+		if err := uow.Commit(); err != nil {
+			t.Fatalf("Commit() of a successor to a terminated manager error = %v", err)
+		}
+	})
+
+	t.Run("workspace runtime refuses the adapter's refused arguments", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		ctx := context.Background()
+		// The shared vectors the herdr adapter's
+		// TestRuntimeCreateWorkspaceRefusesInvalidRequests drives too.
+		for _, vector := range storevectors.WorkspaceRequestsRefused() {
+			if _, err := tc.Runtime.CreateWorkspace(ctx, vector.Request); err == nil {
+				t.Fatalf("CreateWorkspace accepted the %s vector", vector.Name)
+			}
+		}
+		if len(tc.Runtime.Workspaces) != 0 {
+			t.Fatalf("a refused CreateWorkspace created a workspace")
+		}
+		if _, _, err := tc.Runtime.FindWorkspaceByLabel(ctx, ""); err == nil {
+			t.Fatalf("FindWorkspaceByLabel accepted an empty label")
+		}
+		handle, err := tc.Runtime.CreateWorkspace(ctx, app.WorkspaceRequest{Cwd: "/repo", Label: "op-1"})
+		if err != nil {
+			t.Fatalf("CreateWorkspace() error = %v", err)
+		}
+		ref, found, err := tc.Runtime.FindWorkspaceByLabel(ctx, "op-1")
+		if err != nil || !found || app.WorkspaceHandle(ref) != handle {
+			t.Fatalf("FindWorkspaceByLabel(op-1) = %+v, %v, %v; want the created workspace's sole tab and root pane %+v", ref, found, err, handle)
 		}
 	})
 }
