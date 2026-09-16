@@ -88,6 +88,20 @@ package only observes and signals.
 
 ## Verification
 
+- `go test ./internal/adapters/process -run TestGitRefSemanticsThroughRunner -v` —
+  the executed real-git probe (gitref_probe_test.go) behind internal/app's
+  integration-ref rules, run through the production `Runner` in an
+  isolated repository (skips with a reason when no git is installed):
+  `symbolic-ref -q` exits 0 with the target for a symbolic ref, dangling
+  or not, and 1 with no output for a direct or absent ref; create-only
+  `update-ref --no-deref <ref> <new> ""` is refused on both symref shapes
+  with the symref unchanged and its target neither created nor moved, and
+  creates an absent ref; the dereferencing form writes through a dangling
+  symref (the defect it replaces); the `--no-deref` compare-and-swap moves
+  a direct ref only with its current old value, and on a symref whose
+  target holds the old value replaces the symref itself with a direct ref
+  while the target never moves. internal/app's fake git reproduces these
+  observations.
 - `go test ./internal/adapters/process` — the fixture children are the test
   binary re-run in helper modes (an env-dumping child, a group-spawning
   child that leaves a sleeping descendant with whitespace-bearing argv, a
