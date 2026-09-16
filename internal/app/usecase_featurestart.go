@@ -405,7 +405,7 @@ func (c *Controller) initIntegrationBranch(ctx context.Context, handle RunHandle
 	}); err != nil {
 		return fmt.Errorf("app: record integration.init intent: %w", err)
 	}
-	return c.actIntegrationInit(ctx, handle, opID, intent, false)
+	return c.actIntegrationInit(ctx, handle, opID, intent, false, false)
 }
 
 // actIntegrationInit revalidates, runs the create-only CAS
@@ -416,9 +416,11 @@ func (c *Controller) initIntegrationBranch(ctx context.Context, handle RunHandle
 // (a recovered intent whose earlier dispatch may have landed), any other
 // present value is a collision and fails; a ref still not observed fails a
 // fresh intent (nothing was created) and leaves a recovered one
-// reconciling. A runner failure is ambiguous: reconciling.
-func (c *Controller) actIntegrationInit(ctx context.Context, handle RunHandle, opID identity.OperationID, intent *integrationInitIntent, adoptAtBase bool) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per act.
-	if err := c.revalidateForDispatch(ctx, handle, false); err != nil {
+// reconciling. A runner failure is ambiguous: reconciling. stopping marks
+// the stop path's completing act, which revalidates the lease but not the
+// stop flag.
+func (c *Controller) actIntegrationInit(ctx context.Context, handle RunHandle, opID identity.OperationID, intent *integrationInitIntent, adoptAtBase, stopping bool) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per act.
+	if err := c.revalidateForDispatch(ctx, handle, stopping); err != nil {
 		return fmt.Errorf("app: revalidate before integration.init: %w", err)
 	}
 	if !filepath.IsAbs(c.GitExecutable) {
@@ -856,7 +858,7 @@ func bootstrapOutcomeBlocked(err error) (string, error) {
 // commit; an unresolved intent is recovered.
 func (c *Controller) continueIntegrationInit(ctx context.Context, handle RunHandle, frozen *FrozenRun, op *Operation) (string, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
 	if op != nil && (op.State == OperationPending || op.State == OperationReconciling) {
-		return c.recoverIntegrationInit(ctx, handle, op)
+		return c.recoverIntegrationInit(ctx, handle, op, false)
 	}
 	wf := frozen.Snapshot.Workflow
 	if wf.IntegrationBranch == "" || !isObjectID(wf.BaseCommitOID) {
@@ -876,8 +878,9 @@ func (c *Controller) continueIntegrationInit(ctx context.Context, handle RunHand
 // present re-acts the SAME operation (a dead controller's surviving
 // dispatch can only write the identical value, and the create-only CAS
 // lets exactly one land); a read that cannot be made leaves the operation
-// reconciling, never treated as absence.
-func (c *Controller) recoverIntegrationInit(ctx context.Context, handle RunHandle, op *Operation) (string, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
+// reconciling, never treated as absence. stopping selects the stop path's
+// completing act.
+func (c *Controller) recoverIntegrationInit(ctx context.Context, handle RunHandle, op *Operation, stopping bool) (string, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
 	intent, ok := decodeOperationPayload[integrationInitIntent](op.Intent)
 	if !ok || intent.RepositoryRoot == "" || intent.Ref == "" || !isObjectID(intent.BaseOID) {
 		detail := fmt.Sprintf("integration.init %s has an undecodable intent; failing closed", op.ID)
@@ -894,7 +897,7 @@ func (c *Controller) recoverIntegrationInit(ctx context.Context, handle RunHandl
 		collision := fmt.Errorf("%w; then run hop resume %s, or hop stop %s", integrationBranchCollision(intent.Ref), handle.runID, handle.runID)
 		return collision.Error(), c.settleOperation(ctx, handle, op.ID, OperationFailed, "integration branch collision: the ref exists at another commit")
 	default:
-		return bootstrapOutcomeBlocked(c.actIntegrationInit(ctx, handle, op.ID, &intent, true))
+		return bootstrapOutcomeBlocked(c.actIntegrationInit(ctx, handle, op.ID, &intent, true, stopping))
 	}
 }
 
@@ -1041,4 +1044,56 @@ func (c *Controller) returnRunToLaunching(ctx context.Context, handle RunHandle)
 		}
 		return recordTransition(ctx, uow, EntityRun, handle.runID.String(), string(r.State), string(next.State), "feature bootstrap continued: the manager's launch is in flight", gen(handle.lease.Generation), now)
 	})
+}
+
+// settleIntegrationInitForStop resolves every unresolved integration.init
+// before a stopped report (design section 4: a run never reports a
+// terminal state with a ref-move intent unresolved). Each follows its
+// recovery row with the stop path's completing act: the ref at the
+// intent's base is adopted; another value fails the operation as a
+// collision; a ref not observed present is completed by the same
+// create-only CAS — a zombie of the dead controller landing first is
+// adopted — so nothing can create the ref after the terminal report; a
+// read that cannot be made stays outstanding, never absence.
+func (c *Controller) settleIntegrationInitForStop(ctx context.Context, handle RunHandle) ([]string, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per stop round.
+	var unresolved []identity.OperationID
+	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		pending, pendErr := uow.Operations().Pending(ctx, handle.runID)
+		if pendErr != nil {
+			return pendErr
+		}
+		for i := range pending {
+			if pending[i].Kind == OpIntegrationInit {
+				unresolved = append(unresolved, pending[i].ID)
+			}
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	var outstanding []string
+	for _, id := range unresolved {
+		op, err := c.currentOperation(ctx, handle, id)
+		if err != nil {
+			return nil, err
+		}
+		if op.State != OperationPending && op.State != OperationReconciling {
+			continue
+		}
+		detail, err := c.recoverIntegrationInit(ctx, handle, &op, true)
+		if err != nil {
+			return nil, err
+		}
+		settled, err := c.currentOperation(ctx, handle, id)
+		if err != nil {
+			return nil, err
+		}
+		if settled.State == OperationPending || settled.State == OperationReconciling {
+			if detail == "" {
+				detail = fmt.Sprintf("integration.init %s is unresolved", id)
+			}
+			outstanding = append(outstanding, detail)
+		}
+	}
+	return outstanding, nil
 }

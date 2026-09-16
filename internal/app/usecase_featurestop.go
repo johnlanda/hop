@@ -30,7 +30,7 @@ func assertRunQuiescedLocked(ctx context.Context, uow UnitOfWork, wf WorkflowRep
 	}
 	for i := range ops {
 		switch ops[i].Kind {
-		case OpCheckRun, OpIntegrationMerge, OpIntegrationPublish, OpIntegrationReset, OpIntegrationFence:
+		case OpCheckRun, OpIntegrationMerge, OpIntegrationPublish, OpIntegrationReset, OpIntegrationFence, OpIntegrationInit:
 			return fmt.Errorf("%w: operation %s (%s) is pending", errRunNotQuiesced, ops[i].ID, ops[i].Kind)
 		}
 	}
@@ -110,6 +110,14 @@ func (c *Controller) DriveFeatureStop(ctx context.Context, handle RunHandle) (St
 		return StopReport{RunState: string(run.RunStopping)}, refErr
 	}
 	note(refsOutstanding)
+	// integration.init is a ref-move intent too: it is resolved (adopted,
+	// failed, or completed by its own create-only CAS) before any terminal
+	// report, so nothing can create the ref afterward.
+	initOutstanding, initErr := c.settleIntegrationInitForStop(ctx, handle)
+	if initErr != nil {
+		return StopReport{RunState: string(run.RunStopping)}, initErr
+	}
+	outstanding = append(outstanding, initOutstanding...)
 
 	// The integration itself: a merging integration with its merge
 	// settled interrupts; a published-but-unsettled candidate (checking)
@@ -220,8 +228,31 @@ func (c *Controller) stopFeatureSessions(ctx context.Context, handle RunHandle, 
 			continue
 		}
 		if !bindingFound || binding.PaneID == "" {
-			outstanding = append(outstanding, fmt.Sprintf("session %s has no recorded placement; a launch may be in flight — failing closed", session.ID))
-			continue
+			// A launch whose binding was never committed: Phase 2's
+			// unbound-launch rule, session-keyed.
+			verdict, still, resolveErr := c.resolveUnplacedLaunch(ctx, handle, &session)
+			if resolveErr != nil {
+				return nil, resolveErr
+			}
+			switch verdict {
+			case unplacedNothingLive:
+				if termErr := c.terminateRetiredSession(ctx, handle, session.ID, "stop: no launch live"); termErr != nil {
+					return nil, termErr
+				}
+				continue
+			case unplacedOutstanding:
+				outstanding = append(outstanding, fmt.Sprintf("session %s: %s", session.ID, still))
+				continue
+			case unplacedBound:
+			}
+			binding, bindingFound, claim, claimFound, markers, err = c.sessionCloseEvidence(ctx, handle, &session)
+			if err != nil {
+				return nil, err
+			}
+			if !bindingFound || binding.PaneID == "" {
+				outstanding = append(outstanding, fmt.Sprintf("session %s: the recovered placement could not be re-read; failing closed", session.ID))
+				continue
+			}
 		}
 		if !claimFound {
 			_, absent, ambiguous := c.observePaneAbsence(ctx, binding.PaneID, binding.CreationLabel)

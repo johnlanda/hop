@@ -386,7 +386,26 @@ func (c *Controller) retireChildSession(ctx context.Context, handle RunHandle, d
 		return true, "", c.terminateRetiredSession(ctx, handle, session.ID, reason+" (exec failed; no process)")
 	}
 	if !bindingFound || binding.PaneID == "" {
-		return false, fmt.Sprintf("session %s has no recorded placement to retire against; failing closed", session.ID), nil
+		// A launch whose binding was never committed: Phase 2's
+		// unbound-launch rule, session-keyed.
+		verdict, still, resolveErr := c.resolveUnplacedLaunch(ctx, handle, &session)
+		if resolveErr != nil {
+			return false, "", resolveErr
+		}
+		switch verdict {
+		case unplacedNothingLive:
+			return true, "", c.terminateRetiredSession(ctx, handle, session.ID, reason+" (no launch live)")
+		case unplacedOutstanding:
+			return false, fmt.Sprintf("session %s: %s", session.ID, still), nil
+		case unplacedBound:
+		}
+		binding, bindingFound, claim, claimFound, markers, err = c.sessionCloseEvidence(ctx, handle, &session)
+		if err != nil {
+			return false, "", err
+		}
+		if !bindingFound || binding.PaneID == "" {
+			return false, fmt.Sprintf("session %s: the recovered placement could not be re-read; failing closed", session.ID), nil
+		}
 	}
 	if !claimFound {
 		// No recorded occupant identity to close against: only observed
