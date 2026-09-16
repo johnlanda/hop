@@ -161,7 +161,12 @@ type SubmissionStore interface {
 	SettleLaunchFailure(ctx context.Context, incarnation identity.IncarnationID, reason string) error
 	// ClaimCheckExec is written by hop check-exec BEFORE exec: operation id
 	// and own pid (its process-group id). It fails when the operation is
-	// not a pending check execution of the current generation.
+	// not a pending exec-claimable operation of the current generation —
+	// exactly the kinds check.run and integration.merge
+	// (docs/plan/phase-3-design.md section 3): the scratch merge is
+	// spawned through the same boundary so it carries the same durable
+	// pre-exec group claim, while publish, reset and fence are executed
+	// directly by the controller and are never claimable.
 	ClaimCheckExec(ctx context.Context, op identity.OperationID, pid int) error
 	// SubmitResult applies the section 7 validation order atomically,
 	// including the attempt and task transitions on acceptance. submission

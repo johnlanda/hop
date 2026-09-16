@@ -169,6 +169,36 @@ func TestFakeStoreContracts(t *testing.T) {
 		}
 	})
 
+	t.Run("ClaimCheckExec claims both exec-claimable kinds and refuses every other", func(t *testing.T) {
+		// The Phase 3 generalization (design section 3): check.run and
+		// integration.merge are the exec-claimable kinds; a ref-move
+		// operation the controller executes directly never accepts a claim.
+		tc := newTestController(defaultPolicy())
+		_, detail := startedRun(t, tc)
+
+		seedKind := func(kind app.OperationKind) identity.OperationID {
+			opID, err := identity.ParseOperationID(tc.IDs.NewID())
+			if err != nil {
+				t.Fatalf("parse operation id: %v", err)
+			}
+			tc.Store.Operations[opID] = app.Operation{
+				ID: opID, RunID: detail.RunID, Generation: tc.Store.Leases[detail.RunID].lease.Generation,
+				Kind: kind, State: app.OperationPending,
+			}
+			return opID
+		}
+
+		merge := seedKind(app.OpIntegrationMerge)
+		if err := tc.Store.ClaimCheckExec(context.Background(), merge, 5151); err != nil {
+			t.Fatalf("ClaimCheckExec() refused a pending integration.merge of the current generation: %v", err)
+		}
+		for _, kind := range []app.OperationKind{app.OpIntegrationPublish, app.OpIntegrationReset, app.OpIntegrationFence, app.OpPaneOpen} {
+			if err := tc.Store.ClaimCheckExec(context.Background(), seedKind(kind), 5152); err == nil {
+				t.Fatalf("ClaimCheckExec() accepted a pending %s operation, which is never exec-claimable", kind)
+			}
+		}
+	})
+
 	t.Run("SubmitResult checks existence and agreement before duplicate receipts", func(t *testing.T) {
 		tc := newTestController(defaultPolicy())
 		_, detail := runningRun(t, tc)
