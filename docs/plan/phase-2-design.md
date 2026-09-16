@@ -863,11 +863,21 @@ per the decision table (section 4) before any new act.
    exist. The attempt moves to `relaunching`: a NEW session and incarnation
    bound to the same attempt, a fresh pane in the same worktree, the launch
    line as in section 6 with the resume argv
-   (`claude --resume <native-ref>`); the native reference is durably
+   (`claude --resume <native-ref> "<fixed continuation prompt>"` —
+   `--resume` immediately followed by the exact durable reference, then
+   the continuation prompt as one positional argv element, because
+   interactive Claude Code restores a resumed transcript but does not
+   re-run a pending user turn — observed against 2.1.270; the positional
+   prompt itself is documented by `claude --help` (2.1.270) and its
+   continuation behavior is pending verification by the human-run live
+   test — see native-harness-compat.md's interactive-resume item and
+   unverified list); the native
+   reference is durably
    assigned or verified captured — for Claude it is pre-assigned by HOP
    before first launch (section 6), so no capture is needed. Cold relaunch
    argv is composed per harness from the snapshot's harness field; Claude
-   argv is never rendered for another harness, and Codex/opencode cold
+   argv (the continuation prompt included) is never rendered for another
+   harness, and Codex/opencode cold
    resume is out of Phase 2 scope (their capture is unspecified; resume
    reports an actionable unsupported state).
 4. Restore-settled condition (S3, established): there is NO "restoration
@@ -1026,7 +1036,11 @@ and never-resend rule apply.
 3. Composes the harness argv from the snapshot's harness field — for
    Claude, first launch:
    `claude --session-id <native-ref> "<fixed initial prompt>"`; cold
-   resume: `claude --resume <native-ref>`. The native reference is a
+   resume: `claude --resume <native-ref> "<fixed continuation prompt>"`,
+   with `--resume` immediately followed by the exact durable reference
+   (the restored-harness predicate's adjacency rule, which tolerates the
+   trailing positional) and the continuation prompt as one additional
+   argv element. The native reference is a
    crypto-random UUID minted by the controller and persisted on the session
    lineage before the first launch intent. S4 established the contract
    against claude 2.1.270 (scratch profile, credential-free): a
@@ -1038,8 +1052,20 @@ and never-resend rule apply.
    it instructs the worker to read the assignment artifact at its absolute
    path and to submit with the absolute HOP path (`<hop> result submit`),
    including the retry instruction for a `transient` response (section 7).
+   The continuation prompt is the same kind of fixed template from the
+   same durable facts (the frozen assignment path and the
+   `<hop> result submit` command line, never environment values): it
+   exists because an interactive `claude --resume <id>` restores the
+   transcript but does not re-run a pending user turn (the human-run
+   live test observed a prompt-less relaunch sitting idle on 2.1.270;
+   2.1.270's `claude --help` documents the `[prompt]` positional, and
+   the continuation behavior itself is pending verification by the
+   human-run live test — see native-harness-compat.md), so it tells the
+   worker it was relaunched
+   after an interruption, to re-read its assignment, continue and submit.
    Argv is passed via execve — no shell parses it, so multiline or quoted
-   brief content never needs escaping.
+   brief content never needs escaping; neither prompt is ever typed into
+   the pane.
 4. Resolves the harness executable to an absolute path using the sanitized
    environment's PATH.
 5. Applies the workspace-trust pre-seed (verified against Claude Code

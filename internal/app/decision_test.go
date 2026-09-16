@@ -226,6 +226,13 @@ func TestMatchRestoredHarness(t *testing.T) {
 			pane: group(restored, npmMember), harness: run.HarnessClaude, ref: ref,
 			want: app.RestoredHarnessMatched, wantPIDs: []int{7777},
 		},
+		"matched: a trailing positional after the adjacent pair is tolerated (HOP's own relaunch argv)": {
+			pane: group(member(7777, "claude", "claude",
+				"/usr/bin/claude", "--resume", ref,
+				app.RenderContinuationPromptForTest("/state/runs/r/artifacts/assignment.md", "/opt/hop/bin/hop"))),
+			harness: run.HarnessClaude, ref: ref,
+			want: app.RestoredHarnessMatched, wantPIDs: []int{7777},
+		},
 		"none: an unrelated member whose argument embeds the reference in a path": {
 			pane: group(
 				member(9001, "bash", "bash", "/bin/bash"),

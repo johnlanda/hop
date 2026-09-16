@@ -192,6 +192,17 @@ occupant inspection for the worker-launch use case.
   `TestObserverCancellationReleasesBlockedPump` prove a pump blocked on a full
   channel is released, and that `Close`/cancellation report success rather
   than racing the pump's own connection close.
+- `TestClientCallHonorsCancellation` and `TestRuntimeHonorsCancellation`'s
+  fake endpoint holds every connection open, unread past the first line and
+  unanswered, until the test itself ends — it must never close or respond
+  first, since the real Herdr server never closes an idle request early.
+  Reading that first line tolerates a clean, zero-byte EOF without failing
+  the test: net's own Unix-socket dial code can accept-then-abandon a
+  connection it already completed at the kernel level if the caller's
+  context is canceled in the narrow window right after connect(2) succeeds,
+  closing it before writing anything, which this fake's accept loop still
+  receives. Any other read error (a non-empty partial line, for instance)
+  still fails the test.
 - `TestRuntime*` in [runtime_test.go](runtime_test.go) cover every `Runtime`
   method against a fake NDJSON endpoint. Request shapes are asserted by
   `assertRequestParams`: full structural equality against a literal JSON

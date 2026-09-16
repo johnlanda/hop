@@ -802,7 +802,9 @@ func TestRuntimeMapsResponseEnvelopeIDTypeMismatch(t *testing.T) {
 func TestRuntimeHonorsCancellation(t *testing.T) {
 	blocked := make(chan struct{})
 	endpoint := startFakeEndpoint(t, func(t *testing.T, conn net.Conn) {
-		_ = readRequestLine(t, bufio.NewReader(conn))
+		if readCancelableRequestLine(t, bufio.NewReader(conn)) == nil {
+			return // The dial itself was abandoned before any request was written.
+		}
 		<-blocked // Never respond until the test ends.
 	})
 	t.Cleanup(func() { close(blocked) })

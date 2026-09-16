@@ -1,11 +1,30 @@
 package integration
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
 )
+
+// testLaunchArgvDigest reproduces internal/app/usecase_execboundary.go's
+// launchArgvDigest byte for byte (unexported there, like the prompt
+// templates this package already mirrors): the "hop-argv-v1" tag, each
+// argv element as `<decimal byte length>:<raw bytes>`, SHA-256 lowercase
+// hex. It lets a real-process scenario verify the exact argv a launch
+// claim recorded from durable evidence alone.
+func testLaunchArgvDigest(argv []string) string {
+	var b strings.Builder
+	b.WriteString("hop-argv-v1")
+	for _, arg := range argv {
+		fmt.Fprintf(&b, "%d:%s", len(arg), arg)
+	}
+	sum := sha256.Sum256([]byte(b.String()))
+	return hex.EncodeToString(sum[:])
+}
 
 // TestRealProcessControllerKillResumeWarmReattach proves design section 5
 // resume case 1 (warm reattach) against a real hard-killed controller: the
@@ -125,6 +144,33 @@ func TestRealProcessConfirmAbsentColdRelaunchNonRestart(t *testing.T) {
 	attestations := querySQLite(t, fx.dbPath(), fmt.Sprintf("SELECT count(*) FROM operations WHERE run_id = '%s' AND kind = 'absence.attested';", fx.runID))
 	if attestations == "0" {
 		t.Errorf("no absence.attested operation recorded for run %s after --confirm-absent", fx.runID)
+	}
+
+	// The relaunched claim's argv carries the continuation prompt: recompute
+	// the claim's canonical argv digest from durable facts alone — the
+	// claim's own recorded executable, the adjacent `--resume <native-ref>`
+	// pair, and the byte-for-byte continuation prompt built from the run's
+	// assignment path and the hop path the relaunched worker itself observed
+	// in that prompt — and require it to equal the recorded digest. A
+	// prompt-less relaunch argv (the pre-fix shape) fails this equality.
+	newClaimExecutable := querySQLite(t, fx.dbPath(), fmt.Sprintf("SELECT executable FROM launch_claims WHERE incarnation_id = '%s';", newIncarnationID))
+	newClaimDigest := querySQLite(t, fx.dbPath(), fmt.Sprintf("SELECT argv_digest FROM launch_claims WHERE incarnation_id = '%s';", newIncarnationID))
+	if newClaimExecutable == "" || newClaimDigest == "" {
+		t.Fatalf("no launch claim recorded for the relaunched incarnation %s", newIncarnationID)
+	}
+	nativeRef := querySQLite(t, fx.dbPath(), fmt.Sprintf("SELECT DISTINCT native_session_ref FROM sessions WHERE attempt_id = '%s';", attemptID))
+	if nativeRef == "" || strings.Contains(nativeRef, "\n") {
+		t.Fatalf("attempt %s does not carry one shared native session reference; got %q", attemptID, nativeRef)
+	}
+	assignmentPath := filepath.Join(fx.stateDir, "runs", fx.runID, "artifacts", "assignment.md")
+	obs := readWorkerObservation(t, filepath.Join(fx.stateDir, "runs", fx.runID, "artifacts", "worker-observed.txt"))
+	hopPath := obs.Fields["hop_path"]
+	if hopPath == "" {
+		t.Fatalf("the relaunched worker's observation dump records no hop_path (parsed from the continuation prompt)")
+	}
+	wantArgv := []string{newClaimExecutable, "--resume", nativeRef, testContinuationPrompt(assignmentPath, hopPath)}
+	if got := testLaunchArgvDigest(wantArgv); got != newClaimDigest {
+		t.Errorf("relaunched claim argv digest = %s, want %s for %q — the claim's argv must be exactly `<claude> --resume <native-ref> <continuation prompt>`", newClaimDigest, got, wantArgv)
 	}
 }
 

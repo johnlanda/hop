@@ -207,8 +207,14 @@ func TestCorroborateLaunch(t *testing.T) {
 		if nativeRef == "" {
 			t.Fatalf("no native session reference was pre-assigned for the claude harness")
 		}
+		// HOP's own cold-relaunch argv shape: the adjacent `--resume <ref>`
+		// pair plus the trailing continuation prompt
+		// (composeHarnessArgvTail; reproduced via the exported template).
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
-			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "claude", Name: "claude", Argv: []string{"/usr/bin/claude", "--resume", nativeRef}}}}, nil
+			return app.PaneProcess{Foreground: []app.ProcessInfo{{PID: 4242, Argv0: "claude", Name: "claude", Argv: []string{
+				"/usr/bin/claude", "--resume", nativeRef,
+				app.RenderContinuationPromptForTest("/state/runs/r/artifacts/assignment.md", "/usr/local/bin/hop"),
+			}}}}, nil
 		}
 
 		progress, err := tc.Controller.CorroborateLaunch(context.Background(), handle)

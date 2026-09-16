@@ -69,7 +69,8 @@ type LaunchExecPlan struct {
 // snapshot's frozen, versioned policy; composes the harness argv from the
 // frozen snapshot per harness (first launches for Claude, Codex and
 // opencode share the fixed initial prompt; a cold relaunch is Claude's
-// --resume with the pre-assigned native reference, and Codex/opencode
+// --resume with the pre-assigned native reference immediately adjacent,
+// followed by the fixed continuation prompt, and Codex/opencode
 // cold resume reports the Phase 2 unsupported state); resolves the
 // harness executable to
 // an absolute path using the sanitized environment's PATH; applies the
@@ -288,13 +289,23 @@ func validateLaunchEnvironment(environ []string, lc *LaunchContext, runID, attem
 
 // composeHarnessArgvTail renders the harness argv after the executable
 // from the frozen snapshot, per harness. A cold relaunch (attempt
-// relaunching) is supported for Claude only — `--resume <native-ref>`,
-// where the reference was pre-assigned by HOP before first launch —
-// because Codex and opencode native-session capture is unspecified in
-// Phase 2. First launches are supported for all three harnesses, sharing
-// the one fixed initial prompt: Claude `--session-id <ref> <prompt>`
-// (Claude alone needs the native reference), Codex `<prompt>`, opencode
-// `--prompt <prompt>`. Claude argv is never rendered for another harness.
+// relaunching) is supported for Claude only —
+// `--resume <native-ref> <continuation prompt>`, where the reference was
+// pre-assigned by HOP before first launch and the continuation prompt is
+// the fixed positional prompt that makes the restored session continue
+// (interactive Claude Code restores a resumed transcript but never
+// re-runs a pending user turn on --resume; `claude --help` 2.1.270:
+// `Usage: claude [options] [command] [prompt]`, so a positional prompt
+// may follow `--resume <id>` — docs/architecture/native-harness-compat.md).
+// The `--resume` element stays IMMEDIATELY followed by the exact durable
+// reference: the restored-harness predicate (decision.go) requires that
+// adjacency, and it tolerates trailing argv elements. Codex and opencode
+// cold resume reports the Phase 2 unsupported state (their native session
+// capture is unspecified). First launches are supported for all three
+// harnesses, sharing the one fixed initial prompt: Claude
+// `--session-id <ref> <prompt>` (Claude alone needs the native
+// reference), Codex `<prompt>`, opencode `--prompt <prompt>`. Claude argv
+// is never rendered for another harness.
 func composeHarnessArgvTail(lc *LaunchContext, hopPath string) ([]string, error) {
 	if lc.Attempt.State == run.AttemptRelaunching {
 		if lc.Snapshot.Harness != HarnessClaude {
@@ -304,7 +315,10 @@ func composeHarnessArgvTail(lc *LaunchContext, hopPath string) ([]string, error)
 		if ref == "" {
 			return nil, fmt.Errorf("app: the session has no pre-assigned native session reference; claude argv cannot be composed")
 		}
-		return []string{"--resume", ref}, nil
+		if !filepath.IsAbs(lc.Snapshot.AssignmentPath) {
+			return nil, fmt.Errorf("app: the frozen assignment path is not absolute; the continuation prompt carries only absolute paths")
+		}
+		return []string{"--resume", ref, renderContinuationPrompt(lc.Snapshot.AssignmentPath, hopPath)}, nil
 	}
 	if !filepath.IsAbs(lc.Snapshot.AssignmentPath) {
 		return nil, fmt.Errorf("app: the frozen assignment path is not absolute; the initial prompt carries only absolute paths")
@@ -333,6 +347,29 @@ func composeHarnessArgvTail(lc *LaunchContext, hopPath string) ([]string, error)
 // (docs/plan/phase-2-design.md sections 6-7).
 func renderInitialPrompt(assignmentPath, hopPath string) string {
 	return fmt.Sprintf("Read your assignment at %s and complete it. "+
+		"When your work is committed, submit it by running: %s result submit --summary \"<one-line summary>\" --commit <commit-oid>. "+
+		"If the first output line begins with \"transient\", wait briefly and run the exact same command again.",
+		assignmentPath, hopPath)
+}
+
+// renderContinuationPrompt renders the fixed cold-relaunch continuation
+// prompt, the positional argument after `--resume <native-ref>`. It exists
+// because interactive Claude Code restores a resumed session's transcript
+// but does not re-run a pending user turn (observed live against claude
+// 2.1.270; the positional prompt is documented by `claude --help`, its
+// continuation pending the human-run live test —
+// docs/architecture/native-harness-compat.md), so a restored
+// session with no new prompt sits idle at its input box forever. Like the
+// initial prompt it is built from durable run facts only — the frozen
+// absolute assignment path and the same `<hop> result submit` command line
+// as the initial brief — never environment values, and it is passed as an
+// argv element via execve, never typed into the pane. This function is the
+// one source of truth for the template; test-side reproductions
+// (test/integration's fixture worker and scenario assertions) mirror it
+// byte for byte and cite it.
+func renderContinuationPrompt(assignmentPath, hopPath string) string {
+	return fmt.Sprintf("You were relaunched after an interruption; your restored session may show earlier, unfinished work. "+
+		"Re-read your assignment at %s and continue it. "+
 		"When your work is committed, submit it by running: %s result submit --summary \"<one-line summary>\" --commit <commit-oid>. "+
 		"If the first output line begins with \"transient\", wait briefly and run the exact same command again.",
 		assignmentPath, hopPath)

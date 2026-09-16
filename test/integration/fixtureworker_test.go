@@ -51,6 +51,23 @@ import (
 // one source — and the hop path between "submit it by running: " and
 // " result submit --summary" (its only source: this worker never falls back
 // to a PATH lookup or a guessed location for the hop binary).
+//
+// A cold relaunch ("--resume <native-ref> <continuation prompt>") carries
+// the same information through renderContinuationPrompt's fixed template
+// (same file; interactive Claude Code never re-runs a pending user turn on
+// --resume, so HOP appends the continuation prompt as the positional
+// argument):
+//
+//	You were relaunched after an interruption; your restored session may
+//	show earlier, unfinished work. Re-read your assignment at %s and
+//	continue it. When your work is committed, submit it by running: %s
+//	result submit --summary "<one-line summary>" --commit <commit-oid>.
+//	If the first output line begins with "transient", wait briefly and
+//	run the exact same command again.
+//
+// The worker extracts the assignment path between "Re-read your assignment
+// at " and " and continue it." there, and the hop path with the same
+// submit marker as the initial prompt.
 const fixtureWorkerSource = `package main
 
 import (
@@ -114,46 +131,43 @@ func main() {
 
 	env := requireEnv("HOP_STATE_DIR", "HOP_RUN_ID", "HOP_TASK_ID", "HOP_ATTEMPT_ID", "HOP_INCARNATION_ID")
 	assignmentPath := filepath.Join(env["HOP_STATE_DIR"], "runs", env["HOP_RUN_ID"], "artifacts", "assignment.md")
-	// hopPathFile persists the hop path a first launch's prompt named, so a
-	// later cold-relaunch incarnation (argv "--resume <native-ref>", no
-	// prompt at all — a real harness recalls its instructions from its own
-	// persisted session transcript, which this fixture has no equivalent of)
-	// can recover it without one.
-	hopPathFile := assignmentPath + ".hop-path"
 
-	var promptAssignmentPath, hopPath string
+	// Both invocation shapes carry a prompt as their final argv element and
+	// this worker parses it, with per-shape markers: a first launch's fixed
+	// initial prompt ("Read your assignment at <path> and complete it."), or
+	// a cold relaunch's fixed continuation prompt ("Re-read your assignment
+	// at <path> and continue it.") after "--resume <native-ref>" — HOP's
+	// relaunch argv always carries the continuation prompt (internal/app's
+	// composeHarnessArgvTail). A resume-shaped invocation is validated
+	// against that EXACT four-element shape before any element is treated
+	// as the prompt (requireResumeShape): the real CLI's "--resume [value]"
+	// takes an optional value, so a lax fixture that grabbed the final
+	// element would happily accept "--resume <prompt>" with no reference at
+	// all, masking a malformed launch. Any other shape fails loudly.
+	prompt := ""
+	assignmentStart, assignmentEnd := "Read your assignment at ", " and complete it."
 	if isResumeInvocation(os.Args) {
-		promptAssignmentPath = assignmentPath
-		persisted, err := os.ReadFile(hopPathFile)
-		if err != nil {
-			fatalf("resumed with no hop path persisted by a first launch at %s: %v", hopPathFile, err)
-		}
-		hopPath = strings.TrimSpace(string(persisted))
-	} else {
-		prompt := ""
-		if len(os.Args) > 0 {
-			prompt = os.Args[len(os.Args)-1]
-		}
-		promptAssignmentPath = extractMarked(prompt, "Read your assignment at ", " and complete it.")
-		hopPath = extractMarked(prompt, "submit it by running: ", " result submit --summary")
-		if hopPath == "" {
-			fatalf("prompt does not carry the %q marker naming the hop path", "submit it by running: ")
-		}
-		if promptAssignmentPath == "" {
-			fatalf("prompt does not carry the %q marker naming the assignment path", "Read your assignment at ")
-		}
-		// The StateRoot-derived path is what this worker actually reads, but
-		// the prompt's own path is cross-validated against it rather than
-		// merely logged: a mismatch means the launch delivered a different
-		// assignment than the one this run's own state root computes, which
-		// must fail the scenario loudly, never silently prefer one source
-		// over the other.
-		if promptAssignmentPath != assignmentPath {
-			fatalf("prompt's assignment path (%s) does not match the path computed from HOP_STATE_DIR/HOP_RUN_ID (%s)", promptAssignmentPath, assignmentPath)
-		}
-		if err := os.WriteFile(hopPathFile, []byte(hopPath), 0o600); err != nil {
-			fatalf("persist hop path for a future cold relaunch: %v", err)
-		}
+		prompt = requireResumeShape(os.Args)
+		assignmentStart, assignmentEnd = "Re-read your assignment at ", " and continue it."
+	} else if len(os.Args) > 0 {
+		prompt = os.Args[len(os.Args)-1]
+	}
+	promptAssignmentPath := extractMarked(prompt, assignmentStart, assignmentEnd)
+	hopPath := extractMarked(prompt, "submit it by running: ", " result submit --summary")
+	if hopPath == "" {
+		fatalf("prompt does not carry the %q marker naming the hop path", "submit it by running: ")
+	}
+	if promptAssignmentPath == "" {
+		fatalf("prompt does not carry the %q marker naming the assignment path", assignmentStart)
+	}
+	// The StateRoot-derived path is what this worker actually reads, but
+	// the prompt's own path is cross-validated against it rather than
+	// merely logged: a mismatch means the launch delivered a different
+	// assignment than the one this run's own state root computes, which
+	// must fail the scenario loudly, never silently prefer one source
+	// over the other.
+	if promptAssignmentPath != assignmentPath {
+		fatalf("prompt's assignment path (%s) does not match the path computed from HOP_STATE_DIR/HOP_RUN_ID (%s)", promptAssignmentPath, assignmentPath)
 	}
 
 	assignmentContent, err := os.ReadFile(assignmentPath)
@@ -228,10 +242,12 @@ func mcpStandIn() {
 	_, _ = io.Copy(io.Discard, os.Stdin)
 }
 
-// isResumeInvocation reports whether argv is a cold-relaunch invocation
-// (harness argv "--resume <native-ref>", design section 6 item 3) rather
-// than a first-launch invocation carrying the fixed initial prompt as its
-// final argument.
+// isResumeInvocation reports whether argv is a resume-SHAPED invocation:
+// any element equals the exact "--resume". Detection only — it routes the
+// invocation to requireResumeShape's strict validation, so a malformed
+// resume argv can never fall through to first-launch prompt parsing, and
+// the trailing continuation prompt every HOP relaunch carries never
+// disturbs it.
 func isResumeInvocation(argv []string) bool {
 	for _, a := range argv {
 		if a == "--resume" {
@@ -239,6 +255,50 @@ func isResumeInvocation(argv []string) bool {
 		}
 	}
 	return false
+}
+
+// requireResumeShape validates HOP's one supported cold-relaunch argv,
+// exactly [<exe> --resume <native-ref> <continuation prompt>]
+// (internal/app's composeHarnessArgvTail, design section 6 item 3):
+// four elements, "--resume" at index 1 immediately followed by a
+// UUID-shaped native reference, the continuation prompt as the final
+// element. The reference check matters because the real CLI's
+// "--resume [value]" takes an OPTIONAL value: without it, an argv like
+// [worker --resume <prompt>] — no reference at all — would be consumed by
+// the real CLI as a resume value, so this fixture must reject it rather
+// than parse the prompt and proceed. A missing reference or prompt, an
+// intervening extra argument and a wrong ordering all fail the run
+// loudly. It returns the continuation prompt.
+func requireResumeShape(argv []string) string {
+	if len(argv) != 4 || argv[1] != "--resume" {
+		fatalf("resume-shaped argv %q is not the supported [<exe> --resume <native-ref> <continuation prompt>] shape", argv)
+	}
+	if !isUUID(argv[2]) {
+		fatalf("resume argv %q does not carry a UUID-shaped native reference immediately after --resume; the real CLI would consume the next argument as --resume's optional value", argv)
+	}
+	return argv[3]
+}
+
+// isUUID reports whether s has the 8-4-4-4-12 lowercase-hex UUID shape
+// HOP mints for native session references (design section 6: lowercase
+// hex and hyphens).
+func isUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if c != '-' {
+				return false
+			}
+			continue
+		}
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func requireEnv(keys ...string) map[string]string {
@@ -498,6 +558,21 @@ func testAssignmentPrompt(assignmentPath, hopPath string) string {
 		assignmentPath, hopPath)
 }
 
+// testContinuationPrompt reproduces internal/app/usecase_execboundary.go's
+// renderContinuationPrompt byte for byte, exactly as testAssignmentPrompt
+// mirrors renderInitialPrompt — the fixed positional prompt hop launch
+// appends after `--resume <native-ref>` on a cold relaunch. Used to
+// exercise the fixture worker's resume parsing directly, and by the
+// real-process cold-relaunch scenario to recompute the relaunched claim's
+// argv digest (resume_test.go).
+func testContinuationPrompt(assignmentPath, hopPath string) string {
+	return fmt.Sprintf("You were relaunched after an interruption; your restored session may show earlier, unfinished work. "+
+		"Re-read your assignment at %s and continue it. "+
+		"When your work is committed, submit it by running: %s result submit --summary \"<one-line summary>\" --commit <commit-oid>. "+
+		"If the first output line begins with \"transient\", wait briefly and run the exact same command again.",
+		assignmentPath, hopPath)
+}
+
 // TestFixtureWorkerSubmitValid drives the compiled fixture worker directly
 // (no herdr, no cmd/hop) against a fixture repository and a fake hop stub
 // that answers "transient" once before succeeding, proving: HOP_* env
@@ -691,6 +766,153 @@ func TestFixtureWorkerExitWithoutSubmitting(t *testing.T) {
 	}
 	if head := repo.git(t, "rev-parse", "HEAD^{commit}"); head != repo.Base {
 		t.Error("exit-without-submitting committed a change; it must leave the repository untouched")
+	}
+}
+
+// TestFixtureWorkerResumeContinuation drives the compiled fixture worker
+// directly with the cold-relaunch argv shape
+// (`--resume <native-ref> <continuation prompt>`): resume detection must
+// accept the trailing prompt, and the worker must recover BOTH paths from
+// the continuation prompt itself (its only source — nothing is persisted
+// by a first launch), cross-validate the assignment path, and submit
+// through the prompt-named hop path exactly as a first launch would.
+func TestFixtureWorkerResumeContinuation(t *testing.T) {
+	artifacts := newArtifactDir(t)
+	worker := buildFixtureWorker(t, artifacts)
+	repo := newFixtureRepo(t, artifacts, nil, "repo")
+
+	stateDir := artifacts.dir(t, "state")
+	runID := "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+	runDir := filepath.Join(stateDir, "runs", runID, "artifacts")
+	if err := os.MkdirAll(runDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	assignmentPath := filepath.Join(runDir, "assignment.md")
+	brief := fixtureWorkerBrief("submit-valid")
+	if err := os.WriteFile(assignmentPath, []byte("# HOP Assignment\n\n## Brief\n\n"+brief+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	hopStub, transientCountFile := writeTransientOnceHopStub(t, artifacts)
+	prompt := testContinuationPrompt(assignmentPath, hopStub)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, worker, "--resume", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", prompt) //nolint:gosec // G204: fixed test-owned binary and arguments.
+	cmd.Dir = repo.Root
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOP_STATE_DIR=" + stateDir,
+		"HOP_RUN_ID=" + runID,
+		"HOP_TASK_ID=cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+		"HOP_ATTEMPT_ID=dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+		"HOP_INCARNATION_ID=eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+	}
+	var stdout, stderr strings.Builder
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	cmd.Stdin = strings.NewReader("FIXTURE-QUIT\n")
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("run fixture worker (resume): %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
+	}
+	out := stdout.String()
+	for _, want := range []string{"FIXTURE-WORKER-READY", "FIXTURE-SUBMIT-RESULT", "FIXTURE-WORKER-IDLE"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("worker stdout missing %q; got:\n%s", want, out)
+		}
+	}
+
+	calls, err := os.ReadFile(transientCountFile) //nolint:gosec // G304: a path this test constructed itself, under its own artifact directory.
+	if err != nil {
+		t.Fatalf("read hop stub call count: %v", err)
+	}
+	if strings.TrimSpace(string(calls)) != "2" {
+		t.Errorf("hop stub called %s times, want 2 (one transient, one accepted) — the resumed worker must submit through the continuation prompt's hop path", strings.TrimSpace(string(calls)))
+	}
+
+	obs := readWorkerObservation(t, filepath.Join(runDir, "worker-observed.txt"))
+	if obs.Fields["hop_path"] != hopStub {
+		t.Errorf("resumed worker hop_path = %q, want the continuation prompt's %q", obs.Fields["hop_path"], hopStub)
+	}
+	if obs.Fields["prompt_assignment_path"] != assignmentPath {
+		t.Errorf("resumed worker prompt_assignment_path = %q, want %q", obs.Fields["prompt_assignment_path"], assignmentPath)
+	}
+}
+
+// TestFixtureWorkerResumeShapeRejections proves the fixture worker refuses
+// every resume-shaped argv that is not exactly
+// `<exe> --resume <native-ref> <continuation prompt>`: the real CLI's
+// `--resume [value]` takes an optional value, so a lax fixture reading the
+// final element unconditionally would accept a reference-less
+// `--resume <prompt>` (consuming the prompt as the resume value) or an
+// invocation with extra arguments, masking a malformed launch instead of
+// failing the scenario. Each rejected worker must exit non-zero, name the
+// resume shape on stderr, and never invoke hop.
+func TestFixtureWorkerResumeShapeRejections(t *testing.T) {
+	artifacts := newArtifactDir(t)
+	worker := buildFixtureWorker(t, artifacts)
+	repo := newFixtureRepo(t, artifacts, nil, "repo")
+
+	stateDir := artifacts.dir(t, "state")
+	runID := "12121212-1212-4121-8121-121212121212"
+	runDir := filepath.Join(stateDir, "runs", runID, "artifacts")
+	if err := os.MkdirAll(runDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	assignmentPath := filepath.Join(runDir, "assignment.md")
+	if err := os.WriteFile(assignmentPath, []byte("# HOP Assignment\n\n## Brief\n\n"+fixtureWorkerBrief("submit-valid")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	hopStub, countFile := writeTransientOnceHopStub(t, artifacts)
+	prompt := testContinuationPrompt(assignmentPath, hopStub)
+	const ref = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"missing reference: the prompt would be consumed as --resume's value", []string{"--resume", prompt}},
+		{"missing prompt", []string{"--resume", ref}},
+		{"intervening extra argument", []string{"--resume", ref, "--model", prompt}},
+		{"wrong ordering", []string{ref, "--resume", prompt}},
+		{"reference is not UUID-shaped", []string{"--resume", "not-a-native-ref", prompt}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, worker, tc.args...) //nolint:gosec // G204: fixed test-owned binary and arguments.
+			cmd.Dir = repo.Root
+			cmd.Env = []string{
+				"PATH=" + os.Getenv("PATH"),
+				"HOP_STATE_DIR=" + stateDir,
+				"HOP_RUN_ID=" + runID,
+				"HOP_TASK_ID=34343434-3434-4343-8343-343434343434",
+				"HOP_ATTEMPT_ID=56565656-5656-4565-8565-565656565656",
+				"HOP_INCARNATION_ID=78787878-7878-4787-8787-787878787878",
+			}
+			var stdout, stderr strings.Builder
+			cmd.Stdout = &stdout
+			cmd.Stderr = &stderr
+			cmd.Stdin = strings.NewReader("")
+			if err := cmd.Run(); err == nil {
+				t.Fatalf("worker accepted the malformed resume argv %q\nstdout:\n%s\nstderr:\n%s", tc.args, stdout.String(), stderr.String())
+			}
+			if !strings.Contains(stderr.String(), "resume") {
+				t.Errorf("worker stderr does not name the resume shape; got:\n%s", stderr.String())
+			}
+			if strings.Contains(stdout.String(), "FIXTURE-WORKER-READY") {
+				t.Errorf("worker reported ready despite the malformed resume argv %q", tc.args)
+			}
+		})
+	}
+
+	calls, err := os.ReadFile(countFile) //nolint:gosec // G304: a path this test constructed itself, under its own artifact directory.
+	if err != nil {
+		t.Fatalf("read hop stub call count: %v", err)
+	}
+	if strings.TrimSpace(string(calls)) != "0" {
+		t.Errorf("hop stub called %s times, want 0 (a rejected resume shape must never submit)", strings.TrimSpace(string(calls)))
 	}
 }
 
