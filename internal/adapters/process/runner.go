@@ -14,9 +14,11 @@ import (
 )
 
 const (
-	// maxCapturedBytes bounds each captured output stream. A child that
+	// maxCapturedBytes is the default bound of each captured output stream,
+	// used when a command sets no MaxOutputBytes of its own. A child that
 	// writes more keeps running with its pipe drained, but only the first
-	// maxCapturedBytes per stream are returned.
+	// bound's bytes per stream are returned, and the result reports that
+	// stream truncated.
 	maxCapturedBytes = 1 << 20
 	// reapTimeout bounds the cancellation teardown: the wait for the
 	// SIGKILLed leader to be reaped and the poll for its group to empty.
@@ -68,10 +70,13 @@ func (e *CancellationError) Unwrap() error { return e.Cause }
 // which binary runs); cmd.Env is the complete environment — nothing is
 // inherited, and a nil Env runs with an empty environment. A completed
 // command is a result, not an error: ExitCode carries the exit status, or
-// -1 for a termination by a signal Run did not send. On ctx cancellation
-// the whole group is SIGKILLed, the leader is reaped within a bounded wait,
-// and the returned error is a *CancellationError alongside the output
-// captured so far.
+// -1 for a termination by a signal Run did not send. Each stream keeps its
+// first cmd.MaxOutputBytes (maxCapturedBytes when 0; a negative bound is
+// refused before anything starts), growing only as the child writes, and
+// StdoutTruncated/StderrTruncated report any stream whose later bytes were
+// discarded. On ctx cancellation the whole group is SIGKILLed, the leader
+// is reaped within a bounded wait, and the returned error is a
+// *CancellationError alongside the output captured so far.
 //
 // Group discipline: the leader is a fresh group leader (Setpgid, pgid ==
 // leader pid), a sleep anchor is joined into that same group and kept
@@ -91,11 +96,18 @@ func (r Runner) Run(ctx context.Context, cmd app.Command) (app.CommandResult, er
 	if !filepath.IsAbs(cmd.Argv[0]) {
 		return app.CommandResult{}, fmt.Errorf("run: executable %q is not an absolute path; bare and relative names do not pin which binary runs", cmd.Argv[0])
 	}
+	if cmd.MaxOutputBytes < 0 {
+		return app.CommandResult{}, errors.New("run: the output bound is negative")
+	}
 	if err := ctx.Err(); err != nil {
 		return app.CommandResult{}, fmt.Errorf("run: context already canceled, nothing started: %w", err)
 	}
-	stdout := &boundedBuffer{limit: maxCapturedBytes}
-	stderr := &boundedBuffer{limit: maxCapturedBytes}
+	limit := maxCapturedBytes
+	if cmd.MaxOutputBytes > 0 {
+		limit = cmd.MaxOutputBytes
+	}
+	stdout := &boundedBuffer{limit: limit}
+	stderr := &boundedBuffer{limit: limit}
 	// The context here is deliberately not ctx: cancellation must kill the
 	// whole group, in the reap order below, never exec's leader-only kill.
 	leader := exec.CommandContext(context.Background(), cmd.Argv[0], cmd.Argv[1:]...) //nolint:gosec,contextcheck // G204: the argv is chosen by the caller from the run's frozen policy, and argv[0] is enforced absolute above. contextcheck: ctx cancellation is owned by the group-kill select below, never by exec's per-process kill.
@@ -188,12 +200,8 @@ func cancelRun(ctx context.Context, leader, anchor *exec.Cmd, pgid int, waitDone
 	}
 	anchorRetireErr := retireAnchor(anchor) // the anchor took the group SIGKILL; this is its single reap
 	cancellation.GroupEmptied = awaitGroupGone(pgid)
-	result := app.CommandResult{
-		ExitCode: leader.ProcessState.ExitCode(),
-		Stdout:   stdout.bytes(),
-		Stderr:   stderr.bytes(),
-		Duration: time.Since(start),
-	}
+	result := capturedResult(stdout, stderr, time.Since(start))
+	result.ExitCode = leader.ProcessState.ExitCode()
 	if killErr != nil || anchorRetireErr != nil {
 		return result, errors.Join(cancellation, killErr, anchorRetireErr)
 	}
@@ -205,7 +213,7 @@ func cancelRun(ctx context.Context, leader, anchor *exec.Cmd, pgid int, waitDone
 // result with ExitCode -1 (the ProcessState convention) and no error — the
 // caller judges outcomes by exit code; any other wait failure is an error.
 func resultFromWait(waitErr error, stdout, stderr *boundedBuffer, duration time.Duration) (app.CommandResult, error) {
-	result := app.CommandResult{Stdout: stdout.bytes(), Stderr: stderr.bytes(), Duration: duration}
+	result := capturedResult(stdout, stderr, duration)
 	if waitErr == nil {
 		return result, nil
 	}
@@ -214,6 +222,16 @@ func resultFromWait(waitErr error, stdout, stderr *boundedBuffer, duration time.
 		return result, nil
 	}
 	return result, fmt.Errorf("wait: %w", waitErr)
+}
+
+// capturedResult is a result carrying the reaped command's captured
+// streams, each with whether its bound discarded bytes.
+func capturedResult(stdout, stderr *boundedBuffer, duration time.Duration) app.CommandResult {
+	return app.CommandResult{
+		Stdout: stdout.bytes(), StdoutTruncated: stdout.truncated,
+		Stderr: stderr.bytes(), StderrTruncated: stderr.truncated,
+		Duration: duration,
+	}
 }
 
 // startAnchor launches a sleep into the existing process group pgid, so an
@@ -301,19 +319,30 @@ func awaitGroupGone(pgid int) bool {
 }
 
 // boundedBuffer keeps the first limit bytes written and discards the rest,
-// so a torrential child cannot grow the captured output without bound.
-// Write never fails, which keeps the child's pipe drained to the end.
+// so a torrential child cannot grow the captured output without bound;
+// truncated records that some byte was discarded. Its storage grows only
+// as bytes arrive, doubling at most, and never beyond limit, so a large
+// bound costs nothing until a child writes that much. Write never fails,
+// which keeps the child's pipe drained to the end.
 type boundedBuffer struct {
-	limit int
-	data  []byte
+	limit     int
+	data      []byte
+	truncated bool
 }
 
 // Write records up to the remaining capacity and reports the full length as
 // written.
 func (b *boundedBuffer) Write(p []byte) (int, error) {
-	if room := b.limit - len(b.data); room > 0 {
-		b.data = append(b.data, p[:min(room, len(p))]...)
+	keep := min(max(b.limit-len(b.data), 0), len(p))
+	if keep < len(p) {
+		b.truncated = true
 	}
+	if need := len(b.data) + keep; need > cap(b.data) {
+		grown := make([]byte, len(b.data), min(b.limit, max(need, 2*cap(b.data))))
+		copy(grown, b.data)
+		b.data = grown
+	}
+	b.data = append(b.data, p[:keep]...)
 	return len(p), nil
 }
 

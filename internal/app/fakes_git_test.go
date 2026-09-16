@@ -38,6 +38,10 @@ type fakeGitRepo struct {
 	worktrees map[string]string
 	counter   int
 
+	// attempt holds the linked attempt worktrees worktree retirement
+	// inspects and removes (fakes_gitworktree_test.go).
+	attempt fakeAttemptWorktrees
+
 	// MergeOutcome scripts the next merges: "merged" (default), "conflict"
 	// or "no-op".
 	MergeOutcome string
@@ -98,9 +102,16 @@ func (g *fakeGitRepo) setRef(name, oid string) {
 	g.refs[name] = oid
 }
 
+// deleteRef removes a direct ref (test seeding only).
+func (g *fakeGitRepo) deleteRef(name string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	delete(g.refs, name)
+}
+
 // setSymref makes name a symbolic ref to target (test seeding only); the
 // target may be absent (a dangling symref).
-func (g *fakeGitRepo) setSymref(name, target string) { //nolint:unparam // a general ref-store helper; every current scenario seeds the one integration ref.
+func (g *fakeGitRepo) setSymref(name, target string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	delete(g.refs, name)
@@ -187,6 +198,7 @@ func (g *fakeGitRepo) runGitArgv(args []string) app.CommandResult {
 	defer g.mu.Unlock()
 
 	dir := ""
+	var configs []string
 	i := 0
 	for i < len(args) {
 		switch {
@@ -194,6 +206,7 @@ func (g *fakeGitRepo) runGitArgv(args []string) app.CommandResult {
 			dir = args[i+1]
 			i += 2
 		case args[i] == "-c" && i+1 < len(args):
+			configs = append(configs, args[i+1])
 			i += 2
 		default:
 			goto subcommand
@@ -205,6 +218,9 @@ subcommand:
 	}
 	sub := args[i]
 	rest := args[i+1:]
+	if result, handled := g.runAttemptWorktreeGitLocked(dir, configs, sub, rest); handled {
+		return result
+	}
 	switch sub {
 	case "rev-parse":
 		// The single-repository world: every checkout shares one common
@@ -214,6 +230,16 @@ subcommand:
 		}
 		if slices.Contains(rest, "--show-object-format") {
 			return app.CommandResult{ExitCode: 0, Stdout: []byte("sha1\n")}
+		}
+		if slices.Contains(rest, "--verify") && slices.Contains(rest, "-q") {
+			// `rev-parse --verify -q <rev>`, as the process probe pins it:
+			// the object id and exit 0, or exit 1 with no output.
+			rev := rest[len(rest)-1]
+			resolved, err := g.resolveLocked(rev, dir)
+			if err != nil {
+				return app.CommandResult{ExitCode: 1}
+			}
+			return app.CommandResult{ExitCode: 0, Stdout: []byte(resolved + "\n")}
 		}
 		var revs []string
 		for _, a := range rest {

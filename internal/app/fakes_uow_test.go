@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"sort"
+	"time"
 
 	"github.com/johnlanda/hop/internal/app"
 	"github.com/johnlanda/hop/internal/domain/identity"
@@ -150,6 +151,9 @@ type fakeUnitOfWork struct {
 	integrationCreated map[identity.IntegrationID]run.Integration
 	integrationSaved   map[identity.IntegrationID]stagedRow[run.Integration]
 	retryConsumed      map[identity.TaskID]int
+	// worktreesRetired stages WorktreeRetirementRepositories'
+	// set-once run facts.
+	worktreesRetired map[identity.RunID]time.Time
 
 	done bool
 }
@@ -292,6 +296,11 @@ func (u *fakeUnitOfWork) Commit() error {
 	}
 	for id, row := range u.integrationSaved {
 		s.Integrations[id] = &entityRow[run.Integration]{value: row.value, revision: row.revision}
+	}
+	for runID, at := range u.worktreesRetired {
+		if _, set := s.WorktreesRetiredAt[runID]; !set {
+			s.WorktreesRetiredAt[runID] = at
+		}
 	}
 	for taskID := range u.retryConsumed {
 		// The attempt number was already recorded by

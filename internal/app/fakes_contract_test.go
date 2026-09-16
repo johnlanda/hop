@@ -3,12 +3,14 @@ package app_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/johnlanda/hop/internal/app"
 	"github.com/johnlanda/hop/internal/domain/identity"
 	"github.com/johnlanda/hop/internal/domain/run"
+	"github.com/johnlanda/hop/internal/testsupport/runnervectors"
 	"github.com/johnlanda/hop/internal/testsupport/storevectors"
 )
 
@@ -170,10 +172,11 @@ func TestFakeStoreContracts(t *testing.T) {
 		}
 	})
 
-	t.Run("ClaimCheckExec claims both exec-claimable kinds and refuses every other", func(t *testing.T) {
-		// The Phase 3 generalization (design section 3): check.run and
-		// integration.merge are the exec-claimable kinds; a ref-move
-		// operation the controller executes directly never accepts a claim.
+	t.Run("ClaimCheckExec claims every exec-claimable kind and refuses every other", func(t *testing.T) {
+		// The Phase 3 generalization (design section 3): check.run,
+		// integration.merge and the two worktree-retirement executions are
+		// the exec-claimable kinds; a ref-move operation or a Herdr act the
+		// controller executes directly never accepts a claim.
 		tc := newTestController(defaultPolicy())
 		_, detail := startedRun(t, tc)
 
@@ -189,9 +192,10 @@ func TestFakeStoreContracts(t *testing.T) {
 			return opID
 		}
 
-		merge := seedKind(app.OpIntegrationMerge)
-		if err := tc.Store.ClaimCheckExec(context.Background(), merge, 5151); err != nil {
-			t.Fatalf("ClaimCheckExec() refused a pending integration.merge of the current generation: %v", err)
+		for _, kind := range []app.OperationKind{app.OpIntegrationMerge, app.OpRetirementCheck, app.OpWorktreeRetire} {
+			if err := tc.Store.ClaimCheckExec(context.Background(), seedKind(kind), 5151); err != nil {
+				t.Fatalf("ClaimCheckExec() refused a pending %s of the current generation: %v", kind, err)
+			}
 		}
 		for _, kind := range []app.OperationKind{app.OpIntegrationPublish, app.OpIntegrationReset, app.OpIntegrationFence, app.OpPaneOpen} {
 			if err := tc.Store.ClaimCheckExec(context.Background(), seedKind(kind), 5152); err == nil {
@@ -336,6 +340,84 @@ func TestFakePortsRefuseCallsInsideTransactions(t *testing.T) {
 	}
 	if _, err := tc.Commands.Run(context.Background(), app.Command{Argv: []string{"/usr/bin/git", "-C", "/repo", "status"}}); err != nil {
 		t.Fatalf("CommandRunner.Run after commit error = %v", err)
+	}
+}
+
+// TestFakeCommandsBoundCapturedOutput runs the shared capture contract
+// (internal/testsupport/runnervectors, which the real Runner's
+// TestRunnerReportsTruncation also runs) through the fake CommandRunner,
+// for scripted and hooked answers alike: each stream keeps its bound — 1
+// MiB, or the command's own MaxOutputBytes — and is flagged truncated
+// exactly when bytes were discarded, and a negative bound is refused
+// before anything answers. Answers claiming a truncation the real Runner
+// could never report are refused too.
+func TestFakeCommandsBoundCapturedOutput(t *testing.T) {
+	argv := []string{"/usr/bin/git", "-C", "/repo", "ls-files", "-v", "-z"}
+	for _, v := range runnervectors.CaptureVectors() {
+		for _, via := range []string{"scripted", "hooked"} {
+			t.Run(v.Name+", "+via, func(t *testing.T) {
+				commands := newTestController(defaultPolicy()).Commands
+				answer := v.Answer()
+				if via == "scripted" {
+					commands.Results[strings.Join(argv, " ")] = answer
+				} else {
+					commands.RunHook = func(context.Context, app.Command) (app.CommandResult, bool, error) { return answer, true, nil }
+				}
+				result, err := commands.Run(context.Background(), app.Command{Argv: argv, MaxOutputBytes: v.MaxOutputBytes})
+				if checkErr := v.Check(result, err); checkErr != nil {
+					t.Error(checkErr)
+				}
+				if answered := len(commands.Calls) != 0; answered == v.Refused {
+					t.Errorf("the command was answered = %v, want %v", answered, !v.Refused)
+				}
+			})
+		}
+	}
+
+	const bound = fakeCaptureBytes
+	t.Run("a hooked answer is bounded alongside its error, as the real Runner returns output with a cancellation", func(t *testing.T) {
+		commands := newTestController(defaultPolicy()).Commands
+		canceled := errors.New("canceled")
+		commands.RunHook = func(context.Context, app.Command) (app.CommandResult, bool, error) {
+			return app.CommandResult{ExitCode: -1, Stdout: make([]byte, bound+1)}, true, canceled
+		}
+		result, err := commands.Run(context.Background(), app.Command{Argv: argv})
+		if !errors.Is(err, canceled) || len(result.Stdout) != bound || !result.StdoutTruncated {
+			t.Fatalf("Run = %d bytes, truncated %v, %v; want the bounded output with the hook's error", len(result.Stdout), result.StdoutTruncated, err)
+		}
+	})
+
+	for name, tc := range map[string]struct {
+		answer app.CommandResult
+		limit  int
+	}{
+		"a claimed stdout truncation short of the bound":                    {answer: app.CommandResult{Stdout: make([]byte, 10), StdoutTruncated: true}},
+		"a claimed stderr truncation with no output":                        {answer: app.CommandResult{StderrTruncated: true}},
+		"a claimed truncation holding the default bound under a larger one": {answer: app.CommandResult{Stdout: make([]byte, bound), StdoutTruncated: true}, limit: 2 * bound},
+	} {
+		t.Run(name+" is refused", func(t *testing.T) {
+			commands := newTestController(defaultPolicy()).Commands
+			commands.RunHook = func(context.Context, app.Command) (app.CommandResult, bool, error) { return tc.answer, true, nil }
+			if result, err := commands.Run(context.Background(), app.Command{Argv: argv, MaxOutputBytes: tc.limit}); err == nil {
+				t.Fatalf("Run = %+v; want the impossible truncation refused", result)
+			}
+		})
+	}
+	for name, tc := range map[string]struct {
+		answer app.CommandResult
+		limit  int
+	}{
+		"a claimed truncation holding exactly the default bound": {answer: app.CommandResult{Stdout: make([]byte, bound), StdoutTruncated: true}},
+		"a claimed truncation holding exactly a per-call bound":  {answer: app.CommandResult{Stderr: make([]byte, 100), StderrTruncated: true}, limit: 100},
+	} {
+		t.Run(name+" is kept", func(t *testing.T) {
+			commands := newTestController(defaultPolicy()).Commands
+			commands.RunHook = func(context.Context, app.Command) (app.CommandResult, bool, error) { return tc.answer, true, nil }
+			result, err := commands.Run(context.Background(), app.Command{Argv: argv, MaxOutputBytes: tc.limit})
+			if err != nil || result.StdoutTruncated != tc.answer.StdoutTruncated || result.StderrTruncated != tc.answer.StderrTruncated {
+				t.Fatalf("Run = %+v, %v; want the claim kept", result, err)
+			}
+		})
 	}
 }
 

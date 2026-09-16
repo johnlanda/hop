@@ -228,7 +228,7 @@ func TestClaimCheckExecAcceptsMergeOperations(t *testing.T) {
 	if err := f.store.ClaimCheckExec(t.Context(), mergeOp, 9999); err == nil {
 		t.Fatal("ClaimCheckExec(different pid) accepted; want refused")
 	}
-	if err := f.store.ClaimCheckExec(t.Context(), paneOp, 4321); err == nil || !strings.Contains(err.Error(), "not a pending check or merge execution") {
+	if err := f.store.ClaimCheckExec(t.Context(), paneOp, 4321); err == nil || !strings.Contains(err.Error(), "not a pending exec-claimable execution") {
 		t.Fatalf("ClaimCheckExec(pane.open) = %v, want the kind refusal", err)
 	}
 }

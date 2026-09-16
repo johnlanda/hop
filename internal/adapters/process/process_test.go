@@ -17,6 +17,7 @@ import (
 
 	"github.com/johnlanda/hop/internal/adapters/process"
 	"github.com/johnlanda/hop/internal/app"
+	"github.com/johnlanda/hop/internal/testsupport/runnervectors"
 )
 
 // helperModeVar selects the fixture behavior when the test binary re-runs
@@ -40,6 +41,8 @@ func TestMain(m *testing.M) {
 		helperExec()
 	case "execresolved":
 		helperExecResolved()
+	case "flood":
+		helperFlood()
 	default:
 		fmt.Fprintf(os.Stderr, "unknown helper mode %q\n", mode)
 		os.Exit(97)
@@ -86,6 +89,49 @@ func helperEnvDump() {
 		code = parsed
 	}
 	os.Exit(code)
+}
+
+// helperFlood creates the file HOP_HELPER_STARTED names, when set, then
+// writes exactly HOP_HELPER_STDOUT_BYTES bytes of runnervectors.Fill to
+// stdout and HOP_HELPER_STDERR_BYTES to stderr, each in
+// HOP_HELPER_CHUNK_BYTES writes (default 64 KiB), and nothing else, then
+// exits with HOP_HELPER_EXIT.
+func helperFlood() {
+	if marker := os.Getenv("HOP_HELPER_STARTED"); marker != "" {
+		if err := os.WriteFile(marker, nil, 0o600); err != nil { //nolint:gosec // G703: the path is chosen by the parent test inside its own temporary directory.
+			os.Exit(94)
+		}
+	}
+	chunkSize := helperInt("HOP_HELPER_CHUNK_BYTES", 64*1024)
+	for _, stream := range []struct {
+		out *os.File
+		n   int
+	}{{os.Stdout, helperInt("HOP_HELPER_STDOUT_BYTES", 0)}, {os.Stderr, helperInt("HOP_HELPER_STDERR_BYTES", 0)}} {
+		chunk := bytes.Repeat([]byte{runnervectors.Fill}, chunkSize)
+		for written := 0; written < stream.n; {
+			m := min(len(chunk), stream.n-written)
+			if _, err := stream.out.Write(chunk[:m]); err != nil {
+				os.Exit(95)
+			}
+			written += m
+		}
+	}
+	os.Exit(helperInt("HOP_HELPER_EXIT", 0))
+}
+
+// helperInt reads a non-negative integer helper variable, or def when it is
+// unset.
+func helperInt(name string, def int) int {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return def
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		fmt.Fprintln(os.Stderr, "bad", name)
+		os.Exit(96)
+	}
+	return n
 }
 
 // helperSleeper announces itself through its pid file, prints a readiness
@@ -361,6 +407,62 @@ func TestRunnerBoundsCapturedOutput(t *testing.T) {
 	}
 	if len(result.Stdout) != captureLimit {
 		t.Errorf("len(Stdout) = %d, want exactly the %d-byte cap", len(result.Stdout), captureLimit)
+	}
+	if !result.StdoutTruncated || result.StderrTruncated {
+		t.Errorf("StdoutTruncated = %v, StderrTruncated = %v; want only stdout reported truncated", result.StdoutTruncated, result.StderrTruncated)
+	}
+}
+
+// TestRunnerReportsTruncation runs the shared capture contract
+// (internal/testsupport/runnervectors, which every handwritten
+// CommandRunner fake also runs) through the real Runner: a stream is
+// reported truncated exactly when the child wrote more than the bound — 1
+// MiB, or the command's own MaxOutputBytes, applied to each stream
+// separately — whatever the exit status, each flag describes only its own
+// stream, and a negative bound is refused before the child starts. The
+// runner-only cases place the bound against the child's own write
+// boundaries. Callers deciding on a whole stream rely on this.
+func TestRunnerReportsTruncation(t *testing.T) {
+	exe := testExecutable(t)
+	floodEnv := func(v *runnervectors.CaptureVector, marker string, chunk int) []string {
+		env := []string{
+			helperModeVar + "=flood",
+			"HOP_HELPER_STDOUT_BYTES=" + strconv.Itoa(v.StdoutBytes),
+			"HOP_HELPER_STDERR_BYTES=" + strconv.Itoa(v.StderrBytes),
+			"HOP_HELPER_EXIT=" + strconv.Itoa(v.ExitCode),
+			"HOP_HELPER_STARTED=" + marker,
+		}
+		if chunk != 0 {
+			env = append(env, "HOP_HELPER_CHUNK_BYTES="+strconv.Itoa(chunk))
+		}
+		return env
+	}
+	run := func(t *testing.T, v *runnervectors.CaptureVector, chunk int) {
+		t.Helper()
+		marker := filepath.Join(t.TempDir(), "started")
+		result, err := process.Runner{}.Run(t.Context(), app.Command{Argv: []string{exe}, Env: floodEnv(v, marker, chunk), MaxOutputBytes: v.MaxOutputBytes})
+		if checkErr := v.Check(result, err); checkErr != nil {
+			t.Error(checkErr)
+		}
+		_, statErr := os.Lstat(marker)
+		if started := statErr == nil; started == v.Refused {
+			t.Errorf("the child started = %v (%v), want %v", started, statErr, !v.Refused)
+		}
+	}
+	for _, v := range runnervectors.CaptureVectors() {
+		t.Run(v.Name, func(t *testing.T) { run(t, &v, 0) })
+	}
+
+	const bound = runnervectors.DefaultCaptureBytes
+	for _, tc := range []struct {
+		chunk int
+		v     runnervectors.CaptureVector
+	}{
+		{bound, runnervectors.CaptureVector{Name: "exactly the bound in one write is complete", StdoutBytes: bound, KeptStdout: bound}},
+		{bound / 4, runnervectors.CaptureVector{Name: "the bound falls exactly between two writes", StdoutBytes: 2 * bound, KeptStdout: bound, StdoutTruncated: true}},
+		{3000, runnervectors.CaptureVector{Name: "the bound falls inside a write", StdoutBytes: bound + 100, KeptStdout: bound, StdoutTruncated: true}},
+	} {
+		t.Run(tc.v.Name, func(t *testing.T) { run(t, &tc.v, tc.chunk) })
 	}
 }
 

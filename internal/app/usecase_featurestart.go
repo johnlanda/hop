@@ -108,7 +108,9 @@ func (c *Controller) ResolveRunWorkflow(ctx context.Context, repositoryRoot, ove
 // requireds applied as the --workflow feature override), resolves the
 // repository HEAD to the frozen base commit, predicts the run sequence
 // and refuses an integration branch that already exists — every refusal
-// so far wraps ErrStartRefused, before any side effect — then freezes the
+// so far wraps ErrStartRefused, before any side effect; the branch checked
+// out at the root is read as the run's worktree-retirement target — then
+// freezes the
 // role artifacts and the workflow snapshot, and commits InitializeRun's
 // feature shape (run, snapshot, manager session, lease), re-freezing
 // against a fresh prediction when another run took the predicted
@@ -130,6 +132,10 @@ func (c *Controller) StartFeatureRun(ctx context.Context, req StartRunRequest) (
 		return StartRunResult{}, RunHandle{}, err
 	}
 	baseOID, err := c.resolveFeatureBase(ctx, req.RepositoryRoot)
+	if err != nil {
+		return StartRunResult{}, RunHandle{}, err
+	}
+	targetBranch, err := c.resolveTargetBranch(ctx, req.RepositoryRoot)
 	if err != nil {
 		return StartRunResult{}, RunHandle{}, err
 	}
@@ -191,7 +197,7 @@ func (c *Controller) StartFeatureRun(ctx context.Context, req StartRunRequest) (
 		spec.NativeSessionRef = c.IDs.NewID()
 	}
 
-	lease, err := c.freezeAndInitialize(ctx, &spec, &policy, baseOID)
+	lease, err := c.freezeAndInitialize(ctx, &spec, &policy, baseOID, targetBranch)
 	if err != nil {
 		return StartRunResult{}, RunHandle{}, err
 	}
@@ -294,6 +300,23 @@ func (c *Controller) resolveFeatureBase(ctx context.Context, repositoryRoot stri
 	return baseOID, nil
 }
 
+// resolveTargetBranch reads the branch checked out at the repository root
+// (`git symbolic-ref -q HEAD`, probe-pinned) before any side effect: the
+// full `refs/heads/` ref, or "" for a detached HEAD, which freezes a run
+// that never retires its worktrees automatically. Any other answer
+// refuses the start with a value-free reason.
+func (c *Controller) resolveTargetBranch(ctx context.Context, repositoryRoot string) (string, error) {
+	result, err := c.Commands.Run(ctx, Command{Argv: []string{c.GitExecutable, "-C", repositoryRoot, "symbolic-ref", "-q", "HEAD"}})
+	if err != nil {
+		return "", fmt.Errorf("%w: %w", ErrStartRefused, errTargetUnreadable)
+	}
+	target, err := classifyTargetBranch(result.ExitCode, result.Stdout)
+	if err != nil {
+		return "", fmt.Errorf("%w: %w", ErrStartRefused, err)
+	}
+	return target, nil
+}
+
 // isObjectID reports whether s is a 40-hex lowercase SHA-1 object ID.
 func isObjectID(s string) bool {
 	if len(s) != 40 {
@@ -318,7 +341,7 @@ func isObjectID(s string) bool {
 // maxFeatureFreezeAttempts times; exhaustion is an ordinary failure with
 // nothing committed. Artifacts a refused freeze wrote stay in place,
 // exactly as Phase 2 leaves a failed start's files.
-func (c *Controller) freezeAndInitialize(ctx context.Context, spec *NewRunSpec, policy *RunPolicy, baseOID string) (Lease, error) {
+func (c *Controller) freezeAndInitialize(ctx context.Context, spec *NewRunSpec, policy *RunPolicy, baseOID, targetBranch string) (Lease, error) {
 	for attempt := 1; ; attempt++ {
 		seq, err := c.predictRunSequence(ctx, spec.RepositoryRoot)
 		if err != nil {
@@ -335,6 +358,7 @@ func (c *Controller) freezeAndInitialize(ctx context.Context, spec *NewRunSpec, 
 			return Lease{}, fmt.Errorf("app: the workflow artifacts could not be frozen for run %s", spec.RunID)
 		}
 		workflow.BaseCommitOID = baseOID
+		workflow.TargetBranch = targetBranch
 		spec.Snapshot.Workflow = workflow
 		_, lease, err := c.Store.InitializeRun(ctx, *spec)
 		if errors.Is(err, ErrRunSequenceMismatch) && attempt < maxFeatureFreezeAttempts {

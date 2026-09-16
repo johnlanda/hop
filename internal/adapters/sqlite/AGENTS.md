@@ -4,7 +4,8 @@
 
 The persistence adapter behind the application's `StateStore`, `UnitOfWork`
 (with `WorkflowRepositories`), `ReadStore` (with `WorkflowReadStore`),
-`SubmissionStore`, `MessagingStore`, `PlanStore` and `ReviewStore` ports:
+`SubmissionStore`, `MessagingStore`, `PlanStore` and `ReviewStore` ports
+(plus `WorktreeRetirementRepositories` on the same unit of work):
 one SQLite database at
 `<state root>/hop.db` shared by every repository and run, holding runs,
 their frozen snapshots (incl. the feature-mode workflow policy), tasks
@@ -27,6 +28,7 @@ this package never resolves environment variables or defaults.
 | [migrations/001_initial_schema.sql](migrations/001_initial_schema.sql) | — | The complete Phase 2 schema: 17 STRICT tables and the partial unique indexes (one active attempt per task, one accepted result per attempt, one current session per attempt) |
 | [migrations/002_launch_claim_seed_evidence.sql](migrations/002_launch_claim_seed_evidence.sql) | — | Adds `launch_claims.seed_evidence` (nullable TEXT): the workspace-trust pre-seeding outcome hop launch records with the claim; evidence only, NULL on pre-migration rows |
 | [migrations/003_manager_workers_messages.sql](migrations/003_manager_workers_messages.sql) | — | The Phase 3 schema (design section 4; its text's "002"): ten new tables (task_dependencies, messages, message_deliveries, message_acks, message_receipts, reviews, review_submissions, integrations, retry_requests, workflow_receipts) with the partial unique acceptance/serialization indexes; additive columns on runs (plan_closed_at), run_snapshots (workflow), worktrees (attempt_id, base_commit) and tasks (kind/seq/title/instructions_path/retry_count/subjects/mailbox_closed_at/created_at, defaults = the solo backfill); STRICT rebuilds of sessions (attempt_id relaxed, parent_session_id, the one-manager partial index), launch_claims (session_id NOT NULL, backfilled from the binding else the historical launch intent) and check_requests (typed subject, old rows re-keyed id=result_id, subject_kind='result') |
+| [migrations/004_run_worktrees_retired.sql](migrations/004_run_worktrees_retired.sql) | — | The post-merge worktree retirement run fact ([phase-3-worktree-retirement.md](../../../docs/plan/phase-3-worktree-retirement.md)): `runs.worktrees_retired_at` (nullable TEXT, no default), NULL on every pre-migration row; an additive ALTER on the ordinary migration path, no rebuild. Nothing reads or writes it yet |
 | [workflow_uow.go](workflow_uow.go) | `unitOfWork` as `app.WorkflowRepositories`: `TaskDependencies`, `TaskIndex`, `AttemptIndex`, `SessionIndex`, `WorktreeIndex`, `Messages`, `Reviews`, `Integrations`, `RetryRequests`, `ManagerSession` | The Phase 3 controller-transaction repositories on the same fenced unit of work (the additive packaging rule's slice-3 half); controller review-task creation, the store-assigned enqueue sequence, the sorted PendingByAddress mailbox-closure snapshot, the serial integration slot, and `WorktreeIndex().ByAttempt` (the newest row linked to an attempt, in attemptWorktreePath's order; `app.ErrNotFound` otherwise) |
 | [messaging.go](messaging.go) | `SendMessage`, `FetchNextMessage`, `AckMessage`, `AnswerQuestion`, `insertMessageReceipt`, `acceptedMessageReceipt`, `sendRequestDigest` | The section 7 worker-authority messaging port: request-ID receipts first, the caller session's OWN run and current incarnation re-derived per verb, derived answer destinations, the bundled human-question ack, receipts for every outcome except the deliberately receipt-free empty fetch |
 | [plan.go](plan.go) | `CreateTask`, `RequestRetry`, `ClosePlan`, `insertWorkflowReceipt`, `acceptedWorkflowReceipt`, `requireManagerCaller` | The section 8 worker-authority plan port: manager-only verbs, the retry's successor attempt reserved in the accepting transaction (its outcome carries the task's seq and the attempt number, re-read on a receipt replay), the plan flag set/cleared on runs.plan_closed_at, one authoritative acceptance per (run, verb, request ID) |
@@ -35,9 +37,11 @@ this package never resolves environment variables or defaults.
 | [messages.go](messages.go) | `parseAddress`, `scanMessage`, `getMessage`, `messagesByAddress`, `nextEnqueueSeq`, `insertMessage`, `messageDeliveries`, `messageAck`, `resolveSessionAddress` | Shared message row mapping: Message.State reconstructed from the delivery/ack rows in the same snapshot (never a persisted column), the per-(run, recipient) FIFO sequence, lineage-based address resolution |
 | [statestore.go](statestore.go) | `InitializeRun`, `AcquireLease`, `Heartbeat`, `ReleaseLease`, `Begin`, `validateLease` | The controller authority: run bootstrap in one transaction (the snapshot's workflow JSON round-tripped, NULL for solo; a feature spec inserts the run, snapshot, manager session and lease only, refusing `app.ErrFeatureRunSpecInvalid` before the transaction and `app.ErrRunSequenceMismatch` inside it), lease CAS with monotonic generations, fenced unit-of-work begin |
 | [uow.go](uow.go) | `unitOfWork` and the typed repositories (`Runs`…`CheckExecClaims`), `OperationRepository.Pending`/`ByKind`, `Commit`, `Rollback` | One immediate transaction per unit of work; optimistic-concurrency saves; append-only bindings and transitions; journal payloads persisted as uninterpreted JSON; controller-side launch-claim settlement |
-| [entities.go](entities.go) | `getRun`, `getTask`, `getAttempt`, `getSession`, `currentSession`, `currentBinding`, `getWorktree`, `getLaunchClaim`, `acceptedResult`, `incarnationCurrent`, `launchIncarnationCurrent`, `pendingLaunchIntent` | Row ↔ domain-value mapping shared by all three authorities through the `querier` interface (`getWorktree` maps NULL `attempt_id`/`base_commit` to the solo row's empty links) |
+| [entities.go](entities.go) | `getRun`, `getTask`, `getAttempt`, `getSession`, `currentSession`, `currentBinding`, `getWorktree`, `scanWorktree`, `selectWorktreeColumns`, `getLaunchClaim`, `acceptedResult`, `incarnationCurrent`, `launchIncarnationCurrent`, `pendingLaunchIntent` | Row ↔ domain-value mapping shared by all three authorities through the `querier` interface (`getWorktree` and the listing's `scanWorktree` map NULL `attempt_id`/`base_commit` to the solo row's empty links; a worktree's `state` column is read verbatim, including the retirement states `removed`/`absent`/`released`) |
 | [submission.go](submission.go) | `SubmitResult`, `RecordMalformed`, `ClaimLaunch`, `SettleLaunchFailure`, `ClaimCheckExec`, `RequestStop`, `insertReceipt` | The worker authority: the section 7 validation order with the domain's `AcceptResult` inside one transaction, receipts for every outcome, the pre-exec claim contracts, the monotonic stop request |
-| [readstore.go](readstore.go) | `ListRuns`, `LoadRunStatus`, `LoadFrozenRun`, `LoadCheckExecutionContext`, `lastCheckSummary` | Lease-free reads, each inside one deferred read transaction for a consistent WAL snapshot |
+| [readstore.go](readstore.go) | `ListRuns`, `LoadRunStatus`, `LoadFrozenRun`, `LoadCheckExecutionContext`, `lastCheckSummary`, `retirementIntentExecution` | Lease-free reads, each inside one deferred read transaction for a consistent WAL snapshot; `LoadRunStatus` carries the snapshot's frozen `TargetBranch` and the run's `worktrees_retired_at` fact, and for a feature run `featureWorktreeDetail` adds every worktree row (oldest first, non-nil) and the run's `worktree.retire` operations (newest first, through the shared `operationsByKind`) |
+| [worktreeretirement_read.go](worktreeretirement_read.go) | `Store` as `app.RetirementReadStore`: `ListRetirementCandidates`, `terminalUnretiredRuns`, `retirementCandidateRecord`, `collectIntegrations` | The worktree-retirement triage read, in one read transaction. It returns the repository's completed, failed and stopped runs whose fact is unset, whose frozen workflow is feature mode with a target, and that integrated at least one row adding content, in sequence order. Each record carries its integrated rows (oldest first), its `retirement.check` operations (newest first) and whether any `retirement.check` or `worktree.retire` is pending or reconciling. An unknown root has no candidates |
+| [worktreeretirement.go](worktreeretirement.go) | `unitOfWork` as `app.WorktreeRetirementRepositories`: `WorktreesForRetirement`, `WorktreesRetiredAt`, `MarkWorktreesRetired`; `runWorktrees`, `runWorktreesRetiredAt` | `WorktreesForRetirement` lists every worktree row of the leased run (another run is `ErrFenced`) in insertion order (`created_at, rowid`), any state, with its revision; row state saves go through `Worktrees().Save`. `WorktreesRetiredAt` reads the leased run's fact inside the transaction (another run is `ErrFenced`). Migration 004's worktrees-retired run fact: written once inside the fenced unit of work (the leased run only; the UPDATE applies only while NULL, so a repeat keeps the first value; a set-once housekeeping column that does not move `runs.revision`), read back as nil for NULL or the canonical time (anything else fails closed) |
 
 ## Invariants
 
@@ -119,8 +123,13 @@ this package never resolves environment variables or defaults.
   existing binding row disables the intent fallback.
   `LaunchClaims().Settle` moves exec_pending to execed or exec_failed only,
   idempotent per target state. `ClaimCheckExec` requires a pending
-  `check.run` OR `integration.merge` operation of the run's current lease
-  generation — the two kinds the generalized exec boundary spawns.
+  operation whose kind `app.OperationKind.ExecClaimable` accepts
+  (`check.run`, `integration.merge`, `retirement.check`,
+  `worktree.retire` — every kind the generalized exec boundary spawns) of
+  the run's current lease generation. `LoadCheckExecutionContext`
+  resolves each kind's frozen argv: the snapshot's check argv, the merge
+  intent's `merge_argv`/`tree_path`, or a worktree-retirement intent's
+  `argv`/`cwd`; a malformed intent fails closed.
 - Stop requests are monotonic: `stop_requested_at` is set once and never
   cleared or moved; `RunStatus.StopRequested` and `RunDetail.StopRequested`
   mirror it for the read model.
@@ -173,11 +182,14 @@ this package never resolves environment variables or defaults.
   [internal/domain/identity](../../domain/identity/AGENTS.md).
 - Implemented ports: `app.StateStore`, `app.UnitOfWork` (with every typed
   repository including `LaunchClaimRepository` and
-  `CheckExecClaimRepository`) plus `app.WorkflowRepositories`,
+  `CheckExecClaimRepository`) plus `app.WorkflowRepositories` and
+  `app.WorktreeRetirementRepositories`,
   `app.ReadStore` plus `app.WorkflowReadStore`, `app.SubmissionStore`,
   `app.MessagingStore`, `app.PlanStore` and `app.ReviewStore`, all by
   `*Store` and its unit of work. Test files additionally import
   [internal/testsupport/storevectors](../../testsupport/storevectors/AGENTS.md)
+  and
+  [internal/testsupport/runnervectors](../../testsupport/runnervectors/AGENTS.md)
   (production code never does; the checker's test-support rule proves it).
 - External libraries: `modernc.org/sqlite` v1.58.0 (pure-Go SQLite driver;
   no cgo, exact version pinned) and its `lib` subpackage for result-code
@@ -273,7 +285,13 @@ this package never resolves environment variables or defaults.
   `TestWorktreeRepositoryAttemptLink`, the linked and solo round trips;
   `TestWorktreeIndexByAttempt`, the by-attempt lookup reading back a row
   created in the same unit of work and nothing after a rollback, beside
-  the shared `WorktreeLookupByAttempt` vector);
+  the shared `WorktreeLookupByAttempt` vector).
+  The harness's git fake `linkGit` follows the runner's capture contract
+  (`runnervectors.ValidateBound` before answering, `BoundCapture` on
+  every answer, the refuse-if-exists answers included);
+  `TestLinkGitCaptureContract` runs every shared `CaptureVectors` case
+  through it and pins its own common-directory answer under a negative,
+  a one-byte and an exact bound;
   the feature bootstrap (`bootstrap_test.go`:
   `TestInitializeRunFeatureShape` — run, snapshot workflow JSON, a
   reserved attempt-less parentless manager with its assigned native
@@ -289,6 +307,56 @@ this package never resolves environment variables or defaults.
   [internal/testsupport/storevectors](../../testsupport/storevectors/AGENTS.md)
   vector to the identical refusal internal/app observes against its
   fakes.
+- Worktree-retirement exec kinds (same command):
+  `TestClaimCheckExecRetirementKinds` (both kinds claimed at the current
+  generation, same-pid retry idempotent, another pid, a prior generation
+  and a settled operation refused) and
+  `TestLoadCheckExecutionContextRetirementKinds` (the intent's argv and
+  spawn directory verbatim; missing argv, a non-string element, an empty
+  argv, a missing directory and a non-object intent each fail closed).
+- `TestAcquireLeaseOnTerminalRun` (same command): a failed run's released
+  lease is taken under the next generation, and a unit of work under it
+  records the retired fact — the store behavior the retirement pass
+  relies on.
+- `TestListRetirementCandidates` (same command): of eleven seeded runs,
+  only the completed, failed and stopped feature runs with a target, an
+  unset fact and content are listed, in sequence order. Excluded are a
+  solo run, running and stopping runs, a run with no target, a retired
+  run, a merging-only run, a no-op-only run, and another repository's
+  run. Integrated rows come oldest first without the merging row, and
+  retirement checks newest first. The unresolved flag counts only open
+  retirement operations. An unknown root lists none, and the other
+  repository lists its own run.
+- `TestLoadRunStatusWorktreeRows` (same command): a feature run without
+  rows reports an empty list; two rows come back in insertion order with
+  their current states, and only the worktree.retire operations come
+  back, newest first; a solo run carries neither.
+- `TestWorktreesForRetirement` (same command): a run without rows lists
+  none; four linked rows inserted under descending ids list in insertion
+  order with attempt, base, state and revision; each retirement state
+  round-trips through `Worktrees().Save`; another run is fenced.
+- `TestMarkWorktreesRetired` (same command): the fact read inside a unit
+  of work (unset, then the transaction's own uncommitted mark, another
+  run fenced), set once through
+  a committed unit of work, a repeat keeping the first value with the run
+  revision unchanged, another run fenced before any write, a rollback
+  leaving nothing, and a commit after lease expiry fenced with nothing
+  recorded.
+- Worktree-retirement reads (same command):
+  `TestFrozenWorkflowWithoutTargetBranch` (a snapshot frozen before the
+  field existed loads with no target; the key round-trips, and
+  `TestInitializeRunFeatureShape` freezes one through InitializeRun) and
+  `TestLoadRunStatusRetirementFields` (the detail's target, NULL fact as
+  nil, a canonical time read back exactly, a noncanonical one refused).
+- Migration 004 (same command): `TestMigration004Surface` (the chain's
+  latest version, one `schema_migrations` row per migration, the column's
+  nullable default-free TEXT shape, NULL for a freshly initialized run) and
+  `TestMigration004UpgradesPopulated003Store` (a populated store stopped at
+  the 003 boundary through `MigrateUpTo`, upgraded by `Open`: existing runs
+  NULL, runs/sessions/leases byte-for-byte intact, clean foreign keys, a
+  reopen applying nothing). `TestMigration003Surface` pins that version 3
+  is applied; the chain's latest version is pinned only by the newest
+  migration's surface test.
 - `go test -count=3 ./internal/adapters/sqlite` — flake resistance for the
   raced scenarios.
 - Test fixtures: none on disk; every database is created in a `t.TempDir`

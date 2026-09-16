@@ -130,6 +130,10 @@ func (s *Store) LoadRunStatus(ctx context.Context, runID identity.RunID) (app.Ru
 		if err != nil {
 			return err
 		}
+		retiredAt, err := runWorktreesRetiredAt(ctx, tx, runID)
+		if err != nil {
+			return err
+		}
 		detail = app.RunDetail{
 			RunStatus: app.RunStatus{
 				RunID:         runID,
@@ -139,8 +143,10 @@ func (s *Store) LoadRunStatus(ctx context.Context, runID identity.RunID) (app.Ru
 				Reconciling:   reconciling,
 				UpdatedAt:     runV.UpdatedAt,
 			},
-			Mode:      snapshot.Workflow.Mode,
-			StateRoot: snapshot.StateRoot,
+			Mode:               snapshot.Workflow.Mode,
+			TargetBranch:       snapshot.Workflow.TargetBranch,
+			WorktreesRetiredAt: retiredAt,
+			StateRoot:          snapshot.StateRoot,
 		}
 		if snapshot.Workflow.Feature() {
 			// The current manager session is the run-level session identity
@@ -158,6 +164,9 @@ func (s *Store) LoadRunStatus(ctx context.Context, runID identity.RunID) (app.Ru
 			}
 			if featureErr := featureRunDetail(ctx, tx, &detail, &snapshot, s.now()); featureErr != nil {
 				return featureErr
+			}
+			if worktreeErr := featureWorktreeDetail(ctx, tx, &detail); worktreeErr != nil {
+				return worktreeErr
 			}
 		} else {
 			task, _, taskErr := taskByRun(ctx, tx, runID)
@@ -209,6 +218,22 @@ func (s *Store) LoadRunStatus(ctx context.Context, runID identity.RunID) (app.Ru
 		return app.RunDetail{}, err
 	}
 	return detail, nil
+}
+
+// featureWorktreeDetail surfaces a feature run's worktree rows, oldest
+// first, and its worktree.retire operations, newest first, for the
+// per-row status lines; a run without rows gets an empty, non-nil list.
+func featureWorktreeDetail(ctx context.Context, q querier, detail *app.RunDetail) error {
+	rows, err := runWorktrees(ctx, q, detail.RunID)
+	if err != nil {
+		return err
+	}
+	detail.Worktrees = make([]run.Worktree, 0, len(rows))
+	for i := range rows {
+		detail.Worktrees = append(detail.Worktrees, rows[i].Worktree)
+	}
+	detail.WorktreeRetirements, err = operationsByKind(ctx, q, detail.RunID, app.OpWorktreeRetire)
+	return err
 }
 
 // attachSessionBinding surfaces the session's current binding and its
@@ -417,9 +442,11 @@ func (s *Store) LoadFrozenRun(ctx context.Context, runID identity.RunID) (app.Fr
 // signature change): a check.run returns the snapshot's frozen CheckArgv
 // with the design's fixed checkout layout under the state root
 // (runs/<run>/checks/<operation>/tree); an integration.merge returns the
-// intent's own frozen merge_argv with the intent's scratch tree path.
-// A malformed merge intent fails closed rather than hand the boundary an
-// argv nothing froze.
+// intent's own frozen merge_argv with the intent's scratch tree path; a
+// retirement.check or worktree.retire returns the intent's frozen argv
+// with its spawn directory (the "argv" and "cwd" members). A malformed
+// intent fails closed rather than hand the boundary an argv nothing
+// froze.
 func (s *Store) LoadCheckExecutionContext(ctx context.Context, opID identity.OperationID) (app.CheckExecutionContext, error) {
 	var executionContext app.CheckExecutionContext
 	err := s.inReadTx(ctx, func(tx *sql.Tx) error {
@@ -448,14 +475,51 @@ func (s *Store) LoadCheckExecutionContext(ctx context.Context, opID identity.Ope
 			executionContext.CheckoutPath = treePath
 			executionContext.CheckArgv = argv
 			return nil
+		case app.OpRetirementCheck, app.OpWorktreeRetire:
+			argv, cwd, intentErr := retirementIntentExecution(op.Intent)
+			if intentErr != nil {
+				return fmt.Errorf("sqlite: operation %s: %w", opID, intentErr)
+			}
+			executionContext.CheckoutPath = cwd
+			executionContext.CheckArgv = argv
+			return nil
 		default:
-			return fmt.Errorf("sqlite: operation %s is %q, not a check or merge execution", opID, op.Kind)
+			return fmt.Errorf("sqlite: operation %s is %q, not an exec-claimable execution", opID, op.Kind)
 		}
 	})
 	if err != nil {
 		return app.CheckExecutionContext{}, err
 	}
 	return executionContext, nil
+}
+
+// retirementIntentExecution reads the frozen argv and spawn directory
+// from a persisted worktree-retirement intent payload — the documented
+// worktreeRetirementExecIntent JSON keys "argv" and "cwd"
+// (internal/app/worktreeretirement.go) — failing closed on any missing or
+// mistyped member, exactly as mergeIntentExecution does.
+func retirementIntentExecution(intent any) (argv []string, cwd string, err error) {
+	fields, ok := intent.(map[string]any)
+	if !ok {
+		return nil, "", errors.New("retirement intent payload is not a JSON object")
+	}
+	rawArgv, ok := fields["argv"].([]any)
+	if !ok || len(rawArgv) == 0 {
+		return nil, "", errors.New("retirement intent carries no frozen argv")
+	}
+	argv = make([]string, len(rawArgv))
+	for i, element := range rawArgv {
+		text, isString := element.(string)
+		if !isString {
+			return nil, "", errors.New("retirement intent argv carries a non-string element")
+		}
+		argv[i] = text
+	}
+	cwd, ok = fields["cwd"].(string)
+	if !ok || cwd == "" {
+		return nil, "", errors.New("retirement intent carries no spawn directory")
+	}
+	return argv, cwd, nil
 }
 
 // mergeIntentExecution reads the frozen merge argv and scratch tree path

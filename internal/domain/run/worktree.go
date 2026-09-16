@@ -6,13 +6,33 @@ import (
 	"github.com/johnlanda/hop/internal/domain/identity"
 )
 
-// WorktreeState is a worktree's lifecycle state. Phase 2 never removes a
-// worktree: it is created before launch and preserved by both stop and
-// failure, so active is the only state this phase's domain code reaches.
+// WorktreeState is a worktree's lifecycle state. A worktree is created
+// active before launch and stays active through stop and failure; only
+// post-merge worktree retirement moves it on, to one of three final
+// states.
 type WorktreeState string
 
-// WorktreeActive is a worktree's only state in Phase 2.
-const WorktreeActive WorktreeState = "active"
+// Worktree states.
+const (
+	// WorktreeActive is a worktree HOP still owns: its checkout may exist
+	// on disk and a retirement pass may still act on it.
+	WorktreeActive WorktreeState = "active"
+	// WorktreeRemoved is a checkout the retirement pass removed.
+	WorktreeRemoved WorktreeState = "removed"
+	// WorktreeAbsent is a checkout the retirement pass found already gone.
+	WorktreeAbsent WorktreeState = "absent"
+	// WorktreeReleased is a checkout HOP relinquished because it could no
+	// longer prove the checkout is its own; HOP never touches it again.
+	WorktreeReleased WorktreeState = "released"
+)
+
+// worktreeTransitions is the exhaustive Worktree state table: each final
+// state is reached only from active, and none is ever left.
+var worktreeTransitions = newTransitionTable(concatPairs( //nolint:gochecknoglobals // worktreeTransitions is the exhaustive, immutable Worktree state table; it never mutates after init.
+	fromAny(WorktreeRemoved, WorktreeActive),
+	fromAny(WorktreeAbsent, WorktreeActive),
+	fromAny(WorktreeReleased, WorktreeActive),
+))
 
 // Worktree is checkout provenance used by one or more sessions: a path and
 // branch created before launch in the run's repository.
@@ -57,5 +77,16 @@ func NewAttemptWorktree(id identity.WorktreeID, repositoryID identity.Repository
 	w := NewWorktree(id, repositoryID, runID, path, branch)
 	w.AttemptID = attemptID
 	w.BaseCommit = baseCommit
+	return w, nil
+}
+
+// Retire returns w moved to one of the final retirement states (removed,
+// absent or released), or ErrInvalidTransition when w is not active or to
+// is not a final state.
+func (w Worktree) Retire(to WorktreeState) (Worktree, error) { //nolint:gocritic // hugeParam: Worktree is an immutable domain value returned by its transition; a pointer receiver would let a caller's original be mutated through it.
+	if !worktreeTransitions.valid(w.State, to) {
+		return w, fmt.Errorf("%w: worktree %s: %s to %s", ErrInvalidTransition, w.ID, w.State, to)
+	}
+	w.State = to
 	return w, nil
 }

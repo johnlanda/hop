@@ -16,7 +16,7 @@ package only observes and signals.
 | File | Entities / functions | Responsibility |
 | --- | --- | --- |
 | [exec.go](exec.go) | `Exec`, `ExecResolved` | syscall.Exec wrappers, never returning on success, passing the complete env verbatim (nil execs empty). `Exec` rejects an empty, bare or relative argv[0] before any system call; `ExecResolved` executes an absolute path while preserving the caller's argv byte-for-byte (argv[0] may stay the bare name the caller resolved) — hop check-exec's boundary, whose running argv must equal the frozen check argv exactly for group retirement to match |
-| [runner.go](runner.go) | `Runner`, `CancellationError` | Runs argv as the leader of a new process group (Setpgid) with the complete env given, captures each stream bounded at 1 MiB, maps completions to exit codes (-1 for a signal), and on ctx cancellation SIGKILLs the whole group, reaps the leader within a bounded wait and returns a typed `*CancellationError` with the output captured so far; an unstartable anchor retires the group while the leader is provably unreaped instead of inferring anything from the failure's errno |
+| [runner.go](runner.go) | `Runner`, `CancellationError` | Runs argv as the leader of a new process group (Setpgid) with the complete env given, captures each stream bounded at 1 MiB or the command's own `MaxOutputBytes` (per stream; storage grows only as the child writes, never beyond the bound; a negative bound is refused before anything starts) and reports a stream whose later bytes were discarded (`StdoutTruncated`, `StderrTruncated`), maps completions to exit codes (-1 for a signal), and on ctx cancellation SIGKILLs the whole group, reaps the leader within a bounded wait and returns a typed `*CancellationError` with the output captured so far; an unstartable anchor retires the group while the leader is provably unreaped instead of inferring anything from the failure's errno |
 | [inspector.go](inspector.go) | `GroupInspector`, `ArgvUnavailable` | Lists a group's live members (membership from one `ps -A -o pid=,pgid=` parse; a listing failure is an error, never an empty result) and sends the group SIGKILL under the same guard as the runner |
 | [argv_darwin.go](argv_darwin.go) | `processArgv`, `parseProcargs2` | Exact per-pid argv via the `kern.procargs2` sysctl (raw sysctl(2); the stdlib Sysctl cannot address a pid-parameterized MIB), parsed by the exact layout: argc, the executable path in a NUL-padded region of len(path)+1 rounded to 8, then exactly argc entries with empties preserved — never reading into the environment region and never guessing a boundary |
 | [argv_linux.go](argv_linux.go) | `processArgv`, `parseCmdline` | Exact per-pid argv via `/proc/<pid>/cmdline` (NUL-separated, byte-for-byte, empty entries preserved) |
@@ -73,12 +73,21 @@ package only observes and signals.
   reserved for a run that could not be executed or supervised, and
   cancellation returns the typed `*CancellationError` (wrapping the context
   cause) plus the bounded output captured before the kill.
+- Truncation is always reported: a stream is flagged truncated exactly
+  when a byte of it was discarded past the bound, on every result path
+  (completion, cancellation, unanchored settlement) and whatever the exit
+  status. A kept prefix can end exactly on a record boundary and look
+  complete, so callers that decide on a whole stream read the flag, never
+  the prefix's shape.
 - Nothing is inherited: `Command.Env` and `Exec`'s env are the complete
   environment; nil means empty, never the parent's environment.
 
 ## Dependencies and ports
 
-- Allowed inward imports: [internal/app](../../app/AGENTS.md).
+- Allowed inward imports: [internal/app](../../app/AGENTS.md). Test
+  files additionally import
+  [internal/testsupport/runnervectors](../../testsupport/runnervectors/AGENTS.md)
+  (the shared capture contract); production code never does.
 - Implemented ports: `app.CommandRunner` by `Runner`,
   `app.ProcessGroupInspector` by `GroupInspector`; `Exec` (hop launch) and
   `ExecResolved` (hop check-exec) are consumed directly by the
@@ -107,7 +116,22 @@ package only observes and signals.
   child that leaves a sleeping descendant with whitespace-bearing argv, a
   never-exiting child), exercised through the real `Runner`: exit-code
   mapping, exact-environment delivery, nil-env emptiness, working
-  directory, the 1 MiB capture bound, cancellation killing the whole group
+  directory, the 1 MiB capture bound and its truncation flags
+  (`TestRunnerReportsTruncation` runs every shared
+  `runnervectors.CaptureVectors` case — the same cases every handwritten
+  runner fake runs — through the `flood` helper, which writes exact byte
+  counts to each stream: exactly the bound is complete, one byte more is
+  truncated, on a failing exit too, each flag for its own stream, and a
+  per-call `MaxOutputBytes` — larger or smaller than the default —
+  bounds each stream separately; a negative bound is refused and the
+  child's start marker proves it never ran; runner-only cases place the
+  bound at, between and inside the child's writes;
+  `TestBoundedBufferTruncation` pins the
+  accounting over exact write sequences, a write ending on the bound
+  included, and `TestBoundedBufferGrowsOnlyAsBytesArrive` that a 64 MiB
+  bound reserves nothing up front and storage never exceeds double the
+  kept bytes or the bound), cancellation
+  killing the whole group
   with the typed result and group-absence proof, an injected unstartable
   anchor retiring a live leader with an error, and the
   leader-exits-with-children case retired through the real
@@ -129,6 +153,34 @@ package only observes and signals.
   empties preserved, empty buffer unavailable) and darwin real-child
   regressions proving empty-argument vectors byte-for-byte with no
   environment string ever appearing as an argument.
+- `go test -run TestGitProbe ./internal/adapters/process` —
+  [gitworktree_probe_test.go](gitworktree_probe_test.go), the worktree
+  retirement git probe
+  ([phase-3-worktree-retirement.md](../../../docs/plan/phase-3-worktree-retirement.md)):
+  every git value the retirement rules consume, executed through the real
+  `Runner` with an absolute git and the retirement environment against
+  throwaway repositories — `git worktree remove` without force per checkout
+  condition (exit status, exact refusal text, checkout and listing
+  afterwards, branch kept, the `status --porcelain=v1
+  --untracked-files=all` and `ls-files -v` pre-check observations), the
+  three data-deleting hazards (ignored files; untracked files hidden by
+  `status.showUntrackedFiles=no`, refused again under `-c
+  status.showUntrackedFiles=all`; modifications hidden by
+  assume-unchanged/skip-worktree), missing and symlinked checkout paths,
+  the `worktree list --porcelain -z` record shapes, and the target,
+  repository-identity (`cat-file -e <oid>^{commit}`) and ancestry exit
+  statuses. [gitworktree_fsmonitor_probe_test.go](gitworktree_fsmonitor_probe_test.go)
+  adds the repository-code rows. `TestGitProbeFsmonitorOverride`
+  proves a repository-local `core.fsmonitor` hook runs on plain
+  `status`, `ls-files` and `worktree remove`, and never with
+  `-c core.fsmonitor=false`, with the pre-check output unchanged.
+  `TestGitProbeSubmoduleCheckouts` covers a checkout holding a
+  submodule: the submodule's own hook runs through `status` recursion
+  unless the inherited override is set, `diff.ignoreSubmodules=all`
+  hides its changes unless `--ignore-submodules=none` is explicit, and
+  `worktree remove` refuses the checkout, clean or dirty (exit 128, the
+  exact text). The hook only appends to a marker under the test's
+  temporary directory. Skips with a reason when no git is on PATH.
 - Test fixtures: none on disk; helper modes and ps stubs are written by the
   tests.
 

@@ -750,7 +750,13 @@ func (r operationRepository) Pending(ctx context.Context, runID identity.RunID) 
 // ByKind lists every operation of one kind for a run, whatever its state,
 // newest first.
 func (r operationRepository) ByKind(ctx context.Context, runID identity.RunID, kind app.OperationKind) ([]app.Operation, error) {
-	rows, err := r.u.tx.QueryContext(ctx,
+	return operationsByKind(ctx, r.u.tx, runID, kind)
+}
+
+// operationsByKind lists every operation of one kind for a run, whatever
+// its state, newest first, through any querier.
+func operationsByKind(ctx context.Context, q querier, runID identity.RunID, kind app.OperationKind) ([]app.Operation, error) {
+	rows, err := q.QueryContext(ctx,
 		selectOperationColumns+` WHERE run_id = ? AND kind = ? ORDER BY created_at DESC, rowid DESC`,
 		runID.String(), string(kind),
 	)

@@ -90,6 +90,15 @@ type controllerAPI interface {
 	// hop view (docs/plan/phase-3-design.md section 9).
 	SelectRunView(ctx context.Context, label string) error
 	ClearRunView(ctx context.Context) error
+
+	// Post-merge worktree retirement
+	// (docs/plan/phase-3-worktree-retirement.md section 3): lease-free
+	// triage, then per run with work the retirement lease, one pass and a
+	// plain release.
+	RetirementCandidates(ctx context.Context, repositoryRoot, excludeRunID string) ([]app.RetirementCandidate, error)
+	AcquireForRetirement(ctx context.Context, runID, controllerID string) (app.RunHandle, error)
+	RetireWorktrees(ctx context.Context, handle app.RunHandle, opts app.RetireWorktreesOptions) (app.WorktreeRetirementReport, error)
+	ReleaseRetirement(ctx context.Context, handle app.RunHandle) error
 }
 
 var _ controllerAPI = (*app.Controller)(nil)
@@ -128,6 +137,9 @@ type deps struct {
 	// forceExit ends the process immediately: the second SIGINT/SIGTERM
 	// during a detach shutdown exits without waiting for the release.
 	forceExit func()
+	// inspectPath resolves recorded worktree paths for retirement
+	// (inspectCanonicalPath in production).
+	inspectPath app.PathInspector
 	// checkOutcomePosted, when non-nil, is called by the loop's check
 	// driver after an asynchronous check outcome has been posted for
 	// consumption. Production wiring leaves it nil; loop tests use it as
@@ -153,6 +165,7 @@ func defaultDeps() *deps {
 			return ch, func() { signal.Stop(ch) }
 		},
 		openController: openController,
+		inspectPath:    inspectCanonicalPath,
 		exec:           process.Exec,
 		execResolved:   process.ExecResolved,
 		newID:          system.IDGenerator{}.NewID,
