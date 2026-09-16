@@ -85,6 +85,17 @@ type PendingQuestionView struct {
 	Age       time.Duration
 }
 
+// WorktreeOperationView is one unresolved per-attempt worktree.create
+// operation of a feature run and the human's action for it. Branch is ""
+// when the intent is unreadable. Action is fixed text: never a path or a
+// raw cause, which stay in the operation journal.
+type WorktreeOperationView struct {
+	OperationID string
+	Branch      string
+	State       string
+	Action      string
+}
+
 // RunDetailView is the full detail block `hop status -run` renders. Every
 // field the underlying store may not have populated yet renders as its
 // zero value ("" or 0), never a guess.
@@ -130,6 +141,9 @@ type RunDetailView struct {
 	// PendingQuestions is every unanswered human-addressed question,
 	// oldest first.
 	PendingQuestions []PendingQuestionView
+	// WorktreeOperations is every unresolved per-attempt worktree.create
+	// operation, oldest first, with its human action; nil for a solo run.
+	WorktreeOperations []WorktreeOperationView
 }
 
 // StatusResult is Status's success value: exactly one of Runs (the -run-less
@@ -246,6 +260,19 @@ func runDetailView(d RunDetail) RunDetailView { //nolint:gocritic // hugeParam: 
 		view.PendingQuestions = append(view.PendingQuestions, PendingQuestionView{
 			MessageID: q.MessageID.String(), BodyPath: q.BodyPath, Age: q.Age,
 		})
+	}
+	if d.Mode == WorkflowModeFeature {
+		for i := range d.PendingOperations {
+			op := &d.PendingOperations[i]
+			if op.Kind != OpWorktreeCreate {
+				continue
+			}
+			intent, _ := decodeOperationPayload[attemptWorktreeCreateIntent](op.Intent)
+			view.WorktreeOperations = append(view.WorktreeOperations, WorktreeOperationView{
+				OperationID: op.ID.String(), Branch: intent.Branch, State: string(op.State),
+				Action: worktreeOperationAction(op),
+			})
+		}
 	}
 	return view
 }

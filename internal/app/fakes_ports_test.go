@@ -170,7 +170,26 @@ func (r *fakeRuntime) CreateWorktree(_ context.Context, req app.WorktreeRequest)
 	if r.worktreeN > 1 {
 		path = fmt.Sprintf("/worktrees/w-%d", r.worktreeN)
 	}
-	return app.WorktreeInfo{WorkspaceID: fmt.Sprintf("workspace-%d", r.nextPaneN), Path: path, Branch: req.Branch}, nil
+	info := app.WorktreeInfo{WorkspaceID: fmt.Sprintf("workspace-%d", r.nextPaneN), Path: path, Branch: req.Branch}
+	r.nameWorktreeWorkspaceLocked(req.Label, info.WorkspaceID)
+	return info, nil
+}
+
+// nameWorktreeWorkspaceLocked records a labeled worktree.create's new
+// workspace under its label, with its own root tab and pane: the label
+// names the WORKSPACE exactly as workspace.create's does, which the real
+// adapter's TestRealProcessHerdrAdapterWorkspaceAndWorktreeLabels pins
+// through FindWorkspaceByLabel (S9's per-call label round trip). An empty
+// label names nothing. Callers hold r.mu; a scripted CreateWorktreeFn
+// calls it to model a create whose response was lost.
+func (r *fakeRuntime) nameWorktreeWorkspaceLocked(label, workspaceID string) {
+	if label == "" {
+		return
+	}
+	if r.Workspaces == nil {
+		r.Workspaces = map[string]app.WorkspaceRef{}
+	}
+	r.Workspaces[label] = app.WorkspaceRef{WorkspaceID: workspaceID, TabID: "tab-" + workspaceID, PaneID: "root-" + workspaceID}
 }
 
 func (r *fakeRuntime) OpenWorkerPane(_ context.Context, req app.WorkerPaneRequest) (app.PaneHandle, error) { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
@@ -380,12 +399,33 @@ func (c *fakeCommands) Run(ctx context.Context, cmd app.Command) (app.CommandRes
 		return app.CommandResult{ExitCode: 0, Stdout: []byte("cccccccccccccccccccccccccccccccccccccccc\n")}, nil
 	case strings.Contains(k, "cat-file -t"):
 		return app.CommandResult{ExitCode: 0, Stdout: []byte("commit\n")}, nil
+	case strings.Contains(k, " symbolic-ref -q "):
+		// A direct or absent ref: exit 1 with no output, as the process
+		// adapter's real-git probe pins (TestGitRefSemanticsThroughRunner);
+		// a test scripts a symbolic one.
+		return app.CommandResult{ExitCode: 1}, nil
+	case attemptBranchVerify(k):
+		// An attempt branch is absent until a test scripts it: rev-parse
+		// --verify of an absent ref exits non-zero (the same probe).
+		return app.CommandResult{ExitCode: 128, Stderr: []byte("fatal: Needed a single revision\n")}, nil
 	case strings.Contains(k, "worktree add"), strings.Contains(k, "worktree remove"):
 		return app.CommandResult{ExitCode: 0}, nil
 	case strings.Contains(k, "check-exec"):
 		return app.CommandResult{ExitCode: 0}, nil
 	}
 	return app.CommandResult{ExitCode: 0}, nil
+}
+
+// attemptBranchVerify reports whether a joined argv is `rev-parse
+// --verify` of a per-attempt branch (refs/heads/hop/r<seq>/t<tseq>a<n>),
+// never the integration branch.
+func attemptBranchVerify(k string) bool {
+	_, ref, found := strings.Cut(k, " rev-parse --verify refs/heads/hop/r")
+	if !found {
+		return false
+	}
+	_, leaf, found := strings.Cut(ref, "/")
+	return found && strings.HasPrefix(leaf, "t") && strings.Contains(leaf, "a")
 }
 
 // fakeGroups is a handwritten ProcessGroupInspector. Calls refuse to run

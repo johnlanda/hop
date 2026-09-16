@@ -73,8 +73,11 @@ func (*linkRuntime) ClosePane(context.Context, string) error {
 
 func (*linkRuntime) ServerInstance(context.Context) (string, error) { return linkServerInstance, nil }
 
-// linkGit answers exactly the git invocations worktree provenance runs:
-// every known checkout shares the repository's common directory, and each
+// linkGit answers exactly the git invocations the assignment runs: the
+// refuse-if-exists check of an attempt branch — not symbolic, and absent,
+// the shapes the process adapter's TestGitRefSemanticsThroughRunner pins
+// for a ref no worktree has created — then worktree provenance: every
+// known checkout shares the repository's common directory, and each
 // created worktree's HEAD is the base it was requested at.
 type linkGit struct {
 	repositoryRoot string
@@ -90,6 +93,17 @@ func (g linkGit) Run(_ context.Context, cmd app.Command) (app.CommandResult, err
 	base, created := g.runtime.bases[dir]
 	g.runtime.mu.Unlock()
 	switch {
+	case dir == g.repositoryRoot && strings.HasPrefix(args, "symbolic-ref -q refs/heads/hop/"):
+		return app.CommandResult{ExitCode: 1}, nil
+	case dir == g.repositoryRoot && strings.HasPrefix(args, "rev-parse --verify refs/heads/hop/"):
+		branch := strings.TrimPrefix(args, "rev-parse --verify refs/heads/")
+		g.runtime.mu.Lock()
+		_, exists := g.runtime.bases["/worktrees/feature/"+strings.ReplaceAll(branch, "/", "-")]
+		g.runtime.mu.Unlock()
+		if exists {
+			return app.CommandResult{}, fmt.Errorf("the harness never reads an existing attempt branch %s", branch)
+		}
+		return app.CommandResult{ExitCode: 128, Stderr: []byte("fatal: Needed a single revision\n")}, nil
 	case args == "rev-parse --path-format=absolute --git-common-dir" && (created || dir == g.repositoryRoot):
 		return app.CommandResult{Stdout: []byte(g.repositoryRoot + "/.git\n")}, nil
 	case args == "rev-parse HEAD^{commit}" && created:
