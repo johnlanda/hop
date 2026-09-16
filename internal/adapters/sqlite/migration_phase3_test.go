@@ -472,3 +472,39 @@ func TestMigration003ForeignKeyCheckRefused(t *testing.T) {
 		t.Fatalf("store version after the refusal = %d (%v), want 2 with nothing committed", version, scanErr)
 	}
 }
+
+// expectedPhase3Tables is the table set migration 003 adds; the Phase 2
+// list stays in migrations_test.go and TestMigrationTableListMatchesDesign
+// pins the union.
+func expectedPhase3Tables() []string {
+	return []string{
+		"task_dependencies",
+		"messages",
+		"message_deliveries",
+		"message_acks",
+		"message_receipts",
+		"reviews",
+		"review_submissions",
+		"integrations",
+		"retry_requests",
+		"workflow_receipts",
+	}
+}
+
+// TestMigration003Surface pins the 003-specific chain facts: the chain's
+// latest version is 3, a fresh store records one row per migration, and
+// every Phase 3 table exists.
+func TestMigration003Surface(t *testing.T) {
+	if got := sqlite.LatestMigrationVersion(); got != 3 {
+		t.Fatalf("latest migration version = %d, want 3", got)
+	}
+	store := openStoreAt(t, t.TempDir(), newFakeClock())
+	if n := countRows(t, store, `SELECT COUNT(*) FROM schema_migrations`); n != 3 {
+		t.Fatalf("schema_migrations rows = %d, want one per migration", n)
+	}
+	for _, table := range expectedPhase3Tables() {
+		if n := countRows(t, store, `SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = ?`, table); n != 1 {
+			t.Errorf("table %q does not exist after migration", table)
+		}
+	}
+}

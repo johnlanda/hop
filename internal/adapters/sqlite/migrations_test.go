@@ -12,10 +12,10 @@ import (
 	"github.com/johnlanda/hop/internal/adapters/sqlite"
 )
 
-// expectedTables is the complete table set of the migration chain (001
-// creates every Phase 2 table; 002 only adds a column; 003 adds the Phase
-// 3 tables and rebuilds sessions, launch_claims and check_requests under
-// their original names) plus the migrator's own version table.
+// expectedTables is the Phase 2 table set (001 creates every table; 002
+// only adds a column) plus the migrator's own version table; the Phase 3
+// additions live in expectedPhase3Tables (migration_phase3_test.go), and
+// TestMigrationTableListMatchesDesign pins the two lists' union.
 func expectedTables() []string {
 	return []string{
 		"schema_migrations",
@@ -36,16 +36,6 @@ func expectedTables() []string {
 		"transitions",
 		"operations",
 		"run_leases",
-		"task_dependencies",
-		"messages",
-		"message_deliveries",
-		"message_acks",
-		"message_receipts",
-		"reviews",
-		"review_submissions",
-		"integrations",
-		"retry_requests",
-		"workflow_receipts",
 	}
 }
 
@@ -65,8 +55,8 @@ func TestMigrateFromEmpty(t *testing.T) {
 	if err := sqlite.WriteDB(store).QueryRowContext(t.Context(), `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil {
 		t.Fatalf("read schema version: %v", err)
 	}
-	if version != 3 {
-		t.Fatalf("schema version = %d, want 3", version)
+	if version != sqlite.LatestMigrationVersion() {
+		t.Fatalf("schema version = %d, want the chain's latest %d", version, sqlite.LatestMigrationVersion())
 	}
 }
 
@@ -81,7 +71,7 @@ func TestReopenAtSameVersion(t *testing.T) {
 	second := openStoreAt(t, root, clock)
 
 	after := countRows(t, second, `SELECT COUNT(*) FROM schema_migrations`)
-	if before != 3 || after != 3 {
+	if latest := sqlite.LatestMigrationVersion(); before != latest || after != latest {
 		t.Fatalf("schema_migrations rows: first open %d, second open %d; want one row per migration, unchanged by the reopen", before, after)
 	}
 }
@@ -137,7 +127,7 @@ func TestConcurrentOpenAndMigrate(t *testing.T) {
 		defer stores[i].Close() //nolint:errcheck,gocritic // test cleanup of handles opened in this scope; close failures would already surface as errors above.
 	}
 	n := countRows(t, stores[0], `SELECT COUNT(*) FROM schema_migrations`)
-	if n != 3 {
+	if n != sqlite.LatestMigrationVersion() {
 		t.Fatalf("schema_migrations rows after concurrent migrate = %d, want one row per migration", n)
 	}
 }
@@ -210,24 +200,26 @@ func TestMigrationTableListMatchesDesign(t *testing.T) {
 
 	n := countRows(t, store, `SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`)
 
-	if want := expectedTables(); n != len(want) {
-		t.Fatalf("store holds %d tables, the design's migration defines %d: %s", n, len(want), fmt.Sprint(want))
+	want := append(expectedTables(), expectedPhase3Tables()...)
+	if n != len(want) {
+		t.Fatalf("store holds %d tables, the design's migrations define %d: %s", n, len(want), fmt.Sprint(want))
 	}
 }
 
 // TestUpgradePopulatedV1StoreToV2 upgrades a genuine populated version-1
 // store: the 001 schema file executed verbatim on a raw connection with
 // schema_migrations recording version 1 and a full claim chain (repository
-// → run → task → attempt → session → binding → a settled launch claim,
-// written before the seed_evidence column existed; the session and binding
-// rows are ones a real Phase 2 store always has — InitializeRun creates
-// the session, and a settled claim's corroboration recorded the binding —
-// and migration 003's session backfill rightly refuses a claim with
-// neither a binding nor a launch intent as ambiguous). Opening through
-// sqlite.Open applies 002 and 003; the old rows, values and relationships
-// survive with NULL seed evidence and the binding's session backfilled
-// onto the claim, a new evidence-bearing claim row round-trips, and a
-// reopen applies nothing further.
+// → run → task → attempt → a settled launch claim, written before the
+// seed_evidence column existed). The fixture and every assertion are the
+// Phase 2 test's verbatim, held at its ORIGINAL 001→002 migration
+// boundary through the real migrator paths (sqlite.MigrateUpTo): a plain
+// Open now continues to 003, whose launch-claim session backfill rightly
+// refuses this deliberately minimal fixture (its claim has no session
+// source at all) — the populated 001(+002)→003 upgrades have their own
+// fixtures in migration_phase3_test.go. The old rows, values and
+// relationships survive with NULL seed evidence, a new evidence-bearing
+// claim row round-trips, and a re-migration at the boundary applies
+// nothing further.
 func TestUpgradePopulatedV1StoreToV2(t *testing.T) {
 	root := t.TempDir()
 	schema, err := os.ReadFile(filepath.Join("migrations", "001_initial_schema.sql"))
@@ -250,10 +242,6 @@ func TestUpgradePopulatedV1StoreToV2(t *testing.T) {
 		 VALUES ('cccccccc-cccc-4ccc-8ccc-cccccccccccc', 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', 'v1-instructions', 'active', 1, '` + ts + `')`,
 		`INSERT INTO attempts (id, task_id, number, state, revision, updated_at)
 		 VALUES ('dddddddd-dddd-4ddd-8ddd-dddddddddddd', 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', 1, 'running', 1, '` + ts + `')`,
-		`INSERT INTO sessions (id, run_id, attempt_id, role, harness, native_session_ref, native_ref_source, state, revision, updated_at)
-		 VALUES ('99999999-9999-4999-8999-999999999999', 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', 'worker', 'claude', 'v1-native-ref', 'assigned', 'active', 1, '` + ts + `')`,
-		`INSERT INTO runtime_bindings (id, session_id, incarnation_id, server_socket_path, server_instance, workspace_id, tab_id, pane_id, creation_label, launch_kind, occupant_evidence, observed_at, superseded, superseded_at, superseded_evidence)
-		 VALUES ('88888888-8888-4888-8888-888888888888', '99999999-9999-4999-8999-999999999999', 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee', '/tmp/v1.sock', NULL, 'ws-1', 'tab-1', 'pane-1', 'label-1', 'pane', NULL, '` + ts + `', 0, NULL, NULL)`,
 		`INSERT INTO launch_claims (incarnation_id, run_id, attempt_id, executable, argv_digest, pid, state, error, claimed_at, settled_at, settlement_evidence)
 		 VALUES ('eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee', 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', '/opt/harness/claude', 'v1-argv-digest', 4242, 'execed', NULL, '` + ts + `', '` + ts + `', 'settled by the v1 controller')`,
 	} {
@@ -265,29 +253,32 @@ func TestUpgradePopulatedV1StoreToV2(t *testing.T) {
 		t.Fatal(closeErr)
 	}
 
-	store := openStoreAt(t, root, newFakeClock())
+	if err := sqlite.MigrateUpTo(t.Context(), root, 2, newFakeClock()); err != nil {
+		t.Fatalf("migrate to the 002 boundary: %v", err)
+	}
+	db := openRaw(t, root)
 
 	var version int
-	if err := sqlite.WriteDB(store).QueryRowContext(t.Context(), `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil {
+	if err := db.QueryRowContext(t.Context(), `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil {
 		t.Fatalf("read schema version: %v", err)
 	}
-	if version != 3 {
-		t.Fatalf("schema version after the upgrade = %d, want 3", version)
+	if version != 2 {
+		t.Fatalf("schema version after the upgrade = %d, want 2", version)
 	}
 	var (
-		executable, argvDigest, state, settlementEvidence, sessionID string
-		pid                                                          int
-		seedEvidence                                                 sql.NullString
+		executable, argvDigest, state, settlementEvidence string
+		pid                                               int
+		seedEvidence                                      sql.NullString
 	)
-	if err := sqlite.WriteDB(store).QueryRowContext(t.Context(),
-		`SELECT lc.executable, lc.argv_digest, lc.pid, lc.state, lc.settlement_evidence, lc.seed_evidence, lc.session_id
+	if err := db.QueryRowContext(t.Context(),
+		`SELECT lc.executable, lc.argv_digest, lc.pid, lc.state, lc.settlement_evidence, lc.seed_evidence
 		 FROM launch_claims lc
 		 JOIN attempts a ON a.id = lc.attempt_id
 		 JOIN tasks tk ON tk.id = a.task_id AND tk.run_id = lc.run_id
 		 JOIN runs r ON r.id = lc.run_id
 		 JOIN repositories rp ON rp.id = r.repository_id AND rp.root_path = '/repos/v1'
 		 WHERE lc.incarnation_id = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'`,
-	).Scan(&executable, &argvDigest, &pid, &state, &settlementEvidence, &seedEvidence, &sessionID); err != nil {
+	).Scan(&executable, &argvDigest, &pid, &state, &settlementEvidence, &seedEvidence); err != nil {
 		t.Fatalf("read the upgraded v1 claim through its full relationship chain: %v", err)
 	}
 	if executable != "/opt/harness/claude" || argvDigest != "v1-argv-digest" || pid != 4242 || state != "execed" || settlementEvidence != "settled by the v1 controller" {
@@ -296,27 +287,36 @@ func TestUpgradePopulatedV1StoreToV2(t *testing.T) {
 	if seedEvidence.Valid {
 		t.Fatalf("v1 claim seed evidence = %q, want NULL", seedEvidence.String)
 	}
-	if sessionID != "99999999-9999-4999-8999-999999999999" {
-		t.Fatalf("v1 claim session id = %q, want the binding's session backfilled", sessionID)
-	}
 
-	if _, err := sqlite.WriteDB(store).ExecContext(t.Context(),
-		`INSERT INTO launch_claims (incarnation_id, run_id, session_id, attempt_id, executable, argv_digest, pid, state, error, claimed_at, settled_at, settlement_evidence, seed_evidence)
-		 VALUES ('ffffffff-ffff-4fff-8fff-ffffffffffff', 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', '99999999-9999-4999-8999-999999999999', 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', '/opt/harness/claude', 'v2-argv-digest', 4243, 'exec_pending', NULL, '`+ts+`', NULL, NULL, 'workspace trust seeded for /worktrees/v2')`,
+	if _, err := db.ExecContext(t.Context(),
+		`INSERT INTO launch_claims (incarnation_id, run_id, attempt_id, executable, argv_digest, pid, state, error, claimed_at, settled_at, settlement_evidence, seed_evidence)
+		 VALUES ('ffffffff-ffff-4fff-8fff-ffffffffffff', 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', '/opt/harness/claude', 'v2-argv-digest', 4243, 'exec_pending', NULL, '`+ts+`', NULL, NULL, 'workspace trust seeded for /worktrees/v2')`,
 	); err != nil {
 		t.Fatalf("insert an evidence-bearing claim after the upgrade: %v", err)
 	}
 	var newEvidence string
-	if err := sqlite.WriteDB(store).QueryRowContext(t.Context(),
+	if err := db.QueryRowContext(t.Context(),
 		`SELECT seed_evidence FROM launch_claims WHERE incarnation_id = 'ffffffff-ffff-4fff-8fff-ffffffffffff'`,
 	).Scan(&newEvidence); err != nil || newEvidence != "workspace trust seeded for /worktrees/v2" {
 		t.Fatalf("new claim evidence = %q, %v", newEvidence, err)
 	}
-	reopened := openStoreAt(t, root, newFakeClock())
-	if n := countRows(t, reopened, `SELECT COUNT(*) FROM schema_migrations`); n != 3 {
+	if err := sqlite.MigrateUpTo(t.Context(), root, 2, newFakeClock()); err != nil {
+		t.Fatalf("re-migrate at the boundary: %v", err)
+	}
+	if n := rawCount(t, db, `SELECT COUNT(*) FROM schema_migrations`); n != 2 {
 		t.Fatalf("schema_migrations rows after reopen = %d, want one per migration, unchanged", n)
 	}
-	if n := countRows(t, reopened, `SELECT COUNT(*) FROM launch_claims`); n != 2 {
+	if n := rawCount(t, db, `SELECT COUNT(*) FROM launch_claims`); n != 2 {
 		t.Fatalf("launch claims after reopen = %d, want both rows intact", n)
 	}
+}
+
+// rawCount counts rows through a raw handle.
+func rawCount(t *testing.T, db *sql.DB, query string) int {
+	t.Helper()
+	var n int
+	if err := db.QueryRowContext(t.Context(), query).Scan(&n); err != nil {
+		t.Fatalf("count query: %v", err)
+	}
+	return n
 }
