@@ -9,10 +9,11 @@ import (
 	"testing"
 )
 
-// Worktree retirement of checkouts whose recorded spelling only the
-// filesystem can resolve, through the built hop binary: `..` after a
-// symbolic link, and a link on the way that no longer resolves. Every path
-// touched lives under the test's own temporary directories.
+// Worktree retirement of checkouts whose spellings only the filesystem can
+// resolve, through the built hop binary: a recorded `..` after a symbolic
+// link, a recorded link on the way that no longer resolves, and git's
+// registered spelling left unreadable after its parent was relocated.
+// Every path touched lives under the test's own temporary directories.
 
 // respellRecordedPath records spelling as the first checkout's path, in
 // its worktree row and in its worktree.create operation's outcome alike,
@@ -156,4 +157,94 @@ func TestGrammarContractWorktreeRetirementDanglingLinkSpelling(t *testing.T) {
 		t.Fatal("the checkout was removed")
 	}
 	requireLines(t, f.status(f.Repo, "-run", "r1").Stdout, "  worktree:      "+f.Checkouts[0].Branch+" active "+spelling)
+}
+
+// TestGrammarContractWorktreeRetirementUnreadableRegisteredSpelling: git
+// lists a checkout under the realpath it had when it was registered. After
+// its parent directory is relocated behind a symbolic link, that spelling
+// differs from the checkout's current canonical path; while it cannot be
+// read, the listing cannot say whether it names the checkout, so the
+// checkout is retained as not fully inspected — never released as
+// unregistered — and the run is not retired. Once the spelling reads
+// again, it resolves to the same checkout, which is removed.
+func TestGrammarContractWorktreeRetirementUnreadableRegisteredSpelling(t *testing.T) {
+	f := newRetirementFixture(t, retirementSetup{seed: 43000, attempts: 1, target: "refs/heads/main", merged: true})
+	recorded := f.Checkouts[0].Path
+	registered, resolveErr := filepath.EvalSymlinks(recorded)
+	if resolveErr != nil {
+		t.Fatal(resolveErr)
+	}
+	// Relocate the registered parent; its old spelling now reaches the new
+	// place through a gate directory, and the recorded alias points there
+	// directly.
+	oldParent := filepath.Dir(registered)
+	newParent := oldParent + "-relocated"
+	if err := os.Rename(oldParent, newParent); err != nil {
+		t.Fatal(err)
+	}
+	gate := filepath.Join(realDir(t), "gate")
+	if err := os.Mkdir(gate, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for link, target := range map[string]string{filepath.Join(gate, "access"): newParent, oldParent: filepath.Join(gate, "access")} {
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Remove(filepath.Dir(recorded)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(newParent, filepath.Dir(recorded)); err != nil {
+		t.Fatal(err)
+	}
+	current, currentErr := filepath.EvalSymlinks(recorded)
+	if currentErr != nil {
+		t.Fatal(currentErr)
+	}
+	if viaRegistered, err := filepath.EvalSymlinks(registered); err != nil || viaRegistered != current || current == registered {
+		t.Fatalf("the registered spelling resolves to %q (%v), want the checkout at %q under another spelling", viaRegistered, err, current)
+	}
+	if listing := runFixtureGit(t, f.Repo, "worktree", "list", "--porcelain"); !strings.Contains(listing, "worktree "+registered+"\n") {
+		t.Fatalf("git does not list the registered spelling:\n%s", listing)
+	}
+
+	if err := os.Chmod(gate, 0); err != nil {
+		t.Fatal(err)
+	}
+	restore := func() {
+		if err := os.Chmod(gate, 0o700); err != nil { //nolint:gosec // G302: the test's own gate directory, restored so cleanup can remove it.
+			t.Errorf("restore the gate: %v", err)
+		}
+	}
+	t.Cleanup(restore)
+	if _, err := os.Stat(registered); err == nil {
+		t.Skip("skipped, not run: permissions do not deny access under this user")
+	}
+	if !f.exists(recorded) {
+		t.Fatal("the recorded spelling no longer reaches the checkout")
+	}
+
+	out := f.status(f.Repo)
+	requireLines(t, out.Stdout,
+		"r1 worktree "+f.Checkouts[0].Branch+" retained (inspection failed): "+recorded,
+		"  action: the checkout could not be fully inspected; check it and its repository, then run hop status again",
+	)
+	for _, forbidden := range []string{"released", "already absent", "removed", "worktrees retired"} {
+		if strings.Contains(out.Stdout, forbidden) {
+			t.Fatalf("hop status decided on an unreadable registered spelling (%q):\n%s", forbidden, out.Stdout)
+		}
+	}
+	if !f.exists(recorded) {
+		t.Fatal("the checkout was removed")
+	}
+
+	restore()
+	again := f.status(f.Repo)
+	requireLines(t, again.Stdout,
+		"r1 worktrees retired: 1 removed, 0 already absent, 0 released (removal deletes ignored files such as build output)",
+		removedLine(f.Checkouts[0]),
+	)
+	if f.exists(current) {
+		t.Fatalf("the checkout survived its removal:\n%s", again.Stdout)
+	}
 }

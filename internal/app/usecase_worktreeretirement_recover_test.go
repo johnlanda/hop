@@ -191,6 +191,9 @@ func TestRecoverWorktreeRetire(t *testing.T) {
 		// cutListing makes the root's worktree listing end, at the capture
 		// bound, on the record boundary just before the checkout.
 		cutListing bool
+		// relisted leaves git listing the checkout only under a registered
+		// spelling that no longer resolves.
+		relisted   bool
 		wantSignal bool
 	}{
 		{name: "the claimed group still runs the removal: signaled", group: func(inner []string) []app.GroupProcess {
@@ -202,6 +205,7 @@ func TestRecoverWorktreeRetire(t *testing.T) {
 		{name: "the claimed group cannot be listed", listErr: errors.New("ps failed")},
 		{name: "the group is gone but the checkout cannot be observed", unobserved: true},
 		{name: "the group is gone but the worktree listing is cut by the capture bound", cutListing: true},
+		{name: "the group is gone but git lists the checkout only under a spelling that no longer resolves", relisted: true},
 	}
 	for _, tc := range blocked {
 		t.Run("blocked, never re-dispatched: "+tc.name, func(t *testing.T) {
@@ -219,6 +223,11 @@ func TestRecoverWorktreeRetire(t *testing.T) {
 			}
 			if tc.unobserved {
 				f.failPath = a.Recorded
+			}
+			modeledAt := a.Listed
+			if tc.relisted {
+				f.relistUnresolvable(&a)
+				modeledAt = retireRegisteredSpelling
 			}
 			if tc.cutListing {
 				f.git.fillListingBefore(t, a.Listed, app.RetirementListingOutputBytesForTest)
@@ -240,7 +249,7 @@ func TestRecoverWorktreeRetire(t *testing.T) {
 			if signaled := slices.Contains(f.tc.Groups.Signaled, detectPID); signaled != tc.wantSignal {
 				t.Fatalf("group signaled = %v, want %v", signaled, tc.wantSignal)
 			}
-			if _, modeled := f.git.attemptWorktree(a.Listed); !modeled {
+			if _, modeled := f.git.attemptWorktree(modeledAt); !modeled {
 				t.Fatalf("a blocked checkout is gone")
 			}
 		})

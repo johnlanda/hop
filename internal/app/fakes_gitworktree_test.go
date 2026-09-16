@@ -153,6 +153,20 @@ func (g *fakeGitRepo) indexReadLocked(configs []string, invocation string) {
 	}
 }
 
+// relistAttemptWorktree moves the checkout git lists at from to the
+// spelling to: the registration a relocated ancestor leaves behind, once
+// the directory is only reachable under another path.
+func (g *fakeGitRepo) relistAttemptWorktree(from, to string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	w, ok := g.attempt.byPath[from]
+	if !ok {
+		panic("relistAttemptWorktree: no modeled checkout at " + from)
+	}
+	delete(g.attempt.byPath, from)
+	g.attempt.byPath[to] = w
+}
+
 // attemptWorktree returns a copy of the checkout at path.
 func (g *fakeGitRepo) attemptWorktree(path string) (fakeAttemptWorktree, bool) {
 	g.mu.Lock()

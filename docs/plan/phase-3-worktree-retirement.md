@@ -849,15 +849,27 @@ consistent with sections 1 to 12.
   - a path that changed while it was being resolved.
 
   Its errors carry at most the system cause, never the path.
-- **A listed record that no longer resolves.** Git lists realpaths, and
-  a record is the candidate when its inspected path equals the
-  candidate's canonical path. A record that fails inspection while its
-  own text equals that canonical path can only mean the filesystem
-  changed during the pass. The listing then counts as unobservable, with
-  the same outcomes as a failed listing read, so "not listed" never
-  decides `absent` or `released` on it. A record that fails inspection
-  under any other spelling cannot be the candidate and is skipped, so an
-  unrelated broken worktree does not hold up the repository.
+- **A listed record that no longer resolves.** A record is the candidate
+  when its inspected path equals the candidate's canonical path. Git lists
+  each checkout under the realpath it had when it was registered, and
+  that spelling can stop being canonical: an ancestor relocated behind a
+  symbolic link leaves a registered spelling that differs from the
+  checkout's current canonical path yet reaches the same directory. A
+  record whose inspection fails therefore cannot be ruled out as the
+  candidate, whatever its spelling.
+  - The listing lookup remembers every such record and keeps scanning.
+  - A positively resolved match wins.
+  - With no match and any unresolved record, the listing is
+    unobservable: the pre-check retains `inspection-failed`, the post-act
+    observation leaves the operation `reconciling`, and recovery blocks.
+  - Only a fully resolved listing with no match may conclude `absent` or
+    `released`.
+- **The cost of that rule.** One unrelated registered worktree whose path
+  cannot be resolved (an unmounted volume, an unreadable directory)
+  blocks every `absent` and `released` conclusion for that repository's
+  candidates until it resolves again or is pruned. It never blocks a
+  removal: a candidate whose record resolves and matches is verified and
+  proceeds as usual.
 
 **Dispatch revalidation (`revalidateRetirementDispatch`).** Both claimed
 acts run it immediately before the spawn:

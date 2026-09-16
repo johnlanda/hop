@@ -242,10 +242,16 @@ func (c *Controller) inspectAttemptCheckout(ctx context.Context, candidate *atte
 }
 
 // listedCheckout reads the root's own `worktree list --porcelain -z` and
-// returns the record whose path resolves to canonicalPath, or nil when git
-// lists no such checkout; ok is false when the listing could not be read
-// or parsed, or when a record spelled exactly canonicalPath cannot be
-// resolved.
+// returns the record whose path resolves to canonicalPath. ok is false when
+// the listing could not be read or parsed, or when no record matched and
+// some record's path could not be resolved: git lists each checkout under
+// the realpath it had when it was registered, and an ancestor relocated
+// behind a symbolic link since then leaves a spelling that differs from
+// the checkout's current canonical path. An unresolvable record may
+// therefore be the candidate under any spelling, and only a fully resolved
+// listing may say git lists no such checkout. A positively resolved match
+// wins over unresolved records, so an unrelated broken worktree never
+// blocks a verified checkout.
 func (c *Controller) listedCheckout(ctx context.Context, root, canonicalPath string, inspect PathInspector) (record *listedWorktree, ok bool) {
 	listing, err := c.retirementGitBounded(ctx, root, retirementListingOutputBytes, "worktree", "list", "--porcelain", "-z")
 	if err != nil || listing.ExitCode != 0 {
@@ -255,21 +261,17 @@ func (c *Controller) listedCheckout(ctx context.Context, root, canonicalPath str
 	if err != nil {
 		return nil, false
 	}
+	unresolved := false
 	for i := range records {
 		listed, _, listErr := inspect(records[i].Path)
 		switch {
-		case listErr == nil && listed == canonicalPath:
+		case listErr != nil:
+			unresolved = true
+		case listed == canonicalPath:
 			return &records[i], true
-		case listErr != nil && records[i].Path == canonicalPath:
-			// git names the candidate's own canonical path, yet it no longer
-			// resolves: the filesystem changed during the pass, and the
-			// listing cannot say whether it holds the candidate. A record
-			// that fails to resolve under any other spelling cannot be the
-			// candidate and is skipped.
-			return nil, false
 		}
 	}
-	return nil, true
+	return nil, !unresolved
 }
 
 // observeCheckout is the post-act observation of a candidate: whether the

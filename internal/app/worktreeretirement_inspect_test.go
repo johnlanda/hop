@@ -370,7 +370,22 @@ func TestInspectAttemptCheckout(t *testing.T) {
 			want: app.CheckoutVerdictForTest{Disposition: "retained", Retained: app.RetainedInspectionFailed},
 		},
 		{
-			name: "an unrelated listed checkout that no longer resolves is skipped: removable",
+			name: "the candidate listed only under a registered spelling that no longer resolves: retained, never released",
+			setup: func(f *inspectFixture) {
+				f.relistCandidateUnresolvable()
+				f.present[inspectCanonical] = true
+			},
+			want: app.CheckoutVerdictForTest{Disposition: "retained", Retained: app.RetainedInspectionFailed},
+		},
+		{
+			name: "a gone candidate listed only under a registered spelling that no longer resolves: retained, never absent",
+			setup: func(f *inspectFixture) {
+				f.relistCandidateUnresolvable()
+			},
+			want: app.CheckoutVerdictForTest{Disposition: "retained", Retained: app.RetainedInspectionFailed},
+		},
+		{
+			name: "an unresolvable unrelated record does not block a verified match: removable",
 			setup: func(f *inspectFixture) {
 				f.addCheckout(fakeAttemptWorktree{})
 				f.git.addAttemptWorktree("/private/var/wt/a-other", fakeAttemptWorktree{Head: f.head, Present: true})
@@ -471,6 +486,20 @@ func (f *inspectFixture) setBranch(branch string) {
 
 func (f *inspectFixture) setHead(head string) {
 	f.mutate(func(w *fakeAttemptWorktree) { w.Head = head })
+}
+
+// inspectRegisteredSpelling is where git registered the candidate before
+// an ancestor was relocated: it differs from the candidate's current
+// canonical path.
+const inspectRegisteredSpelling = "/private/var/relocated-home/hop-r1-t1a1"
+
+// relistCandidateUnresolvable models the candidate registered under
+// inspectRegisteredSpelling, which the path inspector cannot resolve,
+// while the recorded path still resolves to inspectCanonical; the caller
+// says whether the checkout is present there (f.present).
+func (f *inspectFixture) relistCandidateUnresolvable() {
+	f.git.addAttemptWorktree(inspectRegisteredSpelling, fakeAttemptWorktree{Branch: inspectBranch, Head: f.head, Present: true})
+	f.failPath = inspectRegisteredSpelling
 }
 
 // fillListingBeforeCandidate makes the root's worktree listing hold

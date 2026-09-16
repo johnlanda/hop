@@ -187,6 +187,19 @@ func (f *retireFixture) onRemoval(hook func(cmd app.Command) (app.CommandResult,
 	}
 }
 
+// retireRegisteredSpelling is where git registered an attempt checkout
+// before an ancestor was relocated.
+const retireRegisteredSpelling = "/private/var/relocated-home/checkout"
+
+// relistUnresolvable makes git list attempt a's checkout only under
+// retireRegisteredSpelling, which the path inspector cannot resolve, while
+// the checkout stays present at its current canonical path.
+func (f *retireFixture) relistUnresolvable(a *retireAttempt) {
+	f.git.relistAttemptWorktree(a.Listed, retireRegisteredSpelling)
+	f.present[a.Listed] = true
+	f.failPath = retireRegisteredSpelling
+}
+
 func outcomeField(t *testing.T, op *app.Operation, key string) any {
 	t.Helper()
 	fields, ok := jsonFields(op.Outcome)
@@ -647,6 +660,16 @@ func TestRemoveRunWorktrees(t *testing.T) {
 			hook: func(f *retireFixture, a *retireAttempt) func(app.Command) (app.CommandResult, bool, error) {
 				return func(app.Command) (app.CommandResult, bool, error) {
 					f.git.fillListingBefore(f.t, a.Listed, app.RetirementListingOutputBytesForTest)
+					return app.CommandResult{ExitCode: 128, Stderr: []byte("fatal: refused\n")}, true, nil
+				}
+			},
+			wantRow: "unresolved", wantState: run.WorktreeActive, wantOpState: app.OperationReconciling,
+		},
+		{
+			name: "after a refused act git lists the checkout only under a spelling that no longer resolves: reconciling, never released",
+			hook: func(f *retireFixture, a *retireAttempt) func(app.Command) (app.CommandResult, bool, error) {
+				return func(app.Command) (app.CommandResult, bool, error) {
+					f.relistUnresolvable(a)
 					return app.CommandResult{ExitCode: 128, Stderr: []byte("fatal: refused\n")}, true, nil
 				}
 			},
