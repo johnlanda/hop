@@ -221,8 +221,11 @@ func (u *fakeUnitOfWork) Commit() error {
 	for id, row := range u.worktrees {
 		s.Worktrees[id] = &entityRow[run.Worktree]{value: row.value, revision: row.revision}
 	}
-	for _, w := range u.worktreeCreated {
+	for i := range u.worktreeCreated {
+		w := u.worktreeCreated[i]
 		s.Worktrees[w.ID] = &entityRow[run.Worktree]{value: w, revision: 1}
+		s.worktreeInsertSeq++
+		s.worktreeInsertOrder[w.ID] = s.worktreeInsertSeq
 	}
 	// sessionCreated merges BEFORE the staged sessions saves below: a
 	// transaction that creates a session and then immediately transitions
@@ -575,9 +578,9 @@ func (r fakeWorktreeRepo) Get(_ context.Context, id identity.WorktreeID) (run.Wo
 }
 
 func (r fakeWorktreeRepo) ByRun(_ context.Context, runID identity.RunID) (run.Worktree, int64, error) {
-	for _, w := range r.u.worktreeCreated {
-		if w.RunID == runID {
-			return w, 1, nil
+	for i := range r.u.worktreeCreated {
+		if r.u.worktreeCreated[i].RunID == runID {
+			return r.u.worktreeCreated[i], 1, nil
 		}
 	}
 	for _, base := range r.u.store.Worktrees {
@@ -588,10 +591,72 @@ func (r fakeWorktreeRepo) ByRun(_ context.Context, runID identity.RunID) (run.Wo
 	return run.Worktree{}, 0, fmt.Errorf("%w: no worktree for run %s", app.ErrNotFound, runID)
 }
 
+// Create enforces the real store's insert contract (sqlite
+// worktreeRepository.Create): the row belongs to the leased run, a linked
+// attempt exists and belongs to that same run, and the path is unique
+// across every worktree row (the schema's UNIQUE(path)).
 func (r fakeWorktreeRepo) Create(_ context.Context, v run.Worktree) (int64, error) { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
-
+	if v.RunID != r.u.lease.Run {
+		return 0, fmt.Errorf("%w: worktree %s belongs to run %s, not the leased run %s", app.ErrFenced, v.ID, v.RunID, r.u.lease.Run)
+	}
+	if v.AttemptID != "" {
+		owner, err := r.u.attemptOwnerRun(v.AttemptID)
+		if err != nil {
+			return 0, err
+		}
+		if owner != r.u.lease.Run {
+			return 0, fmt.Errorf("%w: worktree %s's attempt %s belongs to run %s, not the leased run %s", app.ErrFenced, v.ID, v.AttemptID, owner, r.u.lease.Run)
+		}
+	}
+	for i := range r.u.worktreeCreated {
+		if r.u.worktreeCreated[i].Path == v.Path {
+			return 0, fmt.Errorf("app_test: UNIQUE(path) violated for worktree %s", v.ID)
+		}
+	}
+	for _, base := range r.u.store.Worktrees {
+		if base.value.Path == v.Path {
+			return 0, fmt.Errorf("app_test: UNIQUE(path) violated for worktree %s", v.ID)
+		}
+	}
 	r.u.worktreeCreated = append(r.u.worktreeCreated, v)
 	return 1, nil
+}
+
+// attemptOwnerRun resolves an attempt's owning run through its task, from
+// this transaction's staged rows first and the store's base rows second —
+// the fake's counterpart of the real store's runOfAttempt, including its
+// ErrNotFound for an unknown attempt or task.
+func (u *fakeUnitOfWork) attemptOwnerRun(id identity.AttemptID) (identity.RunID, error) {
+	var (
+		taskID identity.TaskID
+		found  bool
+	)
+	if staged, ok := u.attempts[id]; ok {
+		taskID, found = staged.value.TaskID, true
+	}
+	for i := range u.attemptCreated {
+		if !found && u.attemptCreated[i].ID == id {
+			taskID, found = u.attemptCreated[i].TaskID, true
+		}
+	}
+	if base, ok := u.store.Attempts[id]; ok && !found {
+		taskID, found = base.value.TaskID, true
+	}
+	if !found {
+		return "", fmt.Errorf("%w: attempt %s", app.ErrNotFound, id)
+	}
+	if staged, ok := u.tasks[taskID]; ok {
+		return staged.value.RunID, nil
+	}
+	for i := range u.taskCreated {
+		if u.taskCreated[i].ID == taskID {
+			return u.taskCreated[i].RunID, nil
+		}
+	}
+	if base, ok := u.store.Tasks[taskID]; ok {
+		return base.value.RunID, nil
+	}
+	return "", fmt.Errorf("%w: task %s of attempt %s", app.ErrNotFound, taskID, id)
 }
 
 func (r fakeWorktreeRepo) Save(_ context.Context, v run.Worktree, expectedRevision int64) (int64, error) { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.

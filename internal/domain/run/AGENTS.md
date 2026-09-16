@@ -26,7 +26,7 @@ integration — without changing any Phase 2 transition's legality.
 | [attempt.go](attempt.go) | `Attempt`, `AttemptState`, `NewAttempt`, `NewRetryAttempt`, `Launch`, `MarkRunning`, `Submit`, `EnterChecking`, `Complete`, `Fail`, `Interrupt`, `Reconcile`, `Relaunch`, `Reattach`, `CompleteReview` | Attempt's state machine (section 5, "Attempt"), including cold-relaunch/warm-reattach transitions, multi-attempt retry reservation and the review-only `CompleteReview` row |
 | [session.go](session.go) | `Session`, `SessionState`, `Role`, `Harness`, `NativeRefSource`, `NewSession`, `NewManagerSession`, `NewChildSession`, `AssignNativeRef`, `Launch`, `ConfirmActive`, `Reconcile`, `MarkLost`, `Stop`, `Terminate` | Session's state machine (section 5, "Session") and its roles: `RoleWorker` (Phase 2/solo), `RoleManager`, `RoleImplementer`, `RoleReviewer` (Phase 3), with one-level delegation |
 | [binding.go](binding.go) | `RuntimeBinding`, `LaunchKind`, `OccupantEvidence`, `NewRuntimeBinding`, `Observe`, `Supersede` | Append-only runtime placement history and evidence-gated supersession |
-| [worktree.go](worktree.go) | `Worktree`, `WorktreeState`, `NewWorktree` | Checkout provenance; one per attempt in feature mode, one per run in solo mode — a persistence/application distinction this package's type does not carry |
+| [worktree.go](worktree.go) | `Worktree`, `WorktreeState`, `NewWorktree`, `NewAttemptWorktree` | Checkout provenance: one unlinked row per solo run (`NewWorktree`), one per attempt in feature mode (`NewAttemptWorktree`, carrying `AttemptID` and the verified `BaseCommit`) |
 | [result.go](result.go) | `Result`, `ResultSubmission`, `AcceptanceContext`, `AcceptanceOutcome`, `AcceptResult` | The section 7 result-acceptance rule as one pure, cross-entity function |
 | [message.go](message.go) | `Message`, `MessageKind`, `MessageState`, `Principal`, `Address`, `Delivery`, `Ack`, `AckContext`, `AckOutcome`, `AnswerSubmission`, `AnswerOutcome`, `NewQuestion`, `NewInfo`, `Deliver`, `AcceptAck`, `NextDeliverable`, `AcceptAnswer`, `ResolveOrigin`, `ValidateSendAddressing` | The durable message/delivery/ack model (section 7): the `queued`→`delivered`→`acknowledged` machine, FIFO selection, ack eligibility and the derived-destination answer rule |
 | [review.go](review.go) | `Review`, `Verdict`, `ReviewSubmission`, `ReviewAcceptanceContext`, `VerdictOutcome`, `AcceptVerdict` | The section 8 review-verdict acceptance rule, mirroring `AcceptResult`'s receipt-before-eligibility order |
@@ -128,6 +128,12 @@ integration — without changing any Phase 2 transition's legality.
   verdict's content gates run readiness, not the task's own state.
 - A session's native reference is immutable once assigned: `AssignNativeRef`
   refuses a second call, even with an identical value.
+- A feature-mode worktree names the attempt it was created for and the
+  base commit it was verified against: `NewAttemptWorktree` refuses an
+  empty value for either (`ErrInvalidTransition`), since an unlinked
+  feature row looks exactly like a solo row and the launch boundary could
+  not find it by attempt. `NewWorktree` builds the solo shape, with both
+  links empty.
 - `Session.AttemptID` is optional in the sense that its zero value (the
   empty string) means "no attempt" — the manager session's own shape,
   since `identity.AttemptID` is a plain string type and Phase 2 code
@@ -236,6 +242,7 @@ integration — without changing any Phase 2 transition's legality.
   (missing, foreign and duplicate prerequisites, a foreign edge naming a
   different task, an empty prerequisite set against a real dependency,
   and edges disagreeing with `HasDependencies` in either direction);
+  `NewAttemptWorktree`'s required attempt and base-commit links;
   `NewChildSession`'s delegation-depth, role and full parent-shape checks
   (worker parent, cross-run manager, malformed attempt-bound manager,
   terminated manager); runtime binding observation/supersession;

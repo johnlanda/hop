@@ -1108,33 +1108,92 @@ func (s *fakeStore) LoadSessionLaunchContext(_ context.Context, runID identity.R
 	if !ok {
 		return app.SessionLaunchContext{}, fmt.Errorf("%w: run %s", app.ErrNotFound, runID)
 	}
+	incarnation, err := s.sessionLaunchIdentityLocked(session)
+	if err != nil {
+		return app.SessionLaunchContext{}, err
+	}
+	r := rRow.value
 	out := app.SessionLaunchContext{
 		Snapshot: s.Snapshots[runID], Harness: sRow.value.Harness, Session: sRow.value,
-		AttemptID: sRow.value.AttemptID, StopRequested: rRow.value.StopRequested,
+		AttemptID: sRow.value.AttemptID, IncarnationID: incarnation,
+		StopRequested: r.StopRequested || r.State == run.RunStopping || r.State == run.RunStopped,
 	}
-	if binding, ok := s.currentBindingLocked(session); ok {
-		out.IncarnationID = binding.IncarnationID
-		if claim, ok := s.LaunchClaims[binding.IncarnationID]; ok {
-			c := claim
-			out.Claim = &c
-		}
-	} else {
-		for _, op := range s.Operations { //nolint:gocritic // rangeValCopy: test fake; the journal is small and read-only here.
-			if op.State != app.OperationPending || op.Kind != app.OpPaneOpen {
-				continue
-			}
-			intent, ok := decodePaneOpenIntent(op.Intent)
-			if !ok || identity.SessionID(intent.SessionID) != session {
-				continue
-			}
-			out.IncarnationID = identity.IncarnationID(intent.IncarnationID)
-			if claim, ok := s.LaunchClaims[out.IncarnationID]; ok {
-				c := claim
-				out.Claim = &c
-			}
-		}
+	if claim, ok := s.LaunchClaims[incarnation]; ok {
+		c := claim
+		out.Claim = &c
 	}
+	if sRow.value.AttemptID != "" {
+		aRow, ok := s.Attempts[sRow.value.AttemptID]
+		if !ok {
+			return app.SessionLaunchContext{}, fmt.Errorf("%w: attempt %s", app.ErrNotFound, sRow.value.AttemptID)
+		}
+		out.Attempt = aRow.value
+		out.WorktreePath = s.worktreePathForAttemptLocked(runID, sRow.value.AttemptID)
+	}
+	out.Relaunch = s.sessionIsSuccessorLocked(&sRow.value)
 	return out, nil
+}
+
+// sessionLaunchIdentityLocked mirrors the real store's
+// sessionLaunchIdentity: the session's current binding, else its newest
+// pending pane.open/launch.send intent naming it, agreement required when
+// both exist; a disagreement, a malformed intent incarnation or neither
+// source fails closed with ErrNotFound. Callers hold s.mu.
+func (s *fakeStore) sessionLaunchIdentityLocked(session identity.SessionID) (identity.IncarnationID, error) {
+	binding, hasBinding := s.currentBindingLocked(session)
+	var (
+		newest    app.Operation
+		hasIntent bool
+		rawIntent string
+	)
+	for _, op := range s.Operations { //nolint:gocritic // rangeValCopy: test fake; the journal is small and read-only here.
+		if op.State != app.OperationPending || (op.Kind != app.OpPaneOpen && op.Kind != app.OpLaunchSend) {
+			continue
+		}
+		intent, ok := decodePaneOpenIntent(op.Intent)
+		if !ok || identity.SessionID(intent.SessionID) != session {
+			continue
+		}
+		if !hasIntent || op.CreatedAt.After(newest.CreatedAt) || (op.CreatedAt.Equal(newest.CreatedAt) && op.ID > newest.ID) {
+			newest, hasIntent, rawIntent = op, true, intent.IncarnationID
+		}
+	}
+	var intentIncarnation identity.IncarnationID
+	if hasIntent {
+		parsed, err := identity.ParseIncarnationID(rawIntent)
+		if err != nil {
+			return "", fmt.Errorf("%w: pending launch intent of session %s carries a malformed incarnation id", app.ErrNotFound, session)
+		}
+		intentIncarnation = parsed
+	}
+	switch {
+	case hasBinding && hasIntent:
+		if binding.IncarnationID != intentIncarnation {
+			return "", fmt.Errorf("%w: binding and pending intent incarnations disagree for session %s", app.ErrNotFound, session)
+		}
+		return binding.IncarnationID, nil
+	case hasBinding:
+		return binding.IncarnationID, nil
+	case hasIntent:
+		return intentIncarnation, nil
+	default:
+		return "", fmt.Errorf("%w: no binding and no pending launch intent for session %s", app.ErrNotFound, session)
+	}
+}
+
+// sessionIsSuccessorLocked mirrors the real store's sessionIsSuccessor:
+// another session of the same run carries the same non-empty native
+// reference. Callers hold s.mu.
+func (s *fakeStore) sessionIsSuccessorLocked(session *run.Session) bool {
+	if session.NativeSessionRef == "" {
+		return false
+	}
+	for id, row := range s.Sessions {
+		if id != session.ID && row.value.RunID == session.RunID && row.value.NativeSessionRef == session.NativeSessionRef {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *fakeStore) LoadMessagingContext(_ context.Context, session identity.SessionID) (app.MessagingContext, error) {
@@ -1184,13 +1243,10 @@ func (s *fakeStore) LoadMessageDetail(_ context.Context, runID identity.RunID, m
 // --- fakeStore: RunDetail's Phase 3 status-surface assembly (section 3/7) ---
 
 // tasksSummaryLocked returns runID's feature-mode task table, unsorted;
-// callers sort as their rendering requires. WorktreePath is always "":
-// Worktree (internal/domain/run) is still the Phase 2 one-row-per-run
-// shape (no attempt linkage), so a per-attempt worktree path is not yet
-// resolvable from any repository this slice owns. Per the manager: slice
-// 3's migration adds attempt_id and base_commit to worktrees, at which
-// point this field resolves for real — left "" here deliberately rather
-// than guessed. Callers hold s.mu.
+// callers sort as their rendering requires. WorktreePath mirrors the real
+// store: the worktree row linked to the task's highest-numbered attempt,
+// "" when that attempt has none — never the run-wide fallback the launch
+// boundary uses. Callers hold s.mu.
 func (s *fakeStore) tasksSummaryLocked(runID identity.RunID) []app.TaskSummary {
 	var out []app.TaskSummary
 	for id, row := range s.Tasks {
@@ -1203,9 +1259,19 @@ func (s *fakeStore) tasksSummaryLocked(runID identity.RunID) []app.TaskSummary {
 				summary.DependsOn = append(summary.DependsOn, dep.PrerequisiteID)
 			}
 		}
+		var current *run.Attempt
 		for _, a := range s.Attempts {
-			if a.value.TaskID == id {
-				summary.AttemptCount++
+			if a.value.TaskID != id {
+				continue
+			}
+			summary.AttemptCount++
+			if current == nil || a.value.Number > current.Number {
+				current = &a.value
+			}
+		}
+		if current != nil {
+			if w, ok := s.newestAttemptWorktreeLocked(current.ID); ok {
+				summary.WorktreePath = w.Path
 			}
 		}
 		out = append(out, summary)

@@ -273,16 +273,19 @@ func currentSession(ctx context.Context, q querier, attemptID identity.AttemptID
 	return session, revision, true, nil
 }
 
-// getWorktree loads one worktree and its revision.
+// getWorktree loads one worktree and its revision. attempt_id and
+// base_commit are NULL for a solo row and map to the domain's empty
+// values.
 func getWorktree(ctx context.Context, q querier, where, arg string) (run.Worktree, int64, error) {
 	var (
 		id, repositoryID, runID, path, branch, state string
+		attemptID, baseCommit                        sql.NullString
 		revision                                     int64
 	)
 	err := q.QueryRowContext(ctx,
-		`SELECT id, repository_id, run_id, path, branch, state, revision FROM worktrees WHERE `+where+` = ?`,
+		`SELECT id, repository_id, run_id, attempt_id, base_commit, path, branch, state, revision FROM worktrees WHERE `+where+` = ?`,
 		arg,
-	).Scan(&id, &repositoryID, &runID, &path, &branch, &state, &revision)
+	).Scan(&id, &repositoryID, &runID, &attemptID, &baseCommit, &path, &branch, &state, &revision)
 	if errors.Is(err, sql.ErrNoRows) {
 		return run.Worktree{}, 0, fmt.Errorf("sqlite: worktree with %s %s: %w", where, arg, app.ErrNotFound)
 	}
@@ -301,14 +304,23 @@ func getWorktree(ctx context.Context, q querier, where, arg string) (run.Worktre
 	if err != nil {
 		return run.Worktree{}, 0, fmt.Errorf("sqlite: worktree %s run id: %w", id, err)
 	}
-	return run.Worktree{
+	worktree := run.Worktree{
 		ID:           worktreeID,
 		RepositoryID: repoID,
 		RunID:        parsedRunID,
+		BaseCommit:   baseCommit.String,
 		Path:         path,
 		Branch:       branch,
 		State:        run.WorktreeState(state),
-	}, revision, nil
+	}
+	if attemptID.Valid {
+		parsedAttemptID, attemptErr := identity.ParseAttemptID(attemptID.String)
+		if attemptErr != nil {
+			return run.Worktree{}, 0, fmt.Errorf("sqlite: worktree %s attempt id: %w", id, attemptErr)
+		}
+		worktree.AttemptID = parsedAttemptID
+	}
+	return worktree, revision, nil
 }
 
 // acceptedResult loads the attempt's accepted result, or nil when none has

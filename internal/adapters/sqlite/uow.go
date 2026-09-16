@@ -288,13 +288,26 @@ func (r worktreeRepository) ByRun(ctx context.Context, runID identity.RunID) (ru
 	return getWorktree(ctx, r.u.tx, "run_id", runID.String())
 }
 
+// Create inserts a worktree row. A feature-mode row names its attempt,
+// which must belong to the same leased run, and its verified base commit;
+// a solo row leaves both NULL.
 func (r worktreeRepository) Create(ctx context.Context, v run.Worktree) (int64, error) { //nolint:gocritic // hugeParam: the port passes domain values by value; the repository mirrors its signature.
 	if err := r.u.requireLeasedRun(v.RunID, "worktree", v.ID.String()); err != nil {
 		return 0, err
 	}
+	if v.AttemptID != "" {
+		attemptOwner, err := runOfAttempt(ctx, r.u.tx, v.AttemptID)
+		if err != nil {
+			return 0, err
+		}
+		if scopeErr := r.u.requireLeasedRun(attemptOwner, "worktree's attempt", v.AttemptID.String()); scopeErr != nil {
+			return 0, scopeErr
+		}
+	}
 	if _, err := r.u.tx.ExecContext(ctx,
-		`INSERT INTO worktrees (id, repository_id, run_id, path, branch, state, revision, created_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?)`,
+		`INSERT INTO worktrees (id, repository_id, run_id, path, branch, state, revision, created_at, attempt_id, base_commit) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`,
 		v.ID.String(), v.RepositoryID.String(), v.RunID.String(), v.Path, v.Branch, string(v.State), formatTime(r.u.store.now()),
+		nullString(v.AttemptID.String()), nullString(v.BaseCommit),
 	); err != nil {
 		return 0, fmt.Errorf("sqlite: create worktree %s: %w", v.ID, err)
 	}

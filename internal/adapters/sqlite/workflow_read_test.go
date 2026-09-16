@@ -30,10 +30,7 @@ func TestLoadSessionLaunchContext(t *testing.T) {
 	taskB := f.createFeatureTask(t, 7901, 2, run.TaskActive)
 	workerID, workerIncarnation := f.createWorkerSession(t, taskB, run.RoleImplementer, 7902)
 	workerAttempt := identity.AttemptID(uid(7902))
-	worktreeID := uid(7905)
-	rawExec(t, f.store, `INSERT INTO worktrees (id, repository_id, run_id, path, branch, state, revision, created_at, attempt_id, base_commit)
-		SELECT ?, repository_id, id, '/wt/attempt-b', 'hop/r1/t2', 'active', 1, '2026-09-14T10:00:00.000000000Z', ?, 'base-oid' FROM runs WHERE id = ?`,
-		worktreeID, workerAttempt.String(), f.spec.RunID.String())
+	f.createAttemptWorktree(t, 7905, workerAttempt, "/wt/attempt-b", "hop/r1/t2")
 
 	t.Run("bound worker resolves binding, attempt and worktree", func(t *testing.T) {
 		out, err := f.store.LoadSessionLaunchContext(t.Context(), f.spec.RunID, workerID)
@@ -110,6 +107,36 @@ func TestLoadSessionLaunchContext(t *testing.T) {
 		}
 		if out.IncarnationID != successorIncarnation {
 			t.Fatalf("successor incarnation = %s, want its own binding's", out.IncarnationID)
+		}
+	})
+
+	t.Run("unlinked rows: one is the solo fallback, several resolve nothing", func(t *testing.T) {
+		g := newFeatureFixture(t)
+		task := g.createFeatureTask(t, 7951, 2, run.TaskActive)
+		session, _ := g.createWorkerSession(t, task, run.RoleImplementer, 7952)
+		load := func() string {
+			t.Helper()
+			out, err := g.store.LoadSessionLaunchContext(t.Context(), g.spec.RunID, session)
+			if err != nil {
+				t.Fatalf("LoadSessionLaunchContext() = %v", err)
+			}
+			return out.WorktreePath
+		}
+		if got := load(); got != "" {
+			t.Fatalf("worktree path before any row = %q, want empty", got)
+		}
+		repositoryID := g.repositoryID(t)
+		g.createWorktree(t, run.NewWorktree(identity.WorktreeID(uid(7956)), repositoryID, g.spec.RunID, "/wt/solo-one", "hop/run-1"))
+		if got := load(); got != "/wt/solo-one" {
+			t.Fatalf("worktree path with the run's single unlinked row = %q, want that row", got)
+		}
+		g.createWorktree(t, run.NewWorktree(identity.WorktreeID(uid(7957)), repositoryID, g.spec.RunID, "/wt/solo-two", "hop/run-2"))
+		if got := load(); got != "" {
+			t.Fatalf("worktree path among several unlinked rows = %q, want no guess", got)
+		}
+		g.createAttemptWorktree(t, 7958, identity.AttemptID(uid(7952)), "/wt/linked", "hop/r1/t2a1")
+		if got := load(); got != "/wt/linked" {
+			t.Fatalf("worktree path with a linked row among unlinked ones = %q, want the linked row", got)
 		}
 	})
 
@@ -237,9 +264,7 @@ func TestRunDetailFeatureExtensions(t *testing.T) {
 	rawExec(t, f.store, `INSERT INTO task_dependencies (task_id, prerequisite_id, created_at) VALUES (?, ?, '2026-09-14T10:00:00.000000000Z')`,
 		taskC.String(), f.TaskB.String())
 	// A worktree row linked to the worker's attempt.
-	rawExec(t, f.store, `INSERT INTO worktrees (id, repository_id, run_id, path, branch, state, revision, created_at, attempt_id, base_commit)
-		SELECT ?, repository_id, id, '/wt/t2-a1', 'hop/r1/t2', 'active', 1, '2026-09-14T10:00:00.000000000Z', ?, 'base-oid' FROM runs WHERE id = ?`,
-		uid(7942), uid(7302), f.spec.RunID.String())
+	f.createAttemptWorktree(t, 7942, identity.AttemptID(uid(7302)), "/wt/t2-a1", "hop/r1/t2")
 	// An integration row for the worker task.
 	resultID := uid(7943)
 	rawExec(t, f.store, `INSERT INTO results (id, attempt_id, commit_oid, summary, content_digest, accepted, submitted_at)

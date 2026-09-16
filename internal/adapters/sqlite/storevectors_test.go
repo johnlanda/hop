@@ -232,4 +232,38 @@ func TestStoreVectors(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("WorktreeCreateUnknownAttempt", func(t *testing.T) {
+		f := newFeatureFixture(t)
+		vector := storevectors.WorktreeCreateUnknownAttempt(
+			identity.WorktreeID(uid(8030)), f.repositoryID(t), f.spec.RunID, identity.AttemptID(uid(8031)),
+		)
+		assertWorktreeVectorRefused(t, f, vector, app.ErrNotFound)
+	})
+
+	t.Run("WorktreeCreateForeignAttempt", func(t *testing.T) {
+		f := newFeatureFixture(t)
+		// The second run's worker attempt is uid 7454.
+		buildSecondMessagingFixtureAt(t, f.store, f.clock)
+		vector := storevectors.WorktreeCreateForeignAttempt(
+			identity.WorktreeID(uid(8032)), f.repositoryID(t), f.spec.RunID, identity.AttemptID(uid(7454)),
+		)
+		assertWorktreeVectorRefused(t, f, vector, app.ErrFenced)
+	})
+}
+
+// assertWorktreeVectorRefused drives one worktree vector through a unit of
+// work under the fixture's own lease: Create refuses with want, and
+// committing the same unit of work afterwards writes no row.
+func assertWorktreeVectorRefused(t *testing.T, f *featureFixture, vector run.Worktree, want error) { //nolint:gocritic // hugeParam: the vector is the port's by-value argument, passed once per subtest.
+	t.Helper()
+	f.inUOW(t, func(uow app.UnitOfWork) {
+		if _, err := uow.Worktrees().Create(t.Context(), vector); !errors.Is(err, want) {
+			t.Fatalf("Worktrees().Create() error = %v, want %v", err, want)
+		}
+	})
+	var rows int
+	if err := writeDBRow(t, f, `SELECT COUNT(*) FROM worktrees WHERE id = ?`, vector.ID.String()).Scan(&rows); err != nil || rows != 0 {
+		t.Fatalf("worktree rows after a refused create = %d, %v; want 0", rows, err)
+	}
 }
