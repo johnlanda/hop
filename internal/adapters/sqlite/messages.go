@@ -1,0 +1,197 @@
+package sqlite
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/johnlanda/hop/internal/app"
+	"github.com/johnlanda/hop/internal/domain/identity"
+	"github.com/johnlanda/hop/internal/domain/run"
+)
+
+// parseAddress parses the stored canonical recipient form back into a
+// run.Address: "manager", "human" or "task:<uuid>" (app.AddressString's
+// exact rendering, the only writer of the column).
+func parseAddress(text string) (run.Address, error) {
+	switch {
+	case text == "manager":
+		return run.ManagerAddress(), nil
+	case text == "human":
+		return run.HumanAddress(), nil
+	case strings.HasPrefix(text, "task:"):
+		taskID, err := identity.ParseTaskID(strings.TrimPrefix(text, "task:"))
+		if err != nil {
+			return run.Address{}, fmt.Errorf("sqlite: recipient address %q task id: %w", text, err)
+		}
+		return run.TaskAddress(taskID), nil
+	default:
+		return run.Address{}, fmt.Errorf("sqlite: recipient address %q is not a canonical address", text)
+	}
+}
+
+// selectMessageColumns selects everything scanMessage maps. The two
+// trailing EXISTS columns reconstruct Message.State — not a persisted
+// envelope field (the envelope is immutable) — from the delivery and ack
+// rows in the same snapshot.
+const selectMessageColumns = `SELECT m.id, m.run_id, m.sender_kind, m.sender_session_id, m.recipient_address,
+	m.kind, m.reply_to, m.relayed_from, m.enqueue_seq, m.request_id,
+	m.body_path, m.body_digest, m.body_bytes, m.created_at,
+	EXISTS (SELECT 1 FROM message_deliveries d WHERE d.message_id = m.id),
+	EXISTS (SELECT 1 FROM message_acks a WHERE a.message_id = m.id)
+	FROM messages m`
+
+// scanMessage maps one messages row (with the two reconstruction columns)
+// from a row scanner.
+func scanMessage(scan func(dest ...any) error) (run.Message, error) {
+	var (
+		id, runID, senderKind, recipientAddress, kind, bodyPath, bodyDigest, createdAt string
+		senderSession, replyTo, relayedFrom, requestID                                 sql.NullString
+		enqueueSeq, bodyBytes, delivered, acked                                        int64
+	)
+	if err := scan(&id, &runID, &senderKind, &senderSession, &recipientAddress, &kind, &replyTo, &relayedFrom, &enqueueSeq, &requestID, &bodyPath, &bodyDigest, &bodyBytes, &createdAt, &delivered, &acked); err != nil {
+		return run.Message{}, err
+	}
+	messageID, err := identity.ParseMessageID(id)
+	if err != nil {
+		return run.Message{}, fmt.Errorf("sqlite: message id: %w", err)
+	}
+	parsedRunID, err := identity.ParseRunID(runID)
+	if err != nil {
+		return run.Message{}, fmt.Errorf("sqlite: message %s run id: %w", id, err)
+	}
+	recipient, err := parseAddress(recipientAddress)
+	if err != nil {
+		return run.Message{}, fmt.Errorf("sqlite: message %s: %w", id, err)
+	}
+	message := run.Message{
+		ID:         messageID,
+		RunID:      parsedRunID,
+		Sender:     run.Principal{Kind: run.PrincipalKind(senderKind)},
+		Recipient:  recipient,
+		Kind:       run.MessageKind(kind),
+		EnqueueSeq: int(enqueueSeq),
+		RequestID:  requestID.String,
+		BodyPath:   bodyPath,
+		BodyDigest: bodyDigest,
+		BodyBytes:  bodyBytes,
+	}
+	if senderSession.Valid {
+		sessionID, senderErr := identity.ParseSessionID(senderSession.String)
+		if senderErr != nil {
+			return run.Message{}, fmt.Errorf("sqlite: message %s sender session id: %w", id, senderErr)
+		}
+		message.Sender.SessionID = sessionID
+	}
+	if replyTo.Valid {
+		parsed, replyErr := identity.ParseMessageID(replyTo.String)
+		if replyErr != nil {
+			return run.Message{}, fmt.Errorf("sqlite: message %s reply-to id: %w", id, replyErr)
+		}
+		message.ReplyTo = &parsed
+	}
+	if relayedFrom.Valid {
+		parsed, relayErr := identity.ParseMessageID(relayedFrom.String)
+		if relayErr != nil {
+			return run.Message{}, fmt.Errorf("sqlite: message %s relayed-from id: %w", id, relayErr)
+		}
+		message.RelayedFrom = &parsed
+	}
+	if message.CreatedAt, err = parseTime(createdAt); err != nil {
+		return run.Message{}, err
+	}
+	switch {
+	case acked != 0:
+		message.State = run.MessageAcknowledged
+	case delivered != 0:
+		message.State = run.MessageDelivered
+	default:
+		message.State = run.MessageQueued
+	}
+	return message, nil
+}
+
+// getMessage loads one message with its reconstructed state.
+func getMessage(ctx context.Context, q querier, id identity.MessageID) (run.Message, error) {
+	message, err := scanMessage(q.QueryRowContext(ctx, selectMessageColumns+` WHERE m.id = ?`, id.String()).Scan)
+	if errors.Is(err, sql.ErrNoRows) {
+		return run.Message{}, fmt.Errorf("sqlite: message %s: %w", id, app.ErrNotFound)
+	}
+	if err != nil {
+		return run.Message{}, fmt.Errorf("sqlite: load message %s: %w", id, err)
+	}
+	return message, nil
+}
+
+// collectMessages drains one messages query into decoded rows.
+func collectMessages(rows *sql.Rows) ([]run.Message, error) {
+	defer rows.Close() //nolint:errcheck // the deferred close of a fully-iterated read cursor has no failure the rows.Err check below misses.
+	var messages []run.Message
+	for rows.Next() {
+		message, err := scanMessage(rows.Scan)
+		if err != nil {
+			return nil, fmt.Errorf("sqlite: scan message row: %w", err)
+		}
+		messages = append(messages, message)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("sqlite: iterate message rows: %w", err)
+	}
+	return messages, nil
+}
+
+// messagesByAddress lists one recipient address's envelopes, lowest
+// enqueue sequence first, states reconstructed.
+func messagesByAddress(ctx context.Context, q querier, runID identity.RunID, address run.Address) ([]run.Message, error) {
+	rows, err := q.QueryContext(ctx,
+		selectMessageColumns+` WHERE m.run_id = ? AND m.recipient_address = ? ORDER BY m.enqueue_seq`,
+		runID.String(), app.AddressString(address),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: list messages of %s at %s: %w", runID, app.AddressString(address), err)
+	}
+	return collectMessages(rows)
+}
+
+// nextEnqueueSeq assigns the next durable per-(run, recipient address)
+// message sequence inside the caller's transaction — the FIFO authority
+// (section 7): commit order, never caller clocks. Raced writers serialize
+// behind SQLite's single-writer lock, and UNIQUE(run_id,
+// recipient_address, enqueue_seq) backstops the invariant.
+func nextEnqueueSeq(ctx context.Context, q querier, runID identity.RunID, address run.Address) (int, error) {
+	var next int64
+	if err := q.QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(enqueue_seq), 0) + 1 FROM messages WHERE run_id = ? AND recipient_address = ?`,
+		runID.String(), app.AddressString(address),
+	).Scan(&next); err != nil {
+		return 0, fmt.Errorf("sqlite: next enqueue sequence for %s at %s: %w", runID, app.AddressString(address), err)
+	}
+	return int(next), nil
+}
+
+// insertMessage persists one immutable envelope row.
+func insertMessage(ctx context.Context, q querier, m *run.Message) error {
+	var senderSession any
+	if m.Sender.Kind == run.PrincipalSession {
+		senderSession = m.Sender.SessionID.String()
+	}
+	var replyTo, relayedFrom any
+	if m.ReplyTo != nil {
+		replyTo = m.ReplyTo.String()
+	}
+	if m.RelayedFrom != nil {
+		relayedFrom = m.RelayedFrom.String()
+	}
+	if _, err := q.ExecContext(ctx,
+		`INSERT INTO messages (id, run_id, sender_kind, sender_session_id, recipient_address, kind, reply_to, relayed_from, enqueue_seq, request_id, body_path, body_digest, body_bytes, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		m.ID.String(), m.RunID.String(), string(m.Sender.Kind), senderSession, app.AddressString(m.Recipient),
+		string(m.Kind), replyTo, relayedFrom, m.EnqueueSeq, nullString(m.RequestID),
+		m.BodyPath, m.BodyDigest, m.BodyBytes, formatTime(m.CreatedAt),
+	); err != nil {
+		return fmt.Errorf("sqlite: insert message %s: %w", m.ID, err)
+	}
+	return nil
+}
