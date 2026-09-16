@@ -51,12 +51,16 @@ func openFixtureStore(t *testing.T, stateRoot string) *sqlite.Store {
 // test-helper package's architecture-checker category may depend on
 // application and domain code only, never a driven adapter, so it never
 // imports internal/adapters/sqlite or triggers database/sql driver
-// registration): no port method sets this column after InitializeRun,
-// since production code only ever reaches feature mode through slice
-// 6b's still-landing `hop run --workflow feature` bootstrap, which
-// writes it inside InitializeRun's own transaction. This function is the
-// pre-6b legacy substitute; 6b's merge can replace every caller of it
-// with the real feature InitializeRun once that bootstrap lands.
+// registration): no port method sets this column after InitializeRun.
+// Production code reaches feature mode only through `hop run --workflow
+// feature`, whose feature InitializeRun writes the column in its own
+// transaction — but that shape cannot back these fixtures: it creates the
+// manager session itself, refuses a spec carrying the solo bootstrap's
+// task, attempt or worktree identity (hopfixtures.Initialize seeds one),
+// and requires the sequence-named integration branch, while the rest of
+// the bootstrap places the manager through Herdr, which this suite never
+// starts. So every feature fixture seeds the solo base and promotes it
+// here.
 //
 // Composition code (cmd/hop, including its test files) may import any
 // standard package; database/sql's "sqlite" driver is registered
