@@ -282,6 +282,10 @@ this package never resolves environment variables or defaults.
   `TestLoadCheckExecutionContextRetirementKinds` (the intent's argv and
   spawn directory verbatim; missing argv, a non-string element, an empty
   argv, a missing directory and a non-object intent each fail closed).
+- `TestAcquireLeaseOnTerminalRun` (same command): a failed run's released
+  lease is taken under the next generation, and a unit of work under it
+  records the retired fact — the store behavior the retirement pass
+  relies on.
 - `TestMarkWorktreesRetired` (same command): the fact set once through
   a committed unit of work, a repeat keeping the first value with the run
   revision unchanged, another run fenced before any write, a rollback

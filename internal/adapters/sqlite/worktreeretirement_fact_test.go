@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/johnlanda/hop/internal/app"
+	"github.com/johnlanda/hop/internal/domain/run"
 )
 
 // TestMarkWorktreesRetired proves the worktrees-retired fact's store
@@ -105,5 +106,44 @@ func TestMarkWorktreesRetired(t *testing.T) {
 	}
 	if n := countRows(t, lost.store, `SELECT COUNT(*) FROM runs WHERE worktrees_retired_at IS NOT NULL`); n != 0 {
 		t.Fatalf("a fenced commit recorded the fact")
+	}
+}
+
+// TestAcquireLeaseOnTerminalRun pins the store behavior the retirement
+// pass relies on: a terminal run's released lease can be taken by a new
+// controller under the next generation, and a fenced unit of work under it
+// can record the fact.
+func TestAcquireLeaseOnTerminalRun(t *testing.T) {
+	f := newFeatureFixture(t)
+	f.inUOW(t, func(uow app.UnitOfWork) {
+		saveRun(t, uow, f.spec.RunID, func(r run.Run) (run.Run, error) { return r.Fail(f.clock.Now()) })
+	})
+	if err := f.store.ReleaseLease(t.Context(), f.lease); err != nil {
+		t.Fatalf("ReleaseLease: %v", err)
+	}
+
+	lease, err := f.store.AcquireLease(t.Context(), f.spec.RunID, "status-7")
+	if err != nil {
+		t.Fatalf("AcquireLease on a failed run: %v", err)
+	}
+	if lease.Generation != f.lease.Generation+1 || lease.ControllerID != "status-7" {
+		t.Fatalf("lease = %+v, want the next generation held by status-7", lease)
+	}
+	uow, err := f.store.Begin(t.Context(), lease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repos, err := app.RequireWorktreeRetirementRepositories(uow, "terminal run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if markErr := repos.MarkWorktreesRetired(t.Context(), f.spec.RunID, f.clock.Now()); markErr != nil {
+		t.Fatalf("MarkWorktreesRetired: %v", markErr)
+	}
+	if commitErr := uow.Commit(); commitErr != nil {
+		t.Fatalf("Commit: %v", commitErr)
+	}
+	if n := countRows(t, f.store, `SELECT COUNT(*) FROM runs WHERE id = ? AND state = 'failed' AND worktrees_retired_at IS NOT NULL`, f.spec.RunID.String()); n != 1 {
+		t.Fatalf("the failed run's fact was not recorded under the new lease")
 	}
 }
