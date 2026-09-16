@@ -115,6 +115,22 @@ package only observes and signals.
   empties preserved, empty buffer unavailable) and darwin real-child
   regressions proving empty-argument vectors byte-for-byte with no
   environment string ever appearing as an argument.
+- `go test -run TestGitProbe ./internal/adapters/process` —
+  [gitworktree_probe_test.go](gitworktree_probe_test.go), the worktree
+  retirement git probe
+  ([phase-3-worktree-retirement.md](../../../docs/plan/phase-3-worktree-retirement.md)):
+  every git value the retirement rules consume, executed through the real
+  `Runner` with an absolute git and the retirement environment against
+  throwaway repositories — `git worktree remove` without force per checkout
+  condition (exit status, exact refusal text, checkout and listing
+  afterwards, branch kept, the `status --porcelain=v1
+  --untracked-files=all` and `ls-files -v` pre-check observations), the
+  three data-deleting hazards (ignored files; untracked files hidden by
+  `status.showUntrackedFiles=no`, refused again under `-c
+  status.showUntrackedFiles=all`; modifications hidden by
+  assume-unchanged/skip-worktree), missing and symlinked checkout paths,
+  the `worktree list --porcelain -z` record shapes, and the target/ancestry
+  exit statuses. Skips with a reason when no git is on PATH.
 - Test fixtures: none on disk; helper modes and ps stubs are written by the
   tests.
 

@@ -107,8 +107,8 @@ func (s *testServer) worktreeList(t *testing.T, repoRoot string) worktreeListRes
 }
 
 // listedByHerdr reports whether worktree.list names the checkout (by
-// canonical path) and the entry.
-func (s *testServer) listedByHerdr(t *testing.T, repoRoot, path string) (bool, *string, bool) {
+// canonical path), and that entry's open workspace and prunable flag.
+func (s *testServer) listedByHerdr(t *testing.T, repoRoot, path string) (listed bool, openWorkspaceID *string, prunable bool) {
 	t.Helper()
 	for _, entry := range s.worktreeList(t, repoRoot).Worktrees {
 		if sameMaybeMissingPath(t, entry.Path, path) {
@@ -230,8 +230,8 @@ func TestSpikeWorktreeRemoveHerdrShapes(t *testing.T) {
 	}
 
 	// Clean: removed.
-	if err := os.Remove(untracked); err != nil {
-		t.Fatal(err)
+	if removeErr := os.Remove(untracked); removeErr != nil {
+		t.Fatal(removeErr)
 	}
 	raw, err := server.callRaw(t, "worktree.remove", map[string]any{"workspace_id": created.Workspace.WorkspaceID, "force": false})
 	if err != nil {

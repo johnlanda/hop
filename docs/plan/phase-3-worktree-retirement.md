@@ -1,0 +1,530 @@
+# Phase 3 slice 8: post-merge worktree retirement
+
+Design note for [phase-3-design.md](phase-3-design.md) section 12, row 8,
+implementing the human decision of 2026-09-15 (section 6, "Integration
+branch and worktree bases"; section 8, "Completion retirement"; open
+question 6). A proposal for approval: nothing here is implemented yet.
+
+The design fixes the mechanism: lazy detection on the next controller
+start or `hop status` for the repository, an ancestry check under an exec
+claim, removal of the run's attempt worktrees under a fresh exec claim, a
+persisted "worktrees retired" run fact so detection never repeats, and
+branches never deleted. This note settles what the design leaves open.
+
+## 1. Recommendations at a glance
+
+| # | Question | Recommendation |
+| --- | --- | --- |
+| 1 | Target branch | Recorded at freeze by `StartFeatureRun`: the full ref `git symbolic-ref -q HEAD` names at the repository root (`refs/heads/<b>`), in a new frozen `WorkflowSnapshot.TargetBranch`. Exit 1 (detached HEAD) records `""`, and that run never retires automatically. No config key. |
+| 2 | Uncommitted work | HOP's own pre-check decides, never git's clean check alone. Three executed hazards make git's check unsafe on its own (section 4). A worktree with changes is retained with a fixed category and re-examined on every pass. Removal never uses a force option. |
+| 3 | Eligible runs | Terminal (`completed`, `failed`, `stopped`) feature runs with a target, the fact unset, and at least one integrated row that added content. The pass takes the run's lease through `AcquireLease` and skips the run when another controller holds it. |
+| 4 | Candidates | Worktree rows of the run with `attempt_id` set, each verified against its attempt's succeeded `worktree.create` operation. The checkout must also appear in the repository's own `git worktree list`, share its common directory, sit on the recorded branch, and descend from the recorded base. The repository root is never a candidate. |
+| 5 | Transport | `git worktree remove` without force, spawned through `hop check-exec` via `CommandRunner` with the absolute git. **Not** Herdr's `worktree.remove` (section 5). |
+| 6 | Journal | Two exec-claimable operation kinds, `retirement.check` and `worktree.retire`, with the decision-table rows in section 7. |
+| 7 | Run fact | Migration 004: `runs.worktrees_retired_at TEXT NULL`. Per-worktree final states reuse `worktrees.state` (`removed`, `absent`, `released`), which needs no DDL. |
+
+## 2. Target branch and the detection subject
+
+**Target.** `StartFeatureRun` (slice 6b) runs one read-only
+`git -C <root> symbolic-ref -q HEAD` before `InitializeRun`, alongside its
+HEAD resolution:
+
+- Exit 0 with a `refs/heads/` name records that full ref.
+- Exit 1 (detached; pinned: no output) records `""`.
+- Anything else refuses the start before any side effect
+  (`ErrStartRefused`), like the other freeze-time git refusals.
+
+The value is frozen in `WorkflowSnapshot.TargetBranch`, a JSON key in
+`run_snapshots.workflow`, so no DDL is needed. Runs frozen before this
+slice decode `""` and never retire. Solo runs have no integration branch
+and are never candidates.
+
+**Integration head H.** H is the merge commit of the run's most recently
+created `integrated` integration row. Serial integration makes that row
+the last validated head. H comes from HOP's own validated record, never
+from the live `hop/r<seq>/integration` ref: after a merge the human may
+move or delete that branch, but H stays reachable from the target.
+
+**Content rule.** A no-op row records `MergeCommitOID == PremergeHeadOID`.
+A run is eligible only when some integrated row differs, meaning it
+integrated new content.
+
+- Without that rule, H equals the base, which is the target's tip at
+  freeze.
+- `merge-base --is-ancestor X X` exits 0 (pinned).
+- So such a run would read "merged" on its first pass and lose its
+  failed attempts' checkouts before any human decision.
+
+**Detection.** Before any journal row, the target's tip T is resolved
+read-only (`rev-parse --verify -q <target>^{commit}`). Exit 1 means the
+branch is gone (pinned: exit 1, no output), which reports not merged and
+journals nothing.
+
+The claimed act then compares two immutable object ids,
+`git -C <root> merge-base --is-ancestor H T` (pinned exit statuses:
+
+- 0: H is contained.
+- 1: H is not contained.
+- 128: unknown object.
+
+Freezing both ids into the intent makes the check deterministic and
+repeatable, and its evidence self-describing.
+
+## 3. The pass
+
+**Where it runs.**
+
+- `hop status`, both forms, runs the pass for the resolved repository
+  before rendering.
+- `hop run` and `hop resume` run it after flag parsing and repository
+  resolution, before `StartRun`/`Resume`, excluding their own run. Running
+  it first means the new controller's own lease is never waiting on a slow
+  removal.
+- The pass never changes an exit code. `hop status` stays Herdr-free:
+  git only, no Runtime wired.
+
+**Lease-free triage first.** A new read,
+`RetirementReadStore.ListRetirementCandidates(root)`, returns each
+eligible run's:
+
+- target
+- H and the content flag
+- last settled `retirement.check` (H, T, result)
+- whether any retirement operation is unresolved
+- active worktree count
+
+The pass takes a run's lease only when there is work:
+
+- an unresolved retirement operation to recover;
+- a new (H, T) pair not yet settled as not-merged or failed; or
+- a merged run with active worktrees.
+
+A repeated `hop status` on an unmerged run therefore takes no lease and
+writes nothing. Journal growth tracks target movement, not polling, the
+same principle as section 7's receipt-free empty fetch.
+
+**Per run, under the lease.**
+
+- `AcquireLease` → `ErrLeaseHeld` renders "deferred" and skips the run.
+- `cmd/hop` runs the existing `runHeartbeats` for the handle.
+- The run is re-read inside a fenced unit of work: terminal, feature, fact
+  unset.
+- Recovery runs first (section 7). An unresolved operation that cannot be
+  settled blocks the run's pass.
+- Detection, unless a settled `retirement.check` already says merged.
+  Detection never repeats after that.
+- Removal, per active candidate (section 4).
+- Set the fact when every worktree row is final.
+- `ReleaseLease`: a plain release. `Detach` is not used, because it would
+  journal a transition on every pass.
+
+**Budget.** The pass has a fixed 5-minute act bound, and status prints
+`retiring worktrees of r<seq>…` before the first removal act. A canceled
+act kills the claimed group (`CommandRunner`) and leaves the operation for
+the next pass's recovery.
+
+## 4. Candidates, provenance and cleanliness
+
+### Candidate set
+
+The candidates are worktree rows of the run in state `active` with
+`attempt_id` set. The linkage and `base_commit` come from the
+phase-3/worktree-attempt-link fix.
+
+Each row is verified against the attempt's succeeded `worktree.create`
+operation: `attemptWorktreeCreateIntent` plus `worktreeCreateOutcome`.
+The attempt, branch, base, outcome path, and the intent's repository root
+(which must equal the frozen root) must all agree with the row.
+
+A row that fails verification, or has no attempt, is `released` with a
+reason. HOP never acts on a checkout it cannot tie to its own record.
+
+### Pre-act observation
+
+These are read-only git invocations through `CommandRunner`, with the
+retirement environment `GIT_CONFIG_GLOBAL=/dev/null`,
+`GIT_CONFIG_SYSTEM=/dev/null` and `GIT_TERMINAL_PROMPT=0`, and nothing
+inherited. They are not journaled and follow the precedent of
+`classifyWorktreeProvenance`.
+
+A composition seam, `InspectPath`, returns the recorded path's canonical
+form (the deepest existing ancestor resolved, then the remainder
+appended) and whether the path exists. It follows the precedent of the
+launch boundary's `ResolvePath`. `internal/app` itself stays free of
+filesystem access.
+
+| Observation | Outcome |
+| --- | --- |
+| canonical path == canonical repository root | `released`: repository root (never) |
+| not in `git -C <root> worktree list --porcelain -z`, path absent | `absent` (final; nothing to do) |
+| not listed, path present | `released`: not a registered worktree (HOP never deletes a directory git does not vouch for) |
+| listed, `branch` ≠ recorded, or `detached` | `released`: checked out elsewhere (a detached HEAD's commits would become unreachable) |
+| listed with `locked[ <reason>]` | retained: `locked` |
+| listed `prunable` (directory gone) on the recorded branch | removable (the act prunes the entry; outcome `absent`) |
+| `git -C <path> rev-parse --path-format=absolute --git-common-dir` ≠ the root's | `released`: another repository |
+| `merge-base --is-ancestor <recorded base> <listed HEAD>` exit 1 | `released`: HEAD no longer descends from the recorded base |
+| `git -C <path> status --porcelain=v1 --untracked-files=all` non-empty | retained: `uncommitted-changes` |
+| `git -C <path> ls-files -v -z` has a lowercase tag or `S` | retained: `hidden-changes` |
+| any of the above exits unexpectedly | retained: `inspection-failed` |
+| otherwise | removable |
+
+**Final outcomes.** `absent` and `released` are final. Each is journaled
+once as a `worktree.retire` operation that is created settled, is never
+dispatched, and has no act. The row moves to that state in the same
+transaction.
+
+**Retained outcomes** are not persisted and are re-observed on every
+pass. The only exception is a retained outcome produced by a refused act
+(below), which that act's operation journals.
+
+### Why HOP's own check, not git's
+
+These values were executed and are pinned in `TestGitProbeWorktreeRemoveOutcomes`
+(git 2.54.0).
+
+**git refuses** (exit 128) with:
+
+```
+fatal: '<path>' contains modified or untracked files, use --force to delete it
+```
+
+when the checkout has untracked, modified or staged files, or a nested
+untracked repository.
+
+Locked checkouts are refused with different text, with or without a
+reason:
+
+- without a reason:
+  `fatal: cannot remove a locked working tree;\nuse 'remove -f -f' to override or unlock first`
+- with a reason:
+  `…locked working tree, lock reason: <r>\n…`
+
+**Git removes with exit 0 and deletes the data** in three cases:
+
+- **Ignored files** (`.gitignore`, `info/exclude`). They are not
+  uncommitted work to git.
+- **Untracked files hidden by a repository-local
+  `status.showUntrackedFiles=no`.** A command-line
+  `-c status.showUntrackedFiles=all` restores git's refusal (pinned), and
+  HOP's pre-check passes `--untracked-files=all` explicitly.
+- **Modifications hidden by `assume-unchanged` or `skip-worktree`.**
+  `status` shows nothing. Only `ls-files -v` reveals them (tags `h` and
+  `S`, pinned).
+
+So the act's argv carries the override. HOP's pre-check covers the flag
+case, and git's own check stays a second line of defense for the
+remaining window.
+
+**Decision for you: ignored files.** I recommend following git: ignored
+files do not block removal. The note and status say so plainly.
+
+Retaining on ignored files would retain nearly every real checkout,
+because workers produce build output (`node_modules/`, `target/`). The
+feature would then do nothing.
+
+The alternative is a `hidden`-style category for any
+`status --ignored=matching` output.
+
+### Act and outcome
+
+1. Commit the intent.
+2. `revalidateForDispatch`.
+3. Spawn
+   `hop check-exec --op <op> -- <git> -C <root> -c status.showUntrackedFiles=all worktree remove <listed path>`,
+   with `Dir` set to the root and the environment set to the run's
+   sanitized spawn environment plus `HOP_STATE_DIR` and the retirement git
+   variables.
+4. After the act, observe again (listing plus `InspectPath`):
+   - **unlisted and absent:** succeeded; `removed`, or `absent` when the
+     directory was already gone before the act. The row moves to that
+     state.
+   - **listed and present after a non-zero exit:** failed. The category
+     comes from the pre-check run again (else `remove-refused` with the
+     exit code). stdout and stderr are retained as artifacts under
+     `runs/<run>/retirement/<op>/`.
+   - **listed but absent:** failed. The row stays active and the next pass
+     prunes the entry.
+   - **unlisted but present:** `released`.
+   - **spawn error:** `reconciling`.
+
+No argv anywhere contains `--force` or `-f`. The argv is pinned
+byte-for-byte by a unit test.
+
+## 5. Removal transport: git, not Herdr
+
+Evidence read from the 0.9.0 source and the installed binary's schema.
+Section 11 pins the executed values.
+
+- **Shapes.**
+  - Request: `worktree.remove {workspace_id (required), force (default false), trust_repository}`.
+  - Result: `{type: "worktree_removed", workspace_id, path, forced}`.
+  - Dirty refusal: `dirty_worktree_requires_force` carrying git's
+    message; its detection is exactly git's check, with the same hazards.
+- **Addressed by workspace id, and only while that workspace is open**
+  (`workspace_not_found` otherwise). A run's attempt workspaces are
+  routinely closed by the human after completion. Closing is Herdr state
+  only; the checkout stays.
+- **Workspace ids are not durable.** Ids are `w<n>` from a per-process
+  counter re-seeded after a restart from the highest *restored* id
+  (`reserve_workspace_ids`). A workspace closed before a restart can have
+  its id reissued to a new linked worktree, possibly one of a later live
+  run of the same repository. A recorded id is an unsafe removal address.
+- **No exec claim is possible.** Herdr runs `git` (resolved on its own
+  PATH) in its own background thread. HOP spawns nothing: there is no
+  pre-exec claim, no lease-generation fence at the act, and no group
+  retirement. A lost response leaves a Herdr-side removal HOP can only
+  wait on. The design requires removal "under a fresh exec claim".
+- **Closing the workspace.** On success Herdr closes the linked workspace,
+  terminating its shells, including one the human may be working in.
+- **`hop status` stays Herdr-free with git.** The Herdr transport would
+  make status dial the server.
+
+The git transport addresses the checkout by path (the durable identity,
+which git canonicalizes; pinned), fences at the claim, is retired by the
+group rule, and runs HOP's own absolute git.
+
+**What git leaves in Herdr.** Probe
+`TestSpikeGitWorktreeRemoveLeavesHerdrWorkspace`, values in section 11.
+An open linked workspace stays open. Its membership still names the
+removed path, its root shell keeps running in a deleted directory, and
+`worktree.list` no longer names the checkout.
+
+The human closes that workspace (`workspace.close`), and the removal line
+tells them to. A Herdr-side tidy by the controller (close a workspace
+whose recorded worktree is gone) could be a later slice. It is not
+needed for correctness.
+
+## 6. Status rendering
+
+`hop status` prints the pass's lines after the listing (or after the
+detail block), each prefixed with the run label. It still exits 0: state
+is data. A pass error prints one classified, value-free line to stderr,
+and rendering continues. The fixed shapes, pinned by golden tests in
+`cmd/hop`:
+
+```
+r3 worktrees retired: 2 removed, 1 already absent, 0 released
+r3 worktree hop/r3/t2a1 removed: /abs/path (close its Herdr workspace if one is still open)
+r3 worktree hop/r3/t4a1 retained (uncommitted changes): /abs/path
+  action: commit or discard the changes, then run hop status again
+r3 worktree hop/r3/t5a1 released (checked out on another branch): /abs/path; HOP will not remove it
+r3 worktree retirement deferred: the run is held by another controller
+r3 worktree retirement blocked: an earlier retirement process could not be verified gone
+```
+
+Retained categories and their actions:
+
+| Category | Action |
+| --- | --- |
+| `uncommitted-changes` | commit or discard the changes |
+| `hidden-changes` | clear `git update-index --no-assume-unchanged/--no-skip-worktree`, then commit or discard |
+| `locked` | `git worktree unlock` |
+| `interrupted-removal` | inspect; restore (`git checkout -- .`) or remove it yourself |
+| `remove-refused` | inspect the retained evidence path |
+| `inspection-failed` | check the checkout |
+
+Each action ends with ", then run hop status again".
+`interrupted-removal` replaces `uncommitted-changes` when the latest
+settled `worktree.retire` for the row recorded an interrupted act.
+
+`hop status -run` adds:
+
+- `target: refs/heads/main`, or
+  `target: none (detached HEAD at freeze; worktrees are never retired automatically)`;
+- `worktrees: retired <time>` or `worktrees: not retired`;
+- one `worktree: <branch> <state> <path>` line per row, with the released
+  reason.
+
+## 7. Operations, exec claims and the decision table
+
+Both kinds join `check.run` and `integration.merge` as exec-claimable:
+
+- `ClaimCheckExec`'s accepted kind set widens, an in-place change to an
+  existing method body.
+- `LoadCheckExecutionContext` reads a generic `{argv, cwd}` from the
+  intent for the two new kinds and fails closed when that shape is
+  malformed.
+- `PrepareCheckExec` is unchanged.
+
+**Why the no-claim case is decisive.** Every pass acquires a fresh
+generation before recovery. `ClaimCheckExec` refuses a claim for an
+operation that is not pending in the current generation, and that
+refusal happens inside its write transaction, serialized with
+`AcquireLease`. So once the successor holds the lease, a claim-free older
+operation can never act.
+
+| Operation | Crash between intent and act | Crash between act and outcome | Takeover with the intent unresolved |
+| --- | --- | --- | --- |
+| `retirement.check` (intent: H, target ref, T, argv `git -C <root> merge-base --is-ancestor H T`) | No claim: the operation can never run under a superseded generation → settle `failed` ("never executed"); the pass may journal a fresh check | Claim present: retire the claimed group first (argv-matched listing: the frozen argv and its `hop check-exec` invocation, `ClassifyGroupRetirement`), confirm absence, then settle `failed` with result `unknown` (the exit status was never observed). Ancestry over two immutable ids is repeatable, so a fresh check is always safe. Mismatch or inspection failure → stays `reconciling`, and the run's pass is blocked | Same as the two columns, decided by claim presence |
+| `worktree.retire` (intent: worktree, attempt, root, listed path, branch, base, pre-act evidence, argv `git -C <root> -c status.showUntrackedFiles=all worktree remove <path>`) | No claim → settle `failed` ("never executed"). The row is unchanged and re-observed from scratch | Claim present: retire the group first (a surviving `git worktree remove` is killed mid-delete), confirm absence, then observe: unlisted & absent → adopt `removed` (row final); listed & present → `failed`, result `interrupted` (row active; later passes render `interrupted-removal` while the checkout is dirty); listed & absent → `failed`, `interrupted` (the next pass prunes the entry); unlisted & present → `released`. Group mismatch → `reconciling`, pass blocked | Same, by claim presence |
+
+Settled-at-creation `worktree.retire` rows (the `absent`/`released`
+decisions with no act) are never pending and never recovered. Neither
+kind blocks anything outside its own run's retirement pass. Stop, resume
+and the scheduling pass never read them, and runs can never leave a
+terminal state.
+
+## 8. Schema and ports
+
+**Migration 004** (`004_run_worktrees_retired.sql`) is the next dense
+version after 003. If another landing claims 004 first, this one is
+renumbered at merge; `loadMigrations` enforces density. It is additive
+and forward-only, with no rebuild. It runs on the ordinary path: its own
+immediate transaction, with the version re-read inside.
+
+```sql
+ALTER TABLE runs ADD COLUMN worktrees_retired_at TEXT;
+```
+
+- NULL means not retired. Every existing row stays NULL.
+- The value is canonical fixed-width UTC.
+- It is written only through the fenced unit of work (`requireLeasedRun`),
+  set once, never cleared or moved (the `stop_requested_at` discipline).
+- Future-schema refusal is unchanged.
+
+**`worktrees.state`** already has no CHECK constraint, so the new values
+need no DDL. The domain gains `WorktreeRemoved`, `WorktreeAbsent` and
+`WorktreeReleased`, plus `Worktree.Retire(state)`, which is valid only
+from `active`.
+
+**Ports** follow the additive packaging rule: separate interfaces,
+type-asserted, failing closed with typed sentinels.
+
+- `RetirementRepositories`, reached from `UnitOfWork`:
+  - `WorktreesForRetirement(run)`: rows with attempt, base, state and
+    revision.
+  - `MarkWorktreesRetired(run, at)`: idempotent, set only when NULL.
+
+  Row state saves reuse `Worktrees().Save`.
+- `RetirementReadStore`, reached from `ReadStore`:
+  - `ListRetirementCandidates(root)`.
+- `RunDetail` gains additive fields: `TargetBranch`, `WorktreesRetiredAt`
+  and `Worktrees` (branch, path, state, reason).
+- Controller methods for `cmd/hop`:
+  - `RetirementCandidates`
+  - `AcquireForRetirement`
+  - `RetireWorktrees`
+  - `ReleaseRetirement`
+
+  `controllerAPI` and its fake gain them with the real contracts.
+
+## 9. Test plan
+
+**Process probe (landed, executed): `gitworktree_probe_test.go`.** Every
+git value above, under `process.Runner` with the retirement environment.
+
+**Real-Herdr probe (landed, pending the suite):
+`spike_worktreeremove_test.go`.** Section 11.
+
+**Domain.** The `Retire` transition table (only from `active`; each final
+state is terminal).
+
+**SQLite.**
+
+- Migration 004:
+  - from empty, and over a populated 003 store (existing runs NULL, every
+    value intact);
+  - reopen is idempotent.
+- New states round-trip.
+- `MarkWorktreesRetired`: set-once, and fenced across runs.
+- `ListRetirementCandidates` filters: solo, non-terminal, no target,
+  retired, nothing integrated, no-op-only.
+- `ClaimCheckExec` generation, state and kind matrix for both new kinds.
+- `LoadCheckExecutionContext` for both kinds, including a malformed
+  intent.
+- Shared storevectors for the refused inputs.
+
+**Fakes.** A stateful fake git in `fakeCommands` reproduces the pinned
+table, hazards included: a hidden-flag or config-hidden checkout IS
+deleted by its fake `worktree remove`. So a test proves HOP never
+dispatches the removal, rather than trusting git.
+
+The fake also:
+
+- refuses a non-absolute argv[0];
+- fails any `worktree remove` argv containing `--force` or `-f`;
+- applies the config-hidden hazard when the `-c` override is missing;
+- serves the pinned `-z` records, porcelain lines, ls-files tags and
+  exit statuses.
+
+The fake store implements both new interfaces and the widened claim
+kinds.
+
+**App scenarios.**
+
+- **Green boundary:** a merged run retires every worktree exactly once
+  with the fact set. An unmerged run retires nothing and journals only
+  one check. A repeat pass journals nothing and invokes no removal.
+- **Eligibility:** detached-HEAD target, nothing-integrated,
+  no-op-only, and solo runs are never touched. A non-terminal run is
+  never touched. A lease held by another controller defers the run. The
+  invoking run is excluded.
+- **Cleanliness:** every retained category, including the three hazards
+  (dispatch never happens). A dirty checkout later cleaned is removed on
+  the next pass. `locked`.
+- **Released reasons:** not-registered, other branch, detached, other
+  repository, base not an ancestor, repository root, unverifiable
+  provenance.
+- **Absent:** before the act, and prunable.
+- **Crash points:** every cell of section 7, each at both kinds. Also a
+  takeover barrier: a zombie pass's spawn after the successor's
+  acquisition is refused at the claim.
+- **Argv pins:** exact argv for both acts.
+
+**cmd/hop.**
+
+- Status runs the pass before rendering and exits 0 with retained,
+  deferred and blocked outcomes.
+- Golden lines for section 6.
+- `run` and `resume` run the pass first and exclude their own run.
+- `TestStoreOpenDiagnostics`-style value-free error lines.
+- **Real-binary tier:** hopfixtures seeds a terminal feature run whose
+  worktree rows point at real `git worktree add` checkouts of a fixture
+  repository (`hop status` runs with the Herdr canary armed).
+  - The integration branch merged into `main` → checkouts removed,
+    branches kept, fact set, lines printed.
+  - A second `hop status` → nothing.
+  - Unmerged → nothing removed.
+  - Dirty → retained, then removed after cleaning.
+
+**Checks.** `make check`, then a suite request for the probe.
+
+## 10. Limits, deliberately out of scope
+
+- **Squash and rebase merges** never contain H, so their worktrees stay.
+  `hop clean` is future work.
+- **Branches, artifacts, and scratch integration trees** are untouched.
+  The scratch trees keep their own settlement cleanup.
+- **The residual window inside git** between its own clean check and its
+  deletion is unavoidable (Herdr has the same).
+- **A repository-local `core.fsmonitor` hook** could misreport status and
+  also executes repository-local code. Phase B adds
+  `-c core.fsmonitor=false` to the pre-check and the act, with a probe row
+  pinning it.
+- **Slice 7** (real-process feature scenarios) is not part of this slice.
+
+## 11. Probe observations (Herdr 0.9.0, git 2.54.0)
+
+Git values are in section 4 and pinned by the process probe (executed,
+passing).
+
+Herdr values come from `spike_worktreeremove_test.go`. **Pending the
+suite run.** The assertions encode the values read from the 0.9.0 source
+and schema:
+
+- **Dirty refusal:** `dirty_worktree_requires_force` with git's exact
+  message.
+- **Success:** the result key set `{forced, path, type, workspace_id}`,
+  the linked workspace and its root pane closed and its shell gone, the
+  parent kept, the branch kept.
+- **Closed workspace:** a closed workspace refuses with
+  `workspace_not_found` (`workspace <id> not found`), and the checkout is
+  still listed with `open_workspace_id` null.
+- **Restart:** a restart reissues a closed workspace's id.
+- **After a git-side removal:**
+  - the workspace stays open with its membership naming the removed
+    path, and its shell alive;
+  - `worktree.list` drops the entry;
+  - `worktree.remove` on the stale workspace fails with
+    `worktree_remove_failed`;
+  - `workspace.close` tidies it.
