@@ -162,20 +162,19 @@ func runTaskRetry(args []string, stdout, stderr io.Writer, d *deps) (int, error)
 		_, werr := fmt.Fprintf(stderr, "hop task retry: %v\n", err)
 		return exitFailure, werr
 	}
-	return writeLinesAndExit(stdout, taskRetryLines(flags.Arg(0), &result))
+	return writeLinesAndExit(stdout, taskRetryLines(&result))
 }
 
-// taskRetryLines renders RequestRetryResult. The grammar's accepted/
-// duplicate lines name the task by its t<seq> label, which this DTO does
-// not carry (only the raw task id argument the caller passed); rendering
-// the raw id here is a known simplification pending a Seq field on
-// RequestRetryResult (see HANDOFF.md).
-func taskRetryLines(taskArg string, result *app.RequestRetryResult) []string {
+// taskRetryLines renders RequestRetryResult as the grammar's fixed lines:
+// GrammarRetryAcceptedLine / GrammarRetryDuplicateLine name the task by
+// the t<seq> label the store reports (on a receipt replay too), never by
+// the raw task id argument.
+func taskRetryLines(result *app.RequestRetryResult) []string {
 	switch result.Outcome {
 	case "accepted":
-		return []string{fmt.Sprintf("retry accepted %s attempt %d", taskArg, result.AttemptNumber)}
+		return []string{app.GrammarRetryAcceptedLine(result.TaskSeq, result.AttemptNumber)}
 	case "duplicate":
-		return []string{fmt.Sprintf("duplicate %s attempt %d", taskArg, result.AttemptNumber)}
+		return []string{app.GrammarRetryDuplicateLine(result.TaskSeq, result.AttemptNumber)}
 	default:
 		return renderRefusal(refusalToken(result.Reason), result.Detail)
 	}

@@ -256,8 +256,8 @@ func (s *Store) RequestRetry(ctx context.Context, req app.RetryRequest) (app.Ret
 	err := s.inWriteTx(ctx, func(tx *sql.Tx) error {
 		now := s.now()
 		digest := app.ComputeRequestDigest(taskRetryVerb, req.RunID.String(), app.AddressString(run.ManagerAddress()), req.TaskID.String(), req.Reason)
-		record := func(kind app.WorkflowOutcomeKind, attemptID string, attemptNumber int, reason, detail string) error {
-			outcome = app.RetryAccepted{Outcome: kind, AttemptNumber: attemptNumber, Reason: reason, Detail: detail}
+		record := func(kind app.WorkflowOutcomeKind, attemptID string, taskSeq, attemptNumber int, reason, detail string) error {
+			outcome = app.RetryAccepted{Outcome: kind, TaskSeq: taskSeq, AttemptNumber: attemptNumber, Reason: reason, Detail: detail}
 			receipt := &workflowReceipt{
 				runID: req.RunID.String(), op: taskRetryVerb,
 				sessionID: req.Session.String(), incarnationID: req.IncarnationID.String(),
@@ -282,10 +282,15 @@ func (s *Store) RequestRetry(ctx context.Context, req app.RetryRequest) (app.Ret
 					// The original acceptance survives consumption, relaunch
 					// and manager succession: an identical retry reads the
 					// attempt number back from this receipt, never a second
-					// pending row.
-					return record(app.WorkflowDuplicate, createdEntity, createdSeq, "", "")
+					// pending row. The digest covers the task id, so the
+					// retried task is req.TaskID; its seq is immutable.
+					retried, _, taskErr := getTask(ctx, tx, req.TaskID)
+					if taskErr != nil {
+						return fmt.Errorf("sqlite: task of accepted retry receipt: %w", taskErr)
+					}
+					return record(app.WorkflowDuplicate, createdEntity, retried.Seq, createdSeq, "", "")
 				}
-				return record(app.WorkflowRefused, "", 0, app.GrammarReasonConflicting, "request id reused with different content")
+				return record(app.WorkflowRefused, "", 0, 0, app.GrammarReasonConflicting, "request id reused with different content")
 			}
 		}
 
@@ -294,11 +299,11 @@ func (s *Store) RequestRetry(ctx context.Context, req app.RetryRequest) (app.Ret
 			return err
 		}
 		if refusal != "" {
-			return record(app.WorkflowRefused, "", 0, reason, refusal)
+			return record(app.WorkflowRefused, "", 0, 0, reason, refusal)
 		}
 		runV, _, err := getRun(ctx, tx, req.RunID)
 		if errors.Is(err, app.ErrNotFound) {
-			return record(app.WorkflowMalformed, "", 0, app.GrammarReasonMalformed, "unknown run")
+			return record(app.WorkflowMalformed, "", 0, 0, app.GrammarReasonMalformed, "unknown run")
 		}
 		if err != nil {
 			return err
@@ -308,17 +313,17 @@ func (s *Store) RequestRetry(ctx context.Context, req app.RetryRequest) (app.Ret
 			if errors.Is(acceptErr, run.ErrRunNotAccepting) {
 				acceptReason = app.GrammarReasonRunNotAccepting
 			}
-			return record(app.WorkflowRefused, "", 0, acceptReason, acceptErr.Error())
+			return record(app.WorkflowRefused, "", 0, 0, acceptReason, acceptErr.Error())
 		}
 		task, taskRevision, err := getTask(ctx, tx, req.TaskID)
 		if errors.Is(err, app.ErrNotFound) || (err == nil && task.RunID != req.RunID) {
-			return record(app.WorkflowMalformed, "", 0, app.GrammarReasonMalformed, "unknown task")
+			return record(app.WorkflowMalformed, "", 0, 0, app.GrammarReasonMalformed, "unknown task")
 		}
 		if err != nil {
 			return err
 		}
 		if task.State != run.TaskNeedsRework {
-			return record(app.WorkflowRefused, "", 0, app.GrammarReasonRetryNotTerminal, "task is not needs-rework")
+			return record(app.WorkflowRefused, "", 0, 0, app.GrammarReasonRetryNotTerminal, "task is not needs-rework")
 		}
 		var pendingExists bool
 		if scanErr := tx.QueryRowContext(ctx,
@@ -328,7 +333,7 @@ func (s *Store) RequestRetry(ctx context.Context, req app.RetryRequest) (app.Ret
 			return fmt.Errorf("sqlite: read pending retry request of task %s: %w", req.TaskID, scanErr)
 		}
 		if pendingExists {
-			return record(app.WorkflowRefused, "", 0, app.GrammarReasonConflicting, "a retry request is already pending for this task")
+			return record(app.WorkflowRefused, "", 0, 0, app.GrammarReasonConflicting, "a retry request is already pending for this task")
 		}
 
 		attempts, attemptsErr := attemptsByTask(ctx, tx, req.TaskID)
@@ -336,7 +341,7 @@ func (s *Store) RequestRetry(ctx context.Context, req app.RetryRequest) (app.Ret
 			return attemptsErr
 		}
 		if len(attempts) == 0 {
-			return record(app.WorkflowMalformed, "", 0, app.GrammarReasonMalformed, "task has no attempts")
+			return record(app.WorkflowMalformed, "", 0, 0, app.GrammarReasonMalformed, "task has no attempts")
 		}
 		prior := attempts[len(attempts)-1]
 		limit := 3
@@ -359,9 +364,9 @@ func (s *Store) RequestRetry(ctx context.Context, req app.RetryRequest) (app.Ret
 		switch {
 		case err == nil:
 		case errors.Is(err, run.ErrRetryLimit):
-			return record(app.WorkflowRefused, "", 0, app.GrammarReasonRetryLimit, "retry limit reached")
+			return record(app.WorkflowRefused, "", 0, 0, app.GrammarReasonRetryLimit, "retry limit reached")
 		case errors.Is(err, run.ErrRetryNotTerminal):
-			return record(app.WorkflowRefused, "", 0, app.GrammarReasonRetryNotTerminal, "prior attempt is not terminal")
+			return record(app.WorkflowRefused, "", 0, 0, app.GrammarReasonRetryNotTerminal, "prior attempt is not terminal")
 		default:
 			return fmt.Errorf("sqlite: reserve retry attempt: %w", err)
 		}
@@ -406,7 +411,7 @@ func (s *Store) RequestRetry(ctx context.Context, req app.RetryRequest) (app.Ret
 		); err != nil {
 			return fmt.Errorf("sqlite: insert retry request: %w", err)
 		}
-		return record(app.WorkflowAccepted, next.ID.String(), next.Number, "", "")
+		return record(app.WorkflowAccepted, next.ID.String(), task.Seq, next.Number, "", "")
 	})
 	if err != nil {
 		return app.RetryAccepted{}, err

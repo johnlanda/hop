@@ -856,7 +856,7 @@ func (s *fakeStore) RequestRetry(_ context.Context, req app.RetryRequest) (app.R
 				return app.RetryAccepted{Outcome: app.WorkflowMalformed, Reason: app.GrammarReasonMalformed, Detail: "corrupt receipt"}, nil
 			}
 			if prior.digest == digest {
-				return app.RetryAccepted{Outcome: app.WorkflowDuplicate, AttemptNumber: out.AttemptNumber}, nil
+				return app.RetryAccepted{Outcome: app.WorkflowDuplicate, TaskSeq: out.TaskSeq, AttemptNumber: out.AttemptNumber}, nil
 			}
 			return app.RetryAccepted{Outcome: app.WorkflowRefused, Reason: app.GrammarReasonConflicting, Detail: "request id reused with different content"}, nil
 		}
@@ -941,7 +941,7 @@ func (s *fakeStore) RequestRetry(_ context.Context, req app.RetryRequest) (app.R
 	}
 	s.RetryRequestStates[req.TaskID] = app.RetryRequestPending
 
-	outcome := app.RetryAccepted{Outcome: app.WorkflowAccepted, AttemptNumber: next.Number}
+	outcome := app.RetryAccepted{Outcome: app.WorkflowAccepted, TaskSeq: tRow.value.Seq, AttemptNumber: next.Number}
 	if req.RequestID != "" {
 		s.RequestReceipts[requestReceiptKey{run: req.RunID, verb: verb, requestID: req.RequestID}] = requestReceipt{digest: digest, outcome: outcome}
 	}

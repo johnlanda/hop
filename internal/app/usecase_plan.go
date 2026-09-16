@@ -103,11 +103,13 @@ type RequestRetryRequest struct {
 	RequestID     string
 }
 
-// RequestRetryResult is RequestRetry's outcome. Reason is one of
-// grammar.go's GrammarReason* tokens on every refused/malformed outcome;
-// empty on accepted/duplicate.
+// RequestRetryResult is RequestRetry's outcome. TaskSeq (the retried
+// task's t<seq>) and AttemptNumber name the grammar's accepted and
+// duplicate lines. Reason is one of grammar.go's GrammarReason* tokens on
+// every refused/malformed outcome; empty on accepted/duplicate.
 type RequestRetryResult struct {
 	Outcome       string
+	TaskSeq       int
 	AttemptNumber int
 	Reason        string
 	Detail        string
@@ -145,7 +147,7 @@ func (c *Controller) RequestRetry(ctx context.Context, req RequestRetryRequest) 
 	if err != nil {
 		return RequestRetryResult{}, fmt.Errorf("app: request retry: %w", err)
 	}
-	return RequestRetryResult{Outcome: string(outcome.Outcome), AttemptNumber: outcome.AttemptNumber, Reason: outcome.Reason, Detail: outcome.Detail}, nil
+	return RequestRetryResult{Outcome: string(outcome.Outcome), TaskSeq: outcome.TaskSeq, AttemptNumber: outcome.AttemptNumber, Reason: outcome.Reason, Detail: outcome.Detail}, nil
 }
 
 // ClosePlanRequest is `hop plan close`'s driving input.

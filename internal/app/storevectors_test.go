@@ -348,6 +348,34 @@ func TestStoreVectors(t *testing.T) {
 			refuse(t, rf, foreignSession, foreignIncarnation)
 		})
 	})
+	t.Run("TaskRetry", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		fr := seedFeatureRun(t, tc, 2)
+		taskID := seedImplementTask(t, tc, fr.RunID, 4, "D", false, run.TaskReady)
+		workerID, _ := seedWorkerSession(t, tc, fr, taskID)
+		attemptID := tc.Store.Sessions[workerID].value.AttemptID
+		interrupted, err := tc.Store.Attempts[attemptID].value.Interrupt(tc.Clock.Now())
+		if err != nil {
+			t.Fatalf("Interrupt() error = %v", err)
+		}
+		tc.Store.Attempts[attemptID].value = interrupted
+		needsRework, err := tc.Store.Tasks[taskID].value.NeedsRework(tc.Clock.Now())
+		if err != nil {
+			t.Fatalf("NeedsRework() error = %v", err)
+		}
+		tc.Store.Tasks[taskID].value = needsRework
+
+		request := storevectors.TaskRetry(fr.RunID, fr.ManagerID, fr.ManagerIncarnation, taskID, "retry-vector")
+		for _, want := range []app.WorkflowOutcomeKind{app.WorkflowAccepted, app.WorkflowDuplicate} {
+			got, err := tc.Controller.Plan.RequestRetry(context.Background(), request)
+			if err != nil {
+				t.Fatalf("RequestRetry() error = %v", err)
+			}
+			if got.Outcome != want || got.TaskSeq != 4 || got.AttemptNumber != 2 || got.Reason != storevectors.TaskRetryReason {
+				t.Fatalf("RequestRetry() = %+v, want %s t4 attempt 2", got, want)
+			}
+		}
+	})
 }
 
 // seedForeignReviewer builds a second review task inside fr with its own

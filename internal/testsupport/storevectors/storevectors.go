@@ -18,6 +18,10 @@
 // names the outcome and detail observed against the current fakeStore
 // (internal/app); a future sqlite vector-contract test asserts the same
 // outcome from the real store.
+//
+// One vector, TaskRetry, pins an ACCEPTED outcome's shape rather than a
+// refusal: the values hop task retry renders into the shared grammar
+// lines, which the fake and the real store must return identically.
 package storevectors
 
 import (
@@ -253,5 +257,27 @@ func ReviewSubmitForeignReviewer(runID identity.RunID, taskID identity.TaskID, a
 		Session: foreignSession, IncarnationID: foreignIncarnation,
 		SubjectCommitOID: subjectCommitOID, SubjectTreeOID: subjectTreeOID,
 		Verdict: run.VerdictApprove, ReasonsPath: reasonsPath, ReasonsDigest: reasonsDigest,
+	}
+}
+
+// TaskRetryReason is TaskRetry's expected reason token: empty, since both
+// outcomes it pins are successes.
+const TaskRetryReason = ""
+
+// TaskRetry returns a PlanStore.RequestRetry request from the run's
+// current manager for taskID, which the consuming test's own fixture has
+// put in needs-rework behind a terminal prior attempt below the retry
+// limit. Not a refusal: the first submission is app.WorkflowAccepted with
+// TaskSeq equal to the task's own seq and AttemptNumber equal to the
+// prior attempt's number plus one; the identical request submitted again
+// (same requestID, same content) is app.WorkflowDuplicate carrying the
+// SAME TaskSeq and AttemptNumber, read back from the original acceptance.
+// Both carry TaskRetryReason. These are exactly the values hop task retry
+// renders as `retry accepted t<seq> attempt <n>` / `duplicate t<seq>
+// attempt <n>` (app.GrammarRetryAcceptedLine / GrammarRetryDuplicateLine).
+func TaskRetry(runID identity.RunID, manager identity.SessionID, incarnation identity.IncarnationID, taskID identity.TaskID, requestID string) app.RetryRequest {
+	return app.RetryRequest{
+		TaskID: taskID, RunID: runID, Session: manager, IncarnationID: incarnation,
+		Reason: "retry the terminal attempt", RequestID: requestID,
 	}
 }

@@ -207,6 +207,36 @@ func TestGrammarContractTaskRetryNotTerminal(t *testing.T) {
 	}
 }
 
+// TestGrammarContractTaskRetryAccepted drives hop task retry's accepted
+// and duplicate (request-id retry) first lines against a needs-rework
+// task behind a terminal first attempt: both name the task by its t<seq>
+// label and the reserved attempt 2 through the shared grammar renderers,
+// never by the raw task id argument.
+func TestGrammarContractTaskRetryAccepted(t *testing.T) {
+	const taskSeq = 6700
+	f := newFeatureManager(t, 6650, defaultMessageWait)
+	taskID := f.addReworkTask(t, taskSeq, "a task to retry")
+
+	for _, tc := range []struct {
+		name string
+		want string
+	}{
+		{name: "accepted", want: app.GrammarRetryAcceptedLine(taskSeq, 2)},
+		{name: "duplicate", want: app.GrammarRetryDuplicateLine(taskSeq, 2)},
+	} {
+		result := execHop(t, f.env(nil), f.StateRoot, "task", "retry", "--reason", "flaky check", "--request-id", "req-retry-1", taskID)
+		if got := result.FirstStdoutLine(); got != tc.want {
+			t.Errorf("%s first line = %q, want %q; stdout=%q stderr=%q", tc.name, got, tc.want, result.Stdout, result.Stderr)
+		}
+		if strings.Contains(result.Stdout, taskID) {
+			t.Errorf("%s stdout names the raw task id: %q", tc.name, result.Stdout)
+		}
+		if result.ExitCode != exitOK || result.Stderr != "" {
+			t.Errorf("%s exit = %d stderr = %q, want %d and nothing", tc.name, result.ExitCode, result.Stderr, exitOK)
+		}
+	}
+}
+
 // empty-plan (GrammarReasonEmptyPlan) is NOT covered here: every
 // hopfixtures.Initialize fixture's InitializeRun bootstrap creates one
 // task row, and migration 003 defaults an untyped kind to 'implement'

@@ -454,6 +454,41 @@ func SeedChildSession(ctx context.Context, store Store, lease app.Lease, runID, 
 	return sessionID, incarnationID, attemptID, nil
 }
 
+// SeedInterruptedAttempt reserves the next attempt on taskID and records
+// it straight in its terminal "interrupted" state (reserved ->
+// interrupted is a legal transition): the terminal prior attempt a
+// manager's hop task retry needs behind a needs-rework task. Seed the
+// task itself with SeedImplementTask(..., "needs-rework", ...).
+func SeedInterruptedAttempt(ctx context.Context, store Store, lease app.Lease, taskID string, seed int, now time.Time) (attemptID string, err error) {
+	attemptID = uid(seed)
+	txErr := withUOW(ctx, store, lease, func(uow app.UnitOfWork) error {
+		wf, wfErr := app.RequireWorkflowRepositories(uow, "hopfixtures.SeedInterruptedAttempt")
+		if wfErr != nil {
+			return fmt.Errorf("hopfixtures: %w", wfErr)
+		}
+		attempts, listErr := wf.AttemptIndex().ByTask(ctx, identity.TaskID(taskID))
+		if listErr != nil {
+			return fmt.Errorf("hopfixtures: list attempts: %w", listErr)
+		}
+		attempt, attemptErr := run.NewAttempt(identity.AttemptID(attemptID), identity.TaskID(taskID), len(attempts)+1, now)
+		if attemptErr != nil {
+			return fmt.Errorf("hopfixtures: new attempt: %w", attemptErr)
+		}
+		interrupted, trErr := attempt.Interrupt(now)
+		if trErr != nil {
+			return fmt.Errorf("hopfixtures: interrupt attempt: %w", trErr)
+		}
+		if _, createErr := wf.AttemptIndex().Create(ctx, interrupted); createErr != nil {
+			return fmt.Errorf("hopfixtures: create attempt: %w", createErr)
+		}
+		return nil
+	})
+	if txErr != nil {
+		return "", txErr
+	}
+	return attemptID, nil
+}
+
 // RunAttempt drives attemptID from its freshly reserved state through
 // launching to running (the two transitions SeedChildSession leaves
 // undone).

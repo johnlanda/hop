@@ -77,12 +77,16 @@ type RetryRequest struct {
 
 // RetryAccepted is RequestRetry's outcome: `retry accepted t<seq> attempt
 // <n>` / `duplicate t<seq> attempt <n>` / a refusal (not needs-rework, not
-// terminal, retry limit reached, non-manager caller). Reason is one of
-// grammar.go's GrammarReason* tokens, set by the store at its exact
-// decision point, on every WorkflowRefused or WorkflowMalformed outcome;
-// empty on accepted/duplicate.
+// terminal, retry limit reached, non-manager caller). TaskSeq and
+// AttemptNumber are the retried task's sequence and the reserved
+// attempt's number, both set on accepted and on duplicate (the receipt
+// replay reports the original acceptance's values), zero otherwise.
+// Reason is one of grammar.go's GrammarReason* tokens, set by the store at
+// its exact decision point, on every WorkflowRefused or WorkflowMalformed
+// outcome; empty on accepted/duplicate.
 type RetryAccepted struct {
 	Outcome       WorkflowOutcomeKind
+	TaskSeq       int
 	AttemptNumber int
 	Reason        string
 	Detail        string

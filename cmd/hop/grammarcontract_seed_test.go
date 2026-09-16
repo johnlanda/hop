@@ -256,6 +256,23 @@ func (f *featureManager) addImplementTask(t *testing.T, seed int, title string) 
 	return f.bindChild(t, seed, "implementer", taskID)
 }
 
+// addReworkTask seeds one needs-rework implement task (task seq = seed)
+// behind an interrupted first attempt: the shape hop task retry accepts,
+// reserving attempt 2.
+func (f *featureManager) addReworkTask(t *testing.T, seed int, title string) string {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	taskID, err := hopfixtures.SeedImplementTask(ctx, f.store, f.lease, f.RunID, seed, seed, title, "needs-rework", now)
+	if err != nil {
+		t.Fatalf("seed needs-rework task: %v", err)
+	}
+	if _, err := hopfixtures.SeedInterruptedAttempt(ctx, f.store, f.lease, taskID, seed+10, now); err != nil {
+		t.Fatalf("seed interrupted attempt: %v", err)
+	}
+	return taskID
+}
+
 // addReviewTask seeds one running review task, its subject frozen at
 // subjectCommitOID/subjectTreeOID, with a running child reviewer session
 // delegated by f's manager.

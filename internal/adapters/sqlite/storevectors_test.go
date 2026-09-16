@@ -215,4 +215,21 @@ func TestStoreVectors(t *testing.T) {
 			t.Fatalf("AckMessage(cross-run) = %+v, want refused/%s", got, storevectors.AckMessageCrossRunReason)
 		}
 	})
+
+	t.Run("TaskRetry", func(t *testing.T) {
+		f := newFeatureFixture(t)
+		taskID := f.createFeatureTask(t, 8020, 4, run.TaskNeedsRework)
+		seedTerminalAttempt(t, f, taskID, 8021, 1)
+
+		request := storevectors.TaskRetry(f.spec.RunID, f.ManagerID, f.ManagerIncarnation, taskID, "retry-vector")
+		for _, want := range []app.WorkflowOutcomeKind{app.WorkflowAccepted, app.WorkflowDuplicate} {
+			got, err := f.store.RequestRetry(t.Context(), request)
+			if err != nil {
+				t.Fatalf("RequestRetry() error = %v", err)
+			}
+			if got.Outcome != want || got.TaskSeq != 4 || got.AttemptNumber != 2 || got.Reason != storevectors.TaskRetryReason {
+				t.Fatalf("RequestRetry() = %+v, want %s t4 attempt 2", got, want)
+			}
+		}
+	})
 }

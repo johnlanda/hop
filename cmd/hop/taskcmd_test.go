@@ -88,27 +88,35 @@ func TestRunTaskCreate(t *testing.T) {
 }
 
 func TestRunTaskRetry(t *testing.T) {
-	t.Run("accepted names the attempt number", func(t *testing.T) {
-		ctrl := &fakeController{}
-		var req app.RequestRetryRequest
-		ctrl.requestRetry = func(r app.RequestRetryRequest) (app.RequestRetryResult, error) {
-			req = r
-			return app.RequestRetryResult{Outcome: "accepted", AttemptNumber: 2}, nil
-		}
-		td := newTestDeps(ctrl, managerEnv(), t.TempDir())
-		var stdout, stderr bytes.Buffer
+	for _, tt := range []struct {
+		outcome string
+		want    string
+	}{
+		{outcome: "accepted", want: app.GrammarRetryAcceptedLine(7, 2)},
+		{outcome: "duplicate", want: app.GrammarRetryDuplicateLine(7, 2)},
+	} {
+		t.Run(tt.outcome+" names the task by t<seq>, never the raw id argument", func(t *testing.T) {
+			ctrl := &fakeController{}
+			var req app.RequestRetryRequest
+			ctrl.requestRetry = func(r app.RequestRetryRequest) (app.RequestRetryResult, error) {
+				req = r
+				return app.RequestRetryResult{Outcome: tt.outcome, TaskSeq: 7, AttemptNumber: 2}, nil
+			}
+			td := newTestDeps(ctrl, managerEnv(), t.TempDir())
+			var stdout, stderr bytes.Buffer
 
-		code, err := runTask([]string{"retry", "--reason", "flaky", "task-9"}, &stdout, &stderr, td.deps)
-		if err != nil {
-			t.Fatalf("write error: %v", err)
-		}
-		if code != exitOK || stdout.String() != "retry accepted task-9 attempt 2\n" {
-			t.Errorf("code = %d, stdout = %q (stderr: %s)", code, stdout.String(), stderr.String())
-		}
-		if req.TaskID != "task-9" || req.Reason != "flaky" {
-			t.Errorf("request = %+v", req)
-		}
-	})
+			code, err := runTask([]string{"retry", "--reason", "flaky", "task-9"}, &stdout, &stderr, td.deps)
+			if err != nil {
+				t.Fatalf("write error: %v", err)
+			}
+			if code != exitOK || stdout.String() != tt.want+"\n" || stderr.Len() != 0 {
+				t.Errorf("code = %d, stdout = %q, stderr = %q; want %q", code, stdout.String(), stderr.String(), tt.want)
+			}
+			if req.TaskID != "task-9" || req.Reason != "flaky" {
+				t.Errorf("request = %+v", req)
+			}
+		})
+	}
 
 	t.Run("missing --reason is a usage error", func(t *testing.T) {
 		td := newTestDeps(&fakeController{}, managerEnv(), t.TempDir())

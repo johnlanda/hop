@@ -96,7 +96,9 @@ sides together. `cmd/hop` never imports domain or identity types: every
   `PlanStore.RequestRetry`'s own worker-authority transaction (terminal-
   prior-attempt and retry-limit validation, `Task.Reopen` +
   `ReopenMailbox`), matching the CLI grammar's `retry accepted t<seq>
-  attempt <n>` naming the attempt number in that same response — never
+  attempt <n>` naming the attempt number in that same response
+  (`RetryAccepted.TaskSeq`/`AttemptNumber`, also on a receipt replay's
+  duplicate) — never
   deferred to a later controller step. The `retry_requests` bookkeeping
   row it also writes (state pending) is consumed by
   `AssignReadyTasks` in the SAME transaction that launches the
