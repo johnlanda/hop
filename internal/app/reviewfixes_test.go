@@ -203,6 +203,67 @@ func TestReviewFixHistoricalManagerNeverShadows(t *testing.T) {
 	}
 }
 
+// TestReviewFixGuardHeadIsObservedNotInferred pins finding 5: the guard
+// head is OBSERVED from the live integration ref and validated against
+// integrated rows — never inferred from the recorded chain, which
+// repeated no-op merges at one head break (each no-op row records the
+// unchanged head, so chain consumption sees the rows consume each
+// other and resolves no head at all).
+func TestReviewFixGuardHeadIsObservedNotInferred(t *testing.T) {
+	t.Run("consecutive no-ops at one head still resolve it; the review task is created", func(t *testing.T) {
+		f := newIntegrationFixture(t, true)
+		f.git.MergeOutcome = "no-op"
+		f.driveUntil(t, string(run.IntegrationIntegrated), 5)
+
+		// A second completed task whose result is ALSO already contained:
+		// the second integration is another no-op at the same head.
+		priorAttempt := f.tc.Store.Attempts[f.attemptID].value
+		priorResult := f.tc.Store.Results[f.attemptID]
+		f.taskID = seedImplementTask(t, f.tc, f.fr.RunID, 2, "second no-op", false, run.TaskCompleted)
+		f.attemptID = identity.AttemptID(f.tc.IDs.NewID())
+		f.resultID = identity.ResultID(f.tc.IDs.NewID())
+		priorAttempt.ID = f.attemptID
+		priorAttempt.TaskID = f.taskID
+		priorResult.ID = f.resultID
+		priorResult.AttemptID = f.attemptID
+		f.tc.Store.Attempts[f.attemptID] = &entityRow[run.Attempt]{value: priorAttempt, revision: 1}
+		f.tc.Store.Results[f.attemptID] = priorResult
+		f.driveUntil(t, string(run.IntegrationIntegrated), 5)
+
+		closePlanDirectly(t, f.tc, f.fr.RunID)
+		created, err := f.tc.Controller.EnsureReviewTask(context.Background(), f.fr.Handle)
+		if err != nil {
+			t.Fatalf("EnsureReviewTask() error = %v", err)
+		}
+		if !created {
+			t.Fatalf("review task missing after two integrated no-op rows at the same head")
+		}
+	})
+
+	t.Run("a rolled-back head is vouched for by no row: readiness fails closed", func(t *testing.T) {
+		f := newIntegrationFixture(t, false)
+		f.driveUntil(t, string(run.IntegrationChecking), 5)
+		merged := f.git.ref(integrationRefName)
+		f.git.CheckExitCode = 1
+		f.driveUntil(t, string(run.IntegrationRolledBack), 5)
+
+		head := f.git.ref(integrationRefName)
+		if head == merged {
+			t.Fatalf("the rejected candidate stayed published; the rollback never landed")
+		}
+		ready, missing, err := f.tc.Controller.EvaluateRunReadiness(context.Background(), f.fr.Handle)
+		if err != nil {
+			t.Fatalf("EvaluateRunReadiness() error = %v", err)
+		}
+		if ready {
+			t.Fatalf("unsafe: readiness on a fresh rollback commit no integrated row vouches for")
+		}
+		if len(missing) == 0 {
+			t.Fatalf("readiness reported no shortfalls on an unvouched head")
+		}
+	})
+}
+
 // TestReviewFixRetentionFailure pins finding 2: a zero-exit check whose
 // output retention failed is never adopted as passing evidence — the
 // combined check settles the integration check-failed (the reset

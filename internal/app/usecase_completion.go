@@ -34,72 +34,65 @@ type guardEvidence struct {
 }
 
 // resolveGuardHead resolves the current integration head's commit and
-// tree object IDs: the commit from the run's most recently INTEGRATED
-// integration row (a conflicted, checking or merging one has not moved
-// the branch), the tree resolved against the repository. A run with no
-// integrated integration has no head and every head-bound guard reports
-// its shortfall.
+// tree object IDs: the commit is OBSERVED from the live integration ref
+// (outside any transaction, like every git observation), then validated
+// against the journal — the head is guard evidence only when an
+// INTEGRATED integration row records it as its merge candidate. A no-op
+// merge records the unchanged head as its candidate, so repeated no-ops
+// at one head each vouch for it; any inference from the recorded chain
+// alone would see such rows consume each other. A run whose ref cannot
+// be read, or whose observed head no integrated row vouches for (a
+// published-but-unsettled candidate, a half-done rollback), has no
+// guard head and every head-bound guard reports its shortfall — the
+// guards fail closed, never open. evaluateReadinessLocked re-verifies
+// the row match inside each guard transaction.
 func (c *Controller) resolveGuardHead(ctx context.Context, handle RunHandle, frozen *FrozenRun) (guardEvidence, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
-	var head string
+	observed, obsErr := c.runGit(ctx, frozen.RepositoryRoot, "rev-parse", "--verify", integrationRef(frozen.Snapshot.Workflow.IntegrationBranch))
+	if obsErr != nil || observed == "" {
+		return guardEvidence{}, nil // no readable head: head-bound guards report their shortfall.
+	}
+	var vouched bool
 	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 		wf, wfErr := RequireWorkflowRepositories(uow, "resolve guard head")
 		if wfErr != nil {
 			return wfErr
 		}
-		tasks, taskErr := wf.TaskIndex().ByRun(ctx, handle.runID)
-		if taskErr != nil {
-			return taskErr
-		}
-		var integrated []run.Integration
-		for i := range tasks {
-			integrations, intErr := wf.Integrations().ByTask(ctx, tasks[i].ID)
-			if intErr != nil {
-				return intErr
-			}
-			for j := range integrations {
-				if integrations[j].State == run.IntegrationIntegrated {
-					integrated = append(integrated, integrations[j])
-				}
-			}
-		}
-		// Serial integration makes the head derivable from the recorded
-		// chain alone, clock-free: each integration's pre-merge head is
-		// its predecessor's candidate, so the CURRENT head is the
-		// integrated candidate no OTHER integrated row consumed as its
-		// pre-merge base. Timestamps only break a tie the chain cannot
-		// (which a serial journal never produces).
-		var newest *run.Integration
-		for i := range integrated {
-			consumed := false
-			for j := range integrated {
-				if i != j && integrated[j].PremergeHeadOID == integrated[i].MergeCommitOID {
-					consumed = true
-					break
-				}
-			}
-			if consumed {
-				continue
-			}
-			if newest == nil || integrated[i].UpdatedAt.After(newest.UpdatedAt) {
-				v := integrated[i]
-				newest = &v
-			}
-		}
-		if newest != nil {
-			head = newest.MergeCommitOID
-		}
-		return nil
+		var vErr error
+		vouched, vErr = integratedRowVouchesFor(ctx, wf, handle.runID, observed)
+		return vErr
 	}); err != nil {
 		return guardEvidence{}, err
 	}
-	if head == "" {
+	if !vouched {
 		return guardEvidence{}, nil
 	}
-	tree, err := c.runGit(ctx, frozen.RepositoryRoot, "rev-parse", head+"^{tree}")
+	tree, err := c.runGit(ctx, frozen.RepositoryRoot, "rev-parse", observed+"^{tree}")
 	if err != nil {
 		return guardEvidence{}, fmt.Errorf("app: resolve guard head tree: %w", err)
 	}
-	return guardEvidence{HeadCommitOID: head, HeadTreeOID: tree}, nil
+	return guardEvidence{HeadCommitOID: observed, HeadTreeOID: tree}, nil
+}
+
+// integratedRowVouchesFor reports whether an INTEGRATED integration row
+// of the run records head as its merge candidate — the journal-side
+// half of guard-head resolution.
+func integratedRowVouchesFor(ctx context.Context, wf WorkflowRepositories, runID identity.RunID, head string) (bool, error) {
+	tasks, err := wf.TaskIndex().ByRun(ctx, runID)
+	if err != nil {
+		return false, err
+	}
+	for i := range tasks {
+		integrations, intErr := wf.Integrations().ByTask(ctx, tasks[i].ID)
+		if intErr != nil {
+			return false, intErr
+		}
+		for j := range integrations {
+			if integrations[j].State == run.IntegrationIntegrated && integrations[j].MergeCommitOID == head {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
 }
 
 // evaluateReadinessLocked assembles the GuardContext from the caller's
@@ -109,6 +102,18 @@ func (c *Controller) resolveGuardHead(ctx context.Context, handle RunHandle, fro
 // application behavior over evidence rows only — no verb writes any of
 // these except its own pipeline.
 func evaluateReadinessLocked(ctx context.Context, uow UnitOfWork, wf WorkflowRepositories, handle RunHandle, head guardEvidence) (bool, []run.GuardShortfall, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
+	// Re-verify the pre-resolved head against THIS transaction's journal:
+	// evidence rows may have moved since the caller observed the ref, and
+	// a head no integrated row vouches for is no head at all.
+	if head.HeadCommitOID != "" {
+		vouched, vErr := integratedRowVouchesFor(ctx, wf, handle.runID, head.HeadCommitOID)
+		if vErr != nil {
+			return false, nil, vErr
+		}
+		if !vouched {
+			head = guardEvidence{}
+		}
+	}
 	r, _, err := uow.Runs().Get(ctx, handle.runID)
 	if err != nil {
 		return false, nil, err
