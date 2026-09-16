@@ -135,6 +135,21 @@ func (c *Controller) ResumeFeature(ctx context.Context, req ResumeFeatureRequest
 		result.Blocked = append(result.Blocked, blocked)
 	}
 
+	// The feature startup continuation finishes a bootstrap the lost
+	// controller left undone (integration.init, the manager's placement
+	// and pane) before any session is reconciled.
+	bootstrap, err := c.continueFeatureBootstrap(ctx, handle, &frozen, &req)
+	if errors.Is(err, ErrStopRequested) {
+		result.Outcome = "stop-pending"
+		return result, handle, nil
+	}
+	if err != nil {
+		return result, handle, err
+	}
+	if bootstrap.Blocked != "" {
+		result.Blocked = append(result.Blocked, bootstrap.Blocked)
+	}
+
 	sessions, err := c.featureRunSessions(ctx, handle)
 	if err != nil {
 		return result, handle, err
@@ -146,7 +161,11 @@ func (c *Controller) ResumeFeature(ctx context.Context, req ResumeFeatureRequest
 			return result, handle, reconErr
 		}
 		result.Sessions = append(result.Sessions, report)
-		if report.Disposition != SessionWarm && report.Disposition != SessionRelaunched && report.Disposition != SessionRetiredNoProcess {
+		// A manager whose launch is in flight reports pending under the one
+		// predicate; its settlement belongs to the loop's corroboration, so
+		// it does not hold the run in reconciliation.
+		launchInFlight := bootstrap.ManagerLaunching && report.SessionID == bootstrap.ManagerSessionID.String() && report.Disposition == SessionPending
+		if report.Disposition != SessionWarm && report.Disposition != SessionRelaunched && report.Disposition != SessionRetiredNoProcess && !launchInFlight {
 			allSettled = false
 		}
 	}
@@ -157,6 +176,9 @@ func (c *Controller) ResumeFeature(ctx context.Context, req ResumeFeatureRequest
 		}
 		result.Outcome = "resumed"
 		result.RunState = string(run.RunRunning)
+		if bootstrap.ManagerLaunching {
+			result.RunState = string(run.RunLaunching)
+		}
 		return result, handle, nil
 	}
 	result.Outcome = "reconciling"

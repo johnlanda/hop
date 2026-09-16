@@ -70,13 +70,15 @@ func (g *fakeGitRepo) newCommit(tree string, parents ...string) string {
 
 func (g *fakeGitRepo) newCommitLocked(tree string, parents ...string) string {
 	g.counter++
-	oid := fmt.Sprintf("commit-%04d", g.counter)
+	// Real SHA-1 object IDs are 40 lowercase hex characters; the fake
+	// mints the same shape so object-ID validation sees what git reports.
+	oid := fmt.Sprintf("%040x", 0xc0de0000+g.counter)
 	g.commits[oid] = fakeGitCommit{tree: tree, parents: parents}
 	return oid
 }
 
 // ref reads a ref's current value ("" when unset).
-func (g *fakeGitRepo) ref(name string) string { //nolint:unparam // a general ref-store helper; every current scenario exercises the one integration ref.
+func (g *fakeGitRepo) ref(name string) string {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.refs[name]
@@ -174,6 +176,9 @@ subcommand:
 		// directory, matching fakeCommands' default stub.
 		if slices.Contains(rest, "--git-common-dir") {
 			return app.CommandResult{ExitCode: 0, Stdout: []byte("/repo/.git\n")}
+		}
+		if slices.Contains(rest, "--show-object-format") {
+			return app.CommandResult{ExitCode: 0, Stdout: []byte("sha1\n")}
 		}
 		var revs []string
 		for _, a := range rest {
