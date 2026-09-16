@@ -111,6 +111,48 @@ type AssignmentOptions struct {
 	StateRoot                string
 }
 
+// validateAssignmentOptions refuses an AssignmentOptions value the
+// scheduling-pass loop has not actually populated: RepositoryRoot,
+// HOPPath and StateRoot back every worktree, launch and artifact write
+// this step performs, so an empty or relative value here would silently
+// misdirect every git and file-write call at the controller process's own
+// working directory instead of the run's frozen locations, rather than
+// failing loudly the way a caller passing the zero AssignmentOptions{}
+// deserves.
+func validateAssignmentOptions(opts AssignmentOptions) error { //nolint:gocritic // hugeParam: AssignmentOptions is the per-call DTO already threaded through this file; a pointer would only complicate every call site.
+	if !filepath.IsAbs(opts.RepositoryRoot) {
+		return fmt.Errorf("app: assignment repository root %q is not absolute", opts.RepositoryRoot)
+	}
+	if !filepath.IsAbs(opts.HOPPath) {
+		return fmt.Errorf("app: assignment hop executable path %q is not absolute", opts.HOPPath)
+	}
+	if !filepath.IsAbs(opts.StateRoot) {
+		return fmt.Errorf("app: assignment state root %q is not absolute", opts.StateRoot)
+	}
+	return nil
+}
+
+// AssignmentDefaults returns the frozen [workers]/[roles] policy values
+// AssignReadyTasks needs from the run's frozen WorkflowSnapshot —
+// MaxWorkers, the default Harness and ReviewerHarness — as a partially
+// populated AssignmentOptions: the scheduling-pass loop (cmd/hop) fills in
+// the remaining fields it already has in hand (RepositoryRoot, HOPPath,
+// StateRoot) and the per-pass IntegrationHeadCommitOID (ResolveIntegrationHead),
+// never re-reading the frozen run itself for those. Composition passes
+// only primitives and app-defined DTOs; the domain Harness type this
+// returns is named only here, never in cmd/hop.
+func (c *Controller) AssignmentDefaults(ctx context.Context, handle RunHandle) (AssignmentOptions, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per scheduling pass.
+	frozen, err := c.Read.LoadFrozenRun(ctx, handle.runID)
+	if err != nil {
+		return AssignmentOptions{}, fmt.Errorf("app: load frozen run: %w", err)
+	}
+	return AssignmentOptions{
+		MaxWorkers:      frozen.Snapshot.Workflow.MaxWorkers,
+		Harness:         run.Harness(frozen.Snapshot.Harness),
+		ReviewerHarness: run.Harness(frozen.Snapshot.Workflow.ReviewerHarness),
+	}, nil
+}
+
 // AssignedTask is one task AssignReadyTasks launched.
 type AssignedTask struct {
 	TaskID        identity.TaskID
@@ -141,6 +183,9 @@ type AssignmentReport struct {
 // counted INSIDE each assignment transaction so it can never overshoot
 // even across a takeover.
 func (c *Controller) AssignReadyTasks(ctx context.Context, handle RunHandle, opts AssignmentOptions) (AssignmentReport, error) { //nolint:gocritic // hugeParam: RunHandle and AssignmentOptions are per-call DTOs; this runs once per scheduling pass, never a hot loop.
+	if err := validateAssignmentOptions(opts); err != nil {
+		return AssignmentReport{}, err
+	}
 	maxWorkers := opts.MaxWorkers
 	if maxWorkers <= 0 {
 		maxWorkers = 2

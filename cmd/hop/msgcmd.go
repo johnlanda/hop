@@ -217,7 +217,12 @@ func deliveredMessageLines(result *app.FetchMessageResult) []string {
 // rendered value itself), the default is resolved from the run's frozen
 // WorkflowSnapshot (Controller.MessageWaitDefault, lease-free); an
 // explicit --timeout always wins. The "none" line renders whichever
-// timeout was actually used.
+// timeout was actually used. The FIRST fetch attempt validates the
+// caller's HOP_* identity through the exact same FetchMessage call hop
+// msg next uses, before MessageWaitDefault is ever reached: a missing or
+// malformed HOP_RUN_ID/HOP_SESSION_ID/HOP_INCARNATION_ID therefore fails
+// identically for both verbs (same first line, same exit code), and a
+// broken environment never pays for a wasted frozen-run read.
 func runMsgWait(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 	diagnostics := &recordingWriter{w: stderr}
 	flags := flag.NewFlagSet("hop msg wait", flag.ContinueOnError)
@@ -242,10 +247,10 @@ func runMsgWait(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 		return exitFailure, werr
 	}
 
-	// Opening the controller and resolving the default timeout (when
-	// needed) both run under their own short setup bound, before the
-	// wait's own deadline — which depends on the resolved timeout — is
-	// ever created.
+	// Opening the controller, the first (environment-validating) fetch
+	// attempt and resolving the default timeout (when needed) all run
+	// under their own short setup bound, before the wait's own deadline —
+	// which depends on the resolved timeout — is ever created.
 	setupCtx, setupCancel := context.WithTimeout(context.Background(), defaultMsgVerbTimeout)
 	ctrl, closeStore, err := d.openController(setupCtx, controllerConfig{stateRoot: stateRoot})
 	if err != nil {
@@ -254,6 +259,17 @@ func runMsgWait(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 		return exitFailure, werr
 	}
 	defer closeStore() //nolint:errcheck // the store closes on process exit either way; commands report command errors, not pool teardown.
+
+	result, fetchErr := fetchOneMessage(setupCtx, ctrl, d)
+	if fetchErr != nil {
+		setupCancel()
+		_, werr := fmt.Fprintf(stderr, "hop msg wait: %v\n", fetchErr)
+		return exitFailure, werr
+	}
+	if result.Delivered {
+		setupCancel()
+		return writeLinesAndExit(stdout, deliveredMessageLines(&result))
+	}
 	if !timeoutSupplied {
 		resolved, defaultErr := ctrl.MessageWaitDefault(setupCtx, d.getenv("HOP_RUN_ID"))
 		if defaultErr != nil {
@@ -269,6 +285,9 @@ func runMsgWait(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 	defer cancel()
 
 	for {
+		if waitErr := d.wait(deadline, msgPollInterval); waitErr != nil {
+			return writeLinesAndExit(stdout, []string{app.GrammarMsgWaitNoneLine(*timeout)})
+		}
 		callCtx, callCancel := context.WithTimeout(context.Background(), defaultMsgVerbTimeout)
 		result, fetchErr := fetchOneMessage(callCtx, ctrl, d)
 		callCancel()
@@ -278,9 +297,6 @@ func runMsgWait(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 		}
 		if result.Delivered {
 			return writeLinesAndExit(stdout, deliveredMessageLines(&result))
-		}
-		if waitErr := d.wait(deadline, msgPollInterval); waitErr != nil {
-			return writeLinesAndExit(stdout, []string{app.GrammarMsgWaitNoneLine(*timeout)})
 		}
 	}
 }

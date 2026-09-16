@@ -55,6 +55,15 @@ type controllerAPI interface {
 	DriveIntegration(ctx context.Context, handle app.RunHandle, hopPath string, spawnEnv []string) (app.IntegrationReport, error)
 	EnsureReviewTask(ctx context.Context, handle app.RunHandle) (bool, error)
 	AssignReadyTasks(ctx context.Context, handle app.RunHandle, opts app.AssignmentOptions) (app.AssignmentReport, error)
+	// AssignmentDefaults returns the frozen MaxWorkers/Harness/
+	// ReviewerHarness AssignReadyTasks needs; the caller fills in
+	// RepositoryRoot/HOPPath/StateRoot (already resolved) and
+	// IntegrationHeadCommitOID (ResolveIntegrationHead) itself.
+	AssignmentDefaults(ctx context.Context, handle app.RunHandle) (app.AssignmentOptions, error)
+	// ResolveIntegrationHead reads the run's current integration branch
+	// head, the worktree base an implement assignment's
+	// IntegrationHeadCommitOID consumes.
+	ResolveIntegrationHead(ctx context.Context, handle app.RunHandle) (string, error)
 	DriveCompletion(ctx context.Context, handle app.RunHandle) (app.CompletionReport, error)
 	PublishRunPresentation(ctx context.Context, handle app.RunHandle) (app.PresentationReport, error)
 

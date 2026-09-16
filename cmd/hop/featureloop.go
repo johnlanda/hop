@@ -102,8 +102,16 @@ func (c *featureCheckDriver) interrupt() (featureCheckOutcome, bool) {
 // Every dispatch inside these calls revalidates (heartbeat CAS + stop
 // re-read) exactly as Phase 2 requires; this loop adds no revalidation of
 // its own. Stop handling takes precedence over the scheduling pass,
-// mirroring the solo loop's own stop-first branch.
-func runFeatureControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, handle app.RunHandle, runID, label, hopPath string, stdout io.Writer) (loopResult, error) { //nolint:gocritic // hugeParam: RunHandle is the app-defined opaque token, passed by value as every Controller method takes it.
+// mirroring the solo loop's own stop-first branch. While the run is still
+// launching (design L560: launching -> running is the manager's settled
+// launch claim, applied by CorroborateSessionLaunches' own settlement
+// path, not a discrete step here), every other step above depends on a
+// live manager session that does not exist yet — RecomputeReleases has no
+// released work, DriveIntegration and DriveCompletion have no integrated
+// task, AssignReadyTasks has no manager to delegate from — so the pass
+// runs only session-launch corroboration until the run is observed
+// running.
+func runFeatureControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, handle app.RunHandle, runID, label, repositoryRoot, hopPath, stateRoot string, stdout io.Writer) (loopResult, error) { //nolint:gocritic // hugeParam: RunHandle is the app-defined opaque token, passed by value as every Controller method takes it.
 	heartbeatFailed := runHeartbeats(ctx, d, ctrl, handle)
 	var (
 		lastState string
@@ -187,7 +195,7 @@ func runFeatureControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, 
 					return loopResult{}, errors.Join(fmt.Errorf("compose check spawn environment: %w", err), drainChecks())
 				}
 			}
-			if err := runFeatureSchedulingPass(ctx, ctrl, handle, hopPath, spawnEnv); err != nil {
+			if err := runFeatureSchedulingPass(ctx, ctrl, handle, detail.State, repositoryRoot, hopPath, stateRoot, spawnEnv); err != nil {
 				return loopResult{}, errors.Join(err, drainChecks())
 			}
 			if outcome, ok := checks.poll(); ok {
@@ -213,7 +221,20 @@ func runFeatureControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, 
 // round. spawnEnv is the same sanitized environment the check driver
 // spawns hop check-exec with (computed once by the caller and cached
 // across ticks), reused here for the integration merge's own spawn.
-func runFeatureSchedulingPass(ctx context.Context, ctrl controllerAPI, handle app.RunHandle, hopPath string, spawnEnv []string) error { //nolint:gocritic // hugeParam: RunHandle is the app-defined opaque token, passed by value as every Controller method takes it.
+// repositoryRoot and stateRoot are the loop's own already-resolved
+// values, never re-read from the frozen run: AssignReadyTasks refuses an
+// empty or relative RepositoryRoot/HOPPath/StateRoot (fakes law
+// 06FD1A61 — cmd/hop's fakeController enforces the identical contract).
+// runState gates the pass to session-launch corroboration alone while the
+// run is still launching (runStateLaunching); every other step requires a
+// settled manager session.
+func runFeatureSchedulingPass(ctx context.Context, ctrl controllerAPI, handle app.RunHandle, runState, repositoryRoot, hopPath, stateRoot string, spawnEnv []string) error { //nolint:gocritic // hugeParam: RunHandle is the app-defined opaque token, passed by value as every Controller method takes it.
+	if runState == runStateLaunching {
+		if _, err := ctrl.CorroborateSessionLaunches(ctx, handle); err != nil {
+			return fmt.Errorf("corroborate session launches: %w", err)
+		}
+		return nil
+	}
 	if _, err := ctrl.RetireSettledSessions(ctx, handle); err != nil {
 		return fmt.Errorf("retire settled sessions: %w", err)
 	}
@@ -229,7 +250,18 @@ func runFeatureSchedulingPass(ctx context.Context, ctrl controllerAPI, handle ap
 	if _, err := ctrl.DriveCompletion(ctx, handle); err != nil {
 		return fmt.Errorf("drive completion: %w", err)
 	}
-	if _, err := ctrl.AssignReadyTasks(ctx, handle, app.AssignmentOptions{}); err != nil {
+	opts, err := ctrl.AssignmentDefaults(ctx, handle)
+	if err != nil {
+		return fmt.Errorf("load assignment defaults: %w", err)
+	}
+	opts.RepositoryRoot = repositoryRoot
+	opts.HOPPath = hopPath
+	opts.StateRoot = stateRoot
+	opts.IntegrationHeadCommitOID, err = ctrl.ResolveIntegrationHead(ctx, handle)
+	if err != nil {
+		return fmt.Errorf("resolve integration head: %w", err)
+	}
+	if _, err := ctrl.AssignReadyTasks(ctx, handle, opts); err != nil {
 		return fmt.Errorf("assign ready tasks: %w", err)
 	}
 	if _, err := ctrl.CorroborateSessionLaunches(ctx, handle); err != nil {
@@ -261,8 +293,8 @@ func describeFeatureCheckReport(report *app.FeatureCheckReport) string {
 // finishControllerLoop's solo shape exactly (detach classification before
 // ordinary errors, the resume instruction on detach, releaseQuietly on
 // every other exit).
-func finishFeatureControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, handle app.RunHandle, runID, label, hopPath string, stdout, stderr io.Writer, command string) (int, error) { //nolint:gocritic // hugeParam: RunHandle is the app-defined opaque token, passed by value as every Controller method takes it.
-	result, err := runFeatureControllerLoop(ctx, d, ctrl, handle, runID, label, hopPath, stdout)
+func finishFeatureControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, handle app.RunHandle, runID, label, repositoryRoot, hopPath, stateRoot string, stdout, stderr io.Writer, command string) (int, error) { //nolint:gocritic // hugeParam: RunHandle is the app-defined opaque token, passed by value as every Controller method takes it.
+	result, err := runFeatureControllerLoop(ctx, d, ctrl, handle, runID, label, repositoryRoot, hopPath, stateRoot, stdout)
 	if err != nil {
 		if ctx.Err() != nil {
 			if reportable := nonCancellationCauses(err); reportable != nil {

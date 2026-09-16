@@ -123,6 +123,9 @@ func TestRunMsgWaitTimeoutDefault(t *testing.T) {
 
 	t.Run("a frozen-default lookup failure is a command failure", func(t *testing.T) {
 		ctrl := &fakeController{}
+		ctrl.fetchMessage = func(app.FetchMessageRequest) (app.FetchMessageResult, error) {
+			return app.FetchMessageResult{}, nil
+		}
 		ctrl.messageWaitDefault = func(string) (time.Duration, error) {
 			return 0, errors.New("boom")
 		}
@@ -138,6 +141,34 @@ func TestRunMsgWaitTimeoutDefault(t *testing.T) {
 		}
 		if stdout.Len() != 0 {
 			t.Errorf("stdout = %q, want empty on a setup failure", stdout.String())
+		}
+	})
+
+	t.Run("the environment is validated through the first fetch before the default is ever resolved", func(t *testing.T) {
+		ctrl := &fakeController{}
+		ctrl.fetchMessage = func(app.FetchMessageRequest) (app.FetchMessageResult, error) {
+			return app.FetchMessageResult{}, errors.New("app: parse run id: malformed")
+		}
+		// messageWaitDefault is left nil: any call fails the fake, proving
+		// a fetch error (an invalid HOP_* identity, in production) is
+		// never followed by a MessageWaitDefault read.
+		td := newTestDeps(ctrl, managerEnv(), t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runMsgWait(nil, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitFailure {
+			t.Errorf("exit code = %d, want %d", code, exitFailure)
+		}
+		if !strings.Contains(stderr.String(), "parse run id") {
+			t.Errorf("stderr = %q, want the fetch error surfaced directly", stderr.String())
+		}
+		for _, call := range ctrl.recorded() {
+			if call == "MessageWaitDefault" {
+				t.Fatalf("MessageWaitDefault was called despite a failed environment-validating fetch")
+			}
 		}
 	})
 }

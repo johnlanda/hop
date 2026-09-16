@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -41,13 +43,15 @@ type fakeController struct {
 	failLaunch           func(incarnationID, reason string) error
 	prepareCheck         func(req app.CheckExecRequest) (app.CheckExecPlan, error)
 
-	retireSettledSessions func() (app.RetirementReport, error)
-	recomputeReleases     func() (app.ReleaseReport, error)
-	driveIntegration      func(ctx context.Context, hopPath string, spawnEnv []string) (app.IntegrationReport, error)
-	ensureReviewTask      func() (bool, error)
-	assignReadyTasks      func(opts app.AssignmentOptions) (app.AssignmentReport, error)
-	driveCompletion       func() (app.CompletionReport, error)
-	publishPresentation   func() (app.PresentationReport, error)
+	retireSettledSessions  func() (app.RetirementReport, error)
+	recomputeReleases      func() (app.ReleaseReport, error)
+	driveIntegration       func(ctx context.Context, hopPath string, spawnEnv []string) (app.IntegrationReport, error)
+	ensureReviewTask       func() (bool, error)
+	assignReadyTasks       func(opts app.AssignmentOptions) (app.AssignmentReport, error)
+	assignmentDefaults     func() (app.AssignmentOptions, error)
+	resolveIntegrationHead func() (string, error)
+	driveCompletion        func() (app.CompletionReport, error)
+	publishPresentation    func() (app.PresentationReport, error)
 
 	sendMessage        func(req app.SendMessageRequest) (app.SendMessageResult, error)
 	fetchMessage       func(req app.FetchMessageRequest) (app.FetchMessageResult, error)
@@ -263,12 +267,50 @@ func (f *fakeController) EnsureReviewTask(_ context.Context, _ app.RunHandle) (b
 	return f.ensureReviewTask()
 }
 
+// requireAbsoluteAssignmentPaths mirrors the real Controller's own
+// validateAssignmentOptions (internal/app/usecase_schedule.go), fakes law
+// 06FD1A61: this fake must refuse the exact same empty/relative
+// RepositoryRoot/HOPPath/StateRoot shape the real adapter refuses, so an
+// empty app.AssignmentOptions{} can never silently pass a scripted test
+// again.
+func requireAbsoluteAssignmentPaths(opts app.AssignmentOptions) error { //nolint:gocritic // hugeParam: AssignmentOptions is the per-call DTO the real port also takes by value.
+	if !filepath.IsAbs(opts.RepositoryRoot) {
+		return fmt.Errorf("assignment repository root %q is not absolute", opts.RepositoryRoot)
+	}
+	if !filepath.IsAbs(opts.HOPPath) {
+		return fmt.Errorf("assignment hop executable path %q is not absolute", opts.HOPPath)
+	}
+	if !filepath.IsAbs(opts.StateRoot) {
+		return fmt.Errorf("assignment state root %q is not absolute", opts.StateRoot)
+	}
+	return nil
+}
+
 func (f *fakeController) AssignReadyTasks(_ context.Context, _ app.RunHandle, opts app.AssignmentOptions) (app.AssignmentReport, error) { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.
 	f.record("AssignReadyTasks")
+	if err := requireAbsoluteAssignmentPaths(opts); err != nil {
+		return app.AssignmentReport{}, err
+	}
 	if f.assignReadyTasks == nil {
 		return app.AssignmentReport{}, nil
 	}
 	return f.assignReadyTasks(opts)
+}
+
+func (f *fakeController) AssignmentDefaults(_ context.Context, _ app.RunHandle) (app.AssignmentOptions, error) { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.
+	f.record("AssignmentDefaults")
+	if f.assignmentDefaults == nil {
+		return app.AssignmentOptions{}, nil
+	}
+	return f.assignmentDefaults()
+}
+
+func (f *fakeController) ResolveIntegrationHead(_ context.Context, _ app.RunHandle) (string, error) { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.
+	f.record("ResolveIntegrationHead")
+	if f.resolveIntegrationHead == nil {
+		return "", nil
+	}
+	return f.resolveIntegrationHead()
 }
 
 func (f *fakeController) DriveCompletion(_ context.Context, _ app.RunHandle) (app.CompletionReport, error) { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.

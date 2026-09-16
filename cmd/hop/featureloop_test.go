@@ -47,7 +47,7 @@ func TestRunFeatureControllerLoop(t *testing.T) {
 		}
 		var stdout bytes.Buffer
 
-		result, err := runFeatureControllerLoop(context.Background(), td.deps, ctrl, app.RunHandle{}, testRunID, "r1", "/opt/hop/bin/hop", &stdout)
+		result, err := runFeatureControllerLoop(context.Background(), td.deps, ctrl, app.RunHandle{}, testRunID, "r1", "/repo", "/opt/hop/bin/hop", "/state", &stdout)
 		if err != nil {
 			t.Fatalf("runFeatureControllerLoop: %v", err)
 		}
@@ -106,7 +106,7 @@ func TestRunFeatureControllerLoop(t *testing.T) {
 		}
 		var stdout bytes.Buffer
 
-		result, err := runFeatureControllerLoop(context.Background(), td.deps, ctrl, app.RunHandle{}, testRunID, "r1", "/opt/hop/bin/hop", &stdout)
+		result, err := runFeatureControllerLoop(context.Background(), td.deps, ctrl, app.RunHandle{}, testRunID, "r1", "/repo", "/opt/hop/bin/hop", "/state", &stdout)
 		if err != nil {
 			t.Fatalf("runFeatureControllerLoop: %v", err)
 		}
@@ -144,7 +144,7 @@ func TestRunFeatureControllerLoop(t *testing.T) {
 		}
 		var stdout bytes.Buffer
 
-		_, err := runFeatureControllerLoop(context.Background(), td.deps, ctrl, app.RunHandle{}, testRunID, "r1", "/opt/hop/bin/hop", &stdout)
+		_, err := runFeatureControllerLoop(context.Background(), td.deps, ctrl, app.RunHandle{}, testRunID, "r1", "/repo", "/opt/hop/bin/hop", "/state", &stdout)
 		if err == nil || !strings.Contains(err.Error(), "heartbeat failed") {
 			t.Fatalf("err = %v, want the heartbeat failure", err)
 		}
@@ -160,7 +160,7 @@ func TestRunFeatureControllerLoop(t *testing.T) {
 		cancel()
 		var stdout bytes.Buffer
 
-		result, err := runFeatureControllerLoop(ctx, td.deps, ctrl, app.RunHandle{}, testRunID, "r1", "/opt/hop/bin/hop", &stdout)
+		result, err := runFeatureControllerLoop(ctx, td.deps, ctrl, app.RunHandle{}, testRunID, "r1", "/repo", "/opt/hop/bin/hop", "/state", &stdout)
 		if err != nil {
 			t.Fatalf("runFeatureControllerLoop: %v", err)
 		}
@@ -168,6 +168,85 @@ func TestRunFeatureControllerLoop(t *testing.T) {
 			t.Errorf("result = %+v, want Detached", result)
 		}
 	})
+}
+
+// TestRunFeatureControllerLoopWhileLaunching proves the reported defect
+// fix: while the run is still launching, the scheduling pass runs only
+// CorroborateSessionLaunches and skips every other step, since none of
+// them has a settled manager session to work from yet.
+func TestRunFeatureControllerLoopWhileLaunching(t *testing.T) {
+	ctrl := &fakeController{}
+	td := newTestDeps(ctrl, map[string]string{"PATH": "/bin"}, t.TempDir())
+	statusCalls := 0
+	ctrl.status = func(app.StatusRequest) (app.StatusResult, error) {
+		statusCalls++
+		if statusCalls == 1 {
+			return detailStep("launching", "", false), nil
+		}
+		return detailStep("completed", "", false), nil
+	}
+	var stdout bytes.Buffer
+
+	result, err := runFeatureControllerLoop(context.Background(), td.deps, ctrl, app.RunHandle{}, testRunID, "r1", "/repo", "/opt/hop/bin/hop", "/state", &stdout)
+	if err != nil {
+		t.Fatalf("runFeatureControllerLoop: %v", err)
+	}
+	if result.FinalState != "completed" {
+		t.Errorf("result = %+v", result)
+	}
+
+	calls := ctrl.recorded()
+	seen := map[string]bool{}
+	for _, name := range calls {
+		seen[name] = true
+	}
+	if !seen["CorroborateSessionLaunches"] {
+		t.Errorf("CorroborateSessionLaunches was never called; calls = %v", calls)
+	}
+	skipped := []string{
+		"RetireSettledSessions", "RecomputeReleases", "DriveIntegration",
+		"EnsureReviewTask", "DriveCompletion", "AssignReadyTasks",
+		"AssignmentDefaults", "ResolveIntegrationHead", "PublishRunPresentation",
+	}
+	for _, name := range skipped {
+		if seen[name] {
+			t.Errorf("%s ran while the run was still launching; calls = %v", name, calls)
+		}
+	}
+}
+
+// TestRunFeatureSchedulingPassPopulatesAssignmentOptions proves the
+// scheduling pass no longer calls AssignReadyTasks with a zero
+// app.AssignmentOptions{} (the reported defect): MaxWorkers/Harness/
+// ReviewerHarness come from AssignmentDefaults, RepositoryRoot/HOPPath/
+// StateRoot are the loop's own already-resolved values, and
+// IntegrationHeadCommitOID comes from ResolveIntegrationHead, every pass.
+func TestRunFeatureSchedulingPassPopulatesAssignmentOptions(t *testing.T) {
+	ctrl := &fakeController{}
+	ctrl.assignmentDefaults = func() (app.AssignmentOptions, error) {
+		return app.AssignmentOptions{MaxWorkers: 3, Harness: "claude", ReviewerHarness: "codex"}, nil
+	}
+	ctrl.resolveIntegrationHead = func() (string, error) {
+		return "cccccccccccccccccccccccccccccccccccccccc", nil
+	}
+	var gotOpts app.AssignmentOptions
+	ctrl.assignReadyTasks = func(opts app.AssignmentOptions) (app.AssignmentReport, error) {
+		gotOpts = opts
+		return app.AssignmentReport{}, nil
+	}
+
+	if err := runFeatureSchedulingPass(context.Background(), ctrl, app.RunHandle{}, "running", "/repo", "/opt/hop/bin/hop", "/state", []string{"KEY=value"}); err != nil {
+		t.Fatalf("runFeatureSchedulingPass() error = %v", err)
+	}
+
+	want := app.AssignmentOptions{
+		MaxWorkers: 3, Harness: "claude", ReviewerHarness: "codex",
+		RepositoryRoot: "/repo", HOPPath: "/opt/hop/bin/hop", StateRoot: "/state",
+		IntegrationHeadCommitOID: "cccccccccccccccccccccccccccccccccccccccc",
+	}
+	if gotOpts != want {
+		t.Errorf("AssignReadyTasks options = %+v, want %+v", gotOpts, want)
+	}
 }
 
 // TestFinishFeatureControllerLoop proves the exit-code mapping mirrors
@@ -182,7 +261,7 @@ func TestFinishFeatureControllerLoop(t *testing.T) {
 		}
 		var stdout, stderr bytes.Buffer
 
-		code, err := finishFeatureControllerLoop(context.Background(), td.deps, ctrl, app.RunHandle{}, testRunID, "r1", "/opt/hop/bin/hop", &stdout, &stderr, "hop run")
+		code, err := finishFeatureControllerLoop(context.Background(), td.deps, ctrl, app.RunHandle{}, testRunID, "r1", "/repo", "/opt/hop/bin/hop", "/state", &stdout, &stderr, "hop run")
 		if err != nil {
 			t.Fatalf("write error: %v", err)
 		}
@@ -199,7 +278,7 @@ func TestFinishFeatureControllerLoop(t *testing.T) {
 		}
 		var stdout, stderr bytes.Buffer
 
-		code, err := finishFeatureControllerLoop(context.Background(), td.deps, ctrl, app.RunHandle{}, testRunID, "r1", "/opt/hop/bin/hop", &stdout, &stderr, "hop run")
+		code, err := finishFeatureControllerLoop(context.Background(), td.deps, ctrl, app.RunHandle{}, testRunID, "r1", "/repo", "/opt/hop/bin/hop", "/state", &stdout, &stderr, "hop run")
 		if err != nil {
 			t.Fatalf("write error: %v", err)
 		}
