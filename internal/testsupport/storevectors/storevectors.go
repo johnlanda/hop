@@ -1,6 +1,6 @@
 // Package storevectors holds Phase 3's shared refused-input vectors:
 // request shapes internal/app's worker-authority store ports
-// (MessagingStore, PlanStore) must refuse, expressed once so both
+// (MessagingStore, PlanStore, ReviewStore) must refuse, expressed once so both
 // internal/app's fakeStore tests and internal/adapters/sqlite's future
 // real-store tests exercise the IDENTICAL input against their own backing
 // implementation — the section 11 countermeasure for the Phase 2
@@ -160,4 +160,25 @@ func MessageFetchCrossRun(claimedRunID identity.RunID, session identity.SessionI
 // app.AckRefused, detail "session does not belong to this run".
 func AckMessageCrossRun(claimedRunID identity.RunID, messageID identity.MessageID, session identity.SessionID, incarnation identity.IncarnationID) app.MessageAck {
 	return app.MessageAck{RunID: claimedRunID, MessageID: messageID, SessionID: session, IncarnationID: incarnation}
+}
+
+// ReviewSubmitForeignReviewer returns a ReviewStore.SubmitReview request
+// whose submitting session is a live, currently-bound reviewer that is
+// NOT the claimed attempt's own reviewer session: a reviewer of another
+// run, or one assigned to a different review attempt of the same run (the
+// consuming test's fixture decides which shape it builds — both must be
+// refused identically). foreignIncarnation is that session's own CURRENT
+// incarnation, so nothing but the session-to-attempt binding can be the
+// refusal's cause. Refused app.ReviewStale, detail "caller is not the
+// review task's reviewer session", with NO review row and NO state
+// transition committed: the acceptance context is never assembled from a
+// foreign session's binding or launch claim, which would otherwise let a
+// live reviewer elsewhere complete this attempt.
+func ReviewSubmitForeignReviewer(runID identity.RunID, taskID identity.TaskID, attemptID identity.AttemptID, foreignSession identity.SessionID, foreignIncarnation identity.IncarnationID, reviewID identity.ReviewID, subjectCommitOID, subjectTreeOID, reasonsPath, reasonsDigest string) app.ReviewSubmission {
+	return app.ReviewSubmission{
+		ID: reviewID, RunID: runID, TaskID: taskID, AttemptID: attemptID,
+		Session: foreignSession, IncarnationID: foreignIncarnation,
+		SubjectCommitOID: subjectCommitOID, SubjectTreeOID: subjectTreeOID,
+		Verdict: run.VerdictApprove, ReasonsPath: reasonsPath, ReasonsDigest: reasonsDigest,
+	}
 }
