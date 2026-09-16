@@ -148,6 +148,26 @@ func dsn(path string, immediateWrites bool) string {
 	return u.String()
 }
 
+// rebuildDSN builds the connection string a REBUILD migration runs on: the
+// ordinary write-pool settings except foreign_keys(0), which must be set
+// before BEGIN because the pragma is connection-scoped and a no-op inside a
+// transaction. The handle opened on it is dedicated to the one migration
+// and closed on every path — success, failure, panic-unwind — so a
+// connection with enforcement off can never serve a later query; the
+// ordinary DSN-configured pools are untouched throughout.
+func rebuildDSN(path string) string {
+	query := url.Values{}
+	query.Set("_txlock", "immediate")
+	query["_pragma"] = []string{
+		"busy_timeout(5000)",
+		"foreign_keys(0)",
+		"journal_mode(WAL)",
+		"synchronous(FULL)",
+	}
+	u := url.URL{Scheme: "file", OmitHost: true, Path: path, RawQuery: query.Encode()}
+	return u.String()
+}
+
 // now reads the store's clock in UTC.
 func (s *Store) now() time.Time { return s.clock.Now().UTC() }
 

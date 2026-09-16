@@ -125,6 +125,22 @@ func (s *Store) SubmitResult(ctx context.Context, submission app.ResultSubmissio
 		if err != nil {
 			return err
 		}
+		// Receipt before eligibility: only a FIRST acceptance re-reads the
+		// task's mailbox — a queued or delivered-unacknowledged message
+		// refuses the submission with the retryable transient outcome
+		// (section 5's drain-then-submit contract; vacuously clear for a
+		// solo task, which no message ever addresses).
+		if prior == nil {
+			boxClear, mailboxErr := mailboxClear(ctx, tx, submission.TaskID)
+			if mailboxErr != nil {
+				return mailboxErr
+			}
+			if !boxClear {
+				const detail = "transient: undelivered messages; drain with hop msg next, ack, then resubmit"
+				outcome = app.SubmissionOutcome{Kind: app.SubmissionTransient, Detail: detail}
+				return insertReceipt(ctx, tx, submissionReceipt(&submission, app.SubmissionTransient, "", detail), now)
+			}
+		}
 		incarnationIsCurrent, err := incarnationCurrent(ctx, tx, submission.AttemptID, submission.IncarnationID)
 		if err != nil {
 			return err
@@ -216,9 +232,12 @@ func persistAcceptance(ctx context.Context, tx *sql.Tx, acceptance run.Acceptanc
 	); err != nil {
 		return fmt.Errorf("sqlite: insert accepted result: %w", err)
 	}
+	// The typed check subject (migration 003): a result-subject request is
+	// keyed by its own id — the result id, deterministic — with
+	// subject_kind 'result'.
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO check_requests (result_id, attempt_id, state, created_at, claimed_generation) VALUES (?, ?, ?, ?, NULL)`,
-		result.ID.String(), result.AttemptID.String(), string(app.CheckRequestRequested), formatTime(now),
+		`INSERT INTO check_requests (id, subject_kind, result_id, attempt_id, integration_id, state, created_at, claimed_generation) VALUES (?, 'result', ?, ?, NULL, ?, ?, NULL)`,
+		result.ID.String(), result.ID.String(), result.AttemptID.String(), string(app.CheckRequestRequested), formatTime(now),
 	); err != nil {
 		return fmt.Errorf("sqlite: insert check request: %w", err)
 	}
@@ -231,9 +250,12 @@ func persistAcceptance(ctx context.Context, tx *sql.Tx, acceptance run.Acceptanc
 	} else if err := requireCAS(result, fmt.Errorf("sqlite: attempt %s moved during acceptance: %w", acceptance.Attempt.ID, app.ErrRevisionConflict)); err != nil {
 		return err
 	}
+	// Acceptance closes the task's mailbox in the same commit (section 5):
+	// no further message may address a task whose result is accepted; a
+	// consumed retry reopens it through PlanStore.RequestRetry.
 	if result, err := tx.ExecContext(ctx,
-		`UPDATE tasks SET state = ?, updated_at = ?, revision = revision + 1 WHERE id = ? AND revision = ?`,
-		string(acceptance.Task.State), at, acceptance.Task.ID.String(), revisions.task,
+		`UPDATE tasks SET state = ?, mailbox_closed_at = COALESCE(mailbox_closed_at, ?), updated_at = ?, revision = revision + 1 WHERE id = ? AND revision = ?`,
+		string(acceptance.Task.State), at, at, acceptance.Task.ID.String(), revisions.task,
 	); err != nil {
 		return fmt.Errorf("sqlite: apply task handoff: %w", err)
 	} else if err := requireCAS(result, fmt.Errorf("sqlite: task %s moved during acceptance: %w", acceptance.Task.ID, app.ErrRevisionConflict)); err != nil {
@@ -266,20 +288,28 @@ func persistAcceptance(ctx context.Context, tx *sql.Tx, acceptance run.Acceptanc
 	return nil
 }
 
-// ClaimLaunch records hop launch's durable pre-exec claim. Agreement is
-// validated first — the claimed attempt's persisted owning run must be the
-// claimed run, so a mixed tuple can never have its stop or currency
-// questions answered against the wrong run. It then fails — and the caller
-// must not exec — when the run is stopping or stopped, the incarnation is
-// not the attempt's current identity, or a claim for this incarnation
-// already exists with a different run, attempt or pid; a rewrite by the
+// ClaimLaunch records hop launch's durable pre-exec claim, keyed to the
+// session it launches (docs/plan/phase-3-design.md section 4's re-keying).
+// Agreement is validated first — the claimed SESSION's persisted owning
+// run must be the claimed run and, when an attempt is claimed, the attempt
+// must be that session's own — so a mixed tuple can never have its stop or
+// currency questions answered against the wrong run. A Phase 2 caller
+// claims by attempt alone (empty SessionID): the claimed session is then
+// the attempt's current session, resolved here exactly as the currency
+// read path resolves it, and the attempt-owner agreement check is
+// preserved verbatim. It then fails — and the caller must not exec — when
+// the run is stopping or stopped, the incarnation is not the claimed
+// session's current identity, or a claim for this incarnation already
+// exists with a different run, session, attempt or pid; a rewrite by the
 // same pid on the same tuple is idempotent. Currency follows
-// launchIncarnationCurrent: the
-// current binding decides when one exists, and before any binding row the
-// authority is the newest pending launch operation's intent JSON
-// ("incarnation_id"), so a launcher racing the controller's pane.open
-// outcome write is admitted while a retired incarnation's launcher never
-// is.
+// sessionIncarnationCurrent: the session's current binding decides when
+// one exists, and before any binding row the authority is the SESSION's
+// newest pending launch operation's intent JSON ("incarnation_id"), so a
+// launcher racing the controller's pane.open outcome write is admitted, a
+// retired incarnation's launcher never is, and two concurrently pending
+// launches validate independently. The INSERT records the resolved
+// session_id (NOT NULL after migration 003) with attempt_id NULL for an
+// attempt-less session's claim.
 func (s *Store) ClaimLaunch(ctx context.Context, claim app.LaunchClaim) error { //nolint:gocritic // hugeParam: the port passes the claim value; the adapter mirrors its signature.
 	return s.inWriteTx(ctx, func(tx *sql.Tx) error {
 		runV, _, err := getRun(ctx, tx, claim.RunID)
@@ -289,30 +319,59 @@ func (s *Store) ClaimLaunch(ctx context.Context, claim app.LaunchClaim) error { 
 		// Agreement precedes every other precondition: a mixed tuple must
 		// never have its stop or currency questions answered against the
 		// wrong run's state.
-		attemptOwner, err := runOfAttempt(ctx, tx, claim.AttemptID)
-		if err != nil {
-			return err
-		}
-		if attemptOwner != claim.RunID {
-			return fmt.Errorf("sqlite: attempt %s belongs to run %s, not the claimed run %s; launch claim refused", claim.AttemptID, attemptOwner, claim.RunID)
+		var session run.Session
+		switch {
+		case claim.SessionID != "":
+			sessionV, _, sessionErr := getSession(ctx, tx, claim.SessionID)
+			if sessionErr != nil {
+				return sessionErr
+			}
+			if sessionV.RunID != claim.RunID {
+				return fmt.Errorf("sqlite: session %s belongs to run %s, not the claimed run %s; launch claim refused", claim.SessionID, sessionV.RunID, claim.RunID)
+			}
+			if claim.AttemptID != "" && sessionV.AttemptID != claim.AttemptID {
+				return fmt.Errorf("sqlite: attempt %s is not session %s's attempt; launch claim refused", claim.AttemptID, claim.SessionID)
+			}
+			if sessionV.State == run.SessionLost || sessionV.State == run.SessionTerminated {
+				return fmt.Errorf("sqlite: session %s is terminal (%s); launch claim refused", claim.SessionID, sessionV.State)
+			}
+			session = sessionV
+		case claim.AttemptID != "":
+			attemptOwner, ownerErr := runOfAttempt(ctx, tx, claim.AttemptID)
+			if ownerErr != nil {
+				return ownerErr
+			}
+			if attemptOwner != claim.RunID {
+				return fmt.Errorf("sqlite: attempt %s belongs to run %s, not the claimed run %s; launch claim refused", claim.AttemptID, attemptOwner, claim.RunID)
+			}
+			current, _, ok, currentErr := currentSession(ctx, tx, claim.AttemptID)
+			if currentErr != nil {
+				return currentErr
+			}
+			if !ok {
+				return fmt.Errorf("sqlite: incarnation %s is not attempt %s's current identity; launch claim refused", claim.IncarnationID, claim.AttemptID)
+			}
+			session = current
+		default:
+			return fmt.Errorf("sqlite: launch claim %s names neither a session nor an attempt; refused", claim.IncarnationID)
 		}
 		if runV.StopRequested || runV.State == run.RunStopping || runV.State == run.RunStopped {
 			return fmt.Errorf("sqlite: run %s is stopping or stopped; launch claim refused", claim.RunID)
 		}
-		isCurrent, err := launchIncarnationCurrent(ctx, tx, claim.RunID, claim.AttemptID, claim.IncarnationID)
+		isCurrent, err := sessionIncarnationCurrent(ctx, tx, session.ID, claim.IncarnationID)
 		if err != nil {
 			return err
 		}
 		if !isCurrent {
-			return fmt.Errorf("sqlite: incarnation %s is not attempt %s's current identity; launch claim refused", claim.IncarnationID, claim.AttemptID)
+			return fmt.Errorf("sqlite: incarnation %s is not session %s's current identity; launch claim refused", claim.IncarnationID, session.ID)
 		}
 		existing, err := getLaunchClaim(ctx, tx, claim.IncarnationID)
 		if err != nil {
 			return err
 		}
 		if existing != nil {
-			if existing.RunID != claim.RunID || existing.AttemptID != claim.AttemptID {
-				return fmt.Errorf("sqlite: incarnation %s's existing claim is for run %s attempt %s; a claim for run %s attempt %s is refused", claim.IncarnationID, existing.RunID, existing.AttemptID, claim.RunID, claim.AttemptID)
+			if existing.RunID != claim.RunID || existing.SessionID != session.ID || existing.AttemptID != claim.AttemptID {
+				return fmt.Errorf("sqlite: incarnation %s's existing claim is for run %s session %s attempt %s; a claim for run %s session %s attempt %s is refused", claim.IncarnationID, existing.RunID, existing.SessionID, existing.AttemptID, claim.RunID, session.ID, claim.AttemptID)
 			}
 			if existing.PID != claim.PID {
 				return fmt.Errorf("sqlite: incarnation %s already has a launch claim by pid %d; a claim by pid %d is refused", claim.IncarnationID, existing.PID, claim.PID)
@@ -342,9 +401,10 @@ func (s *Store) ClaimLaunch(ctx context.Context, claim app.LaunchClaim) error { 
 			claimedAt = s.now()
 		}
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO launch_claims (incarnation_id, run_id, attempt_id, executable, argv_digest, pid, state, error, claimed_at, settled_at, settlement_evidence, seed_evidence)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL, ?)`,
-			claim.IncarnationID.String(), claim.RunID.String(), claim.AttemptID.String(), claim.Executable, claim.ArgvDigest,
+			`INSERT INTO launch_claims (incarnation_id, run_id, session_id, attempt_id, executable, argv_digest, pid, state, error, claimed_at, settled_at, settlement_evidence, seed_evidence)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL, ?)`,
+			claim.IncarnationID.String(), claim.RunID.String(), session.ID.String(), nullString(claim.AttemptID.String()),
+			claim.Executable, claim.ArgvDigest,
 			claim.PID, string(app.LaunchClaimExecPending), formatTime(claimedAt),
 			sql.NullString{String: claim.SeedEvidence, Valid: claim.SeedEvidence != ""},
 		); err != nil {
@@ -387,19 +447,22 @@ func (s *Store) SettleLaunchFailure(ctx context.Context, incarnation identity.In
 
 // ClaimCheckExec records hop check-exec's durable pre-exec identity: its
 // own pid, which is its process-group id. It fails when the operation is
-// not a pending check execution of the run's current lease generation; a
-// rewrite by the same pid is idempotent. The operation ID is the only
-// claimed identity, so there is no cross-run tuple to disagree: the owning
-// run, its lease generation and the operation's kind and state all resolve
-// from the persisted operation row, never from caller input.
+// not a pending execution — a check.run check or an integration.merge
+// scratch merge, the two kinds the generalized exec boundary spawns
+// (docs/plan/phase-3-design.md sections 4 and 8) — of the run's current
+// lease generation; a rewrite by the same pid is idempotent. The operation
+// ID is the only claimed identity, so there is no cross-run tuple to
+// disagree: the owning run, its lease generation and the operation's kind
+// and state all resolve from the persisted operation row, never from
+// caller input.
 func (s *Store) ClaimCheckExec(ctx context.Context, opID identity.OperationID, pid int) error {
 	return s.inWriteTx(ctx, func(tx *sql.Tx) error {
 		op, err := getOperation(ctx, tx, opID)
 		if err != nil {
 			return err
 		}
-		if op.Kind != app.OpCheckRun || op.State != app.OperationPending {
-			return fmt.Errorf("sqlite: operation %s is %s %q, not a pending check execution", opID, op.State, op.Kind)
+		if (op.Kind != app.OpCheckRun && op.Kind != app.OpIntegrationMerge) || op.State != app.OperationPending {
+			return fmt.Errorf("sqlite: operation %s is %s %q, not a pending check or merge execution", opID, op.State, op.Kind)
 		}
 		var generation int64
 		err = tx.QueryRowContext(ctx, `SELECT generation FROM run_leases WHERE run_id = ?`, op.RunID.String()).Scan(&generation)

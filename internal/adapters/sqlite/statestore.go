@@ -125,7 +125,10 @@ func repositoryIDForRoot(ctx context.Context, q querier, root, at string) (strin
 	return existing, nil
 }
 
-// insertSnapshot persists the run's immutable frozen configuration.
+// insertSnapshot persists the run's immutable frozen configuration. The
+// workflow column round-trips the full frozen app.WorkflowSnapshot as
+// JSON; a solo run's zero value stores NULL, exactly the meaning migration
+// 003 assigns pre-Phase 3 rows.
 func insertSnapshot(ctx context.Context, tx *sql.Tx, runID identity.RunID, snapshot *app.RunSnapshot, at string) error {
 	checkArgv, err := json.Marshal(snapshot.CheckArgv)
 	if err != nil {
@@ -135,12 +138,20 @@ func insertSnapshot(ctx context.Context, tx *sql.Tx, runID identity.RunID, snaps
 	if err != nil {
 		return fmt.Errorf("sqlite: encode env policy: %w", err)
 	}
+	var workflow any
+	if snapshot.Workflow != (app.WorkflowSnapshot{}) {
+		encoded, err := json.Marshal(snapshot.Workflow)
+		if err != nil {
+			return fmt.Errorf("sqlite: encode workflow snapshot: %w", err)
+		}
+		workflow = string(encoded)
+	}
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO run_snapshots (run_id, check_argv, check_timeout_ms, check_repeatable, env_policy, harness, profile_dir, state_root, assignment_path, assignment_digest, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO run_snapshots (run_id, check_argv, check_timeout_ms, check_repeatable, env_policy, harness, profile_dir, state_root, assignment_path, assignment_digest, workflow, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		runID.String(), string(checkArgv), snapshot.CheckTimeout.Milliseconds(), boolToInt(snapshot.CheckRepeatable),
 		string(envPolicy), snapshot.Harness, nullString(snapshot.ProfileDir), snapshot.StateRoot,
-		snapshot.AssignmentPath, snapshot.AssignmentDigest, at,
+		snapshot.AssignmentPath, snapshot.AssignmentDigest, workflow, at,
 	); err != nil {
 		return fmt.Errorf("sqlite: insert run snapshot: %w", err)
 	}

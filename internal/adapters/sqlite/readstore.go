@@ -302,13 +302,13 @@ func runArtifacts(ctx context.Context, q querier, runID identity.RunID) ([]run.A
 func loadSnapshot(ctx context.Context, q querier, runID identity.RunID) (app.RunSnapshot, error) {
 	var (
 		checkArgv, envPolicy, harness, stateRoot, assignmentPath, assignmentDigest string
-		profileDir                                                                 sql.NullString
+		profileDir, workflow                                                       sql.NullString
 		checkTimeoutMS, checkRepeatable                                            int64
 	)
 	err := q.QueryRowContext(ctx,
-		`SELECT check_argv, check_timeout_ms, check_repeatable, env_policy, harness, profile_dir, state_root, assignment_path, assignment_digest FROM run_snapshots WHERE run_id = ?`,
+		`SELECT check_argv, check_timeout_ms, check_repeatable, env_policy, harness, profile_dir, state_root, assignment_path, assignment_digest, workflow FROM run_snapshots WHERE run_id = ?`,
 		runID.String(),
-	).Scan(&checkArgv, &checkTimeoutMS, &checkRepeatable, &envPolicy, &harness, &profileDir, &stateRoot, &assignmentPath, &assignmentDigest)
+	).Scan(&checkArgv, &checkTimeoutMS, &checkRepeatable, &envPolicy, &harness, &profileDir, &stateRoot, &assignmentPath, &assignmentDigest, &workflow)
 	if errors.Is(err, sql.ErrNoRows) {
 		return app.RunSnapshot{}, fmt.Errorf("sqlite: snapshot of run %s: %w", runID, app.ErrNotFound)
 	}
@@ -329,6 +329,13 @@ func loadSnapshot(ctx context.Context, q querier, runID identity.RunID) (app.Run
 	}
 	if err := json.Unmarshal([]byte(envPolicy), &snapshot.EnvPolicy); err != nil {
 		return app.RunSnapshot{}, fmt.Errorf("sqlite: decode env policy of run %s: %w", runID, err)
+	}
+	// NULL means solo (pre-Phase 3 rows and every solo freeze); the zero
+	// WorkflowSnapshot already says exactly that.
+	if workflow.Valid {
+		if err := json.Unmarshal([]byte(workflow.String), &snapshot.Workflow); err != nil {
+			return app.RunSnapshot{}, fmt.Errorf("sqlite: decode workflow snapshot of run %s: %w", runID, err)
+		}
 	}
 	return snapshot, nil
 }

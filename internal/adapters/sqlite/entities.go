@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/johnlanda/hop/internal/app"
 	"github.com/johnlanda/hop/internal/domain/identity"
@@ -33,10 +32,11 @@ func getRun(ctx context.Context, q querier, id identity.RunID) (run.Run, int64, 
 		stopRequestedAt                             sql.NullString
 		seq, revision                               int64
 	)
+	var planClosedAt sql.NullString
 	err := q.QueryRowContext(ctx,
-		`SELECT repository_id, seq, brief_digest, state, stop_requested_at, revision, updated_at FROM runs WHERE id = ?`,
+		`SELECT repository_id, seq, brief_digest, state, stop_requested_at, plan_closed_at, revision, updated_at FROM runs WHERE id = ?`,
 		id.String(),
-	).Scan(&repositoryID, &seq, &briefDigest, &state, &stopRequestedAt, &revision, &updatedAt)
+	).Scan(&repositoryID, &seq, &briefDigest, &state, &stopRequestedAt, &planClosedAt, &revision, &updatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return run.Run{}, 0, fmt.Errorf("sqlite: run %s: %w", id, app.ErrNotFound)
 	}
@@ -58,25 +58,33 @@ func getRun(ctx context.Context, q querier, id identity.RunID) (run.Run, int64, 
 		BriefDigest:   briefDigest,
 		State:         run.RunState(state),
 		StopRequested: stopRequestedAt.Valid,
+		PlanClosed:    planClosedAt.Valid,
 		UpdatedAt:     updated,
 	}, revision, nil
 }
 
-// getTask loads one task and its revision.
-func getTask(ctx context.Context, q querier, id identity.TaskID) (run.Task, int64, error) {
+// selectTaskColumns selects everything scanTask maps, including the
+// has-dependencies fact derived from the task's persisted edge set (the
+// domain field is fixed at creation; the edges are its ground truth) and
+// the mailbox flag derived from mailbox_closed_at.
+const selectTaskColumns = `SELECT t.id, t.run_id, t.kind, t.seq, t.title, t.instructions_digest,
+	EXISTS (SELECT 1 FROM task_dependencies td WHERE td.task_id = t.id),
+	t.subject_commit_oid, t.subject_tree_oid, t.mailbox_closed_at, t.state, t.revision, t.updated_at
+	FROM tasks t`
+
+// scanTask maps one tasks row from a row scanner.
+func scanTask(scan func(dest ...any) error) (run.Task, int64, error) {
 	var (
-		runID, instructionsDigest, state, updatedAt string
-		revision                                    int64
+		id, runID, kind, title, instructionsDigest, state, updatedAt string
+		subjectCommit, subjectTree, mailboxClosedAt                  sql.NullString
+		seq, hasDependencies, revision                               int64
 	)
-	err := q.QueryRowContext(ctx,
-		`SELECT run_id, instructions_digest, state, revision, updated_at FROM tasks WHERE id = ?`,
-		id.String(),
-	).Scan(&runID, &instructionsDigest, &state, &revision, &updatedAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return run.Task{}, 0, fmt.Errorf("sqlite: task %s: %w", id, app.ErrNotFound)
+	if err := scan(&id, &runID, &kind, &seq, &title, &instructionsDigest, &hasDependencies, &subjectCommit, &subjectTree, &mailboxClosedAt, &state, &revision, &updatedAt); err != nil {
+		return run.Task{}, 0, err
 	}
+	taskID, err := identity.ParseTaskID(id)
 	if err != nil {
-		return run.Task{}, 0, fmt.Errorf("sqlite: load task %s: %w", id, err)
+		return run.Task{}, 0, fmt.Errorf("sqlite: task id: %w", err)
 	}
 	parsedRunID, err := identity.ParseRunID(runID)
 	if err != nil {
@@ -87,12 +95,31 @@ func getTask(ctx context.Context, q querier, id identity.TaskID) (run.Task, int6
 		return run.Task{}, 0, err
 	}
 	return run.Task{
-		ID:                 id,
+		ID:                 taskID,
 		RunID:              parsedRunID,
+		Kind:               run.TaskKind(kind),
+		Seq:                int(seq),
+		Title:              title,
 		InstructionsDigest: instructionsDigest,
+		HasDependencies:    hasDependencies != 0,
+		SubjectCommitOID:   subjectCommit.String,
+		SubjectTreeOID:     subjectTree.String,
+		MailboxClosed:      mailboxClosedAt.Valid,
 		State:              run.TaskState(state),
 		UpdatedAt:          updated,
 	}, revision, nil
+}
+
+// getTask loads one task and its revision.
+func getTask(ctx context.Context, q querier, id identity.TaskID) (run.Task, int64, error) {
+	task, revision, err := scanTask(q.QueryRowContext(ctx, selectTaskColumns+` WHERE t.id = ?`, id.String()).Scan)
+	if errors.Is(err, sql.ErrNoRows) {
+		return run.Task{}, 0, fmt.Errorf("sqlite: task %s: %w", id, app.ErrNotFound)
+	}
+	if err != nil {
+		return run.Task{}, 0, fmt.Errorf("sqlite: load task %s: %w", id, err)
+	}
+	return task, revision, nil
 }
 
 // taskByRun loads the run's single Phase 2 task and its revision.
@@ -165,14 +192,16 @@ func latestAttempt(ctx context.Context, q querier, taskID identity.TaskID) (run.
 	return getAttempt(ctx, q, attemptID)
 }
 
-// scanSession maps one sessions row.
+// scanSession maps one sessions row. attempt_id and parent_session_id are
+// NULL for the roles that carry none (a manager binds neither) and map to
+// the domain's empty AttemptID and nil ParentSessionID.
 func scanSession(row *sql.Row, id identity.SessionID) (run.Session, int64, error) {
 	var (
-		runID, attemptID, role, harness, state, updatedAt string
-		nativeRef, nativeRefSource                        sql.NullString
-		revision                                          int64
+		runID, role, harness, state, updatedAt          string
+		attemptID, parentID, nativeRef, nativeRefSource sql.NullString
+		revision                                        int64
 	)
-	err := row.Scan(&runID, &attemptID, &role, &harness, &nativeRef, &nativeRefSource, &state, &revision, &updatedAt)
+	err := row.Scan(&runID, &attemptID, &parentID, &role, &harness, &nativeRef, &nativeRefSource, &state, &revision, &updatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return run.Session{}, 0, fmt.Errorf("sqlite: session %s: %w", id, app.ErrNotFound)
 	}
@@ -183,28 +212,36 @@ func scanSession(row *sql.Row, id identity.SessionID) (run.Session, int64, error
 	if err != nil {
 		return run.Session{}, 0, fmt.Errorf("sqlite: session %s run id: %w", id, err)
 	}
-	parsedAttemptID, err := identity.ParseAttemptID(attemptID)
-	if err != nil {
-		return run.Session{}, 0, fmt.Errorf("sqlite: session %s attempt id: %w", id, err)
-	}
-	updated, err := parseTime(updatedAt)
-	if err != nil {
-		return run.Session{}, 0, err
-	}
-	return run.Session{
+	session := run.Session{
 		ID:               id,
 		RunID:            parsedRunID,
-		AttemptID:        parsedAttemptID,
 		Role:             run.Role(role),
 		Harness:          run.Harness(harness),
 		NativeSessionRef: nativeRef.String,
 		NativeRefSource:  run.NativeRefSource(nativeRefSource.String),
 		State:            run.SessionState(state),
-		UpdatedAt:        updated,
-	}, revision, nil
+	}
+	if attemptID.Valid {
+		parsedAttemptID, attemptErr := identity.ParseAttemptID(attemptID.String)
+		if attemptErr != nil {
+			return run.Session{}, 0, fmt.Errorf("sqlite: session %s attempt id: %w", id, attemptErr)
+		}
+		session.AttemptID = parsedAttemptID
+	}
+	if parentID.Valid {
+		parsedParentID, parentErr := identity.ParseSessionID(parentID.String)
+		if parentErr != nil {
+			return run.Session{}, 0, fmt.Errorf("sqlite: session %s parent session id: %w", id, parentErr)
+		}
+		session.ParentSessionID = &parsedParentID
+	}
+	if session.UpdatedAt, err = parseTime(updatedAt); err != nil {
+		return run.Session{}, 0, err
+	}
+	return session, revision, nil
 }
 
-const selectSessionColumns = `SELECT run_id, attempt_id, role, harness, native_session_ref, native_ref_source, state, revision, updated_at FROM sessions`
+const selectSessionColumns = `SELECT run_id, attempt_id, parent_session_id, role, harness, native_session_ref, native_ref_source, state, revision, updated_at FROM sessions`
 
 // getSession loads one session and its revision.
 func getSession(ctx context.Context, q querier, id identity.SessionID) (run.Session, int64, error) {
@@ -391,14 +428,14 @@ func currentBinding(ctx context.Context, q querier, sessionID identity.SessionID
 // none.
 func getLaunchClaim(ctx context.Context, q querier, incarnationID identity.IncarnationID) (*app.LaunchClaim, error) {
 	var (
-		runID, attemptID, executable, argvDigest, state, claimedAt string
-		claimError, settledAt, settlementEvidence, seedEvidence    sql.NullString
-		pid                                                        int64
+		runID, sessionID, executable, argvDigest, state, claimedAt         string
+		attemptID, claimError, settledAt, settlementEvidence, seedEvidence sql.NullString
+		pid                                                                int64
 	)
 	err := q.QueryRowContext(ctx,
-		`SELECT run_id, attempt_id, executable, argv_digest, pid, state, error, claimed_at, settled_at, settlement_evidence, seed_evidence FROM launch_claims WHERE incarnation_id = ?`,
+		`SELECT run_id, session_id, attempt_id, executable, argv_digest, pid, state, error, claimed_at, settled_at, settlement_evidence, seed_evidence FROM launch_claims WHERE incarnation_id = ?`,
 		incarnationID.String(),
-	).Scan(&runID, &attemptID, &executable, &argvDigest, &pid, &state, &claimError, &claimedAt, &settledAt, &settlementEvidence, &seedEvidence)
+	).Scan(&runID, &sessionID, &attemptID, &executable, &argvDigest, &pid, &state, &claimError, &claimedAt, &settledAt, &settlementEvidence, &seedEvidence)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil //nolint:nilnil // a nil claim with a nil error is the documented "no claim recorded" value.
 	}
@@ -409,34 +446,38 @@ func getLaunchClaim(ctx context.Context, q querier, incarnationID identity.Incar
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: launch claim %s run id: %w", incarnationID, err)
 	}
-	parsedAttemptID, err := identity.ParseAttemptID(attemptID)
+	parsedSessionID, err := identity.ParseSessionID(sessionID)
 	if err != nil {
-		return nil, fmt.Errorf("sqlite: launch claim %s attempt id: %w", incarnationID, err)
+		return nil, fmt.Errorf("sqlite: launch claim %s session id: %w", incarnationID, err)
 	}
-	claimed, err := parseTime(claimedAt)
-	if err != nil {
-		return nil, err
-	}
-	var settled time.Time
-	if settledAt.Valid {
-		if settled, err = parseTime(settledAt.String); err != nil {
-			return nil, err
-		}
-	}
-	return &app.LaunchClaim{
+	claim := &app.LaunchClaim{
 		IncarnationID:      incarnationID,
 		RunID:              parsedRunID,
-		AttemptID:          parsedAttemptID,
+		SessionID:          parsedSessionID,
 		Executable:         executable,
 		ArgvDigest:         argvDigest,
 		PID:                int(pid),
 		State:              app.LaunchClaimState(state),
 		Error:              claimError.String,
-		ClaimedAt:          claimed,
-		SettledAt:          settled,
 		SettlementEvidence: settlementEvidence.String,
 		SeedEvidence:       seedEvidence.String,
-	}, nil
+	}
+	if attemptID.Valid {
+		parsedAttemptID, attemptErr := identity.ParseAttemptID(attemptID.String)
+		if attemptErr != nil {
+			return nil, fmt.Errorf("sqlite: launch claim %s attempt id: %w", incarnationID, attemptErr)
+		}
+		claim.AttemptID = parsedAttemptID
+	}
+	if claim.ClaimedAt, err = parseTime(claimedAt); err != nil {
+		return nil, err
+	}
+	if settledAt.Valid {
+		if claim.SettledAt, err = parseTime(settledAt.String); err != nil {
+			return nil, err
+		}
+	}
+	return claim, nil
 }
 
 // incarnationCurrent reports whether incarnationID is the attempt's current
@@ -454,26 +495,24 @@ func incarnationCurrent(ctx context.Context, q querier, attemptID identity.Attem
 	return binding.IncarnationID == incarnationID, nil
 }
 
-// launchIncarnationCurrent decides ClaimLaunch's currency rule, which must
-// also work in the window before the controller records the binding row:
-// the launcher is the pane's own command and can claim first. The
-// incarnation is current iff (a) the attempt's current session has a
-// current binding carrying exactly this incarnation, or (b) no binding row
-// exists yet for that session — a superseded row without a successor
-// retires the incarnation, so any row at all disables the fallback — and
-// the run's newest pending launch operation (kind pane.open or
-// launch.send) carries BOTH the claim's incarnation and the current
-// session's id in its intent JSON under the documented "incarnation_id"
-// and "session_id" keys, which the controller commits before dispatching
-// the pane request. The session conjunct is what stops a retired
-// incarnation's still-pending old intent from authorizing a claim after a
-// cold relaunch replaces the session. Any other case is not current.
-func launchIncarnationCurrent(ctx context.Context, q querier, runID identity.RunID, attemptID identity.AttemptID, incarnationID identity.IncarnationID) (bool, error) {
-	session, _, ok, err := currentSession(ctx, q, attemptID)
-	if err != nil || !ok {
-		return false, err
-	}
-	binding, ok, err := currentBinding(ctx, q, session.ID)
+// sessionIncarnationCurrent decides the session-keyed launch currency rule
+// (docs/plan/phase-3-design.md section 4's re-keying), which must also
+// work in the window before the controller records the binding row: the
+// launcher is the pane's own command and can claim first. The incarnation
+// is current for sessionID iff (a) the session's current binding carries
+// exactly this incarnation, or (b) no binding row exists yet for the
+// session — a superseded row without a successor retires the incarnation,
+// so any row at all disables the fallback — and the SESSION's newest
+// pending launch operation (kind pane.open or launch.send) carries the
+// claim's incarnation in its intent JSON under the documented
+// "incarnation_id" key, matched to the session by the "session_id" key the
+// controller commits before dispatching the pane request. Keying the
+// intent lookup to the claimed session (never the run's newest pending
+// launch) is what lets two concurrently pending launches validate
+// independently: another session's later intent can no longer invalidate
+// this session's own (B2).
+func sessionIncarnationCurrent(ctx context.Context, q querier, sessionID identity.SessionID, incarnationID identity.IncarnationID) (bool, error) {
+	binding, ok, err := currentBinding(ctx, q, sessionID)
 	if err != nil {
 		return false, err
 	}
@@ -482,18 +521,39 @@ func launchIncarnationCurrent(ctx context.Context, q querier, runID identity.Run
 	}
 	var bindingRows int64
 	if countErr := q.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM runtime_bindings WHERE session_id = ?`, session.ID.String(),
+		`SELECT COUNT(*) FROM runtime_bindings WHERE session_id = ?`, sessionID.String(),
 	).Scan(&bindingRows); countErr != nil {
-		return false, fmt.Errorf("sqlite: count bindings of session %s: %w", session.ID, countErr)
+		return false, fmt.Errorf("sqlite: count bindings of session %s: %w", sessionID, countErr)
 	}
 	if bindingRows > 0 {
 		return false, nil
 	}
-	intent, ok, err := pendingLaunchIntent(ctx, q, runID)
+	intentIncarnation, ok, err := pendingLaunchIntentOfSession(ctx, q, sessionID)
 	if err != nil {
 		return false, err
 	}
-	return ok && intent.incarnationID == incarnationID.String() && intent.sessionID == session.ID.String(), nil
+	return ok && intentIncarnation == incarnationID.String(), nil
+}
+
+// pendingLaunchIntentOfSession reads the SESSION's newest pending launch
+// operation (kind pane.open or launch.send, matched on the intent JSON's
+// "session_id" key) and returns its intent's "incarnation_id"; ok is false
+// when the session has no pending launch operation.
+func pendingLaunchIntentOfSession(ctx context.Context, q querier, sessionID identity.SessionID) (incarnationID string, ok bool, err error) {
+	var intentIncarnation sql.NullString
+	err = q.QueryRowContext(ctx,
+		`SELECT json_extract(intent, '$.incarnation_id') FROM operations
+		 WHERE state = ? AND kind IN (?, ?) AND json_extract(intent, '$.session_id') = ?
+		 ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+		string(app.OperationPending), string(app.OpPaneOpen), string(app.OpLaunchSend), sessionID.String(),
+	).Scan(&intentIncarnation)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("sqlite: read pending launch intent of session %s: %w", sessionID, err)
+	}
+	return intentIncarnation.String, true, nil
 }
 
 // launchIntentIdentities are the two stable identity keys of a pending
@@ -522,6 +582,24 @@ func pendingLaunchIntent(ctx context.Context, q querier, runID identity.RunID) (
 		return launchIntentIdentities{}, false, fmt.Errorf("sqlite: read pending launch intent of run %s: %w", runID, err)
 	}
 	return launchIntentIdentities{incarnationID: intentIncarnation.String, sessionID: intentSession.String}, true, nil
+}
+
+// mailboxClear reports whether task's mailbox has no queued or
+// delivered-unacknowledged message: the section 5 drain-then-submit
+// contract. Vacuously true for a solo task, which no message ever
+// addresses.
+func mailboxClear(ctx context.Context, q querier, taskID identity.TaskID) (bool, error) {
+	var pending int64
+	err := q.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM messages m
+		  WHERE m.recipient_address = ?
+		    AND NOT EXISTS (SELECT 1 FROM message_acks a WHERE a.message_id = m.id))`,
+		app.AddressString(run.TaskAddress(taskID)),
+	).Scan(&pending)
+	if err != nil {
+		return false, fmt.Errorf("sqlite: read mailbox of task %s: %w", taskID, err)
+	}
+	return pending == 0, nil
 }
 
 // runOfTask returns the persisted owning run of a task row.

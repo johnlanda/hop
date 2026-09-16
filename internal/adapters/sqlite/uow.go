@@ -227,21 +227,41 @@ func (r sessionRepository) Save(ctx context.Context, v run.Session, expectedRevi
 	return saveEntity(result, err, "session", v.ID.String(), expectedRevision)
 }
 
+// Create inserts a session row. AttemptID is optional — NULL for a manager
+// session, the only role with none — and a non-empty one must belong to
+// the leased run. ParentSessionID is persisted as given: the one-level
+// delegation rule (parent is the run's manager and has no parent itself)
+// is validated by the application transaction that constructs the child
+// (run.NewChildSession), the same division Phase 2 used for the DAG rule;
+// the store only requires a named parent to be a same-run session row.
 func (r sessionRepository) Create(ctx context.Context, v run.Session) (int64, error) { //nolint:gocritic // hugeParam: the port passes domain values by value; the repository mirrors its signature.
 	if err := r.u.requireLeasedRun(v.RunID, "session", v.ID.String()); err != nil {
 		return 0, err
 	}
-	attemptOwner, err := runOfAttempt(ctx, r.u.tx, v.AttemptID)
-	if err != nil {
-		return 0, err
+	if v.AttemptID != "" {
+		attemptOwner, err := runOfAttempt(ctx, r.u.tx, v.AttemptID)
+		if err != nil {
+			return 0, err
+		}
+		if scopeErr := r.u.requireLeasedRun(attemptOwner, "session's attempt", v.AttemptID.String()); scopeErr != nil {
+			return 0, scopeErr
+		}
 	}
-	if scopeErr := r.u.requireLeasedRun(attemptOwner, "session's attempt", v.AttemptID.String()); scopeErr != nil {
-		return 0, scopeErr
+	var parentID any
+	if v.ParentSessionID != nil {
+		parentOwner, err := runOfSession(ctx, r.u.tx, *v.ParentSessionID)
+		if err != nil {
+			return 0, err
+		}
+		if scopeErr := r.u.requireLeasedRun(parentOwner, "session's parent", v.ParentSessionID.String()); scopeErr != nil {
+			return 0, scopeErr
+		}
+		parentID = v.ParentSessionID.String()
 	}
 	if _, err := r.u.tx.ExecContext(ctx,
-		`INSERT INTO sessions (id, run_id, attempt_id, role, harness, native_session_ref, native_ref_source, state, revision, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
-		v.ID.String(), v.RunID.String(), v.AttemptID.String(), string(v.Role), string(v.Harness),
+		`INSERT INTO sessions (id, run_id, attempt_id, parent_session_id, role, harness, native_session_ref, native_ref_source, state, revision, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+		v.ID.String(), v.RunID.String(), nullString(v.AttemptID.String()), parentID, string(v.Role), string(v.Harness),
 		nullString(v.NativeSessionRef), nullString(string(v.NativeRefSource)), string(v.State), formatTime(v.UpdatedAt),
 	); err != nil {
 		return 0, fmt.Errorf("sqlite: create session %s: %w", v.ID, err)
