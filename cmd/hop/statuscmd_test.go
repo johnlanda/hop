@@ -166,6 +166,38 @@ func TestRunStatusDetail(t *testing.T) {
 		}
 	})
 
+	t.Run("an unresolved feature worktree operation renders with its action", func(t *testing.T) {
+		featureCtrl := &fakeController{}
+		featureCtrl.status = func(app.StatusRequest) (app.StatusResult, error) {
+			featureDetail := *detail
+			featureDetail.Mode = "feature"
+			featureDetail.WorktreeOperations = []app.WorktreeOperationView{{
+				OperationID: testOperationID, Branch: "hop/r1/t1a1", State: "reconciling",
+				Action: "the checkout of this branch could not be verified; inspect it",
+			}, {
+				OperationID: testOperationID, State: "reconciling", Action: "the operation's intent names no attempt",
+			}}
+			return app.StatusResult{Detail: &featureDetail}, nil
+		}
+		td := newTestDeps(featureCtrl, statusEnv(), t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runStatus([]string{"-run", testRunID}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		want := "  pending ops:   1\n" +
+			"  last submit:   transient\n" +
+			"  worktree op:   " + testOperationID + " hop/r1/t1a1 (reconciling)\n" +
+			"    action:      the checkout of this branch could not be verified; inspect it\n" +
+			"  worktree op:   " + testOperationID + " (none) (reconciling)\n" +
+			"    action:      the operation's intent names no attempt\n" +
+			"  artifact:      "
+		if code != exitOK || !strings.Contains(stdout.String(), want) {
+			t.Errorf("code = %d, output:\n%s\nwant the block:\n%s", code, stdout.String(), want)
+		}
+	})
+
 	t.Run("-run accepts the r<seq> label", func(t *testing.T) {
 		td := newTestDeps(ctrl, statusEnv(), t.TempDir())
 		var stdout, stderr bytes.Buffer

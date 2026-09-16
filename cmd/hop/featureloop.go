@@ -264,6 +264,23 @@ func managerLaunchLines(reports []app.SessionLaunchProgress) []string {
 	return lines
 }
 
+// attemptLaunchLines renders the pass's attempt-launch conditions — every
+// recovered launch, and every assignment whose launch did not reach an
+// opened pane — plus the unattributable worktree operations, one line
+// each. A launch that does not complete never ends the loop: a later pass
+// recovers or settles it. Only the app's fixed detail text is printed.
+func attemptLaunchLines(report *app.AssignmentReport) []string {
+	lines := make([]string, 0, len(report.Launches)+len(report.Blocked))
+	for i := range report.Launches {
+		launch := &report.Launches[i]
+		lines = append(lines, fmt.Sprintf("attempt t%da%d %s: %s", launch.TaskSeq, launch.AttemptNumber, launch.Disposition, launch.Detail))
+	}
+	for _, blocked := range report.Blocked {
+		lines = append(lines, "worktree blocked: "+blocked)
+	}
+	return lines
+}
+
 // runFeatureSchedulingPass runs one deterministic scheduling-pass round
 // (design section 6) up to, but not including, check-driving — which the
 // caller runs asynchronously through featureCheckDriver, mirroring the
@@ -335,14 +352,15 @@ func runFeatureSchedulingPass(ctx context.Context, ctrl controllerAPI, handle ap
 	if err != nil {
 		return featurePassResult{}, fmt.Errorf("resolve integration head: %w", err)
 	}
-	if _, err = ctrl.AssignReadyTasks(ctx, handle, opts); err != nil {
-		return featurePassResult{}, fmt.Errorf("assign ready tasks: %w", err)
+	assignment, err := ctrl.AssignReadyTasks(ctx, handle, opts)
+	if err != nil {
+		return featurePassResult{lines: attemptLaunchLines(&assignment)}, fmt.Errorf("assign ready tasks: %w", err)
 	}
 	launches, err := ctrl.CorroborateSessionLaunches(ctx, handle)
 	if err != nil {
-		return featurePassResult{}, fmt.Errorf("corroborate session launches: %w", err)
+		return featurePassResult{lines: attemptLaunchLines(&assignment)}, fmt.Errorf("corroborate session launches: %w", err)
 	}
-	result := featurePassResult{lines: managerLaunchLines(launches)}
+	result := featurePassResult{lines: append(attemptLaunchLines(&assignment), managerLaunchLines(launches)...)}
 	if _, err = ctrl.PublishRunPresentation(ctx, handle); err != nil {
 		return result, fmt.Errorf("publish run presentation: %w", err)
 	}

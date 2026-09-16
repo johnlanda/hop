@@ -119,7 +119,8 @@ func listingMarkers(r *app.RunSummaryView) string {
 }
 
 // renderRunDetail prints the full detail block: states, worktree, binding,
-// claim, pending operations, last submission, artifacts and the last check
+// claim, pending operations (each unresolved feature worktree operation
+// with its human action), last submission, artifacts and the last check
 // execution — including the human's options for an unrepeatable unknown
 // outcome.
 func renderRunDetail(w io.Writer, detail *app.RunDetailView) (int, error) {
@@ -135,6 +136,10 @@ func renderRunDetail(w io.Writer, detail *app.RunDetailView) (int, error) {
 		"  trust seed:    " + orUnset(detail.SeedEvidence),
 		fmt.Sprintf("  pending ops:   %d", detail.PendingOps),
 		"  last submit:   " + orUnset(detail.LastSubmission),
+	}
+	for _, op := range detail.WorktreeOperations {
+		lines = append(lines, "  worktree op:   "+op.OperationID+" "+orUnset(op.Branch)+" ("+op.State+")",
+			"    action:      "+op.Action)
 	}
 	for _, artifact := range detail.Artifacts {
 		lines = append(lines, "  artifact:      "+artifact)
