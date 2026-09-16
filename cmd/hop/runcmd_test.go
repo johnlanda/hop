@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -517,4 +519,75 @@ func TestRunRunWorkflowDispatch(t *testing.T) {
 			t.Fatalf("calls = %v; a signal detaches and never stops", calls)
 		}
 	})
+}
+
+// TestRunFeatureFromRepositorySubdirectory proves a feature run started
+// while the working directory is a subdirectory of the repository is
+// scheduled in the root it froze: hop run hands StartFeatureRun the -C
+// repository (the invoking directory only when -C is absent), and the
+// feature loop's AssignReadyTasks receives exactly the frozen roots
+// AssignmentDefaults serves — never the invoking directory. The scripted
+// start freezes the request's roots, as the real StartFeatureRun does
+// (internal/app TestStartFeatureRunHandsOffToLaunchCorroboration pins
+// AssignmentDefaults against the bootstrap's request).
+func TestRunFeatureFromRepositorySubdirectory(t *testing.T) {
+	env := map[string]string{"HOME": "/home/u", "PATH": "/bin"}
+	for _, tt := range []struct {
+		name     string
+		withC    bool
+		wantRoot func(repo, sub string) string
+	}{
+		{"-C names the repository", true, func(repo, _ string) string { return repo }},
+		{"no -C: the invoking directory is the repository hop run was given", false, func(_, sub string) string { return sub }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			repo, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatalf("resolve temp dir: %v", err)
+			}
+			sub := filepath.Join(repo, "pkg", "inner")
+			if mkErr := os.MkdirAll(sub, 0o700); mkErr != nil {
+				t.Fatalf("mkdir: %v", mkErr)
+			}
+			ctrl := &fakeController{}
+			var request app.StartRunRequest
+			ctrl.startFeatureRun = func(req app.StartRunRequest) (app.StartRunResult, app.RunHandle, error) {
+				request = req
+				ctrl.frozenRepositoryRoot, ctrl.frozenStateRoot = req.RepositoryRoot, req.StateRoot
+				return app.StartRunResult{RunID: testRunID, Sequence: 1}, app.RunHandle{}, nil
+			}
+			var assigned []app.AssignmentOptions
+			ctrl.assignReadyTasks = func(opts app.AssignmentOptions) (app.AssignmentReport, error) {
+				assigned = append(assigned, opts)
+				return app.AssignmentReport{}, nil
+			}
+			ctrl.status = scriptStatus(detailStep("running", "", false), detailStep("running", "", false), detailStep("completed", "", false))
+			td := newTestDeps(ctrl, env, sub)
+			args := []string{"-workflow", "feature", "brief"}
+			if tt.withC {
+				args = append([]string{"-C", repo}, args...)
+			}
+			var stdout, stderr bytes.Buffer
+
+			code, err := runRun(args, &stdout, &stderr, td.deps)
+			if err != nil {
+				t.Fatalf("write error: %v", err)
+			}
+			if code != exitOK {
+				t.Fatalf("exit code = %d, want %d (stderr: %s)", code, exitOK, stderr.String())
+			}
+			want := tt.wantRoot(repo, sub)
+			if request.RepositoryRoot != want || request.StateRoot != "/home/u/.local/state/hop" {
+				t.Fatalf("StartFeatureRun roots = %q, %q; want %q and the resolved state root", request.RepositoryRoot, request.StateRoot, want)
+			}
+			if len(assigned) == 0 {
+				t.Fatalf("the feature loop never assigned; calls = %v", ctrl.recorded())
+			}
+			for _, opts := range assigned {
+				if opts.RepositoryRoot != want || opts.StateRoot != request.StateRoot || opts.HOPPath != "/opt/hop/bin/hop" {
+					t.Fatalf("AssignReadyTasks options = %+v; want the frozen roots %q, %q", opts, want, request.StateRoot)
+				}
+			}
+		})
+	}
 }

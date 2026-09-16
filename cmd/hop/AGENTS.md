@@ -140,7 +140,9 @@ commands expect the built binary at `.bin/hop` (see `make build`).
 - `go test ./cmd/hop` — table-driven command behavior against the scripted
   `controllerAPI` fake and fully-faked `deps` (no real adapter is opened):
   dispatch and exit codes, `hop run --workflow` dispatch and exit codes
-  for both workflows (`TestRunRunWorkflowDispatch`), state-root
+  for both workflows (`TestRunRunWorkflowDispatch`), a feature run
+  started from a repository subdirectory scheduled in the root it froze
+  (`TestRunFeatureFromRepositorySubdirectory`), state-root
   resolution (default, override,
   relative rejection) and the doctor line, the controller loop with a fake
   clock (transitions, stop routing, detach on signal, heartbeat-failure
