@@ -314,6 +314,34 @@ type SessionLaunchContext struct {
 	IncarnationID identity.IncarnationID
 	Claim         *LaunchClaim
 	StopRequested bool
+
+	// Attempt is the session's bound attempt row, the zero value for a
+	// manager session (the only role with none). Its ID equals AttemptID
+	// when non-zero; the launch boundary needs the row itself for the
+	// HOP_TASK_ID environment check (Attempt.TaskID) and the solo shim's
+	// attempt-currency refusals (Attempt.State), exactly as the Phase 2
+	// LaunchContext carries it.
+	Attempt run.Attempt
+	// WorktreePath is the attempt's recorded worktree path exactly as the
+	// worktree row persisted it — resolved the same way LoadLaunchContext
+	// resolves the Phase 2 field, never from a binding that may not exist
+	// yet — or "" for a manager session (whose expected launch directory
+	// is the repository root, from FrozenRun) and before the row exists.
+	// PrepareSessionLaunchExec refuses an attempt-bearing launch whose
+	// working directory does not canonically resolve to it.
+	WorktreePath string
+	// Relaunch reports that this session is a cold-relaunch SUCCESSOR:
+	// another session of the same run carries the same native session
+	// reference. Solo cold relaunch (usecase_resume.go) and both
+	// feature-mode successor paths (usecase_featureresume.go — child and
+	// manager alike) construct exactly this shape, and a first launch's
+	// pre-assigned reference is unique to its session, so the store derives
+	// this with one query and no new column. It selects the harness's
+	// cold-resume argv (`--resume <ref> <continuation prompt>`,
+	// Claude-only) over a first launch's; the attempt-state signal cannot
+	// decide this, since feature-mode relaunch never transitions the
+	// attempt and the manager has no attempt at all.
+	Relaunch bool
 }
 
 // MessagingContext is LoadMessagingContext's result: the caller session's
