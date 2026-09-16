@@ -340,6 +340,38 @@ func TestGrammarContractMsgSendAndDeliver(t *testing.T) {
 	}
 }
 
+// TestGrammarContractMsgSendArtifactWriteFailureEchoesNoPath proves a
+// file-first body write that fails (the run's message directory is
+// blocked by a regular file) is a plain command failure whose one stderr
+// line names the step and category only: neither stream ever carries the
+// state root, which is the operator's path.
+func TestGrammarContractMsgSendArtifactWriteFailureEchoesNoPath(t *testing.T) {
+	f := newFeatureManager(t, 1500, defaultMessageWait)
+	runDir := filepath.Join(f.StateRoot, "runs", f.RunID)
+	if err := os.MkdirAll(runDir, 0o700); err != nil {
+		t.Fatalf("create run dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(runDir, "messages"), []byte("blocks the message directory"), 0o600); err != nil {
+		t.Fatalf("block the message directory: %v", err)
+	}
+
+	result := execHop(t, f.env(nil), f.StateRoot, "msg", "send", "--to", "human", "--kind", "question", "--body", "can I proceed?")
+	if result.ExitCode != exitFailure || result.Stdout != "" {
+		t.Fatalf("exit = %d stdout = %q, want %d and nothing; stderr=%q", result.ExitCode, result.Stdout, exitFailure, result.Stderr)
+	}
+	if !strings.Contains(result.Stderr, "a path element is not a directory") {
+		t.Errorf("stderr = %q, want the fixed category", result.Stderr)
+	}
+	if lines := strings.Split(strings.TrimRight(result.Stderr, "\n"), "\n"); len(lines) != 1 {
+		t.Errorf("stderr = %q, want exactly one line", result.Stderr)
+	}
+	for _, leak := range []string{f.StateRoot, filepath.Base(f.StateRoot), runDir} {
+		if strings.Contains(result.Stderr, leak) || strings.Contains(result.Stdout, leak) {
+			t.Errorf("a stream echoes %q: stdout=%q stderr=%q", leak, result.Stdout, result.Stderr)
+		}
+	}
+}
+
 // TestGrammarContractMsgWaitDefaultTimeout is the manager's required
 // real-binary confirmation of ruling C: hop msg wait's rendered "none"
 // line uses the run's frozen [messages] wait_timeout when --timeout is

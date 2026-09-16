@@ -78,7 +78,7 @@ func runTaskCreate(args []string, stdout, stderr io.Writer, d *deps) (int, error
 	}
 	body, err := os.ReadFile(*file)
 	if err != nil {
-		_, werr := fmt.Fprintf(stderr, "hop task create: cannot read instructions file: %v\n", err)
+		_, werr := fmt.Fprintf(stderr, "hop task create: cannot read instructions file: %s\n", pathErrorCategory(err))
 		return exitFailure, werr
 	}
 	env := readManagerEnvIdentities(d)

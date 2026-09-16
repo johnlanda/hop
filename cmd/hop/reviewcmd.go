@@ -48,7 +48,7 @@ func runReviewSubmit(args []string, stdout, stderr io.Writer, d *deps) (int, err
 	}
 	reasons, err := os.ReadFile(*reasonsFile)
 	if err != nil {
-		_, werr := fmt.Fprintf(stderr, "hop review submit: cannot read reasons file: %v\n", err)
+		_, werr := fmt.Fprintf(stderr, "hop review submit: cannot read reasons file: %s\n", pathErrorCategory(err))
 		return exitFailure, werr
 	}
 

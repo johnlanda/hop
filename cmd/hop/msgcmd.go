@@ -22,7 +22,9 @@ const msgPollInterval = 1 * time.Second
 
 // readBodyFlag resolves a message/answer/reasons body from --file or
 // --body (mutually exclusive; exactly one required), reporting whether it
-// came from --body (Inline) for the caller's size-bound choice.
+// came from --body (Inline) for the caller's size-bound choice. A read
+// failure renders pathErrorCategory's fixed category, never the operator's
+// path.
 func readBodyFlag(file, body string, fileSet, bodySet bool) (data []byte, inline bool, err error) {
 	if fileSet == bodySet {
 		return nil, false, fmt.Errorf("exactly one of --file and --body is required")
@@ -32,7 +34,7 @@ func readBodyFlag(file, body string, fileSet, bodySet bool) (data []byte, inline
 	}
 	content, err := os.ReadFile(file) //nolint:gosec // G304: an operator-supplied --file path; reading it is this flag's purpose.
 	if err != nil {
-		return nil, false, fmt.Errorf("cannot read body file: %w", err)
+		return nil, false, fmt.Errorf("cannot read body file: %s", pathErrorCategory(err))
 	}
 	return content, false, nil
 }

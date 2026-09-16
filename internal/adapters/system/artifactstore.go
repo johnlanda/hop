@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"syscall"
 
 	"github.com/johnlanda/hop/internal/app"
 )
@@ -34,37 +35,86 @@ var _ app.ArtifactStore = ArtifactStore{}
 // destination exactly as it was; a failure after it (the directory fsync)
 // leaves the complete new content whose durability is not yet established —
 // the destination is never anything partial.
+//
+// Every failure is an artifactFailure: its text never carries a path.
 func (s ArtifactStore) WriteArtifact(ctx context.Context, path string, content []byte) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	dir := filepath.Dir(path)
 	if err := s.establishDirDurable(dir); err != nil {
-		return fmt.Errorf("create artifact directory: %w", err)
+		return &artifactFailure{step: "create directory", err: err}
 	}
 	tmp, err := os.CreateTemp(dir, ".hop-artifact-*")
 	if err != nil {
-		return fmt.Errorf("create temp artifact file: %w", err)
+		return &artifactFailure{step: "create temp file", err: err}
 	}
 	if err := fillTemp(tmp, content); err != nil {
-		return errors.Join(err, removeTemp(tmp.Name()))
+		return &artifactFailure{step: "write", err: errors.Join(err, removeTemp(tmp.Name()))}
 	}
 	if err := os.Rename(tmp.Name(), path); err != nil {
-		return errors.Join(fmt.Errorf("publish artifact: %w", err), removeTemp(tmp.Name()))
+		return &artifactFailure{step: "publish", err: errors.Join(err, removeTemp(tmp.Name()))}
 	}
-	return s.syncDirectory(dir)
+	if err := s.syncDirectory(dir); err != nil {
+		return &artifactFailure{step: "sync directory", err: err}
+	}
+	return nil
 }
 
-// ReadArtifact returns the artifact's complete content.
+// ReadArtifact returns the artifact's complete content. A failure is an
+// artifactFailure: its text never carries the path.
 func (ArtifactStore) ReadArtifact(ctx context.Context, path string) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	content, err := os.ReadFile(path) //nolint:gosec // G304: the path is chosen by the application from the run's frozen artifact directories; reading it is this port's purpose.
 	if err != nil {
-		return nil, fmt.Errorf("read artifact: %w", err)
+		return nil, &artifactFailure{step: "read", err: err}
 	}
 	return content, nil
+}
+
+// errNotADirectory reports an existing non-directory entry on an
+// artifact's parent chain.
+var errNotADirectory = errors.New("a path element exists and is not a directory")
+
+// artifactFailure is one failed artifact write or read, rendered without
+// any path: an artifact lives under the operator's state root, and the
+// application surfaces these errors on the CLI and in the operation
+// journal. Error names the failed step and a fixed category established
+// through errors.Is only; Unwrap keeps the chain, so callers still
+// classify with errors.Is (fs.ErrNotExist, context cancellation).
+type artifactFailure struct {
+	step string
+	err  error
+}
+
+func (f *artifactFailure) Error() string {
+	return "artifact " + f.step + " failed: " + artifactFailureCategory(f.err) + " (the artifact path is never echoed)"
+}
+
+func (f *artifactFailure) Unwrap() error { return f.err }
+
+// artifactFailureCategory classifies err through errors.Is only.
+func artifactFailureCategory(err error) string {
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return "a path element does not exist"
+	case errors.Is(err, fs.ErrPermission):
+		return "permission denied"
+	case errors.Is(err, errNotADirectory), errors.Is(err, syscall.ENOTDIR):
+		return "a path element is not a directory"
+	case errors.Is(err, syscall.EISDIR):
+		return "the artifact path is a directory"
+	case errors.Is(err, syscall.ENOSPC):
+		return "no space left on device"
+	case errors.Is(err, syscall.EROFS):
+		return "read-only file system"
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return "canceled"
+	default:
+		return "i/o failure"
+	}
 }
 
 // fillTemp writes the content, pins mode 0600 (CreateTemp's 0600 is
@@ -106,7 +156,7 @@ func (s ArtifactStore) establishDirDurable(dir string) error {
 				return statErr
 			}
 			if !info.IsDir() {
-				return fmt.Errorf("%s exists and is not a directory", component)
+				return errNotADirectory
 			}
 		}
 		if err := s.syncDirectory(filepath.Dir(component)); err != nil {

@@ -51,6 +51,10 @@ commands expect the built binary at `.bin/hop` (see `make build`).
   the root came from (`HOP_STATE_DIR` for worker commands, the resolved
   state root for controller commands) — the raw sqlite/filesystem error
   chain carries the complete path and is never printed.
+- An operator-supplied file a worker-plumbing verb reads (`--file`,
+  `--reasons-file`) that cannot be read renders `pathErrorCategory`'s fixed
+  category, never the path; artifact-write failures reach stderr already
+  path-free from the artifact store (`internal/adapters/system`).
 - Exit codes: 0 success, 1 failure, 2 usage. `hop run`/`hop resume` exit 0
   only on a `completed` run; failed, stopped, detach and errors exit 1; a
   StartRun refusal before any side effect (`app.ErrStartRefused`) is usage.
@@ -151,6 +155,14 @@ commands expect the built binary at `.bin/hop` (see `make build`).
   ever echoing the state-root value, and `TestOpenControllerGitExecutableNotFound`
   proves composition refuses with a fixed, value-free diagnostic when git
   cannot be resolved on its own PATH.
+- `fileerrors_test.go` proves the same value-free rule for file reads
+  and artifact writes: `TestFileReadFailuresNeverEchoThePath` (every
+  `--file`/`--reasons-file` verb, missing and unreadable, a path canary on
+  neither stream, no store opened) and
+  `TestArtifactWriteFailureNeverEchoesThePath` (a real artifact-store
+  failure rendered by `hop msg send`); the grammar contract suite's
+  `TestGrammarContractMsgSendArtifactWriteFailureEchoesNoPath` repeats it
+  against the real binary.
 - `make build && .bin/hop version` — builds the binary and prints the version
   the Go toolchain derived from version control.
 - `.bin/hop doctor` — probes the real installation on this machine.

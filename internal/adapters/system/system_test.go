@@ -3,6 +3,7 @@ package system_test
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -184,6 +185,47 @@ func assertNoTempFiles(t *testing.T, dir string) {
 	for _, entry := range entries {
 		if strings.HasPrefix(entry.Name(), ".hop-artifact-") {
 			t.Errorf("temp file %s left behind in %s", entry.Name(), dir)
+		}
+	}
+}
+
+// TestArtifactStoreErrorsNeverEchoThePath proves every artifact failure
+// renders a fixed category and no path — an artifact lives under the
+// operator's state root, and callers print these errors — while the chain
+// still classifies through errors.Is.
+func TestArtifactStoreErrorsNeverEchoThePath(t *testing.T) {
+	const canary = "credential-like-artifact-canary"
+	store := system.ArtifactStore{}
+	root := filepath.Join(t.TempDir(), canary)
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	occupied := filepath.Join(root, "runs")
+	if err := os.WriteFile(occupied, []byte("file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	writeErr := store.WriteArtifact(t.Context(), filepath.Join(occupied, "r1", "artifact"), []byte("x"))
+	if writeErr == nil || !strings.Contains(writeErr.Error(), "a path element is not a directory") {
+		t.Errorf("WriteArtifact under a file = %v, want the not-a-directory category", writeErr)
+	}
+
+	readErr := func() error {
+		_, err := store.ReadArtifact(t.Context(), filepath.Join(root, "absent"))
+		return err
+	}()
+	if !errors.Is(readErr, fs.ErrNotExist) || !strings.Contains(fmt.Sprint(readErr), "a path element does not exist") {
+		t.Errorf("ReadArtifact(absent) = %v, want the not-exist category wrapping fs.ErrNotExist", readErr)
+	}
+
+	publishErr := store.WriteArtifact(t.Context(), root, []byte("x")) // a directory is the destination
+	if publishErr == nil {
+		t.Error("WriteArtifact onto a directory succeeded")
+	}
+
+	for _, err := range []error{writeErr, readErr, publishErr} {
+		if err != nil && strings.Contains(err.Error(), canary) {
+			t.Errorf("error %q echoes the artifact path", err)
 		}
 	}
 }
