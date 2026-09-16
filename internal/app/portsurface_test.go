@@ -45,6 +45,7 @@ func portSurfaceAllowlist() map[string][]string {
 		"ProcessGroupInspector":          {"GroupProcesses", "SignalGroup"},
 		"ReadStore":                      {"ListRuns", "LoadCheckExecutionContext", "LoadFrozenRun", "LoadRunStatus"},
 		"ResultRepository":               {"Accepted"},
+		"RetirementReadStore":            {"ListRetirementCandidates"},
 		"RetryRequestRepository":         {"MarkConsumed", "Pending"},
 		"ReviewRepository":               {"ByAttempt", "Latest"},
 		"ReviewStore":                    {"SubmitReview"},

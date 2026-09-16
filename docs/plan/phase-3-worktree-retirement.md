@@ -678,6 +678,21 @@ consistent with sections 1 to 12.
 - The first removal is announced through a callback just before its
   spawn, so status can print its "retiring" line before a slow act.
 
+**Triage.**
+
+- The read returns each candidate's integrated rows and all of its
+  `retirement.check` operations, not just the last settled one. App code
+  applies detection's own rules to them (the head rule, the settled merge,
+  the settled answer for the exact (H, T) pair), so triage and detection
+  cannot disagree.
+- The read does not return an active-worktree count. A merged run needs a
+  pass until its fact is set, whether worktrees remain or only the fact
+  does.
+- Triage follows detection's order. A moved or replaced repository is
+  `history-missing` and never leased, even with an unresolved operation.
+  An ambiguous head, an unreadable target and a failed check of the same
+  pair are reported as `check-failed`, with no lease.
+
 **Dispatch revalidation (`revalidateRetirementDispatch`).** Both claimed
 acts run it immediately before the spawn:
 

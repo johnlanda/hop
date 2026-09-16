@@ -151,46 +151,119 @@ func (c *Controller) retirementHead(ctx context.Context, handle RunHandle, froze
 	case head == "" || !hasContent:
 		return "", retirementDetection{State: detectionNothingIntegrated, Detail: "the run integrated no new content"}, nil
 	}
-	if identityCheck, gitErr := c.retirementGit(ctx, frozen.RepositoryRoot, "cat-file", "-e", head+"^{commit}"); gitErr != nil || identityCheck.ExitCode != 0 {
+	if !c.repositoryHoldsHead(ctx, frozen.RepositoryRoot, head) {
 		return "", retirementDetection{State: detectionHistoryMissing, Head: head, Detail: "the repository root no longer holds this run's history"}, nil
 	}
 	return head, retirementDetection{}, nil
 }
 
 // integratedHead reads the run's validated integration head inside the
-// caller's unit of work: the merge commit of the most recently created
-// integrated row. hasContent is false when no integrated row added content
-// (every one is a no-op, merge == pre-merge), and ambiguous is true when
-// two integrated rows share the latest creation time with different merge
-// commits — never a guess.
+// caller's unit of work (latestIntegratedHead over the run's integration
+// rows).
 func integratedHead(ctx context.Context, wf WorkflowRepositories, runID identity.RunID) (head string, hasContent, ambiguous bool, err error) {
 	tasks, err := wf.TaskIndex().ByRun(ctx, runID)
 	if err != nil {
 		return "", false, false, err
 	}
-	var latest time.Time
+	var rows []run.Integration
 	for i := range tasks {
 		integrations, intErr := wf.Integrations().ByTask(ctx, tasks[i].ID)
 		if intErr != nil {
 			return "", false, false, intErr
 		}
-		for j := range integrations {
-			integ := &integrations[j]
-			if integ.State != run.IntegrationIntegrated {
-				continue
-			}
-			if integ.MergeCommitOID != integ.PremergeHeadOID {
-				hasContent = true
-			}
-			switch {
-			case head == "" || integ.CreatedAt.After(latest):
-				head, latest, ambiguous = integ.MergeCommitOID, integ.CreatedAt, false
-			case integ.CreatedAt.Equal(latest) && integ.MergeCommitOID != head:
-				ambiguous = true
-			}
+		rows = append(rows, integrations...)
+	}
+	head, hasContent, ambiguous = latestIntegratedHead(rows)
+	return head, hasContent, ambiguous, nil
+}
+
+// latestIntegratedHead is the validated-head rule over a run's integration
+// rows: the merge commit of the most recently created integrated row.
+// hasContent is false when no integrated row added content (every one is a
+// no-op, merge == pre-merge), and ambiguous is true when two integrated
+// rows share the latest creation time with different merge commits —
+// never a guess.
+func latestIntegratedHead(rows []run.Integration) (head string, hasContent, ambiguous bool) {
+	var latest time.Time
+	for i := range rows {
+		integ := &rows[i]
+		if integ.State != run.IntegrationIntegrated {
+			continue
+		}
+		if integ.MergeCommitOID != integ.PremergeHeadOID {
+			hasContent = true
+		}
+		switch {
+		case head == "" || integ.CreatedAt.After(latest):
+			head, latest, ambiguous = integ.MergeCommitOID, integ.CreatedAt, false
+		case integ.CreatedAt.Equal(latest) && integ.MergeCommitOID != head:
+			ambiguous = true
 		}
 	}
-	return head, hasContent, ambiguous, nil
+	return head, hasContent, ambiguous
+}
+
+// settledMerged reports whether any of the run's retirement.check
+// operations settled with the head contained in the target: detection never
+// runs again after that.
+func settledMerged(checks []Operation) bool {
+	for i := range checks {
+		if checks[i].State != OperationSucceeded {
+			continue
+		}
+		if outcome, ok := decodeOperationPayload[retirementCheckOutcome](checks[i].Outcome); ok && outcome.Result == ancestryContained {
+			return true
+		}
+	}
+	return false
+}
+
+// settledAnswer returns the settled not-merged or failed answer a
+// retirement.check already gave for exactly this head and target tip; ok
+// is false when no check answered this pair, and a fresh check may run.
+func settledAnswer(checks []Operation, head, target string) (ancestryResult, bool) {
+	for i := range checks {
+		if checks[i].State != OperationSucceeded && checks[i].State != OperationFailed {
+			continue
+		}
+		intent, intentOK := decodeOperationPayload[retirementCheckIntent](checks[i].Intent)
+		outcome, outcomeOK := decodeOperationPayload[retirementCheckOutcome](checks[i].Outcome)
+		if !intentOK || !outcomeOK || intent.HeadOID != head || intent.TargetOID != target {
+			continue
+		}
+		if outcome.Result == ancestryNotContained || outcome.Result == ancestryFailed {
+			return outcome.Result, true
+		}
+	}
+	return "", false
+}
+
+// targetTip reads the frozen target branch's tip read-only. A missing
+// branch is gone (exit 1, pinned) and not an error; a failed or malformed
+// read returns a value-free detail.
+func (c *Controller) targetTip(ctx context.Context, repositoryRoot, targetRef string) (tip string, gone bool, failure string) {
+	result, err := c.retirementGit(ctx, repositoryRoot, "rev-parse", "--verify", "-q", targetRef+"^{commit}")
+	switch {
+	case err != nil:
+		return "", false, "the target branch could not be read"
+	case result.ExitCode == 1:
+		return "", true, ""
+	case result.ExitCode != 0:
+		return "", false, "the target branch could not be read"
+	}
+	tip = strings.TrimSpace(string(result.Stdout))
+	if !isObjectID(tip) {
+		return "", false, "the target branch did not resolve to a commit"
+	}
+	return tip, false, ""
+}
+
+// repositoryHoldsHead is the repository-identity check: the frozen root
+// still holds the run's validated head (`cat-file -e <head>^{commit}`,
+// exit statuses probe-pinned).
+func (c *Controller) repositoryHoldsHead(ctx context.Context, repositoryRoot, head string) bool {
+	result, err := c.retirementGit(ctx, repositoryRoot, "cat-file", "-e", head+"^{commit}")
+	return err == nil && result.ExitCode == 0
 }
 
 // detectRetirementMerge runs the rest of the detection step for a run
@@ -208,45 +281,22 @@ func (c *Controller) detectRetirementMerge(ctx context.Context, handle RunHandle
 	}); err != nil {
 		return retirementDetection{}, fmt.Errorf("app: read the run's retirement checks: %w", err)
 	}
-	for i := range settled {
-		if settled[i].State != OperationSucceeded {
-			continue
-		}
-		if outcome, ok := decodeOperationPayload[retirementCheckOutcome](settled[i].Outcome); ok && outcome.Result == ancestryContained {
-			return retirementDetection{State: detectionMerged, Head: head, Detail: "detected earlier"}, nil
-		}
+	if settledMerged(settled) {
+		return retirementDetection{State: detectionMerged, Head: head, Detail: "detected earlier"}, nil
 	}
-
-	root := frozen.RepositoryRoot
 	targetRef := frozen.Snapshot.Workflow.TargetBranch
-	tip, err := c.retirementGit(ctx, root, "rev-parse", "--verify", "-q", targetRef+"^{commit}")
+	target, gone, failure := c.targetTip(ctx, frozen.RepositoryRoot, targetRef)
 	switch {
-	case err != nil:
-		return retirementDetection{State: detectionFailed, Head: head, Detail: "the target branch could not be read"}, nil
-	case tip.ExitCode == 1:
-		return retirementDetection{State: detectionNotMerged, Head: head, Detail: "the target branch " + targetRef + " no longer exists"}, nil
-	case tip.ExitCode != 0:
-		return retirementDetection{State: detectionFailed, Head: head, Detail: "the target branch could not be read"}, nil
+	case failure != "":
+		return retirementDetection{State: detectionFailed, Head: head, Detail: failure}, nil
+	case gone:
+		return retirementDetection{State: detectionNotMerged, Head: head, Detail: "the target branch no longer exists"}, nil
 	}
-	target := strings.TrimSpace(string(tip.Stdout))
-	if !isObjectID(target) {
-		return retirementDetection{State: detectionFailed, Head: head, Detail: "the target branch did not resolve to a commit"}, nil
-	}
-	for i := range settled {
-		if settled[i].State != OperationSucceeded && settled[i].State != OperationFailed {
-			continue
-		}
-		intent, intentOK := decodeOperationPayload[retirementCheckIntent](settled[i].Intent)
-		outcome, outcomeOK := decodeOperationPayload[retirementCheckOutcome](settled[i].Outcome)
-		if !intentOK || !outcomeOK || intent.HeadOID != head || intent.TargetOID != target {
-			continue
-		}
-		switch outcome.Result {
-		case ancestryNotContained:
-			return retirementDetection{State: detectionNotMerged, Head: head, Target: target, Detail: "unchanged since the last check"}, nil
-		case ancestryFailed:
-			return retirementDetection{State: detectionFailed, Head: head, Target: target, Detail: "the last check of this head and tip failed"}, nil
-		}
+	switch answer, answered := settledAnswer(settled, head, target); {
+	case answered && answer == ancestryNotContained:
+		return retirementDetection{State: detectionNotMerged, Head: head, Target: target, Detail: "unchanged since the last check"}, nil
+	case answered:
+		return retirementDetection{State: detectionFailed, Head: head, Target: target, Detail: "the last check of this head and tip failed"}, nil
 	}
 	return c.runRetirementCheck(ctx, handle, frozen, opts, head, targetRef, target)
 }

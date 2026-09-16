@@ -279,3 +279,64 @@ func TestFakeWorktreesForRetirementContract(t *testing.T) {
 		t.Fatalf("another run's rows: err %v, want ErrFenced", err)
 	}
 }
+
+var _ app.RetirementReadStore = (*fakeStore)(nil)
+
+// ListRetirementCandidates mirrors the SQLite store's contract
+// (TestListRetirementCandidates): the repository's terminal feature runs
+// with a target, the fact unset and at least one integrated row that
+// added content, in sequence order, each with its integrated rows, its
+// retirement.check operations newest first and whether any retirement
+// operation is unresolved.
+func (s *fakeStore) ListRetirementCandidates(_ context.Context, repositoryRoot string) ([]app.RetirementCandidateRecord, error) {
+	if err := s.refuseInsideTransaction("RetirementReadStore.ListRetirementCandidates"); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	repoID, ok := s.repoByRoot[repositoryRoot]
+	if !ok {
+		return nil, nil
+	}
+	var records []app.RetirementCandidateRecord
+	for runID, row := range s.Runs {
+		r := row.value
+		snapshot := s.Snapshots[runID]
+		if _, retired := s.WorktreesRetiredAt[runID]; retired || r.RepositoryID != repoID ||
+			!snapshot.Workflow.Feature() || snapshot.Workflow.TargetBranch == "" {
+			continue
+		}
+		switch r.State {
+		case run.RunCompleted, run.RunFailed, run.RunStopped:
+		default:
+			continue
+		}
+		record := app.RetirementCandidateRecord{RunID: runID, Sequence: r.Sequence, RepositoryRoot: repositoryRoot, TargetBranch: snapshot.Workflow.TargetBranch}
+		content := false
+		for _, integ := range s.Integrations {
+			if integ.value.RunID == runID && integ.value.State == run.IntegrationIntegrated {
+				record.Integrated = append(record.Integrated, integ.value)
+				content = content || integ.value.MergeCommitOID != integ.value.PremergeHeadOID
+			}
+		}
+		if !content {
+			continue
+		}
+		slices.SortFunc(record.Integrated, func(a, b run.Integration) int { return a.CreatedAt.Compare(b.CreatedAt) })
+		for _, op := range s.Operations { //nolint:gocritic // rangeValCopy: test fake; the journal rows are small and read-only here.
+			if op.RunID != runID || (op.Kind != app.OpRetirementCheck && op.Kind != app.OpWorktreeRetire) {
+				continue
+			}
+			if op.State == app.OperationPending || op.State == app.OperationReconciling {
+				record.Unresolved = true
+			}
+			if op.Kind == app.OpRetirementCheck {
+				record.Checks = append(record.Checks, op)
+			}
+		}
+		slices.SortFunc(record.Checks, func(a, b app.Operation) int { return b.CreatedAt.Compare(a.CreatedAt) })
+		records = append(records, record)
+	}
+	slices.SortFunc(records, func(a, b app.RetirementCandidateRecord) int { return cmp.Compare(a.Sequence, b.Sequence) })
+	return records, nil
+}
