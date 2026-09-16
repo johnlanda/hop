@@ -447,10 +447,11 @@ func (s *Store) SettleLaunchFailure(ctx context.Context, incarnation identity.In
 
 // ClaimCheckExec records hop check-exec's durable pre-exec identity: its
 // own pid, which is its process-group id. It fails when the operation is
-// not a pending execution — a check.run check or an integration.merge
-// scratch merge, the two kinds the generalized exec boundary spawns
-// (docs/plan/phase-3-design.md sections 4 and 8) — of the run's current
-// lease generation; a rewrite by the same pid is idempotent. The operation
+// not a pending exec-claimable execution (app.OperationKind.ExecClaimable:
+// a check.run check, an integration.merge scratch merge, or one of the
+// worktree-retirement executions — docs/plan/phase-3-design.md sections 4
+// and 8, docs/plan/phase-3-worktree-retirement.md section 7) of the run's
+// current lease generation; a rewrite by the same pid is idempotent. The operation
 // ID is the only claimed identity, so there is no cross-run tuple to
 // disagree: the owning run, its lease generation and the operation's kind
 // and state all resolve from the persisted operation row, never from
@@ -461,8 +462,8 @@ func (s *Store) ClaimCheckExec(ctx context.Context, opID identity.OperationID, p
 		if err != nil {
 			return err
 		}
-		if (op.Kind != app.OpCheckRun && op.Kind != app.OpIntegrationMerge) || op.State != app.OperationPending {
-			return fmt.Errorf("sqlite: operation %s is %s %q, not a pending check or merge execution", opID, op.State, op.Kind)
+		if !op.Kind.ExecClaimable() || op.State != app.OperationPending {
+			return fmt.Errorf("sqlite: operation %s is %s %q, not a pending exec-claimable execution", opID, op.State, op.Kind)
 		}
 		var generation int64
 		err = tx.QueryRowContext(ctx, `SELECT generation FROM run_leases WHERE run_id = ?`, op.RunID.String()).Scan(&generation)

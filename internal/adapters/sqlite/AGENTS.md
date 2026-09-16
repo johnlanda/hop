@@ -114,8 +114,13 @@ this package never resolves environment variables or defaults.
   existing binding row disables the intent fallback.
   `LaunchClaims().Settle` moves exec_pending to execed or exec_failed only,
   idempotent per target state. `ClaimCheckExec` requires a pending
-  `check.run` OR `integration.merge` operation of the run's current lease
-  generation — the two kinds the generalized exec boundary spawns.
+  operation whose kind `app.OperationKind.ExecClaimable` accepts
+  (`check.run`, `integration.merge`, `retirement.check`,
+  `worktree.retire` — every kind the generalized exec boundary spawns) of
+  the run's current lease generation. `LoadCheckExecutionContext`
+  resolves each kind's frozen argv: the snapshot's check argv, the merge
+  intent's `merge_argv`/`tree_path`, or a worktree-retirement intent's
+  `argv`/`cwd`; a malformed intent fails closed.
 - Stop requests are monotonic: `stop_requested_at` is set once and never
   cleared or moved; `RunStatus.StopRequested` and `RunDetail.StopRequested`
   mirror it for the read model.
@@ -257,6 +262,13 @@ this package never resolves environment variables or defaults.
   [internal/testsupport/storevectors](../../testsupport/storevectors/AGENTS.md)
   vector to the identical refusal internal/app observes against its
   fakes.
+- Worktree-retirement exec kinds (same command):
+  `TestClaimCheckExecRetirementKinds` (both kinds claimed at the current
+  generation, same-pid retry idempotent, another pid, a prior generation
+  and a settled operation refused) and
+  `TestLoadCheckExecutionContextRetirementKinds` (the intent's argv and
+  spawn directory verbatim; missing argv, a non-string element, an empty
+  argv, a missing directory and a non-object intent each fail closed).
 - Migration 004 (same command): `TestMigration004Surface` (the chain's
   latest version, one `schema_migrations` row per migration, the column's
   nullable default-free TEXT shape, NULL for a freshly initialized run) and

@@ -693,12 +693,12 @@ func (s *fakeStore) ClaimCheckExec(_ context.Context, op identity.OperationID, p
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	operation, ok := s.Operations[op]
-	// The real store's Phase 3 contract (design section 3): any pending
-	// exec-claimable operation of the current generation — exactly the
-	// kinds check.run and integration.merge. Publish, reset and fence are
+	// The real store's contract (design section 3, generalized by the
+	// worktree-retirement kinds): any pending exec-claimable operation of
+	// the current generation, decided by the same OperationKind predicate
+	// the real store uses. Publish, reset, fence and every Herdr act are
 	// executed directly by the controller and are never claimable.
-	execClaimable := operation.Kind == app.OpCheckRun || operation.Kind == app.OpIntegrationMerge
-	if !ok || !execClaimable || operation.State != app.OperationPending {
+	if !ok || !operation.Kind.ExecClaimable() || operation.State != app.OperationPending {
 		return fmt.Errorf("app_test: operation %s is not a pending exec-claimable execution; check-exec claim refused", op)
 	}
 	if row, ok := s.Leases[operation.RunID]; !ok || operation.Generation != row.lease.Generation {

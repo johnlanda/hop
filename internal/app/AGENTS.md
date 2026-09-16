@@ -67,6 +67,7 @@ sides together. `cmd/hop` never imports domain or identity types: every
 | [usecase_completion.go](usecase_completion.go) | `EnsureReviewTask`, `EvaluateRunReadiness`, `DriveCompletion`, `CompletionReport`, `resolveGuardHead` | Section 8's guard wiring: the head OBSERVED from the live integration ref (outside any transaction) and accepted only when an integrated row vouches for it as its merge candidate (repeated no-op rows each vouch for the unchanged head; an unvouched head — a rolled-back or unsettled candidate — is no head, failing closed), re-verified inside each guard transaction; the run leaves running ONLY in the transaction that first establishes readiness; completion retirement closes the manager and stragglers with scrollback first; the final transaction RE-VALIDATES readiness (failure returns the run to running) — `Run.Complete` is reachable only through this guard in feature mode |
 | [usecase_featurestop.go](usecase_featurestop.go) | `DriveFeatureStop`, `settleIntegrationForStop`, `finishFeatureStop` | Stop across roles: check and merge groups retired by claim, ref intents retired under the fencing rule BEFORE the integration settles (a landed zombie publish is adopted then rolled back — the ref never rests on an unvalidated candidate in a stopped run), a merging integration interrupts, a published-but-unsettled or check-failed one completes its reset, every owned session closes under the close rule, and stopped is reported only on observed absence of everything owned; a fence or reset that journals reconciling without settling is OUTSTANDING work, and the stopped/failed transaction re-derives quiescence from its own repositories (`assertRunQuiescedLocked`) before committing |
 | [usecase_featureresume.go](usecase_featureresume.go) | `ResumeFeature`, `ResumeFeatureRequest`/`Result`, `FeatureSessionReport`, session dispositions, `coldRelaunchFeatureSession` | Feature-mode resume: takeover by lease CAS, a held stop routed to stop handling before any adoption, integration operations recovered first, EVERY session reconciled under the one corroboration predicate; cold relaunch is authorized per session only through `--confirm-absent <session-id>` — the attestation journaled (`absence.attested`) with both assertions and the recorded/observed server-instance evidence, relaunch requiring positive absence AND `ServerContinuityEstablished`, Claude-only; a manager relaunch creates the SUCCESSOR manager session bound to the same native reference with the predecessor marked terminal in the same transaction, children keeping their historical `parent_session_id`. An exec_failed claim is retired with no process: a child's settles through `settleChildExecFailure` exactly as launch corroboration settles it (a controller that died before corroborating never strands the attempt); the manager's session is only terminated, and the manager-lineage failure cause fails the run on the next retirement pass |
+| [worktreeretirement.go](worktreeretirement.go) | `OpRetirementCheck`, `OpWorktreeRetire`, `OperationKind.ExecClaimable`, `worktreeRetirementExecIntent`, `worktreeRetirementCheckArgv`, `worktreeRetireArgv` | The post-merge worktree retirement operation kinds ([phase-3-worktree-retirement.md](../../docs/plan/phase-3-worktree-retirement.md) section 7) and their frozen exec shapes: `ExecClaimable` is the ONE exec-claimable kind set (`check.run`, `integration.merge`, `retirement.check`, `worktree.retire`) the SQLite store and the fakes both decide by; the intent's `argv`/`cwd` members are the store's documented contract; the detection argv compares two object ids (`merge-base --is-ancestor`) and the removal argv is `git -C <root> -c status.showUntrackedFiles=all worktree remove <path>`, never a force option. No use case drives them yet; "retirement" here is worktree retirement, distinct from usecase_retirement.go's per-attempt session retirement |
 | [usecase_presentation.go](usecase_presentation.go) | `PublishRunPresentation`, `PresentationReport` | Section 9 run-state token publication through `Controller.Presentation`: manager-first ordering, the task/parent/state tokens per role, full-replacement semantics (unset optionals cleared), superseded bindings never published to; rehydration on resume is a fresh full publication |
 
 ## Invariants
@@ -396,8 +397,9 @@ sides together. `cmd/hop` never imports domain or identity types: every
   receipts and moves the same row revisions the real acceptance and stop
   transactions do (`TestWorkerWritesMoveRevisions`), `ClaimLaunch`
   enforces the stop/incarnation-currency/different-pid rules with the
-  pre-binding intent fallback, `ClaimCheckExec` requires a pending check
-  operation of the current generation, and every Runtime, CommandRunner,
+  pre-binding intent fallback, `ClaimCheckExec` requires a pending
+  exec-claimable operation (`OperationKind.ExecClaimable`) of the current
+  generation, and every Runtime, CommandRunner,
   ProcessGroupInspector and ArtifactStore fake refuses any call made while
   a unit of work is open (`TestFakePortsRefuseCallsInsideTransactions`).
   `fakeCommands.Run` also mirrors the real Runner's own argv contract,
@@ -536,6 +538,14 @@ sides together. `cmd/hop` never imports domain or identity types: every
   digests, the crib's exact bytes, the derived integration branch name,
   and its refusal table). cmd/hop's real-binary per-verb contract tests
   are slice 6's and assert the same constants.
+- `go test ./internal/app -run 'TestWorktreeRetirement|TestOperationKindExecClaimable'` —
+  the worktree-retirement exec shapes: both frozen argvs byte for byte (no
+  force option anywhere, an option-shaped path kept positional), the
+  intent's exact JSON members through `decodeOperationPayload`, and the
+  exact exec-claimable kind set over every operation kind;
+  `TestPrepareCheckExec`'s retirement vectors pass each argv through the
+  exec boundary byte-identically and refuse a caller argv with a force
+  option inserted, after the claim.
 - `go test ./internal/app -run 'TestComputeResultDigest|TestDecodeOperationPayload'` —
   the canonical digest vectors (`digest_test.go`) and the persisted-payload
   decode contract (`operation_payload_internal_test.go`, a same-package
