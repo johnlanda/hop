@@ -67,6 +67,10 @@ type WorkflowRepositories interface {
 	// SessionIndex lists a run's sessions in bulk — named apart from
 	// UnitOfWork.Sessions() for the identical reason.
 	SessionIndex() SessionIndexRepository
+	// WorktreeIndex finds a feature attempt's worktree row by its attempt
+	// link — named apart from UnitOfWork.Worktrees() for the identical
+	// reason.
+	WorktreeIndex() WorktreeIndexRepository
 	Messages() MessageRepository
 	Reviews() ReviewRepository
 	Integrations() IntegrationRepository
@@ -207,6 +211,18 @@ type SessionIndexRepository interface {
 	// ByRun returns every session recorded for runID, in no particular
 	// order.
 	ByRun(ctx context.Context, runID identity.RunID) ([]run.Session, error)
+}
+
+// WorktreeIndexRepository looks a worktree row up by the attempt it
+// belongs to. WorktreeRepository.ByRun serves only the solo shape (one
+// unlinked row per run); a feature run holds one linked row per attempt,
+// so the per-attempt worktree.create recovery and launch continuation
+// find their row here.
+type WorktreeIndexRepository interface {
+	// ByAttempt returns the newest worktree row linked to attempt, with its
+	// revision; ErrNotFound when no row names the attempt. An unlinked (solo)
+	// row and a row linked to another attempt never answer.
+	ByAttempt(ctx context.Context, attempt identity.AttemptID) (run.Worktree, int64, error)
 }
 
 // RetryRequestState is a retry request's own small lifecycle.

@@ -56,6 +56,10 @@ func (u *fakeUnitOfWork) AttemptIndex() app.AttemptIndexRepository { return fake
 
 func (u *fakeUnitOfWork) SessionIndex() app.SessionIndexRepository { return fakeSessionIndexRepo{u} }
 
+func (u *fakeUnitOfWork) WorktreeIndex() app.WorktreeIndexRepository {
+	return fakeWorktreeIndexRepo{u}
+}
+
 func (u *fakeUnitOfWork) Messages() app.MessageRepository { return fakeMessageRepo{u} }
 
 func (u *fakeUnitOfWork) Reviews() app.ReviewRepository { return fakeReviewRepo{u} }
@@ -88,6 +92,33 @@ func (u *fakeUnitOfWork) ManagerSession(_ context.Context, runID identity.RunID)
 		return base.value, base.revision, nil
 	}
 	return run.Session{}, 0, fmt.Errorf("%w: no manager session for run %s", app.ErrNotFound, runID)
+}
+
+// --- WorktreeIndex ---
+
+type fakeWorktreeIndexRepo struct{ u *fakeUnitOfWork }
+
+// ByAttempt mirrors the real store's `WHERE attempt_id = ? ORDER BY rowid
+// DESC LIMIT 1`: a row this transaction created is newer than every
+// committed row (the latest creation first), committed rows rank by
+// insertion order (newestAttemptWorktreeLocked), a staged save is read
+// back over its committed row, and an empty attempt — an unlinked row's
+// NULL link — matches nothing.
+func (r fakeWorktreeIndexRepo) ByAttempt(_ context.Context, attempt identity.AttemptID) (run.Worktree, int64, error) {
+	if attempt != "" {
+		for i := len(r.u.worktreeCreated) - 1; i >= 0; i-- {
+			if r.u.worktreeCreated[i].AttemptID == attempt {
+				return r.u.worktreeCreated[i], 1, nil
+			}
+		}
+		if committed, ok := r.u.store.newestAttemptWorktreeLocked(attempt); ok {
+			if staged, saved := r.u.worktrees[committed.ID]; saved {
+				return staged.value, staged.revision, nil
+			}
+			return committed, r.u.store.Worktrees[committed.ID].revision, nil
+		}
+	}
+	return run.Worktree{}, 0, fmt.Errorf("%w: no worktree for attempt %s", app.ErrNotFound, attempt)
 }
 
 // --- TaskDependencies ---

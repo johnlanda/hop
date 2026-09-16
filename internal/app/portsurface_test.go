@@ -63,8 +63,9 @@ func portSurfaceAllowlist() map[string][]string {
 		"TrustSeeder":                    {"SeedWorkspaceTrust"},
 		"UnitOfWork":                     {"Artifacts", "Attempts", "Bindings", "CheckExecClaims", "CheckRequests", "Commit", "LaunchClaims", "Operations", "Results", "Rollback", "Runs", "Sessions", "Tasks", "Transitions", "Worktrees"},
 		"WorkflowReadStore":              {"LoadMessageDetail", "LoadMessagingContext", "LoadSessionLaunchContext"},
-		"WorkflowRepositories":           {"AttemptIndex", "Integrations", "ManagerSession", "Messages", "RetryRequests", "Reviews", "SessionIndex", "TaskDependencies", "TaskIndex"},
+		"WorkflowRepositories":           {"AttemptIndex", "Integrations", "ManagerSession", "Messages", "RetryRequests", "Reviews", "SessionIndex", "TaskDependencies", "TaskIndex", "WorktreeIndex"},
 		"WorkspaceRuntime":               {"CreateWorkspace", "FindWorkspaceByLabel"},
+		"WorktreeIndexRepository":        {"ByAttempt"},
 		"WorktreeRepository":             {"ByRun", "Create", "Get", "Save"},
 		"WorktreeRetirementRepositories": {"MarkWorktreesRetired", "WorktreesForRetirement", "WorktreesRetiredAt"},
 	}

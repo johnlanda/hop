@@ -250,6 +250,40 @@ func TestStoreVectors(t *testing.T) {
 		)
 		assertWorktreeVectorRefused(t, f, vector, app.ErrFenced)
 	})
+
+	t.Run("WorktreeLookupByAttempt", func(t *testing.T) {
+		f := newFeatureFixture(t)
+		task := f.createFeatureTask(t, 8040, 4, run.TaskNeedsRework)
+		for i := range 3 {
+			seedTerminalAttempt(t, f, task, 8041+i, i+1)
+		}
+		rowIDs := [4]identity.WorktreeID{
+			identity.WorktreeID(uid(8045)), identity.WorktreeID(uid(8046)), identity.WorktreeID(uid(8047)), identity.WorktreeID(uid(8048)),
+		}
+		vector := storevectors.WorktreeLookupByAttempt(f.repositoryID(t), f.spec.RunID, rowIDs,
+			identity.AttemptID(uid(8041)), identity.AttemptID(uid(8042)), identity.AttemptID(uid(8043)))
+		for i := range vector.Rows {
+			f.inUOW(t, func(uow app.UnitOfWork) {
+				if _, err := uow.Worktrees().Create(t.Context(), vector.Rows[i]); err != nil {
+					t.Fatalf("Worktrees().Create(row %d): %v", i, err)
+				}
+			})
+		}
+		f.inUOW(t, func(uow app.UnitOfWork) {
+			wf := workflowRepos(t, uow)
+			for attempt, wantPath := range vector.Answers {
+				got, revision, err := wf.WorktreeIndex().ByAttempt(t.Context(), attempt)
+				if err != nil || got.Path != wantPath || got.AttemptID != attempt || got.BaseCommit != storevectors.WorktreeVectorBaseCommit || revision != 1 {
+					t.Errorf("ByAttempt(%s) = %+v rev %d, %v; want the row at %s, revision 1", attempt, got, revision, err, wantPath)
+				}
+			}
+			for _, attempt := range vector.Unanswered {
+				if got, _, err := wf.WorktreeIndex().ByAttempt(t.Context(), attempt); !errors.Is(err, app.ErrNotFound) {
+					t.Errorf("ByAttempt(%q) = %+v, %v; want ErrNotFound", attempt, got, err)
+				}
+			}
+		})
+	})
 }
 
 // assertWorktreeVectorRefused drives one worktree vector through a unit of

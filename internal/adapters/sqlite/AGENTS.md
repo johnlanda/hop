@@ -29,7 +29,7 @@ this package never resolves environment variables or defaults.
 | [migrations/002_launch_claim_seed_evidence.sql](migrations/002_launch_claim_seed_evidence.sql) | — | Adds `launch_claims.seed_evidence` (nullable TEXT): the workspace-trust pre-seeding outcome hop launch records with the claim; evidence only, NULL on pre-migration rows |
 | [migrations/003_manager_workers_messages.sql](migrations/003_manager_workers_messages.sql) | — | The Phase 3 schema (design section 4; its text's "002"): ten new tables (task_dependencies, messages, message_deliveries, message_acks, message_receipts, reviews, review_submissions, integrations, retry_requests, workflow_receipts) with the partial unique acceptance/serialization indexes; additive columns on runs (plan_closed_at), run_snapshots (workflow), worktrees (attempt_id, base_commit) and tasks (kind/seq/title/instructions_path/retry_count/subjects/mailbox_closed_at/created_at, defaults = the solo backfill); STRICT rebuilds of sessions (attempt_id relaxed, parent_session_id, the one-manager partial index), launch_claims (session_id NOT NULL, backfilled from the binding else the historical launch intent) and check_requests (typed subject, old rows re-keyed id=result_id, subject_kind='result') |
 | [migrations/004_run_worktrees_retired.sql](migrations/004_run_worktrees_retired.sql) | — | The post-merge worktree retirement run fact ([phase-3-worktree-retirement.md](../../../docs/plan/phase-3-worktree-retirement.md)): `runs.worktrees_retired_at` (nullable TEXT, no default), NULL on every pre-migration row; an additive ALTER on the ordinary migration path, no rebuild. Nothing reads or writes it yet |
-| [workflow_uow.go](workflow_uow.go) | `unitOfWork` as `app.WorkflowRepositories`: `TaskDependencies`, `TaskIndex`, `AttemptIndex`, `SessionIndex`, `Messages`, `Reviews`, `Integrations`, `RetryRequests`, `ManagerSession` | The Phase 3 controller-transaction repositories on the same fenced unit of work (the additive packaging rule's slice-3 half); controller review-task creation, the store-assigned enqueue sequence, the sorted PendingByAddress mailbox-closure snapshot, the serial integration slot |
+| [workflow_uow.go](workflow_uow.go) | `unitOfWork` as `app.WorkflowRepositories`: `TaskDependencies`, `TaskIndex`, `AttemptIndex`, `SessionIndex`, `WorktreeIndex`, `Messages`, `Reviews`, `Integrations`, `RetryRequests`, `ManagerSession` | The Phase 3 controller-transaction repositories on the same fenced unit of work (the additive packaging rule's slice-3 half); controller review-task creation, the store-assigned enqueue sequence, the sorted PendingByAddress mailbox-closure snapshot, the serial integration slot, and `WorktreeIndex().ByAttempt` (the newest row linked to an attempt, in attemptWorktreePath's order; `app.ErrNotFound` otherwise) |
 | [messaging.go](messaging.go) | `SendMessage`, `FetchNextMessage`, `AckMessage`, `AnswerQuestion`, `insertMessageReceipt`, `acceptedMessageReceipt`, `sendRequestDigest` | The section 7 worker-authority messaging port: request-ID receipts first, the caller session's OWN run and current incarnation re-derived per verb, derived answer destinations, the bundled human-question ack, receipts for every outcome except the deliberately receipt-free empty fetch |
 | [plan.go](plan.go) | `CreateTask`, `RequestRetry`, `ClosePlan`, `insertWorkflowReceipt`, `acceptedWorkflowReceipt`, `requireManagerCaller` | The section 8 worker-authority plan port: manager-only verbs, the retry's successor attempt reserved in the accepting transaction (its outcome carries the task's seq and the attempt number, re-read on a receipt replay), the plan flag set/cleared on runs.plan_closed_at, one authoritative acceptance per (run, verb, request ID) |
 | [review.go](review.go) | `SubmitReview`, `persistVerdictAcceptance`, `reviewerSessionEligible` | The section 8 worker-authority verdict write: SubmitResult's order mirrored, acceptance persisting the review, completing attempt and task, closing the mailbox and committing the controller's reasons-bearing manager notice atomically |
@@ -282,12 +282,16 @@ this package never resolves environment variables or defaults.
   `TestWorktreeFallbackServesOnlyALoneUnlinkedRow`, the run-wide fallback
   serving only the run's lone unlinked row: a lone sibling-linked row, or
   one beside an unlinked row, resolves nothing and the launch is refused;
-  `TestWorktreeRepositoryAttemptLink`, the linked and solo round trips).
+  `TestWorktreeRepositoryAttemptLink`, the linked and solo round trips;
+  `TestWorktreeIndexByAttempt`, the by-attempt lookup reading back a row
+  created in the same unit of work and nothing after a rollback, beside
+  the shared `WorktreeLookupByAttempt` vector).
   The harness's git fake `linkGit` follows the runner's capture contract
   (`runnervectors.ValidateBound` before answering, `BoundCapture` on
-  every answer); `TestLinkGitCaptureContract` runs every shared
-  `CaptureVectors` case through it and pins its own common-directory
-  answer under a negative, a one-byte and an exact bound;
+  every answer, the refuse-if-exists answers included);
+  `TestLinkGitCaptureContract` runs every shared `CaptureVectors` case
+  through it and pins its own common-directory answer under a negative,
+  a one-byte and an exact bound;
   the feature bootstrap (`bootstrap_test.go`:
   `TestInitializeRunFeatureShape` — run, snapshot workflow JSON, a
   reserved attempt-less parentless manager with its assigned native

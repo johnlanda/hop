@@ -158,9 +158,11 @@ func listingMarkers(r *app.RunSummaryView) string {
 	return " (" + strings.Join(markers, ", ") + ")"
 }
 
-// renderRunDetail prints the full detail block: states, the worktree (one
-// line per row for a feature run), binding,
-// claim, pending operations, last submission, artifacts and the last check
+// renderRunDetail prints the full detail block: states, a feature run's
+// retirement target and fact, the worktree (one line per row for a feature
+// run), binding, claim, pending operations (each unresolved feature
+// worktree creation with its human action), last submission, artifacts and
+// the last check
 // execution — including the human's options for an unrepeatable unknown
 // outcome.
 func renderRunDetail(w io.Writer, detail *app.RunDetailView) (int, error) {
@@ -189,6 +191,10 @@ func renderRunDetail(w io.Writer, detail *app.RunDetailView) (int, error) {
 		fmt.Sprintf("  pending ops:   %d", detail.PendingOps),
 		"  last submit:   "+orUnset(detail.LastSubmission),
 	)
+	for _, op := range detail.WorktreeOperations {
+		lines = append(lines, "  worktree op:   "+op.OperationID+" "+orUnset(op.Branch)+" ("+op.State+")",
+			"    action:      "+op.Action)
+	}
 	for _, artifact := range detail.Artifacts {
 		lines = append(lines, "  artifact:      "+artifact)
 	}

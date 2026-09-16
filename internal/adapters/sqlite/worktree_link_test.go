@@ -74,8 +74,11 @@ func (*linkRuntime) ClosePane(context.Context, string) error {
 
 func (*linkRuntime) ServerInstance(context.Context) (string, error) { return linkServerInstance, nil }
 
-// linkGit answers exactly the git invocations worktree provenance runs:
-// every known checkout shares the repository's common directory, and each
+// linkGit answers exactly the git invocations the assignment runs: the
+// refuse-if-exists check of an attempt branch — not symbolic, and absent,
+// the shapes the process adapter's TestGitRefSemanticsThroughRunner pins
+// for a ref no worktree has created — then worktree provenance: every
+// known checkout shares the repository's common directory, and each
 // created worktree's HEAD is the base it was requested at. It follows the
 // real runner's capture contract (runnervectors): a negative output bound
 // is refused before anything answers, and every answer is bounded with its
@@ -110,6 +113,17 @@ func (g linkGit) respond(cmd app.Command) (app.CommandResult, error) {
 	g.runtime.mu.Unlock()
 	var result app.CommandResult
 	switch {
+	case dir == g.repositoryRoot && strings.HasPrefix(args, "symbolic-ref -q refs/heads/hop/"):
+		result = app.CommandResult{ExitCode: 1}
+	case dir == g.repositoryRoot && strings.HasPrefix(args, "rev-parse --verify refs/heads/hop/"):
+		branch := strings.TrimPrefix(args, "rev-parse --verify refs/heads/")
+		g.runtime.mu.Lock()
+		_, exists := g.runtime.bases["/worktrees/feature/"+strings.ReplaceAll(branch, "/", "-")]
+		g.runtime.mu.Unlock()
+		if exists {
+			return app.CommandResult{}, fmt.Errorf("the harness never reads an existing attempt branch %s", branch)
+		}
+		result = app.CommandResult{ExitCode: 128, Stderr: []byte("fatal: Needed a single revision\n")}
 	case args == "rev-parse --path-format=absolute --git-common-dir" && (created || dir == g.repositoryRoot):
 		result = app.CommandResult{Stdout: []byte(g.repositoryRoot + "/.git\n")}
 	case args == "rev-parse HEAD^{commit}" && created:
@@ -495,6 +509,42 @@ func TestWorktreeRepositoryAttemptLink(t *testing.T) {
 	if err := writeDBRow(t, f, `SELECT attempt_id IS NULL, base_commit IS NULL FROM worktrees WHERE id = ?`, solo.ID.String()).Scan(&attemptNull, &baseNull); err != nil || !attemptNull || !baseNull {
 		t.Fatalf("solo row attempt/base NULL = %v/%v, %v; want both NULL", attemptNull, baseNull, err)
 	}
+}
+
+// TestWorktreeIndexByAttempt pins the by-attempt lookup beyond the shared
+// vector (TestStoreVectors/WorktreeLookupByAttempt): a row created earlier
+// in the SAME unit of work answers with revision 1, and a rolled-back
+// creation leaves nothing to answer.
+func TestWorktreeIndexByAttempt(t *testing.T) {
+	f := newFeatureFixture(t)
+	ctx := t.Context()
+	task := f.createFeatureTask(t, 8620, 2, run.TaskActive)
+	f.createWorkerSession(t, task, run.RoleImplementer, 8621)
+	attemptID := identity.AttemptID(uid(8621))
+	repositoryID := f.repositoryID(t)
+
+	rolledBack, err := run.NewAttemptWorktree(identity.WorktreeID(uid(8630)), repositoryID, f.spec.RunID, attemptID, linkHeadOID, "/wt/rolled-back", "hop/r1/t2a1")
+	if err != nil {
+		t.Fatalf("NewAttemptWorktree: %v", err)
+	}
+	uow, err := f.store.Begin(ctx, f.lease)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	if _, err := uow.Worktrees().Create(ctx, rolledBack); err != nil {
+		t.Fatalf("create worktree: %v", err)
+	}
+	if got, revision, err := workflowRepos(t, uow).WorktreeIndex().ByAttempt(ctx, attemptID); err != nil || got != rolledBack || revision != 1 {
+		t.Fatalf("ByAttempt in the creating unit of work = %+v rev %d, %v; want %+v rev 1", got, revision, err, rolledBack)
+	}
+	if err := uow.Rollback(); err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+	f.inUOW(t, func(uow app.UnitOfWork) {
+		if got, _, err := workflowRepos(t, uow).WorktreeIndex().ByAttempt(ctx, attemptID); !errors.Is(err, app.ErrNotFound) {
+			t.Fatalf("ByAttempt after the rollback = %+v, %v; want ErrNotFound", got, err)
+		}
+	})
 }
 
 // launchingClaudeChild reserves an attempt on task and creates a LAUNCHING

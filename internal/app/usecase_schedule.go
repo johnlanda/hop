@@ -184,10 +184,19 @@ type AssignedTask struct {
 
 // AssignmentReport is AssignReadyTasks's result.
 type AssignmentReport struct {
+	// Assigned lists the tasks whose launch reached an opened pane this
+	// pass.
 	Assigned []AssignedTask
 	// SlotsFull is true when a ready task remained but every worker slot
 	// was occupied at the last attempt.
 	SlotsFull bool
+	// Launches lists every attempt launch this pass recovered, and every
+	// fresh assignment whose launch did not reach an opened pane: waiting,
+	// reconciling, settled as a launch failure or refused by a stop.
+	Launches []AttemptLaunchCondition
+	// Blocked names unresolved worktree operations no attempt can be
+	// matched to; HOP never settles them automatically.
+	Blocked []string
 }
 
 // AssignReadyTasks is the section 6 scheduling pass's "assign released
@@ -201,6 +210,17 @@ type AssignmentReport struct {
 // non-terminal, non-manager sessions — the reviewer shares the bound —
 // counted INSIDE each assignment transaction so it can never overshoot
 // even across a takeover.
+//
+// Before assigning, the pass recovers every assigned attempt whose launch
+// a lost or failed act left before its pane.open intent
+// (recoverAttemptLaunches): a settled launch failure frees its slot for
+// this same pass. A launch that does not complete never fails the pass:
+// an act error, an unverifiable or unrelated checkout, a colliding branch,
+// an unwritable assignment artifact or a pane act error is reported in
+// Launches and recovered or settled by a later pass; the error return is
+// reserved for store and lease failures (and the assignment
+// transaction's own refusals). A held stop refusing a dispatch ends the
+// pass with nothing further assigned.
 func (c *Controller) AssignReadyTasks(ctx context.Context, handle RunHandle, opts AssignmentOptions) (AssignmentReport, error) { //nolint:gocritic // hugeParam: RunHandle and AssignmentOptions are per-call DTOs; this runs once per scheduling pass, never a hot loop.
 	if err := validateAssignmentOptions(opts); err != nil {
 		return AssignmentReport{}, err
@@ -220,12 +240,25 @@ func (c *Controller) AssignReadyTasks(ctx context.Context, handle RunHandle, opt
 	}
 	// Refused before any task is reserved: every worktree, provenance
 	// check and pane below would otherwise follow the supplied roots.
-	if err := requireFrozenAssignmentRoots(&opts, &frozen); err != nil {
-		return AssignmentReport{}, err
+	if rootErr := requireFrozenAssignmentRoots(&opts, &frozen); rootErr != nil {
+		return AssignmentReport{}, rootErr
+	}
+	in := &attemptLaunchInputs{
+		frozen: &frozen, hopPath: opts.HOPPath, stateRoot: opts.StateRoot,
+		implementerBase: func(context.Context) (string, error) { return opts.IntegrationHeadCommitOID, nil },
 	}
 	var report AssignmentReport
+	recovered, err := c.recoverAttemptLaunches(ctx, handle, attemptLaunchContinue, in)
+	if err != nil {
+		return report, err
+	}
+	report.Launches = append(report.Launches, recovered.conditions...)
+	report.Blocked = append(report.Blocked, recovered.blocked...)
+	if stopRefused(report.Launches) {
+		return report, nil
+	}
 	for {
-		assigned, full, more, err := c.assignOneReadyTask(ctx, handle, &frozen, opts, maxWorkers)
+		assigned, launch, full, more, err := c.assignOneReadyTask(ctx, handle, in, opts, maxWorkers)
 		if err != nil {
 			return report, err
 		}
@@ -236,30 +269,49 @@ func (c *Controller) AssignReadyTasks(ctx context.Context, handle RunHandle, opt
 		if !more {
 			return report, nil
 		}
+		if launch != nil {
+			report.Launches = append(report.Launches, *launch)
+			if launch.Disposition == AttemptLaunchStopRequested {
+				return report, nil
+			}
+			continue
+		}
 		report.Assigned = append(report.Assigned, assigned)
 	}
 }
 
-// assignOneReadyTask claims and launches at most one ready task. ok is
+// stopRefused reports whether a held stop refused any launch act.
+func stopRefused(launches []AttemptLaunchCondition) bool {
+	for i := range launches {
+		if launches[i].Disposition == AttemptLaunchStopRequested {
+			return true
+		}
+	}
+	return false
+}
+
+// assignOneReadyTask claims and launches at most one ready task. more is
 // false when there is nothing left to assign; full is true when a ready
-// task remains but every slot is occupied.
-func (c *Controller) assignOneReadyTask(ctx context.Context, handle RunHandle, frozen *FrozenRun, opts AssignmentOptions, maxWorkers int) (AssignedTask, bool, bool, error) { //nolint:gocritic // hugeParam: RunHandle and AssignmentOptions are per-call DTOs; called in a bounded loop by AssignReadyTasks.
+// task remains but every slot is occupied. launch is non-nil when the
+// claimed task's launch did not reach an opened pane.
+func (c *Controller) assignOneReadyTask(ctx context.Context, handle RunHandle, in *attemptLaunchInputs, opts AssignmentOptions, maxWorkers int) (AssignedTask, *AttemptLaunchCondition, bool, bool, error) { //nolint:gocritic // hugeParam: RunHandle and AssignmentOptions are per-call DTOs; called in a bounded loop by AssignReadyTasks.
 	now := c.Clock.Now()
+	frozen := in.frozen
 	var (
-		full          bool
-		task          run.Task
-		attempt       run.Attempt
-		attemptExists bool
-		manager       run.Session
-		role          run.Role
-		baseCommitOID string
-		harness       run.Harness
-		sessionID     identity.SessionID
-		worktreeID    identity.WorktreeID
-		incarnationID identity.IncarnationID
-		runSeq        int
-		prior         *priorAttemptFeedback
-		reviewBaseOID string
+		full            bool
+		task            run.Task
+		attempt         run.Attempt
+		attemptExists   bool
+		manager         run.Session
+		role            run.Role
+		harness         run.Harness
+		sessionID       identity.SessionID
+		launchedSession run.Session
+		worktreeID      identity.WorktreeID
+		incarnationID   identity.IncarnationID
+		runSeq          int
+		prior           *priorAttemptFeedback
+		reviewBaseOID   string
 	)
 
 	txErr := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
@@ -284,6 +336,13 @@ func (c *Controller) assignOneReadyTask(ctx context.Context, handle RunHandle, f
 		}
 		if r.StopRequested {
 			return fmt.Errorf("%w: run %s", ErrStopRequested, handle.runID)
+		}
+		// Nothing is assigned into a run that carries a terminal-failure
+		// cause, including one a launch settlement earlier in this pass
+		// created: the run can only fail from here.
+		failing, err := featureFailureCauseLocked(ctx, uow, wf, handle.runID)
+		if err != nil || failing {
+			return err
 		}
 
 		occupied, err := countOccupiedChildSessions(ctx, wf, handle.runID)
@@ -342,11 +401,9 @@ func (c *Controller) assignOneReadyTask(ctx context.Context, handle RunHandle, f
 		}
 
 		role = run.RoleImplementer
-		baseCommitOID = opts.IntegrationHeadCommitOID
 		harness = opts.Harness
 		if task.Kind == run.TaskKindReview {
 			role = run.RoleReviewer
-			baseCommitOID = task.SubjectCommitOID
 			harness = opts.ReviewerHarness
 			if harness == "" {
 				harness = opts.Harness
@@ -463,7 +520,7 @@ func (c *Controller) assignOneReadyTask(ctx context.Context, handle RunHandle, f
 		if _, createErr := uow.Sessions().Create(ctx, child); createErr != nil {
 			return createErr
 		}
-		launchedSession, err := child.Launch(now)
+		launchedSession, err = child.Launch(now)
 		if err != nil {
 			return err
 		}
@@ -481,31 +538,32 @@ func (c *Controller) assignOneReadyTask(ctx context.Context, handle RunHandle, f
 		return recordTransition(ctx, uow, EntitySession, sessionID.String(), string(run.SessionReserved), string(launchedSession.State), "delegated by manager", generation, now)
 	})
 	if txErr != nil {
-		return AssignedTask{}, false, false, txErr
+		return AssignedTask{}, nil, false, false, txErr
 	}
 	if full || task.ID == "" {
-		return AssignedTask{}, full, false, nil
+		return AssignedTask{}, nil, full, false, nil
 	}
 
-	branch := fmt.Sprintf("hop/r%d/t%da%d", runSeq, task.Seq, attempt.Number)
-	worktreeInfo, err := c.createAttemptWorktree(ctx, handle, worktreeID, attempt.ID, opts.RepositoryRoot, branch, baseCommitOID, now)
+	// The launch after the commit: the branch refuse-if-exists check, the
+	// worktree, then the per-attempt assignment artifact — written after
+	// the worktree and before the pane opens, since the launch prompt
+	// references it by the same derived path and the worker reads it the
+	// moment it starts — with the facts this transaction gathered.
+	target := attemptLaunchTarget{
+		runSeq: runSeq, task: task, attempt: attempt, session: launchedSession,
+		facts: &attemptAssignmentFacts{prior: prior, reviewBase: reviewBaseOID},
+	}
+	launch, worktreeInfo, err := c.launchAttempt(ctx, handle, in, &target, worktreeID, incarnationID)
 	if err != nil {
-		return AssignedTask{}, false, false, err
+		return AssignedTask{}, nil, false, false, err
 	}
-	// The per-attempt assignment artifact is written after the worktree
-	// and before the pane opens: the launch prompt references it by the
-	// same derived path, and the worker reads it the moment it starts.
-	if err := c.writeAttemptAssignment(ctx, frozen, &task, &attempt, role, opts.HOPPath, prior, reviewBaseOID); err != nil {
-		return AssignedTask{}, false, false, err
+	if launch.Disposition != AttemptLaunchOpened {
+		return AssignedTask{}, &launch, false, true, nil
 	}
-	if err := c.openChildPane(ctx, handle, task.ID, attempt.ID, sessionID, incarnationID, role, worktreeInfo, opts.HOPPath, opts.StateRoot, now); err != nil {
-		return AssignedTask{}, false, false, err
-	}
-
 	return AssignedTask{
 		TaskID: task.ID, AttemptID: attempt.ID, AttemptNumber: attempt.Number,
 		SessionID: sessionID, Role: role, WorktreeInfo: worktreeInfo,
-	}, false, true, nil
+	}, nil, false, true, nil
 }
 
 // collectPriorAttemptFeedback assembles a retry attempt's prior-attempt
@@ -647,7 +705,9 @@ func countOccupiedChildSessions(ctx context.Context, wf WorkflowRepositories, ru
 // attemptWorktreeCreateIntent is the OpWorktreeCreate operation's intent
 // payload for a per-attempt worktree: the Phase 2 shape
 // (worktreeCreateIntent) plus the attempt it belongs to, since Phase 3
-// creates one worktree per attempt rather than one per run. Declared
+// creates one worktree per attempt rather than one per run, and the
+// creation label the request carried (the operation ID, design section 6;
+// empty on an intent journaled before labels were sent). Declared
 // separately from worktreeCreateIntent (usecase_run.go, the Phase 2 solo
 // flow) so that flow's recovery payload shape is untouched.
 type attemptWorktreeCreateIntent struct {
@@ -655,35 +715,58 @@ type attemptWorktreeCreateIntent struct {
 	Branch         string             `json:"branch"`
 	BaseRef        string             `json:"base_ref"`
 	AttemptID      identity.AttemptID `json:"attempt_id"`
+	Label          string             `json:"label,omitempty"`
+}
+
+// attemptWorktreeResult is createAttemptWorktree's result: what Herdr
+// created, the operation's disposition, and the refusal when the dispatch
+// revalidation refused it.
+type attemptWorktreeResult struct {
+	info    WorktreeInfo
+	outcome attemptWorktreeOutcome
+	refusal dispatchRefusal
 }
 
 // createAttemptWorktree drives the OpWorktreeCreate operation for one
-// attempt's fresh worktree: record-intent, act (Runtime.CreateWorktree),
-// record-outcome, mirroring StartRun's createWorktree but carrying the
-// owning attempt in its own intent shape (attemptWorktreeCreateIntent)
-// rather than reusing the Phase 2 solo-flow's worktreeCreateIntent.
-func (c *Controller) createAttemptWorktree(ctx context.Context, handle RunHandle, worktreeID identity.WorktreeID, attemptID identity.AttemptID, repositoryRoot, branch, baseOID string, now time.Time) (WorktreeInfo, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per task assignment.
+// attempt's fresh worktree: record-intent, act (Runtime.CreateWorktree,
+// labeled with the operation ID), record-outcome, mirroring StartRun's
+// createWorktree but carrying the owning attempt in its own intent shape
+// (attemptWorktreeCreateIntent). The returned error is reserved for store
+// and lease failures; every other disposition is the outcome: a held stop
+// or a terminal-failure cause refusing the dispatch records the operation
+// failed as never dispatched (revalidateChildDispatch), an act error or an
+// absent or unverifiable checkout leaves the operation reconciling — the
+// act's response recorded as evidence, so a later adoption knows its
+// workspace — and an unrelated checkout settles it failed.
+func (c *Controller) createAttemptWorktree(ctx context.Context, handle RunHandle, worktreeID identity.WorktreeID, attemptID identity.AttemptID, repositoryRoot, branch, baseOID string, now time.Time) (attemptWorktreeResult, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per task assignment.
 	opID, err := c.newOperationID()
 	if err != nil {
-		return WorktreeInfo{}, err
+		return attemptWorktreeResult{}, err
 	}
-	intent := attemptWorktreeCreateIntent{RepositoryRoot: repositoryRoot, Branch: branch, BaseRef: baseOID, AttemptID: attemptID}
-	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+	label := opID.String()
+	intent := attemptWorktreeCreateIntent{RepositoryRoot: repositoryRoot, Branch: branch, BaseRef: baseOID, AttemptID: attemptID, Label: label}
+	if recordErr := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 		return uow.Operations().Create(ctx, Operation{
 			ID: opID, RunID: handle.runID, Generation: handle.lease.Generation,
 			Kind: OpWorktreeCreate, State: OperationPending, Intent: intent,
 			CreatedAt: now, UpdatedAt: now,
 		})
-	}); err != nil {
-		return WorktreeInfo{}, fmt.Errorf("app: record worktree.create intent: %w", err)
+	}); recordErr != nil {
+		return attemptWorktreeResult{}, fmt.Errorf("app: record worktree.create intent: %w", recordErr)
 	}
 
-	if err := c.revalidateForDispatch(ctx, handle, false); err != nil {
-		return WorktreeInfo{}, fmt.Errorf("app: revalidate before worktree.create: %w", err)
+	refusal, err := c.revalidateChildDispatch(ctx, handle, opID, func(detail string) any {
+		return attemptWorktreeCondition{Condition: worktreeConditionRefused, Cause: detail}
+	})
+	if err != nil {
+		return attemptWorktreeResult{}, fmt.Errorf("app: revalidate before worktree.create: %w", err)
+	}
+	if refusal.disposition != "" {
+		return attemptWorktreeResult{outcome: attemptWorktreeRefused, refusal: refusal}, nil
 	}
 	actCtx, release := handle.actContext(ctx)
 	info, actErr := c.Runtime.CreateWorktree(actCtx, WorktreeRequest{
-		RepositoryRoot: repositoryRoot, Branch: branch, BaseRef: baseOID,
+		RepositoryRoot: repositoryRoot, Branch: branch, BaseRef: baseOID, Label: label,
 	})
 	provenance := worktreeAmbiguous
 	provenanceDetail := ""
@@ -692,6 +775,7 @@ func (c *Controller) createAttemptWorktree(ctx context.Context, handle RunHandle
 	}
 	release()
 
+	outcome := attemptWorktreeUnresolved
 	outcomeErr := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 		op, getErr := uow.Operations().Get(ctx, opID)
 		if getErr != nil {
@@ -701,7 +785,7 @@ func (c *Controller) createAttemptWorktree(ctx context.Context, handle RunHandle
 		switch {
 		case actErr != nil:
 			op.State = OperationReconciling
-			op.Outcome = actErr.Error()
+			op.Outcome = attemptWorktreeCondition{Condition: worktreeConditionActError, Cause: actErr.Error()}
 			return uow.Operations().Save(ctx, op)
 		case provenance == worktreeValid:
 			r, _, runErr := uow.Runs().Get(ctx, handle.runID)
@@ -720,47 +804,39 @@ func (c *Controller) createAttemptWorktree(ctx context.Context, handle RunHandle
 			}
 			op.State = OperationSucceeded
 			op.ActEvidence = worktreeCreateOutcome{Info: info, BaseCommit: baseOID}
+			outcome = attemptWorktreeCreated
 			return uow.Operations().Save(ctx, op)
 		case provenance == worktreeUnrelated:
 			op.State = OperationFailed
-			op.Outcome = provenanceDetail
+			op.Outcome = attemptWorktreeCondition{Condition: worktreeConditionUnrelated, Cause: provenanceDetail}
+			outcome = attemptWorktreeFailed
 			return uow.Operations().Save(ctx, op)
 		default:
 			op.State = OperationReconciling
-			op.Outcome = provenanceDetail
+			op.ActEvidence = worktreeCreateOutcome{Info: info, BaseCommit: baseOID}
+			op.Outcome = attemptWorktreeCondition{Condition: worktreeConditionUnverified, Cause: provenanceDetail}
 			return uow.Operations().Save(ctx, op)
 		}
 	})
-	var resultErr error
-	switch {
-	case actErr != nil:
-		resultErr = fmt.Errorf("app: worktree.create: %w (operation %s is reconciling)", actErr, opID)
-	case provenance == worktreeUnrelated:
-		resultErr = fmt.Errorf("app: worktree.create provenance: %s", provenanceDetail)
-	case provenance != worktreeValid:
-		resultErr = fmt.Errorf("app: worktree.create provenance ambiguous: %s (operation %s is reconciling)", provenanceDetail, opID)
+	if outcomeErr != nil {
+		return attemptWorktreeResult{}, fmt.Errorf("app: record worktree.create outcome: %w", outcomeErr)
 	}
-	switch {
-	case resultErr != nil && outcomeErr != nil:
-		return WorktreeInfo{}, fmt.Errorf("%w; recording the outcome also failed: %w", resultErr, outcomeErr)
-	case outcomeErr != nil:
-		return WorktreeInfo{}, fmt.Errorf("app: record worktree.create outcome: %w", outcomeErr)
-	case resultErr != nil:
-		return WorktreeInfo{}, resultErr
-	}
-	return info, nil
+	return attemptWorktreeResult{info: info, outcome: outcome}, nil
 }
 
-// childPaneOpenIntent is the OpPaneOpen operation's intent payload for a
-// delegated (implementer/reviewer) session's pane: the Phase 2 shape
+// openChildPane drives the OpPaneOpen operation for a delegated
+// (implementer/reviewer) session's pane: the Phase 2 intent shape
 // (paneOpenIntent) already carries IncarnationID/SessionID, which is all
-// SubmissionStore.ClaimLaunch's pre-binding fallback needs; declared here
-// only to keep this file self-contained from usecase_run.go's Phase 2
-// solo-flow intent construction.
-func (c *Controller) openChildPane(ctx context.Context, handle RunHandle, taskID identity.TaskID, attemptID identity.AttemptID, sessionID identity.SessionID, incarnationID identity.IncarnationID, role run.Role, worktree WorktreeInfo, hopPath, stateRoot string, now time.Time) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per task assignment.
+// SubmissionStore.ClaimLaunch's pre-binding fallback needs. The returned
+// error is reserved for store and lease failures: a held stop or a
+// terminal-failure cause refusing the dispatch records the operation
+// failed as never dispatched (revalidateChildDispatch), and an act error
+// with no pane answering for the label leaves the operation reconciling,
+// which launch corroboration recovers by label and deadline.
+func (c *Controller) openChildPane(ctx context.Context, handle RunHandle, taskID identity.TaskID, attemptID identity.AttemptID, sessionID identity.SessionID, incarnationID identity.IncarnationID, role run.Role, worktree WorktreeInfo, hopPath, stateRoot string, now time.Time) (paneOpenOutcome, dispatchRefusal, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per task assignment.
 	opID, err := c.newOperationID()
 	if err != nil {
-		return err
+		return 0, dispatchRefusal{}, err
 	}
 	argv := []string{hopPath, "launch", "--run", handle.runID.String(), "--session", sessionID.String()}
 	env := map[string]string{
@@ -775,18 +851,24 @@ func (c *Controller) openChildPane(ctx context.Context, handle RunHandle, taskID
 	serverInstance := c.observeServerInstance(ctx)
 	intent := paneOpenIntent{Command: argv, Cwd: worktree.Path, WorkspaceID: worktree.WorkspaceID, Label: opID.String(), IncarnationID: incarnationID, SessionID: sessionID, ServerInstance: serverInstance}
 
-	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+	if recordErr := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 		return uow.Operations().Create(ctx, Operation{
 			ID: opID, RunID: handle.runID, Generation: handle.lease.Generation,
 			Kind: OpPaneOpen, State: OperationPending, Intent: intent,
 			CreatedAt: now, UpdatedAt: now,
 		})
-	}); err != nil {
-		return fmt.Errorf("app: record pane.open intent: %w", err)
+	}); recordErr != nil {
+		return 0, dispatchRefusal{}, fmt.Errorf("app: record pane.open intent: %w", recordErr)
 	}
 
-	if err := c.revalidateForDispatch(ctx, handle, false); err != nil {
-		return fmt.Errorf("app: revalidate before pane.open: %w", err)
+	refusal, err := c.revalidateChildDispatch(ctx, handle, opID, func(detail string) any {
+		return paneOpenRefusalOutcome{RefusedBeforeDispatch: true, Reason: detail}
+	})
+	if err != nil {
+		return 0, dispatchRefusal{}, fmt.Errorf("app: revalidate before pane.open: %w", err)
+	}
+	if refusal.disposition != "" {
+		return paneOpenRefused, refusal, nil
 	}
 	actCtx, release := handle.actContext(ctx)
 	paneHandle, actErr := c.Runtime.OpenWorkerPane(actCtx, WorkerPaneRequest{
@@ -820,10 +902,10 @@ func (c *Controller) openChildPane(ctx context.Context, handle RunHandle, taskID
 		return uow.Operations().Save(ctx, op)
 	})
 	if outcomeErr != nil {
-		return fmt.Errorf("app: record pane.open outcome: %w", outcomeErr)
+		return 0, dispatchRefusal{}, fmt.Errorf("app: record pane.open outcome: %w", outcomeErr)
 	}
 	if actErr != nil {
-		return fmt.Errorf("app: pane.open: %w (operation %s is reconciling)", actErr, opID)
+		return paneOpenUnresolved, dispatchRefusal{}, nil
 	}
-	return nil
+	return paneOpened, dispatchRefusal{}, nil
 }

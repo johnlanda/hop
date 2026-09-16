@@ -42,6 +42,11 @@ const (
 	SessionRetiredNoProcess = "retired-no-process"
 	// SessionRelaunchUnsupported: cold resume is Claude-only.
 	SessionRelaunchUnsupported = "relaunch-unsupported"
+	// SessionLaunchSuppressed: an assigned child whose launch never reached
+	// a pane, with no worktree work unresolved, in a run carrying a
+	// terminal-failure cause: nothing is launched for it, and the
+	// controller loop's failure cleanup retires it.
+	SessionLaunchSuppressed = "launch-suppressed"
 )
 
 // FeatureSessionReport is one session's reconciliation disposition.
@@ -54,7 +59,9 @@ type FeatureSessionReport struct {
 
 // ResumeFeatureResult is one ResumeFeature round's outcome.
 type ResumeFeatureResult struct {
-	// Outcome: "resumed" (every session warm or terminal), "reconciling",
+	// Outcome: "resumed" (every session warm or terminal, its launch in
+	// flight, or launch-suppressed for the loop's failure cleanup),
+	// "reconciling",
 	// "stop-pending" (a held stop routes to stop handling before any
 	// adoption or new dispatch) or "nothing-to-do" (a terminal run).
 	Outcome  string
@@ -150,6 +157,20 @@ func (c *Controller) ResumeFeature(ctx context.Context, req ResumeFeatureRequest
 		result.Blocked = append(result.Blocked, bootstrap.Blocked)
 	}
 
+	// Assigned attempts whose launch the lost controller left before its
+	// pane.open intent are recovered next, before any session is
+	// reconciled: adopted or re-driven and launched, or settled as launch
+	// failures (resolve-only while a terminal-failure cause stands).
+	launches, err := c.resumeAttemptLaunches(ctx, handle, &frozen, &req)
+	if err != nil {
+		return result, handle, err
+	}
+	result.Blocked = append(result.Blocked, launches.blocked...)
+	if stopRefused(launches.conditions) {
+		result.Outcome = "stop-pending"
+		return result, handle, nil
+	}
+
 	sessions, err := c.featureRunSessions(ctx, handle)
 	if err != nil {
 		return result, handle, err
@@ -160,12 +181,27 @@ func (c *Controller) ResumeFeature(ctx context.Context, req ResumeFeatureRequest
 		if reconErr != nil {
 			return result, handle, reconErr
 		}
+		switch condition, unresolved := launches.unresolved[sessions[i].ID]; {
+		case report.Disposition != SessionPending:
+		case launches.retirable[sessions[i].ID]:
+			// No pane was ever requested for it and none can be: the run
+			// goes back to running so the controller loop's retirement pass
+			// — which reads the failure cause there — retires it and fails
+			// the run.
+			report.Disposition = SessionLaunchSuppressed
+			report.Detail = "its launch never reached a pane and the run carries a terminal-failure cause; the controller loop's failure cleanup retires it"
+		case unresolved:
+			report.Detail = "attempt launch unresolved: " + condition.Detail
+		}
 		result.Sessions = append(result.Sessions, report)
-		// A manager whose launch is in flight reports pending under the one
-		// predicate; its settlement belongs to the loop's corroboration, so
-		// it does not hold the run in reconciliation.
-		launchInFlight := bootstrap.ManagerLaunching && report.SessionID == bootstrap.ManagerSessionID.String() && report.Disposition == SessionPending
-		if report.Disposition != SessionWarm && report.Disposition != SessionRelaunched && report.Disposition != SessionRetiredNoProcess && !launchInFlight {
+		// A launch in flight — the manager's, or a child's whose pane this
+		// round opened — reports pending under the one predicate; its
+		// settlement belongs to the loop's corroboration, so it does not
+		// hold the run in reconciliation.
+		launchInFlight := report.Disposition == SessionPending &&
+			((bootstrap.ManagerLaunching && report.SessionID == bootstrap.ManagerSessionID.String()) || launches.opened[sessions[i].ID])
+		if report.Disposition != SessionWarm && report.Disposition != SessionRelaunched && report.Disposition != SessionRetiredNoProcess &&
+			report.Disposition != SessionLaunchSuppressed && !launchInFlight {
 			allSettled = false
 		}
 	}
@@ -184,6 +220,63 @@ func (c *Controller) ResumeFeature(ctx context.Context, req ResumeFeatureRequest
 	result.Outcome = "reconciling"
 	result.RunState = string(run.RunResuming)
 	return result, handle, nil
+}
+
+// resumeAttemptLaunches runs the per-attempt launch recovery for a resume
+// round: continue mode, or resolve-only while the run carries a durable
+// terminal-failure cause (nothing new is launched into a failing run).
+// Once a cause stands after the round — at entry, or created by the
+// round's own settlements — every unplaced launch whose worktree work is
+// resolved is marked retirable, unless a launch or worktree intent is
+// unattributable.
+func (c *Controller) resumeAttemptLaunches(ctx context.Context, handle RunHandle, frozen *FrozenRun, req *ResumeFeatureRequest) (attemptLaunchRound, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per resume round.
+	mode := attemptLaunchContinue
+	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		wf, err := RequireWorkflowRepositories(uow, "ResumeFeature")
+		if err != nil {
+			return err
+		}
+		failing, err := featureFailureCauseLocked(ctx, uow, wf, handle.runID)
+		if failing {
+			mode = attemptLaunchResolveOnly
+		}
+		return err
+	}); err != nil {
+		return attemptLaunchRound{}, err
+	}
+	stateRoot := req.StateRoot
+	if stateRoot == "" {
+		stateRoot = frozen.Snapshot.StateRoot
+	}
+	round, err := c.recoverAttemptLaunches(ctx, handle, mode, &attemptLaunchInputs{
+		frozen: frozen, hopPath: req.HOPPath, stateRoot: stateRoot,
+		implementerBase: func(ctx context.Context) (string, error) { return c.ResolveIntegrationHead(ctx, handle) },
+	})
+	if err != nil || len(round.blocked) > 0 {
+		return round, err
+	}
+	failing := false
+	if readErr := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		wf, wfErr := RequireWorkflowRepositories(uow, "ResumeFeature")
+		if wfErr != nil {
+			return wfErr
+		}
+		var causeErr error
+		failing, causeErr = featureFailureCauseLocked(ctx, uow, wf, handle.runID)
+		return causeErr
+	}); readErr != nil || !failing {
+		return round, readErr
+	}
+	targets, launchBlocked, err := c.unresolvedAttemptLaunches(ctx, handle)
+	if err != nil || launchBlocked != "" {
+		return round, err
+	}
+	for i := range targets {
+		if round.pending[targets[i].attempt.ID] == "" {
+			round.retirable[targets[i].session.ID] = true
+		}
+	}
+	return round, nil
 }
 
 // enterFeatureResuming moves the run into resuming (idempotently for an

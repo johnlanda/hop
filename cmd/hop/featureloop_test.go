@@ -514,3 +514,78 @@ func TestFeatureLoopManagerExecFailure(t *testing.T) {
 		t.Errorf("stdout = %q, want %q", got, want)
 	}
 }
+
+// TestFeatureLoopKeepsRunningOverUnresolvedLaunches proves an attempt
+// launch the pass could not complete — a worktree act error, a stop
+// refusing a dispatch, an unattributable worktree operation — never ends
+// the loop: each is printed as the app's fixed-text line, the next tick
+// runs the pass again (where the app recovers the launch), and only a
+// genuine error from AssignReadyTasks still ends the loop.
+func TestFeatureLoopKeepsRunningOverUnresolvedLaunches(t *testing.T) {
+	t.Run("reported launches are printed and later passes continue", func(t *testing.T) {
+		ctrl := &fakeController{runState: runStateRunning}
+		td := newTestDeps(ctrl, map[string]string{"PATH": "/bin"}, t.TempDir())
+		passes := 0
+		ctrl.status = func(app.StatusRequest) (app.StatusResult, error) {
+			if passes >= 3 {
+				ctrl.setRunState("completed")
+			}
+			return detailStep(ctrl.currentRunState(), "", false), nil
+		}
+		ctrl.assignReadyTasks = func(app.AssignmentOptions) (app.AssignmentReport, error) {
+			passes++
+			switch passes {
+			case 1:
+				return app.AssignmentReport{
+					Launches: []app.AttemptLaunchCondition{{TaskSeq: 1, AttemptNumber: 1, Disposition: app.AttemptLaunchReconciling, Detail: "worktree creation did not complete"}},
+					Blocked:  []string{"operation x names no attempt"},
+				}, nil
+			case 2:
+				return app.AssignmentReport{Launches: []app.AttemptLaunchCondition{
+					{TaskSeq: 1, AttemptNumber: 1, Disposition: app.AttemptLaunchOpened, Detail: "the attempt's pane was opened"},
+					{TaskSeq: 2, AttemptNumber: 1, Disposition: app.AttemptLaunchStopRequested, Detail: "a stop request refused the worktree creation"},
+				}}, nil
+			default:
+				return app.AssignmentReport{}, nil
+			}
+		}
+		var stdout bytes.Buffer
+
+		result, err := runFeatureControllerLoop(context.Background(), td.deps, ctrl, app.RunHandle{}, testRunID, "r1", "/opt/hop/bin/hop", &stdout)
+		if err != nil {
+			t.Fatalf("runFeatureControllerLoop: %v", err)
+		}
+		if result.FinalState != "completed" || passes != 3 {
+			t.Fatalf("result = %+v after %d passes, want completed after 3", result, passes)
+		}
+		want := "run r1 running\n" +
+			"attempt t1a1 reconciling: worktree creation did not complete\n" +
+			"worktree blocked: operation x names no attempt\n" +
+			"attempt t1a1 opened: the attempt's pane was opened\n" +
+			"attempt t2a1 stop-requested: a stop request refused the worktree creation\n" +
+			"run r1 completed\n"
+		if got := stdout.String(); got != want {
+			t.Errorf("stdout = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("a store or lease error from assignment still ends the loop, after the report lines", func(t *testing.T) {
+		ctrl := &fakeController{runState: runStateRunning}
+		td := newTestDeps(ctrl, map[string]string{"PATH": "/bin"}, t.TempDir())
+		ctrl.status = statusFromFakeRunState(ctrl)
+		ctrl.assignReadyTasks = func(app.AssignmentOptions) (app.AssignmentReport, error) {
+			return app.AssignmentReport{
+				Launches: []app.AttemptLaunchCondition{{TaskSeq: 1, AttemptNumber: 1, Disposition: app.AttemptLaunchSettled, Detail: "worktree creation failed"}},
+			}, errors.New("app: lease fenced")
+		}
+		var stdout bytes.Buffer
+
+		_, err := runFeatureControllerLoop(context.Background(), td.deps, ctrl, app.RunHandle{}, testRunID, "r1", "/opt/hop/bin/hop", &stdout)
+		if err == nil || !strings.Contains(err.Error(), "assign ready tasks: app: lease fenced") {
+			t.Fatalf("err = %v, want the assignment error", err)
+		}
+		if got := stdout.String(); got != "run r1 running\nattempt t1a1 settled: worktree creation failed\n" {
+			t.Errorf("stdout = %q", got)
+		}
+	})
+}
