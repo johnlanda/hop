@@ -19,6 +19,7 @@ shared vector catches, since both sides run the same input.
 | File | Entities / functions | Responsibility |
 | --- | --- | --- |
 | [storevectors.go](storevectors.go) | `TaskCreateSelfDependency`, `TaskCreateRequestIDConflictFirst`/`Second`, `TaskCreateNonManagerCaller`, `TaskCreateOversizedTitle`, `AckMessageStaleIncarnation`, `MessageSendAnswerUnknownQuestion`, `MessageSendCrossRun`, `MessageFetchCrossRun`, `AckMessageCrossRun`, `ReviewSubmitForeignReviewer` | Ten vectors: a malformed dependency graph, a reused request-ID with conflicting content, a non-manager caller, an oversized title, a stale acking incarnation, an answer replying to an unknown question, a send/fetch/ack from a session belonging to a DIFFERENT run than the request claims, and a review submission from a live reviewer that is not the claimed attempt's own (another run's reviewer, or another review attempt's — both fixture shapes share the one vector) — one function per vector, each returning the exact `app.TaskCreate`/`app.MessageAck`/`app.MessageSend`/`app.MessageFetch`/`app.ReviewSubmission` value to pass to the port method its doc comment names |
+| [storevectors.go](storevectors.go) | `WorkspaceRequestVector`, `WorkspaceRequestsRefused` | The `app.WorkspaceRuntime.CreateWorkspace` argument contract: an empty cwd, a relative cwd and an empty creation label, each refused with nothing sent — driven against the herdr adapter (`TestRuntimeCreateWorkspaceRefusesInvalidRequests`) and internal/app's fake runtime (`TestFakeFeatureBootstrapContracts`) |
 | [storevectors.go](storevectors.go) | `FeatureRunSpecWithTask`, `FeatureRunSpecWithAttempt`, `FeatureRunSpecWithWorktree`, `FeatureRunSpecWithoutManager`, `FeatureRunSpecSequenceMismatch` | Five feature-bootstrap vectors: each bends the caller's VALID feature-mode `app.NewRunSpec` into one refused shape — a solo bootstrap identity (task, attempt, worktree), a missing manager session (all `app.ErrFeatureRunSpecInvalid`), or an integration branch naming the wrong sequence (`app.ErrRunSequenceMismatch`) — refused by `InitializeRun` with nothing committed |
 
 ## Invariants
@@ -80,7 +81,9 @@ shared vector catches, since both sides run the same input.
 ## Related guides
 
 - [Parent index](../AGENTS.md)
-- [internal/app](../../app/AGENTS.md) and
-  [internal/adapters/sqlite](../../adapters/sqlite/AGENTS.md): the two
-  consumers, each driving the identical vectors against its own store.
+- [internal/app](../../app/AGENTS.md),
+  [internal/adapters/sqlite](../../adapters/sqlite/AGENTS.md) and
+  [internal/adapters/herdr](../../adapters/herdr/AGENTS.md): the
+  consumers, each driving the identical vectors against its own
+  implementation.
 - [Architecture and package catalog](../../../docs/architecture/architecture.md)

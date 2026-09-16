@@ -235,3 +235,22 @@ func FeatureRunSpecSequenceMismatch(valid app.NewRunSpec, assignedSeq int) app.N
 	valid.Snapshot.Workflow.IntegrationBranch = app.IntegrationBranchName(assignedSeq + 1)
 	return valid
 }
+
+// WorkspaceRequestVector is one CreateWorkspace request the herdr adapter
+// and internal/app's fake runtime both refuse before any request is sent.
+type WorkspaceRequestVector struct {
+	Name    string
+	Request app.WorkspaceRequest
+}
+
+// WorkspaceRequestsRefused returns the app.WorkspaceRuntime.CreateWorkspace
+// argument-contract vectors: an empty cwd, a relative cwd and an empty
+// creation label (recovery by label would be impossible). Both
+// implementations refuse each with an error and send nothing.
+func WorkspaceRequestsRefused() []WorkspaceRequestVector {
+	return []WorkspaceRequestVector{
+		{Name: "empty cwd", Request: app.WorkspaceRequest{Cwd: "", Label: "op-1"}},
+		{Name: "relative cwd", Request: app.WorkspaceRequest{Cwd: "repo", Label: "op-1"}},
+		{Name: "empty label", Request: app.WorkspaceRequest{Cwd: "/repo", Label: ""}},
+	}
+}

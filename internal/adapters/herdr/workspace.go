@@ -2,12 +2,24 @@ package herdr
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"path/filepath"
 
 	"github.com/johnlanda/hop/internal/app"
 )
 
 var _ app.WorkspaceRuntime = (*Runtime)(nil)
+
+// ErrWorkspaceCwdNotAbsolute and ErrWorkspaceLabelRequired are
+// CreateWorkspace's argument refusals, returned before any request is
+// sent: the manager's workspace is placed at an explicit absolute cwd, and
+// its creation label is the only recovery key for a lost response. Neither
+// error echoes the refused value.
+var (
+	ErrWorkspaceCwdNotAbsolute = errors.New("herdr: workspace cwd must be an absolute path")
+	ErrWorkspaceLabelRequired  = errors.New("herdr: workspace creation label is required")
+)
 
 // workspaceCreateParams is the wire shape of workspace.create: an explicit
 // cwd, additive env and a unique creation label, with focus always false so
@@ -15,9 +27,8 @@ var _ app.WorkspaceRuntime = (*Runtime)(nil)
 // workspace -- except the session's very first-ever workspace, which Herdr
 // always activates regardless of the request (S8-confirmed). label and env
 // are schema-optional on the request (an absent label gets an
-// automatically-assigned one); this adapter always supplies a label, but
-// omits the field rather than sending an empty string when the caller
-// didn't set one.
+// automatically-assigned one); this adapter requires a label
+// (ErrWorkspaceLabelRequired) and omits only an empty env.
 type workspaceCreateParams struct {
 	Cwd   string            `json:"cwd"`
 	Focus bool              `json:"focus"`
@@ -47,6 +58,12 @@ type workspaceCreatedResult struct {
 // and a unique creation label, never requesting focus, and reports the
 // created workspace, tab and root pane ids.
 func (r *Runtime) CreateWorkspace(ctx context.Context, req app.WorkspaceRequest) (app.WorkspaceHandle, error) {
+	if !filepath.IsAbs(req.Cwd) {
+		return app.WorkspaceHandle{}, ErrWorkspaceCwdNotAbsolute
+	}
+	if req.Label == "" {
+		return app.WorkspaceHandle{}, ErrWorkspaceLabelRequired
+	}
 	params := workspaceCreateParams{Cwd: req.Cwd, Focus: false, Label: req.Label, Env: req.Env}
 	var result workspaceCreatedResult
 	if err := r.client.Call(ctx, "workspace.create", params, &result); err != nil {

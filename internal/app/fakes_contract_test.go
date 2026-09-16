@@ -9,6 +9,7 @@ import (
 	"github.com/johnlanda/hop/internal/app"
 	"github.com/johnlanda/hop/internal/domain/identity"
 	"github.com/johnlanda/hop/internal/domain/run"
+	"github.com/johnlanda/hop/internal/testsupport/storevectors"
 )
 
 // TestFakeStoreContracts proves the handwritten fakes enforce the store
@@ -525,11 +526,15 @@ func TestFakeFeatureBootstrapContracts(t *testing.T) {
 	t.Run("workspace runtime refuses the adapter's refused arguments", func(t *testing.T) {
 		tc := newTestController(defaultPolicy())
 		ctx := context.Background()
-		if _, err := tc.Runtime.CreateWorkspace(ctx, app.WorkspaceRequest{Cwd: "relative/repo", Label: "op-1"}); err == nil {
-			t.Fatalf("CreateWorkspace accepted a relative cwd")
+		// The shared vectors the herdr adapter's
+		// TestRuntimeCreateWorkspaceRefusesInvalidRequests drives too.
+		for _, vector := range storevectors.WorkspaceRequestsRefused() {
+			if _, err := tc.Runtime.CreateWorkspace(ctx, vector.Request); err == nil {
+				t.Fatalf("CreateWorkspace accepted the %s vector", vector.Name)
+			}
 		}
-		if _, err := tc.Runtime.CreateWorkspace(ctx, app.WorkspaceRequest{Cwd: "/repo"}); err == nil {
-			t.Fatalf("CreateWorkspace accepted an empty creation label")
+		if len(tc.Runtime.Workspaces) != 0 {
+			t.Fatalf("a refused CreateWorkspace created a workspace")
 		}
 		if _, _, err := tc.Runtime.FindWorkspaceByLabel(ctx, ""); err == nil {
 			t.Fatalf("FindWorkspaceByLabel accepted an empty label")
