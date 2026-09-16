@@ -422,3 +422,253 @@ func TestManagerExecFailureDispositionFalsePositives(t *testing.T) {
 		})
 	}
 }
+
+// resumeChildClaim records the resume fixture child's launch claim in
+// state under childLaunchPID, returning the child's current binding.
+func resumeChildClaim(t *testing.T, f *resumeFixture, state app.LaunchClaimState) run.RuntimeBinding {
+	t.Helper()
+	binding, ok := f.tc.Store.currentBindingLocked(f.ChildID)
+	if !ok {
+		t.Fatalf("no binding for the fixture child %s", f.ChildID)
+	}
+	f.tc.Store.LaunchClaims[binding.IncarnationID] = app.LaunchClaim{
+		IncarnationID: binding.IncarnationID, RunID: f.fr.RunID, SessionID: f.ChildID,
+		AttemptID:  f.tc.Store.Sessions[f.ChildID].value.AttemptID,
+		Executable: "/usr/local/bin/claude", ArgvDigest: "d", PID: childLaunchPID,
+		State: state, ClaimedAt: f.tc.Clock.Now(),
+	}
+	return binding
+}
+
+// liveManagerPane answers the resume fixture's manager pane with its
+// corroborating occupant and every other pane as positively absent;
+// onManager, when non-nil, runs on each manager inspection.
+func liveManagerPane(f *resumeFixture, onManager func()) func(string) (app.PaneProcess, error) {
+	return func(paneID string) (app.PaneProcess, error) {
+		if paneID != "pane-mgr" {
+			return app.PaneProcess{}, app.ErrPaneNotFound
+		}
+		if onManager != nil {
+			onManager()
+		}
+		return app.PaneProcess{
+			ShellPID: 1, ForegroundGroupID: f.ManagerPID,
+			Foreground: []app.ProcessInfo{{PID: f.ManagerPID, Argv: []string{"/usr/local/bin/claude"}, Cmdline: "claude " + f.fr.ManagerIncarnation.String()}},
+		}, nil
+	}
+}
+
+// allPanesAbsent answers every pane as positively absent.
+func allPanesAbsent(string) (app.PaneProcess, error) { return app.PaneProcess{}, app.ErrPaneNotFound }
+
+// TestResumeFeatureSettlesChildExecFailure proves a child whose launch
+// claim is exec_failed and whose controller died before corroboration is
+// settled by resume's reconciliation, never merely retired: the attempt
+// fails and the task takes the budgeted consequence, with the mailbox
+// closure and the manager notice — and a held stop keeps precedence.
+func TestResumeFeatureSettlesChildExecFailure(t *testing.T) {
+	const failureCause = "task failure with owned-work termination observed"
+
+	for _, tt := range []struct {
+		name        string
+		retryLimit  int
+		wantTask    run.TaskState
+		wantMailbox bool
+		wantNotice  string
+	}{
+		{name: "retry budget left: needs-rework", retryLimit: 3, wantTask: run.TaskNeedsRework, wantNotice: "task t1 needs-rework\nreason: the attempt failed to launch (exec_failed claim; no process)\n"},
+		{name: "retry budget exhausted: failed, mailbox closed, the run fails on retirement", retryLimit: 1, wantTask: run.TaskFailed, wantMailbox: true, wantNotice: "task t1 failed\nreason: the attempt failed to launch (exec_failed claim; no process)\norphaned obligations: none\n"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newResumeFixture(t)
+			tc := f.tc
+			snapshot := tc.Store.Snapshots[f.fr.RunID]
+			snapshot.Workflow.RetryLimit = tt.retryLimit
+			tc.Store.Snapshots[f.fr.RunID] = snapshot
+			resumeChildClaim(t, f, app.LaunchClaimExecFailed)
+			attemptID := tc.Store.Sessions[f.ChildID].value.AttemptID
+			taskID := tc.Store.Attempts[attemptID].value.TaskID
+			tc.Runtime.InspectPaneFn = liveManagerPane(f, nil)
+
+			result, handle := f.resume(t, "")
+			if result.Outcome != "resumed" {
+				t.Fatalf("resume outcome = %s, want resumed; %+v", result.Outcome, result)
+			}
+			if report := sessionReport(t, &result, f.ChildID.String()); report.Disposition != app.SessionRetiredNoProcess {
+				t.Errorf("child disposition = %s, want %s", report.Disposition, app.SessionRetiredNoProcess)
+			}
+			if got := tc.Store.Attempts[attemptID].value.State; got != run.AttemptFailed {
+				t.Errorf("attempt state = %s, want failed", got)
+			}
+			task := tc.Store.Tasks[taskID].value
+			if task.State != tt.wantTask || task.MailboxClosed != tt.wantMailbox {
+				t.Errorf("task = %s (mailbox closed %t), want %s (%t)", task.State, task.MailboxClosed, tt.wantTask, tt.wantMailbox)
+			}
+			if got := tc.Store.Sessions[f.ChildID].value.State; got != run.SessionTerminated {
+				t.Errorf("child session state = %s, want terminated", got)
+			}
+			notices := controllerNoticesTo(tc, f.fr.RunID)
+			if len(notices) != 1 || string(tc.Artifacts.files[notices[0].BodyPath]) != tt.wantNotice {
+				t.Fatalf("manager notices = %+v, want exactly one with body %q", notices, tt.wantNotice)
+			}
+
+			// The ordinary pass finds nothing stranded.
+			if _, err := tc.Controller.CorroborateSessionLaunches(context.Background(), handle); err != nil {
+				t.Fatalf("CorroborateSessionLaunches() error = %v", err)
+			}
+			report, err := tc.Controller.RetireSettledSessions(context.Background(), handle)
+			if err != nil {
+				t.Fatalf("RetireSettledSessions() error = %v", err)
+			}
+			if tt.wantTask != run.TaskFailed {
+				if report.RunFailing || report.RunFailed || tc.Store.Tasks[taskID].value.State != tt.wantTask {
+					t.Errorf("retirement = %+v, task = %s; want nothing further", report, tc.Store.Tasks[taskID].value.State)
+				}
+				return
+			}
+			// The failed task fails the run once owned work is observed
+			// terminated: the live manager blocks the first round.
+			if !report.RunFailing || report.RunFailed {
+				t.Fatalf("retirement round 1 = %+v, want RunFailing while the manager is alive", report)
+			}
+			tc.Runtime.InspectPaneFn = allPanesAbsent
+			if report, err = tc.Controller.RetireSettledSessions(context.Background(), handle); err != nil || !report.RunFailed {
+				t.Fatalf("retirement round 2 = %+v, %v; want RunFailed", report, err)
+			}
+			if reason, ok := transitionReason(tc, app.EntityRun, f.fr.RunID.String(), string(run.RunFailed)); !ok || reason != failureCause {
+				t.Errorf("run failure reason = %q (found %t), want %q", reason, ok, failureCause)
+			}
+		})
+	}
+
+	t.Run("a stop held before resume routes to stop handling, which interrupts the child", func(t *testing.T) {
+		f := newResumeFixture(t)
+		tc := f.tc
+		resumeChildClaim(t, f, app.LaunchClaimExecFailed)
+		attemptID := tc.Store.Sessions[f.ChildID].value.AttemptID
+		taskID := tc.Store.Attempts[attemptID].value.TaskID
+		rRow := tc.Store.Runs[f.fr.RunID]
+		rRow.value = rRow.value.RequestStop(tc.Clock.Now())
+		rRow.revision++
+		tc.Runtime.InspectPaneFn = allPanesAbsent
+
+		result, handle := f.resume(t, "")
+		if result.Outcome != "stop-pending" {
+			t.Fatalf("resume outcome = %s, want stop-pending", result.Outcome)
+		}
+		if got := tc.Store.Attempts[attemptID].value.State; got != run.AttemptLaunching {
+			t.Errorf("attempt state after a stop-pending resume = %s, want launching (resume adopts nothing under a stop)", got)
+		}
+		if n := len(controllerNoticesTo(tc, f.fr.RunID)); n != 0 {
+			t.Errorf("manager notices = %d, want none (stop handling owns the terminal state)", n)
+		}
+
+		stop, err := tc.Controller.DriveFeatureStop(context.Background(), handle)
+		if err != nil {
+			t.Fatalf("DriveFeatureStop() error = %v", err)
+		}
+		if !stop.Terminated || stop.RunState != string(run.RunStopped) {
+			t.Fatalf("stop report = %+v, want stopped", stop)
+		}
+		if got := tc.Store.Attempts[attemptID].value.State; got != run.AttemptInterrupted {
+			t.Errorf("attempt state = %s, want interrupted by stop", got)
+		}
+		if got := tc.Store.Tasks[taskID].value.State; got != run.TaskInterrupted {
+			t.Errorf("task state = %s, want interrupted by stop", got)
+		}
+		if got := tc.Store.Sessions[f.ChildID].value.State; got != run.SessionTerminated {
+			t.Errorf("child session state = %s, want terminated", got)
+		}
+	})
+
+	t.Run("a stop landing during resume interrupts the task in the settlement itself", func(t *testing.T) {
+		f := newResumeFixture(t)
+		tc := f.tc
+		resumeChildClaim(t, f, app.LaunchClaimExecFailed)
+		attemptID := tc.Store.Sessions[f.ChildID].value.AttemptID
+		taskID := tc.Store.Attempts[attemptID].value.TaskID
+		stopped := false
+		// The manager reconciles first (sessions reconcile in id order);
+		// its pane inspection is the window between resume's stop check
+		// and the child's settlement.
+		tc.Runtime.InspectPaneFn = liveManagerPane(f, func() {
+			if stopped {
+				return
+			}
+			stopped = true
+			rRow := tc.Store.Runs[f.fr.RunID]
+			rRow.value = rRow.value.RequestStop(tc.Clock.Now())
+			rRow.revision++
+		})
+
+		result, _ := f.resume(t, "")
+		if !stopped {
+			t.Fatalf("the manager was never inspected; resume = %+v", result)
+		}
+		if got := tc.Store.Attempts[attemptID].value.State; got != run.AttemptFailed {
+			t.Errorf("attempt state = %s, want failed (the observed outcome)", got)
+		}
+		if got := tc.Store.Tasks[taskID].value.State; got != run.TaskInterrupted {
+			t.Errorf("task state = %s, want interrupted under the stop", got)
+		}
+		if got := tc.Store.Runs[f.fr.RunID].value.State; got != run.RunStopping {
+			t.Errorf("run state = %s, want stopping (never turned back toward running)", got)
+		}
+		notices := controllerNoticesTo(tc, f.fr.RunID)
+		want := "task t1 interrupted\nreason: the attempt failed to launch (exec_failed claim; no process) while a stop was pending\n"
+		if len(notices) != 1 || string(tc.Artifacts.files[notices[0].BodyPath]) != want {
+			t.Errorf("manager notices = %+v, want exactly one with body %q", notices, want)
+		}
+	})
+}
+
+// TestResumeFeatureManagerExecFailureFailsTheRunOnRetirement proves the
+// resume path's manager branch: an exec-failed manager is only retired
+// (no attempt to settle), resume completes over the warm child, and the
+// manager-lineage failure cause fails the run on the following
+// retirement passes, once the child is observed terminated.
+func TestResumeFeatureManagerExecFailureFailsTheRunOnRetirement(t *testing.T) {
+	const cause = "manager launch exec failed (exec_failed claim; no process) with owned-work termination observed"
+	f := newResumeFixture(t)
+	tc := f.tc
+	managerClaim := tc.Store.LaunchClaims[f.fr.ManagerIncarnation]
+	managerClaim.State = app.LaunchClaimExecFailed
+	tc.Store.LaunchClaims[f.fr.ManagerIncarnation] = managerClaim
+	childBinding := resumeChildClaim(t, f, app.LaunchClaimExeced)
+	childPane := func(paneID string) (app.PaneProcess, error) {
+		if paneID != childBinding.PaneID {
+			return app.PaneProcess{}, app.ErrPaneNotFound
+		}
+		return app.PaneProcess{
+			ShellPID: 1, ForegroundGroupID: childLaunchPID,
+			Foreground: []app.ProcessInfo{{PID: childLaunchPID, Argv: []string{"/usr/local/bin/claude"}, Cmdline: "claude " + childBinding.IncarnationID.String()}},
+		}, nil
+	}
+	tc.Runtime.InspectPaneFn = childPane
+
+	result, handle := f.resume(t, "")
+	if result.Outcome != "resumed" {
+		t.Fatalf("resume outcome = %s, want resumed; %+v", result.Outcome, result)
+	}
+	if report := sessionReport(t, &result, f.fr.ManagerID.String()); report.Disposition != app.SessionRetiredNoProcess {
+		t.Errorf("manager disposition = %s, want %s", report.Disposition, app.SessionRetiredNoProcess)
+	}
+	if got := tc.Store.Sessions[f.fr.ManagerID].value.State; got != run.SessionTerminated {
+		t.Fatalf("manager state = %s, want terminated", got)
+	}
+
+	report, err := tc.Controller.RetireSettledSessions(context.Background(), handle)
+	if err != nil {
+		t.Fatalf("RetireSettledSessions() error = %v", err)
+	}
+	if !report.RunFailing || report.RunFailed {
+		t.Fatalf("retirement round 1 = %+v, want RunFailing while the child still runs", report)
+	}
+	tc.Runtime.InspectPaneFn = allPanesAbsent
+	if report, err = tc.Controller.RetireSettledSessions(context.Background(), handle); err != nil || !report.RunFailed {
+		t.Fatalf("retirement round 2 = %+v, %v; want RunFailed", report, err)
+	}
+	if reason, ok := transitionReason(tc, app.EntityRun, f.fr.RunID.String(), string(run.RunFailed)); !ok || reason != cause {
+		t.Errorf("run failure reason = %q (found %t), want %q", reason, ok, cause)
+	}
+}
