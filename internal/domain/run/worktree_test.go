@@ -63,3 +63,55 @@ func TestNewAttemptWorktree(t *testing.T) {
 		})
 	}
 }
+
+// worktreeStates enumerates every Worktree state.
+func worktreeStates() []run.WorktreeState {
+	return []run.WorktreeState{run.WorktreeActive, run.WorktreeRemoved, run.WorktreeAbsent, run.WorktreeReleased}
+}
+
+// worktreeValidTransitions is the Worktree retirement table, transcribed
+// independently of the production transitionTable: each final state only
+// from active, and nothing out of a final state.
+func worktreeValidTransitions() map[[2]run.WorktreeState]bool {
+	return map[[2]run.WorktreeState]bool{
+		{run.WorktreeActive, run.WorktreeRemoved}:  true,
+		{run.WorktreeActive, run.WorktreeAbsent}:   true,
+		{run.WorktreeActive, run.WorktreeReleased}: true,
+	}
+}
+
+func TestWorktreeRetireTransitions(t *testing.T) {
+	valid := worktreeValidTransitions()
+	targets := append(worktreeStates(), run.WorktreeState("deleted"), "")
+	for _, from := range worktreeStates() {
+		for _, to := range targets {
+			t.Run(string(from)+"_to_"+string(to), func(t *testing.T) {
+				w := run.NewWorktree(testWorktreeID, testRepositoryID, testRunID, "/tmp/hop/r1/t1a1", "hop/r1/t1a1")
+				w.State = from
+
+				got, err := w.Retire(to)
+
+				if valid[[2]run.WorktreeState{from, to}] {
+					if err != nil {
+						t.Fatalf("Retire(%s) from %s: unexpected error: %v", to, from, err)
+					}
+					want := w
+					want.State = to
+					if got != want {
+						t.Fatalf("Retire(%s) from %s = %+v, want %+v", to, from, got, want)
+					}
+					if w.State != from {
+						t.Fatalf("Retire mutated its receiver: State = %s, want %s", w.State, from)
+					}
+					return
+				}
+				if !errors.Is(err, run.ErrInvalidTransition) {
+					t.Fatalf("Retire(%s) from %s: error = %v, want ErrInvalidTransition", to, from, err)
+				}
+				if got != w {
+					t.Fatalf("Retire(%s) from %s changed the value on refusal: %+v", to, from, got)
+				}
+			})
+		}
+	}
+}
