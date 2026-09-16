@@ -45,11 +45,14 @@ const (
 
 // PathInspector is the composition seam the inspection resolves paths
 // through, since this package does no filesystem access itself: it
-// returns path's canonical form — the deepest existing ancestor with
-// symbolic links resolved and the remainder appended — and whether path
-// itself exists. Herdr records a checkout in its requested, possibly
-// non-canonical spelling while git lists the canonical one (both
-// probe-pinned), so every path comparison goes through it.
+// returns path's canonical form, resolved as the filesystem resolves the
+// spelling (`..` after a symbolic link leaves the link's target) — for a
+// missing path, its deepest existing prefix resolved with the missing
+// names appended — and whether path itself exists. A path it cannot
+// resolve that way is an error, which the inspection treats as
+// unobservable, never as absent. Herdr records a checkout in its
+// requested, possibly non-canonical spelling while git lists the canonical
+// one (both probe-pinned), so every path comparison goes through it.
 type PathInspector func(path string) (canonical string, exists bool, err error)
 
 // retirementGitEnv is the complete environment every retirement git

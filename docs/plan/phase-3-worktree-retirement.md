@@ -813,6 +813,33 @@ consistent with sections 1 to 12.
   not be fully inspected; check it and its repository, then run hop
   status again", replacing section 6's "check the checkout".
 
+**Path resolution (`InspectPath`).**
+
+- **The filesystem resolves the spelling.** The composition's inspector
+  never cleans a recorded path before resolving it. Collapsing
+  `<dir>/link/../wt` to `<dir>/wt` is wrong whenever `link` is a
+  symbolic link: the filesystem's answer is the parent of the link's
+  target. Such a collapse can report an existing, registered checkout as
+  a missing unlisted one, and so as `absent` for good.
+  - Existence is `Lstat` of the recorded spelling.
+  - An existing path is `EvalSymlinks` of it. A dangling link leaf is
+    its resolved parent plus its own name.
+  - A missing path is walked component by component. Each symbolic link
+    is resolved before the next component, and `..` steps up from the
+    directory resolved so far. The walk stops at the first missing
+    component, and the remaining plain names are appended (section 4's
+    "deepest existing ancestor, then the remainder").
+- **An unresolvable spelling is never absent.** The inspector returns an
+  error, and the row is retained as `inspection-failed`, when it meets:
+  - a `..` after a missing component;
+  - a dangling or looping link on the way (an unmounted volume, for
+    example);
+  - a non-directory used as a directory;
+  - an unreadable component;
+  - a path that changed while it was being resolved.
+
+  Its errors carry at most the system cause, never the path.
+
 **Dispatch revalidation (`revalidateRetirementDispatch`).** Both claimed
 acts run it immediately before the spawn:
 
