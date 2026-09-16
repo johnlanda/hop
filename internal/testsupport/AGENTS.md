@@ -17,22 +17,40 @@ mechanically, not just by convention).
   refused-input vectors for the Phase 3 worker-authority store ports
   (`MessagingStore`, `PlanStore`), consumed by `internal/app`'s tests today
   and by `internal/adapters/sqlite`'s once that adapter lands.
+- [internal/testsupport/hopfixtures](hopfixtures/AGENTS.md): string-typed
+  run/task/session/binding seeding through the application's store port
+  interfaces, consumed solely by `cmd/hop`'s real-binary grammar contract
+  tests — the one package in this subtree that DOES bootstrap store state
+  itself (see below).
 
 ## Rules specific to this subtree
 
 - A package here may import `internal/app` and the domain packages
-  (whatever its own vectors need to construct), never `cmd/hop` or another
-  adapter package — the same inward-import direction ordinary `test-helper`
-  code follows (`internal/arch_test.go`'s category matrix).
-- A package here never bootstraps a run, session or store handle itself:
-  that setup is inherently per-backing-store (a fake's direct field
-  seeding versus a real store's SQL inserts). It supplies request VALUES
-  and documents the refusal a correct store must produce; the consuming
-  test drives the actual port call and setup.
+  (whatever its own vectors or fixtures need to construct), never
+  `cmd/hop` or another adapter package — the same inward-import direction
+  ordinary `test-helper` code follows (`internal/arch_test.go`'s category
+  matrix). This holds even though `hopfixtures` drives a real store
+  through `app.StateStore`/`app.SubmissionStore`: it consumes those PORT
+  INTERFACES (declared in `internal/app`), never the concrete
+  `internal/adapters/sqlite` package — the caller opens the real adapter
+  and passes it in structurally.
+- Two seeding shapes coexist here, by design, not by drift: a VECTOR
+  package (`storevectors`) never bootstraps a run, session or store handle
+  itself — that setup is inherently per-backing-store (a fake's direct
+  field seeding versus a real store's SQL inserts), so it supplies request
+  VALUES only and the consuming test drives the actual port call and
+  setup against fixture state IT already built. A FIXTURE package
+  (`hopfixtures`) exists for the opposite reason: its one consumer
+  (`cmd/hop`) has no CLI path to build feature-mode state at all (that is
+  slice 6b's `hop run --workflow feature`, still landing), so the package
+  itself drives `InitializeRun`/`UnitOfWork`/`SubmissionStore` calls to
+  reach that state directly. Before adding a third package here, decide
+  which shape it actually is; do not blend request-vector and
+  state-bootstrap responsibilities in one package.
 - Every package here needs its own `internal/arch_test.go` rule row
-  (`category: categoryTestHelper`) and an entry in `internal/app`'s (or
-  whichever consumer's) `testFirstParty` list before that consumer's test
-  files may import it.
+  (`category: categoryTestHelper`) and an entry in its consumer's (or
+  consumers') `testFirstParty` list before that consumer's test files may
+  import it.
 
 ## Related guides
 
