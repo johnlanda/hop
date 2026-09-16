@@ -1,6 +1,7 @@
 package sqlite_test
 
 import (
+	"database/sql"
 	"testing"
 	"time"
 
@@ -59,30 +60,7 @@ func newFeatureFixture(t *testing.T) *featureFixture {
 		ManagerID:          identity.SessionID(uid(offManager)),
 		ManagerIncarnation: identity.IncarnationID(uid(offManagerInc)),
 	}
-	now := clock.Now()
-	f.inUOW(t, func(uow app.UnitOfWork) {
-		saveRun(t, uow, spec.RunID, func(v run.Run) (run.Run, error) { return v.Launch(now) })
-		saveRun(t, uow, spec.RunID, func(v run.Run) (run.Run, error) { return v.MarkRunning(now) })
-		manager := run.NewManagerSession(f.ManagerID, spec.RunID, run.HarnessClaude, now)
-		manager, launchErr := manager.Launch(now)
-		if launchErr != nil {
-			t.Fatalf("launch manager session: %v", launchErr)
-		}
-		if manager, launchErr = manager.ConfirmActive(now); launchErr != nil {
-			t.Fatalf("activate manager session: %v", launchErr)
-		}
-		if _, err := uow.Sessions().Create(t.Context(), manager); err != nil {
-			t.Fatalf("create manager session: %v", err)
-		}
-		binding := run.NewRuntimeBinding(
-			f.ManagerID, f.ManagerIncarnation,
-			"/tmp/herdr.sock", "server-instance-1", "workspace-m", "tab-m", "pane-m",
-			uid(fxBase+3), run.LaunchInitial, now,
-		)
-		if err := uow.Bindings().Create(t.Context(), binding); err != nil {
-			t.Fatalf("create manager binding: %v", err)
-		}
-	})
+	seedFeatureRunState(t, f)
 	return f
 }
 
@@ -188,4 +166,10 @@ func rawExec(t *testing.T, store *sqlite.Store, query string, args ...any) {
 	if _, err := sqlite.WriteDB(store).ExecContext(t.Context(), query, args...); err != nil {
 		t.Fatalf("raw exec: %v\nquery: %.120s", err, query)
 	}
+}
+
+// writeDBRow queries one row through the store's write pool.
+func writeDBRow(t *testing.T, f *featureFixture, query string, args ...any) *sql.Row {
+	t.Helper()
+	return sqlite.WriteDB(f.store).QueryRowContext(t.Context(), query, args...)
 }

@@ -151,6 +151,12 @@ func (r taskRepository) Get(ctx context.Context, id identity.TaskID) (run.Task, 
 	return getTask(ctx, r.u.tx, id)
 }
 
+// Save persists the task's mutable columns. The mailbox flag is persisted
+// both ways under the ordinary revision discipline: a controller
+// settlement closes it (Task.CloseMailbox + Save, keeping the original
+// closure time on a re-save), and only a value loaded at the current
+// revision can write — a retry's reopen goes through
+// PlanStore.RequestRetry's own transaction, never a stale Save.
 func (r taskRepository) Save(ctx context.Context, v run.Task, expectedRevision int64) (int64, error) { //nolint:gocritic // hugeParam: the port passes domain values by value; the repository mirrors its signature.
 	owner, err := runOfTask(ctx, r.u.tx, v.ID)
 	if err != nil {
@@ -159,9 +165,10 @@ func (r taskRepository) Save(ctx context.Context, v run.Task, expectedRevision i
 	if scopeErr := r.u.requireLeasedRun(owner, "task", v.ID.String()); scopeErr != nil {
 		return 0, scopeErr
 	}
+	at := formatTime(v.UpdatedAt)
 	result, err := r.u.tx.ExecContext(ctx,
-		`UPDATE tasks SET state = ?, updated_at = ?, revision = revision + 1 WHERE id = ? AND revision = ?`,
-		string(v.State), formatTime(v.UpdatedAt), v.ID.String(), expectedRevision,
+		`UPDATE tasks SET state = ?, mailbox_closed_at = CASE WHEN ? = 1 THEN COALESCE(mailbox_closed_at, ?) ELSE NULL END, updated_at = ?, revision = revision + 1 WHERE id = ? AND revision = ?`,
+		string(v.State), boolToInt(v.MailboxClosed), at, at, v.ID.String(), expectedRevision,
 	)
 	return saveEntity(result, err, "task", v.ID.String(), expectedRevision)
 }

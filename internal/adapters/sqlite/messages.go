@@ -195,3 +195,61 @@ func insertMessage(ctx context.Context, q querier, m *run.Message) error {
 	}
 	return nil
 }
+
+// messageAck loads one message's acknowledgement, or nil when it has none.
+// SessionID and IncarnationID are empty for a human ack.
+func messageAck(ctx context.Context, q querier, id identity.MessageID) (*run.Ack, error) {
+	var (
+		sessionID, incarnationID sql.NullString
+		ackedAt                  string
+	)
+	err := q.QueryRowContext(ctx,
+		`SELECT session_id, incarnation_id, acked_at FROM message_acks WHERE message_id = ?`, id.String(),
+	).Scan(&sessionID, &incarnationID, &ackedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil //nolint:nilnil // a nil ack with a nil error is the documented "not acknowledged yet" value.
+	}
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: load ack of message %s: %w", id, err)
+	}
+	ack := run.Ack{MessageID: id}
+	if sessionID.Valid {
+		parsed, parseErr := identity.ParseSessionID(sessionID.String)
+		if parseErr != nil {
+			return nil, fmt.Errorf("sqlite: ack session id: %w", parseErr)
+		}
+		ack.SessionID = parsed
+	}
+	if incarnationID.Valid {
+		parsed, parseErr := identity.ParseIncarnationID(incarnationID.String)
+		if parseErr != nil {
+			return nil, fmt.Errorf("sqlite: ack incarnation id: %w", parseErr)
+		}
+		ack.IncarnationID = parsed
+	}
+	if ack.At, err = parseTime(ackedAt); err != nil {
+		return nil, err
+	}
+	return &ack, nil
+}
+
+// resolveSessionAddress resolves a session's logical address: manager for
+// a manager session, task:<id> for an implementer or reviewer via its
+// attempt's task — lineage-based, so every session ever bound to that
+// task resolves the same address, current or historical. A Phase 2 solo
+// worker has no logical address (solo runs have no messaging); ok is
+// false for it and any unknown role.
+func resolveSessionAddress(ctx context.Context, q querier, session *run.Session) (run.Address, bool, error) {
+	switch session.Role {
+	case run.RoleManager:
+		return run.ManagerAddress(), true, nil
+	case run.RoleImplementer, run.RoleReviewer:
+		attempt, _, err := getAttempt(ctx, q, session.AttemptID)
+		if err != nil {
+			return run.Address{}, false, err
+		}
+		return run.TaskAddress(attempt.TaskID), true, nil
+	default:
+		return run.Address{}, false, nil
+	}
+}
