@@ -435,3 +435,46 @@ func seedTerminalAttempt(t *testing.T, f *featureFixture, task identity.TaskID, 
 		}
 	})
 }
+
+// TestWorkflowReceiptAcceptanceKey proves the (run, verb, request ID)
+// key's scope for the plan verbs: the same request ID is accepted
+// independently across two VERBS and across two RUNS, while a reuse
+// within one (run, verb) with different content stays refused.
+func TestWorkflowReceiptAcceptanceKey(t *testing.T) {
+	clock := newFakeClock()
+	store := openStoreAt(t, t.TempDir(), clock)
+	f := buildMessagingFixtureAt(t, store, clock)
+	const requestID = "shared-plan-id"
+
+	// Accepted under task-create.
+	created, err := store.CreateTask(t.Context(), taskCreate(f.featureFixture, 8101, "keyed task", requestID))
+	if err != nil || created.Outcome != app.WorkflowAccepted {
+		t.Fatalf("CreateTask() = %+v, %v", created, err)
+	}
+	// The SAME ID under task-retry is an independent acceptance.
+	taskC := f.createFeatureTask(t, 8102, 4, run.TaskNeedsRework)
+	seedTerminalAttempt(t, f.featureFixture, taskC, 8103, 1)
+	retry, err := store.RequestRetry(t.Context(), app.RetryRequest{
+		TaskID: taskC, RunID: f.spec.RunID, Session: f.ManagerID, IncarnationID: f.ManagerIncarnation,
+		Reason: "keyed retry", RequestID: requestID,
+	})
+	if err != nil || retry.Outcome != app.WorkflowAccepted || retry.AttemptNumber != 2 {
+		t.Fatalf("RequestRetry(same id, other verb) = %+v, %v; want an independent acceptance", retry, err)
+	}
+	// The SAME ID under plan-close is a third independent acceptance.
+	planClose, err := store.ClosePlan(t.Context(), app.PlanClose{RunID: f.spec.RunID, Session: f.ManagerID, IncarnationID: f.ManagerIncarnation, RequestID: requestID})
+	if err != nil || planClose.Outcome != app.WorkflowAccepted {
+		t.Fatalf("ClosePlan(same id, third verb) = %+v, %v; want an independent acceptance", planClose, err)
+	}
+	// The SAME ID in another RUN accepts independently under task-create.
+	other := buildSecondMessagingFixtureAt(t, store, clock)
+	otherCreate, err := store.CreateTask(t.Context(), taskCreate(other.featureFixture, 8104, "keyed task", requestID))
+	if err != nil || otherCreate.Outcome != app.WorkflowAccepted {
+		t.Fatalf("CreateTask(same id, other run) = %+v, %v; want an independent acceptance", otherCreate, err)
+	}
+	// Within one (run, verb), a different-content reuse stays refused.
+	conflicting, err := store.CreateTask(t.Context(), taskCreate(f.featureFixture, 8105, "different content", requestID))
+	if err != nil || conflicting.Outcome != app.WorkflowRefused {
+		t.Fatalf("CreateTask(conflicting reuse) = %+v, %v; want refused", conflicting, err)
+	}
+}

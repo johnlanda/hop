@@ -438,3 +438,37 @@ func TestMigration003FromEmpty(t *testing.T) {
 		}
 	}
 }
+
+// TestMigration003ForeignKeyCheckRefused proves the rebuild's
+// foreign_key_check gate: a claim whose one historical intent names a
+// SESSION THAT DOES NOT EXIST passes the ambiguity validation (the
+// intent's session_id field is authoritative and present) but the
+// rebuilt launch_claims row then references a missing session — the
+// migration fails on the check, before commit, and the store is left
+// unmigrated.
+func TestMigration003ForeignKeyCheckRefused(t *testing.T) {
+	root := t.TempDir()
+	fixture := coreV2Fixture("launching", "active", "launching", "launching")
+	const ghostSession = "aaaaaaaa-aaaa-4aaa-8aaa-00000000dead"
+	fixture = append(fixture,
+		`INSERT INTO operations (id, run_id, generation, kind, state, intent, act_evidence, outcome, created_at, updated_at)
+		 VALUES ('`+fxOperation+`', '`+fxRun+`', 7, 'pane.open', 'pending', '{"session_id":"`+ghostSession+`","incarnation_id":"`+fxIncarnation+`"}', NULL, NULL, '`+v2ts+`', '`+v2ts+`')`,
+		`INSERT INTO launch_claims (incarnation_id, run_id, attempt_id, executable, argv_digest, pid, state, error, claimed_at, settled_at, settlement_evidence, seed_evidence)
+		 VALUES ('`+fxIncarnation+`', '`+fxRun+`', '`+fxAttempt+`', '/opt/harness/claude', 'argv-digest', 42, 'exec_pending', NULL, '`+v2ts+`', NULL, NULL, NULL)`,
+	)
+	buildV2Store(t, root, fixture)
+
+	_, err := sqlite.Open(t.Context(), root, sqlite.Options{Clock: newFakeClock()})
+
+	if err == nil {
+		t.Fatal("Open migrated a store whose backfilled claim references a missing session")
+	}
+	if !strings.Contains(err.Error(), "foreign key violations") || !strings.Contains(err.Error(), "launch_claims") {
+		t.Fatalf("refusal = %v, want the foreign_key_check gate naming launch_claims", err)
+	}
+	raw := openRaw(t, root)
+	var version int
+	if scanErr := raw.QueryRowContext(t.Context(), `SELECT MAX(version) FROM schema_migrations`).Scan(&version); scanErr != nil || version != 2 {
+		t.Fatalf("store version after the refusal = %d (%v), want 2 with nothing committed", version, scanErr)
+	}
+}
