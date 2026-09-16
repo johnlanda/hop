@@ -2,6 +2,7 @@ package sqlite_test
 
 import (
 	"database/sql"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -22,6 +23,31 @@ func featureWorkflow() app.WorkflowSnapshot {
 		ReviewerHarness: "claude", MessageAttention: 2 * time.Minute, MessageWait: 50 * time.Second,
 		IntegrationBranch: "hop/r1/integration",
 	}
+}
+
+// initLegacyFeatureRun initializes a run whose snapshot carries the
+// frozen feature workflow over the SOLO bootstrap rows (task t1, its
+// attempt and a worker-role session) — a repository-level fixture
+// shortcut for the suites below, which address those rows directly as the
+// run's first implement task. The real InitializeRun never produces this
+// shape: a feature spec creates the manager session and no task, attempt
+// or worktree (TestInitializeRunFeatureShape). So spec is initialized
+// solo and the workflow column written afterward; spec.Snapshot.Workflow
+// is set on return so the fixture's copy matches the stored snapshot.
+func initLegacyFeatureRun(t *testing.T, store *sqlite.Store, spec *app.NewRunSpec) app.Lease {
+	t.Helper()
+	spec.Snapshot.Workflow = app.WorkflowSnapshot{}
+	_, lease, err := store.InitializeRun(t.Context(), *spec)
+	if err != nil {
+		t.Fatalf("InitializeRun: %v", err)
+	}
+	spec.Snapshot.Workflow = featureWorkflow()
+	encoded, err := json.Marshal(spec.Snapshot.Workflow)
+	if err != nil {
+		t.Fatalf("encode workflow snapshot: %v", err)
+	}
+	rawExec(t, store, `UPDATE run_snapshots SET workflow = ? WHERE run_id = ?`, string(encoded), spec.RunID.String())
+	return lease
 }
 
 // featureFixture is one feature-mode run: the fixture's bootstrap task,
@@ -50,11 +76,7 @@ func newFeatureFixture(t *testing.T) *featureFixture {
 	clock := newFakeClock()
 	store := openStoreAt(t, t.TempDir(), clock)
 	spec := newSpec("/repos/feature", specStride, clock.Now())
-	spec.Snapshot.Workflow = featureWorkflow()
-	_, lease, err := store.InitializeRun(t.Context(), spec)
-	if err != nil {
-		t.Fatalf("InitializeRun: %v", err)
-	}
+	lease := initLegacyFeatureRun(t, store, &spec)
 	f := &featureFixture{
 		fixture:            &fixture{store: store, clock: clock, spec: spec, lease: lease},
 		ManagerID:          identity.SessionID(uid(offManager)),

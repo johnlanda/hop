@@ -248,11 +248,7 @@ func TestManagerUniquenessRaced(t *testing.T) {
 	storeA := openStoreAt(t, root, clock)
 	storeB := openStoreAt(t, root, clock)
 	spec := newSpec("/repos/raced", specStride, clock.Now())
-	spec.Snapshot.Workflow = featureWorkflow()
-	_, lease, err := storeA.InitializeRun(t.Context(), spec)
-	if err != nil {
-		t.Fatalf("InitializeRun: %v", err)
-	}
+	lease := initLegacyFeatureRun(t, storeA, &spec)
 	now := clock.Now()
 	create := func(store *sqlite.Store, n int) error {
 		uow, err := store.Begin(t.Context(), lease)
@@ -502,11 +498,7 @@ func TestSerialIntegrationIndexRaced(t *testing.T) {
 	storeA := openStoreAt(t, root, clock)
 	storeB := openStoreAt(t, root, clock)
 	spec := newSpec("/repos/serial", specStride, clock.Now())
-	spec.Snapshot.Workflow = featureWorkflow()
-	_, lease, err := storeA.InitializeRun(t.Context(), spec)
-	if err != nil {
-		t.Fatalf("InitializeRun: %v", err)
-	}
+	lease := initLegacyFeatureRun(t, storeA, &spec)
 	f := &fixture{store: storeA, clock: clock, spec: spec, lease: lease}
 	ff := &featureFixture{fixture: f}
 	resultA := seedAcceptedResult(t, ff, 7191)
