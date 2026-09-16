@@ -17,8 +17,9 @@ import (
 var errRunNotQuiesced = errors.New("run has unquiesced owned work")
 
 // assertRunQuiescedLocked re-validates, INSIDE the terminal transaction,
-// that no execution-bearing operation is pending and no integration
-// occupies the serial slot. The caller's own outstanding checks read
+// that no execution-bearing operation — nor an unresolved worktree.create,
+// whose checkout would otherwise be abandoned without a row — is pending
+// and no integration occupies the serial slot. The caller's own outstanding checks read
 // state that may have moved (a losing fence CAS journals reconciling and
 // returns unsettled; a racing zombie publish lands between rounds), so
 // the terminal commit re-derives quiescence from the transaction's own
@@ -30,7 +31,7 @@ func assertRunQuiescedLocked(ctx context.Context, uow UnitOfWork, wf WorkflowRep
 	}
 	for i := range ops {
 		switch ops[i].Kind {
-		case OpCheckRun, OpIntegrationMerge, OpIntegrationPublish, OpIntegrationReset, OpIntegrationFence, OpIntegrationInit:
+		case OpCheckRun, OpIntegrationMerge, OpIntegrationPublish, OpIntegrationReset, OpIntegrationFence, OpIntegrationInit, OpWorktreeCreate:
 			return fmt.Errorf("%w: operation %s (%s) is pending", errRunNotQuiesced, ops[i].ID, ops[i].Kind)
 		}
 	}
@@ -44,7 +45,9 @@ func assertRunQuiescedLocked(ctx context.Context, uow UnitOfWork, wf WorkflowRep
 
 // DriveFeatureStop performs one round of stop interruption for a
 // feature-mode run: it retires every check and merge execution's process
-// group under the group-retirement rule, drives the reset for a
+// group under the group-retirement rule, resolves every unresolved
+// per-attempt worktree.create (adopted and recorded, or settled failed
+// after its bounded wait), drives the reset for a
 // published-but-unsettled candidate so the integration ref never rests
 // on an unvalidated candidate in a stopped run, retires every unresolved
 // ref-move intent under the ref-fencing rule (quiescence is REQUIRED
@@ -118,6 +121,14 @@ func (c *Controller) DriveFeatureStop(ctx context.Context, handle RunHandle) (St
 		return StopReport{RunState: string(run.RunStopping)}, initErr
 	}
 	outstanding = append(outstanding, initOutstanding...)
+	// An unresolved per-attempt worktree.create is never abandoned: it is
+	// adopted and recorded, or settled failed after its bounded wait,
+	// before any terminal report.
+	worktreeOutstanding, wtErr := c.resolveAttemptWorktreesForShutdown(ctx, handle, &frozen)
+	if wtErr != nil {
+		return StopReport{RunState: string(run.RunStopping)}, wtErr
+	}
+	outstanding = append(outstanding, worktreeOutstanding...)
 
 	// The integration itself: a merging integration with its merge
 	// settled interrupts; a published-but-unsettled candidate (checking)

@@ -664,7 +664,8 @@ func (c *Controller) terminateRetiredSession(ctx context.Context, handle RunHand
 // shutdown mirrors stop — every check and merge execution's process
 // group is ACTIVELY retired under the group-retirement rule, every
 // ref-move intent is retired under the ref-fencing rule, an unresolved
-// integration.init is resolved as stop resolves it, and the
+// integration.init is resolved as stop resolves it, every unresolved
+// per-attempt worktree.create is adopted or settled failed, and the
 // current integration settles through the shared shutdown procedure (a
 // published-but-unsettled candidate is rolled back, never left on the
 // ref of a failed run). Only then, once every child session is
@@ -723,6 +724,13 @@ func (c *Controller) driveFeatureTerminalFailure(ctx context.Context, handle Run
 	}
 	if len(initOutstanding) > 0 {
 		return false, "terminal failure blocked: " + strings.Join(initOutstanding, "; "), nil
+	}
+	worktreeOutstanding, err := c.resolveAttemptWorktreesForShutdown(ctx, handle, frozen)
+	if err != nil {
+		return false, "", err
+	}
+	if len(worktreeOutstanding) > 0 {
+		return false, "terminal failure blocked: " + strings.Join(worktreeOutstanding, "; "), nil
 	}
 	stillIntegration, err := c.settleIntegrationForShutdown(ctx, handle, frozen, "run terminal failure")
 	if err != nil {
