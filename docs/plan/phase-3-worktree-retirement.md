@@ -3,7 +3,8 @@
 Design note for [phase-3-design.md](phase-3-design.md) section 12, row 8,
 implementing the human decision of 2026-09-15 (section 6, "Integration
 branch and worktree bases"; section 8, "Completion retirement"; open
-question 6). A proposal for approval: nothing here is implemented yet.
+question 6). Approved on 2026-09-16 with the decisions and conditions in
+section 12. Nothing here is implemented yet.
 
 The design fixes the mechanism: lazy detection on the next controller
 start or `hop status` for the repository, an ancestry check under an exec
@@ -54,6 +55,18 @@ integrated new content.
 - `merge-base --is-ancestor X X` exits 0 (pinned).
 - So such a run would read "merged" on its first pass and lose its
   failed attempts' checkouts before any human decision.
+
+**Repository identity.** Before anything else, the pass confirms that the
+frozen repository root still holds this run's history:
+`git -C <root> cat-file -e H^{commit}` must succeed.
+
+If the root no longer resolves (the repository was moved), or another
+repository now lives there without H, the run is skipped. The pass
+renders "the repository root no longer holds this run's history", takes
+no lease, and writes nothing.
+
+A clone that does contain H is still caught per worktree: it does not
+list HOP's checkouts, and its common directory differs.
 
 **Detection.** Before any journal row, the target's tip T is resolved
 read-only (`rev-parse --verify -q <target>^{commit}`). Exit 1 means the
@@ -149,7 +162,9 @@ inherited. They are not journaled and follow the precedent of
 
 A composition seam, `InspectPath`, returns the recorded path's canonical
 form (the deepest existing ancestor resolved, then the remainder
-appended) and whether the path exists. It follows the precedent of the
+appended) and whether the path exists. Herdr records the path in its
+requested, possibly non-canonical spelling, while git lists the canonical
+form (both pinned), so every comparison uses this canonical form. It follows the precedent of the
 launch boundary's `ResolvePath`. `internal/app` itself stays free of
 filesystem access.
 
@@ -215,15 +230,17 @@ So the act's argv carries the override. HOP's pre-check covers the flag
 case, and git's own check stays a second line of defense for the
 remaining window.
 
-**Decision for you: ignored files.** I recommend following git: ignored
-files do not block removal. The note and status say so plainly.
+**Ignored files (approved: follow git).** Ignored files do not block
+removal. Retaining on them would retain nearly every real checkout,
+because workers produce build output (`node_modules/`, `target/`), and
+the feature would then do nothing.
 
-Retaining on ignored files would retain nearly every real checkout,
-because workers produce build output (`node_modules/`, `target/`). The
-feature would then do nothing.
+The user-facing documentation and `hop status` say it plainly: *removal
+deletes ignored files such as build output; commit anything you want to
+keep* (section 6).
 
-The alternative is a `hidden`-style category for any
-`status --ignored=matching` output.
+Hidden changes (assume-unchanged, skip-worktree) and untracked files
+still retain the worktree, under any `status.showUntrackedFiles` setting.
 
 ### Act and outcome
 
@@ -303,7 +320,7 @@ and rendering continues. The fixed shapes, pinned by golden tests in
 `cmd/hop`:
 
 ```
-r3 worktrees retired: 2 removed, 1 already absent, 0 released
+r3 worktrees retired: 2 removed, 1 already absent, 0 released (removal deletes ignored files such as build output)
 r3 worktree hop/r3/t2a1 removed: /abs/path (close its Herdr workspace if one is still open)
 r3 worktree hop/r3/t4a1 retained (uncommitted changes): /abs/path
   action: commit or discard the changes, then run hop status again
@@ -331,7 +348,8 @@ settled `worktree.retire` for the row recorded an interrupted act.
 
 - `target: refs/heads/main`, or
   `target: none (detached HEAD at freeze; worktrees are never retired automatically)`;
-- `worktrees: retired <time>` or `worktrees: not retired`;
+- `worktrees: retired <time>`, or, before retirement,
+  `worktrees: not retired (removed once the integration branch is merged into <target>; removal deletes ignored files such as build output; commit anything you want to keep)`;
 - one `worktree: <branch> <state> <path>` line per row, with the released
   reason.
 
@@ -413,7 +431,7 @@ type-asserted, failing closed with typed sentinels.
 **Process probe (landed, executed): `gitworktree_probe_test.go`.** Every
 git value above, under `process.Runner` with the retirement environment.
 
-**Real-Herdr probe (landed, pending the suite):
+**Real-Herdr probe (landed, executed, passing):
 `spike_worktreeremove_test.go`.** Section 11.
 
 **Domain.** The `Retire` transition table (only from `active`; each final
@@ -459,6 +477,12 @@ kinds.
   no-op-only, and solo runs are never touched. A non-terminal run is
   never touched. A lease held by another controller defers the run. The
   invoking run is excluded.
+- **Triage is free:** a pass with nothing eligible, and a repeated pass
+  over an unchanged unmerged run, take no lease (the lease generation is
+  unchanged) and write nothing (no operation, transition or row revision).
+- **Moved repository:** the frozen root no longer exists, or a different
+  repository without H lives there. No lease, no operation, nothing
+  released, and a skip line.
 - **Cleanliness:** every retained category, including the three hazards
   (dispatch never happens). A dirty checkout later cleaned is removed on
   the next pass. `locked`.
@@ -508,23 +532,83 @@ kinds.
 Git values are in section 4 and pinned by the process probe (executed,
 passing).
 
-Herdr values come from `spike_worktreeremove_test.go`. **Pending the
-suite run.** The assertions encode the values read from the 0.9.0 source
-and schema:
+Herdr values come from `spike_worktreeremove_test.go`. They were executed
+against a disposable test server, and all four tests passed (exit 0,
+2.7s).
 
-- **Dirty refusal:** `dirty_worktree_requires_force` with git's exact
-  message.
-- **Success:** the result key set `{forced, path, type, workspace_id}`,
-  the linked workspace and its root pane closed and its shell gone, the
-  parent kept, the branch kept.
-- **Closed workspace:** a closed workspace refuses with
-  `workspace_not_found` (`workspace <id> not found`), and the checkout is
-  still listed with `open_workspace_id` null.
-- **Restart:** a restart reissues a closed workspace's id.
-- **After a git-side removal:**
-  - the workspace stays open with its membership naming the removed
-    path, and its shell alive;
-  - `worktree.list` drops the entry;
-  - `worktree.remove` on the stale workspace fails with
-    `worktree_remove_failed`;
-  - `workspace.close` tidies it.
+1. **Paths are not canonicalized.** `worktree.create` reports the
+   checkout path in the requested spelling
+   (`/var/folders/…/attempt-t1a1`, not `/private/var/…`). HOP's recorded
+   path can therefore be non-canonical, while git lists the canonical
+   form. This makes the `InspectPath` canonicalization in section 4
+   load-bearing.
+2. **Dirty refusal.** `worktree.remove {workspace_id, force: false}` with
+   an untracked file returns API error `dirty_worktree_requires_force`
+   with message exactly
+   `fatal: '<recorded path>' contains modified or untracked files, use --force to delete it`.
+   The checkout, workspace, root pane and root shell are untouched.
+3. **Clean removal.**
+   - The result's key set is exactly `{forced, path, type, workspace_id}`,
+     with values `{false, <recorded path>, "worktree_removed", <same id>}`.
+   - The directory and git's listing entry are gone, `worktree.list` no
+     longer names the checkout, and the branch is kept.
+   - The linked workspace is closed (`workspace.get` →
+     `workspace_not_found`), its root pane is gone, and its root shell
+     process exits.
+   - The parent workspace stays.
+4. **Closed workspace.** `workspace.close` on the linked workspace returns
+   `{type: "ok"}`, and the checkout stays on disk and in git's list. A
+   later `worktree.remove` returns `workspace_not_found` with message
+   `workspace <id> not found`. `worktree.list` still names the checkout,
+   with `open_workspace_id` null and `is_prunable` false.
+5. **Id reissue.** Before the restart the ids were a=`w1` and b=`w2`.
+   After closing b and restarting, a keeps `w1` and the next new
+   workspace receives `w2`, the closed workspace's id.
+6. **After a git-side `git worktree remove`** (no force):
+   - The linked workspace stays open. Its membership still records
+     `checkout_path` = the removed path (non-canonical) and
+     `is_linked_worktree: true`; `repo_key` is the canonical common
+     directory and `repo_root` the non-canonical root.
+   - Its root pane and shell stay alive.
+   - `worktree.list` no longer names the checkout.
+   - `worktree.remove` on that stale workspace fails with
+     `worktree_remove_failed`, message
+     `fatal: '<path>' is not a working tree`, and the workspace stays
+     open.
+   - `workspace.close` tidies it: the shell exits and the parent stays.
+
+## 12. Approval (2026-09-16) and Phase B conditions
+
+Approved: recommendations 1, 3, 4, 6 and 7 as written. That includes
+never retiring a run that integrated nothing or only no-ops, and
+migration 004 as an additive nullable column. Decisions:
+
+- **(a) Ignored files.** Follow git, with the plain-language warning in
+  the documentation and in `hop status` (sections 4 and 6).
+- **(b) Transport.** git `worktree remove` without force, through
+  `hop check-exec` and `CommandRunner`, with
+  `-c status.showUntrackedFiles=all`. `hop status` never dials Herdr for
+  this. The removed-worktree line tells the human to close a
+  still-open Herdr workspace.
+- **(c) Placement.** `hop status` for the repository, and `hop run` /
+  `hop resume` before `StartRun`/`Resume`, excluding their own run.
+  Triage with nothing eligible takes no lease and writes nothing, and a
+  test proves it.
+- **(d) Released.** `released` is a final outcome, journaled once.
+
+Conditions:
+
+- **Moved repository.** Never act on a run whose frozen root no longer
+  resolves to the same repository. Section 2's identity check, and the
+  common-directory check, cover this, and the test plan includes a moved
+  repository.
+- **Live working directories.** A worktree that is some live process's
+  working directory is not detected; the design relies on the run being
+  terminal and on the status hint.
+- **Start gate.** Phase B starts only after slice 6b (`StartFeatureRun`,
+  which freezes `TargetBranch`) and the phase-3/worktree-attempt-link fix
+  (`attempt_id`, `base_commit`) have both landed on main.
+- **Claim-kind parity.** `retirement.check` and `worktree.retire` extend
+  the check-exec argv-by-kind boundary. Each kind's argv stays frozen per
+  operation and passes byte-identically through the claim, as the
+  existing kinds do, and the fakes match.
