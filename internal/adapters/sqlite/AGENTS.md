@@ -2,13 +2,18 @@
 
 ## Purpose
 
-The persistence adapter behind the application's `StateStore`, `UnitOfWork`,
-`ReadStore` and `SubmissionStore` ports: one SQLite database at
+The persistence adapter behind the application's `StateStore`, `UnitOfWork`
+(with `WorkflowRepositories`), `ReadStore` (with `WorkflowReadStore`),
+`SubmissionStore`, `MessagingStore`, `PlanStore` and `ReviewStore` ports:
+one SQLite database at
 `<state root>/hop.db` shared by every repository and run, holding runs,
-their frozen snapshots, tasks, attempts, sessions, runtime bindings, launch
-and check-exec claims, worktrees, results, submission receipts, check
-requests, artifacts, transition evidence, the operation journal and the
-controller leases. The driver is the pure-Go `modernc.org/sqlite`, pinned
+their frozen snapshots (incl. the feature-mode workflow policy), tasks
+with their dependency edges, attempts, sessions (roles, optional attempts,
+one-level parents), runtime bindings, launch and check-exec claims,
+worktrees, results, submission receipts, check requests (typed subjects),
+messages with their deliveries, acks and receipts, reviews and their
+receipts, integrations, retry requests, workflow receipts, artifacts,
+transition evidence, the operation journal and the controller leases. The driver is the pure-Go `modernc.org/sqlite`, pinned
 at v1.58.0 in `go.mod` by this package as its first importer. The caller
 (cmd/hop's single state-root resolver) hands `Open` an absolute state root;
 this package never resolves environment variables or defaults.
@@ -18,10 +23,17 @@ this package never resolves environment variables or defaults.
 | File | Entities / functions | Responsibility |
 | --- | --- | --- |
 | [sqlite.go](sqlite.go) | `Store`, `Options`, `Open`, `Close`, `dsn`, `inWriteTx`, `formatTime`, `parseTime`, `newUUID` | Two pools onto one file (immediate-write and read), DSN-applied per-connection settings, bounded whole-transaction busy retry, canonical fixed-width UTC timestamps, adapter-internal UUID minting |
-| [migrations.go](migrations.go) | `ErrFutureSchema`, `migrate`, `applyMigration`, `loadMigrations`, `schemaVersion` | Ordered embedded migrations, each applied in its own immediate transaction with the version re-read inside it; refuses a store newer than the binary |
+| [migrations.go](migrations.go) | `ErrFutureSchema`, `migrate`, `applyMigration`, `applyRebuildMigration`, `validateLaunchClaimBackfill`, `requireCleanForeignKeys`, `loadMigrations`, `schemaVersion` | Ordered embedded migrations, each applied in its own immediate transaction with the version re-read inside it; refuses a store newer than the binary. A REBUILD migration (003) runs on a DEDICATED connection whose DSN sets foreign_keys(0) before BEGIN, validates the launch-claim session backfill in Go (real ambiguity refused NAMING the claim), requires a clean `PRAGMA foreign_key_check` before commit, and closes that connection on every path — it is never any pool |
 | [migrations/001_initial_schema.sql](migrations/001_initial_schema.sql) | — | The complete Phase 2 schema: 17 STRICT tables and the partial unique indexes (one active attempt per task, one accepted result per attempt, one current session per attempt) |
-| [migrations/002_launch_claim_seed_evidence.sql](migrations/002_launch_claim_seed_evidence.sql) | — | Adds `launch_claims.seed_evidence` (nullable TEXT): the workspace-trust pre-seeding outcome hop launch records with the claim; evidence only, NULL on pre-migration rows. The next new migration is 003 (Phase 3's slice-3 design text predates this one and renumbers) |
-| [statestore.go](statestore.go) | `InitializeRun`, `AcquireLease`, `Heartbeat`, `ReleaseLease`, `Begin`, `validateLease` | The controller authority: run bootstrap in one transaction, lease CAS with monotonic generations, fenced unit-of-work begin |
+| [migrations/002_launch_claim_seed_evidence.sql](migrations/002_launch_claim_seed_evidence.sql) | — | Adds `launch_claims.seed_evidence` (nullable TEXT): the workspace-trust pre-seeding outcome hop launch records with the claim; evidence only, NULL on pre-migration rows |
+| [migrations/003_manager_workers_messages.sql](migrations/003_manager_workers_messages.sql) | — | The Phase 3 schema (design section 4; its text's "002"): ten new tables (task_dependencies, messages, message_deliveries, message_acks, message_receipts, reviews, review_submissions, integrations, retry_requests, workflow_receipts) with the partial unique acceptance/serialization indexes; additive columns on runs (plan_closed_at), run_snapshots (workflow), worktrees (attempt_id, base_commit) and tasks (kind/seq/title/instructions_path/retry_count/subjects/mailbox_closed_at/created_at, defaults = the solo backfill); STRICT rebuilds of sessions (attempt_id relaxed, parent_session_id, the one-manager partial index), launch_claims (session_id NOT NULL, backfilled from the binding else the historical launch intent) and check_requests (typed subject, old rows re-keyed id=result_id, subject_kind='result') |
+| [workflow_uow.go](workflow_uow.go) | `unitOfWork` as `app.WorkflowRepositories`: `TaskDependencies`, `TaskIndex`, `AttemptIndex`, `SessionIndex`, `Messages`, `Reviews`, `Integrations`, `RetryRequests`, `ManagerSession` | The Phase 3 controller-transaction repositories on the same fenced unit of work (the additive packaging rule's slice-3 half); controller review-task creation, the store-assigned enqueue sequence, the sorted PendingByAddress mailbox-closure snapshot, the serial integration slot |
+| [messaging.go](messaging.go) | `SendMessage`, `FetchNextMessage`, `AckMessage`, `AnswerQuestion`, `insertMessageReceipt`, `acceptedMessageReceipt`, `sendRequestDigest` | The section 7 worker-authority messaging port: request-ID receipts first, the caller session's OWN run and current incarnation re-derived per verb, derived answer destinations, the bundled human-question ack, receipts for every outcome except the deliberately receipt-free empty fetch |
+| [plan.go](plan.go) | `CreateTask`, `RequestRetry`, `ClosePlan`, `insertWorkflowReceipt`, `acceptedWorkflowReceipt`, `requireManagerCaller` | The section 8 worker-authority plan port: manager-only verbs, the retry's successor attempt reserved in the accepting transaction, the plan flag set/cleared on runs.plan_closed_at, one authoritative acceptance per (run, verb, request ID) |
+| [review.go](review.go) | `SubmitReview`, `persistVerdictAcceptance`, `reviewerSessionEligible` | The section 8 worker-authority verdict write: SubmitResult's order mirrored, acceptance persisting the review, completing attempt and task, closing the mailbox and committing the controller's reasons-bearing manager notice atomically |
+| [workflow_read.go](workflow_read.go) | `LoadSessionLaunchContext`, `LoadMessagingContext`, `LoadMessageDetail`, `featureRunDetail`, `mailboxStatuses`, `guardShortfalls`, `pendingQuestions` | The Phase 3 lease-free reads (`app.WorkflowReadStore`): session-addressed launch context (binding else the SESSION-keyed pending intent, fail closed; the attempt row, worktree path and Relaunch successor fact), the messaging context, hop msg show's detail, and RunDetail's feature extensions |
+| [messages.go](messages.go) | `parseAddress`, `scanMessage`, `getMessage`, `messagesByAddress`, `nextEnqueueSeq`, `insertMessage`, `messageDeliveries`, `messageAck`, `resolveSessionAddress` | Shared message row mapping: Message.State reconstructed from the delivery/ack rows in the same snapshot (never a persisted column), the per-(run, recipient) FIFO sequence, lineage-based address resolution |
+| [statestore.go](statestore.go) | `InitializeRun`, `AcquireLease`, `Heartbeat`, `ReleaseLease`, `Begin`, `validateLease` | The controller authority: run bootstrap in one transaction (the snapshot's workflow JSON round-tripped, NULL for solo), lease CAS with monotonic generations, fenced unit-of-work begin |
 | [uow.go](uow.go) | `unitOfWork` and the typed repositories (`Runs`…`CheckExecClaims`), `OperationRepository.Pending`/`ByKind`, `Commit`, `Rollback` | One immediate transaction per unit of work; optimistic-concurrency saves; append-only bindings and transitions; journal payloads persisted as uninterpreted JSON; controller-side launch-claim settlement |
 | [entities.go](entities.go) | `getRun`, `getTask`, `getAttempt`, `getSession`, `currentSession`, `currentBinding`, `getLaunchClaim`, `acceptedResult`, `incarnationCurrent`, `launchIncarnationCurrent`, `pendingLaunchIntent` | Row ↔ domain-value mapping shared by all three authorities through the `querier` interface |
 | [submission.go](submission.go) | `SubmitResult`, `RecordMalformed`, `ClaimLaunch`, `SettleLaunchFailure`, `ClaimCheckExec`, `RequestStop`, `insertReceipt` | The worker authority: the section 7 validation order with the domain's `AcceptResult` inside one transaction, receipts for every outcome, the pre-exec claim contracts, the monotonic stop request |
@@ -101,7 +113,8 @@ this package never resolves environment variables or defaults.
   existing binding row disables the intent fallback.
   `LaunchClaims().Settle` moves exec_pending to execed or exec_failed only,
   idempotent per target state. `ClaimCheckExec` requires a pending
-  `check.run` operation of the run's current lease generation.
+  `check.run` OR `integration.merge` operation of the run's current lease
+  generation — the two kinds the generalized exec boundary spawns.
 - Stop requests are monotonic: `stop_requested_at` is set once and never
   cleared or moved; `RunStatus.StopRequested` and `RunDetail.StopRequested`
   mirror it for the read model.
@@ -118,6 +131,34 @@ this package never resolves environment variables or defaults.
   whatever its state — a settled unknown outcome stays visible with its
   `Unknown` flag, detail and retained evidence paths, so an unrepeatable
   unknown result stays actionable through status.
+- Phase 3 re-keying: every launch claim is keyed to the SESSION it
+  launches. `ClaimLaunch` validates the claimed session's owning run
+  (an attempt-only Phase 2 caller resolves the attempt's current session
+  exactly as the currency read path does), currency is the session's
+  current binding else the SESSION's newest pending launch intent (B2:
+  two concurrently pending launches validate independently), and the
+  INSERT records `session_id` (NOT NULL) with `attempt_id` NULL for an
+  attempt-less (manager) claim. `LoadSessionLaunchContext` uses the same
+  session-keyed resolution and fails closed like `LoadLaunchContext`;
+  the Phase 2 run-keyed `LoadLaunchContext` is untouched until slice 6
+  deletes it.
+- Worker-authority request idempotency is receipt-first: every mutating
+  messaging/plan verb resolves the (run, verb, request ID) acceptance key
+  before anything else — an identical retry returns the original outcome
+  as duplicate, a conflicting reuse is refused — and every outcome leaves
+  a receipt row EXCEPT an empty fetch, which commits nothing. Message
+  envelopes are immutable; `Message.State` is reconstructed from the
+  delivery/ack rows, the enqueue sequence is assigned in commit order
+  inside the send transaction (FIFO authority, never caller clocks), and
+  a successful serve's evidence is its append-only delivery row.
+- Acceptance closes the mailbox in the same commit: `SubmitResult`'s
+  first acceptance re-reads the task mailbox (queued or
+  delivered-unacknowledged → the retryable transient outcome with the
+  drain grammar) and closes it atomically, as does `SubmitReview`'s,
+  which also commits the controller's reasons-bearing info notice to the
+  manager; `PlanStore.RequestRetry` is the only reopen path, and
+  `taskRepository.Save` persists the flag under the revision discipline
+  for the controller's failure-closure settlement.
 - `runtime_bindings.server_instance` maps to
   `run.RuntimeBinding.ServerInstance` on Create and every read, empty
   string ↔ NULL. `NewRuntimeBinding` takes `serverInstance` right after
@@ -132,8 +173,12 @@ this package never resolves environment variables or defaults.
   [internal/domain/identity](../../domain/identity/AGENTS.md).
 - Implemented ports: `app.StateStore`, `app.UnitOfWork` (with every typed
   repository including `LaunchClaimRepository` and
-  `CheckExecClaimRepository`), `app.ReadStore` and `app.SubmissionStore`,
-  all by `*Store` and its unit of work.
+  `CheckExecClaimRepository`) plus `app.WorkflowRepositories`,
+  `app.ReadStore` plus `app.WorkflowReadStore`, `app.SubmissionStore`,
+  `app.MessagingStore`, `app.PlanStore` and `app.ReviewStore`, all by
+  `*Store` and its unit of work. Test files additionally import
+  [internal/testsupport/storevectors](../../testsupport/storevectors/AGENTS.md)
+  (production code never does; the checker's test-support rule proves it).
 - External libraries: `modernc.org/sqlite` v1.58.0 (pure-Go SQLite driver;
   no cgo, exact version pinned) and its `lib` subpackage for result-code
   constants.
@@ -141,9 +186,10 @@ this package never resolves environment variables or defaults.
 ## Verification
 
 - `go test ./internal/adapters/sqlite` — the real-temporary-database suite:
-  migrations from empty, reopen at the same version, refusal of a future
+  migrations from empty (the Phase 3 index/column surface asserted), reopen
+  at the same version, refusal of a future
   version (`ErrFutureSchema`), concurrent open/migrate from two handles, and
-  a populated version-1→2 upgrade (`TestUpgradePopulatedV1StoreToV2`: the
+  a populated version-1→latest upgrade (`TestUpgradePopulatedV1StoreToV2`: the
   001 schema built raw with a full claim chain, upgraded through
   `sqlite.Open`, old values and relationships intact with NULL seed
   evidence, a new evidence-bearing claim, idempotent reopen);
@@ -182,6 +228,41 @@ this package never resolves environment variables or defaults.
   all-state coverage; and the `server_instance` NULL/non-NULL binding
   round-trip. No sleeps: a shared hand-advanced fake clock decides every
   expiry.
+- The Phase 3 suites (same command): migration 003 over POPULATED
+  pre-003 stores (`TestMigration003*`: active, completed, failed and
+  claim-without-binding fixtures — rebuilt rows byte-for-byte where
+  unchanged, session backfills from binding and historical intent, task
+  defaults, re-keyed check requests, clean foreign keys — plus the three
+  ambiguity refusals naming the claim with the store left unmigrated);
+  the WorkflowRepositories suite (`TestTaskIndex`,
+  `TestTaskDependenciesByRun`, `TestAttemptIndex`, `TestSessionIndexByRun`,
+  `TestManagerSession`, `TestMessageRepository`, `TestReviewRepository`,
+  `TestIntegrationRepository`, `TestRetryRequestRepository`); the
+  worker-authority suites (`TestMessagingLifecycle`,
+  `TestSendRefusalMatrix`, `TestUnauthorizedFetchLeavesReceipt`,
+  `TestRelayedAnswerLineage`, `TestReceiptAcceptanceKey`,
+  `TestHumanAnswerDigestVectors`, `TestCreateTask*`, `TestClosePlan`,
+  `TestRequestRetry*`, `TestSubmitReview*`); the raced contracts across
+  separate handles (`TestFetchFetchRaced` — one serialized in-flight
+  message, a delivery row per serve — `TestAckAckRaced`,
+  `TestAnswerAnswerRaced`, `TestRequestIDReuseRaced`,
+  `TestCreateTaskRaced`, `TestRetryRequestUniquePendingRaced`,
+  `TestManagerUniquenessRaced`, `TestSerialIntegrationIndexRaced`,
+  `TestEnqueueSequenceFIFO` with the inverted clock, the mailbox
+  send/accept and send/failure-settlement races in both orders incl. the
+  snapshot-mismatch retry); the session-keyed claim vectors
+  (`TestClaimLaunchSessionKeyedIntents` — B2 —
+  `TestClaimLaunchByAttemptResolvesSession`,
+  `TestClaimLaunchManagerSession`,
+  `TestClaimCheckExecAcceptsMergeOperations`); the Phase 3 reads
+  (`TestLoadSessionLaunchContext`, `TestLoadMessagingContext`,
+  `TestLoadMessageDetail`, `TestRunDetailFeatureExtensions`,
+  `TestRunDetailSoloZeroValues`, `TestLoadCheckExecutionContextByKind`);
+  and `TestStoreVectors`, the real-store half of the shared
+  refused-input contract, driving every
+  [internal/testsupport/storevectors](../../testsupport/storevectors/AGENTS.md)
+  vector to the identical refusal internal/app observes against its
+  fakes.
 - `go test -count=3 ./internal/adapters/sqlite` — flake resistance for the
   raced scenarios.
 - Test fixtures: none on disk; every database is created in a `t.TempDir`
@@ -193,3 +274,4 @@ this package never resolves environment variables or defaults.
 - [Application layer and ports](../../app/AGENTS.md)
 - [Run domain module](../../domain/run/AGENTS.md)
 - [Phase 2 design, sections 4, 7 and 9](../../../docs/plan/phase-2-design.md)
+- [Phase 3 design, sections 4, 7, 8 and 11](../../../docs/plan/phase-3-design.md)
