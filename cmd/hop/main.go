@@ -61,6 +61,18 @@ func dispatch(args []string, stdout, stderr io.Writer) (int, error) {
 		return runLaunch(args[1:], stdout, stderr, defaultDeps())
 	case "check-exec":
 		return runCheckExec(args[1:], stdout, stderr, defaultDeps())
+	case "task":
+		return runTask(args[1:], stdout, stderr, defaultDeps())
+	case "plan":
+		return runPlan(args[1:], stdout, stderr, defaultDeps())
+	case "msg":
+		return runMsg(args[1:], stdout, stderr, defaultDeps())
+	case "answer":
+		return runAnswer(args[1:], stdout, stderr, defaultDeps())
+	case "review":
+		return runReview(args[1:], stdout, stderr, defaultDeps())
+	case "view":
+		return runView(args[1:], stdout, stderr, defaultDeps())
 	case "help", "-h", "-help", "--help":
 		return exitOK, printUsage(stdout)
 	default:
@@ -83,9 +95,15 @@ func printUsage(w io.Writer) error {
 		"  version         Print the hop build version\n"+
 		"  doctor          Check the Herdr installation, harness support and the state root\n"+
 		"  plugin-context  Print the Herdr plugin invocation environment\n"+
+		"  view            Select or clear HOP's native Agents view (set --run ID | clear)\n"+
+		"  answer          Answer a question relayed to the human (controller-machine command)\n"+
 		"  help            Print this usage text\n\n"+
 		"Worker plumbing (spawned by HOP, not for direct use):\n"+
 		"  launch          Worker exec boundary: claim, sanitize and exec the harness\n"+
-		"  check-exec      Check exec boundary: claim, sanitize and exec the frozen check command\n")
+		"  check-exec      Check exec boundary: claim, sanitize and exec the frozen check command\n"+
+		"  task            Manager plan verbs: create | retry <task-id>\n"+
+		"  plan            Manager plan verb: close\n"+
+		"  msg             Messaging verbs: send | next | wait | ack <id> | show <id>\n"+
+		"  review          Reviewer verb: submit --verdict --subject --reasons-file\n")
 	return err
 }
