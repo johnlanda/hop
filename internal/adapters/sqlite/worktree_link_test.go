@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/johnlanda/hop/internal/adapters/sqlite"
 	"github.com/johnlanda/hop/internal/app"
 	"github.com/johnlanda/hop/internal/domain/identity"
 	"github.com/johnlanda/hop/internal/domain/run"
@@ -365,7 +366,7 @@ func TestAssignedWorktreesLinkTheirAttempts(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), "does not resolve to the attempt's recorded worktree") {
 				t.Fatalf("%s launch from a sibling worktree = %v, want the worktree disagreement refusal", slc.Session.Role, err)
 			}
-			if claim := h.claimOf(t, slc.IncarnationID); claim {
+			if claim := h.claimOf(ctx, t, slc.IncarnationID); claim {
 				t.Fatalf("%s refused launch left a claim", slc.Session.Role)
 			}
 		}
@@ -383,7 +384,7 @@ func TestAssignedWorktreesLinkTheirAttempts(t *testing.T) {
 				plan.Argv[1] != "--session-id" || plan.Argv[2] != slc.Session.NativeSessionRef {
 				t.Fatalf("%s launch plan = %+v, want the Claude first launch with its own native reference", slc.Session.Role, plan)
 			}
-			if !h.claimOf(t, slc.IncarnationID) {
+			if !h.claimOf(ctx, t, slc.IncarnationID) {
 				t.Fatalf("%s launch recorded no claim", slc.Session.Role)
 			}
 		}
@@ -412,17 +413,17 @@ func TestUnlinkedWorktreeRowsRefuseTheLaunch(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "no recorded worktree path") {
 			t.Fatalf("%s launch over unlinked rows = %v, want the missing-worktree refusal", a.Role, err)
 		}
-		if h.claimOf(t, slc.IncarnationID) {
+		if h.claimOf(ctx, t, slc.IncarnationID) {
 			t.Fatalf("%s refused launch left a claim", a.Role)
 		}
 	}
 }
 
 // claimOf reports whether a launch claim row exists for incarnation.
-func (h *assignmentHarness) claimOf(t *testing.T, incarnation identity.IncarnationID) bool {
+func (h *assignmentHarness) claimOf(ctx context.Context, t *testing.T, incarnation identity.IncarnationID) bool {
 	t.Helper()
 	var count int
-	if err := writeDBRow(t, h.featureFixture, `SELECT COUNT(*) FROM launch_claims WHERE incarnation_id = ?`, incarnation.String()).Scan(&count); err != nil {
+	if err := sqlite.WriteDB(h.store).QueryRowContext(ctx, `SELECT COUNT(*) FROM launch_claims WHERE incarnation_id = ?`, incarnation.String()).Scan(&count); err != nil {
 		t.Fatalf("count launch claims: %v", err)
 	}
 	return count != 0

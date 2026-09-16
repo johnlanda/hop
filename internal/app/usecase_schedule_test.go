@@ -708,16 +708,16 @@ func TestUnlinkedWorktreeRowsResolveNoLaunchDirectory(t *testing.T) {
 	}
 
 	for _, a := range report.Assigned {
-		slc, err := tc.Store.LoadSessionLaunchContext(ctx, fr.RunID, a.SessionID)
-		if err != nil {
-			t.Fatalf("LoadSessionLaunchContext() error = %v", err)
+		slc, loadErr := tc.Store.LoadSessionLaunchContext(ctx, fr.RunID, a.SessionID)
+		if loadErr != nil {
+			t.Fatalf("LoadSessionLaunchContext() error = %v", loadErr)
 		}
 		if slc.WorktreePath != "" {
 			t.Fatalf("%s resolved %q among several unlinked rows, want no guess", a.TaskID, slc.WorktreePath)
 		}
-		if _, err := tc.Controller.PrepareSessionLaunchExec(ctx, sessionLaunchRequest(&slc, fr.RunID, a.WorktreeInfo.Path, 7300)); err == nil ||
-			!strings.Contains(err.Error(), "no recorded worktree path") {
-			t.Fatalf("launch over unlinked rows error = %v, want the missing-worktree refusal", err)
+		if _, launchErr := tc.Controller.PrepareSessionLaunchExec(ctx, sessionLaunchRequest(&slc, fr.RunID, a.WorktreeInfo.Path, 7300)); launchErr == nil ||
+			!strings.Contains(launchErr.Error(), "no recorded worktree path") {
+			t.Fatalf("launch over unlinked rows error = %v, want the missing-worktree refusal", launchErr)
 		}
 		if _, claimed := tc.Store.LaunchClaims[slc.IncarnationID]; claimed {
 			t.Fatal("a refused launch left a claim")

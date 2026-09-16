@@ -165,26 +165,25 @@ func (f *featureFixture) repositoryID(t *testing.T) identity.RepositoryID {
 }
 
 // createWorktree records w through the controller's worktree repository —
-// the production writer — and returns it.
-func (f *featureFixture) createWorktree(t *testing.T, w run.Worktree) run.Worktree { //nolint:gocritic // hugeParam: the port passes domain values by value; the helper mirrors it.
+// the production writer.
+func (f *featureFixture) createWorktree(t *testing.T, w run.Worktree) { //nolint:gocritic // hugeParam: the port passes domain values by value; the helper mirrors it.
 	t.Helper()
 	f.inUOW(t, func(uow app.UnitOfWork) {
 		if _, err := uow.Worktrees().Create(t.Context(), w); err != nil {
 			t.Fatalf("create worktree %s: %v", w.Path, err)
 		}
 	})
-	return w
 }
 
 // createAttemptWorktree records attemptID's worktree in the shape
 // AssignReadyTasks writes: linked to the attempt and its base commit.
-func (f *featureFixture) createAttemptWorktree(t *testing.T, n int, attemptID identity.AttemptID, path, branch string) run.Worktree {
+func (f *featureFixture) createAttemptWorktree(t *testing.T, n int, attemptID identity.AttemptID, path, branch string) {
 	t.Helper()
 	w, err := run.NewAttemptWorktree(identity.WorktreeID(uid(n)), f.repositoryID(t), f.spec.RunID, attemptID, "base-oid", path, branch)
 	if err != nil {
 		t.Fatalf("NewAttemptWorktree: %v", err)
 	}
-	return f.createWorktree(t, w)
+	f.createWorktree(t, w)
 }
 
 // workflowRepos asserts the unit of work's WorkflowRepositories capability.

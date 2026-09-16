@@ -531,9 +531,9 @@ func (r fakeWorktreeRepo) Get(_ context.Context, id identity.WorktreeID) (run.Wo
 }
 
 func (r fakeWorktreeRepo) ByRun(_ context.Context, runID identity.RunID) (run.Worktree, int64, error) {
-	for _, w := range r.u.worktreeCreated {
-		if w.RunID == runID {
-			return w, 1, nil
+	for i := range r.u.worktreeCreated {
+		if r.u.worktreeCreated[i].RunID == runID {
+			return r.u.worktreeCreated[i], 1, nil
 		}
 	}
 	for _, base := range r.u.store.Worktrees {
