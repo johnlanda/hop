@@ -373,6 +373,14 @@ func (c *Controller) assignOneReadyTask(ctx context.Context, handle RunHandle, f
 		if err != nil {
 			return err
 		}
+		// A Claude session's first launch is `--session-id <ref>`, so the
+		// reference is pre-assigned here, as StartRun assigns the solo
+		// worker's; Codex and opencode sessions carry none.
+		if harness == run.HarnessClaude {
+			if child, err = child.AssignNativeRef(c.IDs.NewID(), run.NativeRefAssigned, now); err != nil {
+				return err
+			}
+		}
 
 		taskFrom := task.State
 		activated, err := task.Activate(now)
