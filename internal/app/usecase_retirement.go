@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strings"
 
 	"github.com/johnlanda/hop/internal/domain/identity"
 	"github.com/johnlanda/hop/internal/domain/run"
@@ -431,12 +432,16 @@ func (c *Controller) terminateRetiredSession(ctx context.Context, handle RunHand
 }
 
 // driveFeatureTerminalFailure finishes a feature run's terminal failure:
-// a failed implement task can never satisfy readiness again, so once
-// every child session is terminal, no check or merge execution is
-// unresolved and every ref-move intent is retired (quiescence is
-// REQUIRED before any terminal report), the manager is retired under the
-// close rule and the run marked failed — with stop precedence: a held
-// stop leaves the terminal state to stop handling.
+// a failed implement task can never satisfy readiness again, so the
+// shutdown mirrors stop — every check and merge execution's process
+// group is ACTIVELY retired under the group-retirement rule, every
+// ref-move intent is retired under the ref-fencing rule, and the
+// current integration settles through the shared shutdown procedure (a
+// published-but-unsettled candidate is rolled back, never left on the
+// ref of a failed run). Only then, once every child session is
+// terminal, is the manager retired under the close rule and the run
+// marked failed — with stop precedence: a held stop leaves the terminal
+// state to stop handling.
 func (c *Controller) driveFeatureTerminalFailure(ctx context.Context, handle RunHandle, frozen *FrozenRun) (bool, string, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
 	detail, err := c.Read.LoadRunStatus(ctx, handle.runID)
 	if err != nil {
@@ -448,11 +453,30 @@ func (c *Controller) driveFeatureTerminalFailure(ctx context.Context, handle Run
 	if detail.State != run.RunRunning && detail.State != run.RunResuming && detail.State != run.RunCompleting {
 		return false, "", nil
 	}
+	var stillOutstanding []string
 	for i := range detail.PendingOperations {
-		switch detail.PendingOperations[i].Kind {
-		case OpCheckRun, OpIntegrationMerge:
-			return false, fmt.Sprintf("terminal failure blocked: execution %s is unresolved", detail.PendingOperations[i].ID), nil
+		op := detail.PendingOperations[i]
+		switch op.Kind {
+		case OpCheckRun:
+			still, retireErr := c.retireCheckOperation(ctx, handle, &op)
+			if retireErr != nil {
+				return false, "", retireErr
+			}
+			if still != "" {
+				stillOutstanding = append(stillOutstanding, still)
+			}
+		case OpIntegrationMerge:
+			still, retireErr := c.recoverIntegrationMerge(ctx, handle, &op)
+			if retireErr != nil {
+				return false, "", retireErr
+			}
+			if still != "" {
+				stillOutstanding = append(stillOutstanding, still)
+			}
 		}
+	}
+	if len(stillOutstanding) > 0 {
+		return false, "terminal failure blocked: " + strings.Join(stillOutstanding, "; "), nil
 	}
 	outstanding, err := c.retireUnresolvedRefIntents(ctx, handle, frozen)
 	if err != nil {
@@ -460,6 +484,13 @@ func (c *Controller) driveFeatureTerminalFailure(ctx context.Context, handle Run
 	}
 	if outstanding != "" {
 		return false, "terminal failure blocked: " + outstanding, nil
+	}
+	stillIntegration, err := c.settleIntegrationForShutdown(ctx, handle, frozen, "run terminal failure")
+	if err != nil {
+		return false, "", err
+	}
+	if stillIntegration != "" {
+		return false, "terminal failure blocked: " + stillIntegration, nil
 	}
 
 	childrenTerminal, manager, managerFound, err := c.featureSessionsTerminal(ctx, handle)
@@ -481,6 +512,13 @@ func (c *Controller) driveFeatureTerminalFailure(ctx context.Context, handle Run
 
 	now := c.Clock.Now()
 	err = c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		wf, wfErr := RequireWorkflowRepositories(uow, "feature terminal failure")
+		if wfErr != nil {
+			return wfErr
+		}
+		if quiesceErr := assertRunQuiescedLocked(ctx, uow, wf, handle.runID); quiesceErr != nil {
+			return quiesceErr
+		}
 		r, rRev, getErr := uow.Runs().Get(ctx, handle.runID)
 		if getErr != nil {
 			return getErr
@@ -501,24 +539,42 @@ func (c *Controller) driveFeatureTerminalFailure(ctx context.Context, handle Run
 		}
 		return recordTransition(ctx, uow, EntityRun, handle.runID.String(), string(rFrom), string(next.State), "task failure with owned-work termination observed", gen(handle.lease.Generation), now)
 	})
+	if errors.Is(err, errRunNotQuiesced) {
+		return false, "terminal failure blocked: " + err.Error(), nil
+	}
 	if err != nil {
 		return false, "", err
 	}
 	return true, "", nil
 }
 
-// featureSessionsTerminal reports whether every child session is
-// terminal, and returns the run's manager session row.
+// featureSessionsTerminal reports whether every session OTHER than the
+// run's current manager is terminal, and returns that manager row. The
+// current manager resolves through the ManagerSession port (ErrNotFound
+// = no live manager) — never by scanning for the role, which would let
+// a historical manager row from a cold relaunch shadow the live one in
+// whatever order the index returns rows. Historical manager rows are
+// ordinary sessions here: they must be terminal like any other.
 func (c *Controller) featureSessionsTerminal(ctx context.Context, handle RunHandle) (bool, run.Session, bool, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
 	var (
-		childrenTerminal = true
-		manager          run.Session
-		managerFound     bool
+		othersTerminal = true
+		manager        run.Session
+		managerFound   bool
 	)
 	err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 		wf, wfErr := RequireWorkflowRepositories(uow, "feature terminal failure")
 		if wfErr != nil {
 			return wfErr
+		}
+		current, _, mgrErr := wf.ManagerSession(ctx, handle.runID)
+		switch {
+		case mgrErr == nil:
+			manager = current
+			managerFound = true
+		case errors.Is(mgrErr, ErrNotFound):
+			// No live manager: every session below must be terminal.
+		default:
+			return mgrErr
 		}
 		sessions, sessErr := wf.SessionIndex().ByRun(ctx, handle.runID)
 		if sessErr != nil {
@@ -526,16 +582,14 @@ func (c *Controller) featureSessionsTerminal(ctx context.Context, handle RunHand
 		}
 		for i := range sessions {
 			s := sessions[i]
-			if s.Role == run.RoleManager {
-				manager = s
-				managerFound = true
+			if managerFound && s.ID == manager.ID {
 				continue
 			}
 			if s.State != run.SessionTerminated && s.State != run.SessionLost {
-				childrenTerminal = false
+				othersTerminal = false
 			}
 		}
 		return nil
 	})
-	return childrenTerminal, manager, managerFound, err
+	return othersTerminal, manager, managerFound, err
 }

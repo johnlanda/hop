@@ -121,6 +121,88 @@ func TestReviewFixFenceRaceLosingCAS(t *testing.T) {
 	}
 }
 
+// TestReviewFixTerminalFailureRetiresCandidate pins finding 3: a
+// feature run's terminal failure mirrors stop — the current
+// integration's published-but-unsettled candidate is rolled back
+// through the shared shutdown procedure BEFORE the run marks failed,
+// and the terminal transaction re-validates quiescence, so the
+// integration ref never rests on an unvalidated candidate in a failed
+// run.
+func TestReviewFixTerminalFailureRetiresCandidate(t *testing.T) {
+	f := newIntegrationFixture(t, false)
+	f.driveUntil(t, string(run.IntegrationChecking), 5)
+	merged := f.git.ref(integrationRefName)
+	seedImplementTask(t, f.tc, f.fr.RunID, 2, "exhausted independent task", false, run.TaskFailed)
+	f.tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) { return app.PaneProcess{}, app.ErrPaneNotFound }
+
+	var report app.RetirementReport
+	var err error
+	for i := 0; i < 6 && !report.RunFailed; i++ {
+		report, err = f.tc.Controller.RetireSettledSessions(context.Background(), f.fr.Handle)
+		if err != nil {
+			t.Fatalf("RetireSettledSessions() round %d error = %v", i+1, err)
+		}
+	}
+	if !report.RunFailed {
+		t.Fatalf("terminal failure never completed; report=%+v", report)
+	}
+	if got := f.currentIntegrationRow(t).State; got != run.IntegrationRolledBack {
+		t.Fatalf("integration state = %s, want the published candidate rolled back before the failed commit", got)
+	}
+	if head := f.git.ref(integrationRefName); head == merged {
+		t.Fatalf("unsafe: terminal failure left the unvalidated candidate published")
+	}
+	if got := f.tc.Store.Runs[f.fr.RunID].value.State; got != run.RunFailed {
+		t.Fatalf("run state = %s, want failed", got)
+	}
+}
+
+// TestReviewFixHistoricalManagerNeverShadows pins finding 4: the
+// current manager resolves through the ManagerSession port, so a
+// historical lost manager row (a cold relaunch's retired predecessor)
+// can never shadow the live manager in map order and let the run fail
+// while the real manager is still active. 64 iterations force the
+// fake's map iteration through both orders.
+func TestReviewFixHistoricalManagerNeverShadows(t *testing.T) {
+	for i := 0; i < 64; i++ {
+		f := newIntegrationFixture(t, false)
+		seedImplementTask(t, f.tc, f.fr.RunID, 2, "exhausted", false, run.TaskFailed)
+		old := f.tc.Store.Sessions[f.fr.ManagerID].value
+		old.ID = identity.SessionID(f.tc.IDs.NewID())
+		old.State = run.SessionLost
+		f.tc.Store.Sessions[old.ID] = &entityRow[run.Session]{value: old, revision: 1}
+
+		// The live manager's pane observation is AMBIGUOUS: it must not
+		// be retired, and the run must not fail past it.
+		f.tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			return app.PaneProcess{}, errors.New("live manager is not absent")
+		}
+		report, err := f.tc.Controller.RetireSettledSessions(context.Background(), f.fr.Handle)
+		if err != nil {
+			t.Fatalf("iteration %d: RetireSettledSessions() error = %v", i, err)
+		}
+		if report.RunFailed {
+			t.Fatalf("iteration %d: run failed while the live manager was unretired; report=%+v", i, report)
+		}
+		if got := f.tc.Store.Sessions[f.fr.ManagerID].value.State; got != run.SessionActive {
+			t.Fatalf("iteration %d: live manager state = %s, want left active under ambiguity", i, got)
+		}
+
+		// Absence observed: the live manager retires and the run fails —
+		// the historical lost row never blocks the terminal state either.
+		f.tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) { return app.PaneProcess{}, app.ErrPaneNotFound }
+		for j := 0; j < 6 && !report.RunFailed; j++ {
+			report, err = f.tc.Controller.RetireSettledSessions(context.Background(), f.fr.Handle)
+			if err != nil {
+				t.Fatalf("iteration %d: RetireSettledSessions() round %d error = %v", i, j+2, err)
+			}
+		}
+		if !report.RunFailed {
+			t.Fatalf("iteration %d: terminal failure never completed after absence; report=%+v", i, report)
+		}
+	}
+}
+
 // TestReviewFixRetentionFailure pins finding 2: a zero-exit check whose
 // output retention failed is never adopted as passing evidence — the
 // combined check settles the integration check-failed (the reset
