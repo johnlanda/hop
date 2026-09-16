@@ -337,6 +337,13 @@ func (c *Controller) assignOneReadyTask(ctx context.Context, handle RunHandle, i
 		if r.StopRequested {
 			return fmt.Errorf("%w: run %s", ErrStopRequested, handle.runID)
 		}
+		// Nothing is assigned into a run that carries a terminal-failure
+		// cause, including one a launch settlement earlier in this pass
+		// created: the run can only fail from here.
+		failing, err := featureFailureCauseLocked(ctx, uow, wf, handle.runID)
+		if err != nil || failing {
+			return err
+		}
 
 		occupied, err := countOccupiedChildSessions(ctx, wf, handle.runID)
 		if err != nil {

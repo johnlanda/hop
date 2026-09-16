@@ -235,11 +235,20 @@ func (c *Controller) retirementCandidates(ctx context.Context, handle RunHandle)
 // running). Any other lineage shape — no manager, or more than one member
 // never marked lost — is no cause.
 func managerLaunchFailedLocked(ctx context.Context, uow UnitOfWork, wf WorkflowRepositories, runID identity.RunID) (bool, error) {
+	return managerLineageFailedLocked(ctx, uow, wf, runID, run.RunLaunching, run.RunRunning)
+}
+
+// managerLineageFailedLocked is managerLaunchFailedLocked's predicate with
+// the run states it is read in named by the caller: the lineage's most
+// recent session has an exec_failed launch claim while the run is in one
+// of admissible. Every admissible set excludes completing, completed,
+// stopping and stopped, where a manager is legitimately terminal.
+func managerLineageFailedLocked(ctx context.Context, uow UnitOfWork, wf WorkflowRepositories, runID identity.RunID, admissible ...run.RunState) (bool, error) {
 	r, _, err := uow.Runs().Get(ctx, runID)
 	if err != nil {
 		return false, err
 	}
-	if r.State != run.RunLaunching && r.State != run.RunRunning {
+	if !slices.Contains(admissible, r.State) {
 		return false, nil
 	}
 	head, found, err := latestManagerSessionLocked(ctx, wf, runID)

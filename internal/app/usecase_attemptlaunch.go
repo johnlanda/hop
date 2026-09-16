@@ -261,7 +261,21 @@ func (c *Controller) recoverAttemptLaunches(ctx context.Context, handle RunHandl
 	if err != nil {
 		return round, err
 	}
+	states := make([]attemptLaunchState, len(targets))
 	for i := range targets {
+		if states[i], err = c.readAttemptLaunchState(ctx, handle, &targets[i]); err != nil {
+			return round, err
+		}
+	}
+	// Settlements run before any launch step: a task one of them fails
+	// becomes a terminal-failure cause that suppresses every launch after
+	// it in this round, whatever the targets' order.
+	order := make([]int, len(targets))
+	for i := range order {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(a, b int) bool { return states[order[a]].settles() && !states[order[b]].settles() })
+	for _, i := range order {
 		target := &targets[i]
 		var condition AttemptLaunchCondition
 		switch {
@@ -274,7 +288,15 @@ func (c *Controller) recoverAttemptLaunches(ctx context.Context, handle RunHandl
 			}
 			condition = target.report(disposition, byAttempt[target.attempt.ID])
 		default:
-			condition, err = c.advanceAttemptLaunch(ctx, handle, in, target, len(round.blocked) > 0)
+			disposition, detail, suppressErr := c.launchSuppression(ctx, handle)
+			if suppressErr != nil {
+				return round, suppressErr
+			}
+			if disposition != "" {
+				condition = target.report(disposition, detail)
+				break
+			}
+			condition, err = c.advanceAttemptLaunch(ctx, handle, in, target, &states[i], len(round.blocked) > 0)
 			if err != nil {
 				return round, err
 			}
@@ -525,18 +547,26 @@ func (c *Controller) unresolvedAttemptLaunches(ctx context.Context, handle RunHa
 	return targets, blocked, err
 }
 
-// advanceAttemptLaunch advances one unresolved launch whose own
-// worktree.create is not unresolved: an existing row continues the launch,
-// a failed operation settles the attempt, no operation re-drives the
-// create — unless an unattributable operation might be this attempt's.
-func (c *Controller) advanceAttemptLaunch(ctx context.Context, handle RunHandle, in *attemptLaunchInputs, target *attemptLaunchTarget, unattributed bool) (AttemptLaunchCondition, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per target.
-	var (
-		row       run.Worktree
-		hasRow    bool
-		newest    *Operation
-		workspace string
-	)
-	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+// attemptLaunchState is what one unresolved launch's next step depends
+// on: the attempt's worktree row, its newest worktree.create and the
+// workspace a succeeded one recorded.
+type attemptLaunchState struct {
+	row       run.Worktree
+	hasRow    bool
+	newest    *Operation
+	workspace string
+}
+
+// settles reports whether the launch's next step is a launch-failure
+// settlement: a failed worktree.create and no row.
+func (s *attemptLaunchState) settles() bool {
+	return !s.hasRow && s.newest != nil && s.newest.State == OperationFailed
+}
+
+// readAttemptLaunchState reads one target's attemptLaunchState.
+func (c *Controller) readAttemptLaunchState(ctx context.Context, handle RunHandle, target *attemptLaunchTarget) (attemptLaunchState, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per target.
+	var state attemptLaunchState
+	err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 		wf, err := RequireWorkflowRepositories(uow, "attempt launch recovery")
 		if err != nil {
 			return err
@@ -544,7 +574,7 @@ func (c *Controller) advanceAttemptLaunch(ctx context.Context, handle RunHandle,
 		w, _, err := wf.WorktreeIndex().ByAttempt(ctx, target.attempt.ID)
 		switch {
 		case err == nil:
-			row, hasRow = w, true
+			state.row, state.hasRow = w, true
 		case !errors.Is(err, ErrNotFound):
 			return err
 		}
@@ -557,23 +587,28 @@ func (c *Controller) advanceAttemptLaunch(ctx context.Context, handle RunHandle,
 			if !ok || intent.AttemptID != target.attempt.ID {
 				continue
 			}
-			if newest == nil {
+			if state.newest == nil {
 				op := ops[i]
-				newest = &op
+				state.newest = &op
 			}
-			if ops[i].State == OperationSucceeded && workspace == "" {
-				workspace = recordedWorkspace(&ops[i], intent.Branch)
+			if ops[i].State == OperationSucceeded && state.workspace == "" {
+				state.workspace = recordedWorkspace(&ops[i], intent.Branch)
 			}
 		}
 		return nil
-	}); err != nil {
-		return AttemptLaunchCondition{}, err
-	}
+	})
+	return state, err
+}
 
+// advanceAttemptLaunch advances one unresolved launch whose own
+// worktree.create is not unresolved: an existing row continues the launch,
+// a failed operation settles the attempt, no operation re-drives the
+// create — unless an unattributable operation might be this attempt's.
+func (c *Controller) advanceAttemptLaunch(ctx context.Context, handle RunHandle, in *attemptLaunchInputs, target *attemptLaunchTarget, state *attemptLaunchState, unattributed bool) (AttemptLaunchCondition, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per target.
 	switch {
-	case hasRow:
-		return c.continueAttemptLaunch(ctx, handle, in, target, WorktreeInfo{WorkspaceID: workspace, Path: row.Path, Branch: row.Branch}, "")
-	case newest == nil:
+	case state.hasRow:
+		return c.continueAttemptLaunch(ctx, handle, in, target, WorktreeInfo{WorkspaceID: state.workspace, Path: state.row.Path, Branch: state.row.Branch}, "")
+	case state.newest == nil:
 		if unattributed {
 			return target.report(AttemptLaunchReconciling, "an unattributable worktree operation may be this attempt's; nothing is created while it stands"), nil
 		}
@@ -583,8 +618,8 @@ func (c *Controller) advanceAttemptLaunch(ctx context.Context, handle RunHandle,
 		}
 		condition, _, err := c.launchAttempt(ctx, handle, in, target, worktreeID, "")
 		return condition, err
-	case newest.State == OperationFailed:
-		return c.settleAttemptLaunchFailure(ctx, handle, in.frozen, target, failedWorktreeReason(newest))
+	case state.newest.State == OperationFailed:
+		return c.settleAttemptLaunchFailure(ctx, handle, in.frozen, target, failedWorktreeReason(state.newest))
 	default:
 		return target.report(AttemptLaunchReconciling, "the attempt's worktree operation succeeded but its row is missing; failing closed"), nil
 	}
@@ -642,6 +677,9 @@ func (c *Controller) launchAttempt(ctx context.Context, handle RunHandle, in *at
 		condition, err := c.settleAttemptLaunchFailure(ctx, handle, in.frozen, target, fmt.Sprintf("worktree creation refused: %s already exists, and an existing branch would ignore the attempt's base", ref))
 		return condition, WorktreeInfo{}, err
 	}
+	if disposition, detail, err := c.launchSuppression(ctx, handle); err != nil || disposition != "" {
+		return target.report(disposition, detail), WorktreeInfo{}, err
+	}
 
 	info, outcome, err := c.createAttemptWorktree(ctx, handle, worktreeID, target.attempt.ID, in.frozen.RepositoryRoot, branch, base, c.Clock.Now())
 	if err != nil {
@@ -682,6 +720,9 @@ func (c *Controller) continueAttemptLaunch(ctx context.Context, handle RunHandle
 	if target.task.Kind == run.TaskKindReview && facts.reviewBase == "" {
 		return target.report(AttemptLaunchReconciling, "no integration is recorded for the run; the review assignment's diff scope cannot be rendered"), nil
 	}
+	if disposition, detail, err := c.launchSuppression(ctx, handle); err != nil || disposition != "" {
+		return target.report(disposition, detail), err
+	}
 	if err := c.writeAttemptAssignment(ctx, in.frozen, &target.task, &target.attempt, target.session.Role, in.hopPath, facts.prior, facts.reviewBase); err != nil {
 		return target.report(AttemptLaunchReconciling, "the attempt's assignment artifact could not be written; a later round writes it before the pane opens"), nil //nolint:nilerr // a failed artifact write defers the pane; the next round rewrites it.
 	}
@@ -691,6 +732,9 @@ func (c *Controller) continueAttemptLaunch(ctx context.Context, handle RunHandle
 			return AttemptLaunchCondition{}, fmt.Errorf("app: generate incarnation id: %w", err)
 		}
 		incarnationID = fresh
+	}
+	if disposition, detail, err := c.launchSuppression(ctx, handle); err != nil || disposition != "" {
+		return target.report(disposition, detail), err
 	}
 	outcome, err := c.openChildPane(ctx, handle, target.task.ID, target.attempt.ID, target.session.ID, incarnationID, target.session.Role, worktree, in.hopPath, in.stateRoot, c.Clock.Now())
 	if err != nil {
@@ -767,7 +811,10 @@ func (c *Controller) settleAttemptLaunchFailure(ctx context.Context, handle RunH
 // featureFailureCauseLocked reports, inside the caller's transaction,
 // whether the run carries a durable terminal-failure cause (a failed task,
 // or the manager lineage's exec failure) — the causes RetireSettledSessions
-// fails the run for. Nothing new is launched while one stands.
+// fails the run for. Nothing new is launched while one stands. The
+// manager-lineage cause is read while the run is resuming too, since
+// resume recovers launches after it has entered resuming; when the
+// retirement pass fails the run is unchanged (managerLaunchFailedLocked).
 func featureFailureCauseLocked(ctx context.Context, uow UnitOfWork, wf WorkflowRepositories, runID identity.RunID) (bool, error) {
 	tasks, err := wf.TaskIndex().ByRun(ctx, runID)
 	if err != nil {
@@ -778,7 +825,37 @@ func featureFailureCauseLocked(ctx context.Context, uow UnitOfWork, wf WorkflowR
 			return true, nil
 		}
 	}
-	return managerLaunchFailedLocked(ctx, uow, wf, runID)
+	return managerLineageFailedLocked(ctx, uow, wf, runID, run.RunLaunching, run.RunRunning, run.RunResuming)
+}
+
+// launchSuppression re-reads, in its own unit of work, what forbids a new
+// launch step — a worktree intent, an assignment artifact or a pane — for
+// an assigned attempt: a held stop, or a durable terminal-failure cause.
+// It returns the disposition and fixed detail to report, "" when the
+// launch may proceed. Checked immediately before each such step, so a
+// cause a settlement created earlier in the same round, or a manager
+// exec failure recorded meanwhile, suppresses every later launch.
+func (c *Controller) launchSuppression(ctx context.Context, handle RunHandle) (disposition, detail string, err error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per launch step.
+	err = c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		wf, wfErr := RequireWorkflowRepositories(uow, "attempt launch")
+		if wfErr != nil {
+			return wfErr
+		}
+		r, _, runErr := uow.Runs().Get(ctx, handle.runID)
+		if runErr != nil {
+			return runErr
+		}
+		if r.StopRequested {
+			disposition, detail = AttemptLaunchStopRequested, "a stop is requested; nothing more is launched, and stop handling resolves this launch"
+			return nil
+		}
+		failing, causeErr := featureFailureCauseLocked(ctx, uow, wf, handle.runID)
+		if failing {
+			disposition, detail = AttemptLaunchReconciling, "the run carries a terminal-failure cause; nothing more is launched, and the failure settlement retires this session"
+		}
+		return causeErr
+	})
+	return disposition, detail, err
 }
 
 // resolveAttemptWorktreesForShutdown resolves every unresolved per-attempt
