@@ -13,12 +13,19 @@ type Command struct {
 	Env  []string
 }
 
-// CommandResult is one completed invocation's outcome.
+// CommandResult is one completed invocation's outcome. Each captured
+// stream is bounded by the runner; StdoutTruncated and StderrTruncated
+// report that the runner discarded bytes of that stream past its bound, so
+// the stream holds only a prefix of what the command wrote, whatever its
+// exit status. A caller whose decision depends on a stream's whole content
+// treats a truncated stream as unobserved.
 type CommandResult struct {
-	ExitCode int
-	Stdout   []byte
-	Stderr   []byte
-	Duration time.Duration
+	ExitCode        int
+	Stdout          []byte
+	Stderr          []byte
+	StdoutTruncated bool
+	StderrTruncated bool
+	Duration        time.Duration
 }
 
 // CommandRunner executes argv as the leader of a new process group and

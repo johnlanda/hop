@@ -49,7 +49,8 @@ func TestParseWorktreeListZ(t *testing.T) {
 
 // TestHasHiddenIndexFlags reads `git ls-files -v -z` tags as the probe
 // pinned them: H is an ordinary tracked entry, a lowercase tag is
-// assume-unchanged and S is skip-worktree.
+// assume-unchanged and S is skip-worktree, and every entry is
+// NUL-terminated, so a cut final entry is an error.
 func TestHasHiddenIndexFlags(t *testing.T) {
 	cases := []struct {
 		name string
@@ -64,6 +65,9 @@ func TestHasHiddenIndexFlags(t *testing.T) {
 		{"path with spaces", "H a b.txt\x00", false, false},
 		{"untagged entry", "f.txt\x00", false, true},
 		{"missing separator", "Hf.txt\x00", false, true},
+		{"a cut final entry", "H .gitignore\x00H f.t", false, true},
+		{"a cut final entry after its tag", "H .gitignore\x00H ", false, true},
+		{"a single unterminated entry", "H f.txt", false, true},
 	}
 	for _, tc := range cases {
 		got, err := hasHiddenIndexFlags([]byte(tc.out))

@@ -16,7 +16,8 @@ import (
 const (
 	// maxCapturedBytes bounds each captured output stream. A child that
 	// writes more keeps running with its pipe drained, but only the first
-	// maxCapturedBytes per stream are returned.
+	// maxCapturedBytes per stream are returned, and the result reports that
+	// stream truncated.
 	maxCapturedBytes = 1 << 20
 	// reapTimeout bounds the cancellation teardown: the wait for the
 	// SIGKILLed leader to be reaped and the poll for its group to empty.
@@ -68,7 +69,9 @@ func (e *CancellationError) Unwrap() error { return e.Cause }
 // which binary runs); cmd.Env is the complete environment — nothing is
 // inherited, and a nil Env runs with an empty environment. A completed
 // command is a result, not an error: ExitCode carries the exit status, or
-// -1 for a termination by a signal Run did not send. On ctx cancellation
+// -1 for a termination by a signal Run did not send. Each stream keeps its
+// first maxCapturedBytes, and StdoutTruncated/StderrTruncated report any
+// stream whose later bytes were discarded. On ctx cancellation
 // the whole group is SIGKILLed, the leader is reaped within a bounded wait,
 // and the returned error is a *CancellationError alongside the output
 // captured so far.
@@ -188,12 +191,8 @@ func cancelRun(ctx context.Context, leader, anchor *exec.Cmd, pgid int, waitDone
 	}
 	anchorRetireErr := retireAnchor(anchor) // the anchor took the group SIGKILL; this is its single reap
 	cancellation.GroupEmptied = awaitGroupGone(pgid)
-	result := app.CommandResult{
-		ExitCode: leader.ProcessState.ExitCode(),
-		Stdout:   stdout.bytes(),
-		Stderr:   stderr.bytes(),
-		Duration: time.Since(start),
-	}
+	result := capturedResult(stdout, stderr, time.Since(start))
+	result.ExitCode = leader.ProcessState.ExitCode()
 	if killErr != nil || anchorRetireErr != nil {
 		return result, errors.Join(cancellation, killErr, anchorRetireErr)
 	}
@@ -205,7 +204,7 @@ func cancelRun(ctx context.Context, leader, anchor *exec.Cmd, pgid int, waitDone
 // result with ExitCode -1 (the ProcessState convention) and no error — the
 // caller judges outcomes by exit code; any other wait failure is an error.
 func resultFromWait(waitErr error, stdout, stderr *boundedBuffer, duration time.Duration) (app.CommandResult, error) {
-	result := app.CommandResult{Stdout: stdout.bytes(), Stderr: stderr.bytes(), Duration: duration}
+	result := capturedResult(stdout, stderr, duration)
 	if waitErr == nil {
 		return result, nil
 	}
@@ -214,6 +213,16 @@ func resultFromWait(waitErr error, stdout, stderr *boundedBuffer, duration time.
 		return result, nil
 	}
 	return result, fmt.Errorf("wait: %w", waitErr)
+}
+
+// capturedResult is a result carrying the reaped command's captured
+// streams, each with whether its bound discarded bytes.
+func capturedResult(stdout, stderr *boundedBuffer, duration time.Duration) app.CommandResult {
+	return app.CommandResult{
+		Stdout: stdout.bytes(), StdoutTruncated: stdout.truncated,
+		Stderr: stderr.bytes(), StderrTruncated: stderr.truncated,
+		Duration: duration,
+	}
 }
 
 // startAnchor launches a sleep into the existing process group pgid, so an
@@ -301,19 +310,23 @@ func awaitGroupGone(pgid int) bool {
 }
 
 // boundedBuffer keeps the first limit bytes written and discards the rest,
-// so a torrential child cannot grow the captured output without bound.
-// Write never fails, which keeps the child's pipe drained to the end.
+// so a torrential child cannot grow the captured output without bound;
+// truncated records that some byte was discarded. Write never fails, which
+// keeps the child's pipe drained to the end.
 type boundedBuffer struct {
-	limit int
-	data  []byte
+	limit     int
+	data      []byte
+	truncated bool
 }
 
 // Write records up to the remaining capacity and reports the full length as
 // written.
 func (b *boundedBuffer) Write(p []byte) (int, error) {
-	if room := b.limit - len(b.data); room > 0 {
-		b.data = append(b.data, p[:min(room, len(p))]...)
+	room := max(b.limit-len(b.data), 0)
+	if len(p) > room {
+		b.truncated = true
 	}
+	b.data = append(b.data, p[:min(room, len(p))]...)
 	return len(p), nil
 }
 

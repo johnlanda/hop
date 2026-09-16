@@ -40,6 +40,8 @@ func TestMain(m *testing.M) {
 		helperExec()
 	case "execresolved":
 		helperExecResolved()
+	case "flood":
+		helperFlood()
 	default:
 		fmt.Fprintf(os.Stderr, "unknown helper mode %q\n", mode)
 		os.Exit(97)
@@ -86,6 +88,43 @@ func helperEnvDump() {
 		code = parsed
 	}
 	os.Exit(code)
+}
+
+// helperFlood writes exactly HOP_HELPER_STDOUT_BYTES bytes to stdout and
+// HOP_HELPER_STDERR_BYTES bytes to stderr, each in HOP_HELPER_CHUNK_BYTES
+// writes (default 64 KiB), and nothing else, then exits with
+// HOP_HELPER_EXIT.
+func helperFlood() {
+	chunkSize := helperInt("HOP_HELPER_CHUNK_BYTES", 64*1024)
+	for _, stream := range []struct {
+		out *os.File
+		n   int
+	}{{os.Stdout, helperInt("HOP_HELPER_STDOUT_BYTES", 0)}, {os.Stderr, helperInt("HOP_HELPER_STDERR_BYTES", 0)}} {
+		chunk := bytes.Repeat([]byte{'y'}, chunkSize)
+		for written := 0; written < stream.n; {
+			m := min(len(chunk), stream.n-written)
+			if _, err := stream.out.Write(chunk[:m]); err != nil {
+				os.Exit(95)
+			}
+			written += m
+		}
+	}
+	os.Exit(helperInt("HOP_HELPER_EXIT", 0))
+}
+
+// helperInt reads a non-negative integer helper variable, or def when it is
+// unset.
+func helperInt(name string, def int) int {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return def
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		fmt.Fprintln(os.Stderr, "bad", name)
+		os.Exit(96)
+	}
+	return n
 }
 
 // helperSleeper announces itself through its pid file, prints a readiness
@@ -361,6 +400,66 @@ func TestRunnerBoundsCapturedOutput(t *testing.T) {
 	}
 	if len(result.Stdout) != captureLimit {
 		t.Errorf("len(Stdout) = %d, want exactly the %d-byte cap", len(result.Stdout), captureLimit)
+	}
+	if !result.StdoutTruncated || result.StderrTruncated {
+		t.Errorf("StdoutTruncated = %v, StderrTruncated = %v; want only stdout reported truncated", result.StdoutTruncated, result.StderrTruncated)
+	}
+}
+
+// TestRunnerReportsTruncation pins the truncation flags through the real
+// Runner: a stream is reported truncated exactly when the child wrote more
+// than the 1 MiB bound — whatever the exit status, and whether the bound
+// falls inside a write or exactly between two — and each flag describes
+// only its own stream. Callers deciding on a whole stream rely on this.
+func TestRunnerReportsTruncation(t *testing.T) {
+	exe := testExecutable(t)
+	const captureLimit = 1 << 20
+	cases := []struct {
+		name                     string
+		stdout, stderr, chunk    int
+		exit                     int
+		wantStdout, wantStderr   int
+		stdoutTrunc, stderrTrunc bool
+	}{
+		{name: "small output", stdout: 10, stderr: 5, wantStdout: 10, wantStderr: 5},
+		{name: "empty output", wantStdout: 0, wantStderr: 0},
+		{name: "exactly the bound is complete", stdout: captureLimit, wantStdout: captureLimit},
+		{name: "exactly the bound in one write is complete", stdout: captureLimit, chunk: captureLimit, wantStdout: captureLimit},
+		{name: "one byte past the bound", stdout: captureLimit + 1, wantStdout: captureLimit, stdoutTrunc: true},
+		{name: "the bound falls exactly between two writes", stdout: 2 * captureLimit, chunk: captureLimit / 4, wantStdout: captureLimit, stdoutTrunc: true},
+		{name: "the bound falls inside a write", stdout: captureLimit + 100, chunk: 3000, wantStdout: captureLimit, stdoutTrunc: true},
+		{name: "truncated on a successful exit", stdout: 3 * captureLimit, wantStdout: captureLimit, stdoutTrunc: true},
+		{name: "truncated on a failing exit", stdout: 3 * captureLimit, exit: 3, wantStdout: captureLimit, stdoutTrunc: true},
+		{name: "stderr alone", stdout: 7, stderr: captureLimit + 1, wantStdout: 7, wantStderr: captureLimit, stderrTrunc: true},
+		{name: "both streams", stdout: captureLimit + 9, stderr: 2 * captureLimit, wantStdout: captureLimit, wantStderr: captureLimit, stdoutTrunc: true, stderrTrunc: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := []string{
+				helperModeVar + "=flood",
+				"HOP_HELPER_STDOUT_BYTES=" + strconv.Itoa(tc.stdout),
+				"HOP_HELPER_STDERR_BYTES=" + strconv.Itoa(tc.stderr),
+				"HOP_HELPER_EXIT=" + strconv.Itoa(tc.exit),
+			}
+			if tc.chunk != 0 {
+				env = append(env, "HOP_HELPER_CHUNK_BYTES="+strconv.Itoa(tc.chunk))
+			}
+
+			result, err := process.Runner{}.Run(t.Context(), app.Command{Argv: []string{exe}, Env: env})
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+
+			if result.ExitCode != tc.exit {
+				t.Errorf("ExitCode = %d, want %d", result.ExitCode, tc.exit)
+			}
+			if len(result.Stdout) != tc.wantStdout || len(result.Stderr) != tc.wantStderr {
+				t.Errorf("captured %d stdout and %d stderr bytes, want %d and %d", len(result.Stdout), len(result.Stderr), tc.wantStdout, tc.wantStderr)
+			}
+			if result.StdoutTruncated != tc.stdoutTrunc || result.StderrTruncated != tc.stderrTrunc {
+				t.Errorf("StdoutTruncated = %v, StderrTruncated = %v; want %v, %v", result.StdoutTruncated, result.StderrTruncated, tc.stdoutTrunc, tc.stderrTrunc)
+			}
+		})
 	}
 }
 

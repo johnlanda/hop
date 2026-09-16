@@ -774,6 +774,45 @@ consistent with sections 1 to 12.
   - Retirement's own git reads suppress global and system configuration
     and fsmonitor, and never force a removal.
 
+**Output completeness.**
+
+- **The runner reports truncation.** The process runner keeps at most
+  1 MiB of each stream. `CommandResult.StdoutTruncated` and
+  `StderrTruncated` report a stream whose later bytes it discarded,
+  whatever the exit status; the fake runner applies the same bound and
+  computes the same flags. A kept prefix can end exactly on a record
+  boundary (an `ls-files -v -z` entry, a `worktree list -z` record) and
+  then parses as complete output, so no rule decides on the prefix's
+  shape.
+- **Retirement never decides on a truncated read.** `retirementGit`
+  refuses every retirement read with either stream truncated, and each
+  caller already treats a failed read as unobservable:
+  - the pre-check retains the row as `inspection-failed`, removes
+    nothing and journals nothing, and the next pass looks again;
+  - the post-act observation leaves the operation `reconciling`;
+  - recovery blocks;
+  - the target read fails the check, and the identity check reports
+    `history-missing`, which touches nothing.
+
+  A hidden-flag entry past the bound therefore retains the checkout
+  instead of letting a removal delete the hidden change. A worktree
+  listing cut before a candidate's record retains that row (never
+  `released` as unregistered, never `absent`); since the listing is the
+  same for every row, the whole run defers with the existing dispositions
+  and its fact stays unset. A truncated `status` read is retained as
+  `inspection-failed` too, so every truncated read has one outcome.
+- **The `ls-files` terminator.** Every `ls-files -v -z` entry is
+  NUL-terminated (probe-pinned), so output ending without one is
+  malformed. This catches a cut inside an entry, but proves nothing
+  about completeness; the truncation report does.
+- **The claimed acts.** The check decides on its exit status alone, and
+  a removal on the post-act observation, so a truncated act output
+  changes no decision. A failed removal's evidence files hold at most the
+  captured prefix of each stream.
+- **The human action.** `inspection-failed` renders "the checkout could
+  not be fully inspected; check it and its repository, then run hop
+  status again", replacing section 6's "check the checkout".
+
 **Dispatch revalidation (`revalidateRetirementDispatch`).** Both claimed
 acts run it immediately before the spawn:
 

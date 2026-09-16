@@ -23,6 +23,7 @@ const (
 // inspectFixture is a test controller whose git is the fake repository with
 // its linked attempt-worktree model installed.
 type inspectFixture struct {
+	t          *testing.T
 	tc         *testController
 	git        *fakeGitRepo
 	base, head string
@@ -45,7 +46,7 @@ func newInspectFixture(t *testing.T) *inspectFixture {
 		git.requireNoForcedAttemptRemovals(t)
 		git.requireNoFsmonitorRuns(t)
 	})
-	return &inspectFixture{tc: tc, git: git, base: base, head: head, present: map[string]bool{inspectRoot: true, inspectCommon: true}}
+	return &inspectFixture{t: t, tc: tc, git: git, base: base, head: head, present: map[string]bool{inspectRoot: true, inspectCommon: true}}
 }
 
 // inspector canonicalizes /var/ to /private/var/ (the macOS symlink) and
@@ -227,6 +228,104 @@ func TestInspectAttemptCheckout(t *testing.T) {
 			want: retained(app.RetainedInspectionFailed),
 		},
 		{
+			name: "an assume-unchanged flag past the capture bound, the index cut on an entry boundary: retained",
+			setup: func(f *inspectFixture) {
+				f.addCheckout(fakeAttemptWorktree{AssumeUnchanged: true, IndexPadding: fakeCaptureBytes - len("H .gitignore\x00")})
+			},
+			want: retained(app.RetainedInspectionFailed),
+		},
+		{
+			name: "a skip-worktree flag past the capture bound, the index cut on an entry boundary: retained",
+			setup: func(f *inspectFixture) {
+				f.addCheckout(fakeAttemptWorktree{SkipWorktree: true, IndexPadding: fakeCaptureBytes - len("H .gitignore\x00")})
+			},
+			want: retained(app.RetainedInspectionFailed),
+		},
+		{
+			name: "a hidden flag past the capture bound, the index cut inside an entry: retained",
+			setup: func(f *inspectFixture) {
+				f.addCheckout(fakeAttemptWorktree{SkipWorktree: true, IndexPadding: fakeCaptureBytes - len("H .gitignore\x00") + 5})
+			},
+			want: retained(app.RetainedInspectionFailed),
+		},
+		{
+			name: "a clean index past the capture bound: retained, never removable on a prefix",
+			setup: func(f *inspectFixture) {
+				f.addCheckout(fakeAttemptWorktree{IndexPadding: 2 * fakeCaptureBytes})
+			},
+			want: retained(app.RetainedInspectionFailed),
+		},
+		{
+			name: "a large index read to its end still shows its hidden flag",
+			setup: func(f *inspectFixture) {
+				f.addCheckout(fakeAttemptWorktree{AssumeUnchanged: true, IndexPadding: fakeCaptureBytes - len("H .gitignore\x00h f.txt\x00H g.txt\x00")})
+			},
+			want: retained(app.RetainedHiddenChanges),
+		},
+		{
+			name: "a large clean index read to its end: removable",
+			setup: func(f *inspectFixture) {
+				f.addCheckout(fakeAttemptWorktree{IndexPadding: fakeCaptureBytes - len("H .gitignore\x00H f.txt\x00H g.txt\x00")})
+			},
+			want: app.CheckoutVerdictForTest{Disposition: "removable", ListedPath: inspectCanonical},
+		},
+		{
+			name: "an index read whose stderr was truncated: retained",
+			setup: func(f *inspectFixture) {
+				f.addCheckout(fakeAttemptWorktree{})
+				f.failGit("ls-files", app.CommandResult{Stdout: []byte("H .gitignore\x00H f.txt\x00H g.txt\x00"), Stderr: make([]byte, fakeCaptureBytes+1)}, nil)
+			},
+			want: retained(app.RetainedInspectionFailed),
+		},
+		{
+			name: "status output past the capture bound: retained as uninspectable",
+			setup: func(f *inspectFixture) {
+				f.addCheckout(fakeAttemptWorktree{})
+				f.failGit("status", app.CommandResult{Stdout: []byte(strings.Repeat("?? new.txt\n", fakeCaptureBytes/10))}, nil)
+			},
+			want: retained(app.RetainedInspectionFailed),
+		},
+		{
+			name: "a common-directory read past the capture bound: retained, never another repository",
+			setup: func(f *inspectFixture) {
+				// The kept prefix names an existing other repository.
+				f.present["/elsewhere/.git"] = true
+				f.addCheckout(fakeAttemptWorktree{})
+				f.tc.Commands.RunHook = func(ctx context.Context, cmd app.Command) (app.CommandResult, bool, error) {
+					if slices.Contains(cmd.Argv, "--git-common-dir") && slices.Contains(cmd.Argv, inspectCanonical) {
+						return app.CommandResult{Stdout: []byte("/elsewhere/.git\n" + strings.Repeat("\n", fakeCaptureBytes))}, true, nil
+					}
+					return f.git.Hook(ctx, cmd)
+				}
+			},
+			want: retained(app.RetainedInspectionFailed),
+		},
+		{
+			name: "the worktree list cut on a record boundary before the candidate's record: retained, never released",
+			setup: func(f *inspectFixture) {
+				f.addCheckout(fakeAttemptWorktree{})
+				f.fillListingBeforeCandidate(fakeCaptureBytes)
+			},
+			want: app.CheckoutVerdictForTest{Disposition: "retained", Retained: app.RetainedInspectionFailed},
+		},
+		{
+			name: "a gone checkout whose record lies past the listing's capture bound: retained, never absent",
+			setup: func(f *inspectFixture) {
+				f.addCheckout(fakeAttemptWorktree{})
+				f.fillListingBeforeCandidate(fakeCaptureBytes)
+				f.mutate(func(w *fakeAttemptWorktree) { w.Present = false })
+			},
+			want: app.CheckoutVerdictForTest{Disposition: "retained", Retained: app.RetainedInspectionFailed},
+		},
+		{
+			name: "a listing that fills the bound exactly, the candidate within it: removable",
+			setup: func(f *inspectFixture) {
+				f.addCheckout(fakeAttemptWorktree{})
+				f.fillListingBeforeCandidate(fakeCaptureBytes - f.candidateRecordBytes())
+			},
+			want: app.CheckoutVerdictForTest{Disposition: "removable", ListedPath: inspectCanonical},
+		},
+		{
 			name: "the checkout path cannot be resolved: retained",
 			setup: func(f *inspectFixture) {
 				f.addCheckout(fakeAttemptWorktree{})
@@ -319,6 +418,20 @@ func (f *inspectFixture) setBranch(branch string) {
 
 func (f *inspectFixture) setHead(head string) {
 	f.mutate(func(w *fakeAttemptWorktree) { w.Head = head })
+}
+
+// fillListingBeforeCandidate makes the root's worktree listing hold
+// exactly n bytes before the candidate's record.
+func (f *inspectFixture) fillListingBeforeCandidate(n int) {
+	f.t.Helper()
+	f.git.fillListingBefore(f.t, inspectCanonical, n)
+}
+
+// candidateRecordBytes is the length of the candidate's record, the last
+// one in the listing.
+func (f *inspectFixture) candidateRecordBytes() int {
+	f.t.Helper()
+	return len(f.git.worktreeListing()) - f.git.listingOffset(f.t, inspectCanonical)
 }
 
 // failGit answers every git invocation of subcommand with result and err

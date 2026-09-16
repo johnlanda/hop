@@ -643,6 +643,16 @@ func TestRemoveRunWorktrees(t *testing.T) {
 			wantRow: "unresolved", wantState: run.WorktreeActive, wantOpState: app.OperationReconciling,
 		},
 		{
+			name: "the worktree list after a refused act is cut by the capture bound before the checkout: reconciling, never released",
+			hook: func(f *retireFixture, a *retireAttempt) func(app.Command) (app.CommandResult, bool, error) {
+				return func(app.Command) (app.CommandResult, bool, error) {
+					f.git.fillListingBefore(f.t, a.Listed, fakeCaptureBytes)
+					return app.CommandResult{ExitCode: 128, Stderr: []byte("fatal: refused\n")}, true, nil
+				}
+			},
+			wantRow: "unresolved", wantState: run.WorktreeActive, wantOpState: app.OperationReconciling,
+		},
+		{
 			name: "the checkout cannot be observed after the act: reconciling for the next pass",
 			hook: func(f *retireFixture, a *retireAttempt) func(app.Command) (app.CommandResult, bool, error) {
 				return func(app.Command) (app.CommandResult, bool, error) {

@@ -318,7 +318,51 @@ func newFakeCommands() *fakeCommands {
 
 func (*fakeCommands) key(cmd app.Command) string { return strings.Join(cmd.Argv, " ") }
 
+// fakeCaptureBytes is the real Runner's per-stream capture bound
+// (internal/adapters/process maxCapturedBytes).
+const fakeCaptureBytes = 1 << 20
+
+// Run answers cmd and then applies the real Runner's capture bound to the
+// answer, whether scripted, hooked or modeled (boundCapturedOutput).
 func (c *fakeCommands) Run(ctx context.Context, cmd app.Command) (app.CommandResult, error) {
+	result, err := c.run(ctx, cmd)
+	bounded, boundErr := boundCapturedOutput(result)
+	if boundErr != nil {
+		return app.CommandResult{}, boundErr
+	}
+	return bounded, err
+}
+
+// boundCapturedOutput reproduces the real Runner's bounded capture: each
+// stream keeps its first fakeCaptureBytes bytes and is reported truncated
+// exactly when bytes were discarded — whatever the exit status, and even
+// when the kept prefix ends on a record boundary. The fake computes the
+// flags itself; an answer that already claims truncation must hold exactly
+// the bound, the only truncated shape the real Runner reports, and any
+// other claim is refused as a fake misuse.
+func boundCapturedOutput(result app.CommandResult) (app.CommandResult, error) {
+	var err error
+	if result.Stdout, result.StdoutTruncated, err = boundCapturedStream(result.Stdout, result.StdoutTruncated); err != nil {
+		return app.CommandResult{}, fmt.Errorf("app_test: stdout: %w", err)
+	}
+	if result.Stderr, result.StderrTruncated, err = boundCapturedStream(result.Stderr, result.StderrTruncated); err != nil {
+		return app.CommandResult{}, fmt.Errorf("app_test: stderr: %w", err)
+	}
+	return result, nil
+}
+
+func boundCapturedStream(stream []byte, claimed bool) (kept []byte, truncated bool, err error) {
+	switch {
+	case len(stream) > fakeCaptureBytes:
+		return stream[:fakeCaptureBytes:fakeCaptureBytes], true, nil
+	case claimed && len(stream) != fakeCaptureBytes:
+		return nil, false, fmt.Errorf("an answer claims truncation with %d captured bytes; the real Runner reports truncation only with exactly %d", len(stream), fakeCaptureBytes)
+	default:
+		return stream, claimed, nil
+	}
+}
+
+func (c *fakeCommands) run(ctx context.Context, cmd app.Command) (app.CommandResult, error) {
 	// Mirror the real Runner's own contract (internal/adapters/process.
 	// Runner.Run): argv must be non-empty and argv[0] must be an absolute
 	// path. Enforcing it here, not just in the real adapter, is what makes

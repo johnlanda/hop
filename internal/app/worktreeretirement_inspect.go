@@ -64,13 +64,26 @@ func retirementGitEnv() []string {
 // side effect when GitExecutable is not absolute.
 var errRetirementGitUnconfigured = errors.New("app: git executable is not configured as an absolute path")
 
+// errRetirementOutputTruncated refuses a retirement git read whose captured
+// output the runner cut short.
+var errRetirementOutputTruncated = errors.New("app: a retirement git read's output was truncated")
+
 // retirementGit runs one unclaimed, read-only retirement git invocation
-// against dir under retirementGitEnv.
+// against dir under retirementGitEnv. A read whose stdout or stderr the
+// runner truncated is an error, never a result: a prefix of an index scan
+// or a worktree listing can end on a record boundary and look complete,
+// and a removal decided on it could delete what the rest of the output
+// would have protected. Every caller treats the error as an unobservable
+// read and removes nothing.
 func (c *Controller) retirementGit(ctx context.Context, dir string, args ...string) (CommandResult, error) {
 	if !filepath.IsAbs(c.GitExecutable) {
 		return CommandResult{}, errRetirementGitUnconfigured
 	}
-	return c.Commands.Run(ctx, Command{Argv: append([]string{c.GitExecutable, "-C", dir}, args...), Env: retirementGitEnv()})
+	result, err := c.Commands.Run(ctx, Command{Argv: append([]string{c.GitExecutable, "-C", dir}, args...), Env: retirementGitEnv()})
+	if err == nil && (result.StdoutTruncated || result.StderrTruncated) {
+		return result, errRetirementOutputTruncated
+	}
+	return result, err
 }
 
 // retirementIndexRead prefixes a read of a checkout's index with

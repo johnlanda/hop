@@ -73,8 +73,15 @@ func parseWorktreeListZ(out []byte) ([]listedWorktree, error) {
 // hasHiddenIndexFlags reports whether `git ls-files -v -z` output marks any
 // entry assume-unchanged (a lowercase tag) or skip-worktree (`S`): either
 // flag hides a modification from `git status`, and a removal would delete
-// it. An entry that is not `<tag> <path>` is an error, never a guess.
+// it. Every entry is NUL-terminated (probe-pinned), so output ending
+// without a terminator is an error, as is an entry that is not
+// `<tag> <path>` — never a guess. The terminator does not prove the output
+// complete (a cut can land on an entry boundary); completeness is the
+// runner's truncation report, which retirementGit enforces.
 func hasHiddenIndexFlags(out []byte) (bool, error) {
+	if len(out) != 0 && out[len(out)-1] != 0 {
+		return false, errors.New("ls-files output does not end with an entry terminator")
+	}
 	for entry := range bytes.SplitSeq(bytes.TrimSuffix(out, []byte{0}), []byte{0}) {
 		if len(entry) == 0 {
 			continue

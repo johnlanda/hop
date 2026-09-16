@@ -414,7 +414,7 @@ func TestWorktreeDetailLines(t *testing.T) {
 		app.RetainedLocked:             {"locked", "git worktree unlock, then run hop status again"},
 		app.RetainedInterruptedRemoval: {"interrupted removal", "inspect; restore (git checkout -- .) or remove it yourself, then run hop status again"},
 		app.RetainedRemoveRefused:      {"removal refused", "inspect the retained evidence, then run hop status again"},
-		app.RetainedInspectionFailed:   {"inspection failed", "check the checkout, then run hop status again"},
+		app.RetainedInspectionFailed:   {"inspection failed", "the checkout could not be fully inspected; check it and its repository, then run hop status again"},
 	} {
 		if got := [2]string{retainedLabel(category), retainedAction(category, "")}; got != want {
 			t.Errorf("%s = %q, want %q", category, got, want)

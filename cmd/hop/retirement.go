@@ -227,6 +227,7 @@ func retainedAction(category app.WorktreeRetainedCategory, evidencePath string) 
 			action += " at " + evidencePath
 		}
 	case app.RetainedInspectionFailed:
+		action = "the checkout could not be fully inspected; check it and its repository"
 	}
 	return action + ", then run hop status again"
 }

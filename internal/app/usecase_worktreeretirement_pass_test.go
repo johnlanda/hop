@@ -137,6 +137,46 @@ func TestRetireWorktrees(t *testing.T) {
 		}
 	})
 
+	t.Run("a worktree listing cut by the capture bound defers the run: every row retained, nothing removed or settled", func(t *testing.T) {
+		f := newRetireFixture(t)
+		a := f.addAttempt(1, fakeAttemptWorktree{}, nil)
+		gone := f.addAttempt(2, fakeAttemptWorktree{}, func(w *fakeAttemptWorktree) { w.Present = false })
+		// The first kept prefix ends on a record boundary just before the
+		// first candidate: without the truncation report it reads as a
+		// complete listing that names neither checkout.
+		f.git.fillListingBefore(t, a.Listed, fakeCaptureBytes)
+		for range 2 {
+			report, announcedAt := f.pass()
+			if report.Disposition != app.RetirementInProgress || report.Removed+report.Absent+report.Released != 0 || announcedAt != -1 || f.retiredAt() {
+				t.Fatalf("report = %+v (fact %v), want in progress with nothing final", report, f.retiredAt())
+			}
+			want := []app.WorktreeRetirementLine{
+				{Branch: a.Branch, Path: a.Recorded, Outcome: app.WorktreeOutcomeRetained, Retained: app.RetainedInspectionFailed},
+				{Branch: gone.Branch, Path: gone.Recorded, Outcome: app.WorktreeOutcomeRetained, Retained: app.RetainedInspectionFailed},
+			}
+			if !slices.Equal(report.Worktrees, want) {
+				t.Fatalf("lines = %+v, want both retained as uninspectable", report.Worktrees)
+			}
+			if len(f.retires()) != 0 || f.rowState(a.WorktreeID) != run.WorktreeActive || f.rowState(gone.WorktreeID) != run.WorktreeActive {
+				t.Fatalf("a cut listing settled something: %d retire operations, rows %s, %s", len(f.retires()), f.rowState(a.WorktreeID), f.rowState(gone.WorktreeID))
+			}
+			if removes, _, _ := f.git.attemptLog(); len(removes) != 0 {
+				t.Fatalf("removals = %v, want none", removes)
+			}
+			f.acquire()
+		}
+
+		// A complete listing lets the next pass finish.
+		f.git.addAttemptWorktree(fakeListingSibling, fakeAttemptWorktree{Head: fakeGitMainHead, Present: true, Locked: true, LockReason: "x"})
+		final, _ := f.pass()
+		if final.Disposition != app.RetirementRetired || final.Removed != 1 || final.Absent != 1 || !f.retiredAt() {
+			t.Fatalf("after the listing fits: %+v, want retired with one removed and the gone one pruned as absent", final)
+		}
+		if _, still := f.git.attemptWorktree(fakeListingSibling); !still {
+			t.Fatal("the unrelated sibling checkout was removed")
+		}
+	})
+
 	t.Run("a merged run without worktree rows is retired at once", func(t *testing.T) {
 		f := newRetireFixture(t)
 		report, announcedAt := f.pass()

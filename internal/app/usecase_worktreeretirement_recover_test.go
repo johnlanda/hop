@@ -188,6 +188,9 @@ func TestRecoverWorktreeRetire(t *testing.T) {
 		group      func(inner []string) []app.GroupProcess
 		listErr    error
 		unobserved bool
+		// cutListing makes the root's worktree listing end, at the capture
+		// bound, on the record boundary just before the checkout.
+		cutListing bool
 		wantSignal bool
 	}{
 		{name: "the claimed group still runs the removal: signaled", group: func(inner []string) []app.GroupProcess {
@@ -198,6 +201,7 @@ func TestRecoverWorktreeRetire(t *testing.T) {
 		}},
 		{name: "the claimed group cannot be listed", listErr: errors.New("ps failed")},
 		{name: "the group is gone but the checkout cannot be observed", unobserved: true},
+		{name: "the group is gone but the worktree listing is cut by the capture bound", cutListing: true},
 	}
 	for _, tc := range blocked {
 		t.Run("blocked, never re-dispatched: "+tc.name, func(t *testing.T) {
@@ -215,6 +219,9 @@ func TestRecoverWorktreeRetire(t *testing.T) {
 			}
 			if tc.unobserved {
 				f.failPath = a.Recorded
+			}
+			if tc.cutListing {
+				f.git.fillListingBefore(t, a.Listed, fakeCaptureBytes)
 			}
 			spawns := len(f.spawns)
 			for range 2 {

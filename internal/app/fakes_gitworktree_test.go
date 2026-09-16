@@ -1,6 +1,7 @@
 package app_test
 
 import (
+	"context"
 	"fmt"
 	"slices"
 	"sort"
@@ -45,6 +46,11 @@ type fakeAttemptWorktree struct {
 	// remove the checkout at all; DirtySubmodule adds ` M sub` to status.
 	HasSubmodule   bool
 	DirtySubmodule bool
+	// IndexPadding is the byte count of clean tracked `ls-files -v -z`
+	// entries (under d/) listed between .gitignore and f.txt, so a large
+	// index puts f.txt's and g.txt's tags — and any hidden flag on them —
+	// past a chosen offset of the output (indexPadding).
+	IndexPadding int
 }
 
 // fakeAttemptWorktrees is the fake repository's attempt-worktree state.
@@ -240,7 +246,7 @@ func attemptStatusLines(w *fakeAttemptWorktree, showUntracked bool) string {
 }
 
 // attemptIndexTags renders `ls-files -v -z` for the probe's three tracked
-// files.
+// files, with the checkout's padding entries in path order between them.
 func attemptIndexTags(w *fakeAttemptWorktree) string {
 	f, g := "H", "H"
 	if w.AssumeUnchanged {
@@ -249,7 +255,44 @@ func attemptIndexTags(w *fakeAttemptWorktree) string {
 	if w.SkipWorktree {
 		g = "S"
 	}
-	return "H .gitignore\x00" + f + " f.txt\x00" + g + " g.txt\x00"
+	return "H .gitignore\x00" + indexPadding(w.IndexPadding) + f + " f.txt\x00" + g + " g.txt\x00"
+}
+
+const (
+	// indexPaddingEntryBytes is one full padding entry's length, NUL
+	// included; indexPaddingMinBytes is the shortest entry the padding
+	// writes ("H d/00000000-x\x00").
+	indexPaddingEntryBytes = 256
+	indexPaddingMinBytes   = 16
+)
+
+// indexPadding renders exactly n bytes of clean tracked `ls-files -v -z`
+// entries named d/<index>-x…, each a well-formed `H <path>` entry: full
+// entries of indexPaddingEntryBytes, the last one taking the remainder. A
+// non-zero n below indexPaddingMinBytes cannot be rendered and panics.
+func indexPadding(n int) string {
+	if n == 0 {
+		return ""
+	}
+	if n < indexPaddingMinBytes {
+		panic(fmt.Sprintf("indexPadding: %d bytes cannot hold one entry", n))
+	}
+	filler := strings.Repeat("x", indexPaddingEntryBytes+indexPaddingMinBytes)
+	var b strings.Builder
+	b.Grow(n)
+	for i := 0; n > 0; i++ {
+		size := indexPaddingEntryBytes
+		if n-size < indexPaddingMinBytes {
+			size = n
+		}
+		name := fmt.Sprintf("d/%08d-", i)
+		b.WriteString("H ")
+		b.WriteString(name)
+		b.WriteString(filler[:size-len(name)-3])
+		b.WriteByte(0)
+		n -= size
+	}
+	return b.String()
 }
 
 // attemptListLocked renders the probe-pinned `worktree list --porcelain
@@ -286,6 +329,48 @@ func (g *fakeGitRepo) attemptListLocked() app.CommandResult {
 		b.WriteString("\x00")
 	}
 	return app.CommandResult{Stdout: []byte(b.String())}
+}
+
+// worktreeListing is the root's `worktree list --porcelain -z` output.
+func (g *fakeGitRepo) worktreeListing() string {
+	g.mu.Lock()
+	root := g.attempt.root
+	g.mu.Unlock()
+	return string(g.runGitArgv([]string{"-C", root, "worktree", "list", "--porcelain", "-z"}).Stdout)
+}
+
+// listingOffset is the byte offset of the record for path in the root's
+// worktree listing.
+func (g *fakeGitRepo) listingOffset(t *testing.T, path string) int {
+	t.Helper()
+	i := strings.Index(g.worktreeListing(), "worktree "+path+"\x00")
+	if i < 0 {
+		t.Fatalf("the worktree listing does not name %s", path)
+	}
+	return i
+}
+
+// fakeListingSibling is the detached checkout fillListingBefore models; git's
+// path-ordered listing names it before every attempt checkout the fixtures
+// seed.
+const fakeListingSibling = "/private/var/wt/a-sibling"
+
+// fillListingBefore models fakeListingSibling locked with a reason that
+// makes the root's listing hold exactly n bytes before path's record — so
+// a capture bound of n cuts the listing on a record boundary just before
+// it.
+func (g *fakeGitRepo) fillListingBefore(t *testing.T, path string, n int) {
+	t.Helper()
+	if fakeListingSibling >= path {
+		t.Fatalf("the sibling does not sort before %s", path)
+	}
+	sibling := fakeAttemptWorktree{Head: fakeGitMainHead, Present: true, Locked: true, LockReason: "x"}
+	g.addAttemptWorktree(fakeListingSibling, sibling)
+	sibling.LockReason = strings.Repeat("x", 1+n-g.listingOffset(t, path))
+	g.addAttemptWorktree(fakeListingSibling, sibling)
+	if got := g.listingOffset(t, path); got != n {
+		t.Fatalf("the record for %s starts at byte %d, want %d", path, got, n)
+	}
 }
 
 // attemptRemoveLocked applies `git worktree remove` to an attempt checkout
@@ -442,6 +527,48 @@ func TestFakeAttemptWorktreesReproduceTheProbe(t *testing.T) {
 		}
 		if old := g.runGitArgv([]string{"-C", "/wt/old", "-c", fakeFsmonitorOff, "status", "--porcelain=v1", "--untracked-files=all"}); old.ExitCode != 2 {
 			t.Fatalf("a pre-check without --ignore-submodules=none = exit %d, want the model's unhandled refusal", old.ExitCode)
+		}
+	})
+
+	t.Run("a padded index is ordered, well-formed and captured under the runner's bound", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		g := newFakeGitRepo(tc.Controller.GitExecutable, "/opt/hop/bin/hop")
+		tc.Commands.RunHook = g.Hook
+		g.setAttemptRepository(root, "/srv/repo/.git")
+		const gitignore = "H .gitignore\x00"
+		for _, padding := range []int{indexPaddingMinBytes, 700, fakeCaptureBytes - len(gitignore)} {
+			g.addAttemptWorktree(path, fakeAttemptWorktree{Branch: branch, Head: "commit-base", Present: true, SkipWorktree: true, IndexPadding: padding})
+			tags := string(g.runGitArgv([]string{"-C", path, "-c", fakeFsmonitorOff, "ls-files", "-v", "-z"}).Stdout)
+			body, ok := strings.CutPrefix(tags, gitignore)
+			if !ok || !strings.HasSuffix(body, "H f.txt\x00S g.txt\x00") {
+				t.Fatalf("padding %d: ls-files -v -z = %.80q…", padding, tags)
+			}
+			pad := strings.TrimSuffix(body, "H f.txt\x00S g.txt\x00")
+			if len(pad) != padding {
+				t.Fatalf("padding %d rendered %d bytes", padding, len(pad))
+			}
+			entries := strings.Split(strings.TrimSuffix(pad, "\x00"), "\x00")
+			if !slices.IsSorted(entries) {
+				t.Fatalf("padding %d: entries are not in path order", padding)
+			}
+			for _, entry := range entries {
+				if len(entry) < indexPaddingMinBytes-1 || !strings.HasPrefix(entry, "H d/") || strings.Trim(entry[len("H d/00000000-"):], "x") != "" {
+					t.Fatalf("padding %d: malformed entry %.40q", padding, entry)
+				}
+			}
+		}
+
+		// With the padding filling the bound exactly, the runner keeps a
+		// prefix that ends on an entry boundary, shows no hidden flag, and is
+		// reported truncated.
+		argv := []string{tc.Controller.GitExecutable, "-C", path, "-c", fakeFsmonitorOff, "ls-files", "-v", "-z"}
+		result, err := tc.Commands.Run(context.Background(), app.Command{Argv: argv})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(result.Stdout) != fakeCaptureBytes || !result.StdoutTruncated || result.Stdout[len(result.Stdout)-1] != 0 || strings.Contains(string(result.Stdout), "S g.txt") {
+			t.Fatalf("captured %d bytes, truncated %v, ending %q; want the bound, truncated, ending on an entry with the flag cut off",
+				len(result.Stdout), result.StdoutTruncated, result.Stdout[len(result.Stdout)-1:])
 		}
 	})
 
