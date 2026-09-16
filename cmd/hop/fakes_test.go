@@ -49,15 +49,16 @@ type fakeController struct {
 	driveCompletion       func() (app.CompletionReport, error)
 	publishPresentation   func() (app.PresentationReport, error)
 
-	sendMessage  func(req app.SendMessageRequest) (app.SendMessageResult, error)
-	fetchMessage func(req app.FetchMessageRequest) (app.FetchMessageResult, error)
-	ackMessage   func(req app.AckMessageRequest) (app.AckMessageResult, error)
-	showMessage  func(req app.ShowMessageRequest) (app.ShowMessageResult, error)
-	answer       func(req app.AnswerRequest) (app.AnswerResult, error)
-	createTask   func(req app.CreateTaskRequest) (app.CreateTaskResult, error)
-	requestRetry func(req app.RequestRetryRequest) (app.RequestRetryResult, error)
-	closePlan    func(req app.ClosePlanRequest) (app.ClosePlanResult, error)
-	submitReview func(req app.SubmitReviewRequest) (app.SubmitReviewResult, error)
+	sendMessage        func(req app.SendMessageRequest) (app.SendMessageResult, error)
+	fetchMessage       func(req app.FetchMessageRequest) (app.FetchMessageResult, error)
+	ackMessage         func(req app.AckMessageRequest) (app.AckMessageResult, error)
+	messageWaitDefault func(runID string) (time.Duration, error)
+	showMessage        func(req app.ShowMessageRequest) (app.ShowMessageResult, error)
+	answer             func(req app.AnswerRequest) (app.AnswerResult, error)
+	createTask         func(req app.CreateTaskRequest) (app.CreateTaskResult, error)
+	requestRetry       func(req app.RequestRetryRequest) (app.RequestRetryResult, error)
+	closePlan          func(req app.ClosePlanRequest) (app.ClosePlanResult, error)
+	submitReview       func(req app.SubmitReviewRequest) (app.SubmitReviewResult, error)
 
 	selectRunView func(label string) error
 	clearRunView  func() error
@@ -308,6 +309,14 @@ func (f *fakeController) AckMessage(_ context.Context, req app.AckMessageRequest
 		return app.AckMessageResult{}, errors.New("unexpected AckMessage")
 	}
 	return f.ackMessage(req)
+}
+
+func (f *fakeController) MessageWaitDefault(_ context.Context, runID string) (time.Duration, error) {
+	f.record("MessageWaitDefault")
+	if f.messageWaitDefault == nil {
+		return 0, errors.New("unexpected MessageWaitDefault")
+	}
+	return f.messageWaitDefault(runID)
 }
 
 func (f *fakeController) ShowMessage(_ context.Context, req app.ShowMessageRequest) (app.ShowMessageResult, error) {

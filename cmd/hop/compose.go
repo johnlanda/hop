@@ -62,6 +62,10 @@ type controllerAPI interface {
 	SendMessage(ctx context.Context, req app.SendMessageRequest) (app.SendMessageResult, error)
 	FetchMessage(ctx context.Context, req app.FetchMessageRequest) (app.FetchMessageResult, error)
 	AckMessage(ctx context.Context, req app.AckMessageRequest) (app.AckMessageResult, error)
+	// MessageWaitDefault resolves hop msg wait's default --timeout from the
+	// run's frozen [messages] wait_timeout (empty StateRoot handling is the
+	// caller's own worker-state-root resolution; this is store-only).
+	MessageWaitDefault(ctx context.Context, runID string) (time.Duration, error)
 	ShowMessage(ctx context.Context, req app.ShowMessageRequest) (app.ShowMessageResult, error)
 	Answer(ctx context.Context, req app.AnswerRequest) (app.AnswerResult, error)
 	CreateTask(ctx context.Context, req app.CreateTaskRequest) (app.CreateTaskResult, error)

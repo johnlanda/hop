@@ -211,14 +211,18 @@ func deliveredMessageLines(result *app.FetchMessageResult) []string {
 
 // runMsgWait implements `hop msg wait [--timeout <dur>]`: the CLI-side 1s
 // poll loop and timeout (design section 7 — internal/app's FetchMessage is
-// one non-blocking attempt). The default timeout mirrors the design's
-// [messages] wait_timeout default (app.DefaultMessageWait); the run's own
-// configured value is not currently exposed to cmd/hop (see HANDOFF.md).
+// one non-blocking attempt). When --timeout is absent (flag.Visit detects
+// this — the flag.Duration default below is only the fallback for
+// resolving the run's own frozen [messages] wait_timeout, never the
+// rendered value itself), the default is resolved from the run's frozen
+// WorkflowSnapshot (Controller.MessageWaitDefault, lease-free); an
+// explicit --timeout always wins. The "none" line renders whichever
+// timeout was actually used.
 func runMsgWait(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 	diagnostics := &recordingWriter{w: stderr}
 	flags := flag.NewFlagSet("hop msg wait", flag.ContinueOnError)
 	flags.SetOutput(diagnostics)
-	timeout := flags.Duration("timeout", app.DefaultMessageWait, "how long to wait for a message before giving up")
+	timeout := flags.Duration("timeout", app.DefaultMessageWait, "how long to wait for a message before giving up (default: the run's frozen [messages] wait_timeout)")
 	if err := flags.Parse(args); err != nil {
 		return exitUsage, diagnostics.err
 	}
@@ -226,19 +230,43 @@ func runMsgWait(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 		_, err := fmt.Fprintf(stderr, "hop msg wait: unexpected argument %q\n", flags.Arg(0))
 		return exitUsage, err
 	}
+	timeoutSupplied := false
+	flags.Visit(func(f *flag.Flag) {
+		if f.Name == "timeout" {
+			timeoutSupplied = true
+		}
+	})
 	stateRoot, err := requireWorkerStateRoot(d.getenv)
 	if err != nil {
 		_, werr := fmt.Fprintf(stderr, "hop msg wait: %v\n", err)
 		return exitFailure, werr
 	}
-	deadline, cancel := context.WithTimeout(context.Background(), *timeout)
-	defer cancel()
-	ctrl, closeStore, err := d.openController(deadline, controllerConfig{stateRoot: stateRoot})
+
+	// Opening the controller and resolving the default timeout (when
+	// needed) both run under their own short setup bound, before the
+	// wait's own deadline — which depends on the resolved timeout — is
+	// ever created.
+	setupCtx, setupCancel := context.WithTimeout(context.Background(), defaultMsgVerbTimeout)
+	ctrl, closeStore, err := d.openController(setupCtx, controllerConfig{stateRoot: stateRoot})
 	if err != nil {
+		setupCancel()
 		_, werr := fmt.Fprintf(stderr, "hop msg wait: %s\n", describeStoreOpenFailure(err, "HOP_STATE_DIR"))
 		return exitFailure, werr
 	}
 	defer closeStore() //nolint:errcheck // the store closes on process exit either way; commands report command errors, not pool teardown.
+	if !timeoutSupplied {
+		resolved, defaultErr := ctrl.MessageWaitDefault(setupCtx, d.getenv("HOP_RUN_ID"))
+		if defaultErr != nil {
+			setupCancel()
+			_, werr := fmt.Fprintf(stderr, "hop msg wait: %v\n", defaultErr)
+			return exitFailure, werr
+		}
+		*timeout = resolved
+	}
+	setupCancel()
+
+	deadline, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
 
 	for {
 		callCtx, callCancel := context.WithTimeout(context.Background(), defaultMsgVerbTimeout)

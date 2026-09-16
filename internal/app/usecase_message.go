@@ -278,6 +278,29 @@ func (c *Controller) AckMessage(ctx context.Context, req AckMessageRequest) (Ack
 	return AckMessageResult{Outcome: string(outcome.Kind), Reason: outcome.Reason, Detail: outcome.Detail}, nil
 }
 
+// MessageWaitDefault resolves `hop msg wait`'s default --timeout: the
+// run's own frozen [messages] wait_timeout (WorkflowSnapshot.MessageWait)
+// when set, else DefaultMessageWait — a solo run's zero WorkflowSnapshot
+// always resolves to the default, matching ApplyWorkflowDefaults' own
+// fallback. Lease-free (ReadStore.LoadFrozenRun): hop msg wait runs with
+// no controller lease, like every other worker-plumbing verb, and the
+// caller (cmd/hop) uses this only when --timeout was not explicitly given
+// (an explicit flag always wins).
+func (c *Controller) MessageWaitDefault(ctx context.Context, runID string) (time.Duration, error) {
+	rid, err := identity.ParseRunID(runID)
+	if err != nil {
+		return 0, fmt.Errorf("app: parse run id: %w", err)
+	}
+	frozen, err := c.Read.LoadFrozenRun(ctx, rid)
+	if err != nil {
+		return 0, fmt.Errorf("app: load frozen run: %w", err)
+	}
+	if frozen.Snapshot.Workflow.MessageWait > 0 {
+		return frozen.Snapshot.Workflow.MessageWait, nil
+	}
+	return DefaultMessageWait, nil
+}
+
 // AnswerRequest is `hop answer`'s driving input: a controller-machine
 // command, never a session (no HOP_* env, no lease, no incarnation).
 type AnswerRequest struct {

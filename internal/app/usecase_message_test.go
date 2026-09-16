@@ -810,3 +810,42 @@ func TestMessageRefusalReasonsAlwaysSet(t *testing.T) {
 		}
 	})
 }
+
+// TestMessageWaitDefault covers ruling C: hop msg wait's default --timeout
+// resolves from the run's own frozen [messages] wait_timeout when set,
+// falling back to app.DefaultMessageWait only when the frozen value is
+// zero (a solo run's zero WorkflowSnapshot, or a feature run whose policy
+// never set one).
+func TestMessageWaitDefault(t *testing.T) {
+	t.Run("resolves the run's frozen wait_timeout", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		fr := seedFeatureRun(t, tc, 2)
+		snap := tc.Store.Snapshots[fr.RunID]
+		snap.Workflow.MessageWait = 17 * time.Second
+		tc.Store.Snapshots[fr.RunID] = snap
+
+		got, err := tc.Controller.MessageWaitDefault(context.Background(), fr.RunID.String())
+		if err != nil {
+			t.Fatalf("MessageWaitDefault() error = %v", err)
+		}
+		if got != 17*time.Second {
+			t.Fatalf("MessageWaitDefault() = %s, want 17s", got)
+		}
+	})
+
+	t.Run("falls back to the package default when the frozen value is zero", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		fr := seedFeatureRun(t, tc, 2)
+		snap := tc.Store.Snapshots[fr.RunID]
+		snap.Workflow.MessageWait = 0
+		tc.Store.Snapshots[fr.RunID] = snap
+
+		got, err := tc.Controller.MessageWaitDefault(context.Background(), fr.RunID.String())
+		if err != nil {
+			t.Fatalf("MessageWaitDefault() error = %v", err)
+		}
+		if got != app.DefaultMessageWait {
+			t.Fatalf("MessageWaitDefault() = %s, want the package default %s", got, app.DefaultMessageWait)
+		}
+	})
+}
