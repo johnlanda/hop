@@ -127,15 +127,22 @@ func renderRunDetail(w io.Writer, detail *app.RunDetailView) (int, error) {
 		fmt.Sprintf("run %s %s", seqLabel(detail.Sequence), detail.RunID),
 		"  state:         " + detail.State + listingMarkers(&detail.RunSummaryView),
 		"  workflow:      " + workflowLabel(detail.Mode),
-		"  task:          " + orUnset(detail.TaskState),
-		"  attempt:       " + orUnset(detail.AttemptState),
-		"  worktree:      " + orUnset(detail.WorktreePath),
-		"  binding:       " + orUnset(detail.BindingSummary),
-		"  launch claim:  " + orUnset(detail.ClaimState),
-		"  trust seed:    " + orUnset(detail.SeedEvidence),
-		fmt.Sprintf("  pending ops:   %d", detail.PendingOps),
-		"  last submit:   " + orUnset(detail.LastSubmission),
 	}
+	if isFeatureMode(detail.Mode) {
+		lines = append(lines,
+			"  target:        "+targetBranchLabel(detail.TargetBranch),
+			"  worktrees:     "+worktreeRetirementLabel(detail.TargetBranch, detail.WorktreesRetiredAt))
+	}
+	lines = append(lines,
+		"  task:          "+orUnset(detail.TaskState),
+		"  attempt:       "+orUnset(detail.AttemptState),
+		"  worktree:      "+orUnset(detail.WorktreePath),
+		"  binding:       "+orUnset(detail.BindingSummary),
+		"  launch claim:  "+orUnset(detail.ClaimState),
+		"  trust seed:    "+orUnset(detail.SeedEvidence),
+		fmt.Sprintf("  pending ops:   %d", detail.PendingOps),
+		"  last submit:   "+orUnset(detail.LastSubmission),
+	)
 	for _, artifact := range detail.Artifacts {
 		lines = append(lines, "  artifact:      "+artifact)
 	}
@@ -156,6 +163,30 @@ func renderRunDetail(w io.Writer, detail *app.RunDetailView) (int, error) {
 		}
 	}
 	return exitOK, nil
+}
+
+// targetBranchLabel renders a feature run's frozen worktree-retirement
+// target (docs/plan/phase-3-worktree-retirement.md section 6).
+func targetBranchLabel(target string) string {
+	if target == "" {
+		return "none (detached HEAD at freeze; worktrees are never retired automatically)"
+	}
+	return target
+}
+
+// worktreeRetirementLabel renders a feature run's worktrees-retired fact,
+// and before it is set, when and how retirement will happen — including
+// the plain warning that removal deletes ignored files.
+func worktreeRetirementLabel(target string, retiredAt *time.Time) string {
+	switch {
+	case retiredAt != nil:
+		return "retired " + retiredAt.UTC().Format(time.RFC3339)
+	case target == "":
+		return "kept (no target branch)"
+	default:
+		return "not retired (removed once the integration branch is merged into " + target +
+			"; removal deletes ignored files such as build output; commit anything you want to keep)"
+	}
 }
 
 // isFeatureMode reports whether mode (RunDetail.Mode/RunDetailView.Mode)

@@ -130,6 +130,10 @@ func (s *Store) LoadRunStatus(ctx context.Context, runID identity.RunID) (app.Ru
 		if err != nil {
 			return err
 		}
+		retiredAt, err := runWorktreesRetiredAt(ctx, tx, runID)
+		if err != nil {
+			return err
+		}
 		detail = app.RunDetail{
 			RunStatus: app.RunStatus{
 				RunID:         runID,
@@ -139,8 +143,10 @@ func (s *Store) LoadRunStatus(ctx context.Context, runID identity.RunID) (app.Ru
 				Reconciling:   reconciling,
 				UpdatedAt:     runV.UpdatedAt,
 			},
-			Mode:      snapshot.Workflow.Mode,
-			StateRoot: snapshot.StateRoot,
+			Mode:               snapshot.Workflow.Mode,
+			TargetBranch:       snapshot.Workflow.TargetBranch,
+			WorktreesRetiredAt: retiredAt,
+			StateRoot:          snapshot.StateRoot,
 		}
 		if snapshot.Workflow.Feature() {
 			// The current manager session is the run-level session identity

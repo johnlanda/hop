@@ -91,12 +91,16 @@ type PendingQuestionView struct {
 type RunDetailView struct {
 	RunSummaryView
 	// Mode mirrors RunDetail.Mode: "feature", or "" for a solo run.
-	Mode           string
-	TaskState      string
-	AttemptState   string
-	WorktreePath   string
-	BindingSummary string // "workspace/tab/pane"; "" when no current binding
-	ClaimState     string // "" when no launch claim exists yet
+	Mode string
+	// TargetBranch and WorktreesRetiredAt mirror RunDetail's
+	// worktree-retirement target and fact ("" and nil when absent).
+	TargetBranch       string
+	WorktreesRetiredAt *time.Time
+	TaskState          string
+	AttemptState       string
+	WorktreePath       string
+	BindingSummary     string // "workspace/tab/pane"; "" when no current binding
+	ClaimState         string // "" when no launch claim exists yet
 	// SeedEvidence is the claim's recorded workspace-trust pre-seeding
 	// outcome; "" when no launch claim exists yet.
 	SeedEvidence   string
@@ -174,12 +178,14 @@ func runSummaryView(s RunStatus) RunSummaryView {
 
 func runDetailView(d RunDetail) RunDetailView { //nolint:gocritic // hugeParam: RunDetail is a ReadStore DTO rendered at most once per hop status -run call.
 	view := RunDetailView{
-		RunSummaryView: runSummaryView(d.RunStatus),
-		Mode:           d.Mode,
-		TaskState:      string(d.TaskState),
-		AttemptState:   string(d.AttemptState),
-		WorktreePath:   d.WorktreePath,
-		PendingOps:     len(d.PendingOperations),
+		RunSummaryView:     runSummaryView(d.RunStatus),
+		Mode:               d.Mode,
+		TargetBranch:       d.TargetBranch,
+		WorktreesRetiredAt: d.WorktreesRetiredAt,
+		TaskState:          string(d.TaskState),
+		AttemptState:       string(d.AttemptState),
+		WorktreePath:       d.WorktreePath,
+		PendingOps:         len(d.PendingOperations),
 	}
 	if d.Binding != nil {
 		view.BindingSummary = fmt.Sprintf("%s/%s/%s", d.Binding.WorkspaceID, d.Binding.TabID, d.Binding.PaneID)

@@ -38,7 +38,8 @@ this package never resolves environment variables or defaults.
 | [uow.go](uow.go) | `unitOfWork` and the typed repositories (`Runs`…`CheckExecClaims`), `OperationRepository.Pending`/`ByKind`, `Commit`, `Rollback` | One immediate transaction per unit of work; optimistic-concurrency saves; append-only bindings and transitions; journal payloads persisted as uninterpreted JSON; controller-side launch-claim settlement |
 | [entities.go](entities.go) | `getRun`, `getTask`, `getAttempt`, `getSession`, `currentSession`, `currentBinding`, `getLaunchClaim`, `acceptedResult`, `incarnationCurrent`, `launchIncarnationCurrent`, `pendingLaunchIntent` | Row ↔ domain-value mapping shared by all three authorities through the `querier` interface |
 | [submission.go](submission.go) | `SubmitResult`, `RecordMalformed`, `ClaimLaunch`, `SettleLaunchFailure`, `ClaimCheckExec`, `RequestStop`, `insertReceipt` | The worker authority: the section 7 validation order with the domain's `AcceptResult` inside one transaction, receipts for every outcome, the pre-exec claim contracts, the monotonic stop request |
-| [readstore.go](readstore.go) | `ListRuns`, `LoadRunStatus`, `LoadFrozenRun`, `LoadCheckExecutionContext`, `lastCheckSummary` | Lease-free reads, each inside one deferred read transaction for a consistent WAL snapshot |
+| [readstore.go](readstore.go) | `ListRuns`, `LoadRunStatus`, `LoadFrozenRun`, `LoadCheckExecutionContext`, `lastCheckSummary`, `retirementIntentExecution` | Lease-free reads, each inside one deferred read transaction for a consistent WAL snapshot; `LoadRunStatus` carries the snapshot's frozen `TargetBranch` and the run's `worktrees_retired_at` fact |
+| [worktreeretirement.go](worktreeretirement.go) | `runWorktreesRetiredAt` | Reads migration 004's worktrees-retired run fact: NULL is nil, a stored value must be the canonical time format (anything else fails closed) |
 
 ## Invariants
 
@@ -279,6 +280,12 @@ this package never resolves environment variables or defaults.
   `TestLoadCheckExecutionContextRetirementKinds` (the intent's argv and
   spawn directory verbatim; missing argv, a non-string element, an empty
   argv, a missing directory and a non-object intent each fail closed).
+- Worktree-retirement reads (same command):
+  `TestFrozenWorkflowWithoutTargetBranch` (a snapshot frozen before the
+  field existed loads with no target; the key round-trips, and
+  `TestInitializeRunFeatureShape` freezes one through InitializeRun) and
+  `TestLoadRunStatusRetirementFields` (the detail's target, NULL fact as
+  nil, a canonical time read back exactly, a noncanonical one refused).
 - Migration 004 (same command): `TestMigration004Surface` (the chain's
   latest version, one `schema_migrations` row per migration, the column's
   nullable default-free TEXT shape, NULL for a freshly initialized run) and

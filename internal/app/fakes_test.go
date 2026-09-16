@@ -436,11 +436,12 @@ func (s *fakeStore) LoadRunStatus(_ context.Context, runID identity.RunID) (app.
 	taskID := s.TaskByRun[runID]
 	attemptID := s.AttemptByRun[runID]
 	detail := app.RunDetail{
-		RunStatus: s.runStatusLocked(runID),
-		Mode:      s.Snapshots[runID].Workflow.Mode,
-		TaskID:    taskID,
-		AttemptID: attemptID,
-		StateRoot: s.Snapshots[runID].StateRoot,
+		RunStatus:    s.runStatusLocked(runID),
+		Mode:         s.Snapshots[runID].Workflow.Mode,
+		TargetBranch: s.Snapshots[runID].Workflow.TargetBranch,
+		TaskID:       taskID,
+		AttemptID:    attemptID,
+		StateRoot:    s.Snapshots[runID].StateRoot,
 	}
 	if t, ok := s.Tasks[taskID]; ok {
 		detail.TaskState = t.value.State

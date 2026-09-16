@@ -100,7 +100,7 @@ func (g *fakeGitRepo) setRef(name, oid string) {
 
 // setSymref makes name a symbolic ref to target (test seeding only); the
 // target may be absent (a dangling symref).
-func (g *fakeGitRepo) setSymref(name, target string) { //nolint:unparam // a general ref-store helper; every current scenario seeds the one integration ref.
+func (g *fakeGitRepo) setSymref(name, target string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	delete(g.refs, name)

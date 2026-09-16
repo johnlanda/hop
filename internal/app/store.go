@@ -100,6 +100,13 @@ type WorkflowSnapshot struct {
 	// InitializeRun's transaction, so a crash before the integration.init
 	// intent commits never loses the base.
 	BaseCommitOID string
+	// TargetBranch is the full branch ref (`refs/heads/<name>`) checked out
+	// at the repository root at freeze: the branch whose containment of
+	// the run's integrated work retires the run's attempt worktrees
+	// (docs/plan/phase-3-worktree-retirement.md section 2). "" when the
+	// root's HEAD was detached, and for every run frozen before the field
+	// existed: such a run never retires its worktrees automatically.
+	TargetBranch string
 }
 
 // Feature is true when the snapshot describes a feature-mode run. A solo
