@@ -150,15 +150,16 @@ func waitForRunStateWithProcessDiagnostics(t *testing.T, server *testServer, art
 // continuation proving the native-session mechanism end to end against a
 // real harness rather than the fixture worker's own --resume support
 // (fixtureworker_test.go's isResumeInvocation). This run is also the
-// pending VERIFICATION of the continuation prompt: interactive Claude
-// Code restores the resumed transcript but does not re-run a pending
-// user turn (observed live 2026-09-15 on claude 2.1.270 — a prompt-less
+// VERIFICATION of the continuation prompt: interactive Claude Code
+// restores the resumed transcript but does not re-run a pending user
+// turn (observed live 2026-09-15 on claude 2.1.270 — a prompt-less
 // `--resume` left the restored session idle at its input box), and
-// `claude --help` documents the `[prompt]` positional, but no executed
-// probe yet shows a restored session acting on it; this test passing is
-// that evidence (record the claude version with it — see
-// docs/architecture/native-harness-compat.md's unverified list). It
-// never runs in the normal suite or make check —
+// `claude --help` documents the `[prompt]` positional; this test
+// passing (2026-09-15, main 133ed5f, claude 2.1.270) is the executed
+// evidence that a restored session acts on it — see
+// docs/architecture/native-harness-compat.md's Claude Code verified
+// list. Re-running this test is how a version drift gets re-verified.
+// It never runs in the normal suite or make check —
 // only the Makefile's test-live target ever sets HOP_LIVE_HARNESS=1 — and
 // it is never run by this task's own automated verification; a human runs
 // it deliberately.

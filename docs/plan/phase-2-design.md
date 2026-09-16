@@ -869,9 +869,9 @@ per the decision table (section 4) before any new act.
    interactive Claude Code restores a resumed transcript but does not
    re-run a pending user turn — observed against 2.1.270; the positional
    prompt itself is documented by `claude --help` (2.1.270) and its
-   continuation behavior is pending verification by the human-run live
-   test — see native-harness-compat.md's interactive-resume item and
-   unverified list); the native
+   continuation behavior is verified by the human-run live test — see
+   native-harness-compat.md's interactive-resume item and the
+   positional-prompt-continuation item); the native
    reference is durably
    assigned or verified captured — for Claude it is pre-assigned by HOP
    before first launch (section 6), so no capture is needed. Cold relaunch
@@ -1059,8 +1059,8 @@ and never-resend rule apply.
    transcript but does not re-run a pending user turn (the human-run
    live test observed a prompt-less relaunch sitting idle on 2.1.270;
    2.1.270's `claude --help` documents the `[prompt]` positional, and
-   the continuation behavior itself is pending verification by the
-   human-run live test — see native-harness-compat.md), so it tells the
+   the continuation behavior itself is verified by the human-run live
+   test — see native-harness-compat.md), so it tells the
    worker it was relaunched
    after an interruption, to re-read its assignment, continue and submit.
    Argv is passed via execve — no shell parses it, so multiline or quoted

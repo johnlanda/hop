@@ -156,9 +156,23 @@ alternate-profile/pools work; they are not re-verified here.
   `<hop> result submit` command line — telling the worker it was
   relaunched after an interruption, to re-read its assignment, continue
   and submit). That the restored session actually acts on the positional
-  prompt is PENDING verification by the human-run live test (see the
-  unverified list below). Version-scoped like every other 2.1.270 fact:
-  re-verify on drift.
+  prompt is now verified — see the next item. Version-scoped like every
+  other 2.1.270 fact: re-verify on drift.
+- Positional-prompt continuation on `--resume` (verified 2026-09-15
+  against 2.1.270, the Homebrew Caskroom binary, human-run `make
+  test-live` / `TestLiveClaudeDefaultProfileRun` on main 133ed5f, the
+  operator's own default profile): the cold-relaunch invocation
+  `claude --resume <native-ref> "<continuation prompt>"` continued a
+  session whose first worker had settled and was then killed by the
+  test's cold-relaunch step — the restored session's transcript shows
+  nine assistant turns, four tool uses, a git commit and the
+  `hop result submit` call, so the positional prompt documented by
+  `claude --help` is not just accepted but acted on. The run passed in
+  41 seconds. No artifacts are retained for a passing run (the harness
+  retains evidence only on failure); the worker transcript's session id
+  was `641ff0f9-fb2a-4c17-854a-4c462b281f3a` under the scratch worktree
+  path, cited here as the observation — transcript content is not
+  copied into this repository.
 - Transcript portability. Copying the transcript file into a second fresh
   profile under the same `projects/<munged-cwd>/` path made
   `claude -p --resume <uuid>` in that profile find the session (it progressed
@@ -289,14 +303,6 @@ alternate-profile/pools work; they are not re-verified here.
 - Authenticated `--resume`, resuming under a different account than the one
   that created the transcript, and provider-side acceptance of a copied
   transcript are untested.
-- Positional-prompt continuation on `--resume` is unverified: no executed
-  probe shows a restored interactive session accepting and acting on the
-  positional prompt `claude --help` documents. The prompt-less idle
-  behavior is observed (see the interactive-resume item above); the
-  continuation itself is verified only when the human-run
-  `TestLiveClaudeDefaultProfileRun` passes with the relaunch argv
-  `claude --resume <uuid> "<continuation prompt>"` — record the version,
-  the invocation shape and the successful continuation as the evidence.
 - Live limit and quota behavior (what a running session shows when an account
   hits its limit) was not reproduced.
 - The exact post-theme onboarding sequence (login screen ordering) was not
@@ -335,8 +341,9 @@ For a worker in a Herdr pane using account profile `<dir>`:
    interactive resume restores the transcript only — it does not
    auto-continue a pending turn (see the interactive-resume item above),
    so HOP's own cold relaunch appends its fixed continuation prompt as
-   the positional argument after `--resume <uuid>` (continuation itself
-   pending live verification; see the unverified list).
+   the positional argument after `--resume <uuid>` (continuation
+   verified against 2.1.270 by the human-run live test; see the
+   positional-prompt-continuation item above).
 
 ## Codex
 
