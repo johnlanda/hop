@@ -2,6 +2,7 @@ package app
 
 import (
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -244,3 +245,128 @@ func GrammarVerdictAcceptedLine(reviewID string) string { return "verdict accept
 
 // GrammarVerdictDuplicateLine is the idempotent-resubmission line.
 func GrammarVerdictDuplicateLine(reviewID string) string { return "duplicate " + reviewID }
+
+// `hop status -run`'s feature-mode detail lines (docs/plan/phase-3-design.md
+// section 7's "Idle with pending deliveries" and section 10's `hop status`
+// row): fixed line text the fixture manager and the deterministic
+// scenarios parse, exactly like the worker-protocol lines above. Task and
+// review labels ("t<seq>") are resolved by the caller (cmd/hop, against
+// the task table it is also rendering) before reaching these renderers —
+// this file only assembles already-resolved strings into fixed shapes.
+
+// GrammarAttentionLine renders section 7's per-mailbox attention condition
+// line VERBATIM: the in-flight clause appears only when a message is
+// delivered and unacknowledged (inFlightMessageID != ""), the queued
+// clause only when the queue is non-empty (queuedCount > 0) — at least one
+// is always present, since a mailbox with neither never reaches this
+// renderer. address is already resolved to its display form ("manager",
+// "human", or "task:<uuid> (t<seq>)" — the uuid form section 7's message
+// verbs themselves take, alongside the t<seq> label for readability).
+func GrammarAttentionLine(address, inFlightMessageID string, inFlightAge time.Duration, queuedCount int, oldestQueuedAge time.Duration) string {
+	var clauses []string
+	if inFlightMessageID != "" {
+		clauses = append(clauses, "in-flight "+inFlightAge.String()+" (message "+inFlightMessageID+")")
+	}
+	if queuedCount > 0 {
+		clauses = append(clauses, "queued "+strconv.Itoa(queuedCount)+", oldest "+oldestQueuedAge.String())
+	}
+	return "attention: messages pending for " + address + ": " + strings.Join(clauses, ", ")
+}
+
+// GrammarTaskAddress renders a task mailbox's display address: the uuid
+// form section 7's message verbs take, alongside its t<seq> label.
+func GrammarTaskAddress(taskID, taskLabel string) string {
+	return "task:" + taskID + " (" + taskLabel + ")"
+}
+
+// GrammarAttentionActionSession renders section 7's named human action for
+// a manager or task mailbox in the Attention condition: when the session
+// currently has a binding, name it (workspace/tab/pane) so the human knows
+// exactly which pane to open; otherwise the generic instruction, since no
+// pane can be named.
+func GrammarAttentionActionSession(binding string) string {
+	if binding == "" {
+		return "open that session's pane and check that the agent is following its polling instructions"
+	}
+	return "open " + binding + " and check that the agent is following its polling instructions"
+}
+
+// GrammarAttentionActionHuman is section 7's named human action for the
+// human mailbox in the Attention condition: humans have no pane to open.
+const GrammarAttentionActionHuman = "answer pending human questions with hop answer"
+
+// GrammarAttentionMarker is section 7's run-summary condition — appended
+// to hop status's listing markers (cmd/hop's listingMarkers) whenever at
+// least one mailbox is in the Attention condition, on both the bare
+// listing and the detail block's state line.
+const GrammarAttentionMarker = "blocked, needs attention"
+
+// GrammarTaskLabel renders a task's stable display label: "t<seq>".
+func GrammarTaskLabel(seq int) string { return "t" + strconv.Itoa(seq) }
+
+// GrammarTaskLine renders one row of the feature-mode task table (section
+// 10): label AND uuid (hop task retry takes the uuid), kind, state,
+// dependencies (already joined into "(none)" or comma-separated t<seq>
+// labels by the caller), attempt count, and — last, since a path may
+// contain spaces — the worktree path ("(none)" when the task has none
+// yet).
+func GrammarTaskLine(label, taskID, kind, state, deps string, attempts int, worktree string) string {
+	return "task " + label + " " + taskID + ": kind=" + kind + " state=" + state + " deps=" + deps +
+		" attempts=" + strconv.Itoa(attempts) + " worktree=" + worktree
+}
+
+// GrammarIntegrationLine renders the run's most recently created
+// integration row (section 10): identity, the task it merges (by label),
+// state, and its object IDs when set ("(none)" otherwise, resolved by the
+// caller).
+func GrammarIntegrationLine(id, taskLabel, state, source, premerge, merge string) string {
+	return "integration " + id + ": task=" + taskLabel + " state=" + state +
+		" source=" + source + " premerge=" + premerge + " merge=" + merge
+}
+
+// GrammarShortfallVerdictRejected mirrors run.ShortfallVerdictRejected:
+// the one EvaluateReadiness shortfall kind token the manager's standing
+// instruction (renderManagerAssignment) names as its fix-task trigger.
+// Kept as its own grammar constant, rather than an internal/domain/run
+// import here, so this file's constants stay self-contained; parity with
+// the domain constant is pinned by TestGoldenGrammar.
+const GrammarShortfallVerdictRejected = "verdict-rejected"
+
+// GrammarShortfallLine renders one EvaluateReadiness shortfall verbatim
+// (section 10): the kind token exactly as the domain defines it, plus the
+// task's label AND uuid when the shortfall names a task
+// (task-not-integrated) — taskLabel is "" for every other shortfall kind.
+func GrammarShortfallLine(kind, taskLabel, taskID string) string {
+	line := "shortfall: " + kind
+	if taskLabel != "" {
+		line += " " + taskLabel + " " + taskID
+	}
+	return line
+}
+
+// GrammarQuestionLine renders one pending human-addressed question
+// (section 13 item 7's CLI-only human question channel): its id, age and
+// body path.
+func GrammarQuestionLine(messageID string, age time.Duration, bodyPath string) string {
+	return "question " + messageID + " age=" + age.String() + " body: " + bodyPath
+}
+
+// GrammarAnswerInvocationLine renders the exact hop answer invocation for
+// one pending question. The file path is deliberately the literal
+// placeholder "<path>": no answer file exists yet — the human names one
+// when they write their answer, exactly as the review assignment's
+// "<approve|reject>" and "<absolute path>" placeholders name choices the
+// artifact cannot make for its reader.
+func GrammarAnswerInvocationLine(messageID string) string {
+	return "hop " + GrammarVerbAnswer + " " + messageID + " --file <path>"
+}
+
+// GrammarSessionLine renders one row of the feature-mode per-session
+// roles/bindings listing (section 10): identity, role, state, the task it
+// is bound to (already resolved to a "t<seq>" label, "(none)" for the
+// manager) and attempt number (0 for the manager), and its current
+// binding summary ("(none)" when it has none).
+func GrammarSessionLine(sessionID, role, state, taskLabel string, attemptNumber int, binding string) string {
+	return "session " + sessionID + ": role=" + role + " state=" + state +
+		" task=" + taskLabel + " attempt=" + strconv.Itoa(attemptNumber) + " binding=" + binding
+}

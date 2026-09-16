@@ -93,6 +93,7 @@ func TestTemplatesQuoteGrammar(t *testing.T) {
 
 	manager := string(renderManagerAssignment(&managerAssignmentFields{
 		RunID: "r", Brief: "b", AssignmentPath: "/a.md", RolePath: "/r.md", CribPath: "/c.md", HOPPath: "/hop",
+		RepositoryRoot: "/repo",
 	}))
 	for _, quote := range []string{
 		"/hop " + GrammarVerbTaskCreate + " --title",
@@ -102,6 +103,8 @@ func TestTemplatesQuoteGrammar(t *testing.T) {
 		"/hop " + GrammarVerbMsgSend + " --kind answer",
 		"/hop " + GrammarVerbTaskRetry + " <task-uuid>",
 		GrammarRefusalLine("<reason-token>"),
+		"/hop status -C /repo -run r",
+		GrammarShortfallVerdictRejected,
 	} {
 		if !strings.Contains(manager, quote) {
 			t.Errorf("manager assignment does not quote %q", quote)

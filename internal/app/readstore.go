@@ -96,6 +96,21 @@ type PendingQuestion struct {
 	Age       time.Duration
 }
 
+// SessionSummary is one of a feature run's sessions: its role, state and
+// current binding, plus the task and attempt it is delegated to (the zero
+// TaskID and AttemptNumber 0 for the manager, which binds no attempt) —
+// `hop status -run`'s per-session roles/bindings listing (section 10).
+// Binding is nil when the session currently has none (a reserved session,
+// or one between a lost binding and its replacement).
+type SessionSummary struct {
+	SessionID     identity.SessionID
+	Role          run.Role
+	State         run.SessionState
+	TaskID        identity.TaskID // "" for the manager
+	AttemptNumber int             // 0 for the manager
+	Binding       *run.RuntimeBinding
+}
+
 // RunDetail is the full detail block `hop status -run` renders, and the
 // identities the controller use cases (stop, resume) need to load and
 // mutate the run's task, attempt and session directly. Phase 2 gives every
@@ -150,6 +165,10 @@ type RunDetail struct {
 	// PendingQuestions is every unanswered human-addressed question,
 	// oldest first.
 	PendingQuestions []PendingQuestion
+	// Sessions is every session the run has ever created, oldest first;
+	// nil for a solo run (solo's single worker session is already named by
+	// SessionID/Binding/Claim above).
+	Sessions []SessionSummary
 }
 
 // CheckExecutionContext is what the check exec boundary (`hop check-exec`)

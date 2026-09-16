@@ -539,6 +539,7 @@ func (s *fakeStore) LoadRunStatus(_ context.Context, runID identity.RunID) (app.
 	detail.GuardShortfalls = s.guardShortfallsLocked(runID)
 	detail.Mailboxes = s.mailboxesLocked(runID, s.clock.Now())
 	detail.PendingQuestions = s.pendingQuestionsLocked(runID, s.clock.Now())
+	detail.Sessions = s.sessionsLocked(runID)
 
 	return detail, nil
 }

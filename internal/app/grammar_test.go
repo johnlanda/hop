@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/johnlanda/hop/internal/app"
+	"github.com/johnlanda/hop/internal/domain/run"
 )
 
 // TestGoldenGrammar pins the section 7 worker-protocol grammar byte for
@@ -112,6 +113,84 @@ func TestGoldenGrammar(t *testing.T) {
 		{"retry duplicate", app.GrammarRetryDuplicateLine(2, 3), "duplicate t2 attempt 3"},
 		{"verdict accepted", app.GrammarVerdictAcceptedLine(msgID), "verdict accepted " + msgID},
 		{"verdict duplicate", app.GrammarVerdictDuplicateLine(msgID), "duplicate " + msgID},
+
+		{
+			"attention line, in-flight and queued",
+			app.GrammarAttentionLine("manager", msgID, 5*time.Minute, 2, time.Hour),
+			"attention: messages pending for manager: in-flight 5m0s (message " + msgID + "), queued 2, oldest 1h0m0s",
+		},
+		{
+			"attention line, queued only",
+			app.GrammarAttentionLine("human", "", 0, 1, 90*time.Second),
+			"attention: messages pending for human: queued 1, oldest 1m30s",
+		},
+		{
+			"attention line, in-flight only",
+			app.GrammarAttentionLine("task:"+msgID+" (t3)", msgID, 30*time.Second, 0, 0),
+			"attention: messages pending for task:" + msgID + " (t3): in-flight 30s (message " + msgID + ")",
+		},
+		{"task address", app.GrammarTaskAddress(msgID, "t3"), "task:" + msgID + " (t3)"},
+		{
+			"attention action session, no binding",
+			app.GrammarAttentionActionSession(""),
+			"open that session's pane and check that the agent is following its polling instructions",
+		},
+		{
+			"attention action session, with binding",
+			app.GrammarAttentionActionSession("ws/tab/pane"),
+			"open ws/tab/pane and check that the agent is following its polling instructions",
+		},
+		{"attention action human", app.GrammarAttentionActionHuman, "answer pending human questions with hop answer"},
+		{"attention marker", app.GrammarAttentionMarker, "blocked, needs attention"},
+
+		{"task label", app.GrammarTaskLabel(4), "t4"},
+		{
+			"task line",
+			app.GrammarTaskLine("t1", msgID, "implement", "active", "t2,t3", 2, "/worktrees/t1a2"),
+			"task t1 " + msgID + ": kind=implement state=active deps=t2,t3 attempts=2 worktree=/worktrees/t1a2",
+		},
+		{
+			"task line, no deps or worktree",
+			app.GrammarTaskLine("t1", msgID, "implement", "pending", "(none)", 0, "(none)"),
+			"task t1 " + msgID + ": kind=implement state=pending deps=(none) attempts=0 worktree=(none)",
+		},
+
+		{
+			"integration line",
+			app.GrammarIntegrationLine(msgID, "t1", "integrated", "srcoid", "premoid", "mergeoid"),
+			"integration " + msgID + ": task=t1 state=integrated source=srcoid premerge=premoid merge=mergeoid",
+		},
+
+		{"shortfall verdict-rejected token", app.GrammarShortfallVerdictRejected, "verdict-rejected"},
+		{"shortfall token matches the domain", app.GrammarShortfallVerdictRejected, string(run.ShortfallVerdictRejected)},
+		{
+			"shortfall line, no task",
+			app.GrammarShortfallLine("plan-open", "", ""),
+			"shortfall: plan-open",
+		},
+		{
+			"shortfall line, with task",
+			app.GrammarShortfallLine("task-not-integrated", "t2", msgID),
+			"shortfall: task-not-integrated t2 " + msgID,
+		},
+
+		{
+			"question line",
+			app.GrammarQuestionLine(msgID, 90*time.Second, "/state/runs/r/messages/m.md"),
+			"question " + msgID + " age=1m30s body: /state/runs/r/messages/m.md",
+		},
+		{"answer invocation", app.GrammarAnswerInvocationLine(msgID), "hop answer " + msgID + " --file <path>"},
+
+		{
+			"session line",
+			app.GrammarSessionLine(msgID, "implementer", "active", "t2", 1, "ws/tab/pane"),
+			"session " + msgID + ": role=implementer state=active task=t2 attempt=1 binding=ws/tab/pane",
+		},
+		{
+			"session line, manager",
+			app.GrammarSessionLine(msgID, "manager", "active", "(none)", 0, "ws/tab/pane"),
+			"session " + msgID + ": role=manager state=active task=(none) attempt=0 binding=ws/tab/pane",
+		},
 	}
 	for _, tc := range golden {
 		t.Run(tc.name, func(t *testing.T) {

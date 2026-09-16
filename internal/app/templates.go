@@ -127,6 +127,12 @@ type managerAssignmentFields struct {
 	RolePath       string // absolute; the frozen manager role copy
 	CribPath       string // absolute; the worker-protocol crib
 	HOPPath        string // absolute
+	// RepositoryRoot is the run's frozen repository root: the manager's
+	// verdict-channel instruction renders it into the exact `hop status`
+	// invocation the manager runs to learn a review verdict
+	// (docs/plan/phase-3-design.md section 7's "the manager's verdict
+	// channel"; STATUS-1).
+	RepositoryRoot string
 }
 
 // renderManagerAssignment renders the manager's brief assignment
@@ -165,9 +171,25 @@ Answer a question with %s msg send --kind answer --reply-to
 needs-rework task with %s task retry <task-uuid> --reason "<why>".
 Every verb's first line is fixed by the protocol reference, and a
 refusal's first line is refused: <reason-token> with detail after.
+
+## Verdict channel
+
+A review verdict's controller notice carries only the reviewer's reasons
+text as its body; it never names the verdict itself. After any
+controller info notice, run:
+
+    %s status -C %s -run %s
+
+and read its shortfall lines. A shortfall naming verdict-rejected means
+the last review was rejected: read the reasons file the notice named,
+then plan a fix task from it — integrating it produces a new head, which
+gets its own new review task. A needs-rework task notice already carries
+its own retry path (%s task retry <task-uuid> --reason "<why>"); this
+channel is for verdicts, which commit no task-state notice of their own.
 `,
 		f.RunID, f.Brief, f.AssignmentPath, f.RolePath, f.CribPath,
-		f.HOPPath, f.HOPPath, f.HOPPath, f.HOPPath, f.HOPPath, f.HOPPath)
+		f.HOPPath, f.HOPPath, f.HOPPath, f.HOPPath, f.HOPPath, f.HOPPath,
+		f.HOPPath, f.RepositoryRoot, f.RunID, f.HOPPath)
 }
 
 // priorAttemptFeedback is the retry section of a task assignment: the

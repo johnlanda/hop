@@ -1524,6 +1524,59 @@ func (s *fakeStore) pendingQuestionsLocked(runID identity.RunID, now time.Time) 
 	return out
 }
 
+// sessionsLocked lists every session of runID, oldest first (by session
+// id, which fakeIDs mints as a monotonically increasing, lexically
+// sortable sequence — mirroring the real store's `ORDER BY rowid`), with
+// its current binding (nil when it has none) and — for a child
+// (implementer or reviewer) session — the task and attempt number it is
+// delegated to. Returns nil for a solo run, matching RunDetail.Sessions'
+// doc. Callers hold s.mu.
+func (s *fakeStore) sessionsLocked(runID identity.RunID) []app.SessionSummary {
+	if !s.Snapshots[runID].Workflow.Feature() {
+		return nil
+	}
+	var ids []identity.SessionID
+	for id, row := range s.Sessions {
+		if row.value.RunID == runID {
+			ids = append(ids, id)
+		}
+	}
+	slices.Sort(ids)
+	summaries := make([]app.SessionSummary, 0, len(ids))
+	for _, id := range ids {
+		sess := s.Sessions[id].value
+		summary := app.SessionSummary{SessionID: sess.ID, Role: sess.Role, State: sess.State}
+		if sess.AttemptID != "" {
+			if a, ok := s.Attempts[sess.AttemptID]; ok {
+				summary.TaskID = a.value.TaskID
+				summary.AttemptNumber = a.value.Number
+			}
+		}
+		if binding, ok := s.currentBindingBySessionLocked(id); ok {
+			b := binding
+			summary.Binding = &b
+		}
+		summaries = append(summaries, summary)
+	}
+	return summaries
+}
+
+// currentBindingBySessionLocked returns sessionID's current
+// (non-superseded) binding, mirroring the real store's currentBinding: the
+// newest non-superseded row in the session's own binding history,
+// independent of the session's own state (a terminated session's last
+// binding is still its current one — sessionsLocked reports it as
+// evidence of where the session ran). Callers hold s.mu.
+func (s *fakeStore) currentBindingBySessionLocked(sessionID identity.SessionID) (run.RuntimeBinding, bool) {
+	history := s.Bindings[sessionID]
+	for i := len(history) - 1; i >= 0; i-- {
+		if !history[i].Superseded {
+			return history[i], true
+		}
+	}
+	return run.RuntimeBinding{}, false
+}
+
 // sendRequestDigest computes the section 7 request digest for a
 // hop msg send, normalizing an answer's payload (question uuid + body
 // digest) separately from an ordinary question/info send.

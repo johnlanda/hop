@@ -85,6 +85,19 @@ type PendingQuestionView struct {
 	Age       time.Duration
 }
 
+// SessionView is one row of RunDetailView's feature-mode per-session
+// roles/bindings listing. TaskID is "" and AttemptNumber 0 for the
+// manager, which binds no attempt. BindingSummary is "" when the session
+// currently has no binding.
+type SessionView struct {
+	SessionID      string
+	Role           string
+	State          string
+	TaskID         string
+	AttemptNumber  int
+	BindingSummary string
+}
+
 // WorktreeOperationView is one unresolved per-attempt worktree.create
 // operation of a feature run and the human's action for it. Branch is ""
 // when the intent is unreadable. Action is fixed text: never a path or a
@@ -144,6 +157,9 @@ type RunDetailView struct {
 	// WorktreeOperations is every unresolved per-attempt worktree.create
 	// operation, oldest first, with its human action; nil for a solo run.
 	WorktreeOperations []WorktreeOperationView
+	// Sessions is every session the run has ever created, oldest first;
+	// nil for a solo run.
+	Sessions []SessionView
 }
 
 // StatusResult is Status's success value: exactly one of Runs (the -run-less
@@ -260,6 +276,19 @@ func runDetailView(d RunDetail) RunDetailView { //nolint:gocritic // hugeParam: 
 		view.PendingQuestions = append(view.PendingQuestions, PendingQuestionView{
 			MessageID: q.MessageID.String(), BodyPath: q.BodyPath, Age: q.Age,
 		})
+	}
+	for _, s := range d.Sessions {
+		sv := SessionView{
+			SessionID: s.SessionID.String(), Role: string(s.Role), State: string(s.State),
+			AttemptNumber: s.AttemptNumber,
+		}
+		if s.TaskID != "" {
+			sv.TaskID = s.TaskID.String()
+		}
+		if s.Binding != nil {
+			sv.BindingSummary = fmt.Sprintf("%s/%s/%s", s.Binding.WorkspaceID, s.Binding.TabID, s.Binding.PaneID)
+		}
+		view.Sessions = append(view.Sessions, sv)
 	}
 	if d.Mode == WorkflowModeFeature {
 		for i := range d.PendingOperations {

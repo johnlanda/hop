@@ -298,6 +298,34 @@ func TestRunDetailFeatureExtensions(t *testing.T) {
 		t.Fatalf("feature detail session = %s binding %+v, want the current manager", detail.SessionID, detail.Binding)
 	}
 
+	// Sessions lists every session the run has ever created: the legacy
+	// solo-shaped bootstrap session initLegacyFeatureRun's promoted run
+	// still carries (reserved, never bound — the same "bootstrap" row the
+	// task-table assertion below counts), the manager (no task or
+	// attempt), and the implementer bound to TaskB's first attempt, each
+	// of the latter two with its current binding.
+	if len(detail.Sessions) != 3 {
+		t.Fatalf("Sessions = %+v, want the bootstrap, manager and implementer sessions", detail.Sessions)
+	}
+	byRole := map[run.Role]app.SessionSummary{}
+	for _, s := range detail.Sessions {
+		byRole[s.Role] = s
+	}
+	bootstrap := byRole[run.RoleWorker]
+	if bootstrap.State != run.SessionReserved || bootstrap.TaskID == "" || bootstrap.AttemptNumber != 1 || bootstrap.Binding != nil {
+		t.Fatalf("bootstrap session summary = %+v", bootstrap)
+	}
+	manager := byRole[run.RoleManager]
+	if manager.SessionID != f.ManagerID || manager.TaskID != "" || manager.AttemptNumber != 0 ||
+		manager.Binding == nil || manager.Binding.IncarnationID != f.ManagerIncarnation {
+		t.Fatalf("manager session summary = %+v", manager)
+	}
+	worker := byRole[run.RoleImplementer]
+	if worker.SessionID != f.WorkerID || worker.TaskID != f.TaskB || worker.AttemptNumber != 1 ||
+		worker.Binding == nil || worker.Binding.IncarnationID != f.WorkerIncarnation {
+		t.Fatalf("implementer session summary = %+v", worker)
+	}
+
 	if len(detail.Tasks) != 3 {
 		t.Fatalf("task table = %+v, want bootstrap + worker task + dependent", detail.Tasks)
 	}
@@ -390,7 +418,7 @@ func TestRunDetailSoloZeroValues(t *testing.T) {
 		t.Fatalf("Mode = %q, want \"\" for a solo run", detail.Mode)
 	}
 	if detail.Tasks != nil || detail.LatestIntegration != nil || detail.GuardShortfalls != nil ||
-		detail.Mailboxes != nil || detail.PendingQuestions != nil {
+		detail.Mailboxes != nil || detail.PendingQuestions != nil || detail.Sessions != nil {
 		t.Fatalf("solo run rendered feature-mode fields: %+v", detail)
 	}
 }

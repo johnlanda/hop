@@ -302,7 +302,64 @@ func featureRunDetail(ctx context.Context, q querier, detail *app.RunDetail, sna
 	if detail.PendingQuestions, err = pendingQuestions(ctx, q, runID, now); err != nil {
 		return err
 	}
+	if detail.Sessions, err = sessionSummaries(ctx, q, runID); err != nil {
+		return err
+	}
 	return nil
+}
+
+// sessionSummaries lists every session the run has ever created, oldest
+// first, with its current binding (nil when it has none) and — for a
+// child (implementer or reviewer) session — the task and attempt number it
+// is delegated to. A manager session's TaskID stays "" and AttemptNumber 0
+// (a manager binds no attempt).
+func sessionSummaries(ctx context.Context, q querier, runID identity.RunID) ([]app.SessionSummary, error) {
+	rows, err := q.QueryContext(ctx, `SELECT id FROM sessions WHERE run_id = ? ORDER BY rowid`, runID.String())
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: list sessions of run %s: %w", runID, err)
+	}
+	defer rows.Close() //nolint:errcheck // the deferred close of a fully-iterated read cursor has no failure the rows.Err check below misses.
+	var ids []identity.SessionID
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			return nil, fmt.Errorf("sqlite: scan session row: %w", err)
+		}
+		id, parseErr := identity.ParseSessionID(raw)
+		if parseErr != nil {
+			return nil, fmt.Errorf("sqlite: listed session id: %w", parseErr)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("sqlite: iterate session rows: %w", err)
+	}
+
+	summaries := make([]app.SessionSummary, 0, len(ids))
+	for _, id := range ids {
+		session, _, sessionErr := getSession(ctx, q, id)
+		if sessionErr != nil {
+			return nil, sessionErr
+		}
+		summary := app.SessionSummary{SessionID: session.ID, Role: session.Role, State: session.State}
+		if session.AttemptID != "" {
+			attempt, _, attemptErr := getAttempt(ctx, q, session.AttemptID)
+			if attemptErr != nil {
+				return nil, attemptErr
+			}
+			summary.TaskID = attempt.TaskID
+			summary.AttemptNumber = attempt.Number
+		}
+		binding, hasBinding, bindingErr := currentBinding(ctx, q, id)
+		if bindingErr != nil {
+			return nil, bindingErr
+		}
+		if hasBinding {
+			summary.Binding = &binding
+		}
+		summaries = append(summaries, summary)
+	}
+	return summaries, nil
 }
 
 // latestIntegrationSummary loads the run's most recently CREATED

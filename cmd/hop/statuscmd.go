@@ -112,6 +112,9 @@ func listingMarkers(r *app.RunSummaryView) string {
 	if r.Reconciling {
 		markers = append(markers, "reconciling")
 	}
+	if r.NeedsAttention {
+		markers = append(markers, app.GrammarAttentionMarker)
+	}
 	if len(markers) == 0 {
 		return ""
 	}
@@ -155,12 +158,134 @@ func renderRunDetail(w io.Writer, detail *app.RunDetailView) (int, error) {
 			lines = append(lines, "    unknown outcome — options: "+detail.LastCheckOptions)
 		}
 	}
+	lines = append(lines, featureDetailLines(detail)...)
 	for _, line := range lines {
 		if _, err := fmt.Fprintln(w, line); err != nil {
 			return exitFailure, err
 		}
 	}
 	return exitOK, nil
+}
+
+// featureDetailLines renders the section 10 feature-mode detail block:
+// the task table, the latest integration, EvaluateReadiness's guard
+// shortfalls verbatim, the section 7 per-mailbox attention lines, the
+// pending human questions and the per-session roles/bindings listing. A
+// solo run (detail.Mode == "") renders none of this, so solo output stays
+// byte-identical to Phase 2's. Every fixed line's text comes from
+// internal/app/grammar.go; this function only resolves task-uuid-to-label
+// lookups and assembles the block's indentation.
+func featureDetailLines(detail *app.RunDetailView) []string {
+	if !isFeatureMode(detail.Mode) {
+		return nil
+	}
+	labels := taskLabelsByID(detail.Tasks)
+	var lines []string
+
+	for _, t := range detail.Tasks {
+		lines = append(lines, "  "+app.GrammarTaskLine(
+			app.GrammarTaskLabel(t.Seq), t.TaskID, t.Kind, t.State, depLabels(t.DependsOn, labels),
+			t.AttemptCount, orUnset(t.WorktreePath),
+		))
+	}
+
+	if integ := detail.LatestIntegration; integ != nil {
+		lines = append(lines, "  "+app.GrammarIntegrationLine(
+			integ.ID, taskLabelFor(integ.TaskID, labels), integ.State,
+			orUnset(integ.SourceCommitOID), orUnset(integ.PremergeHeadOID), orUnset(integ.MergeCommitOID),
+		))
+	}
+
+	for _, s := range detail.GuardShortfalls {
+		taskLabel := ""
+		if s.TaskID != "" {
+			taskLabel = taskLabelFor(s.TaskID, labels)
+		}
+		lines = append(lines, "  "+app.GrammarShortfallLine(s.Kind, taskLabel, s.TaskID))
+	}
+
+	for _, m := range detail.Mailboxes {
+		address := m.Address
+		if strings.HasPrefix(address, "task:") {
+			taskID := strings.TrimPrefix(address, "task:")
+			address = app.GrammarTaskAddress(taskID, taskLabelFor(taskID, labels))
+		}
+		lines = append(lines, "  "+app.GrammarAttentionLine(address, m.InFlightMessageID, m.InFlightAge, m.QueuedCount, m.OldestQueuedAge))
+		if m.Attention {
+			action := app.GrammarAttentionActionHuman
+			if m.Address != "human" {
+				action = app.GrammarAttentionActionSession(sessionBindingFor(m.Address, detail.Sessions))
+			}
+			lines = append(lines, "    action:      "+action)
+		}
+	}
+
+	for _, q := range detail.PendingQuestions {
+		lines = append(lines,
+			"  "+app.GrammarQuestionLine(q.MessageID, q.Age, q.BodyPath),
+			"    "+app.GrammarAnswerInvocationLine(q.MessageID),
+		)
+	}
+
+	for _, s := range detail.Sessions {
+		taskLabel := "(none)"
+		if s.TaskID != "" {
+			taskLabel = taskLabelFor(s.TaskID, labels)
+		}
+		lines = append(lines, "  "+app.GrammarSessionLine(s.SessionID, s.Role, s.State, taskLabel, s.AttemptNumber, orUnset(s.BindingSummary)))
+	}
+
+	return lines
+}
+
+// taskLabelsByID maps a feature run's task uuids to their stable t<seq>
+// display sequence, for resolving a uuid reference (a dependency edge, a
+// guard shortfall's task, an integration's task, a mailbox address) to its
+// label without a second store round trip.
+func taskLabelsByID(tasks []app.TaskSummaryView) map[string]int {
+	labels := make(map[string]int, len(tasks))
+	for _, t := range tasks {
+		labels[t.TaskID] = t.Seq
+	}
+	return labels
+}
+
+// taskLabelFor resolves one task uuid to its "t<seq>" label.
+func taskLabelFor(taskID string, labels map[string]int) string {
+	return app.GrammarTaskLabel(labels[taskID])
+}
+
+// depLabels renders a task's dependency edges as comma-separated t<seq>
+// labels, or "(none)" when it depends on nothing.
+func depLabels(dependsOn []string, labels map[string]int) string {
+	if len(dependsOn) == 0 {
+		return "(none)"
+	}
+	rendered := make([]string, len(dependsOn))
+	for i, id := range dependsOn {
+		rendered[i] = taskLabelFor(id, labels)
+	}
+	return strings.Join(rendered, ",")
+}
+
+// sessionBindingFor resolves a mailbox address ("manager" or
+// "task:<uuid>") to its live session's current binding summary, the most
+// recently created matching session in sessions (oldest first) — the
+// manager's own succession, or a task's latest attempt — or "" when that
+// session currently has none. The human address is never passed here: it
+// has no session to bind.
+func sessionBindingFor(address string, sessions []app.SessionView) string {
+	taskID, isTask := strings.CutPrefix(address, "task:")
+	var binding string
+	for _, s := range sessions {
+		switch {
+		case isTask && s.TaskID == taskID:
+			binding = s.BindingSummary
+		case !isTask && address == "manager" && s.Role == "manager":
+			binding = s.BindingSummary
+		}
+	}
+	return binding
 }
 
 // isFeatureMode reports whether mode (RunDetail.Mode/RunDetailView.Mode)
