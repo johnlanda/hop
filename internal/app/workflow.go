@@ -323,12 +323,14 @@ type SessionLaunchContext struct {
 	// LaunchContext carries it.
 	Attempt run.Attempt
 	// WorktreePath is the attempt's recorded worktree path exactly as the
-	// worktree row persisted it — resolved the same way LoadLaunchContext
-	// resolves the Phase 2 field, never from a binding that may not exist
-	// yet — or "" for a manager session (whose expected launch directory
-	// is the repository root, from FrozenRun) and before the row exists.
-	// PrepareSessionLaunchExec refuses an attempt-bearing launch whose
-	// working directory does not canonically resolve to it.
+	// worktree row persisted it, never from a binding that may not exist
+	// yet: the row linked to the attempt (every feature-mode row), else
+	// the run's single unlinked row (the solo shape), else "" — a run with
+	// several rows none of which names the attempt is never guessed
+	// among. It is also "" for a manager session (whose expected launch
+	// directory is the repository root, from FrozenRun) and before the row
+	// exists. PrepareSessionLaunchExec refuses an attempt-bearing launch
+	// whose working directory does not canonically resolve to it.
 	WorktreePath string
 	// Relaunch reports that this session is a cold-relaunch SUCCESSOR:
 	// another session of the same run carries the same native session

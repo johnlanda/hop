@@ -700,7 +700,14 @@ func (c *Controller) createAttemptWorktree(ctx context.Context, handle RunHandle
 			if runErr != nil {
 				return runErr
 			}
-			if _, createErr := uow.Worktrees().Create(ctx, run.NewWorktree(worktreeID, r.RepositoryID, handle.runID, info.Path, info.Branch)); createErr != nil {
+			// The row names its attempt and verified base: the launch
+			// boundary finds a feature session's worktree by attempt, never
+			// by run, once the run holds more than one worktree.
+			worktree, wtErr := run.NewAttemptWorktree(worktreeID, r.RepositoryID, handle.runID, attemptID, baseOID, info.Path, info.Branch)
+			if wtErr != nil {
+				return wtErr
+			}
+			if _, createErr := uow.Worktrees().Create(ctx, worktree); createErr != nil {
 				return createErr
 			}
 			op.State = OperationSucceeded
