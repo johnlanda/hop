@@ -1,6 +1,12 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"io/fs"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -183,9 +189,87 @@ func TestGrammarContractResumeConfirmAbsentUsage(t *testing.T) {
 	})
 }
 
+// canaryHarnessName is the executable name hop launch's lookup searches
+// for every launch fixture in this file: hopfixtures freezes the claude
+// harness, and no fixture policy configures a harness executable path
+// beyond that name.
+const canaryHarnessName = "claude"
+
+// launchExecCanary is the direct "exec never reached" barrier for hop
+// launch's contract tests: a directory placed FIRST on the launch's PATH
+// holding one executable under the configured harness name — the name the
+// launch's executable lookup resolves — whose only behavior is creating a
+// marker file and exiting non-zero. It imitates no harness: no prompt, no
+// output, no arguments read. A launch that ever reached its exec would
+// run this script (never a real harness installed later on PATH) and
+// leave the marker behind; every test here asserts the marker never
+// exists.
+type launchExecCanary struct {
+	dir    string
+	marker string
+}
+
+// newLaunchExecCanary writes one canary for t and registers the cleanup
+// that fails t if the marker exists.
+func newLaunchExecCanary(t *testing.T) *launchExecCanary {
+	t.Helper()
+	c := &launchExecCanary{dir: t.TempDir(), marker: filepath.Join(t.TempDir(), "launch-exec-reached")}
+	if strings.ContainsAny(c.marker, "'\n") {
+		t.Fatalf("the canary marker path cannot be quoted for the script")
+	}
+	script := "#!/bin/sh\n: > '" + c.marker + "'\nexit 97\n"
+	if err := os.WriteFile(filepath.Join(c.dir, canaryHarnessName), []byte(script), 0o700); err != nil { //nolint:gosec // G306: the canary must be executable.
+		t.Fatalf("write the launch exec canary: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := os.Stat(c.marker); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("hop launch reached its exec: the harness canary ran (stat: %v)", err)
+		}
+	})
+	return c
+}
+
+// execLaunch runs one hop launch invocation under the isolated
+// environment with a fresh launchExecCanary first on PATH.
+func execLaunch(t *testing.T, hopVars map[string]string, dir string, args ...string) hopResult {
+	t.Helper()
+	canary := newLaunchExecCanary(t)
+	return runHop(t, isolatedTestEnv(t, canary.dir, hopVars), dir, args...)
+}
+
+// TestGrammarContractLaunchExecCanaryIsLive proves the barrier would fire:
+// under a launch invocation's own environment, lookupExecutable — the
+// resolver composition hands PrepareSessionLaunchExec, applied to the
+// same PATH value (sanitization never strips PATH) — resolves the
+// configured harness name to the canary, and running what it resolves
+// creates the marker.
+func TestGrammarContractLaunchExecCanaryIsLive(t *testing.T) {
+	c := newLaunchExecCanary(t)
+	env := isolatedTestEnv(t, c.dir, nil)
+	resolved, err := lookupExecutable(canaryHarnessName, envValue(env, envPath))
+	if want := filepath.Join(c.dir, canaryHarnessName); err != nil || resolved != want {
+		t.Fatalf("lookupExecutable(%s) = %q, %v; want the canary %q", canaryHarnessName, resolved, err, want)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+	defer cancel()
+	run := exec.CommandContext(ctx, resolved) //nolint:gosec // G204: this test's own canary script.
+	run.Env = env
+	var exitErr *exec.ExitError
+	if err := run.Run(); !errors.As(err, &exitErr) || exitErr.ExitCode() != 97 {
+		t.Fatalf("running the canary = %v, want exit 97", err)
+	}
+	if _, err := os.Stat(c.marker); err != nil {
+		t.Fatalf("the canary ran but left no marker: %v", err)
+	}
+	if err := os.Remove(c.marker); err != nil {
+		t.Fatalf("remove the control marker: %v", err)
+	}
+}
+
 // TestGrammarContractLaunchUsage covers hop launch's usage-error branch
 // (--run required, exactly one of --attempt/--session, unexpected
-// argument); no fixture needed.
+// argument); no fixture needed. Every hop launch invocation in this file
+// runs through execLaunch, so each also proves its exec was never reached.
 func TestGrammarContractLaunchUsage(t *testing.T) {
 	dir := freshStateDir(t)
 	cases := []struct {
@@ -199,7 +283,7 @@ func TestGrammarContractLaunchUsage(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			result := execHop(t, map[string]string{"HOP_STATE_DIR": dir}, dir, tc.args...)
+			result := execLaunch(t, map[string]string{"HOP_STATE_DIR": dir}, dir, tc.args...)
 			if result.ExitCode != exitUsage {
 				t.Fatalf("exit = %d, want %d (usage); stdout=%q stderr=%q", result.ExitCode, exitUsage, result.Stdout, result.Stderr)
 			}
@@ -213,13 +297,13 @@ func TestGrammarContractLaunchUsage(t *testing.T) {
 func TestGrammarContractLaunchStateDirRequired(t *testing.T) {
 	dir := realDir(t)
 	t.Run("missing", func(t *testing.T) {
-		result := execHop(t, map[string]string{}, dir, "launch", "--run", testUUID(1), "--attempt", testUUID(2))
+		result := execLaunch(t, map[string]string{}, dir, "launch", "--run", testUUID(1), "--attempt", testUUID(2))
 		if result.ExitCode != exitFailure {
 			t.Fatalf("exit = %d, want %d (failure); stdout=%q stderr=%q", result.ExitCode, exitFailure, result.Stdout, result.Stderr)
 		}
 	})
 	t.Run("relative", func(t *testing.T) {
-		result := execHop(t, map[string]string{"HOP_STATE_DIR": "relative/path"}, dir, "launch", "--run", testUUID(1), "--attempt", testUUID(2))
+		result := execLaunch(t, map[string]string{"HOP_STATE_DIR": "relative/path"}, dir, "launch", "--run", testUUID(1), "--attempt", testUUID(2))
 		if result.ExitCode != exitFailure {
 			t.Fatalf("exit = %d, want %d (failure); stdout=%q stderr=%q", result.ExitCode, exitFailure, result.Stdout, result.Stderr)
 		}
@@ -242,7 +326,7 @@ func TestGrammarContractLaunchUnknownRun(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			result := execHop(t, map[string]string{"HOP_STATE_DIR": dir}, dir, tc.args...)
+			result := execLaunch(t, map[string]string{"HOP_STATE_DIR": dir}, dir, tc.args...)
 			if result.ExitCode != exitFailure {
 				t.Fatalf("exit = %d, want %d (failure); stdout=%q stderr=%q", result.ExitCode, exitFailure, result.Stdout, result.Stderr)
 			}
@@ -280,7 +364,7 @@ func TestGrammarContractLaunchEnvironmentDisagreement(t *testing.T) {
 	f := newSoloReserved(t, 8500)
 	f.launch(t)
 	env := launchEnv(f, map[string]string{"HOP_RUN_ID": testUUID(9999)})
-	result := execHop(t, env, f.StateRoot, "launch", "--run", f.RunID, "--attempt", f.AttemptID)
+	result := execLaunch(t, env, f.StateRoot, "launch", "--run", f.RunID, "--attempt", f.AttemptID)
 	if result.ExitCode != exitFailure {
 		t.Fatalf("exit = %d, want %d (failure); stdout=%q stderr=%q", result.ExitCode, exitFailure, result.Stdout, result.Stderr)
 	}
@@ -300,7 +384,7 @@ func TestGrammarContractLaunchClaimConflict(t *testing.T) {
 	f.launch(t)
 	f.seedConflictingClaim(t)
 	env := launchEnv(f, nil)
-	result := execHop(t, env, f.StateRoot, "launch", "--run", f.RunID, "--attempt", f.AttemptID)
+	result := execLaunch(t, env, f.StateRoot, "launch", "--run", f.RunID, "--attempt", f.AttemptID)
 	if result.ExitCode != exitFailure {
 		t.Fatalf("exit = %d, want %d (failure); stdout=%q stderr=%q", result.ExitCode, exitFailure, result.Stdout, result.Stderr)
 	}
