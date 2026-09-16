@@ -1091,6 +1091,14 @@ surface is asserted in the `DuplicateAndAmbiguousDelivery` exit scenario
 worker is dead and asserts the condition line, its counts and its age
 fields, then asserts the line clears after the relaunch acks.
 
+The manager's verdict channel is exactly this surface: a review verdict's
+controller notice (section 8) carries only the reviewer's reasons text as
+its body, never the verdict itself, so `hop status -run`'s guard-shortfall
+line — `verdict-rejected` names a reject with no task, `task-not-integrated`
+names one with — is how the manager learns a review was rejected, per the
+manager assignment's own standing instruction to run it after every
+controller info notice.
+
 Deferred capability — a dialog-safe nudge: a typed wake-up for an idle
 recipient stays out of HOP until Herdr offers a surface that removes the
 misdetection window, none of which exists on 0.9.0. Research leads a
@@ -1431,6 +1439,12 @@ harmless by construction: the guard compares object IDs, so staleness is
 computed, never stored (the gate-evaluation immutability principle of
 [domain-model.md](../architecture/domain-model.md)).
 
+Since the accepting transaction's controller notice names no verdict (its
+body is the reasons artifact, read separately through the notice's own
+`body:` path), `hop status -run`'s `verdict-rejected` shortfall line —
+named in the manager's own standing instruction — is the only channel
+that tells the manager a verdict was a reject rather than an approve.
+
 ### Reviewer independence
 
 Structural: the reviewer session is a distinct session (its own native
@@ -1538,6 +1552,28 @@ rendered it — solo-mode panes continue to carry the Phase 2 argv verbatim,
 and the two forms are mutually exclusive. Exit codes keep the Phase 2
 discipline; message and review refusals exit 1 with the `refused:`
 grammar; usage errors 2.
+
+Once the worktree-retirement slice (section 12) lands, `hop status` also
+runs the lazy post-merge retirement pass (open question 6) before it
+renders: the detail block below is a separate, later concern from that
+pass, and neither reads the other's output.
+
+The feature-mode detail block's own fixed line text (section 10's `hop
+status` row) is specified as its own small grammar, in
+`internal/app/grammar.go` alongside the verb table above, since the
+fixture manager and the deterministic scenarios (section 11) parse it
+exactly as they parse the verb grammar:
+
+| Line | Shape |
+| --- | --- |
+| Task table row | `task t<seq> <task-uuid>: kind=<kind> state=<state> deps=<t<seq> labels, or (none)> attempts=<n> worktree=<path, or (none)>` |
+| Latest integration | `integration <id>: task=t<seq> state=<state> source=<oid, or (none)> premerge=<oid, or (none)> merge=<oid, or (none)>` |
+| Guard shortfall | `shortfall: <kind>` (`plan-open`, `check-missing`, `verdict-missing`, `verdict-rejected`) or `shortfall: <kind> t<seq> <task-uuid>` (`task-not-integrated`) — the kind token exactly as `run.ShortfallKind` defines it |
+| Attention (section 7, verbatim) | `attention: messages pending for <address>: in-flight <age> (message <uuid>), queued <n>, oldest <age>`, either clause optional but never both absent; `<address>` is `manager`, `human`, or `task:<uuid> (t<seq>)` |
+| Attention action (only when the mailbox's Attention condition holds) | `open <workspace>/<tab>/<pane> and check that the agent is following its polling instructions` (a manager or task address, its live session's binding named when known, else "that session's pane"), or `answer pending human questions with hop answer` (the human address) |
+| Listing/state-line marker | `blocked, needs attention`, appended alongside `stop requested`/`reconciling` whenever any mailbox is in the Attention condition |
+| Pending question | `question <uuid> age=<age> body: <path>` then `hop answer <uuid> --file <path>` (`<path>` a literal placeholder: the answer file does not exist yet) |
+| Per-session row | `session <uuid>: role=<role> state=<state> task=<t<seq>, or (none)> attempt=<n> binding=<workspace/tab/pane, or (none)>` |
 
 ## 11. Test plan
 
