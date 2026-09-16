@@ -11,6 +11,7 @@ import (
 
 // TestMarkWorktreesRetired proves the worktrees-retired fact's store
 // contract, which the app fake mirrors (TestFakeWorktreeRetirementContract):
+// read inside a unit of work (unset, then this transaction's own mark),
 // set once through a committed unit of work, a later value never
 // replacing the first, the run's revision untouched, another run refused
 // as fenced before any write, a rolled-back write leaving nothing, and a
@@ -43,8 +44,14 @@ func TestMarkWorktreesRetired(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if unset, readErr := repos(t, uow).WorktreesRetiredAt(t.Context(), f.spec.RunID); readErr != nil || unset != nil {
+		t.Fatalf("WorktreesRetiredAt before any mark = %v, %v; want nil", unset, readErr)
+	}
 	if markErr := repos(t, uow).MarkWorktreesRetired(t.Context(), f.spec.RunID, first); markErr != nil {
 		t.Fatalf("MarkWorktreesRetired: %v", markErr)
+	}
+	if staged, readErr := repos(t, uow).WorktreesRetiredAt(t.Context(), f.spec.RunID); readErr != nil || staged == nil || !staged.Equal(first) {
+		t.Fatalf("WorktreesRetiredAt after an uncommitted mark = %v, %v; want %v inside the transaction", staged, readErr, first)
 	}
 	if rollbackErr := uow.Rollback(); rollbackErr != nil {
 		t.Fatal(rollbackErr)
@@ -83,6 +90,9 @@ func TestMarkWorktreesRetired(t *testing.T) {
 	}
 	if markErr := repos(t, uow).MarkWorktreesRetired(t.Context(), other.RunID, first); !errors.Is(markErr, app.ErrFenced) {
 		t.Fatalf("marking another run: %v, want ErrFenced", markErr)
+	}
+	if _, readErr := repos(t, uow).WorktreesRetiredAt(t.Context(), other.RunID); !errors.Is(readErr, app.ErrFenced) {
+		t.Fatalf("reading another run's fact: %v, want ErrFenced", readErr)
 	}
 	if rollbackErr := uow.Rollback(); rollbackErr != nil {
 		t.Fatal(rollbackErr)

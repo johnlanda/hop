@@ -257,7 +257,7 @@ func (c *Controller) runRetirementCheck(ctx context.Context, handle RunHandle, f
 		return retirementDetection{}, fmt.Errorf("app: record retirement.check intent: %w", err)
 	}
 	result := retirementDetection{Head: head, Target: target}
-	if err := c.revalidateForDispatch(ctx, handle, false); err != nil {
+	if err := c.revalidateRetirementDispatch(ctx, handle); err != nil {
 		result.State, result.Detail = detectionInterrupted, "the pass lost its lease before the check was dispatched"
 		return result, nil
 	}

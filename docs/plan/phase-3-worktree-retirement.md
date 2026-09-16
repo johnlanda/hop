@@ -4,7 +4,8 @@ Design note for [phase-3-design.md](phase-3-design.md) section 12, row 8,
 implementing the human decision of 2026-09-15 (section 6, "Integration
 branch and worktree bases"; section 8, "Completion retirement"; open
 question 6). Approved on 2026-09-16 with the decisions and conditions in
-section 12. Nothing here is implemented yet.
+section 12. Section 13 records the decisions Phase B made where the note
+is silent.
 
 The design fixes the mechanism: lazy detection on the next controller
 start or `hop status` for the repository, an ancestry check under an exec
@@ -619,3 +620,96 @@ Conditions:
   the check-exec argv-by-kind boundary. Each kind's argv stays frozen per
   operation and passes byte-identically through the claim, as the
   existing kinds do, and the fakes match.
+
+## 13. Phase B implementation decisions
+
+Decisions the implementation made where the note above is silent. Each
+one was proposed to the manager before or while it was built, and each is
+consistent with sections 1 to 12.
+
+**Store and journal.**
+
+- **One claimable-kind predicate.** `OperationKind.ExecClaimable` is the
+  single predicate the store and the fakes share. The store's refusal text
+  is "not a pending exec-claimable execution".
+- **The fact does not move the run's revision.** `MarkWorktreesRetired`
+  sets a set-once housekeeping column, and no revision-checked save
+  decides anything from it.
+- **Leased reads.** `WorktreesForRetirement` lists every row of the leased
+  run in insertion order, in any state. `WorktreesRetiredAt` reads the fact
+  inside the unit of work. Both refuse another run with `ErrFenced`.
+
+**Freeze.**
+
+- `StartFeatureRun` refuses the start (`ErrStartRefused`, "the
+  repository's checked-out branch could not be read") when `symbolic-ref`
+  fails or names a non-`refs/heads/` ref.
+
+**Detection.**
+
+- **Failed checks.** A check that exits with anything other than 0 or 1
+  settles `failed` and is not repeated for the same (H, T). An unobserved
+  outcome settles `unknown` or `never-executed`, which allows a re-check.
+- **Ambiguous heads.** Two integrated rows sharing the latest creation
+  time with different merge commits fail detection closed.
+- **Missing claims.** Recovery treats a missing claim as decisive only
+  for an operation of an older generation. Every pass acquires a fresh
+  generation, so same-generation recovery never happens in a pass.
+- **Environment.** Retirement git reads run with exactly the three
+  retirement variables (section 4). The claimed acts get the sanitized
+  spawn environment, plus `HOP_STATE_DIR`, plus those three.
+
+**Dispatch revalidation (`revalidateRetirementDispatch`).** Both claimed
+acts run it immediately before the spawn:
+
+1. A fresh heartbeat CAS.
+2. A fenced re-read. The run's state must be exactly `completed`, `failed`
+   or `stopped`, and the worktrees-retired fact must be unset. Any other
+   state (`stopping`, `resuming` and `completing` included) refuses the
+   act, and so does a set fact.
+
+It does not consult the run's stop request. The only reason is that a
+terminal run can never start work again: every stopped run carries a stop
+request, and on a terminal run that request is history. The ordinary
+`revalidateForDispatch` refuses under a held stop request, so a stopped
+run would never have dispatched its check. Each pass would then have left
+one more never-executed check behind.
+
+**Candidates.**
+
+- A row is a candidate only when exactly one succeeded `worktree.create`
+  operation of the run carries its attempt, and that operation's intent
+  and recorded outcome agree with the row. The outcome is the act
+  evidence, or a recovery's outcome.
+- The candidate's branch is `refs/heads/` plus the recorded short name.
+  Herdr reports the requested name (spike S9), and git lists the full ref.
+- A row whose recorded branch already starts with `refs/` is unverified.
+
+**Removal operations and outcomes.**
+
+- **(a) Operation states.**
+
+  | Case | Operation state | Result | Row |
+  | --- | --- | --- | --- |
+  | Created settled, checkout absent | succeeded | `absent` | `absent` |
+  | Created settled, released (including unverified provenance) | succeeded | `released`, with the reason | `released` |
+  | After the act: unlisted and present | failed | `released` | `released` |
+  | After the act: listed and absent | failed | `incomplete` | stays active |
+
+  The recovery rows keep section 7's `interrupted`.
+  - A post-act release tells the human that the directory was left on
+    disk and HOP no longer manages it.
+  - After an `incomplete` act, the next pass completes the removal with
+    the same no-force `worktree remove`, which the probe pinned for a
+    missing directory. It does not use a separate prune command.
+- **(b) An exit of 0 with the checkout still listed and present.** This
+  is handled like a non-zero exit: the operation fails, and the category
+  comes from re-inspection (else `remove-refused`), with the evidence
+  retained.
+- **(c) An unobservable outcome.** A post-act observation that cannot be
+  made (the listing, or the path inspection, fails after an observed
+  exit) leaves the operation `reconciling`. The next pass's recovery then
+  retires the claimed group and observes again.
+- **(d) `interrupted-removal`.** It is rendered when the row's latest
+  settled `worktree.retire` has result `interrupted` and re-inspection
+  reports `uncommitted-changes`.

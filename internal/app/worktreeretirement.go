@@ -81,6 +81,11 @@ type WorktreeRetirementRepositories interface {
 	// leased run is refused with ErrFenced; a run without rows returns
 	// none.
 	WorktreesForRetirement(ctx context.Context, runID identity.RunID) ([]RetirementWorktree, error)
+	// WorktreesRetiredAt reads the leased run's worktrees-retired fact
+	// inside the unit of work, this transaction's own mark included: nil
+	// while it is unset. A run other than the unit of work's leased run is
+	// refused with ErrFenced, and an unknown run with ErrNotFound.
+	WorktreesRetiredAt(ctx context.Context, runID identity.RunID) (*time.Time, error)
 	// MarkWorktreesRetired sets the run's worktrees-retired fact to at when
 	// it is unset; a fact already set keeps its first value and the call
 	// succeeds. A run other than the unit of work's leased run is refused

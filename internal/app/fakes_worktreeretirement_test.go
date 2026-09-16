@@ -39,6 +39,28 @@ func (u *fakeUnitOfWork) MarkWorktreesRetired(_ context.Context, runID identity.
 	return nil
 }
 
+// WorktreesRetiredAt mirrors the SQLite store's contract: the leased run
+// only (ErrFenced otherwise), an existing run only (ErrNotFound), and this
+// transaction's own staged mark visible before the committed fact.
+func (u *fakeUnitOfWork) WorktreesRetiredAt(_ context.Context, runID identity.RunID) (*time.Time, error) {
+	u.ensureOpen()
+	if runID != u.lease.Run {
+		return nil, fmt.Errorf("app_test: run %s is not the leased run %s: %w", runID, u.lease.Run, app.ErrFenced)
+	}
+	if _, staged := u.runs[runID]; !staged {
+		if _, exists := u.store.Runs[runID]; !exists {
+			return nil, fmt.Errorf("%w: run %s", app.ErrNotFound, runID)
+		}
+	}
+	if at, ok := u.store.WorktreesRetiredAt[runID]; ok {
+		return &at, nil
+	}
+	if at, ok := u.worktreesRetired[runID]; ok {
+		return &at, nil
+	}
+	return nil, nil //nolint:nilnil // a nil time with a nil error is the documented "not retired" value.
+}
+
 // WorktreesForRetirement mirrors the SQLite store's contract: the leased
 // run only (ErrFenced otherwise), every row of the run in any state with
 // its revision, committed rows in insertion order (a row seeded straight
@@ -103,6 +125,12 @@ func TestFakeWorktreeRetirementContract(t *testing.T) {
 			t.Fatalf("RequireWorktreeRetirementRepositories() error = %v", err)
 		}
 		markErr := repos.MarkWorktreesRetired(context.Background(), runID, at)
+		if markErr == nil {
+			staged, readErr := repos.WorktreesRetiredAt(context.Background(), runID)
+			if readErr != nil || staged == nil {
+				t.Fatalf("the staged mark read back as %v, %v; want it visible inside the unit of work", staged, readErr)
+			}
+		}
 		if !commit || markErr != nil {
 			if rollbackErr := uow.Rollback(); rollbackErr != nil {
 				t.Fatalf("Rollback() error = %v", rollbackErr)
@@ -116,6 +144,26 @@ func TestFakeWorktreeRetirementContract(t *testing.T) {
 		got, err := tc.Store.LoadRunStatus(context.Background(), detail.RunID)
 		if err != nil {
 			t.Fatalf("LoadRunStatus() error = %v", err)
+		}
+		uow, err := tc.Store.Begin(context.Background(), lease)
+		if err != nil {
+			t.Fatalf("Begin() error = %v", err)
+		}
+		defer func() {
+			if rollbackErr := uow.Rollback(); rollbackErr != nil {
+				t.Errorf("Rollback() error = %v", rollbackErr)
+			}
+		}()
+		repos, err := app.RequireWorktreeRetirementRepositories(uow, "contract test")
+		if err != nil {
+			t.Fatalf("RequireWorktreeRetirementRepositories() error = %v", err)
+		}
+		inside, err := repos.WorktreesRetiredAt(context.Background(), detail.RunID)
+		if err != nil {
+			t.Fatalf("WorktreesRetiredAt() error = %v", err)
+		}
+		if (inside == nil) != (got.WorktreesRetiredAt == nil) || (inside != nil && !inside.Equal(*got.WorktreesRetiredAt)) {
+			t.Fatalf("the fact inside a unit of work %v disagrees with LoadRunStatus %v", inside, got.WorktreesRetiredAt)
 		}
 		return got.WorktreesRetiredAt
 	}
@@ -142,6 +190,20 @@ func TestFakeWorktreeRetirementContract(t *testing.T) {
 	}
 	if _, staged := tc.Store.WorktreesRetiredAt[other]; staged {
 		t.Fatalf("a fenced mark recorded a fact for the other run")
+	}
+	fencedRead, err := tc.Store.Begin(context.Background(), lease)
+	if err != nil {
+		t.Fatalf("Begin() error = %v", err)
+	}
+	fencedRepos, err := app.RequireWorktreeRetirementRepositories(fencedRead, "contract test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, readErr := fencedRepos.WorktreesRetiredAt(context.Background(), other); !errors.Is(readErr, app.ErrFenced) {
+		t.Fatalf("reading another run's fact: err %v, want ErrFenced", readErr)
+	}
+	if rollbackErr := fencedRead.Rollback(); rollbackErr != nil {
+		t.Fatal(rollbackErr)
 	}
 
 	uow, err := tc.Store.Begin(context.Background(), lease)

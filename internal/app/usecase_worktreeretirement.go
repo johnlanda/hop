@@ -99,6 +99,42 @@ func (c *Controller) retirementEligible(ctx context.Context, runID identity.RunI
 	return nil
 }
 
+// revalidateRetirementDispatch is the dispatch revalidation every claimed
+// retirement act runs immediately before its spawn: a fresh heartbeat CAS,
+// then a fenced re-read that the run's state is exactly completed, failed
+// or stopped and its worktrees-retired fact is unset; anything else
+// (stopping, resuming and completing included) refuses the act with
+// ErrRetirementNotEligible. Unlike revalidateForDispatch it does not
+// consult the run's stop request, and only because a terminal run can
+// never start work again: every stopped run carries a stop request, which
+// on a terminal run is history.
+func (c *Controller) revalidateRetirementDispatch(ctx context.Context, handle RunHandle) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per act.
+	if err := c.Heartbeat(ctx, handle); err != nil {
+		return err
+	}
+	return c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		repos, err := RequireWorktreeRetirementRepositories(uow, "worktree retirement dispatch")
+		if err != nil {
+			return err
+		}
+		r, _, err := uow.Runs().Get(ctx, handle.runID)
+		if err != nil {
+			return err
+		}
+		if !isTerminalRunState(r.State) {
+			return fmt.Errorf("%w: the run is %s, not terminal", ErrRetirementNotEligible, r.State)
+		}
+		retiredAt, err := repos.WorktreesRetiredAt(ctx, handle.runID)
+		if err != nil {
+			return err
+		}
+		if retiredAt != nil {
+			return fmt.Errorf("%w: the run's worktrees are already retired", ErrRetirementNotEligible)
+		}
+		return nil
+	})
+}
+
 // ReleaseRetirement ends a worktree-retirement pass: it cancels the
 // handle's in-flight acts and releases the lease, journaling nothing — a
 // pass leaves no detach transition behind, so repeated passes do not grow

@@ -65,7 +65,7 @@ func portSurfaceAllowlist() map[string][]string {
 		"WorkflowRepositories":           {"AttemptIndex", "Integrations", "ManagerSession", "Messages", "RetryRequests", "Reviews", "SessionIndex", "TaskDependencies", "TaskIndex"},
 		"WorkspaceRuntime":               {"CreateWorkspace", "FindWorkspaceByLabel"},
 		"WorktreeRepository":             {"ByRun", "Create", "Get", "Save"},
-		"WorktreeRetirementRepositories": {"MarkWorktreesRetired", "WorktreesForRetirement"},
+		"WorktreeRetirementRepositories": {"MarkWorktreesRetired", "WorktreesForRetirement", "WorktreesRetiredAt"},
 	}
 }
 

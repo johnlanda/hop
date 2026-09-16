@@ -81,16 +81,23 @@ func TestAcquireForRetirement(t *testing.T) {
 		}},
 	}
 	for _, tc := range refusals {
-		t.Run("refused before the lease moves: "+tc.name, func(t *testing.T) {
+		t.Run("refused before the lease moves, however often: "+tc.name, func(t *testing.T) {
 			ctrl := newTestController(defaultPolicy())
 			runID := tc.setup(t, ctrl)
 			before := *ctrl.Store.Leases[runID]
-			_, err := ctrl.Controller.AcquireForRetirement(context.Background(), runID.String(), "status-7")
-			if !errors.Is(err, app.ErrRetirementNotEligible) {
-				t.Fatalf("AcquireForRetirement() error = %v, want ErrRetirementNotEligible", err)
+			operations, transitions := len(ctrl.Store.Operations), len(ctrl.Store.Transitions)
+			for range 3 {
+				_, err := ctrl.Controller.AcquireForRetirement(context.Background(), runID.String(), "status-7")
+				if !errors.Is(err, app.ErrRetirementNotEligible) {
+					t.Fatalf("AcquireForRetirement() error = %v, want ErrRetirementNotEligible", err)
+				}
 			}
 			if after := *ctrl.Store.Leases[runID]; after != before {
 				t.Fatalf("the refusal moved the lease: %+v -> %+v", before, after)
+			}
+			if len(ctrl.Store.Operations) != operations || len(ctrl.Store.Transitions) != transitions {
+				t.Fatalf("repeated refusals journaled %d operations and %d transitions, want none",
+					len(ctrl.Store.Operations)-operations, len(ctrl.Store.Transitions)-transitions)
 			}
 		})
 	}

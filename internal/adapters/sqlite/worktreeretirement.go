@@ -39,6 +39,15 @@ func (u *unitOfWork) MarkWorktreesRetired(ctx context.Context, runID identity.Ru
 	return nil
 }
 
+// WorktreesRetiredAt reads the leased run's worktrees-retired fact inside
+// the unit of work's transaction.
+func (u *unitOfWork) WorktreesRetiredAt(ctx context.Context, runID identity.RunID) (*time.Time, error) {
+	if err := u.requireLeasedRun(runID, "run", runID.String()); err != nil {
+		return nil, err
+	}
+	return runWorktreesRetiredAt(ctx, u.tx, runID)
+}
+
 // WorktreesForRetirement lists every worktree row of the leased run in
 // insertion order, whatever its state, with each row's revision.
 func (u *unitOfWork) WorktreesForRetirement(ctx context.Context, runID identity.RunID) ([]app.RetirementWorktree, error) {

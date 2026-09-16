@@ -366,6 +366,85 @@ func TestDetectRetirementMerge(t *testing.T) {
 		})
 	}
 
+	for _, state := range []run.RunState{run.RunStopped, run.RunFailed} {
+		t.Run("a "+string(state)+" run carrying its stop request is checked once, never re-journaled", func(t *testing.T) {
+			f := newDetectFixture(t, true)
+			row := f.tc.Store.Runs[f.fr.RunID]
+			row.value.State, row.value.StopRequested = state, true
+			f.acquire()
+			if d := f.detect(); d.State != "merged" {
+				t.Fatalf("detection = %+v, want merged: a terminal run's stop request never blocks retirement", d)
+			}
+			f.acquire()
+			if d := f.detect(); d.State != "merged" || len(f.checks()) != 1 || len(f.spawns) != 1 {
+				t.Fatalf("second pass = %+v with %d checks and %d spawns, want the settled merged check and nothing new", d, len(f.checks()), len(f.spawns))
+			}
+		})
+	}
+
+	dispatchBarriers := []struct {
+		name  string
+		apply func(f *detectFixture)
+	}{
+		{"running", func(f *detectFixture) { f.tc.Store.Runs[f.fr.RunID].value.State = run.RunRunning }},
+		{"stopping", func(f *detectFixture) { f.tc.Store.Runs[f.fr.RunID].value.State = run.RunStopping }},
+		{"resuming", func(f *detectFixture) { f.tc.Store.Runs[f.fr.RunID].value.State = run.RunResuming }},
+		{"completing", func(f *detectFixture) { f.tc.Store.Runs[f.fr.RunID].value.State = run.RunCompleting }},
+		{"already retired", func(f *detectFixture) {
+			f.tc.Store.WorktreesRetiredAt[f.fr.RunID] = time.Date(2026, 9, 16, 9, 0, 0, 0, time.UTC)
+		}},
+	}
+	for _, tc := range dispatchBarriers {
+		t.Run("a stale eligibility read is refused at dispatch: "+tc.name, func(t *testing.T) {
+			f := newDetectFixture(t, true)
+			f.tc.Store.HeartbeatHook = func() {
+				f.tc.Store.mu.Lock()
+				defer f.tc.Store.mu.Unlock()
+				tc.apply(f)
+			}
+			if d := f.detect(); d.State != "interrupted" {
+				t.Fatalf("detection = %+v, want interrupted", d)
+			}
+			if ops := f.checks(); len(ops) != 1 || ops[0].State != app.OperationPending || len(f.spawns) != 0 || f.claims != 0 {
+				t.Fatalf("checks = %+v, spawns %d, claims %d; want the intent pending and nothing spawned", ops, len(f.spawns), f.claims)
+			}
+		})
+	}
+
+	t.Run("repeated passes over settled runs append no journal rows", func(t *testing.T) {
+		for _, setup := range []struct {
+			name   string
+			merged bool
+			prep   func(f *detectFixture)
+			want   string
+		}{
+			{name: "merged", merged: true, want: "merged"},
+			{name: "not merged", want: "not-merged"},
+			{name: "nothing integrated", merged: true, prep: func(f *detectFixture) { clear(f.tc.Store.Integrations) }, want: "nothing-integrated"},
+			{name: "stopped with its stop request", merged: true, prep: func(f *detectFixture) {
+				row := f.tc.Store.Runs[f.fr.RunID]
+				row.value.State, row.value.StopRequested = run.RunStopped, true
+			}, want: "merged"},
+		} {
+			f := newDetectFixture(t, setup.merged)
+			if setup.prep != nil {
+				setup.prep(f)
+			}
+			f.detect()
+			ops, transitions, spawns := len(f.tc.Store.Operations), len(f.tc.Store.Transitions), len(f.spawns)
+			for range 3 {
+				f.acquire()
+				if d := f.detect(); d.State != setup.want {
+					t.Fatalf("%s: repeated pass = %+v, want %s", setup.name, d, setup.want)
+				}
+			}
+			if len(f.tc.Store.Operations) != ops || len(f.tc.Store.Transitions) != transitions || len(f.spawns) != spawns {
+				t.Fatalf("%s: repeated passes grew the journal: operations %d -> %d, transitions %d -> %d, spawns %d -> %d",
+					setup.name, ops, len(f.tc.Store.Operations), transitions, len(f.tc.Store.Transitions), spawns, len(f.spawns))
+			}
+		}
+	})
+
 	t.Run("a pass that loses its lease before dispatch spawns nothing", func(t *testing.T) {
 		f := newDetectFixture(t, true)
 		f.tc.Store.HeartbeatHook = func() {
