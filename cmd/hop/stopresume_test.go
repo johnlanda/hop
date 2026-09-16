@@ -270,6 +270,9 @@ func TestRunResume(t *testing.T) {
 
 	t.Run("fail-closed reports the pane and the human action, releases and exits 1", func(t *testing.T) {
 		ctrl := &fakeController{}
+		ctrl.status = func(app.StatusRequest) (app.StatusResult, error) {
+			return detailStep("running", "running", false), nil
+		}
 		ctrl.resume = func(app.ResumeRequest) (app.ResumeResult, app.RunHandle, error) {
 			return app.ResumeResult{
 				Outcome:        app.ResumeFailedClosed,
@@ -305,6 +308,9 @@ func TestRunResume(t *testing.T) {
 
 	t.Run("unsupported cold resume exits 1 with the report", func(t *testing.T) {
 		ctrl := newResumeController(app.ResumeUnsupported, "codex cold resume is out of Phase 2 scope")
+		ctrl.status = func(app.StatusRequest) (app.StatusResult, error) {
+			return detailStep("running", "running", false), nil
+		}
 		td := newTestDeps(ctrl, env, t.TempDir())
 		var stdout, stderr bytes.Buffer
 
@@ -336,6 +342,9 @@ func TestRunResume(t *testing.T) {
 
 	t.Run("a resume error releases and exits 1", func(t *testing.T) {
 		ctrl := &fakeController{}
+		ctrl.status = func(app.StatusRequest) (app.StatusResult, error) {
+			return detailStep("running", "running", false), nil
+		}
 		ctrl.resume = func(app.ResumeRequest) (app.ResumeResult, app.RunHandle, error) {
 			return app.ResumeResult{}, app.RunHandle{}, errors.New("app: acquire lease: app: lease is held")
 		}
@@ -363,6 +372,190 @@ func TestRunResume(t *testing.T) {
 
 		if code != exitUsage || !strings.Contains(stderr.String(), "exactly one run-id") {
 			t.Errorf("code = %d, stderr = %q", code, stderr.String())
+		}
+	})
+
+	t.Run("a non-boolean --confirm-absent value on a solo run is a usage error", func(t *testing.T) {
+		ctrl := &fakeController{}
+		ctrl.status = func(app.StatusRequest) (app.StatusResult, error) {
+			return detailStep("running", "running", false), nil
+		}
+		ctrl.resume = func(app.ResumeRequest) (app.ResumeResult, app.RunHandle, error) {
+			t.Fatal("Resume was called despite the malformed flag value")
+			return app.ResumeResult{}, app.RunHandle{}, nil
+		}
+		td := newTestDeps(ctrl, env, t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runResume([]string{"--confirm-absent=some-session-id", testRunID}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitUsage {
+			t.Errorf("exit code = %d, want %d", code, exitUsage)
+		}
+		if !strings.Contains(stderr.String(), "--confirm-absent takes no value on a solo run") {
+			t.Errorf("stderr = %q", stderr.String())
+		}
+	})
+
+	t.Run("--confirm-absent=false on a solo run is accepted and passed through as false", func(t *testing.T) {
+		ctrl := &fakeController{}
+		ctrl.status = func(app.StatusRequest) (app.StatusResult, error) {
+			return detailStep("running", "running", false), nil
+		}
+		var resumed app.ResumeRequest
+		ctrl.resume = func(req app.ResumeRequest) (app.ResumeResult, app.RunHandle, error) {
+			resumed = req
+			return app.ResumeResult{Outcome: app.ResumeReconciling, Detail: "still reconciling"}, app.RunHandle{}, nil
+		}
+		td := newTestDeps(ctrl, env, t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runResume([]string{"--confirm-absent=false", testRunID}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitFailure {
+			t.Errorf("exit code = %d, want %d", code, exitFailure)
+		}
+		if resumed.ConfirmAbsent {
+			t.Error("ConfirmAbsent = true, want false")
+		}
+	})
+
+	t.Run("a feature-mode run requires --confirm-absent=<session-id>; bare or empty is usage", func(t *testing.T) {
+		for _, args := range [][]string{
+			{"--confirm-absent", testRunID},
+			{"--confirm-absent=", testRunID},
+		} {
+			ctrl := &fakeController{}
+			ctrl.status = func(app.StatusRequest) (app.StatusResult, error) {
+				return app.StatusResult{Detail: &app.RunDetailView{
+					RunSummaryView: app.RunSummaryView{RunID: testRunID, Sequence: 1, State: "running"},
+					Mode:           "feature",
+				}}, nil
+			}
+			ctrl.resumeFeature = func(app.ResumeFeatureRequest) (app.ResumeFeatureResult, app.RunHandle, error) {
+				t.Fatal("ResumeFeature was called despite the malformed --confirm-absent")
+				return app.ResumeFeatureResult{}, app.RunHandle{}, nil
+			}
+			td := newTestDeps(ctrl, env, t.TempDir())
+			var stdout, stderr bytes.Buffer
+
+			code, err := runResume(args, &stdout, &stderr, td.deps)
+			if err != nil {
+				t.Fatalf("write error: %v", err)
+			}
+			if code != exitUsage {
+				t.Errorf("args = %v: exit code = %d, want %d", args, code, exitUsage)
+			}
+			if !strings.Contains(stderr.String(), "requires a session id in feature mode") {
+				t.Errorf("args = %v: stderr = %q", args, stderr.String())
+			}
+		}
+	})
+
+	t.Run("a feature-mode run dispatches through ResumeFeature, passing the session id verbatim", func(t *testing.T) {
+		ctrl := &fakeController{}
+		ctrl.status = func(app.StatusRequest) (app.StatusResult, error) {
+			return app.StatusResult{Detail: &app.RunDetailView{
+				RunSummaryView: app.RunSummaryView{RunID: testRunID, Sequence: 1, State: "running"},
+				Mode:           "feature",
+			}}, nil
+		}
+		var resumed app.ResumeFeatureRequest
+		ctrl.resumeFeature = func(req app.ResumeFeatureRequest) (app.ResumeFeatureResult, app.RunHandle, error) {
+			resumed = req
+			return app.ResumeFeatureResult{
+				Outcome:  "reconciling",
+				RunState: "resuming",
+				Sessions: []app.FeatureSessionReport{
+					{SessionID: "worker-session-1", Role: "implementer", Disposition: "reconciling", Detail: "pane absent; cold relaunch requires --confirm-absent worker-session-1"},
+				},
+			}, app.RunHandle{}, nil
+		}
+		ctrl.resume = func(app.ResumeRequest) (app.ResumeResult, app.RunHandle, error) {
+			t.Fatal("the solo Resume was called for a feature-mode run")
+			return app.ResumeResult{}, app.RunHandle{}, nil
+		}
+		td := newTestDeps(ctrl, env, t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runResume([]string{"--confirm-absent=other-session-2", testRunID}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitFailure {
+			t.Errorf("exit code = %d, want %d (a value matching no absent session stays reconciling)", code, exitFailure)
+		}
+		if resumed.ConfirmAbsentSession != "other-session-2" {
+			t.Errorf("ConfirmAbsentSession = %q, want the value passed through verbatim", resumed.ConfirmAbsentSession)
+		}
+		out := stdout.String()
+		if !strings.Contains(out, "resume reconciling: resuming") {
+			t.Errorf("output = %q", out)
+		}
+		if !strings.Contains(out, "worker-session-1") || !strings.Contains(out, "--confirm-absent worker-session-1") {
+			t.Errorf("output does not name the reconciling session's required id: %q", out)
+		}
+	})
+
+	t.Run("a feature-mode run with no --confirm-absent omits the attestation and can still resume", func(t *testing.T) {
+		ctrl := &fakeController{}
+		ctrl.status = func(app.StatusRequest) (app.StatusResult, error) {
+			return app.StatusResult{Detail: &app.RunDetailView{
+				RunSummaryView: app.RunSummaryView{RunID: testRunID, Sequence: 1, State: "completed"},
+				Mode:           "feature",
+			}}, nil
+		}
+		var resumed app.ResumeFeatureRequest
+		ctrl.resumeFeature = func(req app.ResumeFeatureRequest) (app.ResumeFeatureResult, app.RunHandle, error) {
+			resumed = req
+			return app.ResumeFeatureResult{Outcome: "nothing-to-do", RunState: "completed"}, app.RunHandle{}, nil
+		}
+		td := newTestDeps(ctrl, env, t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runResume([]string{testRunID}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitOK {
+			t.Errorf("exit code = %d, want %d", code, exitOK)
+		}
+		if resumed.ConfirmAbsentSession != "" {
+			t.Errorf("ConfirmAbsentSession = %q, want empty when the flag was never given", resumed.ConfirmAbsentSession)
+		}
+	})
+
+	t.Run("a feature-mode run on a controller missing the feature ports fails closed, never falls back to solo", func(t *testing.T) {
+		ctrl := &fakeController{}
+		ctrl.status = func(app.StatusRequest) (app.StatusResult, error) {
+			return app.StatusResult{Detail: &app.RunDetailView{
+				RunSummaryView: app.RunSummaryView{RunID: testRunID, Sequence: 1, State: "running"},
+				Mode:           "feature",
+			}}, nil
+		}
+		ctrl.resumeFeature = func(app.ResumeFeatureRequest) (app.ResumeFeatureResult, app.RunHandle, error) {
+			return app.ResumeFeatureResult{}, app.RunHandle{}, fmt.Errorf("app: %w", app.ErrFeatureModeUnsupported)
+		}
+		ctrl.resume = func(app.ResumeRequest) (app.ResumeResult, app.RunHandle, error) {
+			t.Fatal("the solo Resume was called as a fallback for an unsupported feature-mode run")
+			return app.ResumeResult{}, app.RunHandle{}, nil
+		}
+		td := newTestDeps(ctrl, env, t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runResume([]string{testRunID}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitFailure {
+			t.Errorf("exit code = %d, want %d", code, exitFailure)
+		}
+		if !strings.Contains(stderr.String(), app.ErrFeatureModeUnsupported.Error()) {
+			t.Errorf("stderr = %q, want the fail-closed sentinel surfaced", stderr.String())
 		}
 	})
 }
