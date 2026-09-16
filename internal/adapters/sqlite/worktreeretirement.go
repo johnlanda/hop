@@ -39,6 +39,31 @@ func (u *unitOfWork) MarkWorktreesRetired(ctx context.Context, runID identity.Ru
 	return nil
 }
 
+// WorktreesForRetirement lists every worktree row of the leased run in
+// insertion order, whatever its state, with each row's revision.
+func (u *unitOfWork) WorktreesForRetirement(ctx context.Context, runID identity.RunID) ([]app.RetirementWorktree, error) {
+	if err := u.requireLeasedRun(runID, "run", runID.String()); err != nil {
+		return nil, err
+	}
+	rows, err := u.tx.QueryContext(ctx, selectWorktreeColumns+` WHERE run_id = ? ORDER BY created_at, rowid`, runID.String())
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: list worktrees of run %s: %w", runID, err)
+	}
+	defer rows.Close() //nolint:errcheck // the deferred close of a fully-iterated read cursor has no failure the rows.Err check below misses.
+	var worktrees []app.RetirementWorktree
+	for rows.Next() {
+		worktree, revision, scanErr := scanWorktree(rows.Scan)
+		if scanErr != nil {
+			return nil, fmt.Errorf("sqlite: scan worktree of run %s: %w", runID, scanErr)
+		}
+		worktrees = append(worktrees, app.RetirementWorktree{Worktree: worktree, Revision: revision})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("sqlite: list worktrees of run %s: %w", runID, err)
+	}
+	return worktrees, nil
+}
+
 // runWorktreesRetiredAt reads the run's worktrees-retired fact
 // (migration 004's runs.worktrees_retired_at): nil when the column is
 // NULL, the parsed canonical time otherwise.

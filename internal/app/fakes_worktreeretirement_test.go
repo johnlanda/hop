@@ -1,14 +1,17 @@
 package app_test
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/johnlanda/hop/internal/app"
 	"github.com/johnlanda/hop/internal/domain/identity"
+	"github.com/johnlanda/hop/internal/domain/run"
 )
 
 var _ app.WorktreeRetirementRepositories = (*fakeUnitOfWork)(nil)
@@ -34,6 +37,47 @@ func (u *fakeUnitOfWork) MarkWorktreesRetired(_ context.Context, runID identity.
 		u.worktreesRetired[runID] = at.UTC()
 	}
 	return nil
+}
+
+// WorktreesForRetirement mirrors the SQLite store's contract: the leased
+// run only (ErrFenced otherwise), every row of the run in any state with
+// its revision, committed rows in insertion order (a row seeded straight
+// into the store, which has no insertion sequence, first, by id) followed
+// by this transaction's own creates, and this transaction's staged saves
+// overlaid.
+func (u *fakeUnitOfWork) WorktreesForRetirement(_ context.Context, runID identity.RunID) ([]app.RetirementWorktree, error) {
+	u.ensureOpen()
+	if runID != u.lease.Run {
+		return nil, fmt.Errorf("app_test: run %s is not the leased run %s: %w", runID, u.lease.Run, app.ErrFenced)
+	}
+	var committed []app.RetirementWorktree
+	for id, row := range u.store.Worktrees {
+		if row.value.RunID != runID {
+			continue
+		}
+		committed = append(committed, app.RetirementWorktree{Worktree: row.value, Revision: row.revision})
+		if staged, ok := u.worktrees[id]; ok {
+			committed[len(committed)-1] = app.RetirementWorktree{Worktree: staged.value, Revision: staged.revision}
+		}
+	}
+	slices.SortFunc(committed, func(a, b app.RetirementWorktree) int {
+		return cmp.Or(
+			cmp.Compare(u.store.worktreeInsertOrder[a.Worktree.ID], u.store.worktreeInsertOrder[b.Worktree.ID]),
+			cmp.Compare(a.Worktree.ID, b.Worktree.ID),
+		)
+	})
+	for i := range u.worktreeCreated {
+		created := u.worktreeCreated[i]
+		if created.RunID != runID {
+			continue
+		}
+		row := app.RetirementWorktree{Worktree: created, Revision: 1}
+		if staged, ok := u.worktrees[created.ID]; ok {
+			row = app.RetirementWorktree{Worktree: staged.value, Revision: staged.revision}
+		}
+		committed = append(committed, row)
+	}
+	return committed, nil
 }
 
 // TestFakeWorktreeRetirementContract proves the fake's worktrees-retired
@@ -115,5 +159,61 @@ func TestFakeWorktreeRetirementContract(t *testing.T) {
 	}
 	if _, err := app.RequireWorktreeRetirementRepositories(&plainUnitOfWork{inner: inner}, "plain unit of work"); !errors.Is(err, app.ErrWorktreeRetirementUnsupported) {
 		t.Fatalf("a plain unit of work: err %v, want ErrWorktreeRetirementUnsupported", err)
+	}
+}
+
+// TestFakeWorktreesForRetirementContract proves the fake's leased worktree
+// listing honors the SQLite store's contract (TestWorktreesForRetirement):
+// every row of the run in any state with its revision, oldest first, this
+// transaction's creates and saves included, and another run fenced.
+func TestFakeWorktreesForRetirementContract(t *testing.T) {
+	tc := newTestController(defaultPolicy())
+	_, detail := startedRun(t, tc)
+	lease := tc.Store.Leases[detail.RunID].lease
+	started, ok := tc.Store.worktreeByRunLocked(detail.RunID)
+	if !ok {
+		t.Fatalf("the started run has no worktree")
+	}
+	seeded := run.NewWorktree("00000000-0000-4000-8000-0000000000a1", started.RepositoryID, detail.RunID, "/worktrees/seeded", "hop/seeded")
+	seeded.State = run.WorktreeReleased
+	tc.Store.Worktrees[seeded.ID] = &entityRow[run.Worktree]{value: seeded, revision: 3}
+	foreign := run.NewWorktree("00000000-0000-4000-8000-0000000000a2", started.RepositoryID, "99999999-9999-4999-8999-999999999999", "/worktrees/foreign", "hop/foreign")
+	tc.Store.Worktrees[foreign.ID] = &entityRow[run.Worktree]{value: foreign, revision: 1}
+
+	uow, err := tc.Store.Begin(context.Background(), lease)
+	if err != nil {
+		t.Fatalf("Begin() error = %v", err)
+	}
+	defer func() {
+		if rollbackErr := uow.Rollback(); rollbackErr != nil {
+			t.Errorf("Rollback() error = %v", rollbackErr)
+		}
+	}()
+	repos, err := app.RequireWorktreeRetirementRepositories(uow, "contract test")
+	if err != nil {
+		t.Fatalf("RequireWorktreeRetirementRepositories() error = %v", err)
+	}
+	created := run.NewWorktree("00000000-0000-4000-8000-0000000000a3", started.RepositoryID, detail.RunID, "/worktrees/created", "hop/created")
+	if _, createErr := uow.Worktrees().Create(context.Background(), created); createErr != nil {
+		t.Fatalf("Create() error = %v", createErr)
+	}
+	removed, err := started.Retire(run.WorktreeRemoved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, saveErr := uow.Worktrees().Save(context.Background(), removed, 1); saveErr != nil {
+		t.Fatalf("Save() error = %v", saveErr)
+	}
+
+	got, err := repos.WorktreesForRetirement(context.Background(), detail.RunID)
+	if err != nil {
+		t.Fatalf("WorktreesForRetirement() error = %v", err)
+	}
+	want := []app.RetirementWorktree{{Worktree: seeded, Revision: 3}, {Worktree: removed, Revision: 2}, {Worktree: created, Revision: 1}}
+	if !slices.Equal(got, want) {
+		t.Fatalf("WorktreesForRetirement() = %+v, want %+v", got, want)
+	}
+	if _, err := repos.WorktreesForRetirement(context.Background(), foreign.RunID); !errors.Is(err, app.ErrFenced) {
+		t.Fatalf("another run's rows: err %v, want ErrFenced", err)
 	}
 }

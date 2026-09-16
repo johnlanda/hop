@@ -273,24 +273,34 @@ func currentSession(ctx context.Context, q querier, attemptID identity.AttemptID
 	return session, revision, true, nil
 }
 
+// selectWorktreeColumns is the worktree row every loader scans with
+// scanWorktree.
+const selectWorktreeColumns = `SELECT id, repository_id, run_id, attempt_id, base_commit, path, branch, state, revision FROM worktrees`
+
 // getWorktree loads one worktree and its revision. attempt_id and
 // base_commit are NULL for a solo row and map to the domain's empty
 // values.
 func getWorktree(ctx context.Context, q querier, where, arg string) (run.Worktree, int64, error) {
-	var (
-		id, repositoryID, runID, path, branch, state string
-		attemptID, baseCommit                        sql.NullString
-		revision                                     int64
-	)
-	err := q.QueryRowContext(ctx,
-		`SELECT id, repository_id, run_id, attempt_id, base_commit, path, branch, state, revision FROM worktrees WHERE `+where+` = ?`,
-		arg,
-	).Scan(&id, &repositoryID, &runID, &attemptID, &baseCommit, &path, &branch, &state, &revision)
+	worktree, revision, err := scanWorktree(q.QueryRowContext(ctx, selectWorktreeColumns+` WHERE `+where+` = ?`, arg).Scan)
 	if errors.Is(err, sql.ErrNoRows) {
 		return run.Worktree{}, 0, fmt.Errorf("sqlite: worktree with %s %s: %w", where, arg, app.ErrNotFound)
 	}
 	if err != nil {
 		return run.Worktree{}, 0, fmt.Errorf("sqlite: load worktree with %s %s: %w", where, arg, err)
+	}
+	return worktree, revision, nil
+}
+
+// scanWorktree maps one selectWorktreeColumns row through scan, passing a
+// scan error (sql.ErrNoRows included) through unwrapped.
+func scanWorktree(scan func(dest ...any) error) (run.Worktree, int64, error) {
+	var (
+		id, repositoryID, runID, path, branch, state string
+		attemptID, baseCommit                        sql.NullString
+		revision                                     int64
+	)
+	if err := scan(&id, &repositoryID, &runID, &attemptID, &baseCommit, &path, &branch, &state, &revision); err != nil {
+		return run.Worktree{}, 0, err
 	}
 	worktreeID, err := identity.ParseWorktreeID(id)
 	if err != nil {

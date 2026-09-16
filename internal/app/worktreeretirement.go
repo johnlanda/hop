@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/johnlanda/hop/internal/domain/identity"
+	"github.com/johnlanda/hop/internal/domain/run"
 )
 
 // The post-merge worktree retirement operation kinds and their frozen
@@ -74,12 +75,26 @@ func worktreeRetireArgv(git, repositoryRoot, path string) []string {
 // from UnitOfWork and WorkflowRepositories under the additive packaging
 // rule, and reached through RequireWorktreeRetirementRepositories.
 type WorktreeRetirementRepositories interface {
+	// WorktreesForRetirement returns every worktree row of the leased run,
+	// in any state, oldest first, each with the revision a state save
+	// expects (Worktrees().Save). A run other than the unit of work's
+	// leased run is refused with ErrFenced; a run without rows returns
+	// none.
+	WorktreesForRetirement(ctx context.Context, runID identity.RunID) ([]RetirementWorktree, error)
 	// MarkWorktreesRetired sets the run's worktrees-retired fact to at when
 	// it is unset; a fact already set keeps its first value and the call
 	// succeeds. A run other than the unit of work's leased run is refused
 	// with ErrFenced before anything is written, and an unknown run with
 	// ErrNotFound.
 	MarkWorktreesRetired(ctx context.Context, runID identity.RunID, at time.Time) error
+}
+
+// RetirementWorktree is one worktree row as the retirement pass reads it
+// under its lease: the domain value, with its attempt link and verified
+// base commit, and its current revision.
+type RetirementWorktree struct {
+	Worktree run.Worktree
+	Revision int64
 }
 
 // ErrWorktreeRetirementUnsupported reports that a unit of work does not
