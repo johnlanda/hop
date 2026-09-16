@@ -126,7 +126,8 @@ func (c *Controller) corroborateSessionLaunch(ctx context.Context, handle RunHan
 }
 
 // settleSessionExeced records one feature-mode session's launch-claim
-// settlement: the run's own launching/resuming -> running transition when
+// settlement: the run's own launching -> running transition (never
+// resuming, ResumeFeature's own gate — see applyManagerRunRunning) when
 // session is the manager (design L560 — "launching -> running is the
 // manager's settled launch claim"; worker and reviewer sessions launch
 // only once AssignReadyTasks/EnsureReviewTask have already observed the
@@ -213,13 +214,19 @@ func (c *Controller) settleSessionExeced(ctx context.Context, handle RunHandle, 
 	return nil
 }
 
-// applyManagerRunRunning moves handle's run from launching or resuming to
-// running, in uow, when session is the run's manager — the design L560
-// consequence ("launching -> running is the manager's settled launch
-// claim") that neither the solo-mode settleExeced's mirror nor any step
-// of the feature-mode scheduling pass otherwise applies. A no-op for
-// every other role and for a run already past launching/resuming, so
-// calling it unconditionally from every settlement path stays idempotent.
+// applyManagerRunRunning moves handle's run from launching to running, in
+// uow, when session is the run's manager — the design L560 consequence
+// ("launching -> running is the manager's settled launch claim") that
+// neither the solo-mode settleExeced's mirror nor any step of the
+// feature-mode scheduling pass otherwise applies. Deliberately NEVER
+// resuming: resuming->running is ResumeFeature's own gate
+// (usecase_featureresume.go, markFeatureRunning) — every session warm,
+// relaunched or retired, and no blocked integration operation — and a
+// manager settlement alone must never bypass it, unlike solo's
+// settleExeced, which may accept a resuming run only because a solo run
+// has exactly one session. A no-op for every other role and for a run
+// already running, so calling it unconditionally from every settlement
+// path stays idempotent.
 func applyManagerRunRunning(ctx context.Context, uow UnitOfWork, handle RunHandle, session *run.Session, now time.Time) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per session settlement.
 	if session.Role != run.RoleManager {
 		return nil
@@ -228,7 +235,7 @@ func applyManagerRunRunning(ctx context.Context, uow UnitOfWork, handle RunHandl
 	if err != nil {
 		return err
 	}
-	if r.State != run.RunLaunching && r.State != run.RunResuming {
+	if r.State != run.RunLaunching {
 		return nil
 	}
 	rFrom := r.State
