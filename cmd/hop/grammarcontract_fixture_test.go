@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -274,15 +275,46 @@ type herdrCanary struct {
 	breached atomic.Bool
 }
 
+// Canary placement: a unix socket path must fit the platform's
+// sockaddr_un (sun_path holds the path and its terminating NUL — 104
+// bytes on darwin, 108 on linux), and os.MkdirTemp appends up to ten
+// random digits to the directory pattern.
+const (
+	canaryDirPattern   = "hop-canary"
+	canarySocketName   = "herdr.sock"
+	canaryLongestTag   = "4294967295"
+	shortCanaryBaseDir = "/tmp"
+)
+
+// maxUnixSocketPathLen is the longest socket path this platform binds.
+func maxUnixSocketPathLen() int {
+	if runtime.GOOS == "darwin" {
+		return 103
+	}
+	return 107
+}
+
+// canaryBase returns the directory a canary's own directory is created
+// under: tmp (the process temporary directory) when even MkdirTemp's
+// longest name keeps the socket path within the platform limit, else the
+// short fixed base, so a long TMPDIR never makes the bind fail.
+func canaryBase(tmp string) string {
+	if len(filepath.Join(tmp, canaryDirPattern+canaryLongestTag, canarySocketName)) <= maxUnixSocketPathLen() {
+		return tmp
+	}
+	return shortCanaryBaseDir
+}
+
 // startHerdrCanary starts listening at <dir>/herdr.sock, where dir is a
-// short-lived directory of its own (never t.TempDir(), whose nested
-// subtest path can exceed macOS's ~104-byte unix socket path limit).
+// short-lived directory of its own under canaryBase (never t.TempDir(),
+// whose nested subtest path can exceed the socket path limit); stop
+// removes it.
 func startHerdrCanary() (*herdrCanary, error) {
-	dir, err := os.MkdirTemp("", "hop-canary")
+	dir, err := os.MkdirTemp(canaryBase(os.TempDir()), canaryDirPattern)
 	if err != nil {
 		return nil, fmt.Errorf("create herdr canary dir: %w", err)
 	}
-	path := filepath.Join(dir, "herdr.sock")
+	path := filepath.Join(dir, canarySocketName)
 	var listenConfig net.ListenConfig
 	ln, err := listenConfig.Listen(context.Background(), "unix", path)
 	if err != nil {
@@ -665,4 +697,30 @@ func TestIsolatedEnvironment(t *testing.T) {
 			t.Error("a relative GOCACHE was accepted")
 		}
 	})
+}
+
+// TestCanaryBaseFitsTheSocketLimit proves canary placement never produces
+// a socket path the platform refuses to bind: a temporary directory whose
+// longest canary socket path fits is used as is, and a longer one falls
+// back to the short fixed base — whose own longest path fits.
+func TestCanaryBaseFitsTheSocketLimit(t *testing.T) {
+	longest := func(base string) int {
+		return len(filepath.Join(base, canaryDirPattern+canaryLongestTag, canarySocketName))
+	}
+	if got := canaryBase(shortCanaryBaseDir); got != shortCanaryBaseDir {
+		t.Errorf("canaryBase(%q) = %q, want it kept", shortCanaryBaseDir, got)
+	}
+	if longest(shortCanaryBaseDir) > maxUnixSocketPathLen() {
+		t.Fatalf("the short base's longest socket path (%d bytes) exceeds the limit %d", longest(shortCanaryBaseDir), maxUnixSocketPathLen())
+	}
+	long := filepath.Join(t.TempDir(), strings.Repeat("deliberately-long-tmpdir-", 6))
+	if longest(long) <= maxUnixSocketPathLen() {
+		t.Fatalf("fixture base is not long enough: %d bytes", longest(long))
+	}
+	if got := canaryBase(long); got != shortCanaryBaseDir {
+		t.Errorf("canaryBase(long) = %q, want the short base %q", got, shortCanaryBaseDir)
+	}
+	if got := canaryBase(os.TempDir()); longest(got) > maxUnixSocketPathLen() {
+		t.Errorf("canaryBase(os.TempDir()) = %q, whose longest socket path exceeds the limit", got)
+	}
 }
