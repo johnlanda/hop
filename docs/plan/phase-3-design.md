@@ -819,7 +819,12 @@ outcome, never on dispatch. A manager session's exec failure has no
 attempt to settle and fails the run, as a solo exec failure does in
 Phase 2: the feature terminal-failure procedure retires every live child
 session and group and quiesces ref moves before marking the run failed,
-with stop precedence. The fixture principals deliberately stay
+with stop precedence. The failure is read from the manager's launch
+claim, resolved as the session launch context resolves it — through the
+current binding, else the session's unresolved launch intent — so a
+bootstrap whose `pane.open` outcome was never recorded, and whose
+launcher then failed and closed its pane, still fails the run rather
+than leaving it `launching`. The fixture principals deliberately stay
 alive at a composer-like idle loop after submitting, so the suite proves
 retirement actually terminates them rather than relying on process exit.
 

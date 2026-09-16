@@ -254,18 +254,15 @@ func (c *Controller) reconcileFeatureSession(ctx context.Context, handle RunHand
 	if err != nil {
 		return report, err
 	}
-	if !bindingFound || binding.PaneID == "" {
-		report.Disposition = SessionPending
-		report.Detail = "no recorded placement; the launch may still be in flight"
-		return report, nil
-	}
 	if claimFound && claim.State == LaunchClaimExecFailed {
-		// Nothing is live for this incarnation. A child's exec failure is a
-		// terminal attempt outcome settled exactly as launch corroboration
-		// settles it (attempt failed, budgeted task consequence, mailbox
-		// closure, manager notice, session terminated); the attempt-less
-		// manager's session is only terminated, and the manager-lineage
-		// failure cause then fails the run on the next retirement pass.
+		// Nothing is live for this incarnation, placed or not (a launcher
+		// whose exec failed has exited, closing its pane). A child's exec
+		// failure is a terminal attempt outcome settled exactly as launch
+		// corroboration settles it (attempt failed, budgeted task
+		// consequence, mailbox closure, manager notice, session terminated);
+		// the attempt-less manager's session is only terminated, and the
+		// manager-lineage failure cause then fails the run on the next
+		// retirement pass.
 		if session.Role != run.RoleManager {
 			if err := c.settleChildExecFailure(ctx, handle, frozen, session); err != nil {
 				return report, err
@@ -274,6 +271,11 @@ func (c *Controller) reconcileFeatureSession(ctx context.Context, handle RunHand
 			return report, err
 		}
 		report.Disposition = SessionRetiredNoProcess
+		return report, nil
+	}
+	if !bindingFound || binding.PaneID == "" {
+		report.Disposition = SessionPending
+		report.Detail = "no recorded placement; the launch may still be in flight"
 		return report, nil
 	}
 	if !claimFound || claim.State != LaunchClaimExeced {

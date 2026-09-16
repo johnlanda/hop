@@ -224,7 +224,8 @@ func (c *Controller) retirementCandidates(ctx context.Context, handle RunHandle)
 // managerLaunchFailedLocked reports, inside the caller's transaction,
 // whether handle's run carries the manager exec-failure cause: the run is
 // launching or running, and the MOST RECENT session of its manager
-// lineage has a current binding whose launch claim is exec_failed. The
+// lineage has an exec_failed launch claim (sessionLaunchClaimLocked: its
+// current binding's, else its unresolved launch intent's). The
 // most recent session is the live manager, else the lineage's one member
 // never marked lost — a cold relaunch marks every predecessor lost in its
 // successor's creating transaction, so an earlier exec-failed member
@@ -246,10 +247,10 @@ func managerLaunchFailedLocked(ctx context.Context, uow UnitOfWork, wf WorkflowR
 		return false, err
 	}
 	binding, bindingFound, err := uow.Bindings().Current(ctx, head.ID)
-	if err != nil || !bindingFound {
+	if err != nil {
 		return false, err
 	}
-	claim, claimFound, err := uow.LaunchClaims().Get(ctx, binding.IncarnationID)
+	claim, claimFound, err := sessionLaunchClaimLocked(ctx, uow, runID, head.ID, binding, bindingFound)
 	if err != nil {
 		return false, err
 	}
@@ -518,8 +519,9 @@ func (c *Controller) applyWorkerTermination(ctx context.Context, handle RunHandl
 }
 
 // sessionCloseEvidence resolves one session's recorded close-target
-// evidence: its current binding, the claim keyed to that binding's
-// incarnation, and the durable argv markers.
+// evidence: its current binding, its launch claim (sessionLaunchClaimLocked)
+// and the durable argv markers. A claim can be found with no binding: a
+// launch whose pane.open outcome was never recorded.
 func (c *Controller) sessionCloseEvidence(ctx context.Context, handle RunHandle, session *run.Session) (binding run.RuntimeBinding, bindingFound bool, claim LaunchClaim, claimFound bool, markers []string, err error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
 	err = c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 		var getErr error
@@ -527,13 +529,8 @@ func (c *Controller) sessionCloseEvidence(ctx context.Context, handle RunHandle,
 		if getErr != nil {
 			return getErr
 		}
-		if bindingFound {
-			claim, claimFound, getErr = uow.LaunchClaims().Get(ctx, binding.IncarnationID)
-			if getErr != nil {
-				return getErr
-			}
-		}
-		return nil
+		claim, claimFound, getErr = sessionLaunchClaimLocked(ctx, uow, handle.runID, session.ID, binding, bindingFound)
+		return getErr
 	})
 	if err != nil {
 		return binding, bindingFound, claim, claimFound, nil, err
@@ -552,6 +549,27 @@ func (c *Controller) sessionCloseEvidence(ctx context.Context, handle RunHandle,
 		markers = append(markers, binding.Occupant.ArgvMarker)
 	}
 	return binding, bindingFound, claim, claimFound, markers, nil
+}
+
+// sessionLaunchClaimLocked resolves the launch claim of a session's
+// current incarnation the way the session launch context does (design
+// section 4): the current binding's incarnation, else — while the
+// pane.open outcome is unrecorded — the incarnation of the session's
+// newest unresolved pane.open or launch.send intent.
+func sessionLaunchClaimLocked(ctx context.Context, uow UnitOfWork, runID identity.RunID, sessionID identity.SessionID, binding run.RuntimeBinding, bindingFound bool) (LaunchClaim, bool, error) { //nolint:gocritic // hugeParam: RuntimeBinding is a read snapshot passed by value like every binding.
+	incarnation := binding.IncarnationID
+	if !bindingFound {
+		pending, err := uow.Operations().Pending(ctx, runID)
+		if err != nil {
+			return LaunchClaim{}, false, err
+		}
+		_, intent, found := newestPendingPaneOpenForSession(pending, sessionID)
+		if !found {
+			return LaunchClaim{}, false, nil
+		}
+		incarnation = intent.IncarnationID
+	}
+	return uow.LaunchClaims().Get(ctx, incarnation)
 }
 
 // retireChildSession retires one settled child session under the shared
