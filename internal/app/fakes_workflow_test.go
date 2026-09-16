@@ -1001,6 +1001,23 @@ func (s *fakeStore) SubmitReview(_ context.Context, submission app.ReviewSubmiss
 		prior = &p
 	}
 
+	// Receipt before eligibility: a prior accepted verdict resolves as
+	// duplicate or conflicting whatever the caller's current eligibility;
+	// only a FIRST acceptance validates the reviewer session, which must
+	// be a reviewer of the submission's own run bound to exactly the
+	// review attempt being settled — a foreign session's binding and
+	// launch claim must never assemble this attempt's acceptance context
+	// (the real store's reviewerSessionEligible, enforced here too so a
+	// direct caller of the base fake is refused exactly like one going
+	// through the featureStore wrapper).
+	if prior == nil {
+		sRow, sessionOK := s.Sessions[submission.Session]
+		if !sessionOK || sRow.value.Role != run.RoleReviewer || tRow.value.Kind != run.TaskKindReview ||
+			sRow.value.RunID != submission.RunID || sRow.value.AttemptID != submission.AttemptID {
+			return app.ReviewOutcome{Kind: app.ReviewStale, Detail: "caller is not the review task's reviewer session"}, nil
+		}
+	}
+
 	binding, hasBinding := s.currentBindingLocked(submission.Session)
 	incarnationCurrent := hasBinding && binding.IncarnationID == submission.IncarnationID && !binding.Superseded
 	claim, hasClaim := s.LaunchClaims[submission.IncarnationID]

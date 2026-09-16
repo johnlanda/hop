@@ -242,4 +242,109 @@ func TestStoreVectors(t *testing.T) {
 			t.Fatalf("AckMessage(cross-run) = %+v, want refused", got)
 		}
 	})
+
+	t.Run("ReviewSubmitForeignReviewer", func(t *testing.T) {
+		// Both foreign shapes drive BOTH fake layers — the featureStore
+		// wrapper the controller wires and the base fakeStore beneath it —
+		// so a direct caller of either is refused exactly like the real
+		// store refuses the identical vector, with no review row and the
+		// target attempt untouched.
+		refuse := func(t *testing.T, rf *reviewFixture, foreignSession identity.SessionID, foreignIncarnation identity.IncarnationID) {
+			t.Helper()
+			reviewID, err := identity.ParseReviewID(rf.tc.IDs.NewID())
+			if err != nil {
+				t.Fatalf("parse review id: %v", err)
+			}
+			vector := storevectors.ReviewSubmitForeignReviewer(
+				rf.fr.RunID, rf.TaskID, rf.AttemptID, foreignSession, foreignIncarnation,
+				reviewID, rf.SubjectCommit, fakeSubjectTree, "/state/reasons.md", "reasons-digest",
+			)
+			for name, store := range map[string]app.ReviewStore{
+				"featureStore": rf.tc.Controller.Reviews,
+				"fakeStore":    rf.tc.Store,
+			} {
+				got, err := store.SubmitReview(context.Background(), vector)
+				if err != nil {
+					t.Fatalf("%s.SubmitReview() error = %v", name, err)
+				}
+				if got.Kind != app.ReviewStale {
+					t.Fatalf("%s.SubmitReview(foreign reviewer) = %+v, want stale refusal", name, got)
+				}
+				if _, exists := rf.tc.Store.Reviews[rf.AttemptID]; exists {
+					t.Fatalf("%s accepted a foreign reviewer's verdict: review row exists", name)
+				}
+				if attempt := rf.tc.Store.Attempts[rf.AttemptID]; attempt.value.State != run.AttemptRunning {
+					t.Fatalf("%s moved the attempt to %s; want untouched", name, attempt.value.State)
+				}
+			}
+		}
+
+		t.Run("reviewer of another run", func(t *testing.T) {
+			rf := newReviewFixture(t)
+			fr2 := seedFeatureRun(t, rf.tc, 2)
+			foreignSession, foreignIncarnation := seedForeignReviewer(t, rf.tc, fr2, 2)
+			refuse(t, rf, foreignSession, foreignIncarnation)
+		})
+
+		t.Run("reviewer of a different review attempt in the same run", func(t *testing.T) {
+			rf := newReviewFixture(t)
+			foreignSession, foreignIncarnation := seedForeignReviewer(t, rf.tc, rf.fr, 3)
+			refuse(t, rf, foreignSession, foreignIncarnation)
+		})
+	})
+}
+
+// seedForeignReviewer builds a second review task inside fr with its own
+// running attempt and a live, currently-bound reviewer session — a
+// legitimate reviewer that is simply not the target attempt's — and
+// returns that session's identities.
+func seedForeignReviewer(t *testing.T, tc *testController, fr featureRun, seq int) (identity.SessionID, identity.IncarnationID) { //nolint:gocritic // hugeParam: featureRun is a small test fixture value passed once per call, never a hot loop.
+	t.Helper()
+	now := tc.Clock.Now()
+	taskID, err := identity.ParseTaskID(tc.IDs.NewID())
+	if err != nil {
+		t.Fatalf("parse task id: %v", err)
+	}
+	review := run.NewReviewTask(taskID, fr.RunID, seq, "other-subject-commit", fakeSubjectTree, now)
+	review.State = run.TaskActive
+	tc.Store.Tasks[taskID] = &entityRow[run.Task]{value: review, revision: 1}
+
+	attemptID, err := identity.ParseAttemptID(tc.IDs.NewID())
+	if err != nil {
+		t.Fatalf("parse attempt id: %v", err)
+	}
+	attempt, err := run.NewAttempt(attemptID, taskID, 1, now)
+	if err != nil {
+		t.Fatalf("NewAttempt() error = %v", err)
+	}
+	attempt.State = run.AttemptRunning
+	tc.Store.Attempts[attemptID] = &entityRow[run.Attempt]{value: attempt, revision: 1}
+
+	sessionID, err := identity.ParseSessionID(tc.IDs.NewID())
+	if err != nil {
+		t.Fatalf("parse session id: %v", err)
+	}
+	reviewer, err := run.NewChildSession(sessionID, fr.RunID, attemptID, run.RoleReviewer, tc.Store.Sessions[fr.ManagerID].value, run.HarnessClaude, now)
+	if err != nil {
+		t.Fatalf("NewChildSession() error = %v", err)
+	}
+	if reviewer, err = reviewer.Launch(now); err != nil {
+		t.Fatalf("Launch() error = %v", err)
+	}
+	if reviewer, err = reviewer.ConfirmActive(now); err != nil {
+		t.Fatalf("ConfirmActive() error = %v", err)
+	}
+	tc.Store.Sessions[sessionID] = &entityRow[run.Session]{value: reviewer, revision: 1}
+
+	incarnationID, err := identity.ParseIncarnationID(tc.IDs.NewID())
+	if err != nil {
+		t.Fatalf("parse incarnation id: %v", err)
+	}
+	binding := run.NewRuntimeBinding(sessionID, incarnationID, "", "peer-pid:2", "ws-f", "tab-f", "pane-f", "label-f", run.LaunchInitial, now)
+	tc.Store.Bindings[sessionID] = append(tc.Store.Bindings[sessionID], binding)
+	tc.Store.LaunchClaims[incarnationID] = app.LaunchClaim{
+		IncarnationID: incarnationID, RunID: fr.RunID, SessionID: sessionID, AttemptID: attemptID,
+		Executable: "/usr/local/bin/claude", PID: 556, State: app.LaunchClaimExeced, ClaimedAt: now,
+	}
+	return sessionID, incarnationID
 }

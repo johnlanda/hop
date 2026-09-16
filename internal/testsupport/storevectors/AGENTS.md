@@ -3,9 +3,10 @@
 ## Purpose
 
 Shared refused-input vectors for Phase 3's worker-authority store ports
-(`app.MessagingStore`, `app.PlanStore`): request shapes a correct store
-must refuse, expressed once so both `internal/app`'s `fakeStore` tests and
-`internal/adapters/sqlite`'s future real-store tests exercise the
+(`app.MessagingStore`, `app.PlanStore`, `app.ReviewStore`): request
+shapes a correct store must refuse, expressed once so both
+`internal/app`'s `fakeStore` tests and `internal/adapters/sqlite`'s
+real-store tests exercise the
 IDENTICAL input against their own backing implementation. This is the
 section 11 countermeasure for the Phase 2 escaped-defect class "a fake
 accepted arguments the real adapter refuses" — a shape one implementation
@@ -16,7 +17,7 @@ shared vector catches, since both sides run the same input.
 
 | File | Entities / functions | Responsibility |
 | --- | --- | --- |
-| [storevectors.go](storevectors.go) | `TaskCreateSelfDependency`, `TaskCreateRequestIDConflictFirst`/`Second`, `TaskCreateNonManagerCaller`, `TaskCreateOversizedTitle`, `AckMessageStaleIncarnation`, `MessageSendAnswerUnknownQuestion`, `MessageSendCrossRun`, `MessageFetchCrossRun`, `AckMessageCrossRun` | Nine vectors: a malformed dependency graph, a reused request-ID with conflicting content, a non-manager caller, an oversized title, a stale acking incarnation, an answer replying to an unknown question, and a send/fetch/ack from a session belonging to a DIFFERENT run than the request claims — one function per vector, each returning the exact `app.TaskCreate`/`app.MessageAck`/`app.MessageSend`/`app.MessageFetch` value to pass to the port method its doc comment names |
+| [storevectors.go](storevectors.go) | `TaskCreateSelfDependency`, `TaskCreateRequestIDConflictFirst`/`Second`, `TaskCreateNonManagerCaller`, `TaskCreateOversizedTitle`, `AckMessageStaleIncarnation`, `MessageSendAnswerUnknownQuestion`, `MessageSendCrossRun`, `MessageFetchCrossRun`, `AckMessageCrossRun`, `ReviewSubmitForeignReviewer` | Ten vectors: a malformed dependency graph, a reused request-ID with conflicting content, a non-manager caller, an oversized title, a stale acking incarnation, an answer replying to an unknown question, a send/fetch/ack from a session belonging to a DIFFERENT run than the request claims, and a review submission from a live reviewer that is not the claimed attempt's own (another run's reviewer, or another review attempt's — both fixture shapes share the one vector) — one function per vector, each returning the exact `app.TaskCreate`/`app.MessageAck`/`app.MessageSend`/`app.MessageFetch`/`app.ReviewSubmission` value to pass to the port method its doc comment names |
 
 ## Invariants
 
@@ -37,7 +38,7 @@ shared vector catches, since both sides run the same input.
   construction). It is refused earlier, as an unknown dependency; recorded
   here so a future reader does not re-derive this by surprise.
 - This package takes no dependency on `internal/adapters/sqlite`: the
-  future sqlite vector-contract test imports storevectors, never the
+  sqlite vector-contract test imports storevectors, never the
   reverse (storevectors has no reason to know sqlite exists).
 
 ## Dependencies and ports
@@ -46,25 +47,32 @@ shared vector catches, since both sides run the same input.
   [internal/domain/identity](../../domain/identity/AGENTS.md),
   [internal/domain/run](../../domain/run/AGENTS.md).
 - Consumed/implemented ports: none — this package builds `app.TaskCreate`/
-  `app.MessageAck`/`app.MessageSend` request VALUES for
-  `app.PlanStore`/`app.MessagingStore`; it implements neither port.
+  `app.MessageAck`/`app.MessageSend`/`app.ReviewSubmission` request VALUES
+  for `app.PlanStore`/`app.MessagingStore`/`app.ReviewStore`; it
+  implements none of them.
 - External libraries: none.
 
 ## Verification
 
 - `go test ./internal/app -run TestStoreVectors` — the consuming contract
   test (`internal/app/storevectors_test.go`) drives every vector above
-  against `fakeStore` through the ordinary `PlanStore`/`MessagingStore`
-  ports and asserts the documented refusal.
+  against the fakes (`ReviewSubmitForeignReviewer` against BOTH fake
+  layers, the featureStore wrapper and the base fakeStore) through the
+  ordinary `PlanStore`/`MessagingStore`/`ReviewStore` ports and asserts
+  the documented refusal.
+- `go test ./internal/adapters/sqlite -run 'TestStoreVectors|TestSubmitReviewForeignReviewerRefused'` —
+  the real-store half drives the identical vectors against the SQLite
+  adapter.
 - This package itself has no `_test.go` file: each vector is a pure
   constructor with nothing meaningful to assert in isolation from an
   actual store — the assertion worth making only exists once a vector runs
-  against `fakeStore` (today) or the real store (once
-  `internal/adapters/sqlite` lands), which is exactly what the consuming
-  contract test above does.
+  against `fakeStore` or the real store, which is exactly what the
+  consuming contract tests above do.
 
 ## Related guides
 
 - [Parent index](../AGENTS.md)
-- [internal/app](../../app/AGENTS.md): today's sole consumer.
+- [internal/app](../../app/AGENTS.md) and
+  [internal/adapters/sqlite](../../adapters/sqlite/AGENTS.md): the two
+  consumers, each driving the identical vectors against its own store.
 - [Architecture and package catalog](../../../docs/architecture/architecture.md)

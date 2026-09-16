@@ -52,8 +52,16 @@ func (s *featureStore) SubmitReview(ctx context.Context, submission app.ReviewSu
 
 	// Receipt before eligibility: a prior accepted verdict resolves as
 	// duplicate or conflicting whatever the caller's current eligibility.
+	// A first acceptance requires THE review attempt's own reviewer — a
+	// reviewer-role session of the submission's run bound to exactly the
+	// attempt being settled — so a live reviewer of another run, or of a
+	// different review attempt in this run, is refused before its binding
+	// or launch claim ever reaches the acceptance context (the shared
+	// storevectors.ReviewSubmitForeignReviewer contract, matching the real
+	// store's reviewerSessionEligible).
 	if !hasPrior {
-		if !sessOK || sessRow.value.Role != run.RoleReviewer || !taskOK || taskRow.value.Kind != run.TaskKindReview {
+		if !sessOK || sessRow.value.Role != run.RoleReviewer || !taskOK || taskRow.value.Kind != run.TaskKindReview ||
+			sessRow.value.RunID != submission.RunID || sessRow.value.AttemptID != submission.AttemptID {
 			return app.ReviewOutcome{Kind: app.ReviewStale, Detail: "caller is not the review task's reviewer session"}, nil
 		}
 	}
