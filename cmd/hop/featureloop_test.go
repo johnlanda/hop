@@ -482,3 +482,35 @@ func TestFeatureLoopHonorsRetirementAndCompletionReports(t *testing.T) {
 		requireOnlyCalls(t, ctrl.recorded(), "Status", "CheckSpawnEnvironment", "RetireSettledSessions", "Heartbeat", "Detach")
 	})
 }
+
+// TestFeatureLoopManagerExecFailure proves the loop's side of the manager
+// exec-failure rule: the failed manager launch prints the solo loop's own
+// `launch failed` line — the fixed category, no path, no environment value,
+// nothing on stderr — and the loop then observes the failed run and exits
+// 1. A child's failed launch prints nothing: it settles as a task
+// consequence, never a run transition.
+func TestFeatureLoopManagerExecFailure(t *testing.T) {
+	ctrl := &fakeController{runState: "launching"}
+	td := newTestDeps(ctrl, map[string]string{"PATH": "/bin"}, t.TempDir())
+	ctrl.status = statusFromFakeRunState(ctrl)
+	ctrl.corroborateSessions = func() ([]app.SessionLaunchProgress, error) {
+		ctrl.setRunState("failed")
+		return []app.SessionLaunchProgress{
+			{SessionID: "child-session", Role: "implementer", Progress: app.LaunchFailed},
+			{SessionID: "manager-session", Role: "manager", Progress: app.LaunchFailed},
+		}, nil
+	}
+	var stdout, stderr bytes.Buffer
+
+	code, err := finishFeatureControllerLoop(context.Background(), td.deps, ctrl, app.RunHandle{}, testRunID, "r1", "/opt/hop/bin/hop", &stdout, &stderr, "hop resume")
+	if err != nil {
+		t.Fatalf("write error: %v", err)
+	}
+	if code != exitFailure || stderr.Len() != 0 {
+		t.Fatalf("exit code = %d, stderr = %q; want 1 and nothing", code, stderr.String())
+	}
+	want := "run r1 launching\nlaunch " + describeLaunchProgress(app.LaunchFailed) + "\nrun r1 failed\n"
+	if got := stdout.String(); got != want || want != "run r1 launching\nlaunch failed\nrun r1 failed\n" {
+		t.Errorf("stdout = %q, want %q", got, want)
+	}
+}

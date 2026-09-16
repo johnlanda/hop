@@ -112,6 +112,10 @@ func (c *featureCheckDriver) interrupt() (featureCheckOutcome, bool) {
 // runs only session-launch corroboration until the run is observed
 // running.
 //
+// A manager whose launch exec failed fails the run through the app's
+// terminal-failure path; the pass prints the solo loop's `launch failed`
+// line for it, and the loop then observes the failed run and exits 1.
+//
 // The pass honors the reports it receives: once retirement reports a
 // terminal failure settled or still due, or completion reports the run
 // has left running, the rest of the pass is skipped and no new check
@@ -204,6 +208,11 @@ func runFeatureControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, 
 				}
 			}
 			pass, err := runFeatureSchedulingPass(ctx, ctrl, handle, detail.State, hopPath, spawnEnv)
+			for _, line := range pass.lines {
+				if _, werr := fmt.Fprintln(stdout, line); werr != nil {
+					return loopResult{}, errors.Join(werr, err, drainChecks())
+				}
+			}
 			if err != nil {
 				return loopResult{}, errors.Join(err, drainChecks())
 			}
@@ -230,6 +239,29 @@ type featurePassResult struct {
 	// completion under way or recorded. The loop dispatches no new check
 	// round after a halted pass.
 	halted bool
+	// lines are the transition lines the pass observed, for the loop to
+	// print: the solo loop's launch line for a failed manager launch.
+	lines []string
+}
+
+// roleManager is the manager session's role as SessionLaunchProgress
+// renders it.
+const roleManager = "manager"
+
+// managerLaunchLines renders, for every manager session whose launch
+// corroboration reported failed, the solo loop's own launch transition
+// line (`launch failed`, describeLaunchProgress): the run fails through
+// the terminal-failure path, and this line is the reason the loop shows
+// before it observes the failed run. Only the fixed category text is
+// printed.
+func managerLaunchLines(reports []app.SessionLaunchProgress) []string {
+	var lines []string
+	for _, report := range reports {
+		if report.Role == roleManager && report.Progress == app.LaunchFailed {
+			lines = append(lines, "launch "+describeLaunchProgress(report.Progress))
+		}
+	}
+	return lines
 }
 
 // runFeatureSchedulingPass runs one deterministic scheduling-pass round
@@ -259,10 +291,11 @@ func runFeatureSchedulingPass(ctx context.Context, ctrl controllerAPI, handle ap
 	halted := featurePassResult{halted: true}
 	switch runState {
 	case runStateLaunching:
-		if _, err := ctrl.CorroborateSessionLaunches(ctx, handle); err != nil {
+		launches, err := ctrl.CorroborateSessionLaunches(ctx, handle)
+		if err != nil {
 			return featurePassResult{}, fmt.Errorf("corroborate session launches: %w", err)
 		}
-		return featurePassResult{}, nil
+		return featurePassResult{lines: managerLaunchLines(launches)}, nil
 	case runStateCompleting:
 		if _, err := ctrl.DriveCompletion(ctx, handle); err != nil {
 			return halted, fmt.Errorf("drive completion: %w", err)
@@ -302,16 +335,18 @@ func runFeatureSchedulingPass(ctx context.Context, ctrl controllerAPI, handle ap
 	if err != nil {
 		return featurePassResult{}, fmt.Errorf("resolve integration head: %w", err)
 	}
-	if _, err := ctrl.AssignReadyTasks(ctx, handle, opts); err != nil {
+	if _, err = ctrl.AssignReadyTasks(ctx, handle, opts); err != nil {
 		return featurePassResult{}, fmt.Errorf("assign ready tasks: %w", err)
 	}
-	if _, err := ctrl.CorroborateSessionLaunches(ctx, handle); err != nil {
+	launches, err := ctrl.CorroborateSessionLaunches(ctx, handle)
+	if err != nil {
 		return featurePassResult{}, fmt.Errorf("corroborate session launches: %w", err)
 	}
-	if _, err := ctrl.PublishRunPresentation(ctx, handle); err != nil {
-		return featurePassResult{}, fmt.Errorf("publish run presentation: %w", err)
+	result := featurePassResult{lines: managerLaunchLines(launches)}
+	if _, err = ctrl.PublishRunPresentation(ctx, handle); err != nil {
+		return result, fmt.Errorf("publish run presentation: %w", err)
 	}
-	return featurePassResult{}, nil
+	return result, nil
 }
 
 // describeFeatureCheckReport renders one executed feature-mode check's

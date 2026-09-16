@@ -814,7 +814,11 @@ later become, owed to the retired session); a
 review attempt's accepted verdict, approve or reject; and any terminal
 attempt outcome (failed check settling the attempt, exec failure,
 interruption). The slot frees only on the close's observed-absence
-outcome, never on dispatch. The fixture principals deliberately stay
+outcome, never on dispatch. A manager session's exec failure has no
+attempt to settle and fails the run, as a solo exec failure does in
+Phase 2: the feature terminal-failure procedure retires every live child
+session and group and quiesces ref moves before marking the run failed,
+with stop precedence. The fixture principals deliberately stay
 alive at a composer-like idle loop after submitting, so the suite proves
 retirement actually terminates them rather than relying on process exit.
 
