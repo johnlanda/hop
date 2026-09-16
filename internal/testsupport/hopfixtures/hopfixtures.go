@@ -38,6 +38,7 @@ package hopfixtures
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"time"
 
 	"github.com/johnlanda/hop/internal/app"
@@ -61,6 +62,18 @@ type Store interface {
 // internal/domain/identity's parse contract exactly.
 func uid(seed int) string {
 	return fmt.Sprintf("00000000-0000-4000-8000-%012d", seed)
+}
+
+// derivedUID renders a deterministic canonical-shaped UUID from an
+// arbitrary string basis (an FNV-1a hash folded into uid's numeric
+// form) — used for adapter-internal rows (the operation journal) this
+// package mints without the caller choosing a seed for them, so a
+// collision-free id still only needs the caller's OWN identity
+// (already unique) as input.
+func derivedUID(basis string) string {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(basis))
+	return uid(int(h.Sum64() % 1_000_000_000))
 }
 
 // Entity-role offsets within one fixture's seed block. Callers space
@@ -157,9 +170,13 @@ func withUOW(ctx context.Context, store Store, lease app.Lease, fn func(app.Unit
 
 // LaunchBase drives a Base's run/task/attempt/session from Initialize's
 // initial reserved states through to "launching" (run launching, task
-// active, attempt launching, session launching) — the state hop launch's
-// PrepareSessionLaunchExec requires before it will even validate the
-// pane environment.
+// active, attempt launching, session launching) and commits a pending
+// pane.open launch operation naming the session and incarnation — the
+// state hop launch's PrepareSessionLaunchExec requires before it will
+// even validate the pane environment, and the pre-binding currency
+// evidence ClaimLaunch itself requires before any binding row exists
+// (internal/adapters/sqlite's own documented contract: the controller
+// commits this intent before dispatching the pane request).
 func LaunchBase(ctx context.Context, store Store, lease app.Lease, f Base, now time.Time) error { //nolint:gocritic // hugeParam: Base is a small fixture-identity value read once per call, never a hot loop; mirrors this codebase's own convention for domain-shaped DTOs passed by value.
 	return withUOW(ctx, store, lease, func(uow app.UnitOfWork) error {
 		if err := launchRun(ctx, uow, f.RunID, now); err != nil {
@@ -171,7 +188,27 @@ func LaunchBase(ctx context.Context, store Store, lease app.Lease, f Base, now t
 		if err := launchAttempt(ctx, uow, f.AttemptID, now); err != nil {
 			return err
 		}
-		return launchSession(ctx, uow, f.SessionID, now)
+		if err := launchSession(ctx, uow, f.SessionID, now); err != nil {
+			return err
+		}
+		err := uow.Operations().Create(ctx, app.Operation{
+			ID:         identity.OperationID(derivedUID(f.SessionID + "-launch-intent")),
+			RunID:      identity.RunID(f.RunID),
+			Generation: lease.Generation,
+			Kind:       app.OpPaneOpen,
+			State:      app.OperationPending,
+			Intent: map[string]any{
+				"session_id":     f.SessionID,
+				"incarnation_id": f.IncarnationID,
+				"creation_label": derivedUID(f.SessionID + "-creation-label"),
+			},
+			CreatedAt: now,
+			UpdatedAt: now,
+		})
+		if err != nil {
+			return fmt.Errorf("hopfixtures: create pending launch intent: %w", err)
+		}
+		return nil
 	})
 }
 
