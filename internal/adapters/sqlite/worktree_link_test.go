@@ -473,6 +473,42 @@ func TestWorktreeRepositoryAttemptLink(t *testing.T) {
 	}
 }
 
+// TestWorktreeIndexByAttempt pins the by-attempt lookup beyond the shared
+// vector (TestStoreVectors/WorktreeLookupByAttempt): a row created earlier
+// in the SAME unit of work answers with revision 1, and a rolled-back
+// creation leaves nothing to answer.
+func TestWorktreeIndexByAttempt(t *testing.T) {
+	f := newFeatureFixture(t)
+	ctx := t.Context()
+	task := f.createFeatureTask(t, 8620, 2, run.TaskActive)
+	f.createWorkerSession(t, task, run.RoleImplementer, 8621)
+	attemptID := identity.AttemptID(uid(8621))
+	repositoryID := f.repositoryID(t)
+
+	rolledBack, err := run.NewAttemptWorktree(identity.WorktreeID(uid(8630)), repositoryID, f.spec.RunID, attemptID, linkHeadOID, "/wt/rolled-back", "hop/r1/t2a1")
+	if err != nil {
+		t.Fatalf("NewAttemptWorktree: %v", err)
+	}
+	uow, err := f.store.Begin(ctx, f.lease)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	if _, err := uow.Worktrees().Create(ctx, rolledBack); err != nil {
+		t.Fatalf("create worktree: %v", err)
+	}
+	if got, revision, err := workflowRepos(t, uow).WorktreeIndex().ByAttempt(ctx, attemptID); err != nil || got != rolledBack || revision != 1 {
+		t.Fatalf("ByAttempt in the creating unit of work = %+v rev %d, %v; want %+v rev 1", got, revision, err, rolledBack)
+	}
+	if err := uow.Rollback(); err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+	f.inUOW(t, func(uow app.UnitOfWork) {
+		if got, _, err := workflowRepos(t, uow).WorktreeIndex().ByAttempt(ctx, attemptID); !errors.Is(err, app.ErrNotFound) {
+			t.Fatalf("ByAttempt after the rollback = %+v, %v; want ErrNotFound", got, err)
+		}
+	})
+}
+
 // launchingClaudeChild reserves an attempt on task and creates a LAUNCHING
 // Claude implementer with a pre-assigned native reference and a pending
 // launch intent naming its incarnation: the state a delegated session is

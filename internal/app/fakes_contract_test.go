@@ -549,3 +549,54 @@ func TestFakeFeatureBootstrapContracts(t *testing.T) {
 		}
 	})
 }
+
+// TestFakeWorktreeIndexContract is the fake half of the sqlite adapter's
+// TestWorktreeIndexByAttempt: a row created earlier in the SAME unit of
+// work answers ByAttempt with revision 1, and a rolled-back creation leaves
+// nothing to answer.
+func TestFakeWorktreeIndexContract(t *testing.T) {
+	ctx := context.Background()
+	tc := newTestController(defaultPolicy())
+	fr := seedFeatureRun(t, tc, 2)
+	taskID := seedImplementTask(t, tc, fr.RunID, 1, "index", false, run.TaskActive)
+	attempt, err := run.NewAttempt(identity.AttemptID(tc.IDs.NewID()), taskID, 1, tc.Clock.Now())
+	if err != nil {
+		t.Fatalf("NewAttempt() error = %v", err)
+	}
+	tc.Store.Attempts[attempt.ID] = &entityRow[run.Attempt]{value: attempt, revision: 1}
+	row, err := run.NewAttemptWorktree(identity.WorktreeID(tc.IDs.NewID()), tc.Store.Runs[fr.RunID].value.RepositoryID, fr.RunID, attempt.ID, fakeHeadCommitOID, "/worktrees/rolled-back", "hop/r1/t1a1")
+	if err != nil {
+		t.Fatalf("NewAttemptWorktree() error = %v", err)
+	}
+	lease := tc.Store.Leases[fr.RunID].lease
+
+	uow, err := tc.Store.Begin(ctx, lease)
+	if err != nil {
+		t.Fatalf("Begin() error = %v", err)
+	}
+	if _, err := uow.Worktrees().Create(ctx, row); err != nil {
+		t.Fatalf("Worktrees().Create() error = %v", err)
+	}
+	wf, err := app.RequireWorkflowRepositories(uow, "contract")
+	if err != nil {
+		t.Fatalf("RequireWorkflowRepositories() error = %v", err)
+	}
+	if got, revision, err := wf.WorktreeIndex().ByAttempt(ctx, attempt.ID); err != nil || got != row || revision != 1 {
+		t.Fatalf("ByAttempt in the creating unit of work = %+v rev %d, %v; want %+v rev 1", got, revision, err, row)
+	}
+	if err := uow.Rollback(); err != nil {
+		t.Fatalf("Rollback() error = %v", err)
+	}
+
+	uow, err = tc.Store.Begin(ctx, lease)
+	if err != nil {
+		t.Fatalf("Begin() error = %v", err)
+	}
+	defer func() { _ = uow.Rollback() }()
+	if wf, err = app.RequireWorkflowRepositories(uow, "contract"); err != nil {
+		t.Fatalf("RequireWorkflowRepositories() error = %v", err)
+	}
+	if got, _, err := wf.WorktreeIndex().ByAttempt(ctx, attempt.ID); !errors.Is(err, app.ErrNotFound) {
+		t.Fatalf("ByAttempt after the rollback = %+v, %v; want ErrNotFound", got, err)
+	}
+}

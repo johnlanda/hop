@@ -29,6 +29,8 @@ func (u *unitOfWork) AttemptIndex() app.AttemptIndexRepository { return attemptI
 
 func (u *unitOfWork) SessionIndex() app.SessionIndexRepository { return sessionIndexRepository{u} }
 
+func (u *unitOfWork) WorktreeIndex() app.WorktreeIndexRepository { return worktreeIndexRepository{u} }
+
 func (u *unitOfWork) Messages() app.MessageRepository { return messageRepository{u} }
 
 func (u *unitOfWork) Reviews() app.ReviewRepository { return reviewRepository{u} }
@@ -271,6 +273,26 @@ func (r sessionIndexRepository) ByRun(ctx context.Context, runID identity.RunID)
 		sessions = append(sessions, session)
 	}
 	return sessions, nil
+}
+
+// worktreeIndexRepository finds a feature attempt's worktree row.
+type worktreeIndexRepository struct{ u *unitOfWork }
+
+// ByAttempt loads the newest row linked to attempt, in the order the launch
+// context's attemptWorktreePath reads it; an unlinked (solo) row never
+// matches, since its attempt_id is NULL.
+func (r worktreeIndexRepository) ByAttempt(ctx context.Context, attempt identity.AttemptID) (run.Worktree, int64, error) {
+	var id string
+	err := r.u.tx.QueryRowContext(ctx,
+		`SELECT id FROM worktrees WHERE attempt_id = ? ORDER BY rowid DESC LIMIT 1`, attempt.String(),
+	).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return run.Worktree{}, 0, fmt.Errorf("sqlite: worktree of attempt %s: %w", attempt, app.ErrNotFound)
+	}
+	if err != nil {
+		return run.Worktree{}, 0, fmt.Errorf("sqlite: load worktree of attempt %s: %w", attempt, err)
+	}
+	return getWorktree(ctx, r.u.tx, "id", id)
 }
 
 // messageRepository is the controller-side view of the message journal:

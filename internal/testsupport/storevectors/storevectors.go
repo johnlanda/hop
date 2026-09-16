@@ -386,3 +386,51 @@ func WorktreeCreateForeignAttempt(worktreeID identity.WorktreeID, repositoryID i
 		Path: "/worktrees/vector-foreign-attempt", Branch: "hop/r1/vector-foreign", State: run.WorktreeActive,
 	}
 }
+
+// WorktreeLookupVector is the app.WorktreeIndexRepository.ByAttempt
+// contract: Rows, inserted in order through Worktrees().Create under the
+// run's own lease (each committed in its own unit of work), then Answers
+// and Unanswered read back through ByAttempt in a later unit of work.
+type WorktreeLookupVector struct {
+	Rows []run.Worktree
+	// Answers maps an attempt to the path of the row ByAttempt must return:
+	// the NEWEST row linked to that attempt, never a sibling attempt's row.
+	Answers map[identity.AttemptID]string
+	// Unanswered are attempts ByAttempt must refuse with an error wrapping
+	// app.ErrNotFound: an attempt no row links to (the run's unlinked solo
+	// row never answers for it) and the empty attempt, which matches no
+	// unlinked row's NULL link.
+	Unanswered []identity.AttemptID
+}
+
+// WorktreeLookupByAttempt returns the by-attempt lookup vector for runID:
+// an unlinked solo-shaped row, an older and a newer row linked to target,
+// and a row linked to sibling, inserted in the order unlinked, older
+// target, sibling, newer target. target, sibling and rowless must be
+// distinct existing attempts of runID; rowless has no row. rowIDs names
+// the four rows in insertion order.
+func WorktreeLookupByAttempt(repositoryID identity.RepositoryID, runID identity.RunID, rowIDs [4]identity.WorktreeID, target, sibling, rowless identity.AttemptID) WorktreeLookupVector {
+	row := func(id identity.WorktreeID, attempt identity.AttemptID, name string) run.Worktree {
+		w := run.Worktree{
+			ID: id, RepositoryID: repositoryID, RunID: runID,
+			Path: "/worktrees/vector-lookup-" + name, Branch: "hop/r1/vector-lookup-" + name, State: run.WorktreeActive,
+		}
+		if attempt != "" {
+			w.AttemptID, w.BaseCommit = attempt, WorktreeVectorBaseCommit
+		}
+		return w
+	}
+	return WorktreeLookupVector{
+		Rows: []run.Worktree{
+			row(rowIDs[0], "", "unlinked"),
+			row(rowIDs[1], target, "target-older"),
+			row(rowIDs[2], sibling, "sibling"),
+			row(rowIDs[3], target, "target-newer"),
+		},
+		Answers: map[identity.AttemptID]string{
+			target:  "/worktrees/vector-lookup-target-newer",
+			sibling: "/worktrees/vector-lookup-sibling",
+		},
+		Unanswered: []identity.AttemptID{rowless, ""},
+	}
+}
