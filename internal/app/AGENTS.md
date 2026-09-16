@@ -549,6 +549,18 @@ sides together. `cmd/hop` never imports domain or identity types: every
   `TestPrepareCheckExec`'s retirement vectors pass each argv through the
   exec boundary byte-identically and refuse a caller argv with a force
   option inserted, after the claim.
+- `go test ./internal/app -run TestFakeAttemptWorktreesReproduceTheProbe` —
+  the fake git's linked attempt-worktree model
+  (`fakes_gitworktree_test.go`, installed on `fakeGitRepo`) against the
+  process probe's executed table: status and `ls-files -v -z` pre-check
+  output, every refusal text and exit status, the three data-deleting
+  hazards (recorded in `DeletedHiddenData`), the untracked-files override,
+  the `worktree list --porcelain -z` records (locked with and without a
+  reason, detached, prunable), a prunable removal, an unlisted directory
+  refused, `cat-file -e` identity answers (a moved root cannot be
+  entered), and a force option recorded as a violation
+  (`requireNoForcedAttemptRemovals`). The existing detached scratch-tree
+  removals keep their own behavior.
 - `go test ./internal/app -run TestFakeWorktreeRetirementContract` —
   the fake's worktrees-retired fact against the SQLite store's contract
   (`TestMarkWorktreesRetired`): set once and read back through

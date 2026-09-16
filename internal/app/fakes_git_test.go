@@ -38,6 +38,10 @@ type fakeGitRepo struct {
 	worktrees map[string]string
 	counter   int
 
+	// attempt holds the linked attempt worktrees worktree retirement
+	// inspects and removes (fakes_gitworktree_test.go).
+	attempt fakeAttemptWorktrees
+
 	// MergeOutcome scripts the next merges: "merged" (default), "conflict"
 	// or "no-op".
 	MergeOutcome string
@@ -187,6 +191,7 @@ func (g *fakeGitRepo) runGitArgv(args []string) app.CommandResult {
 	defer g.mu.Unlock()
 
 	dir := ""
+	var configs []string
 	i := 0
 	for i < len(args) {
 		switch {
@@ -194,6 +199,7 @@ func (g *fakeGitRepo) runGitArgv(args []string) app.CommandResult {
 			dir = args[i+1]
 			i += 2
 		case args[i] == "-c" && i+1 < len(args):
+			configs = append(configs, args[i+1])
 			i += 2
 		default:
 			goto subcommand
@@ -205,6 +211,9 @@ subcommand:
 	}
 	sub := args[i]
 	rest := args[i+1:]
+	if result, handled := g.runAttemptWorktreeGitLocked(dir, configs, sub, rest); handled {
+		return result
+	}
 	switch sub {
 	case "rev-parse":
 		// The single-repository world: every checkout shares one common
