@@ -110,13 +110,27 @@ type RunDetail struct {
 	// between the solo and feature-mode use-case pairs (Resume vs
 	// ResumeFeature, DriveStop vs DriveFeatureStop, the loop's two
 	// scheduling shapes) without holding a WorkflowSnapshot itself.
-	Mode         string
-	TaskID       identity.TaskID
-	AttemptID    identity.AttemptID
-	SessionID    identity.SessionID
-	TaskState    run.TaskState
-	AttemptState run.AttemptState
-	WorktreePath string
+	Mode string
+	// TargetBranch mirrors WorkflowSnapshot.TargetBranch: the frozen
+	// worktree-retirement target, "" for a solo run and for a feature run
+	// frozen on a detached HEAD.
+	TargetBranch string
+	// WorktreesRetiredAt is the run's worktrees-retired fact
+	// (docs/plan/phase-3-worktree-retirement.md section 8), nil until the
+	// retirement of every worktree row reaches a final state.
+	WorktreesRetiredAt *time.Time
+	// Worktrees is a feature run's worktree rows, oldest first, and
+	// WorktreeRetirements its worktree.retire operations in any state,
+	// newest first: the input of each row's status line. Both are nil for
+	// a solo run, whose single worktree is WorktreePath.
+	Worktrees           []run.Worktree
+	WorktreeRetirements []Operation
+	TaskID              identity.TaskID
+	AttemptID           identity.AttemptID
+	SessionID           identity.SessionID
+	TaskState           run.TaskState
+	AttemptState        run.AttemptState
+	WorktreePath        string
 	// StateRoot is the run snapshot's frozen absolute state root: where the
 	// run's artifact directories live, needed by evidence capture.
 	StateRoot         string

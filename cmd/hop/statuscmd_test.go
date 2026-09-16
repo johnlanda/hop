@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/johnlanda/hop/internal/app"
 )
@@ -166,6 +167,77 @@ func TestRunStatusDetail(t *testing.T) {
 		}
 	})
 
+	retiredAt := time.Date(2026, 9, 16, 10, 30, 0, 0, time.UTC)
+	targetCases := []struct {
+		name      string
+		mode      string
+		target    string
+		retiredAt *time.Time
+		want      []string
+		absent    []string
+	}{
+		{
+			name: "a feature run with a target, not yet retired, states when and warns about ignored files",
+			mode: "feature", target: "refs/heads/main",
+			want: []string{
+				"  target:        refs/heads/main\n",
+				"  worktrees:     not retired (removed once the integration branch is merged into refs/heads/main; removal deletes ignored files such as build output; commit anything you want to keep)\n",
+			},
+		},
+		{
+			name: "a feature run frozen on a detached HEAD never retires",
+			mode: "feature",
+			want: []string{
+				"  target:        none (detached HEAD at freeze; worktrees are never retired automatically)\n",
+				"  worktrees:     kept (no target branch)\n",
+			},
+		},
+		{
+			name: "a retired feature run renders the fact",
+			mode: "feature", target: "refs/heads/main", retiredAt: &retiredAt,
+			want: []string{"  target:        refs/heads/main\n", "  worktrees:     retired 2026-09-16T10:30:00Z\n"},
+		},
+		{
+			name:   "a solo run renders neither line",
+			absent: []string{"target:", "worktrees:"},
+		},
+	}
+	for _, tc := range targetCases {
+		t.Run(tc.name, func(t *testing.T) {
+			targetCtrl := &fakeController{}
+			targetCtrl.status = func(app.StatusRequest) (app.StatusResult, error) {
+				targetDetail := *detail
+				targetDetail.Mode = tc.mode
+				targetDetail.TargetBranch = tc.target
+				targetDetail.WorktreesRetiredAt = tc.retiredAt
+				return app.StatusResult{Detail: &targetDetail}, nil
+			}
+			td := newTestDeps(targetCtrl, statusEnv(), t.TempDir())
+			var stdout, stderr bytes.Buffer
+
+			code, err := runStatus([]string{"-run", testRunID}, &stdout, &stderr, td.deps)
+			if err != nil {
+				t.Fatalf("write error: %v", err)
+			}
+			if code != exitOK {
+				t.Fatalf("exit code = %d", code)
+			}
+			out := stdout.String()
+			for _, want := range tc.want {
+				if !strings.Contains(out, want) {
+					t.Errorf("detail lacks %q; got:\n%s", want, out)
+				}
+			}
+			for _, absent := range tc.absent {
+				if strings.Contains(out, absent) {
+					t.Errorf("detail carries %q; got:\n%s", absent, out)
+				}
+			}
+			if tc.mode == "feature" && !strings.Contains(out, "  workflow:      feature\n  target:") {
+				t.Errorf("the target line does not follow the workflow line:\n%s", out)
+			}
+		})
+	}
 	t.Run("an unresolved feature worktree operation renders with its action", func(t *testing.T) {
 		featureCtrl := &fakeController{}
 		featureCtrl.status = func(app.StatusRequest) (app.StatusResult, error) {

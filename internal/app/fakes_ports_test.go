@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/johnlanda/hop/internal/app"
+	"github.com/johnlanda/hop/internal/testsupport/runnervectors"
 )
 
 // fakeRuntime is a handwritten Runtime: it records every call and returns
@@ -337,7 +338,27 @@ func newFakeCommands() *fakeCommands {
 
 func (*fakeCommands) key(cmd app.Command) string { return strings.Join(cmd.Argv, " ") }
 
+// fakeCaptureBytes is the real Runner's default per-stream capture bound.
+const fakeCaptureBytes = runnervectors.DefaultCaptureBytes
+
+// Run answers cmd under the real Runner's capture contract
+// (runnervectors): a negative bound is refused before anything answers,
+// and the answer — scripted, hooked or modeled — is bounded to the
+// command's MaxOutputBytes (1 MiB when 0) with the truncation flags
+// computed by BoundCapture.
 func (c *fakeCommands) Run(ctx context.Context, cmd app.Command) (app.CommandResult, error) {
+	if err := runnervectors.ValidateBound(cmd.MaxOutputBytes); err != nil {
+		return app.CommandResult{}, fmt.Errorf("app_test: CommandRunner.Run: %w", err)
+	}
+	result, err := c.run(ctx, cmd)
+	bounded, boundErr := runnervectors.BoundCapture(result, cmd.MaxOutputBytes)
+	if boundErr != nil {
+		return app.CommandResult{}, boundErr
+	}
+	return bounded, err
+}
+
+func (c *fakeCommands) run(ctx context.Context, cmd app.Command) (app.CommandResult, error) {
 	// Mirror the real Runner's own contract (internal/adapters/process.
 	// Runner.Run): argv must be non-empty and argv[0] must be an absolute
 	// path. Enforcing it here, not just in the real adapter, is what makes

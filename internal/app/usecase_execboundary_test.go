@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -329,6 +330,59 @@ func TestPrepareCheckExec(t *testing.T) {
 			t.Errorf("claim count = %d, want the pre-verification claim recorded", len(subs.checkClaims))
 		}
 	})
+
+	worktreeRetirementKinds := []struct {
+		name string
+		argv []string
+	}{
+		{"retirement.check", worktreeRetirementCheckArgv("/usr/bin/git", "/repo", "1111111111111111111111111111111111111111", "2222222222222222222222222222222222222222")},
+		{"worktree.retire", worktreeRetireArgv("/usr/bin/git", "/repo", "/worktrees/repo/hop-r3-t1a1")},
+	}
+	for _, kind := range worktreeRetirementKinds {
+		t.Run(kind.name+": the frozen argv passes through byte-identically", func(t *testing.T) {
+			var calls []string
+			retireCtx := newContext()
+			retireCtx.CheckArgv = append([]string(nil), kind.argv...)
+			retireCtx.CheckoutPath = "/repo"
+			read := &ebReadStub{checkCtx: retireCtx, calls: &calls}
+			subs := &ebSubmissionStub{calls: &calls}
+
+			req := baseRequest()
+			req.CheckArgv = append([]string(nil), kind.argv...)
+			plan, err := (&Controller{Read: read, Submissions: subs}).PrepareCheckExec(context.Background(), req)
+			if err != nil {
+				t.Fatalf("PrepareCheckExec: %v", err)
+			}
+			if len(calls) < 2 || calls[0] != "ClaimCheckExec" || calls[1] != "LoadCheckExecutionContext" {
+				t.Fatalf("call order = %v, want the claim before the context load", calls)
+			}
+			if !slices.Equal(plan.Argv, kind.argv) {
+				t.Fatalf("argv = %q, want %q verbatim", plan.Argv, kind.argv)
+			}
+			if plan.ExecPath != "/resolved//usr/bin/git" {
+				t.Errorf("exec path = %q, want the lookup's resolution of the frozen argv[0]", plan.ExecPath)
+			}
+		})
+		t.Run(kind.name+": an argv differing from the frozen one is refused after the claim", func(t *testing.T) {
+			retireCtx := newContext()
+			retireCtx.CheckArgv = append([]string(nil), kind.argv...)
+			read := &ebReadStub{checkCtx: retireCtx}
+			subs := &ebSubmissionStub{}
+
+			// A force option slipped in by the caller never runs: only the
+			// frozen argv does.
+			req := baseRequest()
+			req.CheckArgv = append(append([]string(nil), kind.argv[:len(kind.argv)-1]...), "--force", kind.argv[len(kind.argv)-1])
+			_, err := (&Controller{Read: read, Submissions: subs}).PrepareCheckExec(context.Background(), req)
+
+			if err == nil || !strings.Contains(err.Error(), "does not equal the frozen check argv") {
+				t.Fatalf("err = %v, want the frozen-argv refusal", err)
+			}
+			if len(subs.checkClaims) != 1 {
+				t.Errorf("claim count = %d, want the pre-verification claim recorded", len(subs.checkClaims))
+			}
+		})
+	}
 
 	refusals := []struct {
 		name      string

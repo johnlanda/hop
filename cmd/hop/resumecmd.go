@@ -35,7 +35,8 @@ func (v *confirmAbsentValue) Set(s string) error {
 
 func (*confirmAbsentValue) IsBoolFlag() bool { return true }
 
-// runResume implements `hop resume <run-id>`: it loads the run's frozen
+// runResume implements `hop resume <run-id>`: after the repository's
+// worktree-retirement pass (excluding this run), it loads the run's frozen
 // mode via Status BEFORE acquiring any lease (the two forms of
 // --confirm-absent can only be validated once mode is known), then
 // acquires the lease (a new fencing generation) and reconciles through
@@ -106,6 +107,15 @@ func runResume(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 	if err != nil {
 		_, werr := fmt.Fprintf(stderr, "hop resume: %v\n", err)
 		return exitUsage, werr
+	}
+	// The repository's worktree-retirement pass runs before this
+	// controller takes its own run's lease, excluding that run.
+	passLines, err := runWorktreeRetirement(ctx, d, ctrl, repoRoot, runID, hopPath, stdout, stderr, "hop resume")
+	if err != nil {
+		return exitFailure, err
+	}
+	if printErr := printLines(stdout, passLines); printErr != nil {
+		return exitFailure, printErr
 	}
 	status, err := ctrl.Status(ctx, app.StatusRequest{RunID: runID})
 	if err != nil {

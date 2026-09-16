@@ -27,6 +27,7 @@ func newFeatureSpec(repoRoot string, base int, f *fakeClock) app.NewRunSpec {
 	spec.Snapshot.Workflow = featureWorkflow()
 	spec.Snapshot.Workflow.IntegrationBranch = app.IntegrationBranchName(1)
 	spec.Snapshot.Workflow.BaseCommitOID = "cccccccccccccccccccccccccccccccccccccccc"
+	spec.Snapshot.Workflow.TargetBranch = "refs/heads/main"
 	return spec
 }
 

@@ -1,10 +1,12 @@
 package app_test
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -171,6 +173,10 @@ type fakeStore struct {
 	// seqByRepo's role for run sequences.
 	taskSeqByRun map[identity.RunID]int
 
+	// WorktreesRetiredAt is the per-run worktrees-retired fact (migration
+	// 004's runs.worktrees_retired_at), absent until set, set once.
+	WorktreesRetiredAt map[identity.RunID]time.Time
+
 	// RequestReceipts is the shared (run, verb, requestID) acceptance-key
 	// idempotency store for every request-ID-bearing verb (send, answer,
 	// task-create, retry, plan-close): the digest of the accepted
@@ -229,6 +235,7 @@ func newFakeStore(clock interface{ Now() time.Time }) *fakeStore {
 		RetryRequestStates: map[identity.TaskID]app.RetryRequestState{},
 		RequestReceipts:    map[requestReceiptKey]requestReceipt{},
 		taskSeqByRun:       map[identity.RunID]int{},
+		WorktreesRetiredAt: map[identity.RunID]time.Time{},
 
 		worktreeInsertOrder: map[identity.WorktreeID]int{},
 	}
@@ -446,11 +453,15 @@ func (s *fakeStore) LoadRunStatus(_ context.Context, runID identity.RunID) (app.
 	taskID := s.TaskByRun[runID]
 	attemptID := s.AttemptByRun[runID]
 	detail := app.RunDetail{
-		RunStatus: s.runStatusLocked(runID),
-		Mode:      s.Snapshots[runID].Workflow.Mode,
-		TaskID:    taskID,
-		AttemptID: attemptID,
-		StateRoot: s.Snapshots[runID].StateRoot,
+		RunStatus:    s.runStatusLocked(runID),
+		Mode:         s.Snapshots[runID].Workflow.Mode,
+		TargetBranch: s.Snapshots[runID].Workflow.TargetBranch,
+		TaskID:       taskID,
+		AttemptID:    attemptID,
+		StateRoot:    s.Snapshots[runID].StateRoot,
+	}
+	if at, retired := s.WorktreesRetiredAt[runID]; retired {
+		detail.WorktreesRetiredAt = &at
 	}
 	if t, ok := s.Tasks[taskID]; ok {
 		detail.TaskState = t.value.State
@@ -536,11 +547,39 @@ func (s *fakeStore) LoadRunStatus(_ context.Context, runID identity.RunID) (app.
 			PremergeHeadOID: integration.PremergeHeadOID, MergeCommitOID: integration.MergeCommitOID, State: integration.State,
 		}
 	}
+	if s.Snapshots[runID].Workflow.Feature() {
+		detail.Worktrees, detail.WorktreeRetirements = s.featureWorktreesLocked(runID)
+	}
 	detail.GuardShortfalls = s.guardShortfallsLocked(runID)
 	detail.Mailboxes = s.mailboxesLocked(runID, s.clock.Now())
 	detail.PendingQuestions = s.pendingQuestionsLocked(runID, s.clock.Now())
 
 	return detail, nil
+}
+
+// featureWorktreesLocked mirrors the real store's feature detail
+// (featureWorktreeDetail): every worktree row of the run in insertion
+// order — a seeded row with no insertion sequence first, by id — as a
+// non-nil list, and the run's worktree.retire operations newest first.
+// Callers hold s.mu.
+func (s *fakeStore) featureWorktreesLocked(runID identity.RunID) ([]run.Worktree, []app.Operation) {
+	rows := []run.Worktree{}
+	for _, row := range s.Worktrees {
+		if row.value.RunID == runID {
+			rows = append(rows, row.value)
+		}
+	}
+	slices.SortFunc(rows, func(a, b run.Worktree) int {
+		return cmp.Or(cmp.Compare(s.worktreeInsertOrder[a.ID], s.worktreeInsertOrder[b.ID]), cmp.Compare(a.ID, b.ID))
+	})
+	var retires []app.Operation
+	for id := range s.Operations {
+		if op := s.Operations[id]; op.RunID == runID && op.Kind == app.OpWorktreeRetire {
+			retires = append(retires, op)
+		}
+	}
+	slices.SortFunc(retires, func(a, b app.Operation) int { return b.CreatedAt.Compare(a.CreatedAt) })
+	return rows, retires
 }
 
 func (s *fakeStore) worktreeByRunLocked(runID identity.RunID) (run.Worktree, bool) {
@@ -784,12 +823,12 @@ func (s *fakeStore) ClaimCheckExec(_ context.Context, op identity.OperationID, p
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	operation, ok := s.Operations[op]
-	// The real store's Phase 3 contract (design section 3): any pending
-	// exec-claimable operation of the current generation — exactly the
-	// kinds check.run and integration.merge. Publish, reset and fence are
+	// The real store's contract (design section 3, generalized by the
+	// worktree-retirement kinds): any pending exec-claimable operation of
+	// the current generation, decided by the same OperationKind predicate
+	// the real store uses. Publish, reset, fence and every Herdr act are
 	// executed directly by the controller and are never claimable.
-	execClaimable := operation.Kind == app.OpCheckRun || operation.Kind == app.OpIntegrationMerge
-	if !ok || !execClaimable || operation.State != app.OperationPending {
+	if !ok || !operation.Kind.ExecClaimable() || operation.State != app.OperationPending {
 		return fmt.Errorf("app_test: operation %s is not a pending exec-claimable execution; check-exec claim refused", op)
 	}
 	if row, ok := s.Leases[operation.RunID]; !ok || operation.Generation != row.lease.Generation {

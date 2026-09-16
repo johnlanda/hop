@@ -47,6 +47,27 @@ type TaskSummaryView struct {
 	WorktreePath string
 }
 
+// WorktreeView is one feature-mode worktree row as hop status -run renders
+// it, from the row and its journaled retirement
+// (docs/plan/phase-3-worktree-retirement.md section 6).
+type WorktreeView struct {
+	// Branch and Path are the row's recorded branch name and path.
+	Branch string
+	Path   string
+	// State is the row's state: active, removed, absent or released.
+	State string
+	// Released is a released row's recorded reason.
+	Released WorktreeReleaseReason
+	// Retained is the category an active row's latest removal was refused
+	// for, and EvidencePath that refusal's retained stderr.
+	Retained     WorktreeRetainedCategory
+	EvidencePath string
+	// Removal names an active row's unfinished removal: "incomplete" or
+	// "interrupted" for a settled act that did not finish, "unresolved" for
+	// an act whose outcome is not recorded yet.
+	Removal string
+}
+
 // IntegrationView is the run's most recently created integration, if any.
 type IntegrationView struct {
 	ID              string
@@ -102,7 +123,14 @@ type WorktreeOperationView struct {
 type RunDetailView struct {
 	RunSummaryView
 	// Mode mirrors RunDetail.Mode: "feature", or "" for a solo run.
-	Mode           string
+	Mode string
+	// TargetBranch and WorktreesRetiredAt mirror RunDetail's
+	// worktree-retirement target and fact ("" and nil when absent).
+	TargetBranch       string
+	WorktreesRetiredAt *time.Time
+	// Worktrees is one line per feature-mode worktree row, oldest first;
+	// nil for a solo run.
+	Worktrees      []WorktreeView
 	TaskState      string
 	AttemptState   string
 	WorktreePath   string
@@ -188,12 +216,15 @@ func runSummaryView(s RunStatus) RunSummaryView {
 
 func runDetailView(d RunDetail) RunDetailView { //nolint:gocritic // hugeParam: RunDetail is a ReadStore DTO rendered at most once per hop status -run call.
 	view := RunDetailView{
-		RunSummaryView: runSummaryView(d.RunStatus),
-		Mode:           d.Mode,
-		TaskState:      string(d.TaskState),
-		AttemptState:   string(d.AttemptState),
-		WorktreePath:   d.WorktreePath,
-		PendingOps:     len(d.PendingOperations),
+		RunSummaryView:     runSummaryView(d.RunStatus),
+		Mode:               d.Mode,
+		TargetBranch:       d.TargetBranch,
+		WorktreesRetiredAt: d.WorktreesRetiredAt,
+		TaskState:          string(d.TaskState),
+		AttemptState:       string(d.AttemptState),
+		WorktreePath:       d.WorktreePath,
+		PendingOps:         len(d.PendingOperations),
+		Worktrees:          worktreeViews(d.Worktrees, d.WorktreeRetirements),
 	}
 	if d.Binding != nil {
 		view.BindingSummary = fmt.Sprintf("%s/%s/%s", d.Binding.WorkspaceID, d.Binding.TabID, d.Binding.PaneID)

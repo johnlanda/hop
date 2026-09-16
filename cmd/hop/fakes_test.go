@@ -69,6 +69,19 @@ type fakeController struct {
 	selectRunView func(label string) error
 	clearRunView  func() error
 
+	// Worktree retirement. retirementCandidates unscripted reports no
+	// candidates (a repository with nothing eligible);
+	// acquireForRetirement, retireWorktrees and releaseRetirement report
+	// an unexpected call when unscripted. retirementHeld is the run whose
+	// retirement lease the command currently holds: the fake refuses a
+	// second acquisition while one is held, a pass or release without one,
+	// and a pass whose options the real use case would refuse.
+	retirementCandidates func(repositoryRoot, excludeRunID string) ([]app.RetirementCandidate, error)
+	acquireForRetirement func(runID, controllerID string) error
+	retireWorktrees      func(ctx context.Context, runID string, opts app.RetireWorktreesOptions) (app.WorktreeRetirementReport, error)
+	releaseRetirement    func(runID string) error
+	retirementHeld       string
+
 	// frozenRepositoryRoot and frozenStateRoot are the scripted run's
 	// frozen roots: the unscripted AssignmentDefaults serves them, and
 	// AssignReadyTasks refuses any other value, exactly as the real
@@ -522,6 +535,70 @@ func (f *fakeController) ClearRunView(_ context.Context) error {
 	return f.clearRunView()
 }
 
+func (f *fakeController) RetirementCandidates(_ context.Context, repositoryRoot, excludeRunID string) ([]app.RetirementCandidate, error) {
+	f.record("RetirementCandidates")
+	if f.retirementCandidates == nil {
+		return nil, nil
+	}
+	return f.retirementCandidates(repositoryRoot, excludeRunID)
+}
+
+func (f *fakeController) AcquireForRetirement(_ context.Context, runID, controllerID string) (app.RunHandle, error) {
+	f.record("AcquireForRetirement " + runID)
+	if f.acquireForRetirement == nil {
+		return app.RunHandle{}, errors.New("unexpected AcquireForRetirement")
+	}
+	f.mu.Lock()
+	held := f.retirementHeld
+	f.mu.Unlock()
+	switch {
+	case runID == "" || controllerID == "":
+		return app.RunHandle{}, errors.New("app: a run id and a controller id are required")
+	case held != "":
+		return app.RunHandle{}, fmt.Errorf("fake: the retirement lease of %s is still held", held)
+	}
+	if err := f.acquireForRetirement(runID, controllerID); err != nil {
+		return app.RunHandle{}, err
+	}
+	f.mu.Lock()
+	f.retirementHeld = runID
+	f.mu.Unlock()
+	return app.RunHandle{}, nil
+}
+
+func (f *fakeController) RetireWorktrees(ctx context.Context, _ app.RunHandle, opts app.RetireWorktreesOptions) (app.WorktreeRetirementReport, error) { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.
+	f.record("RetireWorktrees")
+	f.mu.Lock()
+	held := f.retirementHeld
+	f.mu.Unlock()
+	switch {
+	case f.retireWorktrees == nil:
+		return app.WorktreeRetirementReport{}, errors.New("unexpected RetireWorktrees")
+	case held == "":
+		return app.WorktreeRetirementReport{}, errors.New("fake: RetireWorktrees without a held retirement lease")
+	case !filepath.IsAbs(opts.HOPPath):
+		return app.WorktreeRetirementReport{}, errors.New("app: the hop executable path is not absolute")
+	case opts.InspectPath == nil || opts.Environ == nil:
+		return app.WorktreeRetirementReport{}, errors.New("fake: RetireWorktrees needs the path inspector and the caller's environment")
+	}
+	return f.retireWorktrees(ctx, held, opts)
+}
+
+func (f *fakeController) ReleaseRetirement(_ context.Context, _ app.RunHandle) error { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.
+	f.record("ReleaseRetirement")
+	f.mu.Lock()
+	held := f.retirementHeld
+	f.retirementHeld = ""
+	f.mu.Unlock()
+	switch {
+	case f.releaseRetirement == nil:
+		return errors.New("unexpected ReleaseRetirement")
+	case held == "":
+		return errors.New("fake: ReleaseRetirement without a held retirement lease")
+	}
+	return f.releaseRetirement(held)
+}
+
 // execCall records one exec-seam invocation.
 type execCall struct {
 	Path string
@@ -623,7 +700,8 @@ func newTestDeps(ctrl *fakeController, env map[string]string, dir string) *testD
 			td.execs = append(td.execs, execCall{Path: path, Argv: argv, Env: env})
 			return errors.New("exec recorded by the test seam; nothing replaced")
 		},
-		newID: func() string { return "aaaaaaaa-0000-4000-8000-000000000001" },
+		newID:       func() string { return "aaaaaaaa-0000-4000-8000-000000000001" },
+		inspectPath: inspectCanonicalPath,
 		forceExit: func() {
 			panic("unexpected force exit")
 		},

@@ -15,6 +15,11 @@ testable exit criteria. These are implementation proposals, not completed work.
   task graph and bounded concurrency, pull-only durable messages, the
   built-in feature workflow with review and serial integration, migration
   002, test plan and work breakdown.
+- [Phase 3 worktree retirement](phase-3-worktree-retirement.md): slice 8's
+  design note — post-merge removal of a run's attempt worktrees (target
+  branch, eligibility, provenance and cleanliness rules, the git transport,
+  the two exec-claimable operations and their decision-table rows,
+  migration 004, status rendering, test plan).
 - [Architecture](../architecture/AGENTS.md): boundaries, entities and engineering contracts.
 - [Terminal UX](../ux/AGENTS.md): native Herdr and optional board interactions.
 
