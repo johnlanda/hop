@@ -707,6 +707,16 @@ func (s *fakeStore) ClaimCheckExec(_ context.Context, op identity.OperationID, p
 	if row, ok := s.Leases[operation.RunID]; !ok || operation.Generation != row.lease.Generation {
 		return fmt.Errorf("app_test: operation %s is not of the current generation; check-exec claim refused", op)
 	}
+	// The real store's pid-before-exec contract (sqlite submission.go's
+	// ClaimCheckExec): one row, one pid, never re-armed or overwritten — a
+	// same-pid retry is an idempotent no-op that preserves the original
+	// row, and a different pid is refused.
+	if existing, claimed := s.CheckExecClaims[op]; claimed {
+		if existing.PID != pid {
+			return fmt.Errorf("app_test: operation %s already has a check-exec claim by another pid; a claim is never overwritten", op)
+		}
+		return nil
+	}
 	s.CheckExecClaims[op] = app.CheckExecClaim{OperationID: op, PID: pid, ClaimedAt: s.clock.Now()}
 	return nil
 }

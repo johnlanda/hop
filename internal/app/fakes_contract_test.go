@@ -199,6 +199,51 @@ func TestFakeStoreContracts(t *testing.T) {
 		}
 	})
 
+	t.Run("ClaimCheckExec never overwrites: same pid idempotent, different pid refused", func(t *testing.T) {
+		// The real store's pid-before-exec contract (sqlite submission.go's
+		// ClaimCheckExec) for BOTH exec-claimable kinds: the claim row is
+		// the group-retirement handle, so a claim is never re-armed or
+		// overwritten — a same-pid retry returns success leaving the
+		// original row untouched, and any other pid is refused.
+		tc := newTestController(defaultPolicy())
+		_, detail := startedRun(t, tc)
+
+		for kind, seed := range map[app.OperationKind]func() identity.OperationID{
+			app.OpCheckRun: func() identity.OperationID {
+				return seedPendingCheckOperation(t, tc, detail.RunID, []string{"sh", "check.sh"})
+			},
+			app.OpIntegrationMerge: func() identity.OperationID {
+				opID, err := identity.ParseOperationID(tc.IDs.NewID())
+				if err != nil {
+					t.Fatalf("parse operation id: %v", err)
+				}
+				tc.Store.Operations[opID] = app.Operation{
+					ID: opID, RunID: detail.RunID, Generation: tc.Store.Leases[detail.RunID].lease.Generation,
+					Kind: app.OpIntegrationMerge, State: app.OperationPending,
+				}
+				return opID
+			},
+		} {
+			opID := seed()
+			if err := tc.Store.ClaimCheckExec(context.Background(), opID, 5150); err != nil {
+				t.Fatalf("%s: first claim refused: %v", kind, err)
+			}
+			original := tc.Store.CheckExecClaims[opID]
+			if err := tc.Store.ClaimCheckExec(context.Background(), opID, 5150); err != nil {
+				t.Fatalf("%s: same-pid retry refused: %v", kind, err)
+			}
+			if tc.Store.CheckExecClaims[opID] != original {
+				t.Fatalf("%s: a same-pid retry rewrote the claim row", kind)
+			}
+			if err := tc.Store.ClaimCheckExec(context.Background(), opID, 6160); err == nil {
+				t.Fatalf("%s: ClaimCheckExec() accepted a different pid over an existing claim", kind)
+			}
+			if tc.Store.CheckExecClaims[opID] != original {
+				t.Fatalf("%s: a refused different-pid claim disturbed the row", kind)
+			}
+		}
+	})
+
 	t.Run("SubmitResult checks existence and agreement before duplicate receipts", func(t *testing.T) {
 		tc := newTestController(defaultPolicy())
 		_, detail := runningRun(t, tc)
