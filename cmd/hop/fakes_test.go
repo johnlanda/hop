@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -73,6 +74,31 @@ type fakeController struct {
 	// fakeFrozenStateRoot.
 	frozenRepositoryRoot string
 	frozenStateRoot      string
+
+	// runState is the scripted run's durable state as the state-aware
+	// methods see it (guarded by mu; empty means running, the state every
+	// scheduling-pass test starts from). AssignReadyTasks refuses every
+	// state but running exactly as the real use case does, and the
+	// unscripted DriveCompletion reports it; a scripted method that moves
+	// the run calls setRunState.
+	runState string
+}
+
+// currentRunState returns the scripted run's durable state.
+func (f *fakeController) currentRunState() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.runState == "" {
+		return runStateRunning
+	}
+	return f.runState
+}
+
+// setRunState moves the scripted run to state.
+func (f *fakeController) setRunState(state string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.runState = state
 }
 
 // The scripted run's default frozen roots, deliberately distinct from
@@ -328,6 +354,12 @@ func (f *fakeController) AssignReadyTasks(_ context.Context, _ app.RunHandle, op
 	if opts.StateRoot != stateRoot {
 		return app.AssignmentReport{}, errors.New("assignment state root is not the run's frozen state root")
 	}
+	// The real use case's Run.CanAcceptManagerVerb gate, checked inside the
+	// assignment transaction before any task is read: every state but
+	// running is refused, whether or not a task is ready.
+	if state := f.currentRunState(); state != runStateRunning {
+		return app.AssignmentReport{}, fmt.Errorf("run: run is not accepting this request: state %s", state)
+	}
 	if f.assignReadyTasks == nil {
 		return app.AssignmentReport{}, nil
 	}
@@ -354,7 +386,9 @@ func (f *fakeController) ResolveIntegrationHead(_ context.Context, _ app.RunHand
 func (f *fakeController) DriveCompletion(_ context.Context, _ app.RunHandle) (app.CompletionReport, error) { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.
 	f.record("DriveCompletion")
 	if f.driveCompletion == nil {
-		return app.CompletionReport{}, nil
+		// The real use case always reports the run's state after the
+		// round for a feature-mode run.
+		return app.CompletionReport{RunState: f.currentRunState()}, nil
 	}
 	return f.driveCompletion()
 }

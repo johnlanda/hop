@@ -37,6 +37,12 @@ const (
 	// assignment) depends on a live manager session that does not exist
 	// yet.
 	runStateLaunching = "launching"
+	// runStateRunning and runStateCompleting name the feature-mode states
+	// the scheduling pass dispatches on: only a running run takes the
+	// ordinary pass, and a completing run takes completion retirement
+	// alone.
+	runStateRunning    = "running"
+	runStateCompleting = "completing"
 )
 
 // isTerminalRunState reports whether state ends the foreground loop.

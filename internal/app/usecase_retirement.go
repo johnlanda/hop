@@ -25,6 +25,12 @@ type RetirementReport struct {
 	// completed this round: owned work observed terminated, ref intents
 	// quiesced, and the run marked failed.
 	RunFailed bool
+	// RunFailing is true when a terminal-failure cause is durable but its
+	// settlement has not completed this round (owned work still
+	// outstanding): the run is still running, yet it will never accept
+	// new work again, so the caller schedules nothing more until the
+	// failure settles.
+	RunFailing bool
 }
 
 // retirementCandidate is one child session due for retirement and the
@@ -103,6 +109,7 @@ func (c *Controller) RetireSettledSessions(ctx context.Context, handle RunHandle
 			report.Outstanding = append(report.Outstanding, outstanding)
 		}
 	}
+	report.RunFailing = anyTaskFailed && !report.RunFailed
 	return report, nil
 }
 
