@@ -119,41 +119,53 @@ func sessionLaunchIdentity(ctx context.Context, q querier, sessionID identity.Se
 
 // worktreePathForAttempt resolves the recorded worktree path the launch
 // boundary cross-checks: the attempt's own row when one is linked
-// (worktrees.attempt_id, per-attempt worktrees), else — the pre-linkage
-// solo shape — the run's single worktree row; "" before any row exists.
-// A run holding several rows none of which names the attempt stays "",
-// never a guess among them.
+// (worktrees.attempt_id, every feature-mode row), else — the solo shape —
+// the run's only worktree row, and only while that row is unlinked; ""
+// otherwise. A row linked to another attempt is never served, and a run
+// holding several rows, linked or not, is never guessed among.
 func worktreePathForAttempt(ctx context.Context, q querier, runID identity.RunID, attemptID identity.AttemptID) (string, error) {
-	var path string
-	err := q.QueryRowContext(ctx,
-		`SELECT path FROM worktrees WHERE attempt_id = ? ORDER BY rowid DESC LIMIT 1`, attemptID.String(),
-	).Scan(&path)
-	if err == nil {
-		return path, nil
+	path, linked, err := attemptWorktreePath(ctx, q, attemptID)
+	if err != nil || linked {
+		return path, err
 	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return "", fmt.Errorf("sqlite: load worktree of attempt %s: %w", attemptID, err)
-	}
-	rows, err := q.QueryContext(ctx, `SELECT path FROM worktrees WHERE run_id = ?`, runID.String())
+	rows, err := q.QueryContext(ctx, `SELECT path, attempt_id IS NULL FROM worktrees WHERE run_id = ?`, runID.String())
 	if err != nil {
 		return "", fmt.Errorf("sqlite: load worktrees of run %s: %w", runID, err)
 	}
 	defer rows.Close() //nolint:errcheck // the deferred close of a fully-iterated read cursor has no failure the rows.Err check below misses.
-	var paths []string
+	var (
+		count        int
+		onlyPath     string
+		onlyUnlinked bool
+	)
 	for rows.Next() {
-		var p string
-		if err := rows.Scan(&p); err != nil {
+		if err := rows.Scan(&onlyPath, &onlyUnlinked); err != nil {
 			return "", fmt.Errorf("sqlite: scan worktree path: %w", err)
 		}
-		paths = append(paths, p)
+		count++
 	}
 	if err := rows.Err(); err != nil {
 		return "", fmt.Errorf("sqlite: iterate worktree paths: %w", err)
 	}
-	if len(paths) == 1 {
-		return paths[0], nil
+	if count == 1 && onlyUnlinked {
+		return onlyPath, nil
 	}
 	return "", nil
+}
+
+// attemptWorktreePath loads the path of the newest worktree row linked to
+// attemptID; linked is false when no row names the attempt.
+func attemptWorktreePath(ctx context.Context, q querier, attemptID identity.AttemptID) (path string, linked bool, err error) {
+	err = q.QueryRowContext(ctx,
+		`SELECT path FROM worktrees WHERE attempt_id = ? ORDER BY rowid DESC LIMIT 1`, attemptID.String(),
+	).Scan(&path)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("sqlite: load worktree of attempt %s: %w", attemptID, err)
+	}
+	return path, true, nil
 }
 
 // sessionIsSuccessor reports the cold-relaunch successor fact: another
@@ -269,16 +281,11 @@ func featureRunDetail(ctx context.Context, q querier, detail *app.RunDetail, sna
 		}
 		summary.AttemptCount = len(attempts)
 		if len(attempts) > 0 {
-			current := attempts[len(attempts)-1]
-			var path string
-			pathErr := q.QueryRowContext(ctx,
-				`SELECT path FROM worktrees WHERE attempt_id = ? ORDER BY rowid DESC LIMIT 1`, current.ID.String(),
-			).Scan(&path)
-			if pathErr == nil {
-				summary.WorktreePath = path
-			} else if !errors.Is(pathErr, sql.ErrNoRows) {
-				return fmt.Errorf("sqlite: load worktree of attempt %s: %w", current.ID, pathErr)
+			path, _, pathErr := attemptWorktreePath(ctx, q, attempts[len(attempts)-1].ID)
+			if pathErr != nil {
+				return pathErr
 			}
+			summary.WorktreePath = path
 		}
 		detail.Tasks = append(detail.Tasks, summary)
 	}

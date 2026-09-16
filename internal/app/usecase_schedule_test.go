@@ -246,6 +246,11 @@ func TestAssignReadyTasks(t *testing.T) {
 		if sessionRow.value.ParentSessionID == nil || *sessionRow.value.ParentSessionID != fr.ManagerID {
 			t.Fatalf("session parent = %v, want manager %s", sessionRow.value.ParentSessionID, fr.ManagerID)
 		}
+		// A Claude session's first launch is `--session-id <ref>`: the
+		// reference is pre-assigned with the session, never left empty.
+		if sessionRow.value.NativeSessionRef == "" || sessionRow.value.NativeRefSource != run.NativeRefAssigned {
+			t.Fatalf("session native reference = %q (%s), want a pre-assigned one", sessionRow.value.NativeSessionRef, sessionRow.value.NativeRefSource)
+		}
 
 		wt, ok := tc.Store.worktreeByRunLocked(fr.RunID)
 		if !ok {
@@ -254,6 +259,9 @@ func TestAssignReadyTasks(t *testing.T) {
 		wantBranch := "hop/r1/t1a1"
 		if wt.Branch != wantBranch {
 			t.Fatalf("worktree branch = %s, want %s", wt.Branch, wantBranch)
+		}
+		if wt.AttemptID != assigned.AttemptID || wt.BaseCommit != fakeHeadCommitOID {
+			t.Fatalf("worktree link = attempt %s base %s, want attempt %s base %s", wt.AttemptID, wt.BaseCommit, assigned.AttemptID, fakeHeadCommitOID)
 		}
 
 		if len(tc.Runtime.ClosedPanes) != 0 {
@@ -509,6 +517,292 @@ func TestAssignReadyTasks(t *testing.T) {
 			}
 		}
 	})
+}
+
+// seedReadyReviewTask inserts a ready review task over fakeHeadCommitOID
+// at seq, plus the integration row of integratedTask its diff scope needs.
+func seedReadyReviewTask(t *testing.T, tc *testController, runID identity.RunID, seq int, integratedTask identity.TaskID) identity.TaskID {
+	t.Helper()
+	now := tc.Clock.Now()
+	integrationID, err := identity.ParseIntegrationID(tc.IDs.NewID())
+	if err != nil {
+		t.Fatalf("parse integration id: %v", err)
+	}
+	resultID, err := identity.ParseResultID(tc.IDs.NewID())
+	if err != nil {
+		t.Fatalf("parse result id: %v", err)
+	}
+	integ := run.NewIntegration(integrationID, runID, integratedTask, resultID, "source-oid", "base-premerge-oid", now)
+	tc.Store.Integrations[integrationID] = &entityRow[run.Integration]{value: integ, revision: 1}
+	reviewID, err := identity.ParseTaskID(tc.IDs.NewID())
+	if err != nil {
+		t.Fatalf("parse task id: %v", err)
+	}
+	review := run.NewReviewTask(reviewID, runID, seq, fakeHeadCommitOID, "tttttttttttttttttttttttttttttttttttttttt", now)
+	tc.Store.Tasks[reviewID] = &entityRow[run.Task]{value: review, revision: 1}
+	return reviewID
+}
+
+// freezeLaunchPolicy gives a seeded feature run the frozen launch
+// environment policy hop launch sanitizes under.
+func freezeLaunchPolicy(tc *testController, runID identity.RunID) {
+	snapshot := tc.Store.Snapshots[runID]
+	snapshot.EnvPolicy = app.EnvPolicy{Version: app.EnvPolicyVersion1, Harness: app.HarnessClaude}
+	tc.Store.Snapshots[runID] = snapshot
+}
+
+// sessionLaunchRequest is the hop launch request a delegated session's own
+// pane makes from dir, carrying the environment openChildPane gave it.
+func sessionLaunchRequest(slc *app.SessionLaunchContext, runID identity.RunID, dir string, pid int) app.SessionLaunchExecRequest {
+	return app.SessionLaunchExecRequest{
+		RunID: runID.String(), SessionID: slc.Session.ID.String(),
+		HOPPath: "/usr/local/bin/hop", WorkerDir: dir, PID: pid,
+		Environ: []string{
+			"PATH=/opt/harness",
+			"HOP_STATE_DIR=/state",
+			"HOP_RUN_ID=" + runID.String(),
+			"HOP_TASK_ID=" + slc.Attempt.TaskID.String(),
+			"HOP_ATTEMPT_ID=" + slc.AttemptID.String(),
+			"HOP_INCARNATION_ID=" + slc.IncarnationID.String(),
+			"HOP_SESSION_ID=" + slc.Session.ID.String(),
+			"HOP_ROLE=" + string(slc.Session.Role),
+		},
+		ResolvePath: func(path string) (string, error) { return path, nil },
+		LookupExecutable: func(name, _ string) (string, error) {
+			return "/opt/harness/" + name, nil
+		},
+	}
+}
+
+// TestAssignedSessionsLaunchFromTheirOwnWorktrees is the fake-store half
+// of the feature worktree linkage (the real-store half is
+// internal/adapters/sqlite's TestAssignedWorktreesLinkTheirAttempts): two
+// implementers and a reviewer assigned into one run each get a worktree
+// row linked to their attempt and base, their own pre-assigned native
+// reference, a launch context naming their own worktree, and a launch that
+// is accepted from that worktree and refused from a sibling's.
+func TestAssignedSessionsLaunchFromTheirOwnWorktrees(t *testing.T) {
+	tc := newTestController(defaultPolicy())
+	fr := seedFeatureRun(t, tc, 3)
+	freezeLaunchPolicy(tc, fr.RunID)
+	taskA := seedImplementTask(t, tc, fr.RunID, 1, "A", false, run.TaskReady)
+	taskB := seedImplementTask(t, tc, fr.RunID, 2, "B", false, run.TaskReady)
+	review := seedReadyReviewTask(t, tc, fr.RunID, 3, taskA)
+	ctx := context.Background()
+
+	opts := defaultAssignmentOptions()
+	opts.MaxWorkers = 3
+	opts.ReviewerHarness = run.HarnessClaude
+	report, err := tc.Controller.AssignReadyTasks(ctx, fr.Handle, opts)
+	if err != nil {
+		t.Fatalf("AssignReadyTasks() error = %v", err)
+	}
+	if len(report.Assigned) != 3 {
+		t.Fatalf("Assigned = %+v, want both implement tasks and the review task", report.Assigned)
+	}
+
+	contexts := map[identity.TaskID]app.SessionLaunchContext{}
+	refs := map[string]bool{}
+	for _, a := range report.Assigned {
+		row, ok := tc.Store.newestAttemptWorktreeLocked(a.AttemptID)
+		if !ok || row.Path != a.WorktreeInfo.Path || row.BaseCommit != fakeHeadCommitOID {
+			t.Fatalf("%s worktree row = %+v (found %t), want its own path linked at base %s", a.Role, row, ok, fakeHeadCommitOID)
+		}
+		session := tc.Store.Sessions[a.SessionID].value
+		if session.NativeSessionRef == "" || session.NativeRefSource != run.NativeRefAssigned || refs[session.NativeSessionRef] {
+			t.Fatalf("%s native reference = %q (%s), want its own pre-assigned one", a.Role, session.NativeSessionRef, session.NativeRefSource)
+		}
+		refs[session.NativeSessionRef] = true
+
+		slc, err := tc.Store.LoadSessionLaunchContext(ctx, fr.RunID, a.SessionID)
+		if err != nil {
+			t.Fatalf("LoadSessionLaunchContext(%s) error = %v", a.Role, err)
+		}
+		if slc.WorktreePath != a.WorktreeInfo.Path || slc.Attempt.ID != a.AttemptID || slc.Relaunch {
+			t.Fatalf("%s launch context = worktree %q attempt %s relaunch %t, want its own worktree %q and attempt %s",
+				a.Role, slc.WorktreePath, slc.Attempt.ID, slc.Relaunch, a.WorktreeInfo.Path, a.AttemptID)
+		}
+		contexts[a.TaskID] = slc
+	}
+	if contexts[review].Session.Role != run.RoleReviewer {
+		t.Fatalf("review task session role = %s, want reviewer", contexts[review].Session.Role)
+	}
+
+	pid := 7000
+	for taskID, slc := range contexts {
+		sibling := contexts[taskA].WorktreePath
+		if taskID == taskA {
+			sibling = contexts[taskB].WorktreePath
+		}
+		pid++
+		if _, err := tc.Controller.PrepareSessionLaunchExec(ctx, sessionLaunchRequest(&slc, fr.RunID, sibling, pid)); err == nil ||
+			!strings.Contains(err.Error(), "does not resolve to the attempt's recorded worktree") {
+			t.Fatalf("%s launch from a sibling worktree error = %v, want the worktree disagreement refusal", slc.Session.Role, err)
+		}
+		if _, claimed := tc.Store.LaunchClaims[slc.IncarnationID]; claimed {
+			t.Fatalf("%s refused launch left a claim", slc.Session.Role)
+		}
+		plan, err := tc.Controller.PrepareSessionLaunchExec(ctx, sessionLaunchRequest(&slc, fr.RunID, slc.WorktreePath, pid))
+		if err != nil {
+			t.Fatalf("%s launch from its own worktree error = %v", slc.Session.Role, err)
+		}
+		if len(plan.Argv) < 3 || plan.Argv[1] != "--session-id" || plan.Argv[2] != slc.Session.NativeSessionRef {
+			t.Fatalf("%s launch argv = %q, want `--session-id <its own reference>`", slc.Session.Role, plan.Argv)
+		}
+		if _, claimed := tc.Store.LaunchClaims[slc.IncarnationID]; !claimed {
+			t.Fatalf("%s launch recorded no claim", slc.Session.Role)
+		}
+	}
+}
+
+// TestAssignedNonClaudeSessionsCarryNoNativeReference: only a Claude
+// session's first launch names a pre-assigned reference; a Codex or
+// opencode implementer or reviewer is created without one, as in Phase 2.
+func TestAssignedNonClaudeSessionsCarryNoNativeReference(t *testing.T) {
+	for _, harness := range []run.Harness{run.HarnessCodex, run.HarnessOpenCode} {
+		t.Run(string(harness), func(t *testing.T) {
+			tc := newTestController(defaultPolicy())
+			fr := seedFeatureRun(t, tc, 2)
+			taskA := seedImplementTask(t, tc, fr.RunID, 1, "A", false, run.TaskReady)
+			seedReadyReviewTask(t, tc, fr.RunID, 2, taskA)
+			opts := defaultAssignmentOptions()
+			opts.Harness = harness
+			opts.ReviewerHarness = harness
+			report, err := tc.Controller.AssignReadyTasks(context.Background(), fr.Handle, opts)
+			if err != nil {
+				t.Fatalf("AssignReadyTasks() error = %v", err)
+			}
+			if len(report.Assigned) != 2 {
+				t.Fatalf("Assigned = %+v, want the implementer and the reviewer", report.Assigned)
+			}
+			for _, a := range report.Assigned {
+				session := tc.Store.Sessions[a.SessionID].value
+				if session.Harness != harness || session.NativeSessionRef != "" || session.NativeRefSource != "" {
+					t.Fatalf("%s session = harness %s ref %q (%s), want %s with no reference", a.Role, session.Harness, session.NativeSessionRef, session.NativeRefSource, harness)
+				}
+			}
+		})
+	}
+}
+
+// TestUnlinkedWorktreeRowsResolveNoLaunchDirectory is the refusal
+// regression on the fake store, mirroring the real store's rule: once the
+// run holds several worktree rows none of which names the session's
+// attempt — every feature attempt's shape before the link was recorded —
+// the launch context carries no worktree and hop launch refuses fail-closed
+// with no claim; a run's single unlinked row is the solo fallback.
+func TestUnlinkedWorktreeRowsResolveNoLaunchDirectory(t *testing.T) {
+	tc := newTestController(defaultPolicy())
+	fr := seedFeatureRun(t, tc, 2)
+	freezeLaunchPolicy(tc, fr.RunID)
+	seedImplementTask(t, tc, fr.RunID, 1, "A", false, run.TaskReady)
+	seedImplementTask(t, tc, fr.RunID, 2, "B", false, run.TaskReady)
+	ctx := context.Background()
+	report, err := tc.Controller.AssignReadyTasks(ctx, fr.Handle, defaultAssignmentOptions())
+	if err != nil || len(report.Assigned) != 2 {
+		t.Fatalf("AssignReadyTasks() = %+v, %v; want both tasks assigned", report.Assigned, err)
+	}
+	for id, row := range tc.Store.Worktrees {
+		unlinked := run.NewWorktree(id, row.value.RepositoryID, row.value.RunID, row.value.Path, row.value.Branch)
+		tc.Store.Worktrees[id] = &entityRow[run.Worktree]{value: unlinked, revision: row.revision}
+	}
+
+	for _, a := range report.Assigned {
+		slc, loadErr := tc.Store.LoadSessionLaunchContext(ctx, fr.RunID, a.SessionID)
+		if loadErr != nil {
+			t.Fatalf("LoadSessionLaunchContext() error = %v", loadErr)
+		}
+		if slc.WorktreePath != "" {
+			t.Fatalf("%s resolved %q among several unlinked rows, want no guess", a.TaskID, slc.WorktreePath)
+		}
+		if _, launchErr := tc.Controller.PrepareSessionLaunchExec(ctx, sessionLaunchRequest(&slc, fr.RunID, a.WorktreeInfo.Path, 7300)); launchErr == nil ||
+			!strings.Contains(launchErr.Error(), "no recorded worktree path") {
+			t.Fatalf("launch over unlinked rows error = %v, want the missing-worktree refusal", launchErr)
+		}
+		if _, claimed := tc.Store.LaunchClaims[slc.IncarnationID]; claimed {
+			t.Fatal("a refused launch left a claim")
+		}
+	}
+
+	for id, row := range tc.Store.Worktrees {
+		if row.value.Path == report.Assigned[1].WorktreeInfo.Path {
+			delete(tc.Store.Worktrees, id)
+		}
+	}
+	slc, err := tc.Store.LoadSessionLaunchContext(ctx, fr.RunID, report.Assigned[1].SessionID)
+	if err != nil {
+		t.Fatalf("LoadSessionLaunchContext() error = %v", err)
+	}
+	if slc.WorktreePath != report.Assigned[0].WorktreeInfo.Path {
+		t.Fatalf("worktree path with the run's single unlinked row = %q, want that row %q", slc.WorktreePath, report.Assigned[0].WorktreeInfo.Path)
+	}
+}
+
+// TestWorktreeFallbackServesOnlyALoneUnlinkedRow is the fake-store half
+// of the launch boundary's fallback rule (the real-store half has the same
+// name in internal/adapters/sqlite): a session whose attempt has no row of
+// its own falls back to the run's only row ONLY while that row is
+// unlinked. A lone row linked to a sibling attempt, or a sibling-linked
+// row beside an unlinked one, resolves nothing, and hop launch refuses
+// the session with no claim written.
+func TestWorktreeFallbackServesOnlyALoneUnlinkedRow(t *testing.T) {
+	const unlinkedPath = "/worktrees/unlinked"
+	for _, tt := range []struct {
+		name     string
+		sibling  bool // keep the sibling attempt's linked row
+		unlinked bool // add an unlinked row
+		want     string
+	}{
+		{name: "lone row linked to a sibling attempt", sibling: true, want: ""},
+		{name: "sibling-linked row beside an unlinked row", sibling: true, unlinked: true, want: ""},
+		{name: "the run's only row, unlinked", unlinked: true, want: unlinkedPath},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			tc := newTestController(defaultPolicy())
+			fr := seedFeatureRun(t, tc, 2)
+			freezeLaunchPolicy(tc, fr.RunID)
+			seedImplementTask(t, tc, fr.RunID, 1, "A", false, run.TaskReady)
+			seedImplementTask(t, tc, fr.RunID, 2, "B", false, run.TaskReady)
+			ctx := context.Background()
+			report, err := tc.Controller.AssignReadyTasks(ctx, fr.Handle, defaultAssignmentOptions())
+			if err != nil || len(report.Assigned) != 2 {
+				t.Fatalf("AssignReadyTasks() = %+v, %v; want both tasks assigned", report.Assigned, err)
+			}
+			sibling, subject := report.Assigned[0], report.Assigned[1]
+			for id, row := range tc.Store.Worktrees {
+				if row.value.AttemptID == subject.AttemptID || (!tt.sibling && row.value.AttemptID == sibling.AttemptID) {
+					delete(tc.Store.Worktrees, id)
+				}
+			}
+			if tt.unlinked {
+				w := run.NewWorktree(identity.WorktreeID(tc.IDs.NewID()), tc.Store.Runs[fr.RunID].value.RepositoryID, fr.RunID, unlinkedPath, "hop/run-1")
+				tc.Store.Worktrees[w.ID] = &entityRow[run.Worktree]{value: w, revision: 1}
+			}
+
+			slc, err := tc.Store.LoadSessionLaunchContext(ctx, fr.RunID, subject.SessionID)
+			if err != nil {
+				t.Fatalf("LoadSessionLaunchContext() error = %v", err)
+			}
+			if slc.WorktreePath != tt.want {
+				t.Fatalf("worktree path = %q, want %q", slc.WorktreePath, tt.want)
+			}
+			dir := sibling.WorktreeInfo.Path
+			if tt.want != "" {
+				dir = tt.want
+			}
+			plan, err := tc.Controller.PrepareSessionLaunchExec(ctx, sessionLaunchRequest(&slc, fr.RunID, dir, 7500))
+			_, claimed := tc.Store.LaunchClaims[slc.IncarnationID]
+			if tt.want == "" {
+				if err == nil || !strings.Contains(err.Error(), "no recorded worktree path") || claimed {
+					t.Fatalf("launch from %s = %+v, %v (claimed %t); want the missing-worktree refusal and no claim", dir, plan, err, claimed)
+				}
+				return
+			}
+			if err != nil || !claimed {
+				t.Fatalf("solo-fallback launch = %+v, %v (claimed %t); want accepted with a claim", plan, err, claimed)
+			}
+		})
+	}
 }
 
 // plainUnitOfWork implements exactly app.UnitOfWork over an inner

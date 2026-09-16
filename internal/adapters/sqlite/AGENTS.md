@@ -33,11 +33,11 @@ this package never resolves environment variables or defaults.
 | [messaging.go](messaging.go) | `SendMessage`, `FetchNextMessage`, `AckMessage`, `AnswerQuestion`, `insertMessageReceipt`, `acceptedMessageReceipt`, `sendRequestDigest` | The section 7 worker-authority messaging port: request-ID receipts first, the caller session's OWN run and current incarnation re-derived per verb, derived answer destinations, the bundled human-question ack, receipts for every outcome except the deliberately receipt-free empty fetch |
 | [plan.go](plan.go) | `CreateTask`, `RequestRetry`, `ClosePlan`, `insertWorkflowReceipt`, `acceptedWorkflowReceipt`, `requireManagerCaller` | The section 8 worker-authority plan port: manager-only verbs, the retry's successor attempt reserved in the accepting transaction (its outcome carries the task's seq and the attempt number, re-read on a receipt replay), the plan flag set/cleared on runs.plan_closed_at, one authoritative acceptance per (run, verb, request ID) |
 | [review.go](review.go) | `SubmitReview`, `persistVerdictAcceptance`, `reviewerSessionEligible` | The section 8 worker-authority verdict write: SubmitResult's order mirrored, acceptance persisting the review, completing attempt and task, closing the mailbox and committing the controller's reasons-bearing manager notice atomically |
-| [workflow_read.go](workflow_read.go) | `LoadSessionLaunchContext`, `LoadMessagingContext`, `LoadMessageDetail`, `featureRunDetail`, `mailboxStatuses`, `guardShortfalls`, `pendingQuestions` | The Phase 3 lease-free reads (`app.WorkflowReadStore`): session-addressed launch context (binding else the SESSION-keyed pending intent, fail closed; the attempt row, worktree path and Relaunch successor fact), the messaging context, hop msg show's detail, and RunDetail's feature extensions |
+| [workflow_read.go](workflow_read.go) | `LoadSessionLaunchContext`, `LoadMessagingContext`, `LoadMessageDetail`, `worktreePathForAttempt`, `attemptWorktreePath`, `featureRunDetail`, `mailboxStatuses`, `guardShortfalls`, `pendingQuestions` | The Phase 3 lease-free reads (`app.WorkflowReadStore`): session-addressed launch context (binding else the SESSION-keyed pending intent, fail closed; the attempt row, worktree path and Relaunch successor fact), the messaging context, hop msg show's detail, and RunDetail's feature extensions. The launch context's worktree comes from the newest row linked to the attempt, else the run's only row while that row is unlinked, else ""; a row linked to another attempt is never served, and several rows are never guessed among. The status task table uses the linked row alone |
 | [messages.go](messages.go) | `parseAddress`, `scanMessage`, `getMessage`, `messagesByAddress`, `nextEnqueueSeq`, `insertMessage`, `messageDeliveries`, `messageAck`, `resolveSessionAddress` | Shared message row mapping: Message.State reconstructed from the delivery/ack rows in the same snapshot (never a persisted column), the per-(run, recipient) FIFO sequence, lineage-based address resolution |
 | [statestore.go](statestore.go) | `InitializeRun`, `AcquireLease`, `Heartbeat`, `ReleaseLease`, `Begin`, `validateLease` | The controller authority: run bootstrap in one transaction (the snapshot's workflow JSON round-tripped, NULL for solo; a feature spec inserts the run, snapshot, manager session and lease only, refusing `app.ErrFeatureRunSpecInvalid` before the transaction and `app.ErrRunSequenceMismatch` inside it), lease CAS with monotonic generations, fenced unit-of-work begin |
 | [uow.go](uow.go) | `unitOfWork` and the typed repositories (`Runs`…`CheckExecClaims`), `OperationRepository.Pending`/`ByKind`, `Commit`, `Rollback` | One immediate transaction per unit of work; optimistic-concurrency saves; append-only bindings and transitions; journal payloads persisted as uninterpreted JSON; controller-side launch-claim settlement |
-| [entities.go](entities.go) | `getRun`, `getTask`, `getAttempt`, `getSession`, `currentSession`, `currentBinding`, `getLaunchClaim`, `acceptedResult`, `incarnationCurrent`, `launchIncarnationCurrent`, `pendingLaunchIntent` | Row ↔ domain-value mapping shared by all three authorities through the `querier` interface |
+| [entities.go](entities.go) | `getRun`, `getTask`, `getAttempt`, `getSession`, `currentSession`, `currentBinding`, `getWorktree`, `getLaunchClaim`, `acceptedResult`, `incarnationCurrent`, `launchIncarnationCurrent`, `pendingLaunchIntent` | Row ↔ domain-value mapping shared by all three authorities through the `querier` interface (`getWorktree` maps NULL `attempt_id`/`base_commit` to the solo row's empty links) |
 | [submission.go](submission.go) | `SubmitResult`, `RecordMalformed`, `ClaimLaunch`, `SettleLaunchFailure`, `ClaimCheckExec`, `RequestStop`, `insertReceipt` | The worker authority: the section 7 validation order with the domain's `AcceptResult` inside one transaction, receipts for every outcome, the pre-exec claim contracts, the monotonic stop request |
 | [readstore.go](readstore.go) | `ListRuns`, `LoadRunStatus`, `LoadFrozenRun`, `LoadCheckExecutionContext`, `lastCheckSummary`, `retirementIntentExecution` | Lease-free reads, each inside one deferred read transaction for a consistent WAL snapshot; `LoadRunStatus` carries the snapshot's frozen `TargetBranch` and the run's `worktrees_retired_at` fact |
 | [worktreeretirement.go](worktreeretirement.go) | `unitOfWork` as `app.WorktreeRetirementRepositories`: `MarkWorktreesRetired`; `runWorktreesRetiredAt` | Migration 004's worktrees-retired run fact: written once inside the fenced unit of work (the leased run only; the UPDATE applies only while NULL, so a repeat keeps the first value; a set-once housekeeping column that does not move `runs.revision`), read back as nil for NULL or the canonical time (anything else fails closed) |
@@ -74,6 +74,12 @@ this package never resolves environment variables or defaults.
 - Mutable entity tables (runs, tasks, attempts, sessions, worktrees) carry
   `revision`; every save runs `WHERE id = ? AND revision = ?` and zero
   affected rows is `app.ErrRevisionConflict`.
+- The worktree insert writes `attempt_id` and `base_commit` from the
+  domain value (NULL for a solo row). A linked attempt must exist
+  (`app.ErrNotFound`) and belong to the leased run (`app.ErrFenced`), the
+  same ownership check the session insert applies. Every feature attempt's
+  row is linked (`AssignReadyTasks`), and the launch context finds a
+  session's worktree by that link.
 - The lease row is created only by `InitializeRun` and never deleted or
   reinserted; its generation is monotonic for the life of the row and
   preserved across release. Heartbeat and release are CAS on (run,
@@ -257,9 +263,23 @@ this package never resolves environment variables or defaults.
   `TestClaimLaunchByAttemptResolvesSession`,
   `TestClaimLaunchManagerSession`,
   `TestClaimCheckExecAcceptsMergeOperations`); the Phase 3 reads
-  (`TestLoadSessionLaunchContext`, `TestLoadMessagingContext`,
+  (`TestLoadSessionLaunchContext` — worktree rows written through the
+  production repository, including the one-unlinked-row fallback and the
+  several-unlinked-rows refusal — `TestLoadMessagingContext`,
   `TestLoadMessageDetail`, `TestRunDetailFeatureExtensions`,
   `TestRunDetailSoloZeroValues`, `TestLoadCheckExecutionContextByKind`);
+  the feature worktree linkage on the real store
+  (`TestAssignedWorktreesLinkTheirAttempts`: `ResumeFeature` takes over a
+  seeded run and `AssignReadyTasks` assigns two implementers and a
+  reviewer, each row linked to its attempt and base, each Claude child
+  with its own native reference, and `PrepareSessionLaunchExec` accepting
+  each session from its own worktree and refusing it from a sibling's;
+  `TestUnlinkedWorktreeRowsRefuseTheLaunch`, the pre-fix unlinked rows
+  refusing every launch with no claim;
+  `TestWorktreeFallbackServesOnlyALoneUnlinkedRow`, the run-wide fallback
+  serving only the run's lone unlinked row: a lone sibling-linked row, or
+  one beside an unlinked row, resolves nothing and the launch is refused;
+  `TestWorktreeRepositoryAttemptLink`, the linked and solo round trips);
   the feature bootstrap (`bootstrap_test.go`:
   `TestInitializeRunFeatureShape` — run, snapshot workflow JSON, a
   reserved attempt-less parentless manager with its assigned native

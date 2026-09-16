@@ -21,6 +21,11 @@ type fakeRuntime struct {
 	store *fakeStore
 
 	nextPaneN int
+	// worktreeN counts successful default CreateWorktree responses; each
+	// gets its own path, as Herdr's worktree.create gives every created
+	// checkout (spike S9, TestSpikeConcurrentWorktreeCreate), and as the
+	// store's UNIQUE(path) requires.
+	worktreeN int
 
 	CreateWorktreeErr error
 	CreateWorktreeFn  func(app.WorktreeRequest) (app.WorktreeInfo, error)
@@ -160,7 +165,12 @@ func (r *fakeRuntime) CreateWorktree(_ context.Context, req app.WorktreeRequest)
 		return app.WorktreeInfo{}, r.CreateWorktreeErr
 	}
 	r.nextPaneN++
-	return app.WorktreeInfo{WorkspaceID: fmt.Sprintf("workspace-%d", r.nextPaneN), Path: "/worktrees/w", Branch: req.Branch}, nil
+	r.worktreeN++
+	path := "/worktrees/w"
+	if r.worktreeN > 1 {
+		path = fmt.Sprintf("/worktrees/w-%d", r.worktreeN)
+	}
+	return app.WorktreeInfo{WorkspaceID: fmt.Sprintf("workspace-%d", r.nextPaneN), Path: path, Branch: req.Branch}, nil
 }
 
 func (r *fakeRuntime) OpenWorkerPane(_ context.Context, req app.WorkerPaneRequest) (app.PaneHandle, error) { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.

@@ -115,6 +115,14 @@ type fakeStore struct {
 	Results   map[identity.AttemptID]run.Result
 	Artifacts []run.Artifact
 
+	// worktreeInsertOrder records each committed worktree row's insertion
+	// sequence (worktreeInsertSeq is the last one assigned): the fake's
+	// counterpart of the real store's rowid, which the by-attempt worktree
+	// lookup orders by. A row seeded directly into Worktrees has none and
+	// sorts oldest.
+	worktreeInsertOrder map[identity.WorktreeID]int
+	worktreeInsertSeq   int
+
 	LaunchClaims    map[identity.IncarnationID]app.LaunchClaim
 	CheckExecClaims map[identity.OperationID]app.CheckExecClaim
 	Operations      map[identity.OperationID]app.Operation
@@ -226,6 +234,8 @@ func newFakeStore(clock interface{ Now() time.Time }) *fakeStore {
 		RequestReceipts:    map[requestReceiptKey]requestReceipt{},
 		taskSeqByRun:       map[identity.RunID]int{},
 		WorktreesRetiredAt: map[identity.RunID]time.Time{},
+
+		worktreeInsertOrder: map[identity.WorktreeID]int{},
 	}
 }
 
@@ -549,6 +559,52 @@ func (s *fakeStore) worktreeByRunLocked(runID identity.RunID) (run.Worktree, boo
 		}
 	}
 	return run.Worktree{}, false
+}
+
+// newestAttemptWorktreeLocked returns the most recently inserted worktree
+// row linked to attemptID, mirroring the real store's `WHERE attempt_id =
+// ? ORDER BY rowid DESC LIMIT 1`; an empty attemptID matches nothing, as
+// SQL's comparison with a NULL column never does. Callers hold s.mu.
+func (s *fakeStore) newestAttemptWorktreeLocked(attemptID identity.AttemptID) (run.Worktree, bool) {
+	var (
+		newest run.Worktree
+		order  int
+		found  bool
+	)
+	if attemptID == "" {
+		return run.Worktree{}, false
+	}
+	for id, row := range s.Worktrees {
+		if row.value.AttemptID != attemptID {
+			continue
+		}
+		if seq := s.worktreeInsertOrder[id]; !found || seq > order {
+			newest, order, found = row.value, seq, true
+		}
+	}
+	return newest, found
+}
+
+// worktreePathForAttemptLocked mirrors the real store's launch-boundary
+// lookup (sqlite worktreePathForAttempt): the attempt's own linked row
+// when one exists; else the run's only worktree row, and only while that
+// row is unlinked (the solo shape); else "" — a row linked to another
+// attempt is never served, and several rows, linked or not, are never
+// guessed among. Callers hold s.mu.
+func (s *fakeStore) worktreePathForAttemptLocked(runID identity.RunID, attemptID identity.AttemptID) string {
+	if w, ok := s.newestAttemptWorktreeLocked(attemptID); ok {
+		return w.Path
+	}
+	var rows []run.Worktree
+	for _, row := range s.Worktrees {
+		if row.value.RunID == runID {
+			rows = append(rows, row.value)
+		}
+	}
+	if len(rows) == 1 && rows[0].AttemptID == "" {
+		return rows[0].Path
+	}
+	return ""
 }
 
 func (s *fakeStore) currentBindingByAttemptLocked(attemptID identity.AttemptID) (identity.SessionID, run.RuntimeBinding, bool) {

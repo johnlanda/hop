@@ -373,6 +373,14 @@ func (c *Controller) assignOneReadyTask(ctx context.Context, handle RunHandle, f
 		if err != nil {
 			return err
 		}
+		// A Claude session's first launch is `--session-id <ref>`, so the
+		// reference is pre-assigned here, as StartRun assigns the solo
+		// worker's; Codex and opencode sessions carry none.
+		if harness == run.HarnessClaude {
+			if child, err = child.AssignNativeRef(c.IDs.NewID(), run.NativeRefAssigned, now); err != nil {
+				return err
+			}
+		}
 
 		taskFrom := task.State
 		activated, err := task.Activate(now)
@@ -700,7 +708,14 @@ func (c *Controller) createAttemptWorktree(ctx context.Context, handle RunHandle
 			if runErr != nil {
 				return runErr
 			}
-			if _, createErr := uow.Worktrees().Create(ctx, run.NewWorktree(worktreeID, r.RepositoryID, handle.runID, info.Path, info.Branch)); createErr != nil {
+			// The row names its attempt and verified base: the launch
+			// boundary finds a feature session's worktree by attempt, never
+			// by run, once the run holds more than one worktree.
+			worktree, wtErr := run.NewAttemptWorktree(worktreeID, r.RepositoryID, handle.runID, attemptID, baseOID, info.Path, info.Branch)
+			if wtErr != nil {
+				return wtErr
+			}
+			if _, createErr := uow.Worktrees().Create(ctx, worktree); createErr != nil {
 				return createErr
 			}
 			op.State = OperationSucceeded
