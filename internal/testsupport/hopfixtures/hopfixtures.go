@@ -518,6 +518,157 @@ func RunAttempt(ctx context.Context, store Store, lease app.Lease, attemptID str
 	})
 }
 
+// SeedIntegratedTask seeds one implement task (sequence seq) of managerID's
+// running feature run whose accepted result was integrated: the task
+// active with a running implementer attempt (SeedChildSession,
+// RunAttempt), the result accepted through store.SubmitResult (commitOID),
+// then an integration row driven merging, checking and integrated over
+// premergeOID and mergeOID, and the task left integrated — the validated
+// integration head worktree retirement detects. Seeds occupy seed through
+// seed+21.
+func SeedIntegratedTask(ctx context.Context, store Store, lease app.Lease, runID, managerID string, seq, seed int, commitOID, premergeOID, mergeOID string, now time.Time) (taskID, attemptID string, err error) {
+	taskID, err = SeedImplementTask(ctx, store, lease, runID, seq, seed, fmt.Sprintf("integrated task %d", seq), string(run.TaskActive), now)
+	if err != nil {
+		return "", "", err
+	}
+	_, incarnationID, attemptID, err := SeedChildSession(ctx, store, lease, runID, taskID, managerID, string(run.RoleImplementer), seed+10, now)
+	if err != nil {
+		return "", "", err
+	}
+	if runErr := RunAttempt(ctx, store, lease, attemptID, now); runErr != nil {
+		return "", "", runErr
+	}
+	resultID := uid(seed + 20)
+	outcome, err := store.SubmitResult(ctx, app.ResultSubmission{
+		ID: identity.ResultID(resultID), RunID: identity.RunID(runID), TaskID: identity.TaskID(taskID),
+		AttemptID: identity.AttemptID(attemptID), IncarnationID: identity.IncarnationID(incarnationID),
+		CommitOID: commitOID, Summary: "fixture result", Digest: "fixture-digest-" + resultID,
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("hopfixtures: submit result: %w", err)
+	}
+	if outcome.Kind != app.SubmissionAccepted {
+		return "", "", fmt.Errorf("hopfixtures: submit result: %s (%s)", outcome.Kind, outcome.Detail)
+	}
+	txErr := withUOW(ctx, store, lease, func(uow app.UnitOfWork) error {
+		wf, wfErr := app.RequireWorkflowRepositories(uow, "hopfixtures.SeedIntegratedTask")
+		if wfErr != nil {
+			return fmt.Errorf("hopfixtures: %w", wfErr)
+		}
+		integration := run.NewIntegration(identity.IntegrationID(uid(seed+21)), identity.RunID(runID), identity.TaskID(taskID), identity.ResultID(resultID), commitOID, premergeOID, now)
+		if _, createErr := wf.Integrations().Create(ctx, integration); createErr != nil {
+			return fmt.Errorf("hopfixtures: create integration: %w", createErr)
+		}
+		checking, trErr := integration.EnterChecking(mergeOID, now)
+		if trErr != nil {
+			return fmt.Errorf("hopfixtures: integration checking: %w", trErr)
+		}
+		integrated, trErr := checking.Integrate(now)
+		if trErr != nil {
+			return fmt.Errorf("hopfixtures: integrate: %w", trErr)
+		}
+		if _, saveErr := wf.Integrations().Save(ctx, integrated, 1); saveErr != nil {
+			return fmt.Errorf("hopfixtures: save integration: %w", saveErr)
+		}
+		task, revision, getErr := uow.Tasks().Get(ctx, identity.TaskID(taskID))
+		if getErr != nil {
+			return fmt.Errorf("hopfixtures: get task: %w", getErr)
+		}
+		task.State = run.TaskIntegrated
+		if _, saveErr := uow.Tasks().Save(ctx, task, revision); saveErr != nil {
+			return fmt.Errorf("hopfixtures: save integrated task: %w", saveErr)
+		}
+		return nil
+	})
+	if txErr != nil {
+		return "", "", txErr
+	}
+	return taskID, attemptID, nil
+}
+
+// SeedAttemptWorktree records attemptID's worktree exactly as the
+// assignment act does after Herdr's worktree.create succeeds: a succeeded
+// worktree.create operation whose intent (repository root, requested
+// branch, base commit, attempt) and act evidence (the reported path and
+// branch, the verified base) are in the store's persisted JSON shape, and
+// the worktree row linked to the attempt and base in the same unit of
+// work. branch is the requested short name (hop/r<seq>/t<n>a<m>); path is
+// the spelling Herdr reported. Seeds occupy seed and seed+1.
+func SeedAttemptWorktree(ctx context.Context, store Store, lease app.Lease, runID, attemptID string, seed int, repositoryRoot, path, branch, baseOID string, now time.Time) (worktreeID string, err error) {
+	worktreeID = uid(seed)
+	txErr := withUOW(ctx, store, lease, func(uow app.UnitOfWork) error {
+		current, _, getErr := uow.Runs().Get(ctx, identity.RunID(runID))
+		if getErr != nil {
+			return fmt.Errorf("hopfixtures: get run: %w", getErr)
+		}
+		if opErr := uow.Operations().Create(ctx, app.Operation{
+			ID: identity.OperationID(uid(seed + 1)), RunID: identity.RunID(runID), Generation: lease.Generation,
+			Kind: app.OpWorktreeCreate, State: app.OperationSucceeded,
+			Intent: map[string]any{
+				"repository_root": repositoryRoot, "branch": branch, "base_ref": baseOID, "attempt_id": attemptID,
+			},
+			ActEvidence: map[string]any{
+				"info":        map[string]any{"WorkspaceID": "fixture-workspace-" + attemptID, "Path": path, "Branch": branch},
+				"base_commit": baseOID,
+			},
+			CreatedAt: now, UpdatedAt: now,
+		}); opErr != nil {
+			return fmt.Errorf("hopfixtures: create worktree.create operation: %w", opErr)
+		}
+		worktree, wtErr := run.NewAttemptWorktree(identity.WorktreeID(worktreeID), current.RepositoryID, identity.RunID(runID), identity.AttemptID(attemptID), baseOID, path, branch)
+		if wtErr != nil {
+			return fmt.Errorf("hopfixtures: new attempt worktree: %w", wtErr)
+		}
+		if _, createErr := uow.Worktrees().Create(ctx, worktree); createErr != nil {
+			return fmt.Errorf("hopfixtures: create attempt worktree: %w", createErr)
+		}
+		return nil
+	})
+	if txErr != nil {
+		return "", txErr
+	}
+	return worktreeID, nil
+}
+
+// FinishRun drives runID from running to state — "completed" (through
+// completing), "failed", or "stopped" (a stop request, then stopping) —
+// and releases lease, leaving the run exactly as a finished controller
+// does: terminal, with no controller holding it.
+func FinishRun(ctx context.Context, store Store, lease app.Lease, runID, state string, now time.Time) error {
+	if err := withUOW(ctx, store, lease, func(uow app.UnitOfWork) error {
+		current, revision, err := uow.Runs().Get(ctx, identity.RunID(runID))
+		if err != nil {
+			return fmt.Errorf("hopfixtures: get run: %w", err)
+		}
+		var next run.Run
+		switch run.RunState(state) {
+		case run.RunCompleted:
+			if next, err = current.EnterCompleting(now); err == nil {
+				next, err = next.Complete(now)
+			}
+		case run.RunFailed:
+			next, err = current.Fail(now)
+		case run.RunStopped:
+			next, err = current.RequestStop(now).MarkStopped(now)
+		default:
+			return fmt.Errorf("hopfixtures: %q is not a terminal run state", state)
+		}
+		if err != nil {
+			return fmt.Errorf("hopfixtures: finish run: %w", err)
+		}
+		if _, err := uow.Runs().Save(ctx, next, revision); err != nil {
+			return fmt.Errorf("hopfixtures: save finished run: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	if err := store.ReleaseLease(ctx, lease); err != nil {
+		return fmt.Errorf("hopfixtures: release lease: %w", err)
+	}
+	return nil
+}
+
 func launchRun(ctx context.Context, uow app.UnitOfWork, runID string, now time.Time) error {
 	v, rev, err := uow.Runs().Get(ctx, identity.RunID(runID))
 	if err != nil {
