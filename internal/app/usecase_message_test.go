@@ -218,8 +218,8 @@ func TestSendMessageValidation(t *testing.T) {
 		if err != nil {
 			t.Fatalf("SendMessage() error = %v", err)
 		}
-		if result.Outcome != string(app.MessageRefused) {
-			t.Fatalf("SendMessage() = %+v, want refused (a worker may only send to manager)", result)
+		if result.Outcome != string(app.MessageRefused) || result.Reason != app.GrammarReasonUnauthorized {
+			t.Fatalf("SendMessage() = %+v, want refused/%s (a worker may only send to manager)", result, app.GrammarReasonUnauthorized)
 		}
 	})
 
@@ -239,8 +239,8 @@ func TestSendMessageValidation(t *testing.T) {
 		if err != nil {
 			t.Fatalf("SendMessage() error = %v", err)
 		}
-		if result.Outcome != string(app.MessageMailboxClose) {
-			t.Fatalf("SendMessage() = %+v, want refused-mailbox-closed", result)
+		if result.Outcome != string(app.MessageMailboxClose) || result.Reason != app.GrammarReasonMailboxClosed {
+			t.Fatalf("SendMessage() = %+v, want refused-mailbox-closed/%s", result, app.GrammarReasonMailboxClosed)
 		}
 	})
 
@@ -256,8 +256,8 @@ func TestSendMessageValidation(t *testing.T) {
 		if err != nil {
 			t.Fatalf("SendMessage() error = %v", err)
 		}
-		if result.Outcome != string(app.MessageMalformed) {
-			t.Fatalf("SendMessage() = %+v, want malformed", result)
+		if result.Outcome != string(app.MessageMalformed) || result.Reason != app.GrammarReasonMalformed {
+			t.Fatalf("SendMessage() = %+v, want malformed/%s", result, app.GrammarReasonMalformed)
 		}
 		if len(tc.Store.Messages) != 0 {
 			t.Fatalf("a malformed oversized body must not be written or recorded")
@@ -290,8 +290,8 @@ func TestSendMessageValidation(t *testing.T) {
 		if err != nil {
 			t.Fatalf("SendMessage() error = %v", err)
 		}
-		if result.Outcome != string(app.MessageRefused) {
-			t.Fatalf("SendMessage(cross-run) = %+v, want refused", result)
+		if result.Outcome != string(app.MessageRefused) || result.Reason != app.GrammarReasonUnauthorized {
+			t.Fatalf("SendMessage(cross-run) = %+v, want refused/%s", result, app.GrammarReasonUnauthorized)
 		}
 		if len(tc.Store.Messages) != 0 {
 			t.Fatalf("a cross-run send must not create a message")
@@ -353,8 +353,8 @@ func TestAckMessageCrossRunRefused(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AckMessage() error = %v", err)
 	}
-	if ack.Outcome != string(app.AckRefused) {
-		t.Fatalf("AckMessage(cross-run) = %+v, want refused", ack)
+	if ack.Outcome != string(app.AckRefused) || ack.Reason != app.GrammarReasonUnauthorized {
+		t.Fatalf("AckMessage(cross-run) = %+v, want refused/%s", ack, app.GrammarReasonUnauthorized)
 	}
 }
 
@@ -380,8 +380,8 @@ func TestAckMessageRequiresOwnDelivery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AckMessage() error = %v", err)
 	}
-	if ack.Outcome != string(app.AckRefused) {
-		t.Fatalf("AckMessage() = %+v, want refused (not yet delivered)", ack)
+	if ack.Outcome != string(app.AckRefused) || ack.Reason != app.GrammarReasonNotDelivered {
+		t.Fatalf("AckMessage() = %+v, want refused/%s (not yet delivered)", ack, app.GrammarReasonNotDelivered)
 	}
 
 	if _, fetchErr := tc.Controller.FetchMessage(ctx, app.FetchMessageRequest{
@@ -464,8 +464,8 @@ func TestAckMessageRequiresCurrentIncarnation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AckMessage() error = %v", err)
 	}
-	if ack.Outcome != string(app.AckRefused) {
-		t.Fatalf("AckMessage() at the current-but-never-served incarnation = %+v, want refused", ack)
+	if ack.Outcome != string(app.AckRefused) || ack.Reason != app.GrammarReasonNotDelivered {
+		t.Fatalf("AckMessage() at the current-but-never-served incarnation = %+v, want refused/%s", ack, app.GrammarReasonNotDelivered)
 	}
 
 	// Once the current incarnation is actually served (a re-serve of the
@@ -651,4 +651,162 @@ func TestFetchMessageEmptyQueueCommitsNothing(t *testing.T) {
 	if len(tc.Store.Messages) != 0 || len(tc.Store.MessageDeliveries) != 0 {
 		t.Fatalf("an empty fetch must commit nothing: messages=%d deliveries=%d", len(tc.Store.Messages), len(tc.Store.MessageDeliveries))
 	}
+}
+
+// TestMessageRefusalReasonsAlwaysSet drives every remaining SendMessage/
+// Answer refusal shape not already asserted above (ruling B extended to
+// messaging: a refused/malformed outcome with an empty Reason is a
+// defect) and checks the exact grammar.go token each one sets, through
+// the driving Controller exactly as cmd/hop renders it.
+func TestMessageRefusalReasonsAlwaysSet(t *testing.T) {
+	t.Run("a run that left running refuses a send", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		fr := seedFeatureRun(t, tc, 2)
+		rRow := tc.Store.Runs[fr.RunID]
+		completing, err := rRow.value.EnterCompleting(tc.Clock.Now())
+		if err != nil {
+			t.Fatalf("EnterCompleting() error = %v", err)
+		}
+		rRow.value = completing
+
+		result, err := tc.Controller.SendMessage(context.Background(), app.SendMessageRequest{
+			RunID: fr.RunID.String(), SessionID: fr.ManagerID.String(), IncarnationID: fr.ManagerIncarnation.String(),
+			StateRoot: "/state", To: "human", Kind: "question", Body: []byte("q?"),
+		})
+		if err != nil {
+			t.Fatalf("SendMessage() error = %v", err)
+		}
+		if result.Outcome != string(app.MessageRunNotAccept) || result.Reason != app.GrammarReasonRunNotAccepting {
+			t.Fatalf("SendMessage() over a non-running run = %+v, want refused-run-not-accepting/%s", result, app.GrammarReasonRunNotAccepting)
+		}
+	})
+
+	t.Run("a stale sender incarnation is refused", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		fr := seedFeatureRun(t, tc, 2)
+		history := tc.Store.Bindings[fr.ManagerID]
+		history[len(history)-1].Superseded = true
+
+		result, err := tc.Controller.SendMessage(context.Background(), app.SendMessageRequest{
+			RunID: fr.RunID.String(), SessionID: fr.ManagerID.String(), IncarnationID: fr.ManagerIncarnation.String(),
+			StateRoot: "/state", To: "human", Kind: "question", Body: []byte("q?"),
+		})
+		if err != nil {
+			t.Fatalf("SendMessage() error = %v", err)
+		}
+		if result.Outcome != string(app.MessageRefused) || result.Reason != app.GrammarReasonStale {
+			t.Fatalf("SendMessage() with a stale incarnation = %+v, want refused/%s", result, app.GrammarReasonStale)
+		}
+	})
+
+	t.Run("a conflicting request id is refused for send", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		fr := seedFeatureRun(t, tc, 2)
+		first, err := tc.Controller.SendMessage(context.Background(), app.SendMessageRequest{
+			RunID: fr.RunID.String(), SessionID: fr.ManagerID.String(), IncarnationID: fr.ManagerIncarnation.String(),
+			StateRoot: "/state", To: "human", Kind: "question", Body: []byte("first"), RequestID: "shared-send-id",
+		})
+		if err != nil || first.Outcome != string(app.MessageAccepted) {
+			t.Fatalf("SendMessage(first) = %+v, err = %v", first, err)
+		}
+		second, err := tc.Controller.SendMessage(context.Background(), app.SendMessageRequest{
+			RunID: fr.RunID.String(), SessionID: fr.ManagerID.String(), IncarnationID: fr.ManagerIncarnation.String(),
+			StateRoot: "/state", To: "human", Kind: "question", Body: []byte("different"), RequestID: "shared-send-id",
+		})
+		if err != nil {
+			t.Fatalf("SendMessage(second) error = %v", err)
+		}
+		if second.Outcome != string(app.MessageRefused) || second.Reason != app.GrammarReasonConflicting {
+			t.Fatalf("SendMessage() with a reused, conflicting request id = %+v, want refused/%s", second, app.GrammarReasonConflicting)
+		}
+	})
+
+	t.Run("a session answer to an unknown question is malformed", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		fr := seedFeatureRun(t, tc, 2)
+		unknown, err := identity.ParseMessageID(tc.IDs.NewID())
+		if err != nil {
+			t.Fatalf("parse message id: %v", err)
+		}
+		result, err := tc.Controller.SendMessage(context.Background(), app.SendMessageRequest{
+			RunID: fr.RunID.String(), SessionID: fr.ManagerID.String(), IncarnationID: fr.ManagerIncarnation.String(),
+			StateRoot: "/state", Kind: "answer", ReplyTo: unknown.String(), Body: []byte("a"), Inline: true,
+		})
+		if err != nil {
+			t.Fatalf("SendMessage() error = %v", err)
+		}
+		if result.Outcome != string(app.MessageMalformed) || result.Reason != app.GrammarReasonMalformed {
+			t.Fatalf("SendMessage(session answer to unknown question) = %+v, want malformed/%s", result, app.GrammarReasonMalformed)
+		}
+	})
+
+	t.Run("an answer to an unknown question is malformed", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		fr := seedFeatureRun(t, tc, 2)
+		unknown, err := identity.ParseMessageID(tc.IDs.NewID())
+		if err != nil {
+			t.Fatalf("parse message id: %v", err)
+		}
+		result, err := tc.Controller.Answer(context.Background(), app.AnswerRequest{
+			RunID: fr.RunID.String(), QuestionID: unknown.String(), StateRoot: "/state", Body: []byte("a"), Inline: true,
+		})
+		if err != nil {
+			t.Fatalf("Answer() error = %v", err)
+		}
+		if result.Outcome != string(app.MessageMalformed) || result.Reason != app.GrammarReasonMalformed {
+			t.Fatalf("Answer(unknown question) = %+v, want malformed/%s", result, app.GrammarReasonMalformed)
+		}
+	})
+
+	t.Run("an answer to a non-human-addressed question is refused", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		fr := seedFeatureRun(t, tc, 2)
+		taskB := seedImplementTask(t, tc, fr.RunID, 1, "B", false, run.TaskReady)
+		workerID, workerIncarnation := seedWorkerSession(t, tc, fr, taskB)
+		send, err := tc.Controller.SendMessage(context.Background(), app.SendMessageRequest{
+			RunID: fr.RunID.String(), SessionID: workerID.String(), IncarnationID: workerIncarnation.String(),
+			StateRoot: "/state", To: "manager", Kind: "question", Body: []byte("q?"),
+		})
+		if err != nil {
+			t.Fatalf("SendMessage() error = %v", err)
+		}
+
+		result, err := tc.Controller.Answer(context.Background(), app.AnswerRequest{
+			RunID: fr.RunID.String(), QuestionID: send.MessageID, StateRoot: "/state", Body: []byte("a"), Inline: true,
+		})
+		if err != nil {
+			t.Fatalf("Answer() error = %v", err)
+		}
+		if result.Outcome != string(app.MessageRefused) || result.Reason != app.GrammarReasonMalformed {
+			t.Fatalf("Answer(non-human-addressed question) = %+v, want refused/%s", result, app.GrammarReasonMalformed)
+		}
+	})
+
+	t.Run("a conflicting request id is refused for answer", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		fr := seedFeatureRun(t, tc, 2)
+		send, err := tc.Controller.SendMessage(context.Background(), app.SendMessageRequest{
+			RunID: fr.RunID.String(), SessionID: fr.ManagerID.String(), IncarnationID: fr.ManagerIncarnation.String(),
+			StateRoot: "/state", To: "human", Kind: "question", Body: []byte("q?"),
+		})
+		if err != nil {
+			t.Fatalf("SendMessage() error = %v", err)
+		}
+
+		first, err := tc.Controller.Answer(context.Background(), app.AnswerRequest{
+			RunID: fr.RunID.String(), QuestionID: send.MessageID, StateRoot: "/state", Body: []byte("first"), Inline: true, RequestID: "shared-answer-id",
+		})
+		if err != nil || first.Outcome != string(app.MessageAccepted) {
+			t.Fatalf("Answer(first) = %+v, err = %v", first, err)
+		}
+		second, err := tc.Controller.Answer(context.Background(), app.AnswerRequest{
+			RunID: fr.RunID.String(), QuestionID: send.MessageID, StateRoot: "/state", Body: []byte("different"), Inline: true, RequestID: "shared-answer-id",
+		})
+		if err != nil {
+			t.Fatalf("Answer(second) error = %v", err)
+		}
+		if second.Outcome != string(app.MessageRefused) || second.Reason != app.GrammarReasonConflicting {
+			t.Fatalf("Answer() with a reused, conflicting request id = %+v, want refused/%s", second, app.GrammarReasonConflicting)
+		}
+	})
 }

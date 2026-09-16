@@ -33,10 +33,12 @@ type SendMessageRequest struct {
 }
 
 // SendMessageResult is SendMessage's outcome, string-only per the driving
-// API convention.
+// API convention. Reason is one of grammar.go's GrammarReason* tokens on
+// every non-accepted, non-duplicate outcome; empty otherwise.
 type SendMessageResult struct {
 	Outcome   string
 	MessageID string
+	Reason    string
 	Detail    string
 }
 
@@ -70,34 +72,34 @@ func (c *Controller) SendMessage(ctx context.Context, req SendMessageRequest) (S
 
 	kind, err := parseMessageKind(req.Kind)
 	if err != nil {
-		return SendMessageResult{Outcome: string(MessageMalformed), Detail: err.Error()}, nil
+		return SendMessageResult{Outcome: string(MessageMalformed), Reason: GrammarReasonMalformed, Detail: err.Error()}, nil
 	}
 	limit := MessageBodyFileLimit
 	if req.Inline {
 		limit = MessageBodyInlineLimit
 	}
 	if len(req.Body) == 0 || len(req.Body) > limit {
-		return SendMessageResult{Outcome: string(MessageMalformed), Detail: "body is empty or exceeds the size bound"}, nil
+		return SendMessageResult{Outcome: string(MessageMalformed), Reason: GrammarReasonMalformed, Detail: "body is empty or exceeds the size bound"}, nil
 	}
 
 	var recipient run.Address
 	if kind != run.MessageAnswer {
 		if recipient, err = parseAddress(req.To); err != nil {
-			return SendMessageResult{Outcome: string(MessageMalformed), Detail: err.Error()}, nil
+			return SendMessageResult{Outcome: string(MessageMalformed), Reason: GrammarReasonMalformed, Detail: err.Error()}, nil
 		}
 	}
 	var replyTo, relayOf *identity.MessageID
 	if req.ReplyTo != "" {
 		id, parseErr := identity.ParseMessageID(req.ReplyTo)
 		if parseErr != nil {
-			return SendMessageResult{Outcome: string(MessageMalformed), Detail: "invalid reply-to"}, nil
+			return SendMessageResult{Outcome: string(MessageMalformed), Reason: GrammarReasonMalformed, Detail: "invalid reply-to"}, nil
 		}
 		replyTo = &id
 	}
 	if req.RelayOf != "" {
 		id, parseErr := identity.ParseMessageID(req.RelayOf)
 		if parseErr != nil {
-			return SendMessageResult{Outcome: string(MessageMalformed), Detail: "invalid relay-of"}, nil
+			return SendMessageResult{Outcome: string(MessageMalformed), Reason: GrammarReasonMalformed, Detail: "invalid relay-of"}, nil
 		}
 		relayOf = &id
 	}
@@ -107,7 +109,7 @@ func (c *Controller) SendMessage(ctx context.Context, req SendMessageRequest) (S
 		return SendMessageResult{}, fmt.Errorf("app: load messaging context: %w", err)
 	}
 	if msgCtx.RunID != runID {
-		return SendMessageResult{Outcome: string(MessageRefused), Detail: "session does not belong to this run"}, nil
+		return SendMessageResult{Outcome: string(MessageRefused), Reason: GrammarReasonUnauthorized, Detail: "session does not belong to this run"}, nil
 	}
 
 	msgID, err := identity.ParseMessageID(c.IDs.NewID())
@@ -128,7 +130,7 @@ func (c *Controller) SendMessage(ctx context.Context, req SendMessageRequest) (S
 	if err != nil {
 		return SendMessageResult{}, fmt.Errorf("app: send message: %w", err)
 	}
-	return SendMessageResult{Outcome: string(outcome.Kind), MessageID: outcome.MessageID.String(), Detail: outcome.Detail}, nil
+	return SendMessageResult{Outcome: string(outcome.Kind), MessageID: outcome.MessageID.String(), Reason: outcome.Reason, Detail: outcome.Detail}, nil
 }
 
 // FetchMessageRequest is `hop msg next`'s driving input (also the single
@@ -226,9 +228,12 @@ type AckMessageRequest struct {
 	IncarnationID string
 }
 
-// AckMessageResult is AckMessage's outcome.
+// AckMessageResult is AckMessage's outcome. Reason is one of grammar.go's
+// GrammarReason* tokens on every refused outcome; empty on accepted/
+// duplicate.
 type AckMessageResult struct {
 	Outcome string
+	Reason  string
 	Detail  string
 }
 
@@ -262,7 +267,7 @@ func (c *Controller) AckMessage(ctx context.Context, req AckMessageRequest) (Ack
 		return AckMessageResult{}, fmt.Errorf("app: load messaging context: %w", err)
 	}
 	if msgCtx.RunID != runID {
-		return AckMessageResult{Outcome: string(AckRefused), Detail: "session does not belong to this run"}, nil
+		return AckMessageResult{Outcome: string(AckRefused), Reason: GrammarReasonUnauthorized, Detail: "session does not belong to this run"}, nil
 	}
 	outcome, err := c.Messages.AckMessage(ctx, MessageAck{
 		RunID: runID, MessageID: messageID, SessionID: sessionID, IncarnationID: incarnationID,
@@ -270,7 +275,7 @@ func (c *Controller) AckMessage(ctx context.Context, req AckMessageRequest) (Ack
 	if err != nil {
 		return AckMessageResult{}, fmt.Errorf("app: ack message: %w", err)
 	}
-	return AckMessageResult{Outcome: string(outcome.Kind), Detail: outcome.Detail}, nil
+	return AckMessageResult{Outcome: string(outcome.Kind), Reason: outcome.Reason, Detail: outcome.Detail}, nil
 }
 
 // AnswerRequest is `hop answer`'s driving input: a controller-machine
@@ -284,10 +289,13 @@ type AnswerRequest struct {
 	RequestID  string
 }
 
-// AnswerResult is Answer's outcome.
+// AnswerResult is Answer's outcome. Reason is one of grammar.go's
+// GrammarReason* tokens on every non-accepted, non-duplicate outcome;
+// empty otherwise.
 type AnswerResult struct {
 	Outcome   string
 	MessageID string
+	Reason    string
 	Detail    string
 }
 
@@ -311,7 +319,7 @@ func (c *Controller) Answer(ctx context.Context, req AnswerRequest) (AnswerResul
 		limit = MessageBodyInlineLimit
 	}
 	if len(req.Body) == 0 || len(req.Body) > limit {
-		return AnswerResult{Outcome: string(MessageMalformed), Detail: "body is empty or exceeds the size bound"}, nil
+		return AnswerResult{Outcome: string(MessageMalformed), Reason: GrammarReasonMalformed, Detail: "body is empty or exceeds the size bound"}, nil
 	}
 
 	answerID, err := identity.ParseMessageID(c.IDs.NewID())
@@ -331,7 +339,7 @@ func (c *Controller) Answer(ctx context.Context, req AnswerRequest) (AnswerResul
 	if err != nil {
 		return AnswerResult{}, fmt.Errorf("app: answer question: %w", err)
 	}
-	return AnswerResult{Outcome: string(outcome.Kind), MessageID: outcome.MessageID.String(), Detail: outcome.Detail}, nil
+	return AnswerResult{Outcome: string(outcome.Kind), MessageID: outcome.MessageID.String(), Reason: outcome.Reason, Detail: outcome.Detail}, nil
 }
 
 // ShowMessageRequest is `hop msg show`'s driving input: a read-only,

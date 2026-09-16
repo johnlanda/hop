@@ -122,20 +122,63 @@ func TaskCreateOversizedTitle(runID identity.RunID, session identity.SessionID, 
 	}
 }
 
+// AckMessageStaleIncarnationReason is AckMessageStaleIncarnation's expected
+// refusal reason token.
+const AckMessageStaleIncarnationReason = app.GrammarReasonStale
+
 // AckMessageStaleIncarnation returns a MessagingStore.AckMessage request
-// carrying an incarnation id that is NOT session's current, non-superseded
-// one — refused app.AckRefused: section 7's ack rule requires the ACKING
-// SESSION's current incarnation, since a predecessor's delivery proves
-// nothing about what a successor session actually saw.
+// carrying staleIncarnation, which must be the EXACT incarnation the
+// message was delivered to, now superseded by a fresh one — refused
+// app.AckRefused (reason AckMessageStaleIncarnationReason): the delivery
+// row satisfies the (session, incarnation) delivery check (AcceptAck's
+// first gate), so the refusal reaches the currency check and observes the
+// binding is no longer current, ErrStaleAck. An incarnation that was
+// never delivered to at all is a DIFFERENT refusal shape (ErrNotDelivered,
+// checked first — receipt-before-eligibility): the caller's own fixture
+// must supersede the SAME incarnation it delivered through, never swap in
+// an unrelated one, or this vector proves the wrong thing.
 func AckMessageStaleIncarnation(runID identity.RunID, messageID identity.MessageID, session identity.SessionID, staleIncarnation identity.IncarnationID) app.MessageAck {
 	return app.MessageAck{RunID: runID, MessageID: messageID, SessionID: session, IncarnationID: staleIncarnation}
 }
 
+// AckMessageUnknownMessageReason is AckMessageUnknownMessage's expected
+// refusal reason token.
+const AckMessageUnknownMessageReason = app.GrammarReasonNotFound
+
+// AckMessageUnknownMessage returns a MessagingStore.AckMessage request
+// naming a message id that does not exist in the run at all — refused
+// app.AckRefused (reason AckMessageUnknownMessageReason), detail "unknown
+// message": receipt-before-eligibility resolves the message before ever
+// checking the acking session or any delivery.
+func AckMessageUnknownMessage(runID identity.RunID, unknownMessageID identity.MessageID, session identity.SessionID, incarnation identity.IncarnationID) app.MessageAck {
+	return app.MessageAck{RunID: runID, MessageID: unknownMessageID, SessionID: session, IncarnationID: incarnation}
+}
+
+// AckMessageNotDeliveredReason is AckMessageNotDelivered's expected
+// refusal reason token.
+const AckMessageNotDeliveredReason = app.GrammarReasonNotDelivered
+
+// AckMessageNotDelivered returns a MessagingStore.AckMessage request for
+// an existing, queued message that has never been delivered to session at
+// all (the caller's own fixture creates the message through an ordinary
+// send and must not fetch it first) — refused app.AckRefused (reason
+// AckMessageNotDeliveredReason): a first ack requires a delivery row for
+// the acking session itself, which proves the recipient actually pulled
+// the message before claiming to have read it.
+func AckMessageNotDelivered(runID identity.RunID, messageID identity.MessageID, session identity.SessionID, incarnation identity.IncarnationID) app.MessageAck {
+	return app.MessageAck{RunID: runID, MessageID: messageID, SessionID: session, IncarnationID: incarnation}
+}
+
+// MessageSendAnswerUnknownQuestionReason is MessageSendAnswerUnknownQuestion's
+// expected refusal reason token.
+const MessageSendAnswerUnknownQuestionReason = app.GrammarReasonMalformed
+
 // MessageSendAnswerUnknownQuestion returns a MessagingStore.SendMessage
 // request (Kind answer) whose ReplyTo id does not exist in the run —
-// refused app.MessageMalformed, detail "unknown question": an answer's
-// eligibility starts with resolving the referenced question before
-// anything else (receipt-before-eligibility, section 7).
+// refused app.MessageMalformed (reason MessageSendAnswerUnknownQuestionReason),
+// detail "unknown question": an answer's eligibility starts with resolving
+// the referenced question before anything else (receipt-before-
+// eligibility, section 7).
 func MessageSendAnswerUnknownQuestion(runID identity.RunID, session identity.SessionID, senderAddress run.Address, incarnation identity.IncarnationID, answerID, unknownQuestionID identity.MessageID, bodyPath, bodyDigest string, bodyBytes int64) app.MessageSend {
 	return app.MessageSend{
 		ID: answerID, RunID: runID, Sender: run.SessionPrincipal(session), SenderAddress: senderAddress,
@@ -144,17 +187,24 @@ func MessageSendAnswerUnknownQuestion(runID identity.RunID, session identity.Ses
 	}
 }
 
+// MessageSendCrossRunReason is MessageSendCrossRun's expected refusal
+// reason token.
+const MessageSendCrossRunReason = app.GrammarReasonUnauthorized
+
 // MessageSendCrossRun returns a MessagingStore.SendMessage request whose
 // sender session belongs to a DIFFERENT run than claimedRunID names —
-// refused app.MessageRefused, detail "session does not belong to this
-// run": every messaging verb resolves the caller's session and requires
-// session.RunID == the request's stated run; the stated RunID is a
-// caller-supplied field, never authoritative on its own. Kind is fixed to
-// MessageQuestion: the cross-run check runs before addressing legality,
-// but callers must still pass a (senderAddress, recipient) pair
-// ValidateSendAddressing would otherwise accept (e.g. ManagerAddress to
-// HumanAddress), or a passing test would prove nothing — an addressing
-// refusal and a cross-run refusal share the same outcome kind.
+// refused app.MessageRefused (reason MessageSendCrossRunReason), detail
+// "session does not belong to this run": every messaging verb resolves
+// the caller's session and requires session.RunID == the request's stated
+// run; the stated RunID is a caller-supplied field, never authoritative
+// on its own. Kind is fixed to MessageQuestion: the cross-run check runs
+// before addressing legality, but callers must still pass a
+// (senderAddress, recipient) pair ValidateSendAddressing would otherwise
+// accept (e.g. ManagerAddress to HumanAddress), or a passing test would
+// prove nothing — an addressing refusal and a cross-run refusal share the
+// same outcome kind AND the same reason token (both Unauthorized), so
+// only the Detail text (never asserted by token-checking tests) actually
+// distinguishes them.
 func MessageSendCrossRun(claimedRunID identity.RunID, session identity.SessionID, senderAddress run.Address, incarnation identity.IncarnationID, messageID identity.MessageID, recipient run.Address, bodyPath, bodyDigest string, bodyBytes int64) app.MessageSend {
 	return app.MessageSend{
 		ID: messageID, RunID: claimedRunID, Sender: run.SessionPrincipal(session), SenderAddress: senderAddress,
@@ -173,9 +223,14 @@ func MessageFetchCrossRun(claimedRunID identity.RunID, session identity.SessionI
 	return app.MessageFetch{RunID: claimedRunID, SessionID: session, IncarnationID: incarnation, Address: address}
 }
 
+// AckMessageCrossRunReason is AckMessageCrossRun's expected refusal reason
+// token.
+const AckMessageCrossRunReason = app.GrammarReasonUnauthorized
+
 // AckMessageCrossRun returns a MessagingStore.AckMessage request whose
 // session belongs to a DIFFERENT run than claimedRunID names — refused
-// app.AckRefused, detail "session does not belong to this run".
+// app.AckRefused (reason AckMessageCrossRunReason), detail "session does
+// not belong to this run".
 func AckMessageCrossRun(claimedRunID identity.RunID, messageID identity.MessageID, session identity.SessionID, incarnation identity.IncarnationID) app.MessageAck {
 	return app.MessageAck{RunID: claimedRunID, MessageID: messageID, SessionID: session, IncarnationID: incarnation}
 }

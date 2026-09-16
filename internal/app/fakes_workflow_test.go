@@ -432,7 +432,7 @@ func (s *fakeStore) SendMessage(_ context.Context, send app.MessageSend) (app.Me
 		if prior, ok := s.RequestReceipts[key]; ok {
 			out, ok := receiptOutcome[app.MessageOutcome](prior)
 			if !ok {
-				return app.MessageOutcome{Kind: app.MessageMalformed, Detail: "corrupt receipt"}, nil
+				return app.MessageOutcome{Kind: app.MessageMalformed, Reason: app.GrammarReasonMalformed, Detail: "corrupt receipt"}, nil
 			}
 			if prior.digest == digest {
 				// The grammar reports an identical request-ID retry as
@@ -441,13 +441,13 @@ func (s *fakeStore) SendMessage(_ context.Context, send app.MessageSend) (app.Me
 				// grammar), even though the underlying entity is unchanged.
 				return app.MessageOutcome{Kind: app.MessageDuplicate, MessageID: out.MessageID}, nil
 			}
-			return app.MessageOutcome{Kind: app.MessageRefused, Detail: "request id reused with different content"}, nil
+			return app.MessageOutcome{Kind: app.MessageRefused, Reason: app.GrammarReasonConflicting, Detail: "request id reused with different content"}, nil
 		}
 	}
 
 	rRow, ok := s.Runs[send.RunID]
 	if !ok {
-		return app.MessageOutcome{Kind: app.MessageMalformed, Detail: "unknown run"}, nil
+		return app.MessageOutcome{Kind: app.MessageMalformed, Reason: app.GrammarReasonMalformed, Detail: "unknown run"}, nil
 	}
 	// The sender session's OWN run is the only authoritative source for
 	// which run it may act in — send.RunID is a caller-supplied field,
@@ -455,11 +455,11 @@ func (s *fakeStore) SendMessage(_ context.Context, send app.MessageSend) (app.Me
 	// able to supply run B and act against B's messages).
 	senderRow, ok := s.Sessions[send.Sender.SessionID]
 	if !ok || senderRow.value.RunID != send.RunID {
-		return app.MessageOutcome{Kind: app.MessageRefused, Detail: "session does not belong to this run"}, nil
+		return app.MessageOutcome{Kind: app.MessageRefused, Reason: app.GrammarReasonUnauthorized, Detail: "session does not belong to this run"}, nil
 	}
 	binding, hasBinding := s.currentBindingLocked(send.Sender.SessionID)
 	if !hasBinding || binding.IncarnationID != send.IncarnationID || binding.Superseded {
-		return app.MessageOutcome{Kind: app.MessageRefused, Detail: "incarnation is not current"}, nil
+		return app.MessageOutcome{Kind: app.MessageRefused, Reason: app.GrammarReasonStale, Detail: "incarnation is not current"}, nil
 	}
 
 	var outcome app.MessageOutcome
@@ -468,21 +468,21 @@ func (s *fakeStore) SendMessage(_ context.Context, send app.MessageSend) (app.Me
 		outcome = s.acceptSessionAnswerLocked(send, now)
 	default:
 		if err := run.ValidateSendAddressing(send.SenderAddress, send.Kind, send.Recipient); err != nil {
-			outcome = app.MessageOutcome{Kind: app.MessageRefused, Detail: err.Error()}
+			outcome = app.MessageOutcome{Kind: app.MessageRefused, Reason: app.GrammarReasonUnauthorized, Detail: err.Error()}
 			break
 		}
 		if rRow.value.State != run.RunRunning {
-			outcome = app.MessageOutcome{Kind: app.MessageRunNotAccept, Detail: "run is not accepting messages"}
+			outcome = app.MessageOutcome{Kind: app.MessageRunNotAccept, Reason: app.GrammarReasonRunNotAccepting, Detail: "run is not accepting messages"}
 			break
 		}
 		if send.Recipient.Kind == run.AddressTask {
 			tRow, ok := s.Tasks[send.Recipient.TaskID]
 			if !ok || tRow.value.RunID != send.RunID {
-				outcome = app.MessageOutcome{Kind: app.MessageMalformed, Detail: "unknown task"}
+				outcome = app.MessageOutcome{Kind: app.MessageMalformed, Reason: app.GrammarReasonMalformed, Detail: "unknown task"}
 				break
 			}
 			if tRow.value.MailboxClosed {
-				outcome = app.MessageOutcome{Kind: app.MessageMailboxClose, Detail: "mailbox is closed"}
+				outcome = app.MessageOutcome{Kind: app.MessageMailboxClose, Reason: app.GrammarReasonMailboxClosed, Detail: "mailbox is closed"}
 				break
 			}
 		}
@@ -510,15 +510,15 @@ func (s *fakeStore) SendMessage(_ context.Context, send app.MessageSend) (app.Me
 // answer's destination is never caller-chosen). Callers hold s.mu.
 func (s *fakeStore) acceptSessionAnswerLocked(send app.MessageSend, now time.Time) app.MessageOutcome { //nolint:gocritic // hugeParam: MessageSend is a per-call DTO; mirrors the port method's own convention.
 	if send.ReplyTo == nil {
-		return app.MessageOutcome{Kind: app.MessageMalformed, Detail: "answer requires reply-to"}
+		return app.MessageOutcome{Kind: app.MessageMalformed, Reason: app.GrammarReasonMalformed, Detail: "answer requires reply-to"}
 	}
 	question, ok := s.Messages[*send.ReplyTo]
 	if !ok || question.RunID != send.RunID {
-		return app.MessageOutcome{Kind: app.MessageMalformed, Detail: "unknown question"}
+		return app.MessageOutcome{Kind: app.MessageMalformed, Reason: app.GrammarReasonMalformed, Detail: "unknown question"}
 	}
 	destination, ok := s.answerDestinationLocked(question)
 	if !ok {
-		return app.MessageOutcome{Kind: app.MessageMalformed, Detail: "question originator is not resolvable"}
+		return app.MessageOutcome{Kind: app.MessageMalformed, Reason: app.GrammarReasonMalformed, Detail: "question originator is not resolvable"}
 	}
 
 	var prior *run.Message
@@ -542,9 +542,12 @@ func (s *fakeStore) acceptSessionAnswerLocked(send app.MessageSend, now time.Tim
 	case errors.Is(err, run.ErrDuplicateAnswer):
 		return app.MessageOutcome{Kind: app.MessageDuplicate, MessageID: outcomeVal.Answer.ID}
 	case errors.Is(err, run.ErrConflictingAnswer):
-		return app.MessageOutcome{Kind: app.MessageConflicting, Detail: err.Error()}
+		return app.MessageOutcome{Kind: app.MessageConflicting, Reason: app.GrammarReasonConflicting, Detail: err.Error()}
 	default:
-		return app.MessageOutcome{Kind: app.MessageRefused, Detail: err.Error()}
+		// The only other error AcceptAnswer returns is ErrInvalidTransition
+		// (the reply-to id names a message that is not a question) — a
+		// shape failure, not an authorization one.
+		return app.MessageOutcome{Kind: app.MessageRefused, Reason: app.GrammarReasonMalformed, Detail: err.Error()}
 	}
 }
 
@@ -632,14 +635,14 @@ func (s *fakeStore) AckMessage(_ context.Context, ack app.MessageAck) (app.Messa
 
 	msg, ok := s.Messages[ack.MessageID]
 	if !ok || msg.RunID != ack.RunID {
-		return app.MessageAckOutcome{Kind: app.AckRefused, Detail: "unknown message"}, nil
+		return app.MessageAckOutcome{Kind: app.AckRefused, Reason: app.GrammarReasonNotFound, Detail: "unknown message"}, nil
 	}
 	// The acking session's OWN run is the only authoritative source for
 	// which run it may act in — ack.RunID is a caller-supplied field,
 	// never trusted on its own.
 	ackerRow, ok := s.Sessions[ack.SessionID]
 	if !ok || ackerRow.value.RunID != ack.RunID {
-		return app.MessageAckOutcome{Kind: app.AckRefused, Detail: "session does not belong to this run"}, nil
+		return app.MessageAckOutcome{Kind: app.AckRefused, Reason: app.GrammarReasonUnauthorized, Detail: "session does not belong to this run"}, nil
 	}
 	msg = s.reconstructMessageStateLocked(msg)
 
@@ -669,7 +672,14 @@ func (s *fakeStore) AckMessage(_ context.Context, ack app.MessageAck) (app.Messa
 	outcomeVal, err := run.AcceptAck(msg, priorAck, run.AckContext{DeliveredToSession: deliveredToSession, IncarnationCurrent: incarnationCurrent}, run.Ack{SessionID: ack.SessionID, IncarnationID: ack.IncarnationID}, now)
 	switch {
 	case err != nil:
-		return app.MessageAckOutcome{Kind: app.AckRefused, Detail: err.Error()}, nil
+		reason := app.GrammarReasonUnauthorized
+		switch {
+		case errors.Is(err, run.ErrNotDelivered):
+			reason = app.GrammarReasonNotDelivered
+		case errors.Is(err, run.ErrStaleAck):
+			reason = app.GrammarReasonStale
+		}
+		return app.MessageAckOutcome{Kind: app.AckRefused, Reason: reason, Detail: err.Error()}, nil
 	case priorAck != nil:
 		return app.MessageAckOutcome{Kind: app.AckDuplicate}, nil
 	default:
@@ -690,25 +700,25 @@ func (s *fakeStore) AnswerQuestion(_ context.Context, answer app.HumanAnswer) (a
 		if prior, ok := s.RequestReceipts[key]; ok {
 			out, ok := receiptOutcome[app.MessageOutcome](prior)
 			if !ok {
-				return app.MessageOutcome{Kind: app.MessageMalformed, Detail: "corrupt receipt"}, nil
+				return app.MessageOutcome{Kind: app.MessageMalformed, Reason: app.GrammarReasonMalformed, Detail: "corrupt receipt"}, nil
 			}
 			if prior.digest == digest {
 				return app.MessageOutcome{Kind: app.MessageDuplicate, MessageID: out.MessageID}, nil
 			}
-			return app.MessageOutcome{Kind: app.MessageRefused, Detail: "request id reused with different content"}, nil
+			return app.MessageOutcome{Kind: app.MessageRefused, Reason: app.GrammarReasonConflicting, Detail: "request id reused with different content"}, nil
 		}
 	}
 
 	question, ok := s.Messages[answer.QuestionID]
 	if !ok || question.RunID != answer.RunID {
-		return app.MessageOutcome{Kind: app.MessageMalformed, Detail: "unknown question"}, nil
+		return app.MessageOutcome{Kind: app.MessageMalformed, Reason: app.GrammarReasonMalformed, Detail: "unknown question"}, nil
 	}
 	if question.Recipient.Kind != run.AddressHuman {
-		return app.MessageOutcome{Kind: app.MessageRefused, Detail: "question is not human-addressed"}, nil
+		return app.MessageOutcome{Kind: app.MessageRefused, Reason: app.GrammarReasonMalformed, Detail: "question is not human-addressed"}, nil
 	}
 	destination, ok := s.answerDestinationLocked(question)
 	if !ok {
-		return app.MessageOutcome{Kind: app.MessageMalformed, Detail: "question originator is not resolvable"}, nil
+		return app.MessageOutcome{Kind: app.MessageMalformed, Reason: app.GrammarReasonMalformed, Detail: "question originator is not resolvable"}, nil
 	}
 	var prior *run.Message
 	for _, m := range s.Messages { //nolint:gocritic // rangeValCopy: test fake; the domain snapshot is small and read-only here, and indexing would only obscure the loop.
@@ -735,9 +745,12 @@ func (s *fakeStore) AnswerQuestion(_ context.Context, answer app.HumanAnswer) (a
 	case errors.Is(err, run.ErrDuplicateAnswer):
 		outcome = app.MessageOutcome{Kind: app.MessageDuplicate, MessageID: outcomeVal.Answer.ID}
 	case errors.Is(err, run.ErrConflictingAnswer):
-		outcome = app.MessageOutcome{Kind: app.MessageConflicting, Detail: err.Error()}
+		outcome = app.MessageOutcome{Kind: app.MessageConflicting, Reason: app.GrammarReasonConflicting, Detail: err.Error()}
 	default:
-		outcome = app.MessageOutcome{Kind: app.MessageRefused, Detail: err.Error()}
+		// The only other error AcceptAnswer returns is ErrInvalidTransition
+		// (the question id names a message that is not a question) — a
+		// shape failure, not an authorization one.
+		outcome = app.MessageOutcome{Kind: app.MessageRefused, Reason: app.GrammarReasonMalformed, Detail: err.Error()}
 	}
 	if answer.RequestID != "" && outcome.Kind == app.MessageAccepted {
 		s.RequestReceipts[requestReceiptKey{run: answer.RunID, verb: verb, requestID: answer.RequestID}] = requestReceipt{digest: digest, outcome: outcome}

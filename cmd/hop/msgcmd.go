@@ -148,7 +148,7 @@ func sendMessageLines(result *app.SendMessageResult) []string {
 	case "duplicate":
 		return []string{app.GrammarSendDuplicateLine(result.MessageID)}
 	default:
-		return renderRefusal(messageRefusalToken(result.Outcome), result.Detail)
+		return renderRefusal(refusalToken(result.Reason), result.Detail)
 	}
 }
 
@@ -303,7 +303,7 @@ func ackMessageLines(messageID string, result *app.AckMessageResult) []string {
 	case "duplicate":
 		return []string{app.GrammarAckDuplicateLine(messageID)}
 	default:
-		return renderRefusal(ackRefusalToken(result.Detail), result.Detail)
+		return renderRefusal(refusalToken(result.Reason), result.Detail)
 	}
 }
 
@@ -446,6 +446,6 @@ func answerLines(result *app.AnswerResult) []string {
 	case "duplicate":
 		return []string{app.GrammarSendDuplicateLine(result.MessageID)}
 	default:
-		return renderRefusal(messageRefusalToken(result.Outcome), result.Detail)
+		return renderRefusal(refusalToken(result.Reason), result.Detail)
 	}
 }

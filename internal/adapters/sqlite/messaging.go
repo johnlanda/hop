@@ -111,8 +111,8 @@ func (s *Store) SendMessage(ctx context.Context, send app.MessageSend) (app.Mess
 	err := s.inWriteTx(ctx, func(tx *sql.Tx) error {
 		now := s.now()
 		digest := sendRequestDigest(&send)
-		record := func(kind app.MessageOutcomeKind, messageID identity.MessageID, detail string) error {
-			outcome = app.MessageOutcome{Kind: kind, MessageID: messageID, Detail: detail}
+		record := func(kind app.MessageOutcomeKind, messageID identity.MessageID, reason, detail string) error {
+			outcome = app.MessageOutcome{Kind: kind, MessageID: messageID, Reason: reason, Detail: detail}
 			receipt := &messageReceipt{
 				runID: send.RunID.String(), op: msgSendVerb,
 				sessionID: send.Sender.SessionID.String(), incarnationID: send.IncarnationID.String(),
@@ -140,15 +140,15 @@ func (s *Store) SendMessage(ctx context.Context, send app.MessageSend) (app.Mess
 					if parseErr != nil {
 						return fmt.Errorf("sqlite: accepted send receipt entity id: %w", parseErr)
 					}
-					return record(app.MessageDuplicate, created, "")
+					return record(app.MessageDuplicate, created, "", "")
 				}
-				return record(app.MessageRefused, "", "request id reused with different content")
+				return record(app.MessageRefused, "", app.GrammarReasonConflicting, "request id reused with different content")
 			}
 		}
 
 		runV, _, err := getRun(ctx, tx, send.RunID)
 		if errors.Is(err, app.ErrNotFound) {
-			return record(app.MessageMalformed, "", "unknown run")
+			return record(app.MessageMalformed, "", app.GrammarReasonMalformed, "unknown run")
 		}
 		if err != nil {
 			return err
@@ -157,7 +157,7 @@ func (s *Store) SendMessage(ctx context.Context, send app.MessageSend) (app.Mess
 		// which run it may act in.
 		sender, _, err := getSession(ctx, tx, send.Sender.SessionID)
 		if errors.Is(err, app.ErrNotFound) || (err == nil && sender.RunID != send.RunID) {
-			return record(app.MessageRefused, "", "session does not belong to this run")
+			return record(app.MessageRefused, "", app.GrammarReasonUnauthorized, "session does not belong to this run")
 		}
 		if err != nil {
 			return err
@@ -167,28 +167,28 @@ func (s *Store) SendMessage(ctx context.Context, send app.MessageSend) (app.Mess
 			return err
 		}
 		if !hasBinding || binding.IncarnationID != send.IncarnationID || binding.Superseded {
-			return record(app.MessageRefused, "", "incarnation is not current")
+			return record(app.MessageRefused, "", app.GrammarReasonStale, "incarnation is not current")
 		}
 
 		if send.Kind == run.MessageAnswer {
 			return acceptSessionAnswer(ctx, tx, &send, record, now)
 		}
 		if addrErr := run.ValidateSendAddressing(send.SenderAddress, send.Kind, send.Recipient); addrErr != nil {
-			return record(app.MessageRefused, "", addrErr.Error())
+			return record(app.MessageRefused, "", app.GrammarReasonUnauthorized, addrErr.Error())
 		}
 		if runV.State != run.RunRunning {
-			return record(app.MessageRunNotAccept, "", "run is not accepting messages")
+			return record(app.MessageRunNotAccept, "", app.GrammarReasonRunNotAccepting, "run is not accepting messages")
 		}
 		if send.Recipient.Kind == run.AddressTask {
 			task, _, taskErr := getTask(ctx, tx, send.Recipient.TaskID)
 			if errors.Is(taskErr, app.ErrNotFound) || (taskErr == nil && task.RunID != send.RunID) {
-				return record(app.MessageMalformed, "", "unknown task")
+				return record(app.MessageMalformed, "", app.GrammarReasonMalformed, "unknown task")
 			}
 			if taskErr != nil {
 				return taskErr
 			}
 			if task.MailboxClosed {
-				return record(app.MessageMailboxClose, "", "mailbox is closed")
+				return record(app.MessageMailboxClose, "", app.GrammarReasonMailboxClosed, "mailbox is closed")
 			}
 		}
 		seq, err := nextEnqueueSeq(ctx, tx, send.RunID, send.Recipient)
@@ -204,7 +204,7 @@ func (s *Store) SendMessage(ctx context.Context, send app.MessageSend) (app.Mess
 		if err := insertMessage(ctx, tx, &message); err != nil {
 			return err
 		}
-		return record(app.MessageAccepted, message.ID, "")
+		return record(app.MessageAccepted, message.ID, "", "")
 	})
 	if err != nil {
 		return app.MessageOutcome{}, err
@@ -215,13 +215,13 @@ func (s *Store) SendMessage(ctx context.Context, send app.MessageSend) (app.Mess
 // acceptSessionAnswer handles a session's answer to a question addressed
 // to its own logical address, via run.AcceptAnswer: the destination is
 // derived from the question's own sender, never from send.Recipient.
-func acceptSessionAnswer(ctx context.Context, tx *sql.Tx, send *app.MessageSend, record func(app.MessageOutcomeKind, identity.MessageID, string) error, now time.Time) error {
+func acceptSessionAnswer(ctx context.Context, tx *sql.Tx, send *app.MessageSend, record func(kind app.MessageOutcomeKind, messageID identity.MessageID, reason, detail string) error, now time.Time) error {
 	if send.ReplyTo == nil {
-		return record(app.MessageMalformed, "", "answer requires reply-to")
+		return record(app.MessageMalformed, "", app.GrammarReasonMalformed, "answer requires reply-to")
 	}
 	question, questionErr := getMessage(ctx, tx, *send.ReplyTo)
 	if errors.Is(questionErr, app.ErrNotFound) || (questionErr == nil && question.RunID != send.RunID) {
-		return record(app.MessageMalformed, "", "unknown question")
+		return record(app.MessageMalformed, "", app.GrammarReasonMalformed, "unknown question")
 	}
 	if questionErr != nil {
 		return questionErr
@@ -231,7 +231,7 @@ func acceptSessionAnswer(ctx context.Context, tx *sql.Tx, send *app.MessageSend,
 		return destErr
 	}
 	if !resolvable {
-		return record(app.MessageMalformed, "", "question originator is not resolvable")
+		return record(app.MessageMalformed, "", app.GrammarReasonMalformed, "question originator is not resolvable")
 	}
 	prior, priorErr := acceptedAnswer(ctx, tx, question.ID)
 	if priorErr != nil {
@@ -252,13 +252,16 @@ func acceptSessionAnswer(ctx context.Context, tx *sql.Tx, send *app.MessageSend,
 		if ackErr := persistBundledQuestionAck(ctx, tx, &outcomeVal.Question, now); ackErr != nil {
 			return ackErr
 		}
-		return record(app.MessageAccepted, outcomeVal.Answer.ID, "")
+		return record(app.MessageAccepted, outcomeVal.Answer.ID, "", "")
 	case errors.Is(err, run.ErrDuplicateAnswer):
-		return record(app.MessageDuplicate, outcomeVal.Answer.ID, "")
+		return record(app.MessageDuplicate, outcomeVal.Answer.ID, "", "")
 	case errors.Is(err, run.ErrConflictingAnswer):
-		return record(app.MessageConflicting, "", err.Error())
+		return record(app.MessageConflicting, "", app.GrammarReasonConflicting, err.Error())
 	default:
-		return record(app.MessageRefused, "", err.Error())
+		// The only other error AcceptAnswer returns is ErrInvalidTransition
+		// (the reply-to id names a message that is not a question) —
+		// a shape failure, not an authorization one.
+		return record(app.MessageRefused, "", app.GrammarReasonMalformed, err.Error())
 	}
 }
 
@@ -425,8 +428,8 @@ func (s *Store) AckMessage(ctx context.Context, ack app.MessageAck) (app.Message
 	var outcome app.MessageAckOutcome
 	err := s.inWriteTx(ctx, func(tx *sql.Tx) error {
 		now := s.now()
-		record := func(kind app.MessageAckOutcomeKind, detail string) error {
-			outcome = app.MessageAckOutcome{Kind: kind, Detail: detail}
+		record := func(kind app.MessageAckOutcomeKind, reason, detail string) error {
+			outcome = app.MessageAckOutcome{Kind: kind, Reason: reason, Detail: detail}
 			return insertMessageReceipt(ctx, tx, &messageReceipt{
 				runID: ack.RunID.String(), op: msgAckVerb,
 				sessionID: ack.SessionID.String(), incarnationID: ack.IncarnationID.String(),
@@ -437,14 +440,14 @@ func (s *Store) AckMessage(ctx context.Context, ack app.MessageAck) (app.Message
 
 		message, err := getMessage(ctx, tx, ack.MessageID)
 		if errors.Is(err, app.ErrNotFound) || (err == nil && message.RunID != ack.RunID) {
-			return record(app.AckRefused, "unknown message")
+			return record(app.AckRefused, app.GrammarReasonNotFound, "unknown message")
 		}
 		if err != nil {
 			return err
 		}
 		acker, _, err := getSession(ctx, tx, ack.SessionID)
 		if errors.Is(err, app.ErrNotFound) || (err == nil && acker.RunID != ack.RunID) {
-			return record(app.AckRefused, "session does not belong to this run")
+			return record(app.AckRefused, app.GrammarReasonUnauthorized, "session does not belong to this run")
 		}
 		if err != nil {
 			return err
@@ -472,9 +475,16 @@ func (s *Store) AckMessage(ctx context.Context, ack app.MessageAck) (app.Message
 			run.Ack{SessionID: ack.SessionID, IncarnationID: ack.IncarnationID}, now)
 		switch {
 		case err != nil:
-			return record(app.AckRefused, err.Error())
+			reason := app.GrammarReasonUnauthorized
+			switch {
+			case errors.Is(err, run.ErrNotDelivered):
+				reason = app.GrammarReasonNotDelivered
+			case errors.Is(err, run.ErrStaleAck):
+				reason = app.GrammarReasonStale
+			}
+			return record(app.AckRefused, reason, err.Error())
 		case priorAck != nil:
-			return record(app.AckDuplicate, "")
+			return record(app.AckDuplicate, "", "")
 		default:
 			if _, insertErr := tx.ExecContext(ctx,
 				`INSERT INTO message_acks (message_id, session_id, incarnation_id, acked_at) VALUES (?, ?, ?, ?)`,
@@ -482,7 +492,7 @@ func (s *Store) AckMessage(ctx context.Context, ack app.MessageAck) (app.Message
 			); insertErr != nil {
 				return fmt.Errorf("sqlite: record ack of message %s: %w", ack.MessageID, insertErr)
 			}
-			return record(app.AckAccepted, "")
+			return record(app.AckAccepted, "", "")
 		}
 	})
 	if err != nil {
@@ -504,8 +514,8 @@ func (s *Store) AnswerQuestion(ctx context.Context, answer app.HumanAnswer) (app
 	err := s.inWriteTx(ctx, func(tx *sql.Tx) error {
 		now := s.now()
 		digest := app.ComputeRequestDigest(msgAnswerVerb, answer.RunID.String(), app.AddressString(run.HumanAddress()), answer.QuestionID.String(), answer.BodyDigest)
-		record := func(kind app.MessageOutcomeKind, messageID identity.MessageID, detail string) error {
-			outcome = app.MessageOutcome{Kind: kind, MessageID: messageID, Detail: detail}
+		record := func(kind app.MessageOutcomeKind, messageID identity.MessageID, reason, detail string) error {
+			outcome = app.MessageOutcome{Kind: kind, MessageID: messageID, Reason: reason, Detail: detail}
 			return insertMessageReceipt(ctx, tx, &messageReceipt{
 				runID: answer.RunID.String(), op: msgAnswerVerb,
 				messageID: answer.QuestionID.String(),
@@ -525,28 +535,28 @@ func (s *Store) AnswerQuestion(ctx context.Context, answer app.HumanAnswer) (app
 					if parseErr != nil {
 						return fmt.Errorf("sqlite: accepted answer receipt entity id: %w", parseErr)
 					}
-					return record(app.MessageDuplicate, created, "")
+					return record(app.MessageDuplicate, created, "", "")
 				}
-				return record(app.MessageRefused, "", "request id reused with different content")
+				return record(app.MessageRefused, "", app.GrammarReasonConflicting, "request id reused with different content")
 			}
 		}
 
 		question, err := getMessage(ctx, tx, answer.QuestionID)
 		if errors.Is(err, app.ErrNotFound) || (err == nil && question.RunID != answer.RunID) {
-			return record(app.MessageMalformed, "", "unknown question")
+			return record(app.MessageMalformed, "", app.GrammarReasonMalformed, "unknown question")
 		}
 		if err != nil {
 			return err
 		}
 		if question.Recipient.Kind != run.AddressHuman {
-			return record(app.MessageRefused, "", "question is not human-addressed")
+			return record(app.MessageRefused, "", app.GrammarReasonMalformed, "question is not human-addressed")
 		}
 		destination, resolvable, err := answerDestination(ctx, tx, &question)
 		if err != nil {
 			return err
 		}
 		if !resolvable {
-			return record(app.MessageMalformed, "", "question originator is not resolvable")
+			return record(app.MessageMalformed, "", app.GrammarReasonMalformed, "question originator is not resolvable")
 		}
 		prior, err := acceptedAnswer(ctx, tx, question.ID)
 		if err != nil {
@@ -567,13 +577,16 @@ func (s *Store) AnswerQuestion(ctx context.Context, answer app.HumanAnswer) (app
 			if ackErr := persistBundledQuestionAck(ctx, tx, &outcomeVal.Question, now); ackErr != nil {
 				return ackErr
 			}
-			return record(app.MessageAccepted, outcomeVal.Answer.ID, "")
+			return record(app.MessageAccepted, outcomeVal.Answer.ID, "", "")
 		case errors.Is(err, run.ErrDuplicateAnswer):
-			return record(app.MessageDuplicate, outcomeVal.Answer.ID, "")
+			return record(app.MessageDuplicate, outcomeVal.Answer.ID, "", "")
 		case errors.Is(err, run.ErrConflictingAnswer):
-			return record(app.MessageConflicting, "", err.Error())
+			return record(app.MessageConflicting, "", app.GrammarReasonConflicting, err.Error())
 		default:
-			return record(app.MessageRefused, "", err.Error())
+			// The only other error AcceptAnswer returns is ErrInvalidTransition
+			// (the question id names a message that is not a question) — a
+			// shape failure, not an authorization one.
+			return record(app.MessageRefused, "", app.GrammarReasonMalformed, err.Error())
 		}
 	})
 	if err != nil {

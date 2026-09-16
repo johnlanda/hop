@@ -1,65 +1,41 @@
 package main
 
 import (
-	"strings"
-
 	"github.com/johnlanda/hop/internal/app"
 )
 
-// This file maps a worker-plumbing use case's coarse outcome kind (and,
-// where that alone is not enough, its free-text Detail) to the section 7
+// This file renders a worker-plumbing use case's refusal as the section 7
 // grammar's enumerated reason token — grammar.go's own doc comment on
 // GrammarRefusalPrefix assigns exactly this job to cmd/hop: "cmd/hop maps
 // a verb's outcome kind and detail to exactly one token; the detail
-// itself goes on the following lines, never into the token." The
-// messaging and review ports already return a distinctly-named outcome
-// kind per refusal shape (e.g. "refused-mailbox-closed",
-// "refused-run-not-accepting"), so those map by kind alone; the plan
-// port collapses every refusal into one generic "refused" kind, so its
-// mapping classifies by Detail text instead, matching the exact,
-// deliberately-chosen literal strings internal/adapters/sqlite/plan.go
-// records today. A detail this table does not recognize falls back to
-// "unauthorized" rather than inventing a new token; the real text is
-// still printed as the follow-on line, so nothing is ever silently lost.
+// itself goes on the following lines, never into the token." Every
+// worker-authority store (PlanStore, MessagingStore) and its fake set a
+// typed Reason field directly at each decision point (errors.Is against a
+// domain sentinel, or the adapter's own fixed decision) — never a literal
+// Detail string or substring cmd/hop would have to re-parse; refusalToken
+// only applies the shared fallback for the empty-reason defect case.
+// ReviewStore's outcome kind alone already names a distinct reason per
+// refusal shape (malformed/conflicting/stale; accepted, duplicate and
+// transient are rendered before ever reaching a refusal line), so
+// reviewRefusalToken maps by kind directly — TestReviewRefusalTokenIsExhaustive
+// (cmd/hop) pins that no other kind reaches its default branch.
 
-// messageRefusalToken classifies a SendMessage/Answer MessageOutcomeKind.
-func messageRefusalToken(outcome string) string {
-	switch outcome {
-	case "malformed":
-		return app.GrammarReasonMalformed
-	case "conflicting":
-		return app.GrammarReasonConflicting
-	case "refused-run-not-accepting":
-		return app.GrammarReasonRunNotAccepting
-	case "refused-mailbox-closed":
-		return app.GrammarReasonMailboxClosed
-	default: // "refused": every current call site is a cross-run mismatch.
+// refusalToken renders a store-set Reason directly. An empty reason on a
+// refused/malformed outcome is a defect the store side must never produce
+// (TestPlanRefusalReasonsAlwaysSet and TestMessageRefusalReasonsAlwaysSet,
+// internal/app); this renders the generic fallback token at runtime
+// rather than guessing which refusal occurred.
+func refusalToken(reason string) string {
+	if reason == "" {
 		return app.GrammarReasonUnauthorized
 	}
+	return reason
 }
 
-// ackRefusalToken classifies an AckMessage MessageAckOutcomeKind's Detail:
-// AckRefused alone covers an unknown message, a cross-run session and an
-// undelivered message (ErrNotDelivered), which the outcome kind cannot
-// distinguish.
-func ackRefusalToken(detail string) string {
-	switch detail {
-	case "unknown message":
-		return app.GrammarReasonNotFound
-	case "session does not belong to this run":
-		return app.GrammarReasonUnauthorized
-	default:
-		// Every other AckMessage refusal observed today is
-		// ErrNotDelivered's own message text ("message ... was not
-		// delivered to session ...").
-		if strings.Contains(detail, "not delivered") {
-			return app.GrammarReasonNotDelivered
-		}
-		return app.GrammarReasonUnauthorized
-	}
-}
-
-// reviewRefusalToken classifies a SubmitReviewVerdict ReviewOutcomeKind.
+// reviewRefusalToken classifies a SubmitReviewVerdict ReviewOutcomeKind:
+// the only kinds SubmitReviewResult can carry here are malformed,
+// conflicting and stale (accepted/duplicate/transient are rendered by the
+// caller before this is ever called).
 func reviewRefusalToken(outcome string) string {
 	switch outcome {
 	case "malformed":
@@ -71,22 +47,6 @@ func reviewRefusalToken(outcome string) string {
 	default:
 		return app.GrammarReasonUnauthorized
 	}
-}
-
-// planRefusalToken renders a CreateTask/RequestRetry/ClosePlan refusal's
-// typed reason token: PlanStore (internal/adapters/sqlite/plan.go) and its
-// fake set Reason directly at each decision point (errors.Is against the
-// domain's typed errors, or the adapter's own fixed decision), so cmd/hop
-// never re-derives a token from Detail text — Detail stays free-text and
-// human-readable, printed as the follow-on line. An empty reason on a
-// refused/malformed outcome is a defect the store side must never produce
-// (TestPlanRefusalsAlwaysCarryAReason, internal/app); this renders the
-// generic fallback token rather than guessing which refusal occurred.
-func planRefusalToken(reason string) string {
-	if reason == "" {
-		return app.GrammarReasonUnauthorized
-	}
-	return reason
 }
 
 // renderRefusal renders a refused/malformed outcome as the grammar's

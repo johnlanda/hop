@@ -118,21 +118,77 @@ func TestStoreVectors(t *testing.T) {
 		}); fetchErr != nil {
 			t.Fatalf("FetchMessage() error = %v", fetchErr)
 		}
-		staleIncarnation, err := identity.ParseIncarnationID(tc.IDs.NewID())
+		messageID, err := identity.ParseMessageID(send.MessageID)
+		if err != nil {
+			t.Fatalf("parse message id: %v", err)
+		}
+
+		// Supersede the manager's incarnation that actually received the
+		// delivery with a fresh one — mirroring
+		// TestAckMessageRequiresCurrentIncarnation's reattach seeding — so
+		// AckMessageStaleIncarnation's claimed incarnation (the delivered,
+		// now-superseded one) satisfies the delivery check and fails only
+		// the currency check.
+		history := tc.Store.Bindings[fr.ManagerID]
+		history[len(history)-1].Superseded = true
+		freshIncarnation, err := identity.ParseIncarnationID(tc.IDs.NewID())
 		if err != nil {
 			t.Fatalf("parse incarnation id: %v", err)
+		}
+		last := history[len(history)-1]
+		fresh := run.NewRuntimeBinding(fr.ManagerID, freshIncarnation, last.ServerSocketPath, last.ServerInstance, last.WorkspaceID, last.TabID, last.PaneID, last.CreationLabel, run.LaunchResume, tc.Clock.Now())
+		tc.Store.Bindings[fr.ManagerID] = append(history, fresh)
+
+		got, err := tc.Controller.Messages.AckMessage(context.Background(), storevectors.AckMessageStaleIncarnation(fr.RunID, messageID, fr.ManagerID, fr.ManagerIncarnation))
+		if err != nil {
+			t.Fatalf("AckMessage() error = %v", err)
+		}
+		if got.Kind != app.AckRefused || got.Reason != storevectors.AckMessageStaleIncarnationReason {
+			t.Fatalf("AckMessage(stale incarnation) = %+v, want refused/%s", got, storevectors.AckMessageStaleIncarnationReason)
+		}
+	})
+
+	t.Run("AckMessageUnknownMessage", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		fr := seedFeatureRun(t, tc, 2)
+		unknownMessageID, err := identity.ParseMessageID(tc.IDs.NewID())
+		if err != nil {
+			t.Fatalf("parse message id: %v", err)
+		}
+
+		got, err := tc.Controller.Messages.AckMessage(context.Background(), storevectors.AckMessageUnknownMessage(fr.RunID, unknownMessageID, fr.ManagerID, fr.ManagerIncarnation))
+		if err != nil {
+			t.Fatalf("AckMessage() error = %v", err)
+		}
+		if got.Kind != app.AckRefused || got.Reason != storevectors.AckMessageUnknownMessageReason {
+			t.Fatalf("AckMessage(unknown message) = %+v, want refused/%s", got, storevectors.AckMessageUnknownMessageReason)
+		}
+	})
+
+	t.Run("AckMessageNotDelivered", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		fr := seedFeatureRun(t, tc, 2)
+		taskB := seedImplementTask(t, tc, fr.RunID, 1, "B", false, run.TaskReady)
+		workerID, workerIncarnation := seedWorkerSession(t, tc, fr, taskB)
+
+		send, err := tc.Controller.SendMessage(context.Background(), app.SendMessageRequest{
+			RunID: fr.RunID.String(), SessionID: workerID.String(), IncarnationID: workerIncarnation.String(),
+			StateRoot: "/state", To: "manager", Kind: "question", Body: []byte("q?"),
+		})
+		if err != nil {
+			t.Fatalf("SendMessage() error = %v", err)
 		}
 		messageID, err := identity.ParseMessageID(send.MessageID)
 		if err != nil {
 			t.Fatalf("parse message id: %v", err)
 		}
 
-		got, err := tc.Controller.Messages.AckMessage(context.Background(), storevectors.AckMessageStaleIncarnation(fr.RunID, messageID, fr.ManagerID, staleIncarnation))
+		got, err := tc.Controller.Messages.AckMessage(context.Background(), storevectors.AckMessageNotDelivered(fr.RunID, messageID, fr.ManagerID, fr.ManagerIncarnation))
 		if err != nil {
 			t.Fatalf("AckMessage() error = %v", err)
 		}
-		if got.Kind != app.AckRefused {
-			t.Fatalf("AckMessage(stale incarnation) = %+v, want refused", got)
+		if got.Kind != app.AckRefused || got.Reason != storevectors.AckMessageNotDeliveredReason {
+			t.Fatalf("AckMessage(not delivered) = %+v, want refused/%s", got, storevectors.AckMessageNotDeliveredReason)
 		}
 	})
 
@@ -154,8 +210,8 @@ func TestStoreVectors(t *testing.T) {
 		if err != nil {
 			t.Fatalf("SendMessage() error = %v", err)
 		}
-		if got.Kind != app.MessageMalformed {
-			t.Fatalf("SendMessage(answer to unknown question) = %+v, want malformed", got)
+		if got.Kind != app.MessageMalformed || got.Reason != storevectors.MessageSendAnswerUnknownQuestionReason {
+			t.Fatalf("SendMessage(answer to unknown question) = %+v, want malformed/%s", got, storevectors.MessageSendAnswerUnknownQuestionReason)
 		}
 	})
 
@@ -175,8 +231,8 @@ func TestStoreVectors(t *testing.T) {
 		if err != nil {
 			t.Fatalf("SendMessage() error = %v", err)
 		}
-		if got.Kind != app.MessageRefused {
-			t.Fatalf("SendMessage(cross-run) = %+v, want refused", got)
+		if got.Kind != app.MessageRefused || got.Reason != storevectors.MessageSendCrossRunReason {
+			t.Fatalf("SendMessage(cross-run) = %+v, want refused/%s", got, storevectors.MessageSendCrossRunReason)
 		}
 		if _, exists := tc.Store.Messages[messageID]; exists {
 			t.Fatalf("SendMessage(cross-run) must not create a message")
@@ -238,8 +294,8 @@ func TestStoreVectors(t *testing.T) {
 		if err != nil {
 			t.Fatalf("AckMessage() error = %v", err)
 		}
-		if got.Kind != app.AckRefused {
-			t.Fatalf("AckMessage(cross-run) = %+v, want refused", got)
+		if got.Kind != app.AckRefused || got.Reason != storevectors.AckMessageCrossRunReason {
+			t.Fatalf("AckMessage(cross-run) = %+v, want refused/%s", got, storevectors.AckMessageCrossRunReason)
 		}
 	})
 

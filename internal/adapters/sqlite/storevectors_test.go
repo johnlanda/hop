@@ -80,12 +80,57 @@ func TestStoreVectors(t *testing.T) {
 		if _, served, err := f.store.FetchNextMessage(t.Context(), f.managerFetch()); err != nil || !served {
 			t.Fatalf("serve question: %t, %v", served, err)
 		}
-		got, err := f.store.AckMessage(t.Context(), storevectors.AckMessageStaleIncarnation(f.spec.RunID, send.ID, f.ManagerID, identity.IncarnationID(uid(8012))))
+		// Supersede the manager's incarnation that actually received the
+		// delivery, with no replacement: AckMessageStaleIncarnation's
+		// claimed incarnation (f.ManagerIncarnation) then satisfies the
+		// delivery check but fails currentBinding's currency check —
+		// ErrStaleAck, not ErrNotDelivered (which an incarnation never
+		// delivered to at all would hit first).
+		f.inUOW(t, func(uow app.UnitOfWork) {
+			binding, ok, err := uow.Bindings().Current(t.Context(), f.ManagerID)
+			if err != nil || !ok {
+				t.Fatalf("current binding: %v (found %t)", err, ok)
+			}
+			superseded, err := binding.Supersede("observed replacement occupant", f.clock.Now())
+			if err != nil {
+				t.Fatalf("supersede: %v", err)
+			}
+			if err := uow.Bindings().Save(t.Context(), superseded); err != nil {
+				t.Fatalf("save superseded binding: %v", err)
+			}
+		})
+		got, err := f.store.AckMessage(t.Context(), storevectors.AckMessageStaleIncarnation(f.spec.RunID, send.ID, f.ManagerID, f.ManagerIncarnation))
 		if err != nil {
 			t.Fatalf("AckMessage() error = %v", err)
 		}
-		if got.Kind != app.AckRefused {
-			t.Fatalf("AckMessage(stale incarnation) = %+v, want refused", got)
+		if got.Kind != app.AckRefused || got.Reason != storevectors.AckMessageStaleIncarnationReason {
+			t.Fatalf("AckMessage(stale incarnation) = %+v, want refused/%s", got, storevectors.AckMessageStaleIncarnationReason)
+		}
+	})
+
+	t.Run("AckMessageUnknownMessage", func(t *testing.T) {
+		f := newMessagingFixture(t)
+		got, err := f.store.AckMessage(t.Context(), storevectors.AckMessageUnknownMessage(f.spec.RunID, identity.MessageID(uid(8018)), f.ManagerID, f.ManagerIncarnation))
+		if err != nil {
+			t.Fatalf("AckMessage() error = %v", err)
+		}
+		if got.Kind != app.AckRefused || got.Reason != storevectors.AckMessageUnknownMessageReason {
+			t.Fatalf("AckMessage(unknown message) = %+v, want refused/%s", got, storevectors.AckMessageUnknownMessageReason)
+		}
+	})
+
+	t.Run("AckMessageNotDelivered", func(t *testing.T) {
+		f := newMessagingFixture(t)
+		send := f.workerSend(8019, run.MessageQuestion, "")
+		if outcome, err := f.store.SendMessage(t.Context(), send); err != nil || outcome.Kind != app.MessageAccepted {
+			t.Fatalf("seed question: %+v, %v", outcome, err)
+		}
+		got, err := f.store.AckMessage(t.Context(), storevectors.AckMessageNotDelivered(f.spec.RunID, send.ID, f.ManagerID, f.ManagerIncarnation))
+		if err != nil {
+			t.Fatalf("AckMessage() error = %v", err)
+		}
+		if got.Kind != app.AckRefused || got.Reason != storevectors.AckMessageNotDeliveredReason {
+			t.Fatalf("AckMessage(not delivered) = %+v, want refused/%s", got, storevectors.AckMessageNotDeliveredReason)
 		}
 	})
 
@@ -98,8 +143,8 @@ func TestStoreVectors(t *testing.T) {
 		if err != nil {
 			t.Fatalf("SendMessage() error = %v", err)
 		}
-		if got.Kind != app.MessageMalformed {
-			t.Fatalf("SendMessage(answer to unknown question) = %+v, want malformed", got)
+		if got.Kind != app.MessageMalformed || got.Reason != storevectors.MessageSendAnswerUnknownQuestionReason {
+			t.Fatalf("SendMessage(answer to unknown question) = %+v, want malformed/%s", got, storevectors.MessageSendAnswerUnknownQuestionReason)
 		}
 	})
 
@@ -117,8 +162,8 @@ func TestStoreVectors(t *testing.T) {
 		if err != nil {
 			t.Fatalf("SendMessage() error = %v", err)
 		}
-		if got.Kind != app.MessageRefused {
-			t.Fatalf("SendMessage(cross-run) = %+v, want refused", got)
+		if got.Kind != app.MessageRefused || got.Reason != storevectors.MessageSendCrossRunReason {
+			t.Fatalf("SendMessage(cross-run) = %+v, want refused/%s", got, storevectors.MessageSendCrossRunReason)
 		}
 		if n := countRows(t, store, `SELECT COUNT(*) FROM messages WHERE id = ?`, messageID.String()); n != 0 {
 			t.Fatal("SendMessage(cross-run) must not create a message")
@@ -166,8 +211,8 @@ func TestStoreVectors(t *testing.T) {
 		if err != nil {
 			t.Fatalf("AckMessage() error = %v", err)
 		}
-		if got.Kind != app.AckRefused {
-			t.Fatalf("AckMessage(cross-run) = %+v, want refused", got)
+		if got.Kind != app.AckRefused || got.Reason != storevectors.AckMessageCrossRunReason {
+			t.Fatalf("AckMessage(cross-run) = %+v, want refused/%s", got, storevectors.AckMessageCrossRunReason)
 		}
 	})
 }
