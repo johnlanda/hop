@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -447,64 +448,132 @@ func TestGrammarContractMsgSendUnauthorizedCrossRun(t *testing.T) {
 	}
 }
 
+// hostileBodyFragment is a plain-text piece of hostileBody no legitimate
+// output line contains: finding it anywhere means body content leaked.
+const hostileBodyFragment = "hostile-fragment-q7x"
+
 // hostileBody is a message/answer body deliberately carrying ANSI escape
 // sequences, a bracketed-paste envelope and a literal "y\n" — the exact
 // shapes that could hijack a naive terminal or auto-confirm an
-// interactive prompt if they ever reached stdout raw. Every test using
+// interactive prompt if they ever reached a stream raw. Every test using
 // it proves the opposite: only the body's absolute artifact PATH is ever
 // printed, and the artifact itself carries these bytes unmodified.
-const hostileBody = "\x1b[31mred\x1b[0m\x1b[200~pasted text\x1b[201~y\n"
+const hostileBody = "\x1b[31mred\x1b[0m\x1b[200~pasted " + hostileBodyFragment + "\x1b[201~y\n"
 
-// assertBodyPathOnly scans result's stdout for exactly the rendered
-// "body: <path>" line, fails if the hostile content appears anywhere in
-// stdout, and reads the artifact back to confirm the bytes landed
-// unmodified.
-func assertBodyPathOnly(t *testing.T, result hopResult) {
-	t.Helper()
-	if strings.Contains(result.Stdout, hostileBody) {
-		t.Errorf("stdout contains the raw hostile body: %q", result.Stdout)
-	}
-	var bodyPath string
-	for _, line := range strings.Split(result.Stdout, "\n") {
-		if path, ok := strings.CutPrefix(line, "body: "); ok {
-			bodyPath = path
-		}
-	}
-	if bodyPath == "" {
-		t.Fatalf("no body: line in stdout: %q", result.Stdout)
-	}
-	if got := string(readArtifact(t, bodyPath)); got != hostileBody {
-		t.Errorf("body artifact = %q, want %q", got, hostileBody)
+// hostileCanaries lists hostileBody's independently checked pieces: a
+// partial leak (an escape stripped but its sequence kept, or the text
+// without its escapes) fails as surely as the whole body would.
+func hostileCanaries() map[string]string {
+	return map[string]string{
+		"ESC":                   "\x1b",
+		"bracketed-paste start": "[200~",
+		"bracketed-paste end":   "[201~",
+		"SGR color sequence":    "[31m",
+		"body fragment":         hostileBodyFragment,
 	}
 }
 
+// requireCleanSuccess fails when either stream carries any hostile
+// canary (each reported on its own), then stops the test unless result
+// exited 0 with an empty stderr.
+func requireCleanSuccess(t *testing.T, label string, result hopResult) {
+	t.Helper()
+	for name, canary := range hostileCanaries() {
+		if strings.Contains(result.Stdout, canary) {
+			t.Errorf("%s: stdout carries the hostile body's %s: %q", label, name, result.Stdout)
+		}
+		if strings.Contains(result.Stderr, canary) {
+			t.Errorf("%s: stderr carries the hostile body's %s: %q", label, name, result.Stderr)
+		}
+	}
+	if result.ExitCode != exitOK || result.Stderr != "" {
+		t.Fatalf("%s: exit=%d stderr=%q, want 0 and an empty stderr; stdout=%q", label, result.ExitCode, result.Stderr, result.Stdout)
+	}
+}
+
+// requireSentOnly proves a producing invocation (hop msg send, hop
+// answer) printed exactly one `sent <message-id>` line and nothing else,
+// returning the id.
+func requireSentOnly(t *testing.T, label string, result hopResult) string {
+	t.Helper()
+	requireCleanSuccess(t, label, result)
+	id := strings.TrimSuffix(strings.TrimPrefix(result.Stdout, "sent "), "\n")
+	if !uuidShape.MatchString(id) || result.Stdout != app.GrammarSentLine(id)+"\n" {
+		t.Fatalf("%s: stdout = %q, want exactly one %q line", label, result.Stdout, app.GrammarSentLine("<message-id>"))
+	}
+	return id
+}
+
+// requireDeliveredOnly proves a consuming fetch (hop msg next/wait)
+// printed exactly the three permitted lines — the envelope, the body PATH
+// under the run's message directory, the ack hint — and that the artifact
+// behind that path holds the hostile bytes unmodified.
+func requireDeliveredOnly(t *testing.T, label string, result hopResult, stateRoot, runID, messageID, firstLine string) {
+	t.Helper()
+	requireCleanSuccess(t, label, result)
+	bodyPath := hostileBodyPath(stateRoot, runID, messageID)
+	want := firstLine + "\n" + app.GrammarBodyLine(bodyPath) + "\n" + app.GrammarAckHintLine(messageID) + "\n"
+	if result.Stdout != want {
+		t.Fatalf("%s: stdout = %q, want exactly %q", label, result.Stdout, want)
+	}
+	if got := string(readArtifact(t, bodyPath)); got != hostileBody {
+		t.Errorf("%s: body artifact = %q, want %q", label, got, hostileBody)
+	}
+}
+
+// hostileBodyPath is the file-first body artifact's path for messageID
+// (internal/app's messageBodyPath layout).
+func hostileBodyPath(stateRoot, runID, messageID string) string {
+	return filepath.Join(stateRoot, "runs", runID, "messages", messageID+".md")
+}
+
+// uuidShape matches a canonical lowercase UUID.
+var uuidShape = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
 // TestGrammarContractMsgHostileBodyNeverReachesStdoutRaw is the
 // manager's required proof: a hostile body sent through hop msg send
-// never reaches stdout raw through hop msg next, wait or show — only the
-// body's absolute artifact path is ever printed, and the artifact itself
-// carries the hostile bytes unmodified.
+// never reaches either stream raw through the producing send or the
+// consuming hop msg next, show or wait — every invocation prints exactly
+// its permitted lines (only the body's absolute artifact path, never its
+// content) with an empty stderr, checked against independent canaries for
+// ESC, both bracketed-paste markers, the SGR sequence and a body
+// fragment — and the artifact itself carries the hostile bytes unmodified.
 func TestGrammarContractMsgHostileBodyNeverReachesStdoutRaw(t *testing.T) {
 	f := newFeatureManager(t, 4000, defaultMessageWait)
 	worker := f.addImplementTask(t, 4100, "handle hostile bodies")
+	recipient := "task:" + worker.TaskID
 
-	sendA := execHop(t, f.env(nil), f.StateRoot, "msg", "send", "--to", "task:"+worker.TaskID, "--kind", "info", "--body", hostileBody)
-	if sendA.ExitCode != exitOK {
-		t.Fatalf("msg send (for next): exit=%d stdout=%q stderr=%q", sendA.ExitCode, sendA.Stdout, sendA.Stderr)
-	}
-	msgIDA := strings.TrimPrefix(sendA.FirstStdoutLine(), "sent ")
+	msgIDA := requireSentOnly(t, "msg send (for next)", execHop(t, f.env(nil), f.StateRoot, "msg", "send", "--to", recipient, "--kind", "info", "--body", hostileBody))
 
 	next := execHop(t, worker.env(f, nil), f.StateRoot, "msg", "next")
-	assertBodyPathOnly(t, next)
+	requireDeliveredOnly(t, "msg next", next, f.StateRoot, f.RunID, msgIDA, app.GrammarMessageLine(msgIDA, "info", f.ManagerID, "", "", ""))
 
 	show := execHop(t, map[string]string{"HOP_STATE_DIR": f.StateRoot}, f.StateRoot, "msg", "show", "--run", f.RunID, msgIDA)
-	assertBodyPathOnly(t, show)
-
-	sendB := execHop(t, f.env(nil), f.StateRoot, "msg", "send", "--to", "task:"+worker.TaskID, "--kind", "info", "--body", hostileBody)
-	if sendB.ExitCode != exitOK {
-		t.Fatalf("msg send (for wait): exit=%d stdout=%q stderr=%q", sendB.ExitCode, sendB.Stdout, sendB.Stderr)
+	requireCleanSuccess(t, "msg show", show)
+	showLines := strings.Split(strings.TrimSuffix(show.Stdout, "\n"), "\n")
+	wantShow := []string{
+		app.GrammarMessageShowLine(msgIDA, "info", f.ManagerID, recipient, "", "", 1),
+		app.GrammarBodyLine(hostileBodyPath(f.StateRoot, f.RunID, msgIDA)),
 	}
+	if len(showLines) != 3 || showLines[0] != wantShow[0] || showLines[1] != wantShow[1] {
+		t.Fatalf("msg show stdout = %q, want %q, %q and one delivered line", show.Stdout, wantShow[0], wantShow[1])
+	}
+	deliveredAt, ok := strings.CutPrefix(showLines[2], "delivered: "+worker.SessionID+" ")
+	if _, err := time.Parse(time.RFC3339, deliveredAt); !ok || err != nil {
+		t.Errorf("msg show third line = %q, want %q", showLines[2], app.GrammarDeliveredLine(worker.SessionID, time.Time{}))
+	}
+
+	// The worker settles A first: an unacknowledged message re-serves
+	// ahead of B on every fetch.
+	ack := execHop(t, worker.env(f, nil), f.StateRoot, "msg", "ack", msgIDA)
+	requireCleanSuccess(t, "msg ack", ack)
+	if want := app.GrammarAckAcceptedLine(msgIDA) + "\n"; ack.Stdout != want {
+		t.Errorf("msg ack stdout = %q, want %q", ack.Stdout, want)
+	}
+
+	msgIDB := requireSentOnly(t, "msg send (for wait)", execHop(t, f.env(nil), f.StateRoot, "msg", "send", "--to", recipient, "--kind", "info", "--body", hostileBody))
 	wait := execHop(t, worker.env(f, nil), f.StateRoot, "msg", "wait", "--timeout", "3s")
-	assertBodyPathOnly(t, wait)
+	requireDeliveredOnly(t, "msg wait", wait, f.StateRoot, f.RunID, msgIDB, app.GrammarMessageLine(msgIDB, "info", f.ManagerID, "", "", ""))
 }
 
 // TestGrammarContractAnswerAcceptedAndHostileBody drives hop answer's
@@ -514,17 +583,15 @@ func TestGrammarContractMsgHostileBodyNeverReachesStdoutRaw(t *testing.T) {
 // manager relays it to human (--relay-of), hop answer (through -C/--run,
 // never worker env) answers the relayed question, and the manager
 // receives the answer via hop msg next with relay provenance (origin=
-// the ORIGINAL question id). Also proves a hostile answer body never
-// reaches stdout raw there.
+// the ORIGINAL question id). Also proves a hostile answer body reaches
+// neither stream of the producing hop answer nor of the consuming hop msg
+// next: exactly the permitted lines, an empty stderr, every canary absent.
 func TestGrammarContractAnswerAcceptedAndHostileBody(t *testing.T) {
 	f := newFeatureManager(t, 5000, defaultMessageWait)
 	worker := f.addImplementTask(t, 5100, "ask a question")
 
 	ask := execHop(t, worker.env(f, nil), f.StateRoot, "msg", "send", "--to", "manager", "--kind", "question", "--body", "need guidance")
-	if ask.ExitCode != exitOK {
-		t.Fatalf("msg send (worker question): exit=%d stdout=%q stderr=%q", ask.ExitCode, ask.Stdout, ask.Stderr)
-	}
-	questionID := strings.TrimPrefix(ask.FirstStdoutLine(), "sent ")
+	questionID := requireSentOnly(t, "msg send (worker question)", ask)
 
 	// The manager fetches and acks the worker's question before relaying
 	// it, exactly as a real manager pass would — otherwise it stays the
@@ -540,27 +607,14 @@ func TestGrammarContractAnswerAcceptedAndHostileBody(t *testing.T) {
 	}
 
 	relay := execHop(t, f.env(nil), f.StateRoot, "msg", "send", "--to", "human", "--kind", "question", "--relay-of", questionID, "--body", "worker needs guidance")
-	if relay.ExitCode != exitOK {
-		t.Fatalf("msg send (relay to human): exit=%d stdout=%q stderr=%q", relay.ExitCode, relay.Stdout, relay.Stderr)
-	}
-	relayID := strings.TrimPrefix(relay.FirstStdoutLine(), "sent ")
+	relayID := requireSentOnly(t, "msg send (relay to human)", relay)
 
 	answerEnv := map[string]string{"HOP_STATE_DIR": f.StateRoot}
 	answer := execHop(t, answerEnv, f.RepositoryRoot, "answer", "-C", f.RepositoryRoot, "--run", f.RunID, "--body", hostileBody, relayID)
-	if answer.ExitCode != exitOK {
-		t.Fatalf("answer: exit=%d stdout=%q stderr=%q", answer.ExitCode, answer.Stdout, answer.Stderr)
-	}
-	answerMsgID := strings.TrimPrefix(answer.FirstStdoutLine(), "sent ")
-	if answerMsgID == answer.FirstStdoutLine() || answerMsgID == "" {
-		t.Errorf("answer first line = %q, want \"sent <id>\"", answer.FirstStdoutLine())
-	}
+	answerMsgID := requireSentOnly(t, "answer", answer)
 
 	next := execHop(t, f.env(nil), f.StateRoot, "msg", "next")
-	wantFirst := app.GrammarMessageLine(answerMsgID, "answer", "human", relayID, "", questionID)
-	if got := next.FirstStdoutLine(); got != wantFirst {
-		t.Errorf("msg next (answer) first line = %q, want %q; stdout=%q stderr=%q", got, wantFirst, next.Stdout, next.Stderr)
-	}
-	assertBodyPathOnly(t, next)
+	requireDeliveredOnly(t, "msg next (answer)", next, f.StateRoot, f.RunID, answerMsgID, app.GrammarMessageLine(answerMsgID, "answer", "human", relayID, "", questionID))
 }
 
 // TestGrammarContractAnswerRefusesNonQuestion proves hop answer's
