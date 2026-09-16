@@ -355,8 +355,10 @@ func renderInitialPrompt(assignmentPath, hopPath string) string {
 // renderContinuationPrompt renders the fixed cold-relaunch continuation
 // prompt, the positional argument after `--resume <native-ref>`. It exists
 // because interactive Claude Code restores a resumed session's transcript
-// but does not re-run a pending user turn (verified against claude
-// 2.1.270; docs/architecture/native-harness-compat.md), so a restored
+// but does not re-run a pending user turn (observed live against claude
+// 2.1.270; the positional prompt is documented by `claude --help`, its
+// continuation pending the human-run live test —
+// docs/architecture/native-harness-compat.md), so a restored
 // session with no new prompt sits idle at its input box forever. Like the
 // initial prompt it is built from durable run facts only — the frozen
 // absolute assignment path and the same `<hop> result submit` command line

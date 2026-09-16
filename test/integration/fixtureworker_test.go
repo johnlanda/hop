@@ -138,15 +138,19 @@ func main() {
 	// a cold relaunch's fixed continuation prompt ("Re-read your assignment
 	// at <path> and continue it.") after "--resume <native-ref>" — HOP's
 	// relaunch argv always carries the continuation prompt (internal/app's
-	// composeHarnessArgvTail), so a resume invocation without one fails the
-	// scenario loudly rather than falling back to any persisted state.
+	// composeHarnessArgvTail). A resume-shaped invocation is validated
+	// against that EXACT four-element shape before any element is treated
+	// as the prompt (requireResumeShape): the real CLI's "--resume [value]"
+	// takes an optional value, so a lax fixture that grabbed the final
+	// element would happily accept "--resume <prompt>" with no reference at
+	// all, masking a malformed launch. Any other shape fails loudly.
 	prompt := ""
-	if len(os.Args) > 0 {
-		prompt = os.Args[len(os.Args)-1]
-	}
 	assignmentStart, assignmentEnd := "Read your assignment at ", " and complete it."
 	if isResumeInvocation(os.Args) {
+		prompt = requireResumeShape(os.Args)
 		assignmentStart, assignmentEnd = "Re-read your assignment at ", " and continue it."
+	} else if len(os.Args) > 0 {
+		prompt = os.Args[len(os.Args)-1]
 	}
 	promptAssignmentPath := extractMarked(prompt, assignmentStart, assignmentEnd)
 	hopPath := extractMarked(prompt, "submit it by running: ", " result submit --summary")
@@ -238,12 +242,12 @@ func mcpStandIn() {
 	_, _ = io.Copy(io.Discard, os.Stdin)
 }
 
-// isResumeInvocation reports whether argv is a cold-relaunch invocation
-// (harness argv "--resume <native-ref> <continuation prompt>", design
-// section 6 item 3) rather than a first-launch invocation carrying the
-// fixed initial prompt as its final argument. Detection scans for the
-// exact "--resume" element, so the trailing continuation prompt — which
-// every HOP relaunch carries — never disturbs it.
+// isResumeInvocation reports whether argv is a resume-SHAPED invocation:
+// any element equals the exact "--resume". Detection only — it routes the
+// invocation to requireResumeShape's strict validation, so a malformed
+// resume argv can never fall through to first-launch prompt parsing, and
+// the trailing continuation prompt every HOP relaunch carries never
+// disturbs it.
 func isResumeInvocation(argv []string) bool {
 	for _, a := range argv {
 		if a == "--resume" {
@@ -251,6 +255,50 @@ func isResumeInvocation(argv []string) bool {
 		}
 	}
 	return false
+}
+
+// requireResumeShape validates HOP's one supported cold-relaunch argv,
+// exactly [<exe> --resume <native-ref> <continuation prompt>]
+// (internal/app's composeHarnessArgvTail, design section 6 item 3):
+// four elements, "--resume" at index 1 immediately followed by a
+// UUID-shaped native reference, the continuation prompt as the final
+// element. The reference check matters because the real CLI's
+// "--resume [value]" takes an OPTIONAL value: without it, an argv like
+// [worker --resume <prompt>] — no reference at all — would be consumed by
+// the real CLI as a resume value, so this fixture must reject it rather
+// than parse the prompt and proceed. A missing reference or prompt, an
+// intervening extra argument and a wrong ordering all fail the run
+// loudly. It returns the continuation prompt.
+func requireResumeShape(argv []string) string {
+	if len(argv) != 4 || argv[1] != "--resume" {
+		fatalf("resume-shaped argv %q is not the supported [<exe> --resume <native-ref> <continuation prompt>] shape", argv)
+	}
+	if !isUUID(argv[2]) {
+		fatalf("resume argv %q does not carry a UUID-shaped native reference immediately after --resume; the real CLI would consume the next argument as --resume's optional value", argv)
+	}
+	return argv[3]
+}
+
+// isUUID reports whether s has the 8-4-4-4-12 lowercase-hex UUID shape
+// HOP mints for native session references (design section 6: lowercase
+// hex and hyphens).
+func isUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if c != '-' {
+				return false
+			}
+			continue
+		}
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func requireEnv(keys ...string) map[string]string {
@@ -788,6 +836,83 @@ func TestFixtureWorkerResumeContinuation(t *testing.T) {
 	}
 	if obs.Fields["prompt_assignment_path"] != assignmentPath {
 		t.Errorf("resumed worker prompt_assignment_path = %q, want %q", obs.Fields["prompt_assignment_path"], assignmentPath)
+	}
+}
+
+// TestFixtureWorkerResumeShapeRejections proves the fixture worker refuses
+// every resume-shaped argv that is not exactly
+// `<exe> --resume <native-ref> <continuation prompt>`: the real CLI's
+// `--resume [value]` takes an optional value, so a lax fixture reading the
+// final element unconditionally would accept a reference-less
+// `--resume <prompt>` (consuming the prompt as the resume value) or an
+// invocation with extra arguments, masking a malformed launch instead of
+// failing the scenario. Each rejected worker must exit non-zero, name the
+// resume shape on stderr, and never invoke hop.
+func TestFixtureWorkerResumeShapeRejections(t *testing.T) {
+	artifacts := newArtifactDir(t)
+	worker := buildFixtureWorker(t, artifacts)
+	repo := newFixtureRepo(t, artifacts, nil, "repo")
+
+	stateDir := artifacts.dir(t, "state")
+	runID := "12121212-1212-4121-8121-121212121212"
+	runDir := filepath.Join(stateDir, "runs", runID, "artifacts")
+	if err := os.MkdirAll(runDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	assignmentPath := filepath.Join(runDir, "assignment.md")
+	if err := os.WriteFile(assignmentPath, []byte("# HOP Assignment\n\n## Brief\n\n"+fixtureWorkerBrief("submit-valid")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	hopStub, countFile := writeTransientOnceHopStub(t, artifacts)
+	prompt := testContinuationPrompt(assignmentPath, hopStub)
+	const ref = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"missing reference: the prompt would be consumed as --resume's value", []string{"--resume", prompt}},
+		{"missing prompt", []string{"--resume", ref}},
+		{"intervening extra argument", []string{"--resume", ref, "--model", prompt}},
+		{"wrong ordering", []string{ref, "--resume", prompt}},
+		{"reference is not UUID-shaped", []string{"--resume", "not-a-native-ref", prompt}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, worker, tc.args...) //nolint:gosec // G204: fixed test-owned binary and arguments.
+			cmd.Dir = repo.Root
+			cmd.Env = []string{
+				"PATH=" + os.Getenv("PATH"),
+				"HOP_STATE_DIR=" + stateDir,
+				"HOP_RUN_ID=" + runID,
+				"HOP_TASK_ID=34343434-3434-4343-8343-343434343434",
+				"HOP_ATTEMPT_ID=56565656-5656-4565-8565-565656565656",
+				"HOP_INCARNATION_ID=78787878-7878-4787-8787-787878787878",
+			}
+			var stdout, stderr strings.Builder
+			cmd.Stdout = &stdout
+			cmd.Stderr = &stderr
+			cmd.Stdin = strings.NewReader("")
+			if err := cmd.Run(); err == nil {
+				t.Fatalf("worker accepted the malformed resume argv %q\nstdout:\n%s\nstderr:\n%s", tc.args, stdout.String(), stderr.String())
+			}
+			if !strings.Contains(stderr.String(), "resume") {
+				t.Errorf("worker stderr does not name the resume shape; got:\n%s", stderr.String())
+			}
+			if strings.Contains(stdout.String(), "FIXTURE-WORKER-READY") {
+				t.Errorf("worker reported ready despite the malformed resume argv %q", tc.args)
+			}
+		})
+	}
+
+	calls, err := os.ReadFile(countFile) //nolint:gosec // G304: a path this test constructed itself, under its own artifact directory.
+	if err != nil {
+		t.Fatalf("read hop stub call count: %v", err)
+	}
+	if strings.TrimSpace(string(calls)) != "0" {
+		t.Errorf("hop stub called %s times, want 0 (a rejected resume shape must never submit)", strings.TrimSpace(string(calls)))
 	}
 }
 

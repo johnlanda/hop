@@ -137,26 +137,28 @@ alternate-profile/pools work; they are not re-verified here.
   `Not logged in` error), and an unknown UUID failed earlier with
   `No conversation found with session ID: <uuid>`. Resume lookup is scoped to
   `CLAUDE_CONFIG_DIR`, not to the working directory.
-- Resume accepts a positional prompt, and interactive resume does not
-  auto-continue a pending turn (verified 2026-09-15 against 2.1.270,
-  human-run evidence). `claude --help` prints
+- Interactive resume does not auto-continue a pending turn (observed
+  2026-09-15 against 2.1.270, human-run evidence): an interactive
+  `claude --resume <id>` restores the session's transcript but does NOT
+  re-run a user turn that never got an assistant response — in the
+  human-run `TestLiveClaudeDefaultProfileRun` (main c23b4f0), a worker
+  killed before its first output was relaunched with a prompt-less
+  `--resume <id>`, and the restored session displayed the unanswered
+  prompt and sat idle at its input box for nine minutes. Separately,
+  `claude --help` (2.1.270) DOCUMENTS a positional prompt:
   `Usage: claude [options] [command] [prompt]` and `-r, --resume [value]`,
-  so a positional prompt may follow `--resume <id>` as its own argv
-  element. It is needed: an interactive `claude --resume <id>` restores
-  the session's transcript but does NOT re-run a user turn that never got
-  an assistant response — observed live in the human-run
-  `TestLiveClaudeDefaultProfileRun` (main c23b4f0): a worker killed before
-  its first output was relaunched with a prompt-less `--resume <id>`, the
-  restored session displayed the unanswered prompt and sat idle at its
-  input box for nine minutes. HOP's cold relaunch therefore passes a fixed
-  continuation prompt as the positional argument after the adjacent
-  `--resume <native-ref>` pair
+  so a prompt may follow `--resume <id>` as its own argv element — a
+  help-grammar fact, not an executed probe. HOP's cold relaunch therefore
+  passes a fixed continuation prompt as the positional argument after the
+  adjacent `--resume <native-ref>` pair
   (`internal/app/usecase_execboundary.go`, `renderContinuationPrompt`:
   durable run facts only — the frozen assignment path and the
   `<hop> result submit` command line — telling the worker it was
   relaunched after an interruption, to re-read its assignment, continue
-  and submit). Version-scoped like every other 2.1.270 fact: re-verify on
-  drift.
+  and submit). That the restored session actually acts on the positional
+  prompt is PENDING verification by the human-run live test (see the
+  unverified list below). Version-scoped like every other 2.1.270 fact:
+  re-verify on drift.
 - Transcript portability. Copying the transcript file into a second fresh
   profile under the same `projects/<munged-cwd>/` path made
   `claude -p --resume <uuid>` in that profile find the session (it progressed
@@ -287,6 +289,14 @@ alternate-profile/pools work; they are not re-verified here.
 - Authenticated `--resume`, resuming under a different account than the one
   that created the transcript, and provider-side acceptance of a copied
   transcript are untested.
+- Positional-prompt continuation on `--resume` is unverified: no executed
+  probe shows a restored interactive session accepting and acting on the
+  positional prompt `claude --help` documents. The prompt-less idle
+  behavior is observed (see the interactive-resume item above); the
+  continuation itself is verified only when the human-run
+  `TestLiveClaudeDefaultProfileRun` passes with the relaunch argv
+  `claude --resume <uuid> "<continuation prompt>"` — record the version,
+  the invocation shape and the successful continuation as the evidence.
 - Live limit and quota behavior (what a running session shows when an account
   hits its limit) was not reproduced.
 - The exact post-theme onboarding sequence (login screen ordering) was not
@@ -323,9 +333,10 @@ For a worker in a Herdr pane using account profile `<dir>`:
    `CLAUDE_CONFIG_DIR=<dir> claude --resume <uuid>` from any directory, though
    restoring the original cwd preserves project settings and trust. An
    interactive resume restores the transcript only — it does not
-   auto-continue a pending turn (see the resume-positional-prompt item
-   above), so HOP's own cold relaunch appends its fixed continuation
-   prompt as the positional argument after `--resume <uuid>`.
+   auto-continue a pending turn (see the interactive-resume item above),
+   so HOP's own cold relaunch appends its fixed continuation prompt as
+   the positional argument after `--resume <uuid>` (continuation itself
+   pending live verification; see the unverified list).
 
 ## Codex
 
