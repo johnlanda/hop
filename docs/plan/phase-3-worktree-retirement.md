@@ -527,6 +527,11 @@ kinds.
   also executes repository-local code. Phase B adds
   `-c core.fsmonitor=false` to the pre-check and the act, with a probe row
   pinning it.
+- **Global ignore rules.** Retirement git runs with global and system
+  configuration suppressed, so a file ignored only by the operator's
+  global `core.excludesFile` counts as untracked and retains the
+  worktree. This errs toward keeping data; committing, deleting or
+  repo-ignoring such files lets the next pass remove the worktree.
 - **Slice 7** (real-process feature scenarios) is not part of this slice.
 
 ## 11. Probe observations (Herdr 0.9.0, git 2.54.0)
