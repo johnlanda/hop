@@ -659,6 +659,25 @@ consistent with sections 1 to 12.
   retirement variables (section 4). The claimed acts get the sanitized
   spawn environment, plus `HOP_STATE_DIR`, plus those three.
 
+- **Identity first.** A pass reads the validated head and runs the
+  repository-identity check before recovery and before any settled
+  answer. A run whose root no longer holds the head is left entirely
+  untouched: an earlier pass's unresolved removal is neither recovered nor
+  observed there, and no checkout is released against another repository.
+
+**The pass result.**
+
+- `RetireWorktrees` reports one disposition per run: `retired`,
+  `in-progress`, `not-merged`, `nothing-integrated`, `history-missing`,
+  `blocked`, `check-failed` or `interrupted`. `hop status` reports
+  `deferred` itself.
+- The fact is set in the same unit of work that finds no active row. A
+  merged run with no rows is retired at once.
+- A pass that could not dispatch an act reports `interrupted` and leaves
+  the fact unset.
+- The first removal is announced through a callback just before its
+  spawn, so status can print its "retiring" line before a slow act.
+
 **Dispatch revalidation (`revalidateRetirementDispatch`).** Both claimed
 acts run it immediately before the spawn:
 

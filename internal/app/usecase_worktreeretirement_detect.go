@@ -88,20 +88,73 @@ type retirementPassOptions struct {
 	SpawnEnv []string
 	// InspectPath resolves recorded paths for the removal step.
 	InspectPath PathInspector
+	// beforeFirstRemoval, when set, is called once, immediately before the
+	// pass's first removal spawn; announced records that it was.
+	beforeFirstRemoval func()
+	announced          bool
 }
 
-// detectForRetirement is the pass's detection step: unresolved retirement
-// operations from earlier passes are recovered first — any blocking one
-// ends detection for this pass — then detectRetirementMerge runs.
+// announceRemoval calls beforeFirstRemoval the first time a pass is about
+// to spawn a removal act.
+func (o *retirementPassOptions) announceRemoval() {
+	if o.announced {
+		return
+	}
+	o.announced = true
+	if o.beforeFirstRemoval != nil {
+		o.beforeFirstRemoval()
+	}
+}
+
+// detectForRetirement is the pass's detection step. The run's validated
+// head and the repository-identity check come before anything else: a run
+// that integrated nothing new, or whose frozen root no longer holds its
+// history (a moved or replaced repository), is left untouched — no
+// recovery, no check, nothing journaled. Unresolved retirement operations
+// from earlier passes are recovered next, and any blocking one ends
+// detection for this pass; then detectRetirementMerge runs.
 func (c *Controller) detectForRetirement(ctx context.Context, handle RunHandle, frozen *FrozenRun, opts *retirementPassOptions) (retirementDetection, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per pass.
+	head, stop, err := c.retirementHead(ctx, handle, frozen)
+	if err != nil || stop.State != "" {
+		return stop, err
+	}
 	blocking, err := c.recoverRetirementOperations(ctx, handle, frozen, opts)
 	if err != nil {
 		return retirementDetection{}, err
 	}
 	if blocking != "" {
-		return retirementDetection{State: detectionBlocked, Detail: blocking}, nil
+		return retirementDetection{State: detectionBlocked, Head: head, Detail: blocking}, nil
 	}
-	return c.detectRetirementMerge(ctx, handle, frozen, opts)
+	return c.detectRetirementMerge(ctx, handle, frozen, opts, head)
+}
+
+// retirementHead reads the run's validated integration head and confirms
+// the frozen root still holds it. A non-empty stop.State ends the pass:
+// ambiguous heads fail closed, a run with no new content never retires,
+// and a root without the head is a moved or replaced repository.
+func (c *Controller) retirementHead(ctx context.Context, handle RunHandle, frozen *FrozenRun) (head string, stop retirementDetection, err error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per pass.
+	var hasContent, ambiguous bool
+	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		wf, wfErr := RequireWorkflowRepositories(uow, "worktree retirement detection")
+		if wfErr != nil {
+			return wfErr
+		}
+		var readErr error
+		head, hasContent, ambiguous, readErr = integratedHead(ctx, wf, handle.runID)
+		return readErr
+	}); err != nil {
+		return "", retirementDetection{}, fmt.Errorf("app: read the run's integration head: %w", err)
+	}
+	switch {
+	case ambiguous:
+		return "", retirementDetection{State: detectionFailed, Detail: "two integrated rows claim the latest head; failing closed"}, nil
+	case head == "" || !hasContent:
+		return "", retirementDetection{State: detectionNothingIntegrated, Detail: "the run integrated no new content"}, nil
+	}
+	if identityCheck, gitErr := c.retirementGit(ctx, frozen.RepositoryRoot, "cat-file", "-e", head+"^{commit}"); gitErr != nil || identityCheck.ExitCode != 0 {
+		return "", retirementDetection{State: detectionHistoryMissing, Head: head, Detail: "the repository root no longer holds this run's history"}, nil
+	}
+	return head, retirementDetection{}, nil
 }
 
 // integratedHead reads the run's validated integration head inside the
@@ -140,37 +193,20 @@ func integratedHead(ctx context.Context, wf WorkflowRepositories, runID identity
 	return head, hasContent, ambiguous, nil
 }
 
-// detectRetirementMerge runs the detection step for a run whose lease the
-// pass holds: the validated head, the repository-identity check, the
-// target tip, then — unless a settled check already answers — one claimed
-// ancestry execution. A check already settled as merged ends detection
-// for good; one settled not-merged or failed for the same head and tip is
-// not repeated, so repeated passes over an unchanged run journal nothing.
-func (c *Controller) detectRetirementMerge(ctx context.Context, handle RunHandle, frozen *FrozenRun, opts *retirementPassOptions) (retirementDetection, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per pass.
-	var (
-		head                  string
-		hasContent, ambiguous bool
-		settled               []Operation
-	)
+// detectRetirementMerge runs the rest of the detection step for a run
+// whose validated head the root holds: unless a settled check already
+// answers, the target tip, then one claimed ancestry execution. A check
+// already settled as merged ends detection for good; one settled
+// not-merged or failed for the same head and tip is not repeated, so
+// repeated passes over an unchanged run journal nothing.
+func (c *Controller) detectRetirementMerge(ctx context.Context, handle RunHandle, frozen *FrozenRun, opts *retirementPassOptions, head string) (retirementDetection, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per pass.
+	var settled []Operation
 	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
-		wf, wfErr := RequireWorkflowRepositories(uow, "worktree retirement detection")
-		if wfErr != nil {
-			return wfErr
-		}
 		var readErr error
-		if head, hasContent, ambiguous, readErr = integratedHead(ctx, wf, handle.runID); readErr != nil {
-			return readErr
-		}
 		settled, readErr = uow.Operations().ByKind(ctx, handle.runID, OpRetirementCheck)
 		return readErr
 	}); err != nil {
-		return retirementDetection{}, fmt.Errorf("app: read the run's integration head: %w", err)
-	}
-	switch {
-	case ambiguous:
-		return retirementDetection{State: detectionFailed, Detail: "two integrated rows claim the latest head; failing closed"}, nil
-	case head == "" || !hasContent:
-		return retirementDetection{State: detectionNothingIntegrated, Detail: "the run integrated no new content"}, nil
+		return retirementDetection{}, fmt.Errorf("app: read the run's retirement checks: %w", err)
 	}
 	for i := range settled {
 		if settled[i].State != OperationSucceeded {
@@ -182,9 +218,6 @@ func (c *Controller) detectRetirementMerge(ctx context.Context, handle RunHandle
 	}
 
 	root := frozen.RepositoryRoot
-	if identityCheck, err := c.retirementGit(ctx, root, "cat-file", "-e", head+"^{commit}"); err != nil || identityCheck.ExitCode != 0 {
-		return retirementDetection{State: detectionHistoryMissing, Head: head, Detail: "the repository root no longer holds this run's history"}, nil
-	}
 	targetRef := frozen.Snapshot.Workflow.TargetBranch
 	tip, err := c.retirementGit(ctx, root, "rev-parse", "--verify", "-q", targetRef+"^{commit}")
 	switch {

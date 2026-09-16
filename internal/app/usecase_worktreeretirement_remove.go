@@ -324,6 +324,7 @@ func (c *Controller) removeAttemptCheckout(ctx context.Context, handle RunHandle
 		return report, errRetirementPassHalted
 	}
 
+	opts.announceRemoval()
 	actCtx, release := handle.actContext(ctx)
 	boundedCtx, cancel := context.WithTimeout(actCtx, retirementActTimeout)
 	cmdResult, runErr := c.Commands.Run(boundedCtx, Command{Argv: intent.SpawnArgv, Dir: root, Env: retirementSpawnEnv(opts.SpawnEnv, frozen.Snapshot.StateRoot)})
