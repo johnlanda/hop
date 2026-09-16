@@ -43,3 +43,24 @@ func InspectAttemptCheckoutForTest(ctx context.Context, c *Controller, root, pat
 		ListedPath: v.ListedPath, WasAbsent: v.WasAbsent, Detail: v.Detail,
 	}
 }
+
+// DetectionForTest is one detection step's result, rendered as strings.
+type DetectionForTest struct {
+	State, Head, Target, Detail string
+}
+
+// DetectForRetirementForTest exposes the pass's detection step
+// (recovery of unresolved checks, then detectRetirementMerge) to
+// app_test, under the handle's lease.
+func DetectForRetirementForTest(ctx context.Context, c *Controller, handle RunHandle, hopPath string, environ []string) (DetectionForTest, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; test bridge.
+	frozen, err := c.Read.LoadFrozenRun(ctx, handle.runID)
+	if err != nil {
+		return DetectionForTest{}, err
+	}
+	spawnEnv, err := c.CheckSpawnEnvironment(ctx, handle, environ)
+	if err != nil {
+		return DetectionForTest{}, err
+	}
+	d, err := c.detectForRetirement(ctx, handle, &frozen, &retirementPassOptions{HOPPath: hopPath, SpawnEnv: spawnEnv})
+	return DetectionForTest{State: string(d.State), Head: d.Head, Target: d.Target, Detail: d.Detail}, err
+}

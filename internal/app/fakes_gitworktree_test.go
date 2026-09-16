@@ -133,7 +133,7 @@ func (g *fakeGitRepo) requireNoForcedAttemptRemovals(t *testing.T) {
 // handled is false for everything else. Callers hold g.mu.
 func (g *fakeGitRepo) runAttemptWorktreeGitLocked(dir string, configs []string, sub string, rest []string) (result app.CommandResult, handled bool) {
 	m := &g.attempt
-	if m.byPath == nil {
+	if m.root == "" {
 		return app.CommandResult{}, false
 	}
 	w, isAttempt := m.byPath[dir]
@@ -297,7 +297,7 @@ func (g *fakeGitRepo) catFileExistsLocked(dir, object string) app.CommandResult 
 // and requires the same observable results, hazards included.
 func TestFakeAttemptWorktreesReproduceTheProbe(t *testing.T) {
 	const (
-		root   = "/repo"
+		root   = "/srv/repo"
 		path   = "/worktrees/repo/hop-r1-t1a1"
 		branch = "refs/heads/hop/r1/t1a1"
 	)
@@ -330,7 +330,7 @@ func TestFakeAttemptWorktreesReproduceTheProbe(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			g := newFakeGitRepo("/opt/homebrew/bin/git", "/opt/hop/bin/hop")
-			g.setAttemptRepository(root, "/repo/.git")
+			g.setAttemptRepository(root, "/srv/repo/.git")
 			g.setHideUntracked(tc.hide)
 			state := tc.state
 			state.Branch, state.Head, state.Present = branch, "commit-base", true
@@ -363,7 +363,7 @@ func TestFakeAttemptWorktreesReproduceTheProbe(t *testing.T) {
 
 	t.Run("listing, prunable removal, identity and a forced removal", func(t *testing.T) {
 		g := newFakeGitRepo("/opt/homebrew/bin/git", "/opt/hop/bin/hop")
-		g.setAttemptRepository(root, "/repo/.git")
+		g.setAttemptRepository(root, "/srv/repo/.git")
 		head := g.newCommit("tree-head")
 		g.addAttemptWorktree("/wt/a", fakeAttemptWorktree{Branch: "refs/heads/hop/r1/t1a1", Head: head, Present: true})
 		g.addAttemptWorktree("/wt/b", fakeAttemptWorktree{Branch: "refs/heads/hop/r1/t2a1", Head: head, Present: true, Locked: true, LockReason: "in use"})
@@ -372,7 +372,7 @@ func TestFakeAttemptWorktreesReproduceTheProbe(t *testing.T) {
 		g.addAttemptWorktree("/wt/e", fakeAttemptWorktree{Branch: "refs/heads/hop/r1/t5a1", Head: head, Present: true, Unlisted: true})
 
 		list := g.runGitArgv([]string{"-C", root, "worktree", "list", "--porcelain", "-z"})
-		want := "worktree /repo\x00HEAD commit-main\x00branch refs/heads/main\x00\x00" +
+		want := "worktree /srv/repo\x00HEAD commit-main\x00branch refs/heads/main\x00\x00" +
 			"worktree /wt/a\x00HEAD " + head + "\x00branch refs/heads/hop/r1/t1a1\x00\x00" +
 			"worktree /wt/b\x00HEAD " + head + "\x00branch refs/heads/hop/r1/t2a1\x00locked in use\x00\x00" +
 			"worktree /wt/c\x00HEAD " + head + "\x00detached\x00\x00" +
@@ -389,7 +389,7 @@ func TestFakeAttemptWorktreesReproduceTheProbe(t *testing.T) {
 		if refused := g.runGitArgv([]string{"-C", root, "worktree", "remove", "/wt/e"}); refused.ExitCode != 128 || string(refused.Stderr) != fmt.Sprintf(fakeNotWorkingTree, "/wt/e") {
 			t.Errorf("remove of an unlisted directory = exit %d %q", refused.ExitCode, refused.Stderr)
 		}
-		if common := g.runGitArgv([]string{"-C", "/wt/a", "rev-parse", "--path-format=absolute", "--git-common-dir"}); string(common.Stdout) != "/repo/.git\n" {
+		if common := g.runGitArgv([]string{"-C", "/wt/a", "rev-parse", "--path-format=absolute", "--git-common-dir"}); string(common.Stdout) != "/srv/repo/.git\n" {
 			t.Errorf("common dir = %q", common.Stdout)
 		}
 		for object, wantExit := range map[string]int{head + "^{commit}": 0, "commit-9999^{commit}": 128} {

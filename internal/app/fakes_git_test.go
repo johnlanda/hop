@@ -102,6 +102,13 @@ func (g *fakeGitRepo) setRef(name, oid string) {
 	g.refs[name] = oid
 }
 
+// deleteRef removes a direct ref (test seeding only).
+func (g *fakeGitRepo) deleteRef(name string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	delete(g.refs, name)
+}
+
 // setSymref makes name a symbolic ref to target (test seeding only); the
 // target may be absent (a dangling symref).
 func (g *fakeGitRepo) setSymref(name, target string) {
@@ -223,6 +230,16 @@ subcommand:
 		}
 		if slices.Contains(rest, "--show-object-format") {
 			return app.CommandResult{ExitCode: 0, Stdout: []byte("sha1\n")}
+		}
+		if slices.Contains(rest, "--verify") && slices.Contains(rest, "-q") {
+			// `rev-parse --verify -q <rev>`, as the process probe pins it:
+			// the object id and exit 0, or exit 1 with no output.
+			rev := rest[len(rest)-1]
+			resolved, err := g.resolveLocked(rev, dir)
+			if err != nil {
+				return app.CommandResult{ExitCode: 1}
+			}
+			return app.CommandResult{ExitCode: 0, Stdout: []byte(resolved + "\n")}
 		}
 		var revs []string
 		for _, a := range rest {
