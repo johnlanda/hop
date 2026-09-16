@@ -1,6 +1,7 @@
 // Package storevectors holds Phase 3's shared refused-input vectors:
 // request shapes internal/app's worker-authority store ports
-// (MessagingStore, PlanStore, ReviewStore) must refuse, expressed once so both
+// (MessagingStore, PlanStore, ReviewStore) and the controller unit of
+// work's worktree repository must refuse, expressed once so both
 // internal/app's fakeStore tests and internal/adapters/sqlite's future
 // real-store tests exercise the IDENTICAL input against their own backing
 // implementation — the section 11 countermeasure for the Phase 2
@@ -279,5 +280,37 @@ func TaskRetry(runID identity.RunID, manager identity.SessionID, incarnation ide
 	return app.RetryRequest{
 		TaskID: taskID, RunID: runID, Session: manager, IncarnationID: incarnation,
 		Reason: "retry the terminal attempt", RequestID: requestID,
+	}
+}
+
+// WorktreeVectorBaseCommit is the base commit object ID both worktree
+// vectors carry: a well-formed link whose only fault is the attempt.
+const WorktreeVectorBaseCommit = "cccccccccccccccccccccccccccccccccccccccc"
+
+// WorktreeCreateUnknownAttempt returns a controller UnitOfWork
+// Worktrees().Create value for runID, the unit of work's own leased run,
+// whose attempt link names unknownAttempt, an attempt no store row
+// carries. Refused with an error wrapping app.ErrNotFound, and the unit of
+// work stages no row: a feature worktree row must name a real attempt, the
+// key the launch boundary finds the row by.
+func WorktreeCreateUnknownAttempt(worktreeID identity.WorktreeID, repositoryID identity.RepositoryID, runID identity.RunID, unknownAttempt identity.AttemptID) run.Worktree {
+	return run.Worktree{
+		ID: worktreeID, RepositoryID: repositoryID, RunID: runID,
+		AttemptID: unknownAttempt, BaseCommit: WorktreeVectorBaseCommit,
+		Path: "/worktrees/vector-unknown-attempt", Branch: "hop/r1/vector-unknown", State: run.WorktreeActive,
+	}
+}
+
+// WorktreeCreateForeignAttempt returns a controller UnitOfWork
+// Worktrees().Create value for runID, the unit of work's own leased run,
+// whose attempt link names foreignAttempt, an existing attempt of a
+// DIFFERENT run. Refused with an error wrapping app.ErrFenced, and the unit
+// of work stages no row: one run's lease never links a worktree to another
+// run's attempt.
+func WorktreeCreateForeignAttempt(worktreeID identity.WorktreeID, repositoryID identity.RepositoryID, runID identity.RunID, foreignAttempt identity.AttemptID) run.Worktree {
+	return run.Worktree{
+		ID: worktreeID, RepositoryID: repositoryID, RunID: runID,
+		AttemptID: foreignAttempt, BaseCommit: WorktreeVectorBaseCommit,
+		Path: "/worktrees/vector-foreign-attempt", Branch: "hop/r1/vector-foreign", State: run.WorktreeActive,
 	}
 }

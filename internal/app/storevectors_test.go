@@ -376,6 +376,49 @@ func TestStoreVectors(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("WorktreeCreateUnknownAttempt", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		fr := seedFeatureRun(t, tc, 2)
+		vector := storevectors.WorktreeCreateUnknownAttempt(
+			identity.WorktreeID(tc.IDs.NewID()), tc.Store.Runs[fr.RunID].value.RepositoryID, fr.RunID, identity.AttemptID(tc.IDs.NewID()),
+		)
+		assertWorktreeVectorRefused(t, tc, fr.RunID, vector, app.ErrNotFound)
+	})
+
+	t.Run("WorktreeCreateForeignAttempt", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		fr := seedFeatureRun(t, tc, 2)
+		other := seedFeatureRun(t, tc, 2)
+		otherTask := seedImplementTask(t, tc, other.RunID, 1, "foreign", false, run.TaskReady)
+		foreignWorker, _ := seedWorkerSession(t, tc, other, otherTask)
+		vector := storevectors.WorktreeCreateForeignAttempt(
+			identity.WorktreeID(tc.IDs.NewID()), tc.Store.Runs[fr.RunID].value.RepositoryID, fr.RunID, tc.Store.Sessions[foreignWorker].value.AttemptID,
+		)
+		assertWorktreeVectorRefused(t, tc, fr.RunID, vector, app.ErrFenced)
+	})
+}
+
+// assertWorktreeVectorRefused drives one worktree vector through a unit of
+// work under runID's own lease: Create refuses with want, and committing
+// the same unit of work afterwards adds no worktree row.
+func assertWorktreeVectorRefused(t *testing.T, tc *testController, runID identity.RunID, vector run.Worktree, want error) { //nolint:gocritic // hugeParam: the vector is the port's by-value argument, passed once per subtest.
+	t.Helper()
+	ctx := context.Background()
+	before := len(tc.Store.Worktrees)
+	uow, err := tc.Store.Begin(ctx, tc.Store.Leases[runID].lease)
+	if err != nil {
+		t.Fatalf("Begin() error = %v", err)
+	}
+	if _, err := uow.Worktrees().Create(ctx, vector); !errors.Is(err, want) {
+		t.Fatalf("Worktrees().Create() error = %v, want %v", err, want)
+	}
+	if err := uow.Commit(); err != nil {
+		t.Fatalf("Commit() after the refusal error = %v", err)
+	}
+	if len(tc.Store.Worktrees) != before {
+		t.Fatalf("worktree rows = %d after a refused create, want %d", len(tc.Store.Worktrees), before)
+	}
 }
 
 // seedForeignReviewer builds a second review task inside fr with its own
