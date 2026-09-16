@@ -371,7 +371,9 @@ sides together. `cmd/hop` never imports domain or identity types: every
   standard library only beyond these, no third-party dependencies). Test
   files additionally import
   [internal/testsupport/storevectors](../testsupport/storevectors/AGENTS.md)
-  (the shared refused-input vectors) — production code never does.
+  (the shared refused-input vectors) and
+  [internal/testsupport/runnervectors](../testsupport/runnervectors/AGENTS.md)
+  (the shared runner capture contract) — production code never does.
 - Consumed ports and their adapters: `Probe`, `AgentPresentation`,
   `Observer` and `Runtime` (including `ServerInstance`) are implemented by
   [internal/adapters/herdr](../adapters/herdr/AGENTS.md); `StateStore`,
@@ -416,14 +418,15 @@ sides together. `cmd/hop` never imports domain or identity types: every
   `fakeCommands.Run` also mirrors the real Runner's own argv contract,
   refusing an empty argv or a non-absolute argv[0], so calling it with a
   bare executable name fails the app suite directly rather than only
-  surfacing against a real process at runtime. It applies the Runner's
-  per-stream capture bound (the command's `MaxOutputBytes`, else 1 MiB)
-  to every answer, scripted, hooked or modeled (`boundCapturedOutput`),
-  and computes the truncation flags itself; a negative bound, and an
-  answer claiming a truncation the Runner could never report (anything
-  but exactly the bound), are refused
-  (`TestFakeCommandsBoundCapturedOutput`, mirroring the process
-  adapter's `TestRunnerReportsTruncation`). Scripted `InspectPaneFn`
+  surfacing against a real process at runtime. It follows the Runner's
+  capture contract through `runnervectors`: a negative bound is refused
+  before anything answers (`ValidateBound`), and every answer — scripted,
+  hooked or modeled — is bounded to the command's `MaxOutputBytes` (else
+  1 MiB) with the truncation flags computed by `BoundCapture`, which also
+  refuses an answer claiming a truncation the Runner could never report.
+  `TestFakeCommandsBoundCapturedOutput` runs every shared
+  `CaptureVectors` case, scripted and hooked — the same cases the process
+  adapter's `TestRunnerReportsTruncation` runs against the real Runner. Scripted `InspectPaneFn`
   panes use the real pane.process_info shapes: `mcpGroupPane`
   (helpers_test.go) reproduces the pinned multi-member foreground group —
   MCP-server children listed before the worker in raw platform order —

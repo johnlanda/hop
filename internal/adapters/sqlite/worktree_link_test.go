@@ -12,6 +12,7 @@ import (
 	"github.com/johnlanda/hop/internal/app"
 	"github.com/johnlanda/hop/internal/domain/identity"
 	"github.com/johnlanda/hop/internal/domain/run"
+	"github.com/johnlanda/hop/internal/testsupport/runnervectors"
 )
 
 // Fixed values of the assignment harness below.
@@ -75,13 +76,31 @@ func (*linkRuntime) ServerInstance(context.Context) (string, error) { return lin
 
 // linkGit answers exactly the git invocations worktree provenance runs:
 // every known checkout shares the repository's common directory, and each
-// created worktree's HEAD is the base it was requested at.
+// created worktree's HEAD is the base it was requested at. It follows the
+// real runner's capture contract (runnervectors): a negative output bound
+// is refused before anything answers, and every answer is bounded with its
+// truncation flags.
 type linkGit struct {
 	repositoryRoot string
 	runtime        *linkRuntime
+	// answer, when set, replaces the answer to every accepted invocation,
+	// so the shared capture vectors run through this fake's own Run.
+	answer *app.CommandResult
 }
 
 func (g linkGit) Run(_ context.Context, cmd app.Command) (app.CommandResult, error) {
+	if err := runnervectors.ValidateBound(cmd.MaxOutputBytes); err != nil {
+		return app.CommandResult{}, err
+	}
+	result, err := g.respond(cmd)
+	if err != nil {
+		return app.CommandResult{}, err
+	}
+	return runnervectors.BoundCapture(result, cmd.MaxOutputBytes)
+}
+
+// respond is linkGit's complete answer to cmd, before the capture bound.
+func (g linkGit) respond(cmd app.Command) (app.CommandResult, error) {
 	if len(cmd.Argv) < 4 || cmd.Argv[0] != linkGitPath || cmd.Argv[1] != "-C" {
 		return app.CommandResult{}, fmt.Errorf("unexpected command %q", cmd.Argv)
 	}
@@ -89,14 +108,19 @@ func (g linkGit) Run(_ context.Context, cmd app.Command) (app.CommandResult, err
 	g.runtime.mu.Lock()
 	base, created := g.runtime.bases[dir]
 	g.runtime.mu.Unlock()
+	var result app.CommandResult
 	switch {
 	case args == "rev-parse --path-format=absolute --git-common-dir" && (created || dir == g.repositoryRoot):
-		return app.CommandResult{Stdout: []byte(g.repositoryRoot + "/.git\n")}, nil
+		result = app.CommandResult{Stdout: []byte(g.repositoryRoot + "/.git\n")}
 	case args == "rev-parse HEAD^{commit}" && created:
-		return app.CommandResult{Stdout: []byte(base + "\n")}, nil
+		result = app.CommandResult{Stdout: []byte(base + "\n")}
 	default:
 		return app.CommandResult{}, fmt.Errorf("unexpected git invocation %q in %s", args, dir)
 	}
+	if g.answer != nil {
+		result = *g.answer
+	}
+	return result, nil
 }
 
 // linkArtifacts keeps written artifacts in memory.
@@ -575,5 +599,43 @@ func TestWorktreeFallbackServesOnlyALoneUnlinkedRow(t *testing.T) {
 				t.Fatalf("solo-fallback launch = %+v, %v; want accepted with a claim", plan, err)
 			}
 		})
+	}
+}
+
+// TestLinkGitCaptureContract runs the shared capture contract
+// (internal/testsupport/runnervectors, which the real process runner also
+// runs) through linkGit, and pins its own common-directory answer under a
+// refused negative bound, a one-byte bound and its exact length.
+func TestLinkGitCaptureContract(t *testing.T) {
+	argv := []string{linkGitPath, "-C", "/fixture/repo", "rev-parse", "--path-format=absolute", "--git-common-dir"}
+	for _, v := range runnervectors.CaptureVectors() {
+		t.Run(v.Name, func(t *testing.T) {
+			answer := v.Answer()
+			g := linkGit{repositoryRoot: "/fixture/repo", runtime: &linkRuntime{}, answer: &answer}
+			result, err := g.Run(context.Background(), app.Command{Argv: argv, MaxOutputBytes: v.MaxOutputBytes})
+			if checkErr := v.Check(result, err); checkErr != nil {
+				t.Error(checkErr)
+			}
+		})
+	}
+
+	g := linkGit{repositoryRoot: "/fixture/repo", runtime: &linkRuntime{}}
+	const common = "/fixture/repo/.git\n"
+	if _, err := g.Run(context.Background(), app.Command{Argv: argv, MaxOutputBytes: -1}); err == nil {
+		t.Error("a negative bound was accepted; the real runner refuses it")
+	}
+	for bound, want := range map[int]struct {
+		stdout    string
+		truncated bool
+	}{
+		0:               {common, false},
+		1:               {"/", true},
+		len(common) - 1: {common[:len(common)-1], true},
+		len(common):     {common, false},
+	} {
+		result, err := g.Run(context.Background(), app.Command{Argv: argv, MaxOutputBytes: bound})
+		if err != nil || string(result.Stdout) != want.stdout || result.StdoutTruncated != want.truncated {
+			t.Errorf("bound %d: stdout %q, truncated %v, %v; want %q, %v", bound, result.Stdout, result.StdoutTruncated, err, want.stdout, want.truncated)
+		}
 	}
 }

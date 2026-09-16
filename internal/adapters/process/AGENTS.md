@@ -84,7 +84,10 @@ package only observes and signals.
 
 ## Dependencies and ports
 
-- Allowed inward imports: [internal/app](../../app/AGENTS.md).
+- Allowed inward imports: [internal/app](../../app/AGENTS.md). Test
+  files additionally import
+  [internal/testsupport/runnervectors](../../testsupport/runnervectors/AGENTS.md)
+  (the shared capture contract); production code never does.
 - Implemented ports: `app.CommandRunner` by `Runner`,
   `app.ProcessGroupInspector` by `GroupInspector`; `Exec` (hop launch) and
   `ExecResolved` (hop check-exec) are consumed directly by the
@@ -114,12 +117,16 @@ package only observes and signals.
   never-exiting child), exercised through the real `Runner`: exit-code
   mapping, exact-environment delivery, nil-env emptiness, working
   directory, the 1 MiB capture bound and its truncation flags
-  (`TestRunnerReportsTruncation`, through the `flood` helper that writes
-  exact byte counts to each stream: exactly the bound is complete, one
-  byte more is truncated, on a failing exit too, each flag for its own
-  stream, and a per-call `MaxOutputBytes` — larger or smaller than the
-  default — bounds each stream separately; a negative bound is refused
-  without starting the command; `TestBoundedBufferTruncation` pins the
+  (`TestRunnerReportsTruncation` runs every shared
+  `runnervectors.CaptureVectors` case — the same cases every handwritten
+  runner fake runs — through the `flood` helper, which writes exact byte
+  counts to each stream: exactly the bound is complete, one byte more is
+  truncated, on a failing exit too, each flag for its own stream, and a
+  per-call `MaxOutputBytes` — larger or smaller than the default —
+  bounds each stream separately; a negative bound is refused and the
+  child's start marker proves it never ran; runner-only cases place the
+  bound at, between and inside the child's writes;
+  `TestBoundedBufferTruncation` pins the
   accounting over exact write sequences, a write ending on the bound
   included, and `TestBoundedBufferGrowsOnlyAsBytesArrive` that a 64 MiB
   bound reserves nothing up front and storage never exceeds double the

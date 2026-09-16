@@ -17,6 +17,7 @@ import (
 
 	"github.com/johnlanda/hop/internal/adapters/process"
 	"github.com/johnlanda/hop/internal/app"
+	"github.com/johnlanda/hop/internal/testsupport/runnervectors"
 )
 
 // helperModeVar selects the fixture behavior when the test binary re-runs
@@ -90,17 +91,23 @@ func helperEnvDump() {
 	os.Exit(code)
 }
 
-// helperFlood writes exactly HOP_HELPER_STDOUT_BYTES bytes to stdout and
-// HOP_HELPER_STDERR_BYTES bytes to stderr, each in HOP_HELPER_CHUNK_BYTES
-// writes (default 64 KiB), and nothing else, then exits with
-// HOP_HELPER_EXIT.
+// helperFlood creates the file HOP_HELPER_STARTED names, when set, then
+// writes exactly HOP_HELPER_STDOUT_BYTES bytes of runnervectors.Fill to
+// stdout and HOP_HELPER_STDERR_BYTES to stderr, each in
+// HOP_HELPER_CHUNK_BYTES writes (default 64 KiB), and nothing else, then
+// exits with HOP_HELPER_EXIT.
 func helperFlood() {
+	if marker := os.Getenv("HOP_HELPER_STARTED"); marker != "" {
+		if err := os.WriteFile(marker, nil, 0o600); err != nil { //nolint:gosec // G703: the path is chosen by the parent test inside its own temporary directory.
+			os.Exit(94)
+		}
+	}
 	chunkSize := helperInt("HOP_HELPER_CHUNK_BYTES", 64*1024)
 	for _, stream := range []struct {
 		out *os.File
 		n   int
 	}{{os.Stdout, helperInt("HOP_HELPER_STDOUT_BYTES", 0)}, {os.Stderr, helperInt("HOP_HELPER_STDERR_BYTES", 0)}} {
-		chunk := bytes.Repeat([]byte{'y'}, chunkSize)
+		chunk := bytes.Repeat([]byte{runnervectors.Fill}, chunkSize)
 		for written := 0; written < stream.n; {
 			m := min(len(chunk), stream.n-written)
 			if _, err := stream.out.Write(chunk[:m]); err != nil {
@@ -406,67 +413,56 @@ func TestRunnerBoundsCapturedOutput(t *testing.T) {
 	}
 }
 
-// TestRunnerReportsTruncation pins the capture bound and the truncation
-// flags through the real Runner: a stream is reported truncated exactly
-// when the child wrote more than the bound — 1 MiB, or the command's own
-// MaxOutputBytes, applied to each stream separately — whatever the exit
-// status and wherever the child's writes fall, and each flag describes only
-// its own stream. Callers deciding on a whole stream rely on this.
+// TestRunnerReportsTruncation runs the shared capture contract
+// (internal/testsupport/runnervectors, which every handwritten
+// CommandRunner fake also runs) through the real Runner: a stream is
+// reported truncated exactly when the child wrote more than the bound — 1
+// MiB, or the command's own MaxOutputBytes, applied to each stream
+// separately — whatever the exit status, each flag describes only its own
+// stream, and a negative bound is refused before the child starts. The
+// runner-only cases place the bound against the child's own write
+// boundaries. Callers deciding on a whole stream rely on this.
 func TestRunnerReportsTruncation(t *testing.T) {
 	exe := testExecutable(t)
-	const captureLimit = 1 << 20
-	cases := []struct {
-		name                     string
-		stdout, stderr, chunk    int
-		exit                     int
-		limit                    int
-		wantStdout, wantStderr   int
-		stdoutTrunc, stderrTrunc bool
-	}{
-		{name: "small output", stdout: 10, stderr: 5, wantStdout: 10, wantStderr: 5},
-		{name: "empty output", wantStdout: 0, wantStderr: 0},
-		{name: "exactly the bound is complete", stdout: captureLimit, wantStdout: captureLimit},
-		{name: "exactly the bound in one write is complete", stdout: captureLimit, chunk: captureLimit, wantStdout: captureLimit},
-		{name: "one byte past the bound", stdout: captureLimit + 1, wantStdout: captureLimit, stdoutTrunc: true},
-		{name: "the bound falls exactly between two writes", stdout: 2 * captureLimit, chunk: captureLimit / 4, wantStdout: captureLimit, stdoutTrunc: true},
-		{name: "the bound falls inside a write", stdout: captureLimit + 100, chunk: 3000, wantStdout: captureLimit, stdoutTrunc: true},
-		{name: "truncated on a successful exit", stdout: 3 * captureLimit, wantStdout: captureLimit, stdoutTrunc: true},
-		{name: "truncated on a failing exit", stdout: 3 * captureLimit, exit: 3, wantStdout: captureLimit, stdoutTrunc: true},
-		{name: "stderr alone", stdout: 7, stderr: captureLimit + 1, wantStdout: 7, wantStderr: captureLimit, stderrTrunc: true},
-		{name: "both streams", stdout: captureLimit + 9, stderr: 2 * captureLimit, wantStdout: captureLimit, wantStderr: captureLimit, stdoutTrunc: true, stderrTrunc: true},
-		{name: "a larger per-call bound keeps output past the default", stdout: 2*captureLimit + 1, limit: 3 * captureLimit, wantStdout: 2*captureLimit + 1},
-		{name: "exactly a per-call bound is complete", stdout: 2 * captureLimit, limit: 2 * captureLimit, wantStdout: 2 * captureLimit},
-		{name: "one byte past a per-call bound", stdout: 2*captureLimit + 1, limit: 2 * captureLimit, wantStdout: 2 * captureLimit, stdoutTrunc: true},
-		{name: "a per-call bound applies to each stream", stdout: 3 * captureLimit, stderr: 2 * captureLimit, limit: 2 * captureLimit, wantStdout: 2 * captureLimit, wantStderr: 2 * captureLimit, stdoutTrunc: true},
-		{name: "a per-call bound below the default", stdout: 101, stderr: 100, limit: 100, wantStdout: 100, wantStderr: 100, stdoutTrunc: true},
+	floodEnv := func(v *runnervectors.CaptureVector, marker string, chunk int) []string {
+		env := []string{
+			helperModeVar + "=flood",
+			"HOP_HELPER_STDOUT_BYTES=" + strconv.Itoa(v.StdoutBytes),
+			"HOP_HELPER_STDERR_BYTES=" + strconv.Itoa(v.StderrBytes),
+			"HOP_HELPER_EXIT=" + strconv.Itoa(v.ExitCode),
+			"HOP_HELPER_STARTED=" + marker,
+		}
+		if chunk != 0 {
+			env = append(env, "HOP_HELPER_CHUNK_BYTES="+strconv.Itoa(chunk))
+		}
+		return env
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			env := []string{
-				helperModeVar + "=flood",
-				"HOP_HELPER_STDOUT_BYTES=" + strconv.Itoa(tc.stdout),
-				"HOP_HELPER_STDERR_BYTES=" + strconv.Itoa(tc.stderr),
-				"HOP_HELPER_EXIT=" + strconv.Itoa(tc.exit),
-			}
-			if tc.chunk != 0 {
-				env = append(env, "HOP_HELPER_CHUNK_BYTES="+strconv.Itoa(tc.chunk))
-			}
+	run := func(t *testing.T, v *runnervectors.CaptureVector, chunk int) {
+		t.Helper()
+		marker := filepath.Join(t.TempDir(), "started")
+		result, err := process.Runner{}.Run(t.Context(), app.Command{Argv: []string{exe}, Env: floodEnv(v, marker, chunk), MaxOutputBytes: v.MaxOutputBytes})
+		if checkErr := v.Check(result, err); checkErr != nil {
+			t.Error(checkErr)
+		}
+		_, statErr := os.Lstat(marker)
+		if started := statErr == nil; started == v.Refused {
+			t.Errorf("the child started = %v (%v), want %v", started, statErr, !v.Refused)
+		}
+	}
+	for _, v := range runnervectors.CaptureVectors() {
+		t.Run(v.Name, func(t *testing.T) { run(t, &v, 0) })
+	}
 
-			result, err := process.Runner{}.Run(t.Context(), app.Command{Argv: []string{exe}, Env: env, MaxOutputBytes: tc.limit})
-			if err != nil {
-				t.Fatalf("Run: %v", err)
-			}
-
-			if result.ExitCode != tc.exit {
-				t.Errorf("ExitCode = %d, want %d", result.ExitCode, tc.exit)
-			}
-			if len(result.Stdout) != tc.wantStdout || len(result.Stderr) != tc.wantStderr {
-				t.Errorf("captured %d stdout and %d stderr bytes, want %d and %d", len(result.Stdout), len(result.Stderr), tc.wantStdout, tc.wantStderr)
-			}
-			if result.StdoutTruncated != tc.stdoutTrunc || result.StderrTruncated != tc.stderrTrunc {
-				t.Errorf("StdoutTruncated = %v, StderrTruncated = %v; want %v, %v", result.StdoutTruncated, result.StderrTruncated, tc.stdoutTrunc, tc.stderrTrunc)
-			}
-		})
+	const bound = runnervectors.DefaultCaptureBytes
+	for _, tc := range []struct {
+		chunk int
+		v     runnervectors.CaptureVector
+	}{
+		{bound, runnervectors.CaptureVector{Name: "exactly the bound in one write is complete", StdoutBytes: bound, KeptStdout: bound}},
+		{bound / 4, runnervectors.CaptureVector{Name: "the bound falls exactly between two writes", StdoutBytes: 2 * bound, KeptStdout: bound, StdoutTruncated: true}},
+		{3000, runnervectors.CaptureVector{Name: "the bound falls inside a write", StdoutBytes: bound + 100, KeptStdout: bound, StdoutTruncated: true}},
+	} {
+		t.Run(tc.v.Name, func(t *testing.T) { run(t, &tc.v, tc.chunk) })
 	}
 }
 
@@ -488,17 +484,6 @@ func TestRunnerRejectsInvalidArgv(t *testing.T) {
 			}
 		})
 	}
-
-	t.Run("negative output bound", func(t *testing.T) {
-		marker := filepath.Join(t.TempDir(), "started")
-		_, err := process.Runner{}.Run(t.Context(), app.Command{Argv: []string{"/usr/bin/touch", marker}, MaxOutputBytes: -1})
-		if err == nil {
-			t.Fatal("Run with a negative output bound succeeded, want rejection")
-		}
-		if _, statErr := os.Lstat(marker); !errors.Is(statErr, os.ErrNotExist) {
-			t.Fatalf("the command started despite the rejection (%v)", statErr)
-		}
-	})
 }
 
 func TestRunnerCancellationKillsWholeGroupWithTypedResult(t *testing.T) {

@@ -188,6 +188,8 @@ this package never resolves environment variables or defaults.
   `app.MessagingStore`, `app.PlanStore` and `app.ReviewStore`, all by
   `*Store` and its unit of work. Test files additionally import
   [internal/testsupport/storevectors](../../testsupport/storevectors/AGENTS.md)
+  and
+  [internal/testsupport/runnervectors](../../testsupport/runnervectors/AGENTS.md)
   (production code never does; the checker's test-support rule proves it).
 - External libraries: `modernc.org/sqlite` v1.58.0 (pure-Go SQLite driver;
   no cgo, exact version pinned) and its `lib` subpackage for result-code
@@ -280,7 +282,12 @@ this package never resolves environment variables or defaults.
   `TestWorktreeFallbackServesOnlyALoneUnlinkedRow`, the run-wide fallback
   serving only the run's lone unlinked row: a lone sibling-linked row, or
   one beside an unlinked row, resolves nothing and the launch is refused;
-  `TestWorktreeRepositoryAttemptLink`, the linked and solo round trips);
+  `TestWorktreeRepositoryAttemptLink`, the linked and solo round trips).
+  The harness's git fake `linkGit` follows the runner's capture contract
+  (`runnervectors.ValidateBound` before answering, `BoundCapture` on
+  every answer); `TestLinkGitCaptureContract` runs every shared
+  `CaptureVectors` case through it and pins its own common-directory
+  answer under a negative, a one-byte and an exact bound;
   the feature bootstrap (`bootstrap_test.go`:
   `TestInitializeRunFeatureShape` — run, snapshot workflow JSON, a
   reserved attempt-less parentless manager with its assigned native

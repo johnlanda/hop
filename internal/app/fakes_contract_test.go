@@ -10,6 +10,7 @@ import (
 	"github.com/johnlanda/hop/internal/app"
 	"github.com/johnlanda/hop/internal/domain/identity"
 	"github.com/johnlanda/hop/internal/domain/run"
+	"github.com/johnlanda/hop/internal/testsupport/runnervectors"
 	"github.com/johnlanda/hop/internal/testsupport/storevectors"
 )
 
@@ -342,65 +343,38 @@ func TestFakePortsRefuseCallsInsideTransactions(t *testing.T) {
 	}
 }
 
-// TestFakeCommandsBoundCapturedOutput proves the fake CommandRunner
-// reproduces the real Runner's bounded capture
-// (internal/adapters/process TestRunnerReportsTruncation): each stream
-// keeps its first 1 MiB — or the command's own MaxOutputBytes, per stream —
-// and is reported truncated exactly when bytes were discarded, on any exit
-// status, for scripted and hooked answers alike. A negative bound and an
-// answer claiming a truncation the real Runner could never report are
-// refused.
+// TestFakeCommandsBoundCapturedOutput runs the shared capture contract
+// (internal/testsupport/runnervectors, which the real Runner's
+// TestRunnerReportsTruncation also runs) through the fake CommandRunner,
+// for scripted and hooked answers alike: each stream keeps its bound — 1
+// MiB, or the command's own MaxOutputBytes — and is flagged truncated
+// exactly when bytes were discarded, and a negative bound is refused
+// before anything answers. Answers claiming a truncation the real Runner
+// could never report are refused too.
 func TestFakeCommandsBoundCapturedOutput(t *testing.T) {
-	const bound = 1 << 20
-	cases := []struct {
-		name                     string
-		answer                   app.CommandResult
-		limit                    int
-		wantStdout, wantStderr   int
-		stdoutTrunc, stderrTrunc bool
-	}{
-		{name: "small output", answer: app.CommandResult{Stdout: make([]byte, 10), Stderr: make([]byte, 5)}, wantStdout: 10, wantStderr: 5},
-		{name: "empty output", wantStdout: 0, wantStderr: 0},
-		{name: "exactly the bound is complete", answer: app.CommandResult{Stdout: make([]byte, bound)}, wantStdout: bound},
-		{name: "one byte past the bound", answer: app.CommandResult{Stdout: make([]byte, bound+1)}, wantStdout: bound, stdoutTrunc: true},
-		{name: "truncated on a failing exit", answer: app.CommandResult{ExitCode: 3, Stdout: make([]byte, 3*bound)}, wantStdout: bound, stdoutTrunc: true},
-		{name: "stderr alone", answer: app.CommandResult{Stdout: make([]byte, 7), Stderr: make([]byte, bound+1)}, wantStdout: 7, wantStderr: bound, stderrTrunc: true},
-		{name: "both streams", answer: app.CommandResult{Stdout: make([]byte, bound+9), Stderr: make([]byte, 2*bound)}, wantStdout: bound, wantStderr: bound, stdoutTrunc: true, stderrTrunc: true},
-		{name: "a claimed truncation holding exactly the bound", answer: app.CommandResult{Stdout: make([]byte, bound), StdoutTruncated: true}, wantStdout: bound, stdoutTrunc: true},
-		{name: "a larger per-call bound keeps output past the default", answer: app.CommandResult{Stdout: make([]byte, 2*bound+1)}, limit: 3 * bound, wantStdout: 2*bound + 1},
-		{name: "exactly a per-call bound is complete", answer: app.CommandResult{Stdout: make([]byte, 2*bound)}, limit: 2 * bound, wantStdout: 2 * bound},
-		{name: "one byte past a per-call bound", answer: app.CommandResult{Stdout: make([]byte, 2*bound+1)}, limit: 2 * bound, wantStdout: 2 * bound, stdoutTrunc: true},
-		{name: "a per-call bound applies to each stream", answer: app.CommandResult{Stdout: make([]byte, 3*bound), Stderr: make([]byte, 2*bound)}, limit: 2 * bound, wantStdout: 2 * bound, wantStderr: 2 * bound, stdoutTrunc: true},
-		{name: "a per-call bound below the default", answer: app.CommandResult{Stdout: make([]byte, 101), Stderr: make([]byte, 100)}, limit: 100, wantStdout: 100, wantStderr: 100, stdoutTrunc: true},
-		{name: "a claimed truncation holding exactly a per-call bound", answer: app.CommandResult{Stderr: make([]byte, 100), StderrTruncated: true}, limit: 100, wantStderr: 100, stderrTrunc: true},
-	}
 	argv := []string{"/usr/bin/git", "-C", "/repo", "ls-files", "-v", "-z"}
-	for _, tc := range cases {
+	for _, v := range runnervectors.CaptureVectors() {
 		for _, via := range []string{"scripted", "hooked"} {
-			t.Run(tc.name+", "+via, func(t *testing.T) {
+			t.Run(v.Name+", "+via, func(t *testing.T) {
 				commands := newTestController(defaultPolicy()).Commands
+				answer := v.Answer()
 				if via == "scripted" {
-					commands.Results[strings.Join(argv, " ")] = tc.answer
+					commands.Results[strings.Join(argv, " ")] = answer
 				} else {
-					commands.RunHook = func(context.Context, app.Command) (app.CommandResult, bool, error) { return tc.answer, true, nil }
+					commands.RunHook = func(context.Context, app.Command) (app.CommandResult, bool, error) { return answer, true, nil }
 				}
-				result, err := commands.Run(context.Background(), app.Command{Argv: argv, MaxOutputBytes: tc.limit})
-				if err != nil {
-					t.Fatalf("Run: %v", err)
+				result, err := commands.Run(context.Background(), app.Command{Argv: argv, MaxOutputBytes: v.MaxOutputBytes})
+				if checkErr := v.Check(result, err); checkErr != nil {
+					t.Error(checkErr)
 				}
-				if result.ExitCode != tc.answer.ExitCode {
-					t.Errorf("ExitCode = %d, want %d", result.ExitCode, tc.answer.ExitCode)
-				}
-				if len(result.Stdout) != tc.wantStdout || len(result.Stderr) != tc.wantStderr {
-					t.Errorf("captured %d stdout and %d stderr bytes, want %d and %d", len(result.Stdout), len(result.Stderr), tc.wantStdout, tc.wantStderr)
-				}
-				if result.StdoutTruncated != tc.stdoutTrunc || result.StderrTruncated != tc.stderrTrunc {
-					t.Errorf("StdoutTruncated = %v, StderrTruncated = %v; want %v, %v", result.StdoutTruncated, result.StderrTruncated, tc.stdoutTrunc, tc.stderrTrunc)
+				if answered := len(commands.Calls) != 0; answered == v.Refused {
+					t.Errorf("the command was answered = %v, want %v", answered, !v.Refused)
 				}
 			})
 		}
 	}
 
+	const bound = fakeCaptureBytes
 	t.Run("a hooked answer is bounded alongside its error, as the real Runner returns output with a cancellation", func(t *testing.T) {
 		commands := newTestController(defaultPolicy()).Commands
 		canceled := errors.New("canceled")
@@ -413,26 +387,35 @@ func TestFakeCommandsBoundCapturedOutput(t *testing.T) {
 		}
 	})
 
-	t.Run("a negative bound is refused before anything answers", func(t *testing.T) {
-		commands := newTestController(defaultPolicy()).Commands
-		if result, err := commands.Run(context.Background(), app.Command{Argv: argv, MaxOutputBytes: -1}); err == nil {
-			t.Fatalf("Run = %+v; want the negative bound refused", result)
-		}
-		if len(commands.Calls) != 0 {
-			t.Fatalf("a refused command was answered: %v", commands.Calls)
-		}
-	})
-
-	for name, answer := range map[string]app.CommandResult{
-		"a claimed stdout truncation short of the bound":                    {Stdout: make([]byte, 10), StdoutTruncated: true},
-		"a claimed stderr truncation with no output":                        {StderrTruncated: true},
-		"a claimed truncation holding the default bound under a larger one": {Stdout: make([]byte, bound), StdoutTruncated: true},
+	for name, tc := range map[string]struct {
+		answer app.CommandResult
+		limit  int
+	}{
+		"a claimed stdout truncation short of the bound":                    {answer: app.CommandResult{Stdout: make([]byte, 10), StdoutTruncated: true}},
+		"a claimed stderr truncation with no output":                        {answer: app.CommandResult{StderrTruncated: true}},
+		"a claimed truncation holding the default bound under a larger one": {answer: app.CommandResult{Stdout: make([]byte, bound), StdoutTruncated: true}, limit: 2 * bound},
 	} {
 		t.Run(name+" is refused", func(t *testing.T) {
 			commands := newTestController(defaultPolicy()).Commands
-			commands.RunHook = func(context.Context, app.Command) (app.CommandResult, bool, error) { return answer, true, nil }
-			if result, err := commands.Run(context.Background(), app.Command{Argv: argv, MaxOutputBytes: 2 * bound}); err == nil {
+			commands.RunHook = func(context.Context, app.Command) (app.CommandResult, bool, error) { return tc.answer, true, nil }
+			if result, err := commands.Run(context.Background(), app.Command{Argv: argv, MaxOutputBytes: tc.limit}); err == nil {
 				t.Fatalf("Run = %+v; want the impossible truncation refused", result)
+			}
+		})
+	}
+	for name, tc := range map[string]struct {
+		answer app.CommandResult
+		limit  int
+	}{
+		"a claimed truncation holding exactly the default bound": {answer: app.CommandResult{Stdout: make([]byte, bound), StdoutTruncated: true}},
+		"a claimed truncation holding exactly a per-call bound":  {answer: app.CommandResult{Stderr: make([]byte, 100), StderrTruncated: true}, limit: 100},
+	} {
+		t.Run(name+" is kept", func(t *testing.T) {
+			commands := newTestController(defaultPolicy()).Commands
+			commands.RunHook = func(context.Context, app.Command) (app.CommandResult, bool, error) { return tc.answer, true, nil }
+			result, err := commands.Run(context.Background(), app.Command{Argv: argv, MaxOutputBytes: tc.limit})
+			if err != nil || result.StdoutTruncated != tc.answer.StdoutTruncated || result.StderrTruncated != tc.answer.StderrTruncated {
+				t.Fatalf("Run = %+v, %v; want the claim kept", result, err)
 			}
 		})
 	}

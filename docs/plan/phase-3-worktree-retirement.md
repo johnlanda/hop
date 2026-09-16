@@ -782,8 +782,13 @@ consistent with sections 1 to 12.
   starts). The bound applies to each stream separately, and the buffer
   grows only as the child writes, never beyond the bound.
   `CommandResult.StdoutTruncated` and `StderrTruncated` report a stream
-  whose later bytes it discarded, whatever the exit status. The fake
-  runner applies the same bounds and computes the same flags. A kept prefix can end exactly on a record
+  whose later bytes it discarded, whatever the exit status.
+  `internal/testsupport/runnervectors` holds this contract once, as
+  shared vectors and a reference bound. The real runner and both
+  handwritten runner fakes (`fakeCommands` in `internal/app`, `linkGit`
+  in `internal/adapters/sqlite`) run the same vectors, including the
+  refused negative bound, and both fakes bound their answers through the
+  reference. A kept prefix can end exactly on a record
   boundary (an `ls-files -v -z` entry, a `worktree list -z` record) and
   then parses as complete output, so no rule decides on the prefix's
   shape.
