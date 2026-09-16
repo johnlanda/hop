@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/johnlanda/hop/internal/domain/identity"
@@ -90,13 +91,68 @@ type WorkflowSnapshot struct {
 	// IntegrationBranch is "hop/r<seq>/integration" (section 6): one
 	// ref-namespace scheme, computed once at freeze from the run's
 	// sequence and frozen so every later reference uses the identical
-	// name.
+	// name. A feature-mode InitializeRun refuses a snapshot whose branch
+	// does not name the sequence the store assigns (ErrRunSequenceMismatch).
 	IntegrationBranch string
+	// BaseCommitOID is the repository HEAD at freeze, resolved to an
+	// object ID (section 6, "Integration branch and worktree bases"): the
+	// commit the integration branch is created at. Frozen here, inside
+	// InitializeRun's transaction, so a crash before the integration.init
+	// intent commits never loses the base.
+	BaseCommitOID string
 }
 
 // Feature is true when the snapshot describes a feature-mode run. A solo
 // run's zero WorkflowSnapshot always reports false.
 func (w WorkflowSnapshot) Feature() bool { return w.Mode == "feature" } //nolint:gocritic // hugeParam: WorkflowSnapshot is a small value type read throughout the codebase by value, mirroring RunSnapshot's own convention; called at most a few times per controller pass, never a hot loop.
+
+// ErrFeatureRunSpecInvalid reports a feature-mode NewRunSpec that
+// InitializeRun refuses before writing anything. A feature run's first
+// transaction creates the run, its snapshot, the manager session and the
+// first lease only (docs/plan/phase-3-design.md section 9), so a spec
+// carrying a task, attempt or worktree identity — the solo bootstrap
+// shape — or lacking the manager session identity is refused.
+var ErrFeatureRunSpecInvalid = errors.New("app: feature-mode run spec is invalid")
+
+// ErrRunSequenceMismatch reports a feature-mode InitializeRun whose frozen
+// integration branch does not name the sequence the store assigned the
+// run: the freeze predicted a sequence another run took first. Nothing is
+// committed; the caller re-freezes against a fresh prediction.
+var ErrRunSequenceMismatch = errors.New("app: the frozen integration branch does not name the run's assigned sequence")
+
+// ValidateFeatureRunSpec checks the feature-mode shape of spec, shared by
+// every StateStore implementation so the refusal is identical everywhere:
+// the manager session identity is required, and the solo bootstrap
+// identities (task, attempt, worktree) must be absent. Errors wrap
+// ErrFeatureRunSpecInvalid and name fields, never values.
+func ValidateFeatureRunSpec(spec *NewRunSpec) error {
+	if spec.SessionID == "" {
+		return fmt.Errorf("%w: the manager session identity is required", ErrFeatureRunSpecInvalid)
+	}
+	for _, field := range []struct {
+		name string
+		set  bool
+	}{
+		{"a task", spec.TaskID != ""},
+		{"an attempt", spec.AttemptID != ""},
+		{"a worktree", spec.WorktreeID != ""},
+	} {
+		if field.set {
+			return fmt.Errorf("%w: a feature run is initialized without %s; tasks, attempts and worktrees are created by the scheduling pass", ErrFeatureRunSpecInvalid, field.name)
+		}
+	}
+	return nil
+}
+
+// RequireIntegrationBranchForSequence checks that a feature snapshot's
+// frozen integration branch names seq, the sequence the store assigned
+// inside InitializeRun's transaction. Errors wrap ErrRunSequenceMismatch.
+func RequireIntegrationBranchForSequence(w *WorkflowSnapshot, seq int) error {
+	if w.IntegrationBranch != IntegrationBranchName(seq) {
+		return fmt.Errorf("%w: the run was assigned sequence %d", ErrRunSequenceMismatch, seq)
+	}
+	return nil
+}
 
 // NewRunSpec is the complete, application-assembled input to InitializeRun:
 // every identity, digest and frozen value the run's first transaction
@@ -107,6 +163,12 @@ func (w WorkflowSnapshot) Feature() bool { return w.Mode == "feature" } //nolint
 // AssignmentDigest as the run's frozen intent, and the caller writes the
 // file through ArtifactStore afterward, as a separate act — no external
 // call, including a local file write, happens inside this transaction.
+//
+// A feature-mode spec (Snapshot.Workflow.Feature()) has a different shape
+// (ValidateFeatureRunSpec): SessionID, Harness and NativeSessionRef
+// describe the MANAGER session, and TaskID, AttemptID and WorktreeID are
+// empty — tasks, attempts and worktrees belong to the scheduling pass.
+// IncarnationID is never persisted by InitializeRun in either mode.
 type NewRunSpec struct {
 	// RepositoryRoot is the symlink-resolved absolute repository root — the
 	// design's repository identity — canonicalized by cmd/hop's single
@@ -375,6 +437,13 @@ type StateStore interface {
 	// snapshot, the task, attempt and session rows, and the initial
 	// controller lease, in one transaction. This is the only way a run and
 	// its first lease come into being, so there is no bootstrap cycle.
+	// A feature-mode spec instead creates the run, the snapshot with its
+	// workflow policy, the MANAGER session (role manager, no attempt, no
+	// parent, the pre-assigned native reference) and the lease — no task,
+	// attempt or worktree — refusing a malformed spec with
+	// ErrFeatureRunSpecInvalid before any write and a frozen integration
+	// branch naming another sequence with ErrRunSequenceMismatch inside
+	// the transaction, committing nothing either way.
 	InitializeRun(ctx context.Context, spec NewRunSpec) (identity.RunID, Lease, error)
 
 	// AcquireLease claims or takes over an existing run's controller lease

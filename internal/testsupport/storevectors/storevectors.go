@@ -182,3 +182,56 @@ func ReviewSubmitForeignReviewer(runID identity.RunID, taskID identity.TaskID, a
 		Verdict: run.VerdictApprove, ReasonsPath: reasonsPath, ReasonsDigest: reasonsDigest,
 	}
 }
+
+// Feature-run bootstrap vectors (docs/plan/phase-3-design.md section 9):
+// NewRunSpec values StateStore.InitializeRun must refuse. Each takes the
+// consuming test's own VALID feature-mode spec — the manager session
+// identity set, no task/attempt/worktree identity, and an integration
+// branch naming the sequence the store will assign — and returns a copy
+// bent into exactly one refused shape. Against internal/app's fakeStore
+// and internal/adapters/sqlite alike, every refusal commits nothing: no
+// run row, no snapshot, no session, no lease.
+
+// FeatureRunSpecWithTask returns valid carrying a task identity — the solo
+// bootstrap shape. Refused with an error wrapping
+// app.ErrFeatureRunSpecInvalid ("a feature run is initialized without a
+// task") before any write.
+func FeatureRunSpecWithTask(valid app.NewRunSpec, task identity.TaskID) app.NewRunSpec { //nolint:gocritic // hugeParam: a vector returns a modified copy of the caller's spec by design.
+	valid.TaskID = task
+	return valid
+}
+
+// FeatureRunSpecWithAttempt returns valid carrying an attempt identity.
+// Refused with an error wrapping app.ErrFeatureRunSpecInvalid ("a feature
+// run is initialized without an attempt") before any write.
+func FeatureRunSpecWithAttempt(valid app.NewRunSpec, attempt identity.AttemptID) app.NewRunSpec { //nolint:gocritic // hugeParam: a vector returns a modified copy of the caller's spec by design.
+	valid.AttemptID = attempt
+	return valid
+}
+
+// FeatureRunSpecWithWorktree returns valid carrying a worktree identity.
+// Refused with an error wrapping app.ErrFeatureRunSpecInvalid ("a feature
+// run is initialized without a worktree") before any write.
+func FeatureRunSpecWithWorktree(valid app.NewRunSpec, worktree identity.WorktreeID) app.NewRunSpec { //nolint:gocritic // hugeParam: a vector returns a modified copy of the caller's spec by design.
+	valid.WorktreeID = worktree
+	return valid
+}
+
+// FeatureRunSpecWithoutManager returns valid with no manager session
+// identity. Refused with an error wrapping app.ErrFeatureRunSpecInvalid
+// ("the manager session identity is required") before any write.
+func FeatureRunSpecWithoutManager(valid app.NewRunSpec) app.NewRunSpec { //nolint:gocritic // hugeParam: a vector returns a modified copy of the caller's spec by design.
+	valid.SessionID = ""
+	return valid
+}
+
+// FeatureRunSpecSequenceMismatch returns valid whose frozen integration
+// branch names assignedSeq+1 — a freeze that predicted a sequence another
+// run then took. Refused with an error wrapping app.ErrRunSequenceMismatch
+// ("the run was assigned sequence <assignedSeq>") INSIDE the transaction,
+// which rolls back: resubmitting valid itself afterward succeeds at
+// assignedSeq, since the refused attempt consumed nothing.
+func FeatureRunSpecSequenceMismatch(valid app.NewRunSpec, assignedSeq int) app.NewRunSpec { //nolint:gocritic // hugeParam: a vector returns a modified copy of the caller's spec by design.
+	valid.Snapshot.Workflow.IntegrationBranch = app.IntegrationBranchName(assignedSeq + 1)
+	return valid
+}
