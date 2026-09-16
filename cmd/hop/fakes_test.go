@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -66,6 +65,35 @@ type fakeController struct {
 
 	selectRunView func(label string) error
 	clearRunView  func() error
+
+	// frozenRepositoryRoot and frozenStateRoot are the scripted run's
+	// frozen roots: the unscripted AssignmentDefaults serves them, and
+	// AssignReadyTasks refuses any other value, exactly as the real
+	// Controller does. Empty selects fakeFrozenRepositoryRoot /
+	// fakeFrozenStateRoot.
+	frozenRepositoryRoot string
+	frozenStateRoot      string
+}
+
+// The scripted run's default frozen roots, deliberately distinct from
+// every directory a command test resolves from its own working directory
+// or environment.
+const (
+	fakeFrozenRepositoryRoot = "/frozen/repository"
+	fakeFrozenStateRoot      = "/frozen/state"
+)
+
+// frozenRoots returns the scripted run's frozen repository and state
+// roots.
+func (f *fakeController) frozenRoots() (repositoryRoot, stateRoot string) {
+	repositoryRoot, stateRoot = f.frozenRepositoryRoot, f.frozenStateRoot
+	if repositoryRoot == "" {
+		repositoryRoot = fakeFrozenRepositoryRoot
+	}
+	if stateRoot == "" {
+		stateRoot = fakeFrozenStateRoot
+	}
+	return repositoryRoot, stateRoot
 }
 
 func (f *fakeController) record(name string) {
@@ -275,13 +303,13 @@ func (f *fakeController) EnsureReviewTask(_ context.Context, _ app.RunHandle) (b
 // again.
 func requireAbsoluteAssignmentPaths(opts app.AssignmentOptions) error { //nolint:gocritic // hugeParam: AssignmentOptions is the per-call DTO the real port also takes by value.
 	if !filepath.IsAbs(opts.RepositoryRoot) {
-		return fmt.Errorf("assignment repository root %q is not absolute", opts.RepositoryRoot)
+		return errors.New("assignment repository root is not absolute")
 	}
 	if !filepath.IsAbs(opts.HOPPath) {
-		return fmt.Errorf("assignment hop executable path %q is not absolute", opts.HOPPath)
+		return errors.New("assignment hop executable path is not absolute")
 	}
 	if !filepath.IsAbs(opts.StateRoot) {
-		return fmt.Errorf("assignment state root %q is not absolute", opts.StateRoot)
+		return errors.New("assignment state root is not absolute")
 	}
 	return nil
 }
@@ -290,6 +318,15 @@ func (f *fakeController) AssignReadyTasks(_ context.Context, _ app.RunHandle, op
 	f.record("AssignReadyTasks")
 	if err := requireAbsoluteAssignmentPaths(opts); err != nil {
 		return app.AssignmentReport{}, err
+	}
+	// The real use case's requireFrozenAssignmentRoots: a root other than
+	// the run's frozen one is refused before any task is reserved.
+	repositoryRoot, stateRoot := f.frozenRoots()
+	if opts.RepositoryRoot != repositoryRoot {
+		return app.AssignmentReport{}, errors.New("assignment repository root is not the run's frozen repository root")
+	}
+	if opts.StateRoot != stateRoot {
+		return app.AssignmentReport{}, errors.New("assignment state root is not the run's frozen state root")
 	}
 	if f.assignReadyTasks == nil {
 		return app.AssignmentReport{}, nil
@@ -300,7 +337,8 @@ func (f *fakeController) AssignReadyTasks(_ context.Context, _ app.RunHandle, op
 func (f *fakeController) AssignmentDefaults(_ context.Context, _ app.RunHandle) (app.AssignmentOptions, error) { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.
 	f.record("AssignmentDefaults")
 	if f.assignmentDefaults == nil {
-		return app.AssignmentOptions{}, nil
+		repositoryRoot, stateRoot := f.frozenRoots()
+		return app.AssignmentOptions{RepositoryRoot: repositoryRoot, StateRoot: stateRoot}, nil
 	}
 	return f.assignmentDefaults()
 }

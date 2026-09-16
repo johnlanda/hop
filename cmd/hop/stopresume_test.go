@@ -529,6 +529,56 @@ func TestRunResume(t *testing.T) {
 		}
 	})
 
+	t.Run("resuming a feature run by UUID from another directory assigns in the frozen repository", func(t *testing.T) {
+		otherDir := t.TempDir()
+		for _, args := range [][]string{
+			{testRunID},
+			{"-C", otherDir, testRunID},
+		} {
+			ctrl := &fakeController{}
+			statusCalls := 0
+			ctrl.status = func(req app.StatusRequest) (app.StatusResult, error) {
+				if req.RunID != testRunID {
+					t.Errorf("status request = %+v, want the UUID looked up directly", req)
+				}
+				statusCalls++
+				state := "running"
+				if statusCalls > 3 { // resume's mode load, the label, the first tick
+					state = "completed"
+				}
+				return app.StatusResult{Detail: &app.RunDetailView{
+					RunSummaryView: app.RunSummaryView{RunID: testRunID, Sequence: 1, State: state},
+					Mode:           "feature",
+				}}, nil
+			}
+			ctrl.resumeFeature = func(app.ResumeFeatureRequest) (app.ResumeFeatureResult, app.RunHandle, error) {
+				return app.ResumeFeatureResult{Outcome: "resumed", RunState: "running"}, app.RunHandle{}, nil
+			}
+			var assigned []app.AssignmentOptions
+			ctrl.assignReadyTasks = func(opts app.AssignmentOptions) (app.AssignmentReport, error) {
+				assigned = append(assigned, opts)
+				return app.AssignmentReport{}, nil
+			}
+			td := newTestDeps(ctrl, env, otherDir)
+			var stdout, stderr bytes.Buffer
+
+			code, err := runResume(args, &stdout, &stderr, td.deps)
+			if err != nil {
+				t.Fatalf("write error: %v", err)
+			}
+			if code != exitOK {
+				t.Fatalf("args = %v: exit code = %d, want %d (stderr: %s)", args, code, exitOK, stderr.String())
+			}
+			if len(assigned) != 1 {
+				t.Fatalf("args = %v: AssignReadyTasks calls = %+v, want exactly one", args, assigned)
+			}
+			if assigned[0].RepositoryRoot != fakeFrozenRepositoryRoot || assigned[0].StateRoot != fakeFrozenStateRoot {
+				t.Errorf("args = %v: assignment roots = %q/%q, want the frozen %q/%q (never the caller's %q)",
+					args, assigned[0].RepositoryRoot, assigned[0].StateRoot, fakeFrozenRepositoryRoot, fakeFrozenStateRoot, otherDir)
+			}
+		}
+	})
+
 	t.Run("a feature-mode run on a controller missing the feature ports fails closed, never falls back to solo", func(t *testing.T) {
 		ctrl := &fakeController{}
 		ctrl.status = func(app.StatusRequest) (app.StatusResult, error) {

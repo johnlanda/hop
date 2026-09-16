@@ -111,7 +111,7 @@ func (c *featureCheckDriver) interrupt() (featureCheckOutcome, bool) {
 // task, AssignReadyTasks has no manager to delegate from — so the pass
 // runs only session-launch corroboration until the run is observed
 // running.
-func runFeatureControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, handle app.RunHandle, runID, label, repositoryRoot, hopPath, stateRoot string, stdout io.Writer) (loopResult, error) { //nolint:gocritic // hugeParam: RunHandle is the app-defined opaque token, passed by value as every Controller method takes it.
+func runFeatureControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, handle app.RunHandle, runID, label, hopPath string, stdout io.Writer) (loopResult, error) { //nolint:gocritic // hugeParam: RunHandle is the app-defined opaque token, passed by value as every Controller method takes it.
 	heartbeatFailed := runHeartbeats(ctx, d, ctrl, handle)
 	var (
 		lastState string
@@ -195,7 +195,7 @@ func runFeatureControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, 
 					return loopResult{}, errors.Join(fmt.Errorf("compose check spawn environment: %w", err), drainChecks())
 				}
 			}
-			if err := runFeatureSchedulingPass(ctx, ctrl, handle, detail.State, repositoryRoot, hopPath, stateRoot, spawnEnv); err != nil {
+			if err := runFeatureSchedulingPass(ctx, ctrl, handle, detail.State, hopPath, spawnEnv); err != nil {
 				return loopResult{}, errors.Join(err, drainChecks())
 			}
 			if outcome, ok := checks.poll(); ok {
@@ -221,14 +221,16 @@ func runFeatureControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, 
 // round. spawnEnv is the same sanitized environment the check driver
 // spawns hop check-exec with (computed once by the caller and cached
 // across ticks), reused here for the integration merge's own spawn.
-// repositoryRoot and stateRoot are the loop's own already-resolved
-// values, never re-read from the frozen run: AssignReadyTasks refuses an
-// empty or relative RepositoryRoot/HOPPath/StateRoot (fakes law
+// Every run-fixed AssignReadyTasks field — the frozen repository and
+// state roots included — comes from AssignmentDefaults: a known run
+// operates on its frozen repository, never on the directory hop was
+// invoked from, and AssignReadyTasks refuses any other root (fakes law
 // 06FD1A61 — cmd/hop's fakeController enforces the identical contract).
+// hopPath is the running binary, the one field the loop supplies itself.
 // runState gates the pass to session-launch corroboration alone while the
 // run is still launching (runStateLaunching); every other step requires a
 // settled manager session.
-func runFeatureSchedulingPass(ctx context.Context, ctrl controllerAPI, handle app.RunHandle, runState, repositoryRoot, hopPath, stateRoot string, spawnEnv []string) error { //nolint:gocritic // hugeParam: RunHandle is the app-defined opaque token, passed by value as every Controller method takes it.
+func runFeatureSchedulingPass(ctx context.Context, ctrl controllerAPI, handle app.RunHandle, runState, hopPath string, spawnEnv []string) error { //nolint:gocritic // hugeParam: RunHandle is the app-defined opaque token, passed by value as every Controller method takes it.
 	if runState == runStateLaunching {
 		if _, err := ctrl.CorroborateSessionLaunches(ctx, handle); err != nil {
 			return fmt.Errorf("corroborate session launches: %w", err)
@@ -254,9 +256,7 @@ func runFeatureSchedulingPass(ctx context.Context, ctrl controllerAPI, handle ap
 	if err != nil {
 		return fmt.Errorf("load assignment defaults: %w", err)
 	}
-	opts.RepositoryRoot = repositoryRoot
 	opts.HOPPath = hopPath
-	opts.StateRoot = stateRoot
 	opts.IntegrationHeadCommitOID, err = ctrl.ResolveIntegrationHead(ctx, handle)
 	if err != nil {
 		return fmt.Errorf("resolve integration head: %w", err)
@@ -293,8 +293,8 @@ func describeFeatureCheckReport(report *app.FeatureCheckReport) string {
 // finishControllerLoop's solo shape exactly (detach classification before
 // ordinary errors, the resume instruction on detach, releaseQuietly on
 // every other exit).
-func finishFeatureControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, handle app.RunHandle, runID, label, repositoryRoot, hopPath, stateRoot string, stdout, stderr io.Writer, command string) (int, error) { //nolint:gocritic // hugeParam: RunHandle is the app-defined opaque token, passed by value as every Controller method takes it.
-	result, err := runFeatureControllerLoop(ctx, d, ctrl, handle, runID, label, repositoryRoot, hopPath, stateRoot, stdout)
+func finishFeatureControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, handle app.RunHandle, runID, label, hopPath string, stdout, stderr io.Writer, command string) (int, error) { //nolint:gocritic // hugeParam: RunHandle is the app-defined opaque token, passed by value as every Controller method takes it.
+	result, err := runFeatureControllerLoop(ctx, d, ctrl, handle, runID, label, hopPath, stdout)
 	if err != nil {
 		if ctx.Err() != nil {
 			if reportable := nonCancellationCauses(err); reportable != nil {

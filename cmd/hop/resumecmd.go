@@ -126,7 +126,7 @@ func runResume(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 			}
 			sessionID = confirmAbsent.value
 		}
-		return runResumeFeature(ctx, d, ctrl, runID, sessionID, repoRoot, hopPath, stateRoot, stdout, stderr)
+		return runResumeFeature(ctx, d, ctrl, runID, sessionID, hopPath, stateRoot, stdout, stderr)
 	}
 
 	confirmBool := false
@@ -191,7 +191,9 @@ func runResume(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 // value is runtime state, not a usage error — the printed line names
 // exactly the id that session still requires), then dispatching to the
 // feature-mode loop or a status-based exit exactly like the solo branch.
-func runResumeFeature(ctx context.Context, d *deps, ctrl controllerAPI, runID, confirmAbsentSession, repositoryRoot, hopPath, stateRoot string, stdout, stderr io.Writer) (int, error) {
+// The caller's directory only scopes an r<seq> lookup: the loop assigns in
+// the run's frozen repository, whichever directory hop resume ran in.
+func runResumeFeature(ctx context.Context, d *deps, ctrl controllerAPI, runID, confirmAbsentSession, hopPath, stateRoot string, stdout, stderr io.Writer) (int, error) {
 	result, handle, err := ctrl.ResumeFeature(ctx, app.ResumeFeatureRequest{
 		RunID:                runID,
 		ControllerID:         d.newID(),
@@ -222,7 +224,7 @@ func runResumeFeature(ctx context.Context, d *deps, ctrl controllerAPI, runID, c
 
 	switch result.Outcome {
 	case "resumed", "stop-pending":
-		return finishFeatureControllerLoop(ctx, d, ctrl, handle, runID, label, repositoryRoot, hopPath, stateRoot, stdout, stderr, "hop resume")
+		return finishFeatureControllerLoop(ctx, d, ctrl, handle, runID, label, hopPath, stdout, stderr, "hop resume")
 	case "nothing-to-do":
 		status, statusErr := ctrl.Status(ctx, app.StatusRequest{RunID: runID})
 		releaseQuietly(ctx, ctrl, handle)
