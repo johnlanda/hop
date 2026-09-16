@@ -40,7 +40,11 @@ func newInspectFixture(t *testing.T) *inspectFixture {
 	base := git.newCommit("tree-base")
 	head := git.newCommit("tree-head", base)
 	tc.Commands.RunHook = git.Hook
-	t.Cleanup(func() { git.requireNoForcedAttemptRemovals(t) })
+	git.setFsmonitorHook(true)
+	t.Cleanup(func() {
+		git.requireNoForcedAttemptRemovals(t)
+		git.requireNoFsmonitorRuns(t)
+	})
 	return &inspectFixture{tc: tc, git: git, base: base, head: head, present: map[string]bool{inspectRoot: true, inspectCommon: true}}
 }
 

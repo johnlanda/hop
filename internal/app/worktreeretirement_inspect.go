@@ -73,6 +73,14 @@ func (c *Controller) retirementGit(ctx context.Context, dir string, args ...stri
 	return c.Commands.Run(ctx, Command{Argv: append([]string{c.GitExecutable, "-C", dir}, args...), Env: retirementGitEnv()})
 }
 
+// retirementIndexRead prefixes a read of a checkout's index with
+// `-c core.fsmonitor=false`: a repository-local fsmonitor hook would
+// otherwise run on the read, and on every submodule read git recurses
+// into, which inherit the override (probe-pinned).
+func retirementIndexRead(args ...string) []string {
+	return append([]string{"-c", "core.fsmonitor=false"}, args...)
+}
+
 // attemptCheckout is one candidate's recorded provenance.
 type attemptCheckout struct {
 	RepositoryRoot string
@@ -178,14 +186,16 @@ func (c *Controller) inspectAttemptCheckout(ctx context.Context, candidate *atte
 	case ancestryContained:
 	}
 
-	status, err := c.retirementGit(ctx, record.Path, "status", "--porcelain=v1", "--untracked-files=all")
+	// An explicit --ignore-submodules=none keeps a repository-local
+	// diff.ignoreSubmodules from hiding a dirty submodule (probe-pinned).
+	status, err := c.retirementGit(ctx, record.Path, retirementIndexRead("status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none")...)
 	if err != nil || status.ExitCode != 0 {
 		return retainedVerdict(RetainedInspectionFailed, record.Path, "the checkout's status could not be read")
 	}
 	if strings.TrimSpace(string(status.Stdout)) != "" {
 		return retainedVerdict(RetainedUncommittedChanges, record.Path, "git status reports uncommitted or untracked changes")
 	}
-	tags, err := c.retirementGit(ctx, record.Path, "ls-files", "-v", "-z")
+	tags, err := c.retirementGit(ctx, record.Path, retirementIndexRead("ls-files", "-v", "-z")...)
 	if err != nil || tags.ExitCode != 0 {
 		return retainedVerdict(RetainedInspectionFailed, record.Path, "the checkout's index could not be read")
 	}

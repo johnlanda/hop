@@ -62,12 +62,14 @@ func worktreeRetirementCheckArgv(git, repositoryRoot, headOID, targetOID string)
 
 // worktreeRetireArgv is the frozen removal argv. It never carries a force
 // option, so git's own refusal of a checkout with modified, staged or
-// untracked files stays in force; the `-c status.showUntrackedFiles=all`
-// override keeps untracked files visible to that refusal whatever the
-// repository's own configuration says (probe-pinned: a repository-local
-// `no` otherwise lets the removal delete them).
+// untracked files stays in force. Two overrides are probe-pinned:
+// `-c status.showUntrackedFiles=all` keeps untracked files visible to that
+// refusal whatever the repository's own configuration says (a
+// repository-local `no` otherwise lets the removal delete them), and
+// `-c core.fsmonitor=false` keeps a repository-local fsmonitor hook from
+// running during the removal's own clean check.
 func worktreeRetireArgv(git, repositoryRoot, path string) []string {
-	return []string{git, "-C", repositoryRoot, "-c", "status.showUntrackedFiles=all", "worktree", "remove", path}
+	return []string{git, "-C", repositoryRoot, "-c", "status.showUntrackedFiles=all", "-c", "core.fsmonitor=false", "worktree", "remove", path}
 }
 
 // WorktreeRetirementRepositories is the controller-transaction surface

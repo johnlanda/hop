@@ -145,7 +145,18 @@ package only observes and signals.
   assume-unchanged/skip-worktree), missing and symlinked checkout paths,
   the `worktree list --porcelain -z` record shapes, and the target,
   repository-identity (`cat-file -e <oid>^{commit}`) and ancestry exit
-  statuses. Skips with a reason when no git is on PATH.
+  statuses. [gitworktree_fsmonitor_probe_test.go](gitworktree_fsmonitor_probe_test.go)
+  adds the repository-code rows. `TestGitProbeFsmonitorOverride`
+  proves a repository-local `core.fsmonitor` hook runs on plain
+  `status`, `ls-files` and `worktree remove`, and never with
+  `-c core.fsmonitor=false`, with the pre-check output unchanged.
+  `TestGitProbeSubmoduleCheckouts` covers a checkout holding a
+  submodule: the submodule's own hook runs through `status` recursion
+  unless the inherited override is set, `diff.ignoreSubmodules=all`
+  hides its changes unless `--ignore-submodules=none` is explicit, and
+  `worktree remove` refuses the checkout, clean or dirty (exit 128, the
+  exact text). The hook only appends to a marker under the test's
+  temporary directory. Skips with a reason when no git is on PATH.
 - Test fixtures: none on disk; helper modes and ps stubs are written by the
   tests.
 

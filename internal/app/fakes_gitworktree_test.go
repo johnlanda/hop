@@ -41,6 +41,10 @@ type fakeAttemptWorktree struct {
 	Ignored         bool // no status line; deleted by a removal
 	AssumeUnchanged bool // `h f.txt`; the change is invisible to status
 	SkipWorktree    bool // `S g.txt`; the change is invisible to status
+	// HasSubmodule is an initialized submodule `sub`: git refuses to
+	// remove the checkout at all; DirtySubmodule adds ` M sub` to status.
+	HasSubmodule   bool
+	DirtySubmodule bool
 }
 
 // fakeAttemptWorktrees is the fake repository's attempt-worktree state.
@@ -51,6 +55,9 @@ type fakeAttemptWorktrees struct {
 	// hideUntracked models a repository-local
 	// status.showUntrackedFiles=no.
 	hideUntracked bool
+	// fsmonitorHook models a repository-local core.fsmonitor hook: every
+	// index read and removal without `-c core.fsmonitor=false` runs it.
+	fsmonitorHook bool
 	byPath        map[string]*fakeAttemptWorktree
 
 	// RemoveCalls records every attempt-worktree removal argv tail.
@@ -62,17 +69,23 @@ type fakeAttemptWorktrees struct {
 	// check did not see (ignored files, untracked files hidden by config,
 	// index-flag-hidden modifications).
 	DeletedHiddenData []string
+	// FsmonitorRuns records every invocation that ran the repository's
+	// fsmonitor hook.
+	FsmonitorRuns []string
 }
 
 const (
 	fakeGitMainHead = "commit-main"
 	// fakeDirtyRefusal, fakeLockedRefusal and fakeNotWorkingTree are the
 	// probe-pinned stderr texts, %s the checkout path.
-	fakeDirtyRefusal   = "fatal: '%s' contains modified or untracked files, use --force to delete it\n"
-	fakeLockedRefusal  = "fatal: cannot remove a locked working tree;\nuse 'remove -f -f' to override or unlock first\n"
-	fakeLockedReason   = "fatal: cannot remove a locked working tree, lock reason: %s\nuse 'remove -f -f' to override or unlock first\n"
-	fakeNotWorkingTree = "fatal: '%s' is not a working tree\n"
-	fakeCannotChangeTo = "fatal: cannot change to '%s': No such file or directory\n"
+	fakeDirtyRefusal     = "fatal: '%s' contains modified or untracked files, use --force to delete it\n"
+	fakeLockedRefusal    = "fatal: cannot remove a locked working tree;\nuse 'remove -f -f' to override or unlock first\n"
+	fakeLockedReason     = "fatal: cannot remove a locked working tree, lock reason: %s\nuse 'remove -f -f' to override or unlock first\n"
+	fakeNotWorkingTree   = "fatal: '%s' is not a working tree\n"
+	fakeCannotChangeTo   = "fatal: cannot change to '%s': No such file or directory\n"
+	fakeSubmoduleRefusal = "fatal: working trees containing submodules cannot be moved or removed\n"
+	// fakeFsmonitorOff is the override that keeps the hook from running.
+	fakeFsmonitorOff = "core.fsmonitor=false"
 )
 
 // setAttemptRepository names the repository root and common directory the
@@ -100,6 +113,38 @@ func (g *fakeGitRepo) setHideUntracked(hide bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.attempt.hideUntracked = hide
+}
+
+// setFsmonitorHook sets the repository-local core.fsmonitor hook
+// condition.
+func (g *fakeGitRepo) setFsmonitorHook(hook bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.attempt.fsmonitorHook = hook
+}
+
+// fsmonitorRuns returns a copy of the invocations that ran the hook.
+func (g *fakeGitRepo) fsmonitorRuns() []string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return slices.Clone(g.attempt.FsmonitorRuns)
+}
+
+// requireNoFsmonitorRuns fails t when any invocation ran the repository's
+// fsmonitor hook.
+func (g *fakeGitRepo) requireNoFsmonitorRuns(t *testing.T) {
+	t.Helper()
+	if runs := g.fsmonitorRuns(); len(runs) != 0 {
+		t.Errorf("git invocations ran the repository's fsmonitor hook: %v", runs)
+	}
+}
+
+// indexReadLocked records a hook run for an index read or removal made
+// without the override. Callers hold g.mu.
+func (g *fakeGitRepo) indexReadLocked(configs []string, invocation string) {
+	if g.attempt.fsmonitorHook && !slices.Contains(configs, fakeFsmonitorOff) {
+		g.attempt.FsmonitorRuns = append(g.attempt.FsmonitorRuns, invocation)
+	}
 }
 
 // attemptWorktree returns a copy of the checkout at path.
@@ -152,9 +197,11 @@ func (g *fakeGitRepo) runAttemptWorktreeGitLocked(dir string, configs []string, 
 		return app.CommandResult{}, false
 	case !w.Present:
 		return app.CommandResult{ExitCode: 128, Stderr: fmt.Appendf(nil, fakeCannotChangeTo, dir)}, true
-	case sub == "status" && slices.Equal(rest, []string{"--porcelain=v1", "--untracked-files=all"}):
+	case sub == "status" && slices.Equal(rest, []string{"--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none"}):
+		g.indexReadLocked(configs, "status "+dir)
 		return app.CommandResult{Stdout: []byte(attemptStatusLines(w, true))}, true
 	case sub == "ls-files" && slices.Equal(rest, []string{"-v", "-z"}):
+		g.indexReadLocked(configs, "ls-files "+dir)
 		return app.CommandResult{Stdout: []byte(attemptIndexTags(w))}, true
 	case sub == "rev-parse" && slices.Contains(rest, "--git-common-dir"):
 		common := w.CommonDir
@@ -176,6 +223,9 @@ func attemptStatusLines(w *fakeAttemptWorktree, showUntracked bool) string {
 	}
 	if w.Modified {
 		lines = append(lines, " M f.txt")
+	}
+	if w.DirtySubmodule {
+		lines = append(lines, " M sub")
 	}
 	if showUntracked && w.NestedRepo {
 		lines = append(lines, "?? nested/")
@@ -264,6 +314,10 @@ func (g *fakeGitRepo) attemptRemoveLocked(configs, options []string, path string
 	case w.Locked:
 		return app.CommandResult{ExitCode: 128, Stderr: []byte(fakeLockedRefusal)}
 	}
+	g.indexReadLocked(configs, "worktree remove "+path)
+	if w.Present && w.HasSubmodule {
+		return app.CommandResult{ExitCode: 128, Stderr: []byte(fakeSubmoduleRefusal)}
+	}
 	if w.Present {
 		showUntracked := !m.hideUntracked || slices.Contains(configs, "status.showUntrackedFiles=all")
 		if attemptStatusLines(w, showUntracked) != "" {
@@ -302,6 +356,7 @@ func TestFakeAttemptWorktreesReproduceTheProbe(t *testing.T) {
 		branch = "refs/heads/hop/r1/t1a1"
 	)
 	override := []string{"-c", "status.showUntrackedFiles=all"}
+	precheck := []string{"status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none"}
 	cases := []struct {
 		name        string
 		state       fakeAttemptWorktree
@@ -326,6 +381,8 @@ func TestFakeAttemptWorktreesReproduceTheProbe(t *testing.T) {
 		{name: "untracked hidden by config, with the override", state: fakeAttemptWorktree{Untracked: true}, hide: true, configs: override, wantStatus: "?? new.txt\n", wantExit: 128, wantStderr: fmt.Sprintf(fakeDirtyRefusal, path)},
 		{name: "HAZARD assume-unchanged", state: fakeAttemptWorktree{AssumeUnchanged: true}, wantTags: "H .gitignore\x00h f.txt\x00H g.txt\x00", wantRemoved: true, wantHidden: true},
 		{name: "HAZARD skip-worktree", state: fakeAttemptWorktree{SkipWorktree: true}, wantTags: "H .gitignore\x00H f.txt\x00S g.txt\x00", wantRemoved: true, wantHidden: true},
+		{name: "clean submodule", state: fakeAttemptWorktree{HasSubmodule: true}, wantExit: 128, wantStderr: fakeSubmoduleRefusal},
+		{name: "dirty submodule", state: fakeAttemptWorktree{HasSubmodule: true, DirtySubmodule: true}, wantStatus: " M sub\n", wantExit: 128, wantStderr: fakeSubmoduleRefusal},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -336,12 +393,12 @@ func TestFakeAttemptWorktreesReproduceTheProbe(t *testing.T) {
 			state.Branch, state.Head, state.Present = branch, "commit-base", true
 			g.addAttemptWorktree(path, state)
 
-			status := g.runGitArgv([]string{"-C", path, "status", "--porcelain=v1", "--untracked-files=all"})
+			status := g.runGitArgv(append([]string{"-C", path, "-c", fakeFsmonitorOff}, precheck...))
 			if status.ExitCode != 0 || string(status.Stdout) != tc.wantStatus {
 				t.Errorf("status = exit %d %q, want %q", status.ExitCode, status.Stdout, tc.wantStatus)
 			}
 			if tc.wantTags != "" {
-				if tags := g.runGitArgv([]string{"-C", path, "ls-files", "-v", "-z"}); string(tags.Stdout) != tc.wantTags {
+				if tags := g.runGitArgv([]string{"-C", path, "-c", fakeFsmonitorOff, "ls-files", "-v", "-z"}); string(tags.Stdout) != tc.wantTags {
 					t.Errorf("ls-files -v -z = %q, want %q", tags.Stdout, tc.wantTags)
 				}
 			}
@@ -360,6 +417,33 @@ func TestFakeAttemptWorktreesReproduceTheProbe(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("a repository-local fsmonitor hook runs on every index read and removal without the override", func(t *testing.T) {
+		g := newFakeGitRepo("/opt/homebrew/bin/git", "/opt/hop/bin/hop")
+		g.setAttemptRepository(root, "/srv/repo/.git")
+		g.setFsmonitorHook(true)
+		for _, wt := range []string{"/wt/plain", "/wt/guarded", "/wt/old"} {
+			g.addAttemptWorktree(wt, fakeAttemptWorktree{Branch: branch, Head: "commit-base", Present: true})
+		}
+		g.runGitArgv(append([]string{"-C", "/wt/plain"}, precheck...))
+		g.runGitArgv([]string{"-C", "/wt/plain", "ls-files", "-v", "-z"})
+		g.runGitArgv([]string{"-C", root, "-c", "status.showUntrackedFiles=all", "worktree", "remove", "/wt/plain"})
+		want := []string{"status /wt/plain", "ls-files /wt/plain", "worktree remove /wt/plain"}
+		if runs := g.fsmonitorRuns(); !slices.Equal(runs, want) {
+			t.Fatalf("hook runs without the override = %q, want %q", runs, want)
+		}
+		g.runGitArgv(append([]string{"-C", "/wt/guarded", "-c", fakeFsmonitorOff}, precheck...))
+		g.runGitArgv([]string{"-C", "/wt/guarded", "-c", fakeFsmonitorOff, "ls-files", "-v", "-z"})
+		if removed := g.runGitArgv([]string{"-C", root, "-c", "status.showUntrackedFiles=all", "-c", fakeFsmonitorOff, "worktree", "remove", "/wt/guarded"}); removed.ExitCode != 0 {
+			t.Fatalf("guarded removal = exit %d", removed.ExitCode)
+		}
+		if runs := g.fsmonitorRuns(); !slices.Equal(runs, want) {
+			t.Fatalf("the override still ran the hook: %q", runs)
+		}
+		if old := g.runGitArgv([]string{"-C", "/wt/old", "-c", fakeFsmonitorOff, "status", "--porcelain=v1", "--untracked-files=all"}); old.ExitCode != 2 {
+			t.Fatalf("a pre-check without --ignore-submodules=none = exit %d, want the model's unhandled refusal", old.ExitCode)
+		}
+	})
 
 	t.Run("listing, prunable removal, identity and a forced removal", func(t *testing.T) {
 		g := newFakeGitRepo("/opt/homebrew/bin/git", "/opt/hop/bin/hop")
@@ -380,7 +464,7 @@ func TestFakeAttemptWorktreesReproduceTheProbe(t *testing.T) {
 		if string(list.Stdout) != want {
 			t.Errorf("list = %q, want %q", list.Stdout, want)
 		}
-		if missing := g.runGitArgv([]string{"-C", "/wt/d", "status", "--porcelain=v1", "--untracked-files=all"}); missing.ExitCode != 128 || string(missing.Stderr) != fmt.Sprintf(fakeCannotChangeTo, "/wt/d") {
+		if missing := g.runGitArgv(append([]string{"-C", "/wt/d"}, precheck...)); missing.ExitCode != 128 || string(missing.Stderr) != fmt.Sprintf(fakeCannotChangeTo, "/wt/d") {
 			t.Errorf("status in a missing checkout = exit %d %q", missing.ExitCode, missing.Stderr)
 		}
 		if removed := g.runGitArgv([]string{"-C", root, "-c", "status.showUntrackedFiles=all", "worktree", "remove", "/wt/d"}); removed.ExitCode != 0 {

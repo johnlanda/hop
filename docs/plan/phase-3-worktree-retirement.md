@@ -181,7 +181,7 @@ filesystem access.
 | listed `prunable` (directory gone) on the recorded branch | removable (the act prunes the entry; outcome `absent`) |
 | `git -C <path> rev-parse --path-format=absolute --git-common-dir` ≠ the root's | `released`: another repository |
 | `merge-base --is-ancestor <recorded base> <listed HEAD>` exit 1 | `released`: HEAD no longer descends from the recorded base |
-| `git -C <path> status --porcelain=v1 --untracked-files=all` non-empty | retained: `uncommitted-changes` |
+| `git -C <path> -c core.fsmonitor=false status --porcelain=v1 --untracked-files=all --ignore-submodules=none` non-empty | retained: `uncommitted-changes` |
 | `git -C <path> ls-files -v -z` has a lowercase tag or `S` | retained: `hidden-changes` |
 | any of the above exits unexpectedly | retained: `inspection-failed` |
 | otherwise | removable |
@@ -250,7 +250,7 @@ still retain the worktree, under any `status.showUntrackedFiles` setting.
 1. Commit the intent.
 2. `revalidateForDispatch`.
 3. Spawn
-   `hop check-exec --op <op> -- <git> -C <root> -c status.showUntrackedFiles=all worktree remove <listed path>`,
+   `hop check-exec --op <op> -- <git> -C <root> -c status.showUntrackedFiles=all -c core.fsmonitor=false worktree remove <listed path>`,
    with `Dir` set to the root and the environment set to the run's
    sanitized spawn environment plus `HOP_STATE_DIR` and the retirement git
    variables.
@@ -525,9 +525,9 @@ kinds.
 - **The residual window inside git** between its own clean check and its
   deletion is unavoidable (Herdr has the same).
 - **A repository-local `core.fsmonitor` hook** could misreport status and
-  also executes repository-local code. Phase B adds
-  `-c core.fsmonitor=false` to the pre-check and the act, with a probe row
-  pinning it.
+  also executes repository-local code. Phase B passes
+  `-c core.fsmonitor=false` on the pre-check's index reads and on the act,
+  pinned by probe rows (section 13).
 - **Global ignore rules.** Retirement git runs with global and system
   configuration suppressed, so a file ignored only by the operator's
   global `core.excludesFile` counts as untracked and retains the
@@ -733,6 +733,46 @@ consistent with sections 1 to 12.
   - A solo run keeps its single line. `RunDetail` carries the rows and the
     run's `worktree.retire` operations, and app code derives each row's
     view.
+
+**Repository code in the checkout.**
+
+- **The fsmonitor hook.** A repository-local `core.fsmonitor` hook runs
+  on every index read git makes, including the pre-check's `status` and
+  `ls-files` and the removal's own clean check. The pre-check's index
+  reads and the removal argv therefore carry `-c core.fsmonitor=false`,
+  so the removal argv is
+  `git -C <root> -c status.showUntrackedFiles=all -c core.fsmonitor=false worktree remove <path>`.
+  Child git processes inherit command-line configuration through
+  `GIT_CONFIG_PARAMETERS`, so the override also reaches a submodule
+  `status` recurses into.
+  - The probe rows prove the hazard first: each plain invocation runs the
+    hook, including a submodule's own. Then they prove the protection:
+    with the override, the hook never runs
+    (`TestGitProbeFsmonitorOverride`, `TestGitProbeSubmoduleCheckouts`).
+  - The real-binary merged test repeats this with a hook that
+    `hop status` must never run.
+- **Submodules.**
+  - The pre-check passes `--ignore-submodules=none` explicitly. A
+    repository-local `diff.ignoreSubmodules=all` otherwise hides a dirty
+    submodule from `status` (probe-pinned), so such a checkout is retained
+    as `uncommitted-changes`.
+  - `git worktree remove` refuses any checkout that holds an initialized
+    submodule, clean or not: exit 128, "fatal: working trees containing
+    submodules cannot be moved or removed". A clean one therefore reaches
+    the act, is refused, and is retained as `remove-refused` with the
+    evidence path. HOP never removes it.
+- **Residual: clean and smudge filters.** `git status` can run
+  repository-configured clean filters (`filter.<name>.clean`, selected by
+  `.gitattributes`) on racily-clean files, and no single command-line
+  switch neutralizes that. This is a documented residual, not a defect.
+  - The design's trust model treats workers as cooperative participants
+    in the run's transitions, not as a boundary against an agent running
+    under the operator's own UID, which can already run code as the
+    operator.
+  - The integration check already runs repository code by design (the
+    check command).
+  - Retirement's own git reads suppress global and system configuration
+    and fsmonitor, and never force a removal.
 
 **Dispatch revalidation (`revalidateRetirementDispatch`).** Both claimed
 acts run it immediately before the spawn:

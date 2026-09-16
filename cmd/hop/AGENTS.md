@@ -221,7 +221,8 @@ commands expect the built binary at `.bin/hop` (see `make build`).
   worktree-retirement green boundary through the real binary and real
   git:
   - **Merged:** both checkouts are removed, ignored build output
-    included, with the branches kept, git's list empty, section 6's lines
+    included, with a repository-local fsmonitor hook that never runs and
+    the branches kept, git's list empty, section 6's lines
     printed and the fact rendered by `-run` with per-row lines. A second
     `hop status` prints only the listing, journals nothing and takes no
     lease.

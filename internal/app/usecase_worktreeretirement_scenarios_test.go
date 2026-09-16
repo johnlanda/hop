@@ -340,7 +340,7 @@ func TestWorktreeRetirementSiblingRows(t *testing.T) {
 			t.Fatalf("the sibling row = %s, want removed", f.rowState(sibling.WorktreeID))
 		}
 		removes, _, _ := f.git.attemptLog()
-		if want := []string{"status.showUntrackedFiles=all " + sibling.Listed}; !slices.Equal(removes, want) {
+		if want := []string{"status.showUntrackedFiles=all core.fsmonitor=false " + sibling.Listed}; !slices.Equal(removes, want) {
 			t.Fatalf("removals = %v, want only the sibling's own, once", removes)
 		}
 		if _, modeled := f.git.attemptWorktree(stray.Listed); !modeled {

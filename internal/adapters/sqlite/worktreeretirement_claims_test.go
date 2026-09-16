@@ -16,8 +16,8 @@ func retirementIntent(argv []string, cwd string) map[string]any {
 }
 
 var (
-	retirementCheckTestArgv = []string{"/usr/bin/git", "-C", "/repos/feature", "merge-base", "--is-ancestor", "1111111111111111111111111111111111111111", "2222222222222222222222222222222222222222"} //nolint:gochecknoglobals // immutable test vector shared by the claim and context tests.
-	worktreeRetireTestArgv  = []string{"/usr/bin/git", "-C", "/repos/feature", "-c", "status.showUntrackedFiles=all", "worktree", "remove", "/worktrees/feature/hop-r1-t1a1"}                         //nolint:gochecknoglobals // immutable test vector shared by the claim and context tests.
+	retirementCheckTestArgv = []string{"/usr/bin/git", "-C", "/repos/feature", "merge-base", "--is-ancestor", "1111111111111111111111111111111111111111", "2222222222222222222222222222222222222222"}       //nolint:gochecknoglobals // immutable test vector shared by the claim and context tests.
+	worktreeRetireTestArgv  = []string{"/usr/bin/git", "-C", "/repos/feature", "-c", "status.showUntrackedFiles=all", "-c", "core.fsmonitor=false", "worktree", "remove", "/worktrees/feature/hop-r1-t1a1"} //nolint:gochecknoglobals // immutable test vector shared by the claim and context tests.
 )
 
 // TestClaimCheckExecRetirementKinds proves both worktree-retirement kinds

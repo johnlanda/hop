@@ -19,7 +19,7 @@ func TestWorktreeRetirementArgvShapes(t *testing.T) {
 	}
 
 	remove := worktreeRetireArgv("/usr/bin/git", "/repo", "/worktrees/repo/hop-r3-t1a1")
-	wantRemove := []string{"/usr/bin/git", "-C", "/repo", "-c", "status.showUntrackedFiles=all", "worktree", "remove", "/worktrees/repo/hop-r3-t1a1"}
+	wantRemove := []string{"/usr/bin/git", "-C", "/repo", "-c", "status.showUntrackedFiles=all", "-c", "core.fsmonitor=false", "worktree", "remove", "/worktrees/repo/hop-r3-t1a1"}
 	if !slices.Equal(remove, wantRemove) {
 		t.Errorf("worktree retire argv = %q, want %q", remove, wantRemove)
 	}

@@ -53,8 +53,12 @@ func newRetireFixture(t *testing.T) *retireFixture {
 		ignoredOnly:   map[string]bool{},
 	}
 	f.baseHook = f.tc.Commands.RunHook
+	// Every fixture repository carries a repository-local fsmonitor hook:
+	// no scenario may ever run it.
+	f.git.setFsmonitorHook(true)
 	t.Cleanup(func() {
 		f.git.requireNoForcedAttemptRemovals(t)
+		f.git.requireNoFsmonitorRuns(t)
 		_, _, hidden := f.git.attemptLog()
 		for _, path := range hidden {
 			if !f.ignoredOnly[path] {
@@ -221,7 +225,7 @@ func TestRemoveRunWorktrees(t *testing.T) {
 			t.Fatalf("worktree.retire ops %d, claims %d, spawns %d; want one claimed spawn per removal", len(ops), f.claims, len(f.spawns))
 		}
 		removes, _, _ := f.git.attemptLog()
-		wantRemoves := []string{"status.showUntrackedFiles=all " + a.Listed, "status.showUntrackedFiles=all " + b.Listed}
+		wantRemoves := []string{"status.showUntrackedFiles=all core.fsmonitor=false " + a.Listed, "status.showUntrackedFiles=all core.fsmonitor=false " + b.Listed}
 		if !slices.Equal(removes, wantRemoves) {
 			t.Fatalf("removal calls = %q, want %q", removes, wantRemoves)
 		}
@@ -231,7 +235,7 @@ func TestRemoveRunWorktrees(t *testing.T) {
 			t.Fatalf("operation = %+v, want succeeded removed", op)
 		}
 		intent, _ := jsonFields(op.Intent)
-		wantArgv := []any{f.tc.Controller.GitExecutable, "-C", detectRoot, "-c", "status.showUntrackedFiles=all", "worktree", "remove", a.Listed}
+		wantArgv := []any{f.tc.Controller.GitExecutable, "-C", detectRoot, "-c", "status.showUntrackedFiles=all", "-c", "core.fsmonitor=false", "worktree", "remove", a.Listed}
 		if !equalJSONList(intent["argv"], wantArgv) || intent["cwd"] != detectRoot {
 			t.Fatalf("intent argv/cwd = %v %v, want %v in the root", intent["argv"], intent["cwd"], wantArgv)
 		}
@@ -450,6 +454,7 @@ func TestRemoveRunWorktrees(t *testing.T) {
 		{name: "HAZARD skip-worktree", state: fakeAttemptWorktree{SkipWorktree: true}, want: app.RetainedHiddenChanges},
 		{name: "HAZARD ignored files beside an assume-unchanged change", state: fakeAttemptWorktree{Ignored: true, AssumeUnchanged: true}, want: app.RetainedHiddenChanges},
 		{name: "locked", state: fakeAttemptWorktree{Locked: true, LockReason: "in use"}, want: app.RetainedLocked},
+		{name: "dirty submodule", state: fakeAttemptWorktree{HasSubmodule: true, DirtySubmodule: true}, want: app.RetainedUncommittedChanges},
 		{name: "unreadable path", fail: true, want: app.RetainedInspectionFailed},
 	}
 	for _, tc := range retained {
@@ -570,6 +575,19 @@ func TestRemoveRunWorktrees(t *testing.T) {
 			},
 			wantRow: "retained", wantState: run.WorktreeActive, wantOpState: app.OperationFailed, wantResult: "refused",
 			wantRetained: app.RetainedLocked, wantExit: 128, wantEvidence: true,
+		},
+		{
+			name: "a clean checkout holding a submodule: git refuses, remove-refused with the exit code",
+			hook: func(f *retireFixture, a *retireAttempt) func(app.Command) (app.CommandResult, bool, error) {
+				return func(app.Command) (app.CommandResult, bool, error) {
+					w, _ := f.git.attemptWorktree(a.Listed)
+					w.HasSubmodule = true
+					f.git.addAttemptWorktree(a.Listed, w)
+					return app.CommandResult{}, false, nil
+				}
+			},
+			wantRow: "retained", wantState: run.WorktreeActive, wantOpState: app.OperationFailed, wantResult: "refused",
+			wantRetained: app.RetainedRemoveRefused, wantExit: 128, wantEvidence: true,
 		},
 		{
 			name: "a non-zero exit with nothing to show for it: remove-refused with the exit code",
@@ -702,7 +720,7 @@ func TestRemoveRunWorktrees(t *testing.T) {
 			t.Fatalf("second pass = %+v, want absent", rows)
 		}
 		removes, _, _ := f.git.attemptLog()
-		if want := []string{"status.showUntrackedFiles=all " + a.Listed}; !slices.Equal(removes, want) {
+		if want := []string{"status.showUntrackedFiles=all core.fsmonitor=false " + a.Listed}; !slices.Equal(removes, want) {
 			t.Fatalf("removal calls = %q, want the one completing no-force removal %q", removes, want)
 		}
 		ops := f.retires()

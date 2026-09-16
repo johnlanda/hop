@@ -225,8 +225,22 @@ func removedLine(c retirementCheckout) string {
 func TestGrammarContractWorktreeRetirementMerged(t *testing.T) {
 	f := newRetirementFixture(t, retirementSetup{seed: 21000, attempts: 2, target: "refs/heads/main", merged: true})
 	writeFixtureFile(t, filepath.Join(f.Checkouts[1].Path, "build", "output.bin"), "ignored build output\n")
+	// A repository-local fsmonitor hook would run on every index read and
+	// removal hop makes; it must never run.
+	hookDir := realDir(t)
+	marker := filepath.Join(hookDir, "fsmonitor-ran")
+	hook := filepath.Join(hookDir, "fsmonitor-hook.sh")
+	writeFixtureFile(t, hook, "#!/bin/sh\necho ran >> '"+marker+"'\nexit 1\n")
+	if err := os.Chmod(hook, 0o700); err != nil { //nolint:gosec // G302: the fixture's own hook must be executable.
+		t.Fatal(err)
+	}
+	runFixtureGit(t, f.Repo, "config", "core.fsmonitor", hook)
 
 	first := f.status(f.Repo)
+	if f.exists(marker) {
+		t.Fatal("hop status ran the repository's fsmonitor hook")
+	}
+	runFixtureGit(t, f.Repo, "config", "--unset", "core.fsmonitor")
 	requireLines(t, first.Stdout,
 		"retiring worktrees of r1…",
 		"no runs (use -all to include finished runs)",
