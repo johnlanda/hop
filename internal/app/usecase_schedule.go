@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"time"
 
@@ -144,9 +145,18 @@ func (c *Controller) AssignReadyTasks(ctx context.Context, handle RunHandle, opt
 	if maxWorkers <= 0 {
 		maxWorkers = 2
 	}
+	// The frozen run is loaded once, outside every assignment transaction:
+	// the per-attempt assignment artifact derives its path from the frozen
+	// state root and references the frozen role-artifact copies, exactly
+	// the values the launch boundary later re-derives, so writer and
+	// prompt can never disagree.
+	frozen, err := c.Read.LoadFrozenRun(ctx, handle.runID)
+	if err != nil {
+		return AssignmentReport{}, fmt.Errorf("app: load frozen run: %w", err)
+	}
 	var report AssignmentReport
 	for {
-		assigned, full, more, err := c.assignOneReadyTask(ctx, handle, opts, maxWorkers)
+		assigned, full, more, err := c.assignOneReadyTask(ctx, handle, &frozen, opts, maxWorkers)
 		if err != nil {
 			return report, err
 		}
@@ -164,7 +174,7 @@ func (c *Controller) AssignReadyTasks(ctx context.Context, handle RunHandle, opt
 // assignOneReadyTask claims and launches at most one ready task. ok is
 // false when there is nothing left to assign; full is true when a ready
 // task remains but every slot is occupied.
-func (c *Controller) assignOneReadyTask(ctx context.Context, handle RunHandle, opts AssignmentOptions, maxWorkers int) (AssignedTask, bool, bool, error) { //nolint:gocritic // hugeParam: RunHandle and AssignmentOptions are per-call DTOs; called in a bounded loop by AssignReadyTasks.
+func (c *Controller) assignOneReadyTask(ctx context.Context, handle RunHandle, frozen *FrozenRun, opts AssignmentOptions, maxWorkers int) (AssignedTask, bool, bool, error) { //nolint:gocritic // hugeParam: RunHandle and AssignmentOptions are per-call DTOs; called in a bounded loop by AssignReadyTasks.
 	now := c.Clock.Now()
 	var (
 		full          bool
@@ -179,6 +189,8 @@ func (c *Controller) assignOneReadyTask(ctx context.Context, handle RunHandle, o
 		worktreeID    identity.WorktreeID
 		incarnationID identity.IncarnationID
 		runSeq        int
+		prior         *priorAttemptFeedback
+		reviewBaseOID string
 	)
 
 	txErr := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
@@ -347,6 +359,30 @@ func (c *Controller) assignOneReadyTask(ctx context.Context, handle RunHandle, o
 			}
 		}
 
+		// Assignment-artifact inputs, read inside the same transaction that
+		// claims the task (the artifact write itself is an external act
+		// after commit, like the worktree): a retry attempt's prior-attempt
+		// feedback paths, and a review task's diff-scope base — the run's
+		// FIRST integration's recorded pre-merge head, which is the
+		// integration branch's creation base.
+		if task.Kind != run.TaskKindReview && attempt.Number > 1 {
+			feedback, fbErr := collectPriorAttemptFeedback(ctx, uow, wf, handle.runID, frozen.Snapshot.StateRoot, attempts, attempt.Number)
+			if fbErr != nil {
+				return fbErr
+			}
+			prior = feedback
+		}
+		if task.Kind == run.TaskKindReview {
+			base, baseErr := earliestIntegrationBase(ctx, wf, tasks)
+			if baseErr != nil {
+				return baseErr
+			}
+			if base == "" {
+				return fmt.Errorf("app: no integration is recorded for the run; a review task's diff scope cannot be rendered")
+			}
+			reviewBaseOID = base
+		}
+
 		if _, createErr := uow.Sessions().Create(ctx, child); createErr != nil {
 			return createErr
 		}
@@ -379,6 +415,12 @@ func (c *Controller) assignOneReadyTask(ctx context.Context, handle RunHandle, o
 	if err != nil {
 		return AssignedTask{}, false, false, err
 	}
+	// The per-attempt assignment artifact is written after the worktree
+	// and before the pane opens: the launch prompt references it by the
+	// same derived path, and the worker reads it the moment it starts.
+	if err := c.writeAttemptAssignment(ctx, frozen, &task, &attempt, role, opts.HOPPath, prior, reviewBaseOID); err != nil {
+		return AssignedTask{}, false, false, err
+	}
 	if err := c.openChildPane(ctx, handle, task.ID, attempt.ID, sessionID, incarnationID, role, worktreeInfo, opts.HOPPath, opts.StateRoot, now); err != nil {
 		return AssignedTask{}, false, false, err
 	}
@@ -387,6 +429,120 @@ func (c *Controller) assignOneReadyTask(ctx context.Context, handle RunHandle, o
 		TaskID: task.ID, AttemptID: attempt.ID, AttemptNumber: attempt.Number,
 		SessionID: sessionID, Role: role, WorktreeInfo: worktreeInfo,
 	}, false, true, nil
+}
+
+// collectPriorAttemptFeedback assembles a retry attempt's prior-attempt
+// feedback (design section 6): the newest earlier attempt's accepted
+// result commit, its check execution's retained stdout/stderr paths
+// (located by the newest check.run operation whose intent names that
+// result), and — when the run's latest accepted review is a reject — the
+// review reasons path. Every element is optional evidence; absence
+// renders as absence, never as an error.
+func collectPriorAttemptFeedback(ctx context.Context, uow UnitOfWork, wf WorkflowRepositories, runID identity.RunID, stateRoot string, attempts []run.Attempt, attemptNumber int) (*priorAttemptFeedback, error) {
+	var priorAttempt *run.Attempt
+	for i := range attempts {
+		if attempts[i].Number >= attemptNumber {
+			continue
+		}
+		if priorAttempt == nil || attempts[i].Number > priorAttempt.Number {
+			priorAttempt = &attempts[i]
+		}
+	}
+	if priorAttempt == nil {
+		return nil, nil //nolint:nilnil // no earlier attempt means no feedback section, not an error.
+	}
+	feedback := &priorAttemptFeedback{Number: priorAttempt.Number}
+	result, err := uow.Results().Accepted(ctx, priorAttempt.ID)
+	if err != nil {
+		return nil, err
+	}
+	if result != nil {
+		feedback.ResultCommitOID = result.CommitOID
+		ops, opErr := uow.Operations().ByKind(ctx, runID, OpCheckRun)
+		if opErr != nil {
+			return nil, opErr
+		}
+		for i := range ops { // newest first: the first match is the newest execution.
+			intent, ok := decodeOperationPayload[CheckRunIntent](ops[i].Intent)
+			if !ok || intent.ResultID != result.ID.String() {
+				continue
+			}
+			feedback.CheckStdoutPath, feedback.CheckStderrPath = checkEvidencePaths(stateRoot, runID, ops[i].ID)
+			break
+		}
+	}
+	latest, err := wf.Reviews().Latest(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	if latest != nil && latest.Verdict == run.VerdictReject {
+		feedback.ReviewReasonsPath = reviewReasonsPath(stateRoot, runID, latest.ID)
+	}
+	return feedback, nil
+}
+
+// earliestIntegrationBase finds the run's FIRST integration's recorded
+// pre-merge head across every task — the integration branch's creation
+// base, which is the review assignment's diff-scope base. "" when the
+// run has no integration row at all.
+func earliestIntegrationBase(ctx context.Context, wf WorkflowRepositories, tasks []run.Task) (string, error) {
+	var (
+		base     string
+		earliest time.Time
+	)
+	for i := range tasks {
+		integrations, err := wf.Integrations().ByTask(ctx, tasks[i].ID)
+		if err != nil {
+			return "", err
+		}
+		for j := range integrations {
+			if base == "" || integrations[j].CreatedAt.Before(earliest) {
+				earliest = integrations[j].CreatedAt
+				base = integrations[j].PremergeHeadOID
+			}
+		}
+	}
+	return base, nil
+}
+
+// writeAttemptAssignment renders and durably writes one assigned
+// attempt's assignment artifact — the implementer's task assignment or
+// the reviewer's review assignment — at the app-derived per-attempt path
+// the launch prompt references (attemptAssignmentPath), referencing the
+// frozen role-artifact copies. Called between the worktree act and the
+// pane.open intent; a failed write fails the assignment before any pane
+// exists.
+func (c *Controller) writeAttemptAssignment(ctx context.Context, frozen *FrozenRun, task *run.Task, attempt *run.Attempt, role run.Role, hopPath string, prior *priorAttemptFeedback, reviewBaseOID string) error {
+	stateRoot := frozen.Snapshot.StateRoot
+	path := attemptAssignmentPath(stateRoot, task.RunID, attempt.ID)
+	var content []byte
+	if role == run.RoleReviewer {
+		rolePath := frozen.Snapshot.Workflow.ReviewerRolePath
+		if !filepath.IsAbs(rolePath) {
+			return fmt.Errorf("app: the frozen reviewer role artifact path is missing or not absolute; a feature run freezes it before any assignment")
+		}
+		content = renderReviewAssignment(&reviewAssignmentFields{
+			RunID: task.RunID.String(), TaskID: task.ID.String(), AttemptID: attempt.ID.String(),
+			TaskSeq: task.Seq, AttemptNumber: attempt.Number,
+			SubjectCommitOID: task.SubjectCommitOID, SubjectTreeOID: task.SubjectTreeOID,
+			DiffBaseOID: reviewBaseOID, RolePath: rolePath, AssignmentPath: path, HOPPath: hopPath,
+		})
+	} else {
+		rolePath := frozen.Snapshot.Workflow.ImplementerRolePath
+		if !filepath.IsAbs(rolePath) {
+			return fmt.Errorf("app: the frozen implementer role artifact path is missing or not absolute; a feature run freezes it before any assignment")
+		}
+		content = renderTaskAssignment(&taskAssignmentFields{
+			RunID: task.RunID.String(), TaskID: task.ID.String(), AttemptID: attempt.ID.String(),
+			TaskSeq: task.Seq, AttemptNumber: attempt.Number, Title: task.Title,
+			InstructionsPath: taskInstructionsPath(stateRoot, task.RunID, task.ID),
+			RolePath:         rolePath, AssignmentPath: path, HOPPath: hopPath, Prior: prior,
+		})
+	}
+	if err := c.Artifacts.WriteArtifact(ctx, path, content); err != nil {
+		return fmt.Errorf("app: write attempt assignment artifact: %w", err)
+	}
+	return nil
 }
 
 // countOccupiedChildSessions counts runID's non-terminal, non-manager
