@@ -75,7 +75,7 @@ func dispatch(args []string, stdout, stderr io.Writer) (int, error) {
 func printUsage(w io.Writer) error {
 	_, err := fmt.Fprint(w, "Usage: hop <command> [arguments]\n\n"+
 		"Commands:\n"+
-		"  run \"<brief>\"   Start a run and stay as its foreground controller\n"+
+		"  run \"<brief>\"   Start a run (--workflow solo|feature) and stay as its foreground controller\n"+
 		"  status          List the repository's active runs (-all includes finished; -run for one run's detail)\n"+
 		"  stop <run-id>   Request and drive a stop until termination is observed\n"+
 		"  resume <run-id> Reacquire a run's lease and reconcile, then continue as its controller\n"+

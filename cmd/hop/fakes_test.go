@@ -23,6 +23,8 @@ type fakeController struct {
 	lastStatusCtx context.Context //nolint:containedctx // test-only capture of the call's context for deterministic cancellation scripting.
 
 	startRun             func(req app.StartRunRequest) (app.StartRunResult, app.RunHandle, error)
+	startFeatureRun      func(req app.StartRunRequest) (app.StartRunResult, app.RunHandle, error)
+	resolveRunWorkflow   func(repositoryRoot, override string) (string, error)
 	resume               func(req app.ResumeRequest) (app.ResumeResult, app.RunHandle, error)
 	resumeFeature        func(req app.ResumeFeatureRequest) (app.ResumeFeatureResult, app.RunHandle, error)
 	status               func(req app.StatusRequest) (app.StatusResult, error)
@@ -82,6 +84,29 @@ func (f *fakeController) StartRun(_ context.Context, req app.StartRunRequest) (a
 		return app.StartRunResult{}, app.RunHandle{}, errors.New("unexpected StartRun")
 	}
 	return f.startRun(req)
+}
+
+func (f *fakeController) StartFeatureRun(_ context.Context, req app.StartRunRequest) (app.StartRunResult, app.RunHandle, error) { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.
+	f.record("StartFeatureRun")
+	if f.startFeatureRun == nil {
+		return app.StartRunResult{}, app.RunHandle{}, errors.New("unexpected StartFeatureRun")
+	}
+	return f.startFeatureRun(req)
+}
+
+// ResolveRunWorkflow, unscripted, resolves exactly as the app does for a
+// repository whose policy sets no [workflow] mode: an override wins, and
+// no override is solo — so the Phase 2 hop run scenarios keep driving
+// StartRun unchanged.
+func (f *fakeController) ResolveRunWorkflow(_ context.Context, repositoryRoot, override string) (string, error) {
+	f.record("ResolveRunWorkflow")
+	if f.resolveRunWorkflow != nil {
+		return f.resolveRunWorkflow(repositoryRoot, override)
+	}
+	if override != "" {
+		return override, nil
+	}
+	return app.WorkflowModeSolo, nil
 }
 
 func (f *fakeController) Resume(_ context.Context, req app.ResumeRequest) (app.ResumeResult, app.RunHandle, error) {

@@ -29,6 +29,11 @@ var _ app.Runtime = (*herdr.Runtime)(nil)
 // handwritten port fakes for the exec boundaries.
 type controllerAPI interface {
 	StartRun(ctx context.Context, req app.StartRunRequest) (app.StartRunResult, app.RunHandle, error)
+	// StartFeatureRun and ResolveRunWorkflow are hop run's feature-mode
+	// bootstrap (docs/plan/phase-3-design.md section 10): the start use
+	// case for --workflow feature, and the rule choosing between the two.
+	StartFeatureRun(ctx context.Context, req app.StartRunRequest) (app.StartRunResult, app.RunHandle, error)
+	ResolveRunWorkflow(ctx context.Context, repositoryRoot, override string) (string, error)
 	Resume(ctx context.Context, req app.ResumeRequest) (app.ResumeResult, app.RunHandle, error)
 	ResumeFeature(ctx context.Context, req app.ResumeFeatureRequest) (app.ResumeFeatureResult, app.RunHandle, error)
 	Status(ctx context.Context, req app.StatusRequest) (app.StatusResult, error)
