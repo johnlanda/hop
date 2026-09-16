@@ -12,14 +12,21 @@ import (
 )
 
 // Worktree retirement against git output larger than the process runner's
-// capture bound, through the built hop binary: an index or worktree listing
-// whose kept prefix ends exactly on a record boundary looks complete, so
-// only the runner's truncation report keeps hop from deciding on it. Every
-// path touched lives under the test's own temporary directories.
+// default capture bound, through the built hop binary. The index scan and
+// the worktree listing are read with a larger bound of their own, so such
+// output is decided on in full; past that bound, a kept prefix ending
+// exactly on a record boundary looks complete, and only the runner's
+// truncation report keeps hop from deciding on it. Every path touched
+// lives under the test's own temporary directories.
 
-// retirementCaptureBytes is the process runner's per-stream capture bound
-// (internal/adapters/process).
-const retirementCaptureBytes = 1 << 20
+const (
+	// retirementCaptureBytes is the process runner's default per-stream
+	// capture bound (internal/adapters/process).
+	retirementCaptureBytes = 1 << 20
+	// retirementListingBytes is the capture bound of retirement's index
+	// scan and worktree listing (internal/app).
+	retirementListingBytes = 64 << 20
+)
 
 // fixtureGitBytes runs one git command in dir under the isolated fixture
 // environment and returns its exact stdout.
@@ -69,24 +76,24 @@ func writeIndexFiller(t *testing.T, dir string, n int) {
 }
 
 // TestGrammarContractWorktreeRetirementLargeIndex: a merged run's checkout
-// whose `ls-files -v -z` output outgrows the capture bound, with a
+// whose `ls-files -v -z` output outgrows the default capture bound, with a
 // modification hidden by assume-unchanged or skip-worktree in the entry
-// right after the kept prefix (or inside a cut entry), is retained as not
-// fully inspected; the checkout and the hidden change survive and the run
-// is not retired.
+// right at that bound (or past it), is read in full and retained for its
+// hidden change; the checkout and the change survive and the run is not
+// retired. A read cut at the default bound would have removed it.
 func TestGrammarContractWorktreeRetirementLargeIndex(t *testing.T) {
 	cases := []struct {
 		name string
 		flag string
 		tag  string
 		// overshoot is how far the entries before the hidden one run past
-		// the bound: 0 cuts the output exactly on the entry boundary in
-		// front of it.
+		// the default bound: 0 puts the hidden entry exactly where a
+		// default-bounded read would end.
 		overshoot int
 	}{
-		{"assume-unchanged at an entry boundary", "--assume-unchanged", "h", 0},
-		{"skip-worktree at an entry boundary", "--skip-worktree", "S", 0},
-		{"assume-unchanged inside an entry", "--assume-unchanged", "h", 100},
+		{"assume-unchanged right at the default bound", "--assume-unchanged", "h", 0},
+		{"skip-worktree right at the default bound", "--skip-worktree", "S", 0},
+		{"assume-unchanged past the default bound", "--assume-unchanged", "h", 100},
 	}
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -115,11 +122,11 @@ func TestGrammarContractWorktreeRetirementLargeIndex(t *testing.T) {
 
 			out := f.status(f.Repo)
 			requireLines(t, out.Stdout,
-				"r1 worktree "+checkout.Branch+" retained (inspection failed): "+checkout.Path,
-				"  action: the checkout could not be fully inspected; check it and its repository, then run hop status again",
+				"r1 worktree "+checkout.Branch+" retained (hidden changes): "+checkout.Path,
+				"  action: clear git update-index --no-assume-unchanged/--no-skip-worktree, then commit or discard, then run hop status again",
 			)
 			if strings.Contains(out.Stdout, "removed") || strings.Contains(out.Stdout, "worktrees retired") || out.Stderr != "" {
-				t.Fatalf("hop status acted on a checkout it could not fully inspect:\n%s%s", out.Stdout, out.Stderr)
+				t.Fatalf("hop status acted on a checkout with a hidden change:\n%s%s", out.Stdout, out.Stderr)
 			}
 			if got, err := os.ReadFile(filepath.Join(checkout.Path, hidden)); err != nil || string(got) != edit {
 				t.Fatalf("DATA LOSS: the hidden change is %q (%v)", got, err)
@@ -131,20 +138,17 @@ func TestGrammarContractWorktreeRetirementLargeIndex(t *testing.T) {
 	}
 }
 
-// TestGrammarContractWorktreeRetirementLargeListing: a repository whose
-// `worktree list --porcelain -z` output reaches the capture bound exactly
-// at the record boundary before a merged run's checkout — a sibling
-// checkout, locked with a long reason, fills it — keeps that checkout
-// retained as not fully inspected: never released as unregistered, never
-// recorded absent, and the run is not retired. The sibling is untouched.
-func TestGrammarContractWorktreeRetirementLargeListing(t *testing.T) {
-	f := newRetirementFixture(t, retirementSetup{seed: 38000, attempts: 1, target: "refs/heads/main", merged: true})
-	checkout := f.Checkouts[0]
-	canonical, err := filepath.EvalSymlinks(checkout.Path)
+// lockSiblingToFill adds a detached sibling checkout that git's
+// path-ordered listing names before the fixture's checkout, locked with a
+// reason sized so the listing holds exactly n bytes before the checkout's
+// record. It returns the sibling and its lock file.
+func lockSiblingToFill(t *testing.T, f *retirementFixture, n int) (sibling, lockFile string) {
+	t.Helper()
+	canonical, err := filepath.EvalSymlinks(f.Checkouts[0].Path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sibling := filepath.Join(filepath.Dir(canonical), "a-sibling")
+	sibling = filepath.Join(filepath.Dir(canonical), "a-sibling")
 	runFixtureGit(t, f.Repo, "worktree", "add", "-q", "--detach", sibling)
 	record := []byte("\x00\x00worktree " + canonical + "\x00")
 	offset := bytes.Index(fixtureGitBytes(t, f.Repo, "worktree", "list", "--porcelain", "-z"), record) + 2
@@ -154,30 +158,62 @@ func TestGrammarContractWorktreeRetirementLargeListing(t *testing.T) {
 	// git prints the reason from the sibling's administrative lock file as
 	// one `locked <reason>` attribute, inserted before the sibling's record
 	// terminator.
-	reason := strings.Repeat("r", retirementCaptureBytes-offset-len("locked \x00"))
-	lockFile := filepath.Join(runFixtureGit(t, sibling, "rev-parse", "--absolute-git-dir"), "locked")
-	writeFixtureFile(t, lockFile, reason)
-	listing := fixtureGitBytes(t, f.Repo, "worktree", "list", "--porcelain", "-z")
-	if at := bytes.Index(listing, record) + 2; at != retirementCaptureBytes {
-		t.Fatalf("the checkout's record starts at byte %d, want %d", at, retirementCaptureBytes)
+	lockFile = filepath.Join(runFixtureGit(t, sibling, "rev-parse", "--absolute-git-dir"), "locked")
+	writeFixtureFile(t, lockFile, strings.Repeat("r", n-offset-len("locked \x00")))
+	if at := bytes.Index(fixtureGitBytes(t, f.Repo, "worktree", "list", "--porcelain", "-z"), record) + 2; at != n {
+		t.Fatalf("the checkout's record starts at byte %d, want %d", at, n)
 	}
+	return sibling, lockFile
+}
 
-	out := f.status(f.Repo)
-	requireLines(t, out.Stdout,
-		"r1 worktree "+checkout.Branch+" retained (inspection failed): "+checkout.Path,
-		"  action: the checkout could not be fully inspected; check it and its repository, then run hop status again",
-	)
-	for _, forbidden := range []string{"released", "already absent", "removed", "worktrees retired"} {
-		if strings.Contains(out.Stdout, forbidden) {
-			t.Fatalf("hop status decided on a cut worktree listing (%q):\n%s", forbidden, out.Stdout)
+// TestGrammarContractWorktreeRetirementLargeListing: a repository whose
+// `worktree list --porcelain -z` output reaches a capture bound exactly at
+// the record boundary before a merged run's checkout — a sibling checkout,
+// locked with a long reason, fills it. At the default bound the listing is
+// still read in full and the checkout is removed; at the listing's own
+// bound the checkout is retained as not fully inspected — never released
+// as unregistered, never recorded absent — and the run is not retired.
+// The sibling is never touched.
+func TestGrammarContractWorktreeRetirementLargeListing(t *testing.T) {
+	t.Run("past the default bound: read in full, the checkout removed", func(t *testing.T) {
+		f := newRetirementFixture(t, retirementSetup{seed: 38000, attempts: 1, target: "refs/heads/main", merged: true})
+		sibling, lockFile := lockSiblingToFill(t, f, retirementCaptureBytes)
+		reason, err := os.ReadFile(lockFile) //nolint:gosec // G304: the sibling checkout's lock file under this test's own fixture repository.
+		if err != nil {
+			t.Fatal(err)
 		}
-	}
-	if !f.exists(checkout.Path) || !f.exists(sibling) {
-		t.Fatalf("checkout present %v, sibling present %v; want both kept", f.exists(checkout.Path), f.exists(sibling))
-	}
-	if got, err := os.ReadFile(lockFile); err != nil || string(got) != reason { //nolint:gosec // G304: the sibling checkout's lock file under this test's own fixture repository.
-		t.Fatalf("the sibling's lock changed (%v)", err)
-	}
-	detail := f.status(f.Repo, "-run", "r1")
-	requireLines(t, detail.Stdout, "  worktree:      "+checkout.Branch+" active "+checkout.Path)
+
+		out := f.status(f.Repo)
+		requireLines(t, out.Stdout,
+			"r1 worktrees retired: 1 removed, 0 already absent, 0 released (removal deletes ignored files such as build output)",
+			removedLine(f.Checkouts[0]),
+		)
+		if f.exists(f.Checkouts[0].Path) || !f.exists(sibling) {
+			t.Fatalf("checkout present %v, sibling present %v; want the checkout removed and the sibling kept", f.exists(f.Checkouts[0].Path), f.exists(sibling))
+		}
+		if got, err := os.ReadFile(lockFile); err != nil || !bytes.Equal(got, reason) { //nolint:gosec // G304: as above.
+			t.Fatalf("the sibling's lock changed (%v)", err)
+		}
+	})
+
+	t.Run("cut at the listing's own bound: retained", func(t *testing.T) {
+		f := newRetirementFixture(t, retirementSetup{seed: 39000, attempts: 1, target: "refs/heads/main", merged: true})
+		checkout := f.Checkouts[0]
+		sibling, _ := lockSiblingToFill(t, f, retirementListingBytes)
+
+		out := f.status(f.Repo)
+		requireLines(t, out.Stdout,
+			"r1 worktree "+checkout.Branch+" retained (inspection failed): "+checkout.Path,
+			"  action: the checkout could not be fully inspected; check it and its repository, then run hop status again",
+		)
+		for _, forbidden := range []string{"released", "already absent", "removed", "worktrees retired"} {
+			if strings.Contains(out.Stdout, forbidden) {
+				t.Fatalf("hop status decided on a cut worktree listing (%q):\n%s", forbidden, out.Stdout)
+			}
+		}
+		if !f.exists(checkout.Path) || !f.exists(sibling) {
+			t.Fatalf("checkout present %v, sibling present %v; want both kept", f.exists(checkout.Path), f.exists(sibling))
+		}
+		requireLines(t, f.status(f.Repo, "-run", "r1").Stdout, "  worktree:      "+checkout.Branch+" active "+checkout.Path)
+	})
 }

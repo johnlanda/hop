@@ -221,7 +221,7 @@ func TestRecoverWorktreeRetire(t *testing.T) {
 				f.failPath = a.Recorded
 			}
 			if tc.cutListing {
-				f.git.fillListingBefore(t, a.Listed, fakeCaptureBytes)
+				f.git.fillListingBefore(t, a.Listed, app.RetirementListingOutputBytesForTest)
 			}
 			spawns := len(f.spawns)
 			for range 2 {

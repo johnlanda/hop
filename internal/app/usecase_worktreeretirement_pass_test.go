@@ -144,7 +144,7 @@ func TestRetireWorktrees(t *testing.T) {
 		// The first kept prefix ends on a record boundary just before the
 		// first candidate: without the truncation report it reads as a
 		// complete listing that names neither checkout.
-		f.git.fillListingBefore(t, a.Listed, fakeCaptureBytes)
+		f.git.fillListingBefore(t, a.Listed, app.RetirementListingOutputBytesForTest)
 		for range 2 {
 			report, announcedAt := f.pass()
 			if report.Disposition != app.RetirementInProgress || report.Removed+report.Absent+report.Released != 0 || announcedAt != -1 || f.retiredAt() {

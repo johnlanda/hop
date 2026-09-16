@@ -18,6 +18,11 @@ const (
 	// worktree.create reports the requested spelling).
 	inspectRecorded = "/var/wt/hop-r1-t1a1"
 	inspectBranch   = "refs/heads/hop/r1/t1a1"
+	// inspectGitignoreTag is the modeled index's first entry.
+	inspectGitignoreTag = "H .gitignore\x00"
+	// listingBound is the capture bound of the index scan and the worktree
+	// listing.
+	listingBound = app.RetirementListingOutputBytesForTest
 )
 
 // inspectFixture is a test controller whose git is the fake repository with
@@ -228,44 +233,58 @@ func TestInspectAttemptCheckout(t *testing.T) {
 			want: retained(app.RetainedInspectionFailed),
 		},
 		{
-			name: "an assume-unchanged flag past the capture bound, the index cut on an entry boundary: retained",
+			name: "an assume-unchanged flag past the default capture bound, inside the index read's own bound: hidden changes",
 			setup: func(f *inspectFixture) {
-				f.addCheckout(fakeAttemptWorktree{AssumeUnchanged: true, IndexPadding: fakeCaptureBytes - len("H .gitignore\x00")})
-			},
-			want: retained(app.RetainedInspectionFailed),
-		},
-		{
-			name: "a skip-worktree flag past the capture bound, the index cut on an entry boundary: retained",
-			setup: func(f *inspectFixture) {
-				f.addCheckout(fakeAttemptWorktree{SkipWorktree: true, IndexPadding: fakeCaptureBytes - len("H .gitignore\x00")})
-			},
-			want: retained(app.RetainedInspectionFailed),
-		},
-		{
-			name: "a hidden flag past the capture bound, the index cut inside an entry: retained",
-			setup: func(f *inspectFixture) {
-				f.addCheckout(fakeAttemptWorktree{SkipWorktree: true, IndexPadding: fakeCaptureBytes - len("H .gitignore\x00") + 5})
-			},
-			want: retained(app.RetainedInspectionFailed),
-		},
-		{
-			name: "a clean index past the capture bound: retained, never removable on a prefix",
-			setup: func(f *inspectFixture) {
-				f.addCheckout(fakeAttemptWorktree{IndexPadding: 2 * fakeCaptureBytes})
-			},
-			want: retained(app.RetainedInspectionFailed),
-		},
-		{
-			name: "a large index read to its end still shows its hidden flag",
-			setup: func(f *inspectFixture) {
-				f.addCheckout(fakeAttemptWorktree{AssumeUnchanged: true, IndexPadding: fakeCaptureBytes - len("H .gitignore\x00h f.txt\x00H g.txt\x00")})
+				f.addCheckout(fakeAttemptWorktree{AssumeUnchanged: true, IndexPadding: fakeCaptureBytes - len(inspectGitignoreTag)})
 			},
 			want: retained(app.RetainedHiddenChanges),
 		},
 		{
-			name: "a large clean index read to its end: removable",
+			name: "a skip-worktree flag past the default capture bound, inside the index read's own bound: hidden changes",
 			setup: func(f *inspectFixture) {
-				f.addCheckout(fakeAttemptWorktree{IndexPadding: fakeCaptureBytes - len("H .gitignore\x00H f.txt\x00H g.txt\x00")})
+				f.addCheckout(fakeAttemptWorktree{SkipWorktree: true, IndexPadding: 3 * fakeCaptureBytes})
+			},
+			want: retained(app.RetainedHiddenChanges),
+		},
+		{
+			name: "an assume-unchanged flag past the index read's bound, the index cut on an entry boundary: retained",
+			setup: func(f *inspectFixture) {
+				f.addCheckout(fakeAttemptWorktree{AssumeUnchanged: true, IndexPadding: listingBound - len(inspectGitignoreTag)})
+			},
+			want: retained(app.RetainedInspectionFailed),
+		},
+		{
+			name: "a skip-worktree flag past the index read's bound, the index cut on an entry boundary: retained",
+			setup: func(f *inspectFixture) {
+				f.addCheckout(fakeAttemptWorktree{SkipWorktree: true, IndexPadding: listingBound - len(inspectGitignoreTag)})
+			},
+			want: retained(app.RetainedInspectionFailed),
+		},
+		{
+			name: "a hidden flag past the index read's bound, the index cut inside an entry: retained",
+			setup: func(f *inspectFixture) {
+				f.addCheckout(fakeAttemptWorktree{SkipWorktree: true, IndexPadding: listingBound - len(inspectGitignoreTag) + 5})
+			},
+			want: retained(app.RetainedInspectionFailed),
+		},
+		{
+			name: "a clean index past the index read's bound: retained, never removable on a prefix",
+			setup: func(f *inspectFixture) {
+				f.addCheckout(fakeAttemptWorktree{IndexPadding: listingBound})
+			},
+			want: retained(app.RetainedInspectionFailed),
+		},
+		{
+			name: "an index filling the index read's bound exactly still shows its hidden flag",
+			setup: func(f *inspectFixture) {
+				f.addCheckout(fakeAttemptWorktree{AssumeUnchanged: true, IndexPadding: listingBound - len(inspectGitignoreTag+"h f.txt\x00H g.txt\x00")})
+			},
+			want: retained(app.RetainedHiddenChanges),
+		},
+		{
+			name: "a clean index filling the index read's bound exactly: removable",
+			setup: func(f *inspectFixture) {
+				f.addCheckout(fakeAttemptWorktree{IndexPadding: listingBound - len(inspectGitignoreTag+"H f.txt\x00H g.txt\x00")})
 			},
 			want: app.CheckoutVerdictForTest{Disposition: "removable", ListedPath: inspectCanonical},
 		},
@@ -273,12 +292,12 @@ func TestInspectAttemptCheckout(t *testing.T) {
 			name: "an index read whose stderr was truncated: retained",
 			setup: func(f *inspectFixture) {
 				f.addCheckout(fakeAttemptWorktree{})
-				f.failGit("ls-files", app.CommandResult{Stdout: []byte("H .gitignore\x00H f.txt\x00H g.txt\x00"), Stderr: make([]byte, fakeCaptureBytes+1)}, nil)
+				f.failGit("ls-files", app.CommandResult{Stdout: []byte(inspectGitignoreTag + "H f.txt\x00H g.txt\x00"), Stderr: make([]byte, listingBound+1)}, nil)
 			},
 			want: retained(app.RetainedInspectionFailed),
 		},
 		{
-			name: "status output past the capture bound: retained as uninspectable",
+			name: "status output past the default capture bound, which status keeps: retained as uninspectable",
 			setup: func(f *inspectFixture) {
 				f.addCheckout(fakeAttemptWorktree{})
 				f.failGit("status", app.CommandResult{Stdout: []byte(strings.Repeat("?? new.txt\n", fakeCaptureBytes/10))}, nil)
@@ -286,7 +305,7 @@ func TestInspectAttemptCheckout(t *testing.T) {
 			want: retained(app.RetainedInspectionFailed),
 		},
 		{
-			name: "a common-directory read past the capture bound: retained, never another repository",
+			name: "a common-directory read past the default capture bound: retained, never another repository",
 			setup: func(f *inspectFixture) {
 				// The kept prefix names an existing other repository.
 				f.present["/elsewhere/.git"] = true
@@ -301,27 +320,35 @@ func TestInspectAttemptCheckout(t *testing.T) {
 			want: retained(app.RetainedInspectionFailed),
 		},
 		{
-			name: "the worktree list cut on a record boundary before the candidate's record: retained, never released",
+			name: "a worktree list past the default capture bound, inside the listing's own bound: removable",
 			setup: func(f *inspectFixture) {
 				f.addCheckout(fakeAttemptWorktree{})
 				f.fillListingBeforeCandidate(fakeCaptureBytes)
 			},
+			want: app.CheckoutVerdictForTest{Disposition: "removable", ListedPath: inspectCanonical},
+		},
+		{
+			name: "the worktree list cut on a record boundary before the candidate's record: retained, never released",
+			setup: func(f *inspectFixture) {
+				f.addCheckout(fakeAttemptWorktree{})
+				f.fillListingBeforeCandidate(listingBound)
+			},
 			want: app.CheckoutVerdictForTest{Disposition: "retained", Retained: app.RetainedInspectionFailed},
 		},
 		{
-			name: "a gone checkout whose record lies past the listing's capture bound: retained, never absent",
+			name: "a gone checkout whose record lies past the listing's bound: retained, never absent",
 			setup: func(f *inspectFixture) {
 				f.addCheckout(fakeAttemptWorktree{})
-				f.fillListingBeforeCandidate(fakeCaptureBytes)
+				f.fillListingBeforeCandidate(listingBound)
 				f.mutate(func(w *fakeAttemptWorktree) { w.Present = false })
 			},
 			want: app.CheckoutVerdictForTest{Disposition: "retained", Retained: app.RetainedInspectionFailed},
 		},
 		{
-			name: "a listing that fills the bound exactly, the candidate within it: removable",
+			name: "a listing that fills its bound exactly, the candidate within it: removable",
 			setup: func(f *inspectFixture) {
 				f.addCheckout(fakeAttemptWorktree{})
-				f.fillListingBeforeCandidate(fakeCaptureBytes - f.candidateRecordBytes())
+				f.fillListingBeforeCandidate(listingBound - f.candidateRecordBytes())
 			},
 			want: app.CheckoutVerdictForTest{Disposition: "removable", ListedPath: inspectCanonical},
 		},
@@ -446,8 +473,9 @@ func (f *inspectFixture) failGit(subcommand string, result app.CommandResult, er
 }
 
 // requireReadOnlyRetirementGit asserts every command the inspection ran
-// was the absolute git under exactly the retirement environment, and that
-// none removed anything.
+// was the absolute git under exactly the retirement environment, that only
+// the index scan and the worktree listing raised the capture bound, and
+// that none removed anything.
 func (f *inspectFixture) requireReadOnlyRetirementGit(t *testing.T) {
 	t.Helper()
 	wantEnv := []string{"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null", "GIT_TERMINAL_PROMPT=0"}
@@ -457,6 +485,13 @@ func (f *inspectFixture) requireReadOnlyRetirementGit(t *testing.T) {
 		}
 		if slices.Contains(call.Argv, "remove") {
 			t.Errorf("inspection ran a removal: %q", call.Argv)
+		}
+		wantBound := 0
+		if slices.Contains(call.Argv, "ls-files") || slices.Contains(call.Argv, "list") {
+			wantBound = listingBound
+		}
+		if call.MaxOutputBytes != wantBound {
+			t.Errorf("inspection ran %q with output bound %d, want %d", call.Argv, call.MaxOutputBytes, wantBound)
 		}
 	}
 	if removes, _, _ := f.git.attemptLog(); len(removes) != 0 {

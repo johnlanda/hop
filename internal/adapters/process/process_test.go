@@ -406,11 +406,12 @@ func TestRunnerBoundsCapturedOutput(t *testing.T) {
 	}
 }
 
-// TestRunnerReportsTruncation pins the truncation flags through the real
-// Runner: a stream is reported truncated exactly when the child wrote more
-// than the 1 MiB bound — whatever the exit status, and whether the bound
-// falls inside a write or exactly between two — and each flag describes
-// only its own stream. Callers deciding on a whole stream rely on this.
+// TestRunnerReportsTruncation pins the capture bound and the truncation
+// flags through the real Runner: a stream is reported truncated exactly
+// when the child wrote more than the bound — 1 MiB, or the command's own
+// MaxOutputBytes, applied to each stream separately — whatever the exit
+// status and wherever the child's writes fall, and each flag describes only
+// its own stream. Callers deciding on a whole stream rely on this.
 func TestRunnerReportsTruncation(t *testing.T) {
 	exe := testExecutable(t)
 	const captureLimit = 1 << 20
@@ -418,6 +419,7 @@ func TestRunnerReportsTruncation(t *testing.T) {
 		name                     string
 		stdout, stderr, chunk    int
 		exit                     int
+		limit                    int
 		wantStdout, wantStderr   int
 		stdoutTrunc, stderrTrunc bool
 	}{
@@ -432,6 +434,11 @@ func TestRunnerReportsTruncation(t *testing.T) {
 		{name: "truncated on a failing exit", stdout: 3 * captureLimit, exit: 3, wantStdout: captureLimit, stdoutTrunc: true},
 		{name: "stderr alone", stdout: 7, stderr: captureLimit + 1, wantStdout: 7, wantStderr: captureLimit, stderrTrunc: true},
 		{name: "both streams", stdout: captureLimit + 9, stderr: 2 * captureLimit, wantStdout: captureLimit, wantStderr: captureLimit, stdoutTrunc: true, stderrTrunc: true},
+		{name: "a larger per-call bound keeps output past the default", stdout: 2*captureLimit + 1, limit: 3 * captureLimit, wantStdout: 2*captureLimit + 1},
+		{name: "exactly a per-call bound is complete", stdout: 2 * captureLimit, limit: 2 * captureLimit, wantStdout: 2 * captureLimit},
+		{name: "one byte past a per-call bound", stdout: 2*captureLimit + 1, limit: 2 * captureLimit, wantStdout: 2 * captureLimit, stdoutTrunc: true},
+		{name: "a per-call bound applies to each stream", stdout: 3 * captureLimit, stderr: 2 * captureLimit, limit: 2 * captureLimit, wantStdout: 2 * captureLimit, wantStderr: 2 * captureLimit, stdoutTrunc: true},
+		{name: "a per-call bound below the default", stdout: 101, stderr: 100, limit: 100, wantStdout: 100, wantStderr: 100, stdoutTrunc: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -445,7 +452,7 @@ func TestRunnerReportsTruncation(t *testing.T) {
 				env = append(env, "HOP_HELPER_CHUNK_BYTES="+strconv.Itoa(tc.chunk))
 			}
 
-			result, err := process.Runner{}.Run(t.Context(), app.Command{Argv: []string{exe}, Env: env})
+			result, err := process.Runner{}.Run(t.Context(), app.Command{Argv: []string{exe}, Env: env, MaxOutputBytes: tc.limit})
 			if err != nil {
 				t.Fatalf("Run: %v", err)
 			}
@@ -481,6 +488,17 @@ func TestRunnerRejectsInvalidArgv(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("negative output bound", func(t *testing.T) {
+		marker := filepath.Join(t.TempDir(), "started")
+		_, err := process.Runner{}.Run(t.Context(), app.Command{Argv: []string{"/usr/bin/touch", marker}, MaxOutputBytes: -1})
+		if err == nil {
+			t.Fatal("Run with a negative output bound succeeded, want rejection")
+		}
+		if _, statErr := os.Lstat(marker); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("the command started despite the rejection (%v)", statErr)
+		}
+	})
 }
 
 func TestRunnerCancellationKillsWholeGroupWithTypedResult(t *testing.T) {

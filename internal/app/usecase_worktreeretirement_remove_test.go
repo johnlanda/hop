@@ -646,7 +646,7 @@ func TestRemoveRunWorktrees(t *testing.T) {
 			name: "the worktree list after a refused act is cut by the capture bound before the checkout: reconciling, never released",
 			hook: func(f *retireFixture, a *retireAttempt) func(app.Command) (app.CommandResult, bool, error) {
 				return func(app.Command) (app.CommandResult, bool, error) {
-					f.git.fillListingBefore(f.t, a.Listed, fakeCaptureBytes)
+					f.git.fillListingBefore(f.t, a.Listed, app.RetirementListingOutputBytesForTest)
 					return app.CommandResult{ExitCode: 128, Stderr: []byte("fatal: refused\n")}, true, nil
 				}
 			},

@@ -30,6 +30,7 @@ func TestBoundedBufferTruncation(t *testing.T) {
 		{name: "a write crossing the bound", limit: 10, writes: []int{8, 3}, wantKept: 10, wantTrunc: true},
 		{name: "one write past the bound", limit: 10, writes: []int{11}, wantKept: 10, wantTrunc: true},
 		{name: "nothing written", limit: 10},
+		{name: "many writes under a large bound", limit: 1 << 26, writes: []int{3, 4096, 100000, 1, 65536}, wantKept: 3 + 4096 + 100000 + 1 + 65536},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -49,6 +50,37 @@ func TestBoundedBufferTruncation(t *testing.T) {
 				t.Errorf("truncated = %v, want %v", b.truncated, tc.wantTrunc)
 			}
 		})
+	}
+}
+
+// TestBoundedBufferGrowsOnlyAsBytesArrive: a large bound reserves nothing
+// up front; storage grows with the bytes kept, at most doubling, and never
+// past the bound, even when a single write overshoots it.
+func TestBoundedBufferGrowsOnlyAsBytesArrive(t *testing.T) {
+	const limit = 64 << 20
+	b := &boundedBuffer{limit: limit}
+	if _, err := b.Write([]byte("small")); err != nil {
+		t.Fatal(err)
+	}
+	if got := cap(b.data); got > 64 {
+		t.Fatalf("capacity after 5 bytes = %d, want a few bytes, never the %d-byte bound", got, limit)
+	}
+	chunk := bytes.Repeat([]byte{'z'}, 32<<10)
+	for len(b.data) < 3<<20 {
+		if _, err := b.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+		if c, n := cap(b.data), len(b.data); c > 2*n || c > limit {
+			t.Fatalf("capacity %d for %d kept bytes, want at most double and within the bound", c, n)
+		}
+	}
+
+	small := &boundedBuffer{limit: 100}
+	if _, err := small.Write(make([]byte, 1000)); err != nil {
+		t.Fatal(err)
+	}
+	if len(small.data) != 100 || cap(small.data) != 100 || !small.truncated {
+		t.Fatalf("len %d, cap %d, truncated %v after an overshooting write; want the bound exactly, truncated", len(small.data), cap(small.data), small.truncated)
 	}
 }
 

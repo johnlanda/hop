@@ -71,18 +71,34 @@ var errRetirementGitUnconfigured = errors.New("app: git executable is not config
 // output the runner cut short.
 var errRetirementOutputTruncated = errors.New("app: a retirement git read's output was truncated")
 
+// retirementListingOutputBytes is the per-stream capture bound of the two
+// retirement reads whose output grows with the repository — the index scan
+// and the worktree listing — so a large repository is still inspected in
+// full; every other read keeps the runner's default bound. Output past it
+// is still truncated and never decided on.
+const retirementListingOutputBytes = 64 << 20
+
 // retirementGit runs one unclaimed, read-only retirement git invocation
-// against dir under retirementGitEnv. A read whose stdout or stderr the
-// runner truncated is an error, never a result: a prefix of an index scan
-// or a worktree listing can end on a record boundary and look complete,
-// and a removal decided on it could delete what the rest of the output
-// would have protected. Every caller treats the error as an unobservable
-// read and removes nothing.
+// against dir under retirementGitEnv, with the runner's default output
+// bound.
 func (c *Controller) retirementGit(ctx context.Context, dir string, args ...string) (CommandResult, error) {
+	return c.retirementGitBounded(ctx, dir, 0, args...)
+}
+
+// retirementGitBounded is retirementGit with maxOutput as the per-stream
+// capture bound (0 is the runner's default). A read whose stdout or stderr
+// the runner truncated is an error, never a result: a prefix of an index
+// scan or a worktree listing can end on a record boundary and look
+// complete, and a removal decided on it could delete what the rest of the
+// output would have protected. Every caller treats the error as an
+// unobservable read and removes nothing.
+func (c *Controller) retirementGitBounded(ctx context.Context, dir string, maxOutput int, args ...string) (CommandResult, error) {
 	if !filepath.IsAbs(c.GitExecutable) {
 		return CommandResult{}, errRetirementGitUnconfigured
 	}
-	result, err := c.Commands.Run(ctx, Command{Argv: append([]string{c.GitExecutable, "-C", dir}, args...), Env: retirementGitEnv()})
+	result, err := c.Commands.Run(ctx, Command{
+		Argv: append([]string{c.GitExecutable, "-C", dir}, args...), Env: retirementGitEnv(), MaxOutputBytes: maxOutput,
+	})
 	if err == nil && (result.StdoutTruncated || result.StderrTruncated) {
 		return result, errRetirementOutputTruncated
 	}
@@ -211,7 +227,7 @@ func (c *Controller) inspectAttemptCheckout(ctx context.Context, candidate *atte
 	if strings.TrimSpace(string(status.Stdout)) != "" {
 		return retainedVerdict(RetainedUncommittedChanges, record.Path, "git status reports uncommitted or untracked changes")
 	}
-	tags, err := c.retirementGit(ctx, record.Path, retirementIndexRead("ls-files", "-v", "-z")...)
+	tags, err := c.retirementGitBounded(ctx, record.Path, retirementListingOutputBytes, retirementIndexRead("ls-files", "-v", "-z")...)
 	if err != nil || tags.ExitCode != 0 {
 		return retainedVerdict(RetainedInspectionFailed, record.Path, "the checkout's index could not be read")
 	}
@@ -230,7 +246,7 @@ func (c *Controller) inspectAttemptCheckout(ctx context.Context, candidate *atte
 // lists no such checkout; ok is false when the listing could not be read
 // or parsed.
 func (c *Controller) listedCheckout(ctx context.Context, root, canonicalPath string, inspect PathInspector) (record *listedWorktree, ok bool) {
-	listing, err := c.retirementGit(ctx, root, "worktree", "list", "--porcelain", "-z")
+	listing, err := c.retirementGitBounded(ctx, root, retirementListingOutputBytes, "worktree", "list", "--porcelain", "-z")
 	if err != nil || listing.ExitCode != 0 {
 		return nil, false
 	}

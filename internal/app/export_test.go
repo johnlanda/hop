@@ -23,6 +23,10 @@ func RenderContinuationPromptForTest(assignmentPath, hopPath string) string {
 	return renderContinuationPrompt(assignmentPath, hopPath)
 }
 
+// RetirementListingOutputBytesForTest is retirementListingOutputBytes,
+// the capture bound of the index scan and the worktree listing.
+const RetirementListingOutputBytesForTest = retirementListingOutputBytes
+
 // CheckoutVerdictForTest is inspectAttemptCheckout's verdict with its
 // disposition rendered as a string, for app_test.
 type CheckoutVerdictForTest struct {

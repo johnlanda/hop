@@ -41,7 +41,7 @@ prepare use cases and then exec through the process adapter.
 | [grammarcontract_seed_test.go](grammarcontract_seed_test.go) | `openFixtureStore`, `freezeWorkflowSnapshot`, `featureWorkflowSnapshot`, `featureManager`, `newFeatureManager`, `newFeatureManagerAt`, `newFeatureManagerIn`, `addReworkTask`, `childSession`, `soloFixture`, `newSoloReserved`, `newSoloRunning`, `fixtureRowRevisions`, `TestHopfixturesLaunchBaseIsSingleUse` | Seeds fixture state through [internal/testsupport/hopfixtures](../../internal/testsupport/hopfixtures/AGENTS.md) — never through `hop run`, which would place a worker through Herdr — opening the real `internal/adapters/sqlite` Store directly (the same production call `compose.go` makes) and passing it to hopfixtures' string-typed API. `freezeWorkflowSnapshot` is the one raw `database/sql` write hopfixtures cannot perform itself (promotes a seeded run from solo to feature mode by writing JSON into `run_snapshots.workflow`; kept after 6b because the feature `InitializeRun` creates its own manager session and refuses the solo base hopfixtures seeds). `newFeatureManagerIn` seeds a SECOND run into an already-open fixture's own store — the only way to build a genuine cross-run scenario, since two separate state roots make a foreign session merely unknown there, not foreign |
 | [grammarcontract_retirement_test.go](grammarcontract_retirement_test.go) | `retirementFixture`, `newRetirementFixture`, `retirementSetup`, `retirementCheckout`, `requireLines`, `TestGrammarContractWorktreeRetirement*` | The real-binary green boundary of worktree retirement. A real fixture repository (`main`, a `build/` ignore rule) gets real `git worktree add` checkouts, created and recorded through a symbolic link so the recorded spelling is never git's canonical one. An integration branch merges them one by one, and main is optionally fast-forwarded onto it. hopfixtures seeds a completed feature run, frozen with the target (or none), whose integrated rows carry the real pre-merge and merge commits and whose linked worktree rows and succeeded `worktree.create` operations name the checkouts; its lease is released. The built `hop status` runs under the Herdr canary. `journal` reads the run's operation count and lease generation through a raw read-only connection |
 | [grammarcontract_retirement_paths_test.go](grammarcontract_retirement_paths_test.go) | `respellRecordedPath`, `symlinkedParentSpelling`, `TestGrammarContractWorktreeRetirementSymlinkParentSpelling`, `TestGrammarContractWorktreeRetirementDanglingLinkSpelling` | Retirement of checkouts whose recorded spelling only the filesystem resolves, through the built binary. `respellRecordedPath` rewrites the first checkout's row path and its `worktree.create` outcome path together through a raw connection, so provenance still agrees; `symlinkedParentSpelling` builds `<dir>/link/../<checkout>`, which resolves to the checkout while its collapse names nothing |
-| [grammarcontract_retirement_capture_test.go](grammarcontract_retirement_capture_test.go) | `retirementCaptureBytes`, `fixtureGitBytes`, `writeIndexFiller`, `TestGrammarContractWorktreeRetirementLargeIndex`, `TestGrammarContractWorktreeRetirementLargeListing` | Retirement against git output larger than the process runner's per-stream capture bound, through the built binary. `fixtureGitBytes` returns a fixture git command's exact stdout; `writeIndexFiller` writes clean files whose `ls-files -v -z` entries total an exact byte count, so a test places a hidden flag's entry at a chosen offset. A sibling checkout's lock reason, written to its administrative `locked` file, places the candidate's listing record at a chosen offset |
+| [grammarcontract_retirement_capture_test.go](grammarcontract_retirement_capture_test.go) | `retirementCaptureBytes`, `retirementListingBytes`, `fixtureGitBytes`, `writeIndexFiller`, `lockSiblingToFill`, `TestGrammarContractWorktreeRetirementLargeIndex`, `TestGrammarContractWorktreeRetirementLargeListing` | Retirement against git output larger than the process runner's default per-stream capture bound, through the built binary. `fixtureGitBytes` returns a fixture git command's exact stdout; `writeIndexFiller` writes clean files whose `ls-files -v -z` entries total an exact byte count, so a test places a hidden flag's entry at a chosen offset. `lockSiblingToFill` writes a sibling checkout's lock reason to its administrative `locked` file, placing the candidate's listing record at a chosen offset |
 | [grammarcontract_msg_test.go](grammarcontract_msg_test.go), [grammarcontract_plan_test.go](grammarcontract_plan_test.go), [grammarcontract_review_test.go](grammarcontract_review_test.go), [grammarcontract_view_test.go](grammarcontract_view_test.go), [grammarcontract_phase2_test.go](grammarcontract_phase2_test.go) | `TestGrammarContract*` | The real-binary grammar contract tests themselves, one file per verb-family group: msg send/next/wait/ack/show + answer (the hostile-body proof checks both streams of every producing and consuming invocation for exact permitted output, an empty stderr and independent canaries — ESC, both bracketed-paste markers, the SGR sequence, a body fragment); task create/retry + plan close; review submit (`initFixtureGitRepo`/`commitFixtureChange`/`gitRevParseTree` build an isolated real git repository, since `SubmitReviewVerdict` resolves `--subject`'s tree object id via a real `git rev-parse` against the run's recorded repository root); view set/clear; the five Phase 2 verbs never covered before (`status`/`stop`/`resume`/`launch`/`result submit`) — `launchEnv` builds a solo launch fixture's pane environment, `hopfixtures.LaunchBase` plus a deliberately mismatched or conflicting value constructs each refusal-before-exec shape without ever letting `hop launch` reach `d.exec`, and every `hop launch` invocation runs through `execLaunch`: a `launchExecCanary` executable under the configured harness name (`claude`) sits first on the launch's PATH and only creates a marker, which each test asserts never exists (`TestGrammarContractLaunchExecCanaryIsLive` proves the lookup resolves to it and that running it leaves the marker). Every test asserts the observed first line against an `internal/app/grammar.go` constant (or documents why a shape is unreachable without a live Herdr connection) — `TestGoldenGrammar` (`internal/app`) already pins that a constant's literal text is right; this suite answers only "does cmd/hop actually render it" |
 
 The repository root's [herdr-plugin.toml](../../herdr-plugin.toml) declares
@@ -253,14 +253,19 @@ commands expect the built binary at `.bin/hop` (see `make build`).
   - **Moved repository:** with an empty directory or a different git
     repository now at the root, the run is skipped with no lease, no
     operation and nothing removed.
-
   - **Large index** (`grammarcontract_retirement_capture_test.go`): a
-    checkout whose `ls-files -v -z` output outgrows the capture bound,
-    with an assume-unchanged or skip-worktree change in the entry right
-    after the kept prefix (the cut exactly on an entry boundary) or past
-    a cut inside an entry, is retained as `inspection failed` with its
-    action. The hidden change survives, git still lists the checkout,
-    and the run is not retired.
+    checkout whose `ls-files -v -z` output outgrows the default capture
+    bound, with an assume-unchanged or skip-worktree change in the entry
+    right where a default-bounded read would end (or past it), is read in
+    full and retained as `hidden changes` with its action. The hidden
+    change survives, git still lists the checkout, and the run is not
+    retired.
+  - **Large listing:** a sibling checkout locked with a reason sized so
+    the worktree listing reaches a bound exactly at the record boundary
+    before the candidate. At the default bound the listing is read in
+    full and the candidate is removed. At the listing's own 64 MiB bound
+    the candidate is retained as `inspection failed`, never released or
+    recorded absent. The sibling and its lock are untouched.
   - **Symlinked-parent spelling**
     (`grammarcontract_retirement_paths_test.go`): a checkout recorded as
     `<dir>/link/../<checkout>` is removed when it exists. When it was
@@ -269,21 +274,23 @@ commands expect the built binary at `.bin/hop` (see `make build`).
   - **Dangling-link spelling:** a checkout recorded through a link that
     no longer resolves is retained as `inspection failed`, never
     recorded absent, and stays on disk.
-  - **Large listing:** a sibling checkout locked with a reason sized so
-    the worktree listing reaches the bound exactly at the record
-    boundary before the candidate: the candidate is retained, never
-    released or recorded absent, and the sibling and its lock are
-    untouched.
 
   Recording the checkouts through a symbolic link makes the path
   canonicalization load-bearing: an inspector that skips it would
-  release the checkouts instead of removing them. Against the code
-  before the truncation report, the large-index cases remove the
-  checkout with its hidden change, and the large-listing case releases
-  the checkout as unregistered. Against the inspector that collapsed
-  spellings first, the symlinked-parent checkout is recorded absent
-  while it still exists, the deleted one stays in git's list, and the
-  dangling-link checkout is recorded absent.
+  release the checkouts instead of removing them.
+
+  Each case fails against a weaker implementation:
+  - Against the code before the truncation report, the large-index cases
+    remove the checkout with its hidden change, and a listing cut on a
+    record boundary releases the checkout as unregistered.
+  - With the reads' raised bound dropped, the large-index cases and the
+    default-bound listing are retained as uninspectable instead of being
+    decided in full.
+  - Against the inspector that collapsed spellings first:
+    - the symlinked-parent checkout is recorded absent while it still
+      exists;
+    - the deleted one stays in git's list;
+    - the dangling-link checkout is recorded absent.
 - Real-Herdr behavior (a live server, real panes, real worktrees) is
   exercised only by the `test/integration` suite (task 6b), never by
   anything in this package.

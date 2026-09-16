@@ -2,6 +2,7 @@ package app_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -318,15 +319,24 @@ func newFakeCommands() *fakeCommands {
 
 func (*fakeCommands) key(cmd app.Command) string { return strings.Join(cmd.Argv, " ") }
 
-// fakeCaptureBytes is the real Runner's per-stream capture bound
+// fakeCaptureBytes is the real Runner's default per-stream capture bound
 // (internal/adapters/process maxCapturedBytes).
 const fakeCaptureBytes = 1 << 20
 
-// Run answers cmd and then applies the real Runner's capture bound to the
-// answer, whether scripted, hooked or modeled (boundCapturedOutput).
+// Run answers cmd and then applies the real Runner's capture bound — the
+// command's MaxOutputBytes, or fakeCaptureBytes when 0 — to the answer,
+// whether scripted, hooked or modeled (boundCapturedOutput). Like the real
+// Runner, it refuses a negative bound before answering anything.
 func (c *fakeCommands) Run(ctx context.Context, cmd app.Command) (app.CommandResult, error) {
+	if cmd.MaxOutputBytes < 0 {
+		return app.CommandResult{}, errors.New("app_test: CommandRunner.Run called with a negative output bound; the real Runner refuses this")
+	}
 	result, err := c.run(ctx, cmd)
-	bounded, boundErr := boundCapturedOutput(result)
+	limit := fakeCaptureBytes
+	if cmd.MaxOutputBytes > 0 {
+		limit = cmd.MaxOutputBytes
+	}
+	bounded, boundErr := boundCapturedOutput(result, limit)
 	if boundErr != nil {
 		return app.CommandResult{}, boundErr
 	}
@@ -334,29 +344,29 @@ func (c *fakeCommands) Run(ctx context.Context, cmd app.Command) (app.CommandRes
 }
 
 // boundCapturedOutput reproduces the real Runner's bounded capture: each
-// stream keeps its first fakeCaptureBytes bytes and is reported truncated
-// exactly when bytes were discarded — whatever the exit status, and even
-// when the kept prefix ends on a record boundary. The fake computes the
-// flags itself; an answer that already claims truncation must hold exactly
-// the bound, the only truncated shape the real Runner reports, and any
-// other claim is refused as a fake misuse.
-func boundCapturedOutput(result app.CommandResult) (app.CommandResult, error) {
+// stream keeps its first limit bytes and is reported truncated exactly when
+// bytes were discarded — whatever the exit status, and even when the kept
+// prefix ends on a record boundary. The fake computes the flags itself; an
+// answer that already claims truncation must hold exactly the bound, the
+// only truncated shape the real Runner reports, and any other claim is
+// refused as a fake misuse.
+func boundCapturedOutput(result app.CommandResult, limit int) (app.CommandResult, error) {
 	var err error
-	if result.Stdout, result.StdoutTruncated, err = boundCapturedStream(result.Stdout, result.StdoutTruncated); err != nil {
+	if result.Stdout, result.StdoutTruncated, err = boundCapturedStream(result.Stdout, result.StdoutTruncated, limit); err != nil {
 		return app.CommandResult{}, fmt.Errorf("app_test: stdout: %w", err)
 	}
-	if result.Stderr, result.StderrTruncated, err = boundCapturedStream(result.Stderr, result.StderrTruncated); err != nil {
+	if result.Stderr, result.StderrTruncated, err = boundCapturedStream(result.Stderr, result.StderrTruncated, limit); err != nil {
 		return app.CommandResult{}, fmt.Errorf("app_test: stderr: %w", err)
 	}
 	return result, nil
 }
 
-func boundCapturedStream(stream []byte, claimed bool) (kept []byte, truncated bool, err error) {
+func boundCapturedStream(stream []byte, claimed bool, limit int) (kept []byte, truncated bool, err error) {
 	switch {
-	case len(stream) > fakeCaptureBytes:
-		return stream[:fakeCaptureBytes:fakeCaptureBytes], true, nil
-	case claimed && len(stream) != fakeCaptureBytes:
-		return nil, false, fmt.Errorf("an answer claims truncation with %d captured bytes; the real Runner reports truncation only with exactly %d", len(stream), fakeCaptureBytes)
+	case len(stream) > limit:
+		return stream[:limit:limit], true, nil
+	case claimed && len(stream) != limit:
+		return nil, false, fmt.Errorf("an answer claims truncation with %d captured bytes; the real Runner reports truncation only with exactly %d", len(stream), limit)
 	default:
 		return stream, claimed, nil
 	}

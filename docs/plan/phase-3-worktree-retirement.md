@@ -777,13 +777,23 @@ consistent with sections 1 to 12.
 **Output completeness.**
 
 - **The runner reports truncation.** The process runner keeps at most
-  1 MiB of each stream. `CommandResult.StdoutTruncated` and
-  `StderrTruncated` report a stream whose later bytes it discarded,
-  whatever the exit status; the fake runner applies the same bound and
-  computes the same flags. A kept prefix can end exactly on a record
+  1 MiB of each stream, or the command's own `Command.MaxOutputBytes`
+  (0 is the default, and a negative bound is refused before anything
+  starts). The bound applies to each stream separately, and the buffer
+  grows only as the child writes, never beyond the bound.
+  `CommandResult.StdoutTruncated` and `StderrTruncated` report a stream
+  whose later bytes it discarded, whatever the exit status. The fake
+  runner applies the same bounds and computes the same flags. A kept prefix can end exactly on a record
   boundary (an `ls-files -v -z` entry, a `worktree list -z` record) and
   then parses as complete output, so no rule decides on the prefix's
   shape.
+- **Larger bounds for the two growing reads.** The index scan
+  (`ls-files -v -z`) and the worktree listing are read with a 64 MiB
+  bound (`retirementListingOutputBytes`), so a repository with a large
+  index or many worktrees is still inspected in full. Every other
+  retirement read keeps the 1 MiB default; `status` among them, whose
+  output past 1 MiB already means changes. The bound only moves the cut:
+  the truncation rule below still applies to every read.
 - **Retirement never decides on a truncated read.** `retirementGit`
   refuses every retirement read with either stream truncated, and each
   caller already treats a failed read as unobservable:

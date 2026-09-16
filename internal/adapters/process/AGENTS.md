@@ -16,7 +16,7 @@ package only observes and signals.
 | File | Entities / functions | Responsibility |
 | --- | --- | --- |
 | [exec.go](exec.go) | `Exec`, `ExecResolved` | syscall.Exec wrappers, never returning on success, passing the complete env verbatim (nil execs empty). `Exec` rejects an empty, bare or relative argv[0] before any system call; `ExecResolved` executes an absolute path while preserving the caller's argv byte-for-byte (argv[0] may stay the bare name the caller resolved) — hop check-exec's boundary, whose running argv must equal the frozen check argv exactly for group retirement to match |
-| [runner.go](runner.go) | `Runner`, `CancellationError` | Runs argv as the leader of a new process group (Setpgid) with the complete env given, captures each stream bounded at 1 MiB and reports a stream whose later bytes were discarded (`StdoutTruncated`, `StderrTruncated`), maps completions to exit codes (-1 for a signal), and on ctx cancellation SIGKILLs the whole group, reaps the leader within a bounded wait and returns a typed `*CancellationError` with the output captured so far; an unstartable anchor retires the group while the leader is provably unreaped instead of inferring anything from the failure's errno |
+| [runner.go](runner.go) | `Runner`, `CancellationError` | Runs argv as the leader of a new process group (Setpgid) with the complete env given, captures each stream bounded at 1 MiB or the command's own `MaxOutputBytes` (per stream; storage grows only as the child writes, never beyond the bound; a negative bound is refused before anything starts) and reports a stream whose later bytes were discarded (`StdoutTruncated`, `StderrTruncated`), maps completions to exit codes (-1 for a signal), and on ctx cancellation SIGKILLs the whole group, reaps the leader within a bounded wait and returns a typed `*CancellationError` with the output captured so far; an unstartable anchor retires the group while the leader is provably unreaped instead of inferring anything from the failure's errno |
 | [inspector.go](inspector.go) | `GroupInspector`, `ArgvUnavailable` | Lists a group's live members (membership from one `ps -A -o pid=,pgid=` parse; a listing failure is an error, never an empty result) and sends the group SIGKILL under the same guard as the runner |
 | [argv_darwin.go](argv_darwin.go) | `processArgv`, `parseProcargs2` | Exact per-pid argv via the `kern.procargs2` sysctl (raw sysctl(2); the stdlib Sysctl cannot address a pid-parameterized MIB), parsed by the exact layout: argc, the executable path in a NUL-padded region of len(path)+1 rounded to 8, then exactly argc entries with empties preserved — never reading into the environment region and never guessing a boundary |
 | [argv_linux.go](argv_linux.go) | `processArgv`, `parseCmdline` | Exact per-pid argv via `/proc/<pid>/cmdline` (NUL-separated, byte-for-byte, empty entries preserved) |
@@ -117,8 +117,13 @@ package only observes and signals.
   (`TestRunnerReportsTruncation`, through the `flood` helper that writes
   exact byte counts to each stream: exactly the bound is complete, one
   byte more is truncated, on a failing exit too, each flag for its own
-  stream; `TestBoundedBufferTruncation` pins the accounting over exact
-  write sequences, a write ending on the bound included), cancellation
+  stream, and a per-call `MaxOutputBytes` — larger or smaller than the
+  default — bounds each stream separately; a negative bound is refused
+  without starting the command; `TestBoundedBufferTruncation` pins the
+  accounting over exact write sequences, a write ending on the bound
+  included, and `TestBoundedBufferGrowsOnlyAsBytesArrive` that a 64 MiB
+  bound reserves nothing up front and storage never exceeds double the
+  kept bytes or the bound), cancellation
   killing the whole group
   with the typed result and group-absence proof, an injected unstartable
   anchor retiring a live leader with an error, and the

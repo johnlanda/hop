@@ -7,10 +7,15 @@ import (
 
 // Command is one process invocation: the complete argv, working directory
 // and complete environment (not additions — unlike the Runtime pane env).
+// MaxOutputBytes bounds each captured stream of this invocation; 0 keeps
+// the runner's default bound (1 MiB), and a negative value is refused
+// before anything starts. A larger bound never removes the truncation
+// report.
 type Command struct {
-	Argv []string
-	Dir  string
-	Env  []string
+	Argv           []string
+	Dir            string
+	Env            []string
+	MaxOutputBytes int
 }
 
 // CommandResult is one completed invocation's outcome. Each captured
