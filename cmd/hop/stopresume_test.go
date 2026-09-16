@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -17,6 +18,9 @@ func TestRunStop(t *testing.T) {
 
 	t.Run("requests, acquires the free lease and drives to stopped", func(t *testing.T) {
 		ctrl := &fakeController{}
+		ctrl.status = func(app.StatusRequest) (app.StatusResult, error) {
+			return detailStep("running", "running", false), nil
+		}
 		requested := ""
 		ctrl.requestStop = func(runID string) error { requested = runID; return nil }
 		ctrl.resume = func(app.ResumeRequest) (app.ResumeResult, app.RunHandle, error) {
@@ -87,6 +91,9 @@ func TestRunStop(t *testing.T) {
 
 	t.Run("a deadline that leaves the run stopping exits 1 and says it is rerunnable", func(t *testing.T) {
 		ctrl := &fakeController{}
+		ctrl.status = func(app.StatusRequest) (app.StatusResult, error) {
+			return detailStep("running", "running", false), nil
+		}
 		ctrl.requestStop = func(string) error { return nil }
 		ctrl.resume = func(app.ResumeRequest) (app.ResumeResult, app.RunHandle, error) {
 			return app.ResumeResult{Outcome: app.ResumeStopPending}, app.RunHandle{}, nil
@@ -139,6 +146,80 @@ func TestRunStop(t *testing.T) {
 
 		if code != exitUsage || !strings.Contains(stderr.String(), "exactly one run-id") {
 			t.Errorf("code = %d, stderr = %q", code, stderr.String())
+		}
+	})
+
+	t.Run("a feature-mode run drives through ResumeFeature/DriveFeatureStop, never the solo pair", func(t *testing.T) {
+		ctrl := &fakeController{}
+		ctrl.status = func(app.StatusRequest) (app.StatusResult, error) {
+			return app.StatusResult{Detail: &app.RunDetailView{
+				RunSummaryView: app.RunSummaryView{RunID: testRunID, Sequence: 1, State: "running"},
+				Mode:           "feature",
+			}}, nil
+		}
+		ctrl.requestStop = func(string) error { return nil }
+		ctrl.resumeFeature = func(app.ResumeFeatureRequest) (app.ResumeFeatureResult, app.RunHandle, error) {
+			return app.ResumeFeatureResult{Outcome: "stop-pending"}, app.RunHandle{}, nil
+		}
+		rounds := 0
+		ctrl.driveFeatureStop = func() (app.StopReport, error) {
+			rounds++
+			if rounds < 2 {
+				return app.StopReport{RunState: "stopping"}, nil
+			}
+			return app.StopReport{RunState: "stopped", Terminated: true}, nil
+		}
+		ctrl.resume = func(app.ResumeRequest) (app.ResumeResult, app.RunHandle, error) {
+			t.Fatal("the solo Resume was called for a feature-mode run")
+			return app.ResumeResult{}, app.RunHandle{}, nil
+		}
+		ctrl.driveStop = func() (app.StopReport, error) {
+			t.Fatal("the solo DriveStop was called for a feature-mode run")
+			return app.StopReport{}, nil
+		}
+		td := newTestDeps(ctrl, env, t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runStop([]string{testRunID}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitOK {
+			t.Errorf("exit code = %d, want %d (stderr: %s)", code, exitOK, stderr.String())
+		}
+		if !strings.Contains(stdout.String(), "stopped\n") {
+			t.Errorf("output = %q, want it to reach stopped", stdout.String())
+		}
+	})
+
+	t.Run("a feature-mode run on a controller missing the feature ports fails closed, never falls back to solo", func(t *testing.T) {
+		ctrl := &fakeController{}
+		ctrl.status = func(app.StatusRequest) (app.StatusResult, error) {
+			return app.StatusResult{Detail: &app.RunDetailView{
+				RunSummaryView: app.RunSummaryView{RunID: testRunID, Sequence: 1, State: "running"},
+				Mode:           "feature",
+			}}, nil
+		}
+		ctrl.requestStop = func(string) error { return nil }
+		ctrl.resumeFeature = func(app.ResumeFeatureRequest) (app.ResumeFeatureResult, app.RunHandle, error) {
+			return app.ResumeFeatureResult{}, app.RunHandle{}, fmt.Errorf("app: %w", app.ErrFeatureModeUnsupported)
+		}
+		ctrl.resume = func(app.ResumeRequest) (app.ResumeResult, app.RunHandle, error) {
+			t.Fatal("the solo Resume was called as a fallback for an unsupported feature-mode run")
+			return app.ResumeResult{}, app.RunHandle{}, nil
+		}
+		td := newTestDeps(ctrl, env, t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runStop([]string{testRunID}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitFailure {
+			t.Errorf("exit code = %d, want %d", code, exitFailure)
+		}
+		if !strings.Contains(stderr.String(), app.ErrFeatureModeUnsupported.Error()) {
+			t.Errorf("stderr = %q, want the fail-closed sentinel surfaced", stderr.String())
 		}
 	})
 }

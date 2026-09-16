@@ -90,6 +90,8 @@ type PendingQuestionView struct {
 // zero value ("" or 0), never a guess.
 type RunDetailView struct {
 	RunSummaryView
+	// Mode mirrors RunDetail.Mode: "feature", or "" for a solo run.
+	Mode           string
 	TaskState      string
 	AttemptState   string
 	WorktreePath   string
@@ -173,6 +175,7 @@ func runSummaryView(s RunStatus) RunSummaryView {
 func runDetailView(d RunDetail) RunDetailView { //nolint:gocritic // hugeParam: RunDetail is a ReadStore DTO rendered at most once per hop status -run call.
 	view := RunDetailView{
 		RunSummaryView: runSummaryView(d.RunStatus),
+		Mode:           d.Mode,
 		TaskState:      string(d.TaskState),
 		AttemptState:   string(d.AttemptState),
 		WorktreePath:   d.WorktreePath,

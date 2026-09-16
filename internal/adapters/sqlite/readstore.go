@@ -139,6 +139,7 @@ func (s *Store) LoadRunStatus(ctx context.Context, runID identity.RunID) (app.Ru
 				Reconciling:   reconciling,
 				UpdatedAt:     runV.UpdatedAt,
 			},
+			Mode:      snapshot.Workflow.Mode,
 			StateRoot: snapshot.StateRoot,
 		}
 		if snapshot.Workflow.Feature() {

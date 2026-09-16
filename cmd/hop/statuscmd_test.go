@@ -127,6 +127,7 @@ func TestRunStatusDetail(t *testing.T) {
 		out := stdout.String()
 		for _, want := range []string{
 			"run r1 " + testRunID,
+			"workflow:      solo",
 			"task:          active",
 			"attempt:       running",
 			"worktree:      /worktrees/run-1",
@@ -143,6 +144,25 @@ func TestRunStatusDetail(t *testing.T) {
 			if !strings.Contains(out, want) {
 				t.Errorf("detail lacks %q; got:\n%s", want, out)
 			}
+		}
+	})
+
+	t.Run("a feature-mode run renders workflow: feature", func(t *testing.T) {
+		featureCtrl := &fakeController{}
+		featureCtrl.status = func(app.StatusRequest) (app.StatusResult, error) {
+			featureDetail := *detail
+			featureDetail.Mode = "feature"
+			return app.StatusResult{Detail: &featureDetail}, nil
+		}
+		td := newTestDeps(featureCtrl, statusEnv(), t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runStatus([]string{"-run", testRunID}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitOK || !strings.Contains(stdout.String(), "workflow:      feature") {
+			t.Errorf("code = %d, output:\n%s", code, stdout.String())
 		}
 	})
 

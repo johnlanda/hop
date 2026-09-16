@@ -20,10 +20,16 @@ const stopPollInterval = 2 * time.Second
 
 // runStop implements `hop stop <run-id>`: it records the monotonic stop
 // request, then drives the stop directly when the lease is free (acquiring
-// it with a new generation through Resume, which routes a stopping run to
-// stop handling) or reports and observes when a live controller holds the
-// lease. Exit 0 when stopped was reached, 1 when the deadline left it
-// stopping (rerunnable) or on error, 2 on usage.
+// it with a new generation through Resume/ResumeFeature, which routes a
+// stopping run to stop handling) or reports and observes when a live
+// controller holds the lease. The run's mode (loaded once via Status
+// before any lease acquisition) selects the driving pair: a feature-mode
+// run always drives through ResumeFeature/DriveFeatureStop, a solo run
+// through Resume/DriveStop — never a fallback between them, so a
+// feature-mode run against a Controller missing the feature ports
+// surfaces app.ErrFeatureModeUnsupported rather than silently running
+// under the solo procedure. Exit 0 when stopped was reached, 1 when the
+// deadline left it stopping (rerunnable) or on error, 2 on usage.
 func runStop(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 	diagnostics := &recordingWriter{w: stderr}
 	flags := flag.NewFlagSet("hop stop", flag.ContinueOnError)
@@ -69,21 +75,49 @@ func runStop(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 		_, werr := fmt.Fprintf(stderr, "hop stop: %v\n", err)
 		return exitUsage, werr
 	}
+	status, err := ctrl.Status(ctx, app.StatusRequest{RunID: runID})
+	if err != nil {
+		_, werr := fmt.Fprintf(stderr, "hop stop: %v\n", err)
+		return exitFailure, werr
+	}
+	if status.Detail == nil {
+		_, werr := fmt.Fprintf(stderr, "hop stop: run %s has no status detail\n", runID)
+		return exitFailure, werr
+	}
+	feature := isFeatureMode(status.Detail.Mode)
+
 	if stopErr := ctrl.RequestStop(ctx, runID); stopErr != nil {
 		_, werr := fmt.Fprintf(stderr, "hop stop: %v\n", stopErr)
 		return exitFailure, werr
 	}
 
+	if feature {
+		result, handle, featureErr := ctrl.ResumeFeature(ctx, app.ResumeFeatureRequest{
+			RunID:        runID,
+			ControllerID: d.newID(),
+			HOPPath:      hopPath,
+			StateRoot:    stateRoot,
+		})
+		return dispatchStopResume(ctx, d, ctrl, handle, featureErr, result.Outcome == "nothing-to-do", ctrl.DriveFeatureStop, runID, stdout, stderr)
+	}
 	result, handle, err := ctrl.Resume(ctx, app.ResumeRequest{
 		RunID:        runID,
 		ControllerID: d.newID(),
 		HOPPath:      hopPath,
 		StateRoot:    stateRoot,
 	})
+	return dispatchStopResume(ctx, d, ctrl, handle, err, result.Outcome == app.ResumeNothingToDo, ctrl.DriveStop, runID, stdout, stderr)
+}
+
+// dispatchStopResume is the shared tail of runStop's two mode branches:
+// resumeErr and nothingToDo are the ResumeFeature/Resume call's own
+// outcome, driveStop is the matching DriveFeatureStop/DriveStop method
+// value — never crossed with the other mode's Resume/DriveStop pair.
+func dispatchStopResume(ctx context.Context, d *deps, ctrl controllerAPI, handle app.RunHandle, resumeErr error, nothingToDo bool, driveStop func(context.Context, app.RunHandle) (app.StopReport, error), runID string, stdout, stderr io.Writer) (int, error) { //nolint:gocritic // hugeParam: RunHandle is the app-defined opaque token, passed by value as every Controller method takes it.
 	switch {
-	case err == nil:
-		return driveStopRounds(ctx, d, ctrl, handle, result.Outcome, stdout, stderr)
-	case errors.Is(err, app.ErrLeaseHeld):
+	case resumeErr == nil:
+		return driveStopRounds(ctx, d, ctrl, handle, nothingToDo, driveStop, stdout, stderr)
+	case errors.Is(resumeErr, app.ErrLeaseHeld):
 		// A live controller holds the lease; it observes the stop request
 		// on its next round and drives the stop itself. Observe until
 		// stopped or the deadline.
@@ -93,17 +127,18 @@ func runStop(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 		return observeStop(ctx, d, ctrl, runID, stdout, stderr)
 	default:
 		releaseQuietly(ctx, ctrl, handle)
-		_, werr := fmt.Fprintf(stderr, "hop stop: %v\n", err)
+		_, werr := fmt.Fprintf(stderr, "hop stop: %v\n", resumeErr)
 		return exitFailure, werr
 	}
 }
 
-// driveStopRounds drives DriveStop with the held lease until termination
-// is observed or the deadline leaves the run stopping (rerunnable).
-func driveStopRounds(ctx context.Context, d *deps, ctrl controllerAPI, handle app.RunHandle, entry app.ResumeOutcome, stdout, stderr io.Writer) (int, error) { //nolint:gocritic // hugeParam: RunHandle is the app-defined opaque token, passed by value as every Controller method takes it.
+// driveStopRounds drives driveStop (DriveStop or DriveFeatureStop, per the
+// caller's mode) with the held lease until termination is observed or the
+// deadline leaves the run stopping (rerunnable).
+func driveStopRounds(ctx context.Context, d *deps, ctrl controllerAPI, handle app.RunHandle, nothingToDo bool, driveStop func(context.Context, app.RunHandle) (app.StopReport, error), stdout, stderr io.Writer) (int, error) { //nolint:gocritic // hugeParam: RunHandle is the app-defined opaque token, passed by value as every Controller method takes it.
 	defer releaseQuietly(ctx, ctrl, handle)
-	if entry == app.ResumeNothingToDo {
-		report, err := ctrl.DriveStop(ctx, handle)
+	if nothingToDo {
+		report, err := driveStop(ctx, handle)
 		if err != nil {
 			_, werr := fmt.Fprintf(stderr, "hop stop: %v\n", err)
 			return exitFailure, werr
@@ -125,7 +160,7 @@ func driveStopRounds(ctx context.Context, d *deps, ctrl controllerAPI, handle ap
 			return exitFailure, werr
 		default:
 		}
-		report, err := ctrl.DriveStop(ctx, handle)
+		report, err := driveStop(ctx, handle)
 		if err != nil {
 			_, werr := fmt.Fprintf(stderr, "hop stop: %v\n", err)
 			return exitFailure, werr

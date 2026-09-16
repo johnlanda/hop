@@ -266,6 +266,9 @@ func TestRunDetailFeatureExtensions(t *testing.T) {
 	if detail.TaskID != "" || detail.AttemptID != "" {
 		t.Fatalf("feature detail carries solo task identities: %+v", detail.RunStatus)
 	}
+	if detail.Mode != "feature" {
+		t.Fatalf("Mode = %q, want %q", detail.Mode, "feature")
+	}
 	if detail.SessionID != f.ManagerID || detail.Binding == nil || detail.Binding.IncarnationID != f.ManagerIncarnation {
 		t.Fatalf("feature detail session = %s binding %+v, want the current manager", detail.SessionID, detail.Binding)
 	}
@@ -357,6 +360,9 @@ func TestRunDetailSoloZeroValues(t *testing.T) {
 	}
 	if detail.TaskID != f.spec.TaskID || detail.AttemptID != f.spec.AttemptID || detail.SessionID != f.spec.SessionID {
 		t.Fatalf("solo identities = %+v, want the Phase 2 single-task shape", detail)
+	}
+	if detail.Mode != "" {
+		t.Fatalf("Mode = %q, want \"\" for a solo run", detail.Mode)
 	}
 	if detail.Tasks != nil || detail.LatestIntegration != nil || detail.GuardShortfalls != nil ||
 		detail.Mailboxes != nil || detail.PendingQuestions != nil {

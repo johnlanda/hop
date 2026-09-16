@@ -107,6 +107,12 @@ type PendingQuestion struct {
 // possible mid-reconciliation, between a lost session and its replacement).
 type RunDetail struct {
 	RunStatus
+	// Mode is the run's frozen workflow mode ("feature"), or "" for a
+	// solo run — mirrors WorkflowSnapshot.Mode so cmd/hop can dispatch
+	// between the solo and feature-mode use-case pairs (Resume vs
+	// ResumeFeature, DriveStop vs DriveFeatureStop, the loop's two
+	// scheduling shapes) without holding a WorkflowSnapshot itself.
+	Mode         string
 	TaskID       identity.TaskID
 	AttemptID    identity.AttemptID
 	SessionID    identity.SessionID

@@ -126,6 +126,7 @@ func renderRunDetail(w io.Writer, detail *app.RunDetailView) (int, error) {
 	lines := []string{
 		fmt.Sprintf("run %s %s", seqLabel(detail.Sequence), detail.RunID),
 		"  state:         " + detail.State + listingMarkers(&detail.RunSummaryView),
+		"  workflow:      " + workflowLabel(detail.Mode),
 		"  task:          " + orUnset(detail.TaskState),
 		"  attempt:       " + orUnset(detail.AttemptState),
 		"  worktree:      " + orUnset(detail.WorktreePath),
@@ -155,6 +156,21 @@ func renderRunDetail(w io.Writer, detail *app.RunDetailView) (int, error) {
 		}
 	}
 	return exitOK, nil
+}
+
+// isFeatureMode reports whether mode (RunDetail.Mode/RunDetailView.Mode)
+// names a feature-mode run: "" means solo (app.WorkflowSnapshot's own
+// zero-value convention), matched against app.WorkflowModeFeature rather
+// than a repeated literal.
+func isFeatureMode(mode string) bool { return mode == app.WorkflowModeFeature }
+
+// workflowLabel renders a run's workflow mode for human display: "solo"
+// for the zero value, "feature" otherwise.
+func workflowLabel(mode string) string {
+	if isFeatureMode(mode) {
+		return app.WorkflowModeFeature
+	}
+	return app.WorkflowModeSolo
 }
 
 // orUnset renders an explicit marker for a value the store has not

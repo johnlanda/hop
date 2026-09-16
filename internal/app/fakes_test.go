@@ -402,6 +402,7 @@ func (s *fakeStore) LoadRunStatus(_ context.Context, runID identity.RunID) (app.
 	attemptID := s.AttemptByRun[runID]
 	detail := app.RunDetail{
 		RunStatus: s.runStatusLocked(runID),
+		Mode:      s.Snapshots[runID].Workflow.Mode,
 		TaskID:    taskID,
 		AttemptID: attemptID,
 		StateRoot: s.Snapshots[runID].StateRoot,
