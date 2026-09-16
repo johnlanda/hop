@@ -86,6 +86,8 @@ type retirementPassOptions struct {
 	// SpawnEnv is the invoking process's environment, sanitized under the
 	// run's frozen policy (CheckSpawnEnvironment).
 	SpawnEnv []string
+	// InspectPath resolves recorded paths for the removal step.
+	InspectPath PathInspector
 }
 
 // detectForRetirement is the pass's detection step: unresolved checks from

@@ -712,4 +712,12 @@ one more never-executed check behind.
   retires the claimed group and observes again.
 - **(d) `interrupted-removal`.** It is rendered when the row's latest
   settled `worktree.retire` has result `interrupted` and re-inspection
-  reports `uncommitted-changes`.
+  reports `uncommitted-changes`. "Latest" means the newest generation,
+  then the newest creation.
+- **Evidence.** A failed act's stdout and stderr are written under
+  `runs/<run>/retirement/<op>/` through `ArtifactStore`. Their paths are
+  recorded in the operation's outcome, and no artifact rows are written,
+  so the domain needs no new artifact kinds.
+- **A halted pass.** When an act's dispatch revalidation refuses, the
+  pass stops: the intent stays pending (the next pass settles it
+  `never-executed`), and later rows wait for the next pass.

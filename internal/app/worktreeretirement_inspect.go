@@ -135,21 +135,9 @@ func (c *Controller) inspectAttemptCheckout(ctx context.Context, candidate *atte
 		return releasedVerdict(ReleasedRepositoryRoot, "", "the recorded path is the repository root")
 	}
 
-	listing, err := c.retirementGit(ctx, candidate.RepositoryRoot, "worktree", "list", "--porcelain", "-z")
-	if err != nil || listing.ExitCode != 0 {
+	record, listed := c.listedCheckout(ctx, candidate.RepositoryRoot, canonicalPath, inspect)
+	if !listed {
 		return retainedVerdict(RetainedInspectionFailed, "", "the repository's worktree list could not be read")
-	}
-	records, err := parseWorktreeListZ(listing.Stdout)
-	if err != nil {
-		return retainedVerdict(RetainedInspectionFailed, "", "the repository's worktree list could not be parsed")
-	}
-	var record *listedWorktree
-	for i := range records {
-		listed, _, listErr := inspect(records[i].Path)
-		if listErr == nil && listed == canonicalPath {
-			record = &records[i]
-			break
-		}
 	}
 	switch {
 	case record == nil && !pathExists:
@@ -209,6 +197,46 @@ func (c *Controller) inspectAttemptCheckout(ctx context.Context, candidate *atte
 		return retainedVerdict(RetainedHiddenChanges, record.Path, "index entries are marked assume-unchanged or skip-worktree")
 	}
 	return checkoutVerdict{Disposition: checkoutRemovable, ListedPath: record.Path, Detail: "clean, on the recorded branch, descending from the recorded base"}
+}
+
+// listedCheckout reads the root's own `worktree list --porcelain -z` and
+// returns the record whose path resolves to canonicalPath, or nil when git
+// lists no such checkout; ok is false when the listing could not be read
+// or parsed.
+func (c *Controller) listedCheckout(ctx context.Context, root, canonicalPath string, inspect PathInspector) (record *listedWorktree, ok bool) {
+	listing, err := c.retirementGit(ctx, root, "worktree", "list", "--porcelain", "-z")
+	if err != nil || listing.ExitCode != 0 {
+		return nil, false
+	}
+	records, err := parseWorktreeListZ(listing.Stdout)
+	if err != nil {
+		return nil, false
+	}
+	for i := range records {
+		listed, _, listErr := inspect(records[i].Path)
+		if listErr == nil && listed == canonicalPath {
+			return &records[i], true
+		}
+	}
+	return nil, true
+}
+
+// observeCheckout is the post-act observation of a candidate: whether the
+// root's worktree list still names it and whether its recorded path still
+// exists; ok is false when either could not be observed.
+func (c *Controller) observeCheckout(ctx context.Context, candidate *attemptCheckout, inspect PathInspector) (listed, exists, ok bool) {
+	if inspect == nil {
+		return false, false, false
+	}
+	canonicalPath, exists, err := inspect(candidate.Path)
+	if err != nil {
+		return false, false, false
+	}
+	record, ok := c.listedCheckout(ctx, candidate.RepositoryRoot, canonicalPath, inspect)
+	if !ok {
+		return false, false, false
+	}
+	return record != nil, exists, true
 }
 
 // retirementCommonDir resolves dir's git common directory in canonical
