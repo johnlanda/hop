@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 
 	"github.com/johnlanda/hop/internal/domain/identity"
 	"github.com/johnlanda/hop/internal/domain/run"
@@ -44,9 +45,10 @@ type SessionLaunchExecRequest struct {
 // store predates Phase 3 — validates the pane-provided HOP_* environment
 // against it fail-closed (the session-addressed pane set includes
 // HOP_SESSION_ID and HOP_ROLE; the solo shim's Phase 2 pane set does not
-// provide them, so on that path they are validated only when present; an
+// provide them, so on that path they are validated whenever present —
+// a present-but-empty variable is a disagreement, never absent; an
 // attempt-bearing session requires HOP_TASK_ID and HOP_ATTEMPT_ID, and a
-// manager session refuses them outright), refuses on a stop request, a
+// manager session refuses either entry outright, empty included), refuses on a stop request, a
 // session that is not launching, or a claim identity mismatch, sanitizes
 // the environment under the frozen policy, composes the role's argv from
 // frozen run facts (worker and implementer share the Phase 2 prompt
@@ -225,10 +227,13 @@ func (c *Controller) resolveShimSession(ctx context.Context, runID identity.RunI
 // session-addressed pane set (feature mode) additionally provides
 // HOP_SESSION_ID and HOP_ROLE, so requireSessionVars is true on that
 // path; the solo shim's Phase 2 pane set does not provide them, so there
-// they are validated only when present. An attempt-bearing session
+// they are validated whenever PRESENT — and presence is the entry
+// existing at all, so a variable that is present but EMPTY is a
+// disagreement, never treated as absent. An attempt-bearing session
 // requires HOP_TASK_ID and HOP_ATTEMPT_ID; a manager session has neither
-// and refuses a pane environment that carries them — a stale or foreign
-// pane. Errors name the variable, never the value.
+// and refuses a pane environment that carries either entry at all, an
+// explicitly empty one included — a stale or foreign pane. Errors name
+// the variable, never the value.
 func validateSessionLaunchEnvironment(environ []string, slc *SessionLaunchContext, runID, sessionID string, requireSessionVars bool) error {
 	type expectation struct {
 		name     string
@@ -249,14 +254,14 @@ func validateSessionLaunchEnvironment(environ []string, slc *SessionLaunchContex
 		)
 	} else {
 		for _, name := range []string{"HOP_TASK_ID", "HOP_ATTEMPT_ID"} {
-			if environValue(environ, name) != "" {
+			if _, present := environEntry(environ, name); present {
 				return fmt.Errorf("app: %s is set but this session has no attempt; a stale or foreign pane environment never execs", name)
 			}
 		}
 	}
 	for _, v := range expected {
-		got := environValue(environ, v.name)
-		if got == "" {
+		got, present := environEntry(environ, v.name)
+		if !present {
 			if v.required {
 				return fmt.Errorf("app: %s is not set; hop launch runs only in a HOP-created pane, which provides it", v.name)
 			}
@@ -267,6 +272,22 @@ func validateSessionLaunchEnvironment(environ []string, slc *SessionLaunchContex
 		}
 	}
 	return nil
+}
+
+// environEntry reports name's value in environ and whether ANY entry for
+// name exists, resolving duplicates exactly as environValue does (the
+// last entry wins; a name-only entry is present with an empty value).
+// validateSessionLaunchEnvironment needs the distinction environValue
+// erases: a variable that is present but empty must fail the agreement
+// check, never pass as absent.
+func environEntry(environ []string, name string) (value string, present bool) {
+	for i := len(environ) - 1; i >= 0; i-- {
+		entryName, entryValue, _ := strings.Cut(environ[i], "=")
+		if entryName == name {
+			return entryValue, true
+		}
+	}
+	return "", false
 }
 
 // composeSessionArgvTail renders the harness argv after the executable

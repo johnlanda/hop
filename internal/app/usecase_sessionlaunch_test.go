@@ -787,3 +787,75 @@ func TestPrepareSessionLaunchExecCrossHarnessProfile(t *testing.T) {
 		}
 	})
 }
+
+// TestSessionLaunchEnvironmentPresentButEmpty pins the review's F3
+// tightening: presence is the entry existing at all, so an explicitly
+// empty variable fails the agreement check (or the manager's no-attempt
+// refusal) instead of passing as absent.
+func TestSessionLaunchEnvironmentPresentButEmpty(t *testing.T) {
+	newController := func(read ReadStore, subs *ebSubmissionStub) *Controller {
+		return &Controller{Read: read, Submissions: subs, Clock: ebClock{now: time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)}}
+	}
+
+	t.Run("shim: an explicitly empty HOP_SESSION_ID is a disagreement", func(t *testing.T) {
+		read := &ebSessionReadStub{session: ebSessionContext(t, run.RoleWorker)}
+		read.detail = RunDetail{AttemptID: mustAttemptID(t, ebAttemptID), SessionID: mustSessionID(t, ebSessionID)}
+		subs := &ebSubmissionStub{}
+		req := ebSessionRequest()
+		req.SessionID = ""
+		req.AttemptID = ebAttemptID
+		req.Environ = append(ebEnviron(), "HOP_SESSION_ID=")
+
+		_, err := newController(read, subs).PrepareSessionLaunchExec(context.Background(), req)
+		if err == nil || !strings.Contains(err.Error(), "HOP_SESSION_ID does not agree") {
+			t.Fatalf("err = %v, want the empty entry refused as a disagreement", err)
+		}
+		if len(subs.claims) != 0 {
+			t.Errorf("a refused launch wrote a claim")
+		}
+	})
+
+	t.Run("shim: an explicitly empty HOP_ROLE is a disagreement", func(t *testing.T) {
+		read := &ebSessionReadStub{session: ebSessionContext(t, run.RoleWorker)}
+		read.detail = RunDetail{AttemptID: mustAttemptID(t, ebAttemptID), SessionID: mustSessionID(t, ebSessionID)}
+		subs := &ebSubmissionStub{}
+		req := ebSessionRequest()
+		req.SessionID = ""
+		req.AttemptID = ebAttemptID
+		req.Environ = append(ebEnviron(), "HOP_ROLE=")
+
+		_, err := newController(read, subs).PrepareSessionLaunchExec(context.Background(), req)
+		if err == nil || !strings.Contains(err.Error(), "HOP_ROLE does not agree") {
+			t.Fatalf("err = %v, want the empty entry refused as a disagreement", err)
+		}
+	})
+
+	t.Run("manager: an explicitly empty HOP_ATTEMPT_ID entry is refused", func(t *testing.T) {
+		read := &ebSessionReadStub{session: ebSessionContext(t, run.RoleManager)}
+		read.frozen = FrozenRun{RepositoryRoot: "/var/repos/project"}
+		subs := &ebSubmissionStub{}
+		req := ebSessionRequest()
+		req.WorkerDir = "/var/repos/project"
+		req.Environ = append(ebSessionEnviron(run.RoleManager), "HOP_ATTEMPT_ID=")
+
+		_, err := newController(read, subs).PrepareSessionLaunchExec(context.Background(), req)
+		if err == nil || !strings.Contains(err.Error(), "HOP_ATTEMPT_ID is set but this session has no attempt") {
+			t.Fatalf("err = %v, want the empty entry refused outright", err)
+		}
+		if len(subs.claims) != 0 {
+			t.Errorf("a refused launch wrote a claim")
+		}
+	})
+
+	t.Run("session path: an explicitly empty required variable is a disagreement", func(t *testing.T) {
+		read := &ebSessionReadStub{session: ebSessionContext(t, run.RoleImplementer)}
+		subs := &ebSubmissionStub{}
+		req := ebSessionRequest()
+		req.Environ = append(environWithout(ebSessionEnviron(run.RoleImplementer), "HOP_TASK_ID"), "HOP_TASK_ID=")
+
+		_, err := newController(read, subs).PrepareSessionLaunchExec(context.Background(), req)
+		if err == nil || !strings.Contains(err.Error(), "HOP_TASK_ID does not agree") {
+			t.Fatalf("err = %v, want the empty entry refused as a disagreement", err)
+		}
+	})
+}
