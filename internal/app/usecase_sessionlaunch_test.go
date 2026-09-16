@@ -859,3 +859,30 @@ func TestSessionLaunchEnvironmentPresentButEmpty(t *testing.T) {
 		}
 	})
 }
+
+// TestSessionLaunchRefusesAttemptlessChildContext pins the fail-closed
+// guard on assignment-path derivation: an implementer or reviewer
+// context whose attempt identity is missing (a malformed store row) is
+// refused before any seed or claim, never pointed at a plausible-looking
+// path one directory level up.
+func TestSessionLaunchRefusesAttemptlessChildContext(t *testing.T) {
+	slc := ebSessionContext(t, run.RoleImplementer)
+	slc.AttemptID = ""
+	slc.Attempt = run.Attempt{}
+	slc.Session.AttemptID = ""
+	read := &ebSessionReadStub{session: slc}
+	subs := &ebSubmissionStub{}
+	req := ebSessionRequest()
+	// No task/attempt variables: with the context claiming no attempt,
+	// the environment check passes and the derivation guard must refuse.
+	req.Environ = ebSessionEnviron(run.RoleManager)
+	req.Environ = append(environWithout(req.Environ, "HOP_ROLE"), "HOP_ROLE=implementer")
+
+	_, err := (&Controller{Read: read, Submissions: subs, Clock: ebClock{now: time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)}}).PrepareSessionLaunchExec(context.Background(), req)
+	if err == nil || !strings.Contains(err.Error(), "carries no attempt identity") {
+		t.Fatalf("err = %v, want the attempt-less child context refused", err)
+	}
+	if len(subs.claims) != 0 {
+		t.Errorf("a refused launch wrote a claim")
+	}
+}

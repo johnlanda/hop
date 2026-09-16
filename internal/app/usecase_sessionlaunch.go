@@ -356,18 +356,18 @@ func sessionPrompt(slc *SessionLaunchContext, runID identity.RunID, hopPath stri
 			continuation: renderContinuationPrompt(slc.Snapshot.AssignmentPath, hopPath),
 		}, nil
 	case run.RoleImplementer:
-		path := attemptAssignmentPath(slc.Snapshot.StateRoot, runID, slc.AttemptID)
-		if !filepath.IsAbs(path) {
-			return sessionPrompts{}, fmt.Errorf("app: the derived assignment path is not absolute; the prompt carries only absolute paths")
+		path, err := boundAttemptAssignmentPath(slc, runID)
+		if err != nil {
+			return sessionPrompts{}, err
 		}
 		return sessionPrompts{
 			initial:      renderInitialPrompt(path, hopPath),
 			continuation: renderContinuationPrompt(path, hopPath),
 		}, nil
 	case run.RoleReviewer:
-		path := attemptAssignmentPath(slc.Snapshot.StateRoot, runID, slc.AttemptID)
-		if !filepath.IsAbs(path) {
-			return sessionPrompts{}, fmt.Errorf("app: the derived assignment path is not absolute; the prompt carries only absolute paths")
+		path, err := boundAttemptAssignmentPath(slc, runID)
+		if err != nil {
+			return sessionPrompts{}, err
 		}
 		return sessionPrompts{
 			initial:      renderReviewerInitialPrompt(path, hopPath),
@@ -385,6 +385,23 @@ func sessionPrompt(slc *SessionLaunchContext, runID identity.RunID, hopPath stri
 	default:
 		return sessionPrompts{}, fmt.Errorf("app: session role %q has no launch prompt; only worker, manager, implementer and reviewer launch", slc.Session.Role)
 	}
+}
+
+// boundAttemptAssignmentPath derives an attempt-bearing session's
+// assignment path, refusing a context that carries no attempt identity:
+// without the guard, a malformed store row would derive a
+// plausible-looking path one directory level up instead of failing
+// closed, and the launched session would be pointed at an artifact
+// nothing ever writes.
+func boundAttemptAssignmentPath(slc *SessionLaunchContext, runID identity.RunID) (string, error) {
+	if slc.AttemptID == "" {
+		return "", fmt.Errorf("app: the session context carries no attempt identity; a %s launch cannot derive its assignment path", slc.Session.Role)
+	}
+	path := attemptAssignmentPath(slc.Snapshot.StateRoot, runID, slc.AttemptID)
+	if !filepath.IsAbs(path) {
+		return "", fmt.Errorf("app: the derived assignment path is not absolute; the prompt carries only absolute paths")
+	}
+	return path, nil
 }
 
 // managerPromptPaths are the three frozen artifacts the manager's prompts
