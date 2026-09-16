@@ -738,6 +738,73 @@ func TestUnlinkedWorktreeRowsResolveNoLaunchDirectory(t *testing.T) {
 	}
 }
 
+// TestWorktreeFallbackServesOnlyALoneUnlinkedRow is the fake-store half
+// of the launch boundary's fallback rule (the real-store half has the same
+// name in internal/adapters/sqlite): a session whose attempt has no row of
+// its own falls back to the run's only row ONLY while that row is
+// unlinked. A lone row linked to a sibling attempt, or a sibling-linked
+// row beside an unlinked one, resolves nothing, and hop launch refuses
+// the session with no claim written.
+func TestWorktreeFallbackServesOnlyALoneUnlinkedRow(t *testing.T) {
+	const unlinkedPath = "/worktrees/unlinked"
+	for _, tt := range []struct {
+		name     string
+		sibling  bool // keep the sibling attempt's linked row
+		unlinked bool // add an unlinked row
+		want     string
+	}{
+		{name: "lone row linked to a sibling attempt", sibling: true, want: ""},
+		{name: "sibling-linked row beside an unlinked row", sibling: true, unlinked: true, want: ""},
+		{name: "the run's only row, unlinked", unlinked: true, want: unlinkedPath},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			tc := newTestController(defaultPolicy())
+			fr := seedFeatureRun(t, tc, 2)
+			freezeLaunchPolicy(tc, fr.RunID)
+			seedImplementTask(t, tc, fr.RunID, 1, "A", false, run.TaskReady)
+			seedImplementTask(t, tc, fr.RunID, 2, "B", false, run.TaskReady)
+			ctx := context.Background()
+			report, err := tc.Controller.AssignReadyTasks(ctx, fr.Handle, defaultAssignmentOptions())
+			if err != nil || len(report.Assigned) != 2 {
+				t.Fatalf("AssignReadyTasks() = %+v, %v; want both tasks assigned", report.Assigned, err)
+			}
+			sibling, subject := report.Assigned[0], report.Assigned[1]
+			for id, row := range tc.Store.Worktrees {
+				if row.value.AttemptID == subject.AttemptID || (!tt.sibling && row.value.AttemptID == sibling.AttemptID) {
+					delete(tc.Store.Worktrees, id)
+				}
+			}
+			if tt.unlinked {
+				w := run.NewWorktree(identity.WorktreeID(tc.IDs.NewID()), tc.Store.Runs[fr.RunID].value.RepositoryID, fr.RunID, unlinkedPath, "hop/run-1")
+				tc.Store.Worktrees[w.ID] = &entityRow[run.Worktree]{value: w, revision: 1}
+			}
+
+			slc, err := tc.Store.LoadSessionLaunchContext(ctx, fr.RunID, subject.SessionID)
+			if err != nil {
+				t.Fatalf("LoadSessionLaunchContext() error = %v", err)
+			}
+			if slc.WorktreePath != tt.want {
+				t.Fatalf("worktree path = %q, want %q", slc.WorktreePath, tt.want)
+			}
+			dir := sibling.WorktreeInfo.Path
+			if tt.want != "" {
+				dir = tt.want
+			}
+			plan, err := tc.Controller.PrepareSessionLaunchExec(ctx, sessionLaunchRequest(&slc, fr.RunID, dir, 7500))
+			_, claimed := tc.Store.LaunchClaims[slc.IncarnationID]
+			if tt.want == "" {
+				if err == nil || !strings.Contains(err.Error(), "no recorded worktree path") || claimed {
+					t.Fatalf("launch from %s = %+v, %v (claimed %t); want the missing-worktree refusal and no claim", dir, plan, err, claimed)
+				}
+				return
+			}
+			if err != nil || !claimed {
+				t.Fatalf("solo-fallback launch = %+v, %v (claimed %t); want accepted with a claim", plan, err, claimed)
+			}
+		})
+	}
+}
+
 // plainUnitOfWork implements exactly app.UnitOfWork over an inner
 // *fakeUnitOfWork, deliberately NOT also implementing
 // app.WorkflowRepositories — a store that predates Phase 3 feature-mode

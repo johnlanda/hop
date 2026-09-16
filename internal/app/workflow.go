@@ -325,9 +325,10 @@ type SessionLaunchContext struct {
 	// WorktreePath is the attempt's recorded worktree path exactly as the
 	// worktree row persisted it, never from a binding that may not exist
 	// yet: the row linked to the attempt (every feature-mode row), else
-	// the run's single unlinked row (the solo shape), else "" — a run with
-	// several rows none of which names the attempt is never guessed
-	// among. It is also "" for a manager session (whose expected launch
+	// the run's only row while that row is unlinked (the solo shape), else
+	// "" — a row linked to another attempt is never served, and a run with
+	// several rows is never guessed among. It is also "" for a manager
+	// session (whose expected launch
 	// directory is the repository root, from FrozenRun) and before the row
 	// exists. PrepareSessionLaunchExec refuses an attempt-bearing launch
 	// whose working directory does not canonically resolve to it.

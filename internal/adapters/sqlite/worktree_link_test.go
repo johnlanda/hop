@@ -472,3 +472,108 @@ func TestWorktreeRepositoryAttemptLink(t *testing.T) {
 		t.Fatalf("solo row attempt/base NULL = %v/%v, %v; want both NULL", attemptNull, baseNull, err)
 	}
 }
+
+// launchingClaudeChild reserves an attempt on task and creates a LAUNCHING
+// Claude implementer with a pre-assigned native reference and a pending
+// launch intent naming its incarnation: the state a delegated session is
+// in when its pane runs hop launch.
+func launchingClaudeChild(t *testing.T, f *featureFixture, task identity.TaskID, n int) (identity.SessionID, identity.IncarnationID) {
+	t.Helper()
+	attemptID := identity.AttemptID(uid(n))
+	sessionID := identity.SessionID(uid(n + 1))
+	incarnation := identity.IncarnationID(uid(n + 2))
+	now := f.clock.Now()
+	manager := f.managerSessionValue(t)
+	f.inUOW(t, func(uow app.UnitOfWork) {
+		attempt, err := run.NewAttempt(attemptID, task, 1, now)
+		if err != nil {
+			t.Fatalf("new attempt: %v", err)
+		}
+		if _, createErr := workflowRepos(t, uow).AttemptIndex().Create(t.Context(), attempt); createErr != nil {
+			t.Fatalf("create attempt: %v", createErr)
+		}
+		session, err := run.NewChildSession(sessionID, f.spec.RunID, attemptID, run.RoleImplementer, manager, run.HarnessClaude, now)
+		if err != nil {
+			t.Fatalf("new child session: %v", err)
+		}
+		if session, err = session.AssignNativeRef(uid(n+3), run.NativeRefAssigned, now); err != nil {
+			t.Fatalf("assign native reference: %v", err)
+		}
+		if session, err = session.Launch(now); err != nil {
+			t.Fatalf("launch child session: %v", err)
+		}
+		if _, createErr := uow.Sessions().Create(t.Context(), session); createErr != nil {
+			t.Fatalf("create child session: %v", createErr)
+		}
+	})
+	createLaunchIntentFor(t, f, n+4, sessionID, incarnation)
+	return sessionID, incarnation
+}
+
+// TestWorktreeFallbackServesOnlyALoneUnlinkedRow pins the launch
+// boundary's run-wide fallback on the real store: an attempt with no row
+// of its own falls back to the run's only row ONLY while that row is
+// unlinked (the solo shape). A lone row linked to a sibling attempt, or a
+// sibling-linked row beside an unlinked one, resolves nothing, and hop
+// launch refuses the session there with no claim written.
+func TestWorktreeFallbackServesOnlyALoneUnlinkedRow(t *testing.T) {
+	const (
+		siblingPath  = "/wt/sibling-a"
+		unlinkedPath = "/wt/unlinked"
+	)
+	for _, tc := range []struct {
+		name     string
+		sibling  bool // a row linked to the sibling attempt exists
+		unlinked bool // an unlinked row exists
+		want     string
+	}{
+		{name: "lone row linked to a sibling attempt", sibling: true, want: ""},
+		{name: "sibling-linked row beside an unlinked row", sibling: true, unlinked: true, want: ""},
+		{name: "the run's only row, unlinked", unlinked: true, want: unlinkedPath},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFeatureFixture(t)
+			ctx := t.Context()
+			siblingTask := f.createFeatureTask(t, 9101, 2, run.TaskActive)
+			f.createWorkerSession(t, siblingTask, run.RoleImplementer, 9102)
+			task := f.createFeatureTask(t, 9111, 3, run.TaskActive)
+			session, incarnation := launchingClaudeChild(t, f, task, 9112)
+			if tc.sibling {
+				f.createAttemptWorktree(t, 9121, identity.AttemptID(uid(9102)), siblingPath, "hop/r1/t2a1")
+			}
+			if tc.unlinked {
+				f.createWorktree(t, run.NewWorktree(identity.WorktreeID(uid(9122)), f.repositoryID(t), f.spec.RunID, unlinkedPath, "hop/run-1"))
+			}
+
+			slc, err := f.store.LoadSessionLaunchContext(ctx, f.spec.RunID, session)
+			if err != nil {
+				t.Fatalf("LoadSessionLaunchContext: %v", err)
+			}
+			if slc.WorktreePath != tc.want {
+				t.Fatalf("worktree path = %q, want %q", slc.WorktreePath, tc.want)
+			}
+
+			// Launch preparation needs only the store and the trust port.
+			h := &assignmentHarness{featureFixture: f, ctrl: &app.Controller{
+				Read: f.store, Submissions: f.store, Clock: f.clock, Trust: linkTrust{},
+			}}
+			dir := siblingPath
+			if tc.want != "" {
+				dir = tc.want
+			}
+			plan, err := h.ctrl.PrepareSessionLaunchExec(ctx, h.launchRequest(&slc, dir, 7400))
+			if tc.want == "" {
+				if err == nil || !strings.Contains(err.Error(), "no recorded worktree path") {
+					t.Fatalf("launch from %s = %+v, %v; want the missing-worktree refusal", dir, plan, err)
+				}
+				if h.claimOf(ctx, t, incarnation) {
+					t.Fatal("a refused launch left a claim")
+				}
+				return
+			}
+			if err != nil || plan.IncarnationID != incarnation.String() || !h.claimOf(ctx, t, incarnation) {
+				t.Fatalf("solo-fallback launch = %+v, %v; want accepted with a claim", plan, err)
+			}
+		})
+	}
+}

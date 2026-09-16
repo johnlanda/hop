@@ -564,7 +564,7 @@ sides together. `cmd/hop` never imports domain or identity types: every
     session write, not merely before the later external worktree/pane
     act. The first case also pins the worktree row's attempt/base link and
     the Claude session's pre-assigned native reference.
-  - `go test ./internal/app -run 'TestAssignedSessionsLaunchFromTheirOwnWorktrees|TestAssignedNonClaudeSessionsCarryNoNativeReference|TestUnlinkedWorktreeRowsResolveNoLaunchDirectory'` —
+  - `go test ./internal/app -run 'TestAssignedSessionsLaunchFromTheirOwnWorktrees|TestAssignedNonClaudeSessionsCarryNoNativeReference|TestUnlinkedWorktreeRowsResolveNoLaunchDirectory|TestWorktreeFallbackServesOnlyALoneUnlinkedRow'` —
     feature worktree linkage through hop launch on the fake store (the
     real-store half is `internal/adapters/sqlite`'s
     `TestAssignedWorktreesLinkTheirAttempts`). Two implementers and a
@@ -573,7 +573,10 @@ sides together. `cmd/hop` never imports domain or identity types: every
     accepts each one from that worktree (`--session-id <ref>`) and refuses
     it from a sibling's with no claim. Codex/opencode children carry no
     reference. Several unlinked rows resolve no worktree and the launch
-    refuses fail-closed, while a single unlinked row is the solo fallback.
+    refuses fail-closed. The run-wide fallback serves only the run's lone
+    unlinked row (the solo shape): a lone row linked to a sibling attempt,
+    or one beside an unlinked row, resolves nothing and the launch is
+    refused.
     The fake store enforces the real contracts these paths meet: the
     worktree insert's run/attempt/UNIQUE(path) rules, and
     `LoadSessionLaunchContext`'s attempt row, by-attempt worktree rule,

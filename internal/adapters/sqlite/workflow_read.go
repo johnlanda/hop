@@ -119,33 +119,36 @@ func sessionLaunchIdentity(ctx context.Context, q querier, sessionID identity.Se
 
 // worktreePathForAttempt resolves the recorded worktree path the launch
 // boundary cross-checks: the attempt's own row when one is linked
-// (worktrees.attempt_id, every feature-mode row), else — the unlinked
-// solo shape — the run's single worktree row; "" before any row exists.
-// A run holding several rows none of which names the attempt stays "",
-// never a guess among them.
+// (worktrees.attempt_id, every feature-mode row), else — the solo shape —
+// the run's only worktree row, and only while that row is unlinked; ""
+// otherwise. A row linked to another attempt is never served, and a run
+// holding several rows, linked or not, is never guessed among.
 func worktreePathForAttempt(ctx context.Context, q querier, runID identity.RunID, attemptID identity.AttemptID) (string, error) {
 	path, linked, err := attemptWorktreePath(ctx, q, attemptID)
 	if err != nil || linked {
 		return path, err
 	}
-	rows, err := q.QueryContext(ctx, `SELECT path FROM worktrees WHERE run_id = ?`, runID.String())
+	rows, err := q.QueryContext(ctx, `SELECT path, attempt_id IS NULL FROM worktrees WHERE run_id = ?`, runID.String())
 	if err != nil {
 		return "", fmt.Errorf("sqlite: load worktrees of run %s: %w", runID, err)
 	}
 	defer rows.Close() //nolint:errcheck // the deferred close of a fully-iterated read cursor has no failure the rows.Err check below misses.
-	var paths []string
+	var (
+		count        int
+		onlyPath     string
+		onlyUnlinked bool
+	)
 	for rows.Next() {
-		var p string
-		if err := rows.Scan(&p); err != nil {
+		if err := rows.Scan(&onlyPath, &onlyUnlinked); err != nil {
 			return "", fmt.Errorf("sqlite: scan worktree path: %w", err)
 		}
-		paths = append(paths, p)
+		count++
 	}
 	if err := rows.Err(); err != nil {
 		return "", fmt.Errorf("sqlite: iterate worktree paths: %w", err)
 	}
-	if len(paths) == 1 {
-		return paths[0], nil
+	if count == 1 && onlyUnlinked {
+		return onlyPath, nil
 	}
 	return "", nil
 }

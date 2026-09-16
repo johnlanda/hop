@@ -543,21 +543,22 @@ func (s *fakeStore) newestAttemptWorktreeLocked(attemptID identity.AttemptID) (r
 
 // worktreePathForAttemptLocked mirrors the real store's launch-boundary
 // lookup (sqlite worktreePathForAttempt): the attempt's own linked row
-// when one exists; else, when the run holds exactly one worktree row, that
-// row's path (the unlinked solo shape); else "" — several rows none of
-// which names the attempt are never guessed among. Callers hold s.mu.
+// when one exists; else the run's only worktree row, and only while that
+// row is unlinked (the solo shape); else "" — a row linked to another
+// attempt is never served, and several rows, linked or not, are never
+// guessed among. Callers hold s.mu.
 func (s *fakeStore) worktreePathForAttemptLocked(runID identity.RunID, attemptID identity.AttemptID) string {
 	if w, ok := s.newestAttemptWorktreeLocked(attemptID); ok {
 		return w.Path
 	}
-	var paths []string
+	var rows []run.Worktree
 	for _, row := range s.Worktrees {
 		if row.value.RunID == runID {
-			paths = append(paths, row.value.Path)
+			rows = append(rows, row.value)
 		}
 	}
-	if len(paths) == 1 {
-		return paths[0]
+	if len(rows) == 1 && rows[0].AttemptID == "" {
+		return rows[0].Path
 	}
 	return ""
 }
