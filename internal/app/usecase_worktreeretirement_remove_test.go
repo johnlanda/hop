@@ -71,6 +71,12 @@ func newRetireFixture(t *testing.T) *retireFixture {
 // set, adjusts the model state last.
 func (f *retireFixture) addAttempt(n int, state fakeAttemptWorktree, edit func(w *fakeAttemptWorktree)) retireAttempt { //nolint:gocritic // hugeParam: test seeding takes the state by value so a caller's literal is copied, never aliased.
 	f.t.Helper()
+	return f.addAttemptFor(f.fr.RunID, n, state, edit)
+}
+
+// addAttemptFor is addAttempt for any run of the fixture repository.
+func (f *retireFixture) addAttemptFor(runID identity.RunID, n int, state fakeAttemptWorktree, edit func(w *fakeAttemptWorktree)) retireAttempt { //nolint:gocritic // hugeParam: test seeding takes the state by value so a caller's literal is copied, never aliased.
+	f.t.Helper()
 	a := retireAttempt{
 		WorktreeID: identity.WorktreeID(f.tc.IDs.NewID()),
 		AttemptID:  identity.AttemptID(f.tc.IDs.NewID()),
@@ -79,8 +85,8 @@ func (f *retireFixture) addAttempt(n int, state fakeAttemptWorktree, edit func(w
 		Listed:     fmt.Sprintf("/private/var/wt/hop-r2-t%da1", n),
 		Head:       f.git.newCommit(fmt.Sprintf("tree-t%d", n), f.base),
 	}
-	repositoryID := f.tc.Store.Runs[f.fr.RunID].value.RepositoryID
-	row, err := run.NewAttemptWorktree(a.WorktreeID, repositoryID, f.fr.RunID, a.AttemptID, f.base, a.Recorded, a.Branch)
+	repositoryID := f.tc.Store.Runs[runID].value.RepositoryID
+	row, err := run.NewAttemptWorktree(a.WorktreeID, repositoryID, runID, a.AttemptID, f.base, a.Recorded, a.Branch)
 	if err != nil {
 		f.t.Fatal(err)
 	}
@@ -90,7 +96,7 @@ func (f *retireFixture) addAttempt(n int, state fakeAttemptWorktree, edit func(w
 	opID := identity.OperationID(f.tc.IDs.NewID())
 	now := f.tc.Clock.Now()
 	f.tc.Store.Operations[opID] = app.Operation{
-		ID: opID, RunID: f.fr.RunID, Generation: 1, Kind: app.OpWorktreeCreate, State: app.OperationSucceeded,
+		ID: opID, RunID: runID, Generation: 1, Kind: app.OpWorktreeCreate, State: app.OperationSucceeded,
 		Intent: map[string]any{"repository_root": detectRoot, "branch": a.Branch, "base_ref": f.base, "attempt_id": a.AttemptID.String()},
 		ActEvidence: map[string]any{
 			"info":        map[string]any{"WorkspaceID": fmt.Sprintf("w%d", n), "Path": a.Recorded, "Branch": a.Branch},

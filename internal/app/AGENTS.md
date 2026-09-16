@@ -619,6 +619,36 @@ sides together. `cmd/hop` never imports domain or identity types: every
     touches no later row.
   - **Invariants:** no forced removal in any scenario, and no data unseen
     by git is deleted except the approved ignored files.
+- `go test ./internal/app -run 'TestWorktreeRetireDecisionTable|TestWorktreeRetirementZombiePass|TestWorktreeRetirementSiblingRows'` —
+  whole-pass scenarios.
+  - **Decision table:** every `worktree.retire` cell of design note
+    section 7, each through two `RetireWorktrees` passes (the first dies
+    at the cell's crash point, the successor is a newer generation):
+    - a lease lost before dispatch, and a death before any claim, each
+      settle never-executed and are then removed;
+    - a claimed removal that finished is adopted;
+    - nothing removed is interrupted and then removed, or retained as
+      `interrupted-removal` when the kill left changes;
+    - a directory gone but still listed is interrupted, then pruned as
+      absent;
+    - an entry dropped with the directory left is released;
+    - a running group is signaled and a foreign one is not, and both
+      block the pass.
+
+    Removal counts and signals are pinned per cell.
+  - **Takeover barrier:** a successor acquires between a pass's
+    revalidation and its spawn's claim. The zombie's claim is refused, so
+    git never runs; its outcome is fenced and its intent stays pending.
+    The successor settles it never-executed and removes the checkout
+    exactly once.
+  - **Sibling rows:** another run's rows in the same repository wait for
+    that run's own pass (its checkout and fact untouched), then retire
+    there. A row whose record names a sibling's checkout is released as
+    another branch's, and only the sibling's own row removes that
+    checkout, once. A retired run's fact never moves.
+  - **Every scenario:** `retireFixture` asserts no forced removal and no
+    data unseen by git deleted, the approved ignored-only checkouts
+    excepted.
 - `go test ./internal/app -run TestStatusWorktreeLines` — the per-row
   status input after real passes. Each row is covered in turn: removed,
   absent, released with its reason, active with a refused category and
