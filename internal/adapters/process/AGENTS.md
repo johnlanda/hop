@@ -143,8 +143,9 @@ package only observes and signals.
   `status.showUntrackedFiles=no`, refused again under `-c
   status.showUntrackedFiles=all`; modifications hidden by
   assume-unchanged/skip-worktree), missing and symlinked checkout paths,
-  the `worktree list --porcelain -z` record shapes, and the target/ancestry
-  exit statuses. Skips with a reason when no git is on PATH.
+  the `worktree list --porcelain -z` record shapes, and the target,
+  repository-identity (`cat-file -e <oid>^{commit}`) and ancestry exit
+  statuses. Skips with a reason when no git is on PATH.
 - Test fixtures: none on disk; helper modes and ps stubs are written by the
   tests.
 

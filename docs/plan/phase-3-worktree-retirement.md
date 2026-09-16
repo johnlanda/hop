@@ -58,7 +58,9 @@ integrated new content.
 
 **Repository identity.** Before anything else, the pass confirms that the
 frozen repository root still holds this run's history:
-`git -C <root> cat-file -e H^{commit}` must succeed.
+`git -C <root> cat-file -e H^{commit}` must exit 0. Pinned: a missing
+object, a non-commit object, and a root that no longer exists all exit
+128.
 
 If the root no longer resolves (the repository was moved), or another
 repository now lives there without H, the run is skipped. The pass

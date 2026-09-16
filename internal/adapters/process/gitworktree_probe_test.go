@@ -472,9 +472,11 @@ func TestGitProbeWorktreeListPorcelainZ(t *testing.T) {
 
 // TestGitProbeTargetAndAncestry pins the freeze-time target capture
 // (`symbolic-ref -q HEAD`), target resolution (`rev-parse --verify -q
-// <ref>^{commit}`) and the detection predicate (`merge-base --is-ancestor
-// <integration head> <target oid>`): exit 0 is contained (including a
-// commit with itself), 1 is not contained, and 128 is an unknown object.
+// <ref>^{commit}`), the repository-identity check (`cat-file -e
+// <head>^{commit}`) and the detection predicate (`merge-base
+// --is-ancestor <integration head> <target oid>`): exit 0 is contained
+// (including a commit with itself), 1 is not contained, and 128 is an
+// unknown object.
 func TestGitProbeTargetAndAncestry(t *testing.T) {
 	p := newWorktreeProbe(t)
 	first := p.must(p.repo, "rev-parse", "HEAD~1")
@@ -506,6 +508,28 @@ func TestGitProbeTargetAndAncestry(t *testing.T) {
 		result := p.run(p.repo, "merge-base", "--is-ancestor", tc.ancestor, tc.descendant)
 		if result.ExitCode != tc.wantExit || string(result.Stderr) != tc.wantStderr || len(result.Stdout) != 0 {
 			t.Errorf("%s: exit %d stdout %q stderr %q, want exit %d stderr %q", tc.name, result.ExitCode, result.Stdout, result.Stderr, tc.wantExit, tc.wantStderr)
+		}
+	}
+
+	// The repository-identity check: the frozen root must still hold the
+	// run's integration head as a commit. Exit 0 only for a present commit;
+	// a missing object, a non-commit object and a root that no longer
+	// exists all exit 128.
+	tree := p.must(p.repo, "rev-parse", "HEAD^{tree}")
+	identity := []struct {
+		name, dir, object string
+		wantExit          int
+		wantStderr        string
+	}{
+		{"present commit", p.repo, p.base + "^{commit}", 0, ""},
+		{"missing object", p.repo, "0123456789012345678901234567890123456789^{commit}", 128, "fatal: Not a valid object name 0123456789012345678901234567890123456789^{commit}\n"},
+		{"tree object", p.repo, tree + "^{commit}", 128, "error: " + tree + "^{commit}: expected commit type, but the object dereferences to tree type\nfatal: Not a valid object name " + tree + "^{commit}\n"},
+		{"root no longer exists", filepath.Join(p.root, "moved-away"), p.base + "^{commit}", 128, "fatal: cannot change to '" + filepath.Join(p.root, "moved-away") + "': No such file or directory\n"},
+	}
+	for _, tc := range identity {
+		result := p.run(tc.dir, "cat-file", "-e", tc.object)
+		if result.ExitCode != tc.wantExit || string(result.Stderr) != tc.wantStderr || len(result.Stdout) != 0 {
+			t.Errorf("cat-file -e (%s): exit %d stdout %q stderr %q, want exit %d stderr %q", tc.name, result.ExitCode, result.Stdout, result.Stderr, tc.wantExit, tc.wantStderr)
 		}
 	}
 
