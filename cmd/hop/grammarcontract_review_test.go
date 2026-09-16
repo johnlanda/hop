@@ -1,9 +1,7 @@
 package main
 
 import (
-	"context"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -17,70 +15,37 @@ import (
 // repository: SubmitReviewVerdict resolves --subject's tree object id by
 // running `git rev-parse <subject>^{tree}` against the run's recorded
 // repository root (confirmed by reading internal/app/usecase_review.go),
-// before ever reaching ReviewStore. The repo's own HOME and author/
-// committer identity are isolated from the operator's real git
-// configuration; nothing here touches ~/.gitconfig.
+// before ever reaching ReviewStore. Every git command runs through
+// runFixtureGit: the isolated environment (a fresh HOME, a fixed
+// author/committer identity, no system git configuration, the canary
+// socket), bounded by callTimeout; nothing here touches ~/.gitconfig.
 func initFixtureGitRepo(t *testing.T) (repoRoot, commitOID string) {
 	t.Helper()
 	dir := realDir(t)
-	gitHome := t.TempDir()
-	runGit := func(args ...string) string {
-		t.Helper()
-		cmd := exec.CommandContext(context.Background(), "git", args...) //nolint:gosec // G204: a fixed git invocation against this test's own throwaway repository.
-		cmd.Dir = dir
-		cmd.Env = []string{
-			"PATH=" + os.Getenv("PATH"),
-			"HOME=" + gitHome,
-			"GIT_AUTHOR_NAME=hop-fixture", "GIT_AUTHOR_EMAIL=hop-fixture@example.invalid",
-			"GIT_COMMITTER_NAME=hop-fixture", "GIT_COMMITTER_EMAIL=hop-fixture@example.invalid",
-		}
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
-		}
-		return strings.TrimSpace(string(out))
-	}
-	runGit("init", "-q")
-	runGit("config", "commit.gpgsign", "false")
+	runFixtureGit(t, dir, "init", "-q")
+	runFixtureGit(t, dir, "config", "commit.gpgsign", "false")
 	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("hop fixture\n"), 0o600); err != nil {
 		t.Fatalf("write fixture repo file: %v", err)
 	}
-	runGit("add", "README.md")
-	runGit("commit", "-q", "-m", "fixture commit")
-	return dir, runGit("rev-parse", "HEAD")
+	runFixtureGit(t, dir, "add", "README.md")
+	runFixtureGit(t, dir, "commit", "-q", "-m", "fixture commit")
+	return dir, runFixtureGit(t, dir, "rev-parse", "HEAD")
 }
 
-// commitFixtureChange adds one more commit to the repository at dir
-// (initFixtureGitRepo's own isolated identity), returning its object id —
-// used only to build a SECOND, genuinely resolvable commit distinct from
-// the review task's frozen subject, so a subject-mismatch refusal is
-// reached through a real `git rev-parse` success, not a resolution
-// failure (which the app layer classifies as malformed instead).
+// commitFixtureChange adds one more commit to the repository at dir,
+// returning its object id — used only to build a SECOND, genuinely
+// resolvable commit distinct from the review task's frozen subject, so a
+// subject-mismatch refusal is reached through a real `git rev-parse`
+// success, not a resolution failure (which the app layer classifies as
+// malformed instead).
 func commitFixtureChange(t *testing.T, dir string) string {
 	t.Helper()
-	gitHome := t.TempDir()
-	runGit := func(args ...string) string {
-		t.Helper()
-		cmd := exec.CommandContext(context.Background(), "git", args...) //nolint:gosec // G204: a fixed git invocation against this test's own throwaway repository.
-		cmd.Dir = dir
-		cmd.Env = []string{
-			"PATH=" + os.Getenv("PATH"),
-			"HOME=" + gitHome,
-			"GIT_AUTHOR_NAME=hop-fixture", "GIT_AUTHOR_EMAIL=hop-fixture@example.invalid",
-			"GIT_COMMITTER_NAME=hop-fixture", "GIT_COMMITTER_EMAIL=hop-fixture@example.invalid",
-		}
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
-		}
-		return strings.TrimSpace(string(out))
-	}
 	if err := os.WriteFile(filepath.Join(dir, "second.md"), []byte("second change\n"), 0o600); err != nil {
 		t.Fatalf("write second fixture repo file: %v", err)
 	}
-	runGit("add", "second.md")
-	runGit("commit", "-q", "-m", "second fixture commit")
-	return runGit("rev-parse", "HEAD")
+	runFixtureGit(t, dir, "add", "second.md")
+	runFixtureGit(t, dir, "commit", "-q", "-m", "second fixture commit")
+	return runFixtureGit(t, dir, "rev-parse", "HEAD")
 }
 
 // gitRevParseTree resolves subject's tree object id in the repo at dir —
@@ -88,14 +53,7 @@ func commitFixtureChange(t *testing.T, dir string) string {
 // here only to build a review fixture's frozen SubjectTreeOID.
 func gitRevParseTree(t *testing.T, dir, subject string) string {
 	t.Helper()
-	cmd := exec.CommandContext(context.Background(), "git", "rev-parse", subject+"^{tree}") //nolint:gosec // G204: a fixed git invocation against this test's own throwaway repository.
-	cmd.Dir = dir
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + t.TempDir()}
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("git rev-parse %s^{tree}: %v\n%s", subject, err, out)
-	}
-	return strings.TrimSpace(string(out))
+	return runFixtureGit(t, dir, "rev-parse", subject+"^{tree}")
 }
 
 // writeReasonsFile writes a readable reasons file under dir, returning

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -30,13 +32,16 @@ import (
 // cmd/hop actually render it, end to end, through the real compiled
 // binary.
 //
-// No Herdr binary and no network: every exec here runs under
-// isolatedHopEnv, which never inherits the calling process's environment
-// and always points HERDR_SOCKET_PATH at a per-test canary listener that
-// fails the test if anything ever connects to it (herdrCanary below).
-// Nothing in this file starts a Herdr server or lives under
-// test/integration; the real SQLite adapter is the only production
-// dependency exercised.
+// No Herdr binary and no network: every subprocess this suite starts —
+// the hop binary under test, the one go build and the fixture git
+// commands — runs under isolatedEnvironment, which never inherits the
+// calling process's environment, always sets a fresh temporary HOME and
+// always points HERDR_SOCKET_PATH at a canary listener that fails the
+// suite if anything ever connects to it (herdrCanary below). The one
+// exception is the read-only `go env` query that locates the operator's
+// Go caches (goBuildVars). Nothing in this file starts a Herdr server or
+// lives under test/integration; the real SQLite adapter is the only
+// production dependency exercised.
 
 // TestMain builds the hop binary once for every test in this package's
 // `go test` process (buildHopBinary, cached behind hopBinary's sync.Once)
@@ -68,7 +73,10 @@ var hopBinary struct { //nolint:gochecknoglobals // process-lifetime build cache
 // directory and returns the built executable's absolute path. go test
 // runs with the package's own source directory as the working directory,
 // so building "." here is exactly `go build ./cmd/hop` from the module
-// root — no module-root discovery is needed.
+// root — no module-root discovery is needed. The build runs under
+// isolatedEnvironment (a HOME of its own inside the build directory, its
+// own canary listener, checked once the build returns) with only the Go
+// settings goBuildVars resolves.
 func buildHopBinary(t *testing.T) string {
 	t.Helper()
 	hopBinary.once.Do(func() {
@@ -78,31 +86,114 @@ func buildHopBinary(t *testing.T) string {
 			return
 		}
 		hopBinary.dir = dir
-		goBin, err := exec.LookPath("go")
-		if err != nil {
-			hopBinary.err = fmt.Errorf("the go tool is required to build cmd/hop: %w", err)
-			return
-		}
-		wd, err := os.Getwd()
-		if err != nil {
-			hopBinary.err = fmt.Errorf("resolve cmd/hop source directory: %w", err)
-			return
-		}
-		out := filepath.Join(dir, "hop")
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		defer cancel()
-		build := exec.CommandContext(ctx, goBin, "build", "-o", out, ".") //nolint:gosec // G204: the go tool builds this repository's own command with a fixed argument list.
-		build.Dir = wd
-		if combined, buildErr := build.CombinedOutput(); buildErr != nil {
-			hopBinary.err = fmt.Errorf("go build ./cmd/hop: %w\n%s", buildErr, combined)
-			return
-		}
-		hopBinary.path = out
+		hopBinary.path, hopBinary.err = buildInto(dir)
 	})
 	if hopBinary.err != nil {
 		t.Fatalf("build hop binary: %v", hopBinary.err)
 	}
 	return hopBinary.path
+}
+
+// buildTimeout bounds the one go build and its go env query.
+const buildTimeout = 2 * time.Minute
+
+// buildInto builds cmd/hop into dir/hop under the isolated build
+// environment and returns the executable's path.
+func buildInto(dir string) (string, error) {
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		return "", fmt.Errorf("the go tool is required to build cmd/hop: %w", err)
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("resolve cmd/hop source directory: %w", err)
+	}
+	home := filepath.Join(dir, "home")
+	if err = os.Mkdir(home, 0o700); err != nil {
+		return "", fmt.Errorf("create the build HOME: %w", err)
+	}
+	canary, err := startHerdrCanary()
+	if err != nil {
+		return "", err
+	}
+	defer canary.stop() //nolint:errcheck // best-effort removal of the build canary; a breach is reported below.
+
+	ctx, cancel := context.WithTimeout(context.Background(), buildTimeout)
+	defer cancel()
+	goVars, err := goBuildVars(ctx, goBin, canary.path)
+	if err != nil {
+		return "", err
+	}
+	env, err := isolatedEnvironment(home, canary.path, "", goVars)
+	if err != nil {
+		return "", err
+	}
+	out := filepath.Join(dir, "hop")
+	build := exec.CommandContext(ctx, goBin, "build", "-o", out, ".") //nolint:gosec // G204: the go tool builds this repository's own command with a fixed argument list.
+	build.Dir = wd
+	build.Env = env
+	combined, buildErr := build.CombinedOutput()
+	if canary.breached.Load() {
+		return "", errors.New("the go build connected to its HERDR_SOCKET_PATH canary")
+	}
+	if buildErr != nil {
+		return "", fmt.Errorf("go build ./cmd/hop: %w\n%s", buildErr, combined)
+	}
+	return out, nil
+}
+
+// goBuildVars resolves the Go settings the isolated build needs, once:
+// GOCACHE, GOMODCACHE and GOPATH from the operator's own `go env` (so the
+// build cache stays warm and no module is fetched), plus GOTOOLCHAIN and
+// GOFLAGS exactly when the operator's environment sets them (make exports
+// GOTOOLCHAIN from go.mod). The `go env` query is the suite's one
+// subprocess that sees the operator's real HOME — Go locates its
+// configuration file and default caches from it — and it is still an
+// explicit allowlist (goEnvQueryKeys) with the canary socket: a read-only
+// configuration query that builds and runs nothing.
+func goBuildVars(ctx context.Context, goBin, herdrSocket string) (map[string]string, error) {
+	query := exec.CommandContext(ctx, goBin, "env", "-json", "GOCACHE", "GOMODCACHE", "GOPATH")
+	query.Env = goEnvQueryEnvironment(herdrSocket)
+	raw, err := query.Output()
+	if err != nil {
+		return nil, fmt.Errorf("go env: %w", err)
+	}
+	var resolved map[string]string
+	if err := json.Unmarshal(raw, &resolved); err != nil {
+		return nil, fmt.Errorf("decode go env: %w", err)
+	}
+	vars := map[string]string{}
+	for _, key := range []string{"GOCACHE", "GOMODCACHE", "GOPATH"} {
+		value := resolved[key]
+		if !filepath.IsAbs(value) {
+			return nil, fmt.Errorf("go env %s is not an absolute path", key)
+		}
+		vars[key] = value
+	}
+	for _, key := range []string{"GOTOOLCHAIN", "GOFLAGS"} {
+		if value, ok := os.LookupEnv(key); ok && value != "" {
+			vars[key] = value
+		}
+	}
+	return vars, nil
+}
+
+// goEnvQueryKeys are the calling process's variables the `go env` query
+// may see: where Go finds its configuration and caches, and nothing else.
+func goEnvQueryKeys() []string {
+	return []string{"PATH", "HOME", "TMPDIR", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "GOENV", "GOROOT", "GOPATH", "GOCACHE", "GOMODCACHE", "GOTOOLCHAIN", "GOFLAGS"}
+}
+
+// goEnvQueryEnvironment builds the `go env` query's environment from
+// goEnvQueryKeys and the canary socket.
+func goEnvQueryEnvironment(herdrSocket string) []string {
+	env := []string{envHerdrSocket + "=" + herdrSocket}
+	for _, key := range goEnvQueryKeys() {
+		if value, ok := os.LookupEnv(key); ok {
+			env = append(env, key+"="+value)
+		}
+	}
+	return env
 }
 
 // callTimeout bounds one hop subcommand invocation in this suite; every
@@ -167,39 +258,37 @@ func closeQuietly(c io.Closer) {
 	_ = c.Close() //nolint:errcheck // the close result carries no signal here.
 }
 
-// herdrCanary is a unix-socket listener that fails the test if anything
-// ever connects to it: every exec in this suite points HERDR_SOCKET_PATH
-// at one, and no command under test (a store-only refusal or usage-error
-// shape, by construction — see each test file's scope comment) should
-// ever dial it. Accept runs on its own goroutine; the connection flag is
-// checked and reported from t.Cleanup, which still runs while the test is
-// considered active, so it is safe to call t.Errorf there (unlike from
-// the accept goroutine itself, which could otherwise race a completed
-// test).
+// herdrCanary is a unix-socket listener that records any connection:
+// every subprocess in this suite points HERDR_SOCKET_PATH at one, and
+// nothing it runs (a store-only refusal or usage-error shape, by
+// construction — see each test file's scope comment — or the build and
+// fixture git commands) should ever dial it. Accept runs on its own
+// goroutine; a test's canary is checked and reported from t.Cleanup,
+// which still runs while the test is considered active, so it is safe to
+// call t.Errorf there (unlike from the accept goroutine itself, which
+// could otherwise race a completed test).
 type herdrCanary struct {
+	dir      string
 	path     string
 	ln       net.Listener
 	breached atomic.Bool
 }
 
-// newHerdrCanary starts listening at <dir>/herdr.sock, where dir is a
+// startHerdrCanary starts listening at <dir>/herdr.sock, where dir is a
 // short-lived directory of its own (never t.TempDir(), whose nested
-// subtest path can exceed macOS's ~104-byte unix socket path limit), and
-// registers a cleanup that closes the listener, removes dir and fails t
-// if anything ever connected.
-func newHerdrCanary(t *testing.T) *herdrCanary {
-	t.Helper()
+// subtest path can exceed macOS's ~104-byte unix socket path limit).
+func startHerdrCanary() (*herdrCanary, error) {
 	dir, err := os.MkdirTemp("", "hop-canary")
 	if err != nil {
-		t.Fatalf("create herdr canary dir: %v", err)
+		return nil, fmt.Errorf("create herdr canary dir: %w", err)
 	}
 	path := filepath.Join(dir, "herdr.sock")
 	var listenConfig net.ListenConfig
 	ln, err := listenConfig.Listen(context.Background(), "unix", path)
 	if err != nil {
-		t.Fatalf("listen on herdr canary socket: %v", err)
+		return nil, errors.Join(fmt.Errorf("listen on herdr canary socket: %w", err), os.RemoveAll(dir))
 	}
-	c := &herdrCanary{path: path, ln: ln}
+	c := &herdrCanary{dir: dir, path: path, ln: ln}
 	go func() {
 		for {
 			conn, acceptErr := ln.Accept()
@@ -210,49 +299,103 @@ func newHerdrCanary(t *testing.T) *herdrCanary {
 			closeQuietly(conn)
 		}
 	}()
+	return c, nil
+}
+
+// stop closes the listener and removes its directory.
+func (c *herdrCanary) stop() error {
+	closeQuietly(c.ln)
+	return os.RemoveAll(c.dir)
+}
+
+// newHerdrCanary starts a canary for one test and registers a cleanup
+// that stops it and fails t if anything ever connected.
+func newHerdrCanary(t *testing.T) *herdrCanary {
+	t.Helper()
+	c, err := startHerdrCanary()
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() {
-		closeQuietly(ln)
-		if removeErr := os.RemoveAll(dir); removeErr != nil {
-			t.Errorf("remove herdr canary dir: %v", removeErr)
+		if stopErr := c.stop(); stopErr != nil {
+			t.Errorf("remove herdr canary dir: %v", stopErr)
 		}
 		if c.breached.Load() {
-			t.Errorf("HERDR_SOCKET_PATH canary at %s: a command connected to it; this suite must never reach Herdr", path)
+			t.Errorf("HERDR_SOCKET_PATH canary at %s: a command connected to it; this suite must never reach Herdr", c.path)
 		}
 	})
 	return c
 }
 
-// isolatedHopEnv is the one helper every exec in this suite uses to build
-// the child process's environment (ruling: an explicit allowlist enforced
-// by a helper all tests use). It never inherits the calling process's
-// environment: only PATH and TMPDIR (when the host has one) plus hopVars'
-// HOP_* entries are carried; HOME is always a fresh t.TempDir(); and
-// HERDR_SOCKET_PATH always names a fresh herdrCanary listener — never a
-// flag, never a value the caller can steer elsewhere. No ANTHROPIC_*,
-// OPENAI_*, CLAUDE_CONFIG_DIR, CODEX_HOME, HOP_LIVE_HARNESS or
-// HOP_LIVE_HARNESS_HOME entry is ever present, because nothing beyond
-// this allowlist is ever added.
-func isolatedHopEnv(t *testing.T, hopVars map[string]string) []string {
-	t.Helper()
-	home := t.TempDir()
-	canary := newHerdrCanary(t)
-	env := []string{
-		"PATH=" + os.Getenv("PATH"),
-		"HOME=" + home,
-		"HERDR_SOCKET_PATH=" + canary.path,
+// The keys isolatedEnvironment fixes itself; a caller's vars may never
+// name one.
+const (
+	envPath        = "PATH"
+	envHome        = "HOME"
+	envTmpDir      = "TMPDIR"
+	envHerdrSocket = "HERDR_SOCKET_PATH"
+)
+
+// isolatedEnvironment is the ONE constructor for every subprocess
+// environment in this suite (ruling: an explicit allowlist enforced by a
+// helper every exec uses) — the hop binary under test, the go build and
+// the fixture git commands. It never inherits the calling process's
+// environment: it carries PATH (behind pathPrefix, when one is given) and
+// TMPDIR (when the host has one) from the calling process, HOME as home,
+// HERDR_SOCKET_PATH as herdrSocket, and vars — nothing else. vars may not
+// name any of those four keys, so a caller can never steer HOME or the
+// canary elsewhere (a PATH change goes through pathPrefix alone). No
+// ANTHROPIC_*, OPENAI_*, CLAUDE_CONFIG_DIR, CODEX_HOME, HOP_LIVE_HARNESS
+// or other operator entry is ever present unless a caller names it.
+func isolatedEnvironment(home, herdrSocket, pathPrefix string, vars map[string]string) ([]string, error) {
+	if !filepath.IsAbs(home) || !filepath.IsAbs(herdrSocket) {
+		return nil, errors.New("isolated environment: HOME and the canary socket must be absolute paths")
 	}
-	if tmp, ok := os.LookupEnv("TMPDIR"); ok {
-		env = append(env, "TMPDIR="+tmp)
+	if pathPrefix != "" && !filepath.IsAbs(pathPrefix) {
+		return nil, errors.New("isolated environment: the PATH prefix must be an absolute directory")
 	}
-	keys := make([]string, 0, len(hopVars))
-	for k := range hopVars {
-		keys = append(keys, k)
+	keys := make([]string, 0, len(vars))
+	for key := range vars {
+		switch key {
+		case envPath, envHome, envTmpDir, envHerdrSocket:
+			return nil, fmt.Errorf("isolated environment: %s is fixed and cannot be overridden", key)
+		}
+		if key == "" || strings.ContainsAny(key, "=\x00") {
+			return nil, errors.New("isolated environment: a variable name is empty or malformed")
+		}
+		keys = append(keys, key)
 	}
 	sort.Strings(keys)
-	for _, k := range keys {
-		env = append(env, k+"="+hopVars[k])
+	path := os.Getenv(envPath)
+	if pathPrefix != "" {
+		path = pathPrefix + string(os.PathListSeparator) + path
+	}
+	env := []string{envPath + "=" + path, envHome + "=" + home, envHerdrSocket + "=" + herdrSocket}
+	if tmp, ok := os.LookupEnv(envTmpDir); ok {
+		env = append(env, envTmpDir+"="+tmp)
+	}
+	for _, key := range keys {
+		env = append(env, key+"="+vars[key])
+	}
+	return env, nil
+}
+
+// isolatedTestEnv builds one test's subprocess environment: a fresh
+// t.TempDir() HOME and a fresh herdrCanary.
+func isolatedTestEnv(t *testing.T, pathPrefix string, vars map[string]string) []string {
+	t.Helper()
+	env, err := isolatedEnvironment(t.TempDir(), newHerdrCanary(t).path, pathPrefix, vars)
+	if err != nil {
+		t.Fatal(err)
 	}
 	return env
+}
+
+// isolatedHopEnv builds a hop invocation's environment: the host PATH and
+// hopVars' HOP_* entries on top of the fixed allowlist.
+func isolatedHopEnv(t *testing.T, hopVars map[string]string) []string {
+	t.Helper()
+	return isolatedTestEnv(t, "", hopVars)
 }
 
 // execHop is the convenience wrapper every test in this package calls:
@@ -260,6 +403,34 @@ func isolatedHopEnv(t *testing.T, hopVars map[string]string) []string {
 func execHop(t *testing.T, hopVars map[string]string, dir string, args ...string) hopResult {
 	t.Helper()
 	return runHop(t, isolatedHopEnv(t, hopVars), dir, args...)
+}
+
+// fixtureGitVars are the fixture git commands' variables beyond the
+// allowlist: a fixed author/committer identity, and no system-wide git
+// configuration (HOME is already a fresh directory, so no user
+// configuration is read either).
+func fixtureGitVars() map[string]string {
+	return map[string]string{
+		"GIT_AUTHOR_NAME": "hop-fixture", "GIT_AUTHOR_EMAIL": "hop-fixture@example.invalid",
+		"GIT_COMMITTER_NAME": "hop-fixture", "GIT_COMMITTER_EMAIL": "hop-fixture@example.invalid",
+		"GIT_CONFIG_NOSYSTEM": "1",
+	}
+}
+
+// runFixtureGit runs one git command in dir under the isolated fixture
+// environment, bounded by callTimeout, and returns its trimmed output.
+func runFixtureGit(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", args...) //nolint:gosec // G204: a fixed git invocation against this test's own throwaway repository.
+	cmd.Dir = dir
+	cmd.Env = isolatedTestEnv(t, "", fixtureGitVars())
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // freshStateDir returns a fresh, empty absolute directory suitable for
@@ -308,3 +479,161 @@ func testUUID(n int) string {
 // hex but the wrong group width, so every ParseXxxID in internal/domain/identity
 // rejects it the same way an empty or garbled value would.
 const malformedUUID = "not-a-valid-uuid"
+
+// envKeys returns env's variable names, sorted.
+func envKeys(env []string) []string {
+	keys := make([]string, 0, len(env))
+	for _, entry := range env {
+		key, _, _ := strings.Cut(entry, "=")
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// envValue returns key's value in env.
+func envValue(env []string, key string) string {
+	for _, entry := range env {
+		if k, v, ok := strings.Cut(entry, "="); ok && k == key {
+			return v
+		}
+	}
+	return ""
+}
+
+// allowlistedKeys returns the fixed allowlist's keys plus extra, sorted
+// the way envKeys sorts them.
+func allowlistedKeys(extra ...string) []string {
+	keys := append([]string{envPath, envHome, envHerdrSocket}, extra...)
+	if _, ok := os.LookupEnv(envTmpDir); ok {
+		keys = append(keys, envTmpDir)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// TestIsolatedEnvironment pins the one subprocess-environment constructor
+// every exec in this suite uses: a caller can override none of the fixed
+// keys, and the hop, fixture-git and build environments each carry
+// exactly the allowlist plus their own named variables — never an
+// operator variable, never the operator's HOME or Herdr socket.
+func TestIsolatedEnvironment(t *testing.T) {
+	const operatorCanary = "not-a-real-credential-canary"
+	t.Setenv("ANTHROPIC_API_KEY", operatorCanary)
+	t.Setenv("HOP_LIVE_HARNESS", operatorCanary)
+	t.Setenv(envHerdrSocket, "/operator/"+operatorCanary+"/herdr.sock")
+	home, socket := t.TempDir(), filepath.Join(t.TempDir(), "herdr.sock")
+
+	t.Run("fixed keys cannot be overridden", func(t *testing.T) {
+		for _, key := range []string{envHome, envHerdrSocket, envPath, envTmpDir} {
+			if env, err := isolatedEnvironment(home, socket, "", map[string]string{key: "/elsewhere"}); err == nil {
+				t.Errorf("an override of %s was accepted: %q", key, env)
+			}
+		}
+		for _, bad := range []map[string]string{{"": "x"}, {"A=B": "x"}} {
+			if _, err := isolatedEnvironment(home, socket, "", bad); err == nil {
+				t.Errorf("a malformed variable name %q was accepted", bad)
+			}
+		}
+		if _, err := isolatedEnvironment("relative", socket, "", nil); err == nil {
+			t.Error("a relative HOME was accepted")
+		}
+		if _, err := isolatedEnvironment(home, socket, "relative", nil); err == nil {
+			t.Error("a relative PATH prefix was accepted")
+		}
+	})
+
+	check := func(t *testing.T, env, wantKeys []string) {
+		t.Helper()
+		if got := envKeys(env); strings.Join(got, ",") != strings.Join(wantKeys, ",") {
+			t.Errorf("keys = %v, want %v", got, wantKeys)
+		}
+		if envValue(env, envHome) != home || envValue(env, envHerdrSocket) != socket {
+			t.Errorf("HOME/HERDR_SOCKET_PATH = %q/%q, want %q/%q", envValue(env, envHome), envValue(env, envHerdrSocket), home, socket)
+		}
+		for _, entry := range env {
+			if strings.Contains(entry, operatorCanary) {
+				t.Errorf("an operator value leaked: %q", entry)
+			}
+		}
+	}
+
+	t.Run("hop invocation", func(t *testing.T) {
+		env, err := isolatedEnvironment(home, socket, "", map[string]string{"HOP_STATE_DIR": "/state"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		check(t, env, allowlistedKeys("HOP_STATE_DIR"))
+		if envValue(env, envPath) != os.Getenv(envPath) {
+			t.Errorf("PATH = %q, want the host PATH", envValue(env, envPath))
+		}
+	})
+
+	t.Run("PATH prefix goes first", func(t *testing.T) {
+		prefix := t.TempDir()
+		env, err := isolatedEnvironment(home, socket, prefix, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		check(t, env, allowlistedKeys())
+		if want := prefix + string(os.PathListSeparator) + os.Getenv(envPath); envValue(env, envPath) != want {
+			t.Errorf("PATH = %q, want %q", envValue(env, envPath), want)
+		}
+	})
+
+	t.Run("fixture git", func(t *testing.T) {
+		env, err := isolatedEnvironment(home, socket, "", fixtureGitVars())
+		if err != nil {
+			t.Fatal(err)
+		}
+		gitKeys := make([]string, 0, len(fixtureGitVars()))
+		for key := range fixtureGitVars() {
+			gitKeys = append(gitKeys, key)
+		}
+		check(t, env, allowlistedKeys(gitKeys...))
+		if envValue(env, "GIT_CONFIG_NOSYSTEM") != "1" {
+			t.Error("the fixture git environment reads the system git configuration")
+		}
+	})
+
+	t.Run("go build", func(t *testing.T) {
+		goBin, err := exec.LookPath("go")
+		if err != nil {
+			t.Skip("the go tool is not on PATH")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), buildTimeout)
+		defer cancel()
+		vars, err := goBuildVars(ctx, goBin, socket)
+		if err != nil {
+			t.Fatalf("goBuildVars: %v", err)
+		}
+		var names []string
+		for key := range vars {
+			switch key {
+			case "GOCACHE", "GOMODCACHE", "GOPATH", "GOTOOLCHAIN", "GOFLAGS":
+				names = append(names, key)
+			default:
+				t.Errorf("the build carries %s, outside the Go allowlist", key)
+			}
+		}
+		for _, required := range []string{"GOCACHE", "GOMODCACHE", "GOPATH"} {
+			if vars[required] == "" {
+				t.Errorf("the build lacks %s; its cache would go cold", required)
+			}
+		}
+		env, err := isolatedEnvironment(home, socket, "", vars)
+		if err != nil {
+			t.Fatal(err)
+		}
+		check(t, env, allowlistedKeys(names...))
+		for _, entry := range goEnvQueryEnvironment(socket) {
+			key, _, _ := strings.Cut(entry, "=")
+			if key != envHerdrSocket && !slices.Contains(goEnvQueryKeys(), key) {
+				t.Errorf("the go env query carries %s, outside its allowlist", key)
+			}
+			if strings.Contains(entry, operatorCanary) {
+				t.Errorf("the go env query carries an operator value: %q", entry)
+			}
+		}
+	})
+}
