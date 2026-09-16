@@ -1,6 +1,10 @@
 package app
 
-import "github.com/johnlanda/hop/internal/domain/identity"
+import (
+	"context"
+
+	"github.com/johnlanda/hop/internal/domain/identity"
+)
 
 // NewRunHandleForTest exposes newRunHandle to app_test: scheduler and
 // messaging scenarios seed a feature-mode run directly into the fake store
@@ -17,4 +21,25 @@ func NewRunHandleForTest(runID identity.RunID, lease Lease) RunHandle {
 // template rather than an ad-hoc string.
 func RenderContinuationPromptForTest(assignmentPath, hopPath string) string {
 	return renderContinuationPrompt(assignmentPath, hopPath)
+}
+
+// CheckoutVerdictForTest is inspectAttemptCheckout's verdict with its
+// disposition rendered as a string, for app_test.
+type CheckoutVerdictForTest struct {
+	Disposition string
+	Retained    WorktreeRetainedCategory
+	Released    WorktreeReleaseReason
+	ListedPath  string
+	WasAbsent   bool
+	Detail      string
+}
+
+// InspectAttemptCheckoutForTest exposes inspectAttemptCheckout to
+// app_test, whose fake git models the linked attempt worktrees.
+func InspectAttemptCheckoutForTest(ctx context.Context, c *Controller, root, path, branch, baseOID string, inspect PathInspector) CheckoutVerdictForTest {
+	v := c.inspectAttemptCheckout(ctx, &attemptCheckout{RepositoryRoot: root, Path: path, Branch: branch, BaseOID: baseOID}, inspect)
+	return CheckoutVerdictForTest{
+		Disposition: string(v.Disposition), Retained: v.Retained, Released: v.Released,
+		ListedPath: v.ListedPath, WasAbsent: v.WasAbsent, Detail: v.Detail,
+	}
 }
