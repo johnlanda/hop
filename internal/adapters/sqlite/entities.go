@@ -556,34 +556,6 @@ func pendingLaunchIntentOfSession(ctx context.Context, q querier, sessionID iden
 	return intentIncarnation.String, true, nil
 }
 
-// launchIntentIdentities are the two stable identity keys of a pending
-// launch operation's intent JSON — the documented app↔store contract keys
-// "incarnation_id" and "session_id". A missing or non-string member is "".
-type launchIntentIdentities struct {
-	incarnationID string
-	sessionID     string
-}
-
-// pendingLaunchIntent reads the run's newest pending launch operation
-// (kind pane.open or launch.send) and returns its intent's identity keys;
-// ok is false when no such operation is pending.
-func pendingLaunchIntent(ctx context.Context, q querier, runID identity.RunID) (launchIntentIdentities, bool, error) {
-	var intentIncarnation, intentSession sql.NullString
-	err := q.QueryRowContext(ctx,
-		`SELECT json_extract(intent, '$.incarnation_id'), json_extract(intent, '$.session_id') FROM operations
-		 WHERE run_id = ? AND state = ? AND kind IN (?, ?)
-		 ORDER BY created_at DESC, rowid DESC LIMIT 1`,
-		runID.String(), string(app.OperationPending), string(app.OpPaneOpen), string(app.OpLaunchSend),
-	).Scan(&intentIncarnation, &intentSession)
-	if errors.Is(err, sql.ErrNoRows) {
-		return launchIntentIdentities{}, false, nil
-	}
-	if err != nil {
-		return launchIntentIdentities{}, false, fmt.Errorf("sqlite: read pending launch intent of run %s: %w", runID, err)
-	}
-	return launchIntentIdentities{incarnationID: intentIncarnation.String, sessionID: intentSession.String}, true, nil
-}
-
 // mailboxClear reports whether task's mailbox has no queued or
 // delivered-unacknowledged message: the section 5 drain-then-submit
 // contract. Vacuously true for a solo task, which no message ever

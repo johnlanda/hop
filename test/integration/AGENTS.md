@@ -286,15 +286,14 @@ scenario (compiles, skips cleanly by default, never run by this task).
   landing) — unlike the claim-write-*failure* case above (an externally
   held lock, no race), this needs the actual write to never happen at
   all, which only a timing race against the process itself could produce.
-- **The fallback-transport shell-fork pid case, and the send-text
-  fallback as its own scenario**: `internal/app` never calls
-  `Runtime.SendText` anywhere — `hop run`'s launch flow only ever uses the
-  primary `layout.apply` transport, with no decision-table branch,
-  config flag or fallback path that would select send-text. The
-  send-text mechanism itself is a working, independently-tested port and
-  adapter method (`internal/adapters/herdr`'s own tests, and the S1 probe,
-  `spike_launch_test.go`) — there is simply nothing in `hop run`'s own
-  behavior today to drive it through.
+- **The fallback-transport shell-fork pid case**: `internal/app` never had
+  a decision-table branch, config flag or fallback path that selected the
+  send-text transport — `hop run`'s launch flow only ever used the primary
+  `layout.apply` transport — and slice 6 deleted `Runtime.SendText` and
+  its herdr adapter method entirely as dead, uncalled surface (the S1
+  probe, `spike_launch_test.go`, still exercises the raw
+  `pane.send_text` wire method directly through `Client.Call`, unrelated
+  to the deleted port member).
 
 ## Dependencies and ports
 

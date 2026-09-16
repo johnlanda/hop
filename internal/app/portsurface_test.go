@@ -43,21 +43,13 @@ func portSurfaceAllowlist() map[string][]string {
 		"PlanStore":                {"ClosePlan", "CreateTask", "RequestRetry"},
 		"Probe":                    {"Binary", "Harness", "Ping", "Schema"},
 		"ProcessGroupInspector":    {"GroupProcesses", "SignalGroup"},
-		"ReadStore":                {"ListRuns", "LoadCheckExecutionContext", "LoadFrozenRun", "LoadLaunchContext", "LoadRunStatus"},
+		"ReadStore":                {"ListRuns", "LoadCheckExecutionContext", "LoadFrozenRun", "LoadRunStatus"},
 		"ResultRepository":         {"Accepted"},
 		"RetryRequestRepository":   {"MarkConsumed", "Pending"},
 		"ReviewRepository":         {"ByAttempt", "Latest"},
 		"ReviewStore":              {"SubmitReview"},
 		"RunRepository":            {"Get", "Save"},
-		// Runtime still carries SendText: the staged legacy member of the
-		// section 7 injection invariant, declared but never referenced by
-		// production code (the internal checker's forbidden-call rule
-		// enforces the no-reference half). Legacy exception recorded
-		// 2026-09-15 by slice 2b; slice 6's removal landing deletes the
-		// port member together with this entry's "SendText", at which
-		// point this test asserts its absence through the typed-input scan
-		// below losing its one exception.
-		"Runtime":                  {"ClosePane", "CreateWorktree", "FindPaneByLabel", "InspectPane", "OpenWorkerPane", "ReadPane", "SendText", "ServerInstance"},
+		"Runtime":                  {"ClosePane", "CreateWorktree", "FindPaneByLabel", "InspectPane", "OpenWorkerPane", "ReadPane", "ServerInstance"},
 		"SessionIndexRepository":   {"ByRun"},
 		"SessionRepository":        {"Create", "Current", "Get", "Save"},
 		"StateStore":               {"AcquireLease", "Begin", "Heartbeat", "InitializeRun", "ReleaseLease"},
@@ -85,12 +77,12 @@ func typedInputMethodNames() map[string]bool {
 }
 
 // legacyTypedInputExceptions are the staged legacy members the typed-input
-// scan tolerates, as "Interface.Method". Exactly one exists: Runtime.
-// SendText, recorded 2026-09-15 (slice 2b); slice 6's removal landing
-// deletes the port member and this entry together, and the scan then
-// proves the whole package free of typed-input method names.
+// scan tolerates, as "Interface.Method". None remain: slice 6 deleted the
+// one that ever existed (Runtime.SendText, recorded 2026-09-15 by slice
+// 2b), so this scan now proves the whole package free of typed-input
+// method names with no exception.
 func legacyTypedInputExceptions() map[string]bool {
-	return map[string]bool{"Runtime.SendText": true}
+	return map[string]bool{}
 }
 
 // declaredPortSurface parses every production (non-test) file of the

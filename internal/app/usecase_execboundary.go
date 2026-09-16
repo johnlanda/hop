@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/johnlanda/hop/internal/domain/identity"
-	"github.com/johnlanda/hop/internal/domain/run"
 )
 
 // launchArgvDigestTag versions the canonical launch-argv digest encoding.
@@ -21,172 +20,19 @@ const launchArgvDigestTag = "hop-argv-v1"
 // filesystem access itself.
 type ExecutableLookup func(name, pathValue string) (string, error)
 
-// LaunchExecRequest is hop launch's input: the --run/--attempt flag values
-// as raw strings, the absolute path of the running hop executable (rendered
-// into the initial prompt's submit instruction), the launcher's
-// symlink-resolved absolute working directory (the attempt worktree the
-// pane was created at — execve preserves it, so it is exactly the path the
-// harness resolves as its own cwd), the launcher's complete inherited
-// environment and its own pid, and the composition-supplied executable
-// lookup.
-type LaunchExecRequest struct {
-	RunID     string
-	AttemptID string
-	HOPPath   string
-	WorkerDir string
-	Environ   []string
-	PID       int
-	// ResolvePath canonically resolves an absolute path (symlinks
-	// followed), supplied by composition like LookupExecutable because
-	// this package performs no filesystem access itself. PrepareLaunchExec
-	// resolves BOTH the launcher's working directory and the recorded
-	// worktree path through it and refuses on disagreement; its errors are
-	// never echoed (they may carry the path).
-	ResolvePath      func(path string) (string, error)
-	LookupExecutable ExecutableLookup
-}
-
-// LaunchExecPlan is what hop launch execs once PrepareLaunchExec has
-// validated, seeded, claimed and composed: the harness argv (argv[0] the
-// resolved absolute executable recorded in the claim) and the sanitized
-// complete environment. IncarnationID is the claimed incarnation as a
-// string, so a failed exec can settle the claim through FailLaunchExec
-// without the caller holding a typed identity. SeedEvidence is the
-// workspace-trust pre-seeding outcome exactly as the claim recorded it.
+// LaunchExecPlan is what hop launch execs once PrepareSessionLaunchExec
+// has validated, seeded, claimed and composed: the harness argv (argv[0]
+// the resolved absolute executable recorded in the claim) and the
+// sanitized complete environment. IncarnationID is the claimed incarnation
+// as a string, so a failed exec can settle the claim through
+// FailLaunchExec without the caller holding a typed identity. SeedEvidence
+// is the workspace-trust pre-seeding outcome exactly as the claim
+// recorded it.
 type LaunchExecPlan struct {
 	Argv          []string
 	Env           []string
 	IncarnationID string
 	SeedEvidence  string
-}
-
-// PrepareLaunchExec performs every hop launch step before the exec itself
-// (docs/plan/phase-2-design.md section 6): it loads the launch context
-// lease-free, validates the HOP_* environment against it fail-closed —
-// every pane-provided variable must be present and agree with the context
-// (validateLaunchEnvironment) — together with attempt currency, the stop
-// state and the different-pid claim rule; sanitizes the launcher's inherited environment under the
-// snapshot's frozen, versioned policy; composes the harness argv from the
-// frozen snapshot per harness (first launches for Claude, Codex and
-// opencode share the fixed initial prompt; a cold relaunch is Claude's
-// --resume with the pre-assigned native reference immediately adjacent,
-// followed by the fixed continuation prompt, and Codex/opencode
-// cold resume reports the Phase 2 unsupported state); resolves the
-// harness executable to
-// an absolute path using the sanitized environment's PATH; applies the
-// workspace-trust pre-seed (PlanTrustSeed over the sanitized environment
-// and the launcher's resolved working directory, written through the
-// TrustSeeder port — an absent or unparsable profile config is a
-// not-seeded outcome and the launch proceeds, while a seeding failure
-// refuses the launch fail-closed); and records the
-// launch claim (exec_pending) with that exact executable, the argv digest,
-// the launcher's own pid and the seed outcome as evidence — evidence only,
-// never a decision input. Any failure returns before the claim is
-// written — no claim, no exec — except a failed claim write itself, which
-// is the store's refusal. Error messages name environment variables but
-// never echo their values.
-func (c *Controller) PrepareLaunchExec(ctx context.Context, req LaunchExecRequest) (LaunchExecPlan, error) { //nolint:gocritic // hugeParam: LaunchExecRequest is the driving DTO for hop launch, called once per launcher process.
-	runID, err := identity.ParseRunID(req.RunID)
-	if err != nil {
-		return LaunchExecPlan{}, fmt.Errorf("app: parse run id: %w", err)
-	}
-	attemptID, err := identity.ParseAttemptID(req.AttemptID)
-	if err != nil {
-		return LaunchExecPlan{}, fmt.Errorf("app: parse attempt id: %w", err)
-	}
-	if req.PID <= 0 {
-		return LaunchExecPlan{}, fmt.Errorf("app: launcher pid %d is not a valid process id", req.PID)
-	}
-	if !filepath.IsAbs(req.HOPPath) {
-		return LaunchExecPlan{}, fmt.Errorf("app: hop executable path is not absolute; the initial prompt carries only absolute paths")
-	}
-	if !filepath.IsAbs(req.WorkerDir) {
-		return LaunchExecPlan{}, fmt.Errorf("app: the launcher working directory is not absolute; the workspace-trust seed key must be the resolved worktree path")
-	}
-	if req.LookupExecutable == nil {
-		return LaunchExecPlan{}, fmt.Errorf("app: no executable lookup supplied")
-	}
-	if req.ResolvePath == nil {
-		return LaunchExecPlan{}, fmt.Errorf("app: no path resolver supplied")
-	}
-
-	lc, err := c.Read.LoadLaunchContext(ctx, runID, attemptID)
-	if err != nil {
-		return LaunchExecPlan{}, fmt.Errorf("app: load launch context: %w", err)
-	}
-	if envErr := validateLaunchEnvironment(req.Environ, &lc, runID.String(), attemptID.String()); envErr != nil {
-		return LaunchExecPlan{}, envErr
-	}
-	if lc.StopRequested {
-		return LaunchExecPlan{}, fmt.Errorf("app: the run has a stop request; the worker is not launched")
-	}
-	if lc.Attempt.State != run.AttemptLaunching && lc.Attempt.State != run.AttemptRelaunching {
-		return LaunchExecPlan{}, fmt.Errorf("app: attempt is %s, not launching or relaunching; this launcher invocation is not current", lc.Attempt.State)
-	}
-	if lc.Claim != nil {
-		if lc.Claim.PID != req.PID {
-			return LaunchExecPlan{}, fmt.Errorf("app: a launch claim for this incarnation already exists with a different pid; a duplicate launcher never execs")
-		}
-		if lc.Claim.State != LaunchClaimExecPending {
-			return LaunchExecPlan{}, fmt.Errorf("app: the launch claim for this incarnation is already settled %s; this incarnation never execs again", lc.Claim.State)
-		}
-	}
-
-	validated, err := lc.Snapshot.EnvPolicy.Validate()
-	if err != nil {
-		return LaunchExecPlan{}, fmt.Errorf("app: frozen environment policy: %w", err)
-	}
-	env, _ := SanitizeEnvironment(req.Environ, validated)
-
-	tail, err := composeHarnessArgvTail(&lc, req.HOPPath)
-	if err != nil {
-		return LaunchExecPlan{}, err
-	}
-	executable, err := req.LookupExecutable(lc.Snapshot.Harness, environValue(env, "PATH"))
-	if err != nil {
-		return LaunchExecPlan{}, fmt.Errorf("app: resolve harness executable: %w", err)
-	}
-	if !filepath.IsAbs(executable) {
-		return LaunchExecPlan{}, fmt.Errorf("app: resolved harness executable is not an absolute path")
-	}
-	argv := append([]string{executable}, tail...)
-	digest := launchArgvDigest(argv)
-	// An existing same-pid exec_pending claim authorizes only the exact
-	// invocation it recorded: the corroboration predicate settles a claim
-	// by its recorded executable and argv identity, and a same-pid retry
-	// keeps every identity field of the existing row (the store refreshes
-	// its seed evidence only), so executing a differently composed plan
-	// under it would run an invocation the claim
-	// does not describe. Identical retries stay idempotent; anything else
-	// fails closed before exec.
-	if lc.Claim != nil && (lc.Claim.Executable != executable || lc.Claim.ArgvDigest != digest) {
-		return LaunchExecPlan{}, fmt.Errorf("app: the existing launch claim for this incarnation records a different executable or argv than this invocation composed; a claim is never rewritten and this launcher never execs")
-	}
-
-	workerDir, err := resolveWorkerDirAgainstWorktree(req.ResolvePath, req.WorkerDir, lc.WorktreePath)
-	if err != nil {
-		return LaunchExecPlan{}, err
-	}
-	seedEvidence, err := c.seedWorkspaceTrust(ctx, lc.Snapshot.Harness, env, workerDir)
-	if err != nil {
-		return LaunchExecPlan{}, err
-	}
-
-	claim := LaunchClaim{
-		IncarnationID: lc.IncarnationID,
-		RunID:         runID,
-		AttemptID:     attemptID,
-		Executable:    executable,
-		ArgvDigest:    digest,
-		PID:           req.PID,
-		State:         LaunchClaimExecPending,
-		ClaimedAt:     c.Clock.Now(),
-		SeedEvidence:  seedEvidence,
-	}
-	if err := c.Submissions.ClaimLaunch(ctx, claim); err != nil {
-		return LaunchExecPlan{}, fmt.Errorf("app: claim launch: %w", err)
-	}
-	return LaunchExecPlan{Argv: argv, Env: env, IncarnationID: lc.IncarnationID.String(), SeedEvidence: seedEvidence}, nil
 }
 
 // resolveWorkerDirAgainstWorktree canonically resolves the launcher's
@@ -257,87 +103,6 @@ func (c *Controller) FailLaunchExec(ctx context.Context, incarnationID, reason s
 		return fmt.Errorf("app: settle launch failure: %w", err)
 	}
 	return nil
-}
-
-// validateLaunchEnvironment checks the pane-provided HOP_* variables
-// against the loaded launch context, fail closed: every variable the
-// design's pane environment carries — HOP_STATE_DIR, HOP_RUN_ID,
-// HOP_TASK_ID, HOP_ATTEMPT_ID, HOP_INCARNATION_ID — must be PRESENT and
-// must agree with the frozen state root, the command's own parsed flags,
-// the attempt's task and the incarnation the launch intent recorded. A
-// missing or disagreeing variable refuses the launch before any claim.
-// Errors name the variable and what disagreed, never the value.
-func validateLaunchEnvironment(environ []string, lc *LaunchContext, runID, attemptID string) error {
-	expected := []struct{ name, want string }{
-		{"HOP_STATE_DIR", lc.Snapshot.StateRoot},
-		{"HOP_RUN_ID", runID},
-		{"HOP_TASK_ID", lc.Attempt.TaskID.String()},
-		{"HOP_ATTEMPT_ID", attemptID},
-		{"HOP_INCARNATION_ID", lc.IncarnationID.String()},
-	}
-	for _, v := range expected {
-		got := environValue(environ, v.name)
-		if got == "" {
-			return fmt.Errorf("app: %s is not set; hop launch runs only in a HOP-created worker pane, which provides it", v.name)
-		}
-		if got != v.want {
-			return fmt.Errorf("app: %s does not agree with the run's launch context; a stale or foreign pane environment never execs", v.name)
-		}
-	}
-	return nil
-}
-
-// composeHarnessArgvTail renders the harness argv after the executable
-// from the frozen snapshot, per harness. A cold relaunch (attempt
-// relaunching) is supported for Claude only —
-// `--resume <native-ref> <continuation prompt>`, where the reference was
-// pre-assigned by HOP before first launch and the continuation prompt is
-// the fixed positional prompt that makes the restored session continue
-// (interactive Claude Code restores a resumed transcript but never
-// re-runs a pending user turn on --resume; `claude --help` 2.1.270:
-// `Usage: claude [options] [command] [prompt]`, so a positional prompt
-// may follow `--resume <id>` — docs/architecture/native-harness-compat.md).
-// The `--resume` element stays IMMEDIATELY followed by the exact durable
-// reference: the restored-harness predicate (decision.go) requires that
-// adjacency, and it tolerates trailing argv elements. Codex and opencode
-// cold resume reports the Phase 2 unsupported state (their native session
-// capture is unspecified). First launches are supported for all three
-// harnesses, sharing the one fixed initial prompt: Claude
-// `--session-id <ref> <prompt>` (Claude alone needs the native
-// reference), Codex `<prompt>`, opencode `--prompt <prompt>`. Claude argv
-// is never rendered for another harness.
-func composeHarnessArgvTail(lc *LaunchContext, hopPath string) ([]string, error) {
-	if lc.Attempt.State == run.AttemptRelaunching {
-		if lc.Snapshot.Harness != HarnessClaude {
-			return nil, fmt.Errorf("app: cold resume for harness %q is not supported in Phase 2; its native session capture is unspecified — stop the run or continue it manually", lc.Snapshot.Harness)
-		}
-		ref := lc.Session.NativeSessionRef
-		if ref == "" {
-			return nil, fmt.Errorf("app: the session has no pre-assigned native session reference; claude argv cannot be composed")
-		}
-		if !filepath.IsAbs(lc.Snapshot.AssignmentPath) {
-			return nil, fmt.Errorf("app: the frozen assignment path is not absolute; the continuation prompt carries only absolute paths")
-		}
-		return []string{"--resume", ref, renderContinuationPrompt(lc.Snapshot.AssignmentPath, hopPath)}, nil
-	}
-	if !filepath.IsAbs(lc.Snapshot.AssignmentPath) {
-		return nil, fmt.Errorf("app: the frozen assignment path is not absolute; the initial prompt carries only absolute paths")
-	}
-	prompt := renderInitialPrompt(lc.Snapshot.AssignmentPath, hopPath)
-	switch lc.Snapshot.Harness {
-	case HarnessClaude:
-		ref := lc.Session.NativeSessionRef
-		if ref == "" {
-			return nil, fmt.Errorf("app: the session has no pre-assigned native session reference; claude argv cannot be composed")
-		}
-		return []string{"--session-id", ref, prompt}, nil
-	case HarnessCodex:
-		return []string{prompt}, nil
-	case HarnessOpencode:
-		return []string{"--prompt", prompt}, nil
-	default:
-		return nil, fmt.Errorf("app: harness %q is not one of claude, codex, opencode", lc.Snapshot.Harness)
-	}
 }
 
 // renderInitialPrompt renders the fixed first-launch prompt: absolute paths

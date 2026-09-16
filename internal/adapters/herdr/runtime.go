@@ -287,21 +287,6 @@ func (r *Runtime) FindPaneByLabel(ctx context.Context, label string) (app.PaneRe
 	}
 }
 
-// sendTextParams is the wire shape of pane.send_text.
-type sendTextParams struct {
-	PaneID string `json:"pane_id"`
-	Text   string `json:"text"`
-}
-
-// SendText sends one line of text into a pane's foreground process. It is
-// the fallback transport only: the fixed-grammar launch line
-// (docs/plan/phase-2-design.md section 6). It is never used for anything
-// else.
-func (r *Runtime) SendText(ctx context.Context, paneID, text string) error {
-	err := r.client.Call(ctx, "pane.send_text", sendTextParams{PaneID: paneID, Text: text}, nil)
-	return wrapPaneError("send text to", paneID, err)
-}
-
 // readPaneParams is the wire shape of pane.read for scrollback capture:
 // the "recent" source (scrollback, not just the visible viewport) as plain
 // text with ANSI stripped (strip_ansi's server default), bounded to lines

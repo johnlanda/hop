@@ -18,7 +18,7 @@ occupant inspection for the worker-launch use case.
 | [probe.go](probe.go) | `InstallationProbe`, `parseSchema` | Implements `app.Probe`: resolves executables, reads `--version` lines, extracts protocol and method constants from `herdr api schema --json`, pings the configured socket |
 | [presentation.go](presentation.go) | `Presentation`, `NewPresentation` | Implements `app.AgentPresentation`: `pane.report_metadata` token patches, `agent.view.set` with a manager-first token sort and `agent.view.clear` — all under HOP's fixed source so its view is owned and clearable |
 | [observation.go](observation.go) | `Observer`, `NewObserver`, `statusStream`, `DrainRemaining`, `flushBacklog` | Implements `app.Observer`: one `pane.agent_status_changed` subscription per watched pane, normalized into `app.StatusEvent`, and a `session.snapshot` reduced to `app.PaneObservation`; on stop-intake, the decode pump moves its pending event and the rest of the raw backlog into an overflow slice that `DrainRemaining` exposes |
-| [runtime.go](runtime.go) | `Runtime`, `NewRuntime`, `ErrPaneNotFound`, `ErrWorkspaceIDRequired` | Implements `app.Runtime`: `worktree.create` (cwd/branch/base, plus an S9 creation label sent only when the caller supplies one), `layout.apply` worker-pane creation, pane recovery by creation label via `session.snapshot`, the `pane.send_text` fallback transport, `pane.read` scrollback capture, `pane.process_info` occupant inspection, `pane.close`, and `ServerInstance`'s dial-inspect-close socket-peer-pid lookup |
+| [runtime.go](runtime.go) | `Runtime`, `NewRuntime`, `ErrPaneNotFound`, `ErrWorkspaceIDRequired` | Implements `app.Runtime`: `worktree.create` (cwd/branch/base, plus an S9 creation label sent only when the caller supplies one), `layout.apply` worker-pane creation, pane recovery by creation label via `session.snapshot`, `pane.read` scrollback capture, `pane.process_info` occupant inspection, `pane.close`, and `ServerInstance`'s dial-inspect-close socket-peer-pid lookup |
 | [workspace.go](workspace.go) | `Runtime.CreateWorkspace`, `Runtime.FindWorkspaceByLabel` | Implements `app.WorkspaceRuntime` on the same `Runtime` type: `workspace.create` (explicit cwd, additive env, a unique creation label, focus always false) and its S8 recovery lookup — resolve the labeled workspace via `session.snapshot`, then descend to its sole tab and that tab's sole pane |
 | [runtime_darwin.go](runtime_darwin.go), [runtime_linux.go](runtime_linux.go), [runtime_other.go](runtime_other.go) | `peerPID` | GOOS-selected: `peerPID` reads a dialed connection's socket peer pid — `getsockopt(SOL_LOCAL, LOCAL_PEERPID)` on darwin, `getsockopt(SOL_SOCKET, SO_PEERCRED)` on linux, unconditionally unavailable elsewhere |
 
@@ -121,8 +121,8 @@ occupant inspection for the worker-launch use case.
   non-match (an absent label decoding as `""` could otherwise let an
   empty lookup label match a malformed workspace).
 - `ErrPaneNotFound` is a typed, `errors.Is`-checkable sentinel every
-  pane-addressed `Runtime` method (`SendText`, `ReadPane`, `InspectPane`,
-  `ClosePane`) maps Herdr's `pane_not_found` API error onto, through the
+  pane-addressed `Runtime` method (`ReadPane`, `InspectPane`, `ClosePane`)
+  maps Herdr's `pane_not_found` API error onto, through the
   shared `wrapPaneError` helper; every other error keeps its own type under
   the added pane-address context. For `InspectPane` specifically, Herdr
   returns this same code both for no such pane and for a pane that exists
@@ -265,9 +265,10 @@ occupant inspection for the worker-launch use case.
   allowlist. The six terminal-input methods (`pane.send_text`,
   `pane.send_keys`, `pane.send_input`, `agent.prompt`, `agent.send_keys`,
   `agent.start`, S11-confirmed as Herdr 0.9.0's complete real input
-  surface) are never on that allowlist except the one staged exception,
-  `pane.send_text` for `SendText` itself, which slice 6 removes together
-  with the port member. The test cross-checks its own reference count
+  surface) are never on that allowlist: slice 6 deleted the one staged
+  exception this adapter ever carried, `pane.send_text` for the `SendText`
+  port member itself, together with the member. The test cross-checks its
+  own reference count
   against a plain syntactic count of `.Call`-named selectors and fails if
   they disagree, so a type-checking gap cannot silently under-cover.
   `TestCallSiteAllowlistRuleCatchesViolations` proves the rule actually

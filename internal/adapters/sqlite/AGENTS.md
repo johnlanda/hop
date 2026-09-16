@@ -37,7 +37,7 @@ this package never resolves environment variables or defaults.
 | [uow.go](uow.go) | `unitOfWork` and the typed repositories (`Runs`…`CheckExecClaims`), `OperationRepository.Pending`/`ByKind`, `Commit`, `Rollback` | One immediate transaction per unit of work; optimistic-concurrency saves; append-only bindings and transitions; journal payloads persisted as uninterpreted JSON; controller-side launch-claim settlement |
 | [entities.go](entities.go) | `getRun`, `getTask`, `getAttempt`, `getSession`, `currentSession`, `currentBinding`, `getLaunchClaim`, `acceptedResult`, `incarnationCurrent`, `launchIncarnationCurrent`, `pendingLaunchIntent` | Row ↔ domain-value mapping shared by all three authorities through the `querier` interface |
 | [submission.go](submission.go) | `SubmitResult`, `RecordMalformed`, `ClaimLaunch`, `SettleLaunchFailure`, `ClaimCheckExec`, `RequestStop`, `insertReceipt` | The worker authority: the section 7 validation order with the domain's `AcceptResult` inside one transaction, receipts for every outcome, the pre-exec claim contracts, the monotonic stop request |
-| [readstore.go](readstore.go) | `ListRuns`, `LoadRunStatus`, `LoadFrozenRun`, `LoadLaunchContext`, `LoadCheckExecutionContext`, `launchIdentity`, `lastCheckSummary` | Lease-free reads, each inside one deferred read transaction for a consistent WAL snapshot |
+| [readstore.go](readstore.go) | `ListRuns`, `LoadRunStatus`, `LoadFrozenRun`, `LoadCheckExecutionContext`, `lastCheckSummary` | Lease-free reads, each inside one deferred read transaction for a consistent WAL snapshot |
 
 ## Invariants
 
@@ -118,13 +118,6 @@ this package never resolves environment variables or defaults.
 - Stop requests are monotonic: `stop_requested_at` is set once and never
   cleared or moved; `RunStatus.StopRequested` and `RunDetail.StopRequested`
   mirror it for the read model.
-- `LoadLaunchContext` returns the incarnation HOP_INCARNATION_ID must match
-  (`LaunchContext.IncarnationID`), not a binding: the current binding
-  decides it when one exists, the session's pending launch intent
-  (`incarnation_id`, gated on a matching `session_id`) otherwise, and when
-  both exist they must agree — a disagreement, a malformed intent identity,
-  or neither source fails closed with `app.ErrNotFound` rather than handing
-  the launcher an identity nothing recorded.
 - `LoadFrozenRun` serves the frozen snapshot, repository root and brief
   lease-free; `RunDetail.StateRoot` carries the frozen state root and
   `RunDetail.LastCheck` summarizes the newest `check.run` operation
@@ -138,10 +131,11 @@ this package never resolves environment variables or defaults.
   current binding else the SESSION's newest pending launch intent (B2:
   two concurrently pending launches validate independently), and the
   INSERT records `session_id` (NOT NULL) with `attempt_id` NULL for an
-  attempt-less (manager) claim. `LoadSessionLaunchContext` uses the same
-  session-keyed resolution and fails closed like `LoadLaunchContext`;
-  the Phase 2 run-keyed `LoadLaunchContext` is untouched until slice 6
-  deletes it.
+  attempt-less (manager) claim. `LoadSessionLaunchContext` resolves the
+  incarnation HOP_INCARNATION_ID must match the same session-keyed way and
+  fails closed with `app.ErrNotFound`; slice 6 deleted the Phase 2
+  run-keyed `LoadLaunchContext`, so this is the only launch-context read
+  now — every role, the permanent solo shim included.
 - Worker-authority request idempotency is receipt-first: every mutating
   messaging/plan verb resolves the (run, verb, request ID) acceptance key
   before anything else — an identical retry returns the original outcome
@@ -219,10 +213,9 @@ this package never resolves environment variables or defaults.
   precedence, supersession retirement, replacement-session refusal);
   `SettleLaunchFailure` and controller settlement transitions;
   `ClaimCheckExec` generation/kind/state matrix; monotonic `RequestStop`;
-  the read-store loads, including `LoadLaunchContext` resolving the
-  incarnation from a binding, from the pending intent pre-binding, and
-  failing closed on no-source, binding/intent disagreement and a
-  wrong-session intent; `LoadFrozenRun`; `RunDetail.LastCheck` for a
+  the read-store loads (`LoadFrozenRun`; the session-keyed launch-context
+  suite below is `LoadLaunchContext`'s successor and only remaining
+  reader); `RunDetail.LastCheck` for a
   settled unknown execution with evidence paths; `StopRequested` in both
   the detail and the run list; `OperationRepository.ByKind` ordering and
   all-state coverage; and the `server_instance` NULL/non-NULL binding

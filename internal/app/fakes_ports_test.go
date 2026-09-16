@@ -51,7 +51,6 @@ type fakeRuntime struct {
 	ClosePaneErr error
 	ClosedPanes  []string
 
-	SentText     []string
 	PaneContents map[string]string
 
 	// ServerInstanceValue is what ServerInstance reports; "" means the
@@ -125,16 +124,6 @@ func (r *fakeRuntime) FindPaneByLabel(_ context.Context, label string) (app.Pane
 		return r.FindPaneByLabelFn(label)
 	}
 	return app.PaneRef{}, false, nil
-}
-
-func (r *fakeRuntime) SendText(_ context.Context, paneID, text string) error {
-	if err := r.store.refuseInsideTransaction("Runtime.SendText"); err != nil {
-		return err
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.SentText = append(r.SentText, paneID+": "+text)
-	return nil
 }
 
 func (r *fakeRuntime) ReadPane(_ context.Context, paneID string, lines int) (string, error) {

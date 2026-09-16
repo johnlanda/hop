@@ -407,34 +407,6 @@ func TestRuntimeFindPaneByLabel(t *testing.T) {
 	})
 }
 
-func TestRuntimeSendText(t *testing.T) {
-	runtime, got := startFakeRuntime(t, `{"type":"ok"}`)
-	const text = "exec '/abs/hop' launch --run r1 --attempt a1\n"
-
-	if err := runtime.SendText(testContext(t), "w1:p1", text); err != nil {
-		t.Fatalf("SendText: %v", err)
-	}
-
-	request := <-got
-	assertRequestParams(t, request, "pane.send_text", func() string {
-		raw, err := json.Marshal(map[string]string{"pane_id": "w1:p1", "text": text})
-		if err != nil {
-			t.Fatal(err)
-		}
-		return string(raw)
-	}())
-}
-
-func TestRuntimeSendTextMapsPaneNotFound(t *testing.T) {
-	runtime := startFakeRuntimeError(t, "pane_not_found", "pane w1:p1 not found")
-
-	err := runtime.SendText(testContext(t), "w1:p1", "text")
-
-	if !errors.Is(err, herdr.ErrPaneNotFound) {
-		t.Fatalf("SendText error = %v, want ErrPaneNotFound", err)
-	}
-}
-
 func TestRuntimeReadPane(t *testing.T) {
 	runtime, got := startFakeRuntime(t, `{"type":"pane_read","read":{"pane_id":"w1:p1","workspace_id":"w1",`+
 		`"tab_id":"t1","source":"recent","format":"text","text":"line one\nline two\n","revision":3,"truncated":false}}`)
@@ -826,7 +798,6 @@ func TestRuntimeHonorsCancellation(t *testing.T) {
 			_, _, err := runtime.FindPaneByLabel(ctx, "label")
 			return err
 		}},
-		{"SendText", func(ctx context.Context) error { return runtime.SendText(ctx, "w1:p1", "text") }},
 		{"ReadPane", func(ctx context.Context) error { _, err := runtime.ReadPane(ctx, "w1:p1", 10); return err }},
 		{"InspectPane", func(ctx context.Context) error { _, err := runtime.InspectPane(ctx, "w1:p1"); return err }},
 		{"ClosePane", func(ctx context.Context) error { return runtime.ClosePane(ctx, "w1:p1") }},

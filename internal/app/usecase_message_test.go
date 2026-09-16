@@ -31,10 +31,6 @@ func (p plainReadStore) LoadFrozenRun(ctx context.Context, runID identity.RunID)
 	return p.inner.LoadFrozenRun(ctx, runID)
 }
 
-func (p plainReadStore) LoadLaunchContext(ctx context.Context, runID identity.RunID, attempt identity.AttemptID) (app.LaunchContext, error) {
-	return p.inner.LoadLaunchContext(ctx, runID, attempt)
-}
-
 func (p plainReadStore) LoadCheckExecutionContext(ctx context.Context, op identity.OperationID) (app.CheckExecutionContext, error) {
 	return p.inner.LoadCheckExecutionContext(ctx, op)
 }

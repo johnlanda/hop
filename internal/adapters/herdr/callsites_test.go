@@ -13,44 +13,35 @@ import (
 	"testing"
 )
 
-// stagedTerminalInputException is the one terminal-input method the
-// allowlist currently admits: Runtime.SendText (the fixed-grammar
-// launch-line fallback transport, docs/plan/phase-2-design.md section 6) is
-// the adapter's own sanctioned use of a terminal-input method. Slice 6
-// deletes SendText along with the app.Runtime port member and this
-// exception together (docs/plan/phase-3-design.md's slice-6 work-breakdown
-// row); until then, this constant names it so this file has exactly one
-// place to update.
-const stagedTerminalInputException = "pane.send_text"
-
 // callAllowlist is the reviewed set of Herdr wire methods this adapter's
 // production Client.Call sites may invoke (docs/plan/phase-3-design.md
 // section 11, part iii of the no-injection mechanism). A function, not a
 // package-level var, per this repo's gochecknoglobals lint rule.
 func callAllowlist() map[string]bool {
 	return map[string]bool{
-		"ping":                       true, // probe.go's socket liveness check
-		"pane.report_metadata":       true,
-		"agent.view.set":             true,
-		"agent.view.clear":           true,
-		"session.snapshot":           true,
-		"worktree.create":            true,
-		"layout.apply":               true,
-		"pane.read":                  true,
-		"pane.process_info":          true,
-		"pane.close":                 true,
-		"workspace.create":           true,
-		stagedTerminalInputException: true,
+		"ping":                 true, // probe.go's socket liveness check
+		"pane.report_metadata": true,
+		"agent.view.set":       true,
+		"agent.view.clear":     true,
+		"session.snapshot":     true,
+		"worktree.create":      true,
+		"layout.apply":         true,
+		"pane.read":            true,
+		"pane.process_info":    true,
+		"pane.close":           true,
+		"workspace.create":     true,
 	}
 }
 
 // terminalInputMethods is Herdr's complete real input surface
 // (S11-confirmed against repos/herdr/src/api/schema.rs on 0.9.0): no
-// production Call site may use any of these except through the staged
-// exception above. HOP delivers everything by pull
-// (docs/plan/phase-3-design.md section 7); a terminal-input method reaching
-// a live pane from production code is exactly the injection this rule
-// exists to catch.
+// production Call site may use any of these. HOP delivers everything by
+// pull (docs/plan/phase-3-design.md section 7); a terminal-input method
+// reaching a live pane from production code is exactly the injection this
+// rule exists to catch. Runtime.SendText (pane.send_text) was the one
+// staged exception, deleted in slice 6 together with the app.Runtime port
+// member; this scan now proves the whole package free of every method
+// here.
 func terminalInputMethods() map[string]bool {
 	return map[string]bool{
 		"pane.send_text":  true,
@@ -206,7 +197,7 @@ func callSiteViolations(pkgPath string, unresolvedImports []string, fset *token.
 				violations = append(violations, fmt.Sprintf("%s: cannot unquote method literal %s: %v", pos, lit.Value, err))
 				return true
 			}
-			if forbidden[method] && method != stagedTerminalInputException {
+			if forbidden[method] {
 				violations = append(violations, fmt.Sprintf("%s: Call(%q, ...) uses a forbidden terminal-input method", pos, method))
 				return true
 			}
@@ -315,9 +306,9 @@ func (c *Client) Call(ctx int, method string, params, result any) error { return
 			wantViolations: 1,
 		},
 		{
-			name:           "the staged pane.send_text exception passes",
+			name:           "pane.send_text is forbidden now that its staged exception is gone",
 			body:           `func f(c *Client, ctx int) { c.Call(ctx, "pane.send_text", nil, nil) }`,
-			wantViolations: 0,
+			wantViolations: 1,
 		},
 		{
 			name: "a method value extracted then invoked with a dynamic method fails",

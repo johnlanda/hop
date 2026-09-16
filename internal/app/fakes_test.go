@@ -547,10 +547,6 @@ func (s *fakeStore) LoadFrozenRun(_ context.Context, runID identity.RunID) (app.
 	return app.FrozenRun{Snapshot: s.Snapshots[runID], RepositoryRoot: root, Brief: s.Briefs[runID]}, nil
 }
 
-func (*fakeStore) LoadLaunchContext(context.Context, identity.RunID, identity.AttemptID) (app.LaunchContext, error) {
-	return app.LaunchContext{}, fmt.Errorf("app_test: LoadLaunchContext is not exercised by the controller (hop launch's own port)")
-}
-
 func (*fakeStore) LoadCheckExecutionContext(context.Context, identity.OperationID) (app.CheckExecutionContext, error) {
 	return app.CheckExecutionContext{}, fmt.Errorf("app_test: LoadCheckExecutionContext is not exercised by the controller (hop check-exec's own port)")
 }

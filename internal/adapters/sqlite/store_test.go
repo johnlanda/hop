@@ -209,35 +209,6 @@ func (f *fixture) createLaunchIntent(t *testing.T, session identity.SessionID, i
 	})
 }
 
-// createMalformedLaunchIntent commits a pending pane.open launch operation
-// whose intent JSON names session under "session_id" but carries a
-// non-UUID string under "incarnation_id", so the store's parse of the
-// intent identity fails closed.
-func (f *fixture) createMalformedLaunchIntent(t *testing.T, session identity.SessionID, rawIncarnation string) {
-	t.Helper()
-	f.opSeq++
-	opID := identity.OperationID(uid(9600 + f.opSeq))
-	f.inUOW(t, func(uow app.UnitOfWork) {
-		err := uow.Operations().Create(t.Context(), app.Operation{
-			ID:         opID,
-			RunID:      f.spec.RunID,
-			Generation: f.lease.Generation,
-			Kind:       app.OpPaneOpen,
-			State:      app.OperationPending,
-			Intent: map[string]any{
-				"session_id":     session.String(),
-				"incarnation_id": rawIncarnation,
-				"creation_label": uid(9001),
-			},
-			CreatedAt: f.clock.Now(),
-			UpdatedAt: f.clock.Now(),
-		})
-		if err != nil {
-			t.Fatalf("create malformed launch intent: %v", err)
-		}
-	})
-}
-
 // fixtureSeedEvidence is the workspace-trust seed evidence claimLaunch
 // records, asserted round-tripped by the read-store tests.
 const fixtureSeedEvidence = "workspace trust seeded for /worktrees/fixture"

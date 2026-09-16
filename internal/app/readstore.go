@@ -148,34 +148,6 @@ type RunDetail struct {
 	PendingQuestions []PendingQuestion
 }
 
-// LaunchContext is what the launch exec boundary (`hop launch`) needs,
-// loaded without a lease. hop launch's own argv IS the pane's command
-// (docs/plan/phase-2-design.md section 6): it starts the instant
-// layout.apply creates the pane, which can be before the controller's
-// pane.open outcome transaction — the one that records the runtime binding
-// — has even committed. LoadLaunchContext is therefore satisfiable from
-// the run snapshot and the recorded launch intent alone and never depends
-// on a binding existing yet: IncarnationID is the incarnation the pending
-// pane.open (or launch.send) operation's intent recorded, which
-// HOP_INCARNATION_ID must match.
-type LaunchContext struct {
-	Snapshot RunSnapshot
-	Harness  run.Harness
-	Attempt  run.Attempt
-	Session  run.Session
-	// WorktreePath is the run's recorded worktree path exactly as the
-	// worktree row persisted it (worktree.create's outcome; recorded
-	// before any pane exists, so exposing it keeps this context free of
-	// the later binding), or "" when no worktree row exists yet.
-	// PrepareLaunchExec refuses a launch whose working directory does not
-	// canonically resolve to it — the workspace-trust seed and the exec
-	// must target the attempt's own worktree, never a foreign directory.
-	WorktreePath  string
-	IncarnationID identity.IncarnationID
-	Claim         *LaunchClaim
-	StopRequested bool
-}
-
 // CheckExecutionContext is what the check exec boundary (`hop check-exec`)
 // needs, addressed by the check execution's operation ID: the frozen env
 // policy, the absolute state root, the candidate checkout path and the
@@ -228,6 +200,5 @@ type ReadStore interface {
 	LoadRunStatus(ctx context.Context, run identity.RunID) (RunDetail, error)
 	// LoadFrozenRun returns the run's frozen snapshot and repository root.
 	LoadFrozenRun(ctx context.Context, run identity.RunID) (FrozenRun, error)
-	LoadLaunchContext(ctx context.Context, run identity.RunID, attempt identity.AttemptID) (LaunchContext, error)
 	LoadCheckExecutionContext(ctx context.Context, op identity.OperationID) (CheckExecutionContext, error)
 }

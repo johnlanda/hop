@@ -310,9 +310,6 @@ func TestFeatureTraceHappyPathDependencyRelease(t *testing.T) {
 	if len(h.tc.Store.Reviews) != 1 {
 		t.Fatalf("review rows = %d, want the approve verdict", len(h.tc.Store.Reviews))
 	}
-	if len(h.tc.Runtime.SentText) != 0 {
-		t.Fatalf("SendText was called; the feature workflow must never type into a pane")
-	}
 	if got := h.tc.Store.Runs[h.fr.RunID].value.State; got != run.RunCompleted {
 		t.Fatalf("run state = %s, want completed", got)
 	}

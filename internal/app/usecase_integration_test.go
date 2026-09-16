@@ -271,9 +271,6 @@ func TestDriveIntegrationHappyPath(t *testing.T) {
 	if !hooksSeen {
 		t.Errorf("the empty hooks directory was never created under the operation's artifact dir")
 	}
-	if len(f.tc.Runtime.SentText) != 0 {
-		t.Fatalf("SendText was called %d times; the integration flow must never type into a pane", len(f.tc.Runtime.SentText))
-	}
 }
 
 func TestDriveIntegrationNoOpAdoption(t *testing.T) {

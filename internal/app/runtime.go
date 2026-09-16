@@ -114,10 +114,6 @@ type Runtime interface {
 	// was lost: creation labels round-trip through tab.list and
 	// session.snapshot.
 	FindPaneByLabel(ctx context.Context, label string) (PaneRef, bool, error)
-	// SendText is the fallback transport only: the fixed-grammar launch
-	// line (docs/plan/phase-2-design.md section 6). It is never used to
-	// send anything else.
-	SendText(ctx context.Context, paneID, text string) error
 	// ReadPane captures scrollback evidence; it vanishes with the pane, so
 	// callers capture it periodically and before every stop or retirement
 	// action.
