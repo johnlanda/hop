@@ -501,6 +501,64 @@ func TestRunResume(t *testing.T) {
 		}
 	})
 
+	t.Run("a resumed feature run with a launch-suppressed child reaches failed through the loop, never a stop", func(t *testing.T) {
+		ctrl := &fakeController{runState: runStateRunning}
+		ctrl.status = func(app.StatusRequest) (app.StatusResult, error) {
+			return app.StatusResult{Detail: &app.RunDetailView{
+				RunSummaryView: app.RunSummaryView{RunID: testRunID, Sequence: 1, State: ctrl.currentRunState()},
+				Mode:           "feature",
+			}}, nil
+		}
+		ctrl.resumeFeature = func(app.ResumeFeatureRequest) (app.ResumeFeatureResult, app.RunHandle, error) {
+			return app.ResumeFeatureResult{
+				Outcome:  "resumed",
+				RunState: "running",
+				Sessions: []app.FeatureSessionReport{
+					{SessionID: "manager-session", Role: "manager", Disposition: app.SessionWarm},
+					{SessionID: "worker-session-2", Role: "implementer", Disposition: app.SessionLaunchSuppressed, Detail: "its launch never reached a pane and the run carries a terminal-failure cause; the controller loop's failure cleanup retires it"},
+				},
+			}, app.RunHandle{}, nil
+		}
+		ctrl.requestStop = func(string) error {
+			t.Fatal("a stop was requested for a run the failure cleanup settles")
+			return nil
+		}
+		rounds := 0
+		ctrl.retireSettledSessions = func() (app.RetirementReport, error) {
+			rounds++
+			if rounds < 2 {
+				return app.RetirementReport{RunFailing: true, Outstanding: []string{"session manager-session: close dispatched"}}, nil
+			}
+			ctrl.setRunState("failed")
+			return app.RetirementReport{RunFailed: true, Retired: []string{"worker-session-2", "manager-session"}}, nil
+		}
+		ctrl.assignReadyTasks = func(app.AssignmentOptions) (app.AssignmentReport, error) {
+			t.Fatal("AssignReadyTasks ran in a failing run")
+			return app.AssignmentReport{}, nil
+		}
+		td := newTestDeps(ctrl, env, t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runResume([]string{testRunID}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitFailure || rounds != 2 {
+			t.Errorf("exit code = %d after %d retirement rounds, want %d after 2 (stderr: %s)", code, rounds, exitFailure, stderr.String())
+		}
+		out := stdout.String()
+		for _, want := range []string{
+			"resume resumed: running",
+			"session worker-session-2 (implementer): launch-suppressed",
+			"run r1 running",
+			"run r1 failed",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("output lacks %q:\n%s", want, out)
+			}
+		}
+	})
+
 	t.Run("a feature-mode run with no --confirm-absent omits the attestation and can still resume", func(t *testing.T) {
 		ctrl := &fakeController{}
 		ctrl.status = func(app.StatusRequest) (app.StatusResult, error) {

@@ -718,38 +718,51 @@ type attemptWorktreeCreateIntent struct {
 	Label          string             `json:"label,omitempty"`
 }
 
+// attemptWorktreeResult is createAttemptWorktree's result: what Herdr
+// created, the operation's disposition, and the refusal when the dispatch
+// revalidation refused it.
+type attemptWorktreeResult struct {
+	info    WorktreeInfo
+	outcome attemptWorktreeOutcome
+	refusal dispatchRefusal
+}
+
 // createAttemptWorktree drives the OpWorktreeCreate operation for one
 // attempt's fresh worktree: record-intent, act (Runtime.CreateWorktree,
 // labeled with the operation ID), record-outcome, mirroring StartRun's
 // createWorktree but carrying the owning attempt in its own intent shape
 // (attemptWorktreeCreateIntent). The returned error is reserved for store
 // and lease failures; every other disposition is the outcome: a held stop
-// refusing the dispatch leaves the intent pending, an act error or an
+// or a terminal-failure cause refusing the dispatch records the operation
+// failed as never dispatched (revalidateChildDispatch), an act error or an
 // absent or unverifiable checkout leaves the operation reconciling — the
 // act's response recorded as evidence, so a later adoption knows its
 // workspace — and an unrelated checkout settles it failed.
-func (c *Controller) createAttemptWorktree(ctx context.Context, handle RunHandle, worktreeID identity.WorktreeID, attemptID identity.AttemptID, repositoryRoot, branch, baseOID string, now time.Time) (WorktreeInfo, attemptWorktreeOutcome, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per task assignment.
+func (c *Controller) createAttemptWorktree(ctx context.Context, handle RunHandle, worktreeID identity.WorktreeID, attemptID identity.AttemptID, repositoryRoot, branch, baseOID string, now time.Time) (attemptWorktreeResult, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per task assignment.
 	opID, err := c.newOperationID()
 	if err != nil {
-		return WorktreeInfo{}, 0, err
+		return attemptWorktreeResult{}, err
 	}
 	label := opID.String()
 	intent := attemptWorktreeCreateIntent{RepositoryRoot: repositoryRoot, Branch: branch, BaseRef: baseOID, AttemptID: attemptID, Label: label}
-	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+	if recordErr := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 		return uow.Operations().Create(ctx, Operation{
 			ID: opID, RunID: handle.runID, Generation: handle.lease.Generation,
 			Kind: OpWorktreeCreate, State: OperationPending, Intent: intent,
 			CreatedAt: now, UpdatedAt: now,
 		})
-	}); err != nil {
-		return WorktreeInfo{}, 0, fmt.Errorf("app: record worktree.create intent: %w", err)
+	}); recordErr != nil {
+		return attemptWorktreeResult{}, fmt.Errorf("app: record worktree.create intent: %w", recordErr)
 	}
 
-	if err := c.revalidateForDispatch(ctx, handle, false); err != nil {
-		if errors.Is(err, ErrStopRequested) {
-			return WorktreeInfo{}, attemptWorktreeStopRequested, nil
-		}
-		return WorktreeInfo{}, 0, fmt.Errorf("app: revalidate before worktree.create: %w", err)
+	refusal, err := c.revalidateChildDispatch(ctx, handle, opID, func(detail string) any {
+		return attemptWorktreeCondition{Condition: worktreeConditionRefused, Cause: detail}
+	})
+	if err != nil {
+		return attemptWorktreeResult{}, fmt.Errorf("app: revalidate before worktree.create: %w", err)
+	}
+	if refusal.disposition != "" {
+		return attemptWorktreeResult{outcome: attemptWorktreeRefused, refusal: refusal}, nil
 	}
 	actCtx, release := handle.actContext(ctx)
 	info, actErr := c.Runtime.CreateWorktree(actCtx, WorktreeRequest{
@@ -806,23 +819,24 @@ func (c *Controller) createAttemptWorktree(ctx context.Context, handle RunHandle
 		}
 	})
 	if outcomeErr != nil {
-		return WorktreeInfo{}, 0, fmt.Errorf("app: record worktree.create outcome: %w", outcomeErr)
+		return attemptWorktreeResult{}, fmt.Errorf("app: record worktree.create outcome: %w", outcomeErr)
 	}
-	return info, outcome, nil
+	return attemptWorktreeResult{info: info, outcome: outcome}, nil
 }
 
 // openChildPane drives the OpPaneOpen operation for a delegated
 // (implementer/reviewer) session's pane: the Phase 2 intent shape
 // (paneOpenIntent) already carries IncarnationID/SessionID, which is all
 // SubmissionStore.ClaimLaunch's pre-binding fallback needs. The returned
-// error is reserved for store and lease failures: a held stop refusing
-// the dispatch leaves the intent pending, and an act error with no pane
-// answering for the label leaves the operation reconciling, which launch
-// corroboration recovers by label and deadline.
-func (c *Controller) openChildPane(ctx context.Context, handle RunHandle, taskID identity.TaskID, attemptID identity.AttemptID, sessionID identity.SessionID, incarnationID identity.IncarnationID, role run.Role, worktree WorktreeInfo, hopPath, stateRoot string, now time.Time) (paneOpenOutcome, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per task assignment.
+// error is reserved for store and lease failures: a held stop or a
+// terminal-failure cause refusing the dispatch records the operation
+// failed as never dispatched (revalidateChildDispatch), and an act error
+// with no pane answering for the label leaves the operation reconciling,
+// which launch corroboration recovers by label and deadline.
+func (c *Controller) openChildPane(ctx context.Context, handle RunHandle, taskID identity.TaskID, attemptID identity.AttemptID, sessionID identity.SessionID, incarnationID identity.IncarnationID, role run.Role, worktree WorktreeInfo, hopPath, stateRoot string, now time.Time) (paneOpenOutcome, dispatchRefusal, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per task assignment.
 	opID, err := c.newOperationID()
 	if err != nil {
-		return 0, err
+		return 0, dispatchRefusal{}, err
 	}
 	argv := []string{hopPath, "launch", "--run", handle.runID.String(), "--session", sessionID.String()}
 	env := map[string]string{
@@ -837,21 +851,24 @@ func (c *Controller) openChildPane(ctx context.Context, handle RunHandle, taskID
 	serverInstance := c.observeServerInstance(ctx)
 	intent := paneOpenIntent{Command: argv, Cwd: worktree.Path, WorkspaceID: worktree.WorkspaceID, Label: opID.String(), IncarnationID: incarnationID, SessionID: sessionID, ServerInstance: serverInstance}
 
-	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+	if recordErr := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 		return uow.Operations().Create(ctx, Operation{
 			ID: opID, RunID: handle.runID, Generation: handle.lease.Generation,
 			Kind: OpPaneOpen, State: OperationPending, Intent: intent,
 			CreatedAt: now, UpdatedAt: now,
 		})
-	}); err != nil {
-		return 0, fmt.Errorf("app: record pane.open intent: %w", err)
+	}); recordErr != nil {
+		return 0, dispatchRefusal{}, fmt.Errorf("app: record pane.open intent: %w", recordErr)
 	}
 
-	if err := c.revalidateForDispatch(ctx, handle, false); err != nil {
-		if errors.Is(err, ErrStopRequested) {
-			return paneOpenStopRequested, nil
-		}
-		return 0, fmt.Errorf("app: revalidate before pane.open: %w", err)
+	refusal, err := c.revalidateChildDispatch(ctx, handle, opID, func(detail string) any {
+		return paneOpenRefusalOutcome{RefusedBeforeDispatch: true, Reason: detail}
+	})
+	if err != nil {
+		return 0, dispatchRefusal{}, fmt.Errorf("app: revalidate before pane.open: %w", err)
+	}
+	if refusal.disposition != "" {
+		return paneOpenRefused, refusal, nil
 	}
 	actCtx, release := handle.actContext(ctx)
 	paneHandle, actErr := c.Runtime.OpenWorkerPane(actCtx, WorkerPaneRequest{
@@ -885,10 +902,10 @@ func (c *Controller) openChildPane(ctx context.Context, handle RunHandle, taskID
 		return uow.Operations().Save(ctx, op)
 	})
 	if outcomeErr != nil {
-		return 0, fmt.Errorf("app: record pane.open outcome: %w", outcomeErr)
+		return 0, dispatchRefusal{}, fmt.Errorf("app: record pane.open outcome: %w", outcomeErr)
 	}
 	if actErr != nil {
-		return paneOpenUnresolved, nil
+		return paneOpenUnresolved, dispatchRefusal{}, nil
 	}
-	return paneOpened, nil
+	return paneOpened, dispatchRefusal{}, nil
 }

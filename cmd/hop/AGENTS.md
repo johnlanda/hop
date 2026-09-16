@@ -149,7 +149,9 @@ commands expect the built binary at `.bin/hop` (see `make build`).
   relative rejection) and the doctor line, the controller loop with a fake
   clock (transitions, stop routing, detach on signal, heartbeat-failure
   exit), hop run's refusal/failure/detach paths and flag surface, resume
-  outcome routing, stop's drive/observe/deadline paths, status filtering
+  outcome routing (a resumed feature run whose child is
+  launch-suppressed enters the loop and reaches failed through the
+  retirement pass, never a stop), stop's drive/observe/deadline paths, status filtering
   and detail rendering, result submit's outcome and exit-code contract,
   and both exec boundaries (state-root requirement, prepared request
   shape, recorded exec argv/env, exec_failed settlement after a failed

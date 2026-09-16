@@ -58,6 +58,9 @@ const (
 	worktreeConditionIntent     = "intent-unreadable"
 	worktreeConditionNoCheckout = "no-checkout"
 	worktreeConditionUnrelated  = "unrelated-checkout"
+	// worktreeConditionRefused marks a create the dispatch revalidation
+	// refused: never dispatched, so nothing can surface for it.
+	worktreeConditionRefused = "refused-before-dispatch"
 )
 
 // attemptWorktreeCondition is the outcome payload of a per-attempt
@@ -82,9 +85,10 @@ const (
 	// attemptWorktreeFailed: the created checkout is unrelated; the
 	// operation settled failed.
 	attemptWorktreeFailed
-	// attemptWorktreeStopRequested: a held stop refused the dispatch; the
-	// intent stays pending for stop handling.
-	attemptWorktreeStopRequested
+	// attemptWorktreeRefused: the dispatch revalidation refused (a held
+	// stop, or a terminal-failure cause) and recorded the operation failed
+	// as never dispatched.
+	attemptWorktreeRefused
 )
 
 // paneOpenOutcome is openChildPane's disposition of its own operation.
@@ -97,9 +101,38 @@ const (
 	// the operation is reconciling and launch corroboration recovers it by
 	// label and deadline.
 	paneOpenUnresolved
-	// paneOpenStopRequested: a held stop refused the dispatch.
-	paneOpenStopRequested
+	// paneOpenRefused: the dispatch revalidation refused (a held stop, or
+	// a terminal-failure cause) and recorded the operation failed as never
+	// dispatched.
+	paneOpenRefused
 )
+
+// dispatchRefusal is what a refused feature-child dispatch reports: the
+// launch disposition and its fixed detail.
+type dispatchRefusal struct {
+	disposition string
+	detail      string
+}
+
+// paneOpenRefusalOutcome is the outcome payload of a pane.open whose
+// dispatch the revalidation refused: the pane was never requested.
+type paneOpenRefusalOutcome struct {
+	RefusedBeforeDispatch bool   `json:"refused_before_dispatch"`
+	Reason                string `json:"reason"`
+}
+
+// refusedBeforeDispatch reports whether op is a launch operation the
+// dispatch revalidation refused and recorded as never dispatched.
+func refusedBeforeDispatch(op *Operation) bool {
+	if op.State != OperationFailed {
+		return false
+	}
+	if refusal, ok := decodeOperationPayload[paneOpenRefusalOutcome](op.Outcome); ok && refusal.RefusedBeforeDispatch {
+		return true
+	}
+	condition, ok := decodeOperationPayload[attemptWorktreeCondition](op.Outcome)
+	return ok && condition.Condition == worktreeConditionRefused
+}
 
 // attemptLaunchTarget is one launching child attempt whose launch has not
 // reached its pane.open intent.
@@ -176,6 +209,13 @@ type attemptLaunchRound struct {
 	// unresolved maps a session whose launch this round left unresolved to
 	// its condition.
 	unresolved map[identity.SessionID]AttemptLaunchCondition
+	// pending maps an attempt whose worktree.create is still unresolved
+	// after this round to the fixed reason.
+	pending map[identity.AttemptID]string
+	// retirable are the sessions resume hands to the failure cleanup: set
+	// only while a terminal-failure cause stands, for unplaced launches
+	// with no unresolved worktree work (resumeAttemptLaunches).
+	retirable map[identity.SessionID]bool
 }
 
 // decodeAttemptWorktreeIntent reads a per-attempt worktree.create intent,
@@ -217,6 +257,8 @@ func (c *Controller) recoverAttemptLaunches(ctx context.Context, handle RunHandl
 	round := attemptLaunchRound{
 		opened:     map[identity.SessionID]bool{},
 		unresolved: map[identity.SessionID]AttemptLaunchCondition{},
+		pending:    map[identity.AttemptID]string{},
+		retirable:  map[identity.SessionID]bool{},
 	}
 	var pending []Operation
 	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
@@ -231,7 +273,7 @@ func (c *Controller) recoverAttemptLaunches(ctx context.Context, handle RunHandl
 		return round, err
 	}
 
-	byAttempt := map[identity.AttemptID]string{}
+	byAttempt := round.pending
 	for i := range pending {
 		op := &pending[i]
 		intent, ok := decodeAttemptWorktreeIntent(op, in.frozen.RepositoryRoot)
@@ -476,7 +518,8 @@ func (c *Controller) settleAttemptWorktree(ctx context.Context, handle RunHandle
 // launching attempt's only session (a cold-relaunch successor is the
 // relaunch path's), has no binding, and no pane.open or launch.send
 // operation names it in any state — a launch intent, once journaled, is
-// the launch machinery's and is never opened twice. blocked is non-empty,
+// the launch machinery's and is never opened twice — except one the
+// dispatch revalidation refused, which was never dispatched. blocked is non-empty,
 // and names why, when an undecodable launch intent might name any of them.
 func (c *Controller) unresolvedAttemptLaunches(ctx context.Context, handle RunHandle) ([]attemptLaunchTarget, string, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
 	var (
@@ -499,6 +542,9 @@ func (c *Controller) unresolvedAttemptLaunches(ctx context.Context, handle RunHa
 				return opErr
 			}
 			for i := range ops {
+				if refusedBeforeDispatch(&ops[i]) {
+					continue // never dispatched: no pane can exist for it.
+				}
 				intent, ok := decodeOperationPayload[paneOpenIntent](ops[i].Intent)
 				if !ok || intent.SessionID == "" {
 					blocked = fmt.Sprintf("launch operation %s has an unreadable intent that may name this session; nothing is launched while it stands", ops[i].ID)
@@ -646,6 +692,8 @@ func failedWorktreeReason(op *Operation) string {
 		return "worktree creation failed: no checkout of the attempt's branch surfaced within the bounded wait"
 	case worktreeConditionUnrelated:
 		return "worktree creation failed: the checkout of the attempt's branch is not the intended repository at the attempt's base"
+	case worktreeConditionRefused:
+		return "worktree creation was refused before dispatch"
 	default:
 		return fmt.Sprintf("worktree creation failed: operation %s settled failed", op.ID)
 	}
@@ -681,21 +729,21 @@ func (c *Controller) launchAttempt(ctx context.Context, handle RunHandle, in *at
 		return target.report(disposition, detail), WorktreeInfo{}, err
 	}
 
-	info, outcome, err := c.createAttemptWorktree(ctx, handle, worktreeID, target.attempt.ID, in.frozen.RepositoryRoot, branch, base, c.Clock.Now())
+	created, err := c.createAttemptWorktree(ctx, handle, worktreeID, target.attempt.ID, in.frozen.RepositoryRoot, branch, base, c.Clock.Now())
 	if err != nil {
 		return AttemptLaunchCondition{}, WorktreeInfo{}, err
 	}
-	switch outcome {
-	case attemptWorktreeStopRequested:
-		return target.report(AttemptLaunchStopRequested, "a stop request refused the worktree creation; stop handling resolves its pending intent"), WorktreeInfo{}, nil
+	switch created.outcome {
+	case attemptWorktreeRefused:
+		return target.report(created.refusal.disposition, created.refusal.detail), WorktreeInfo{}, nil
 	case attemptWorktreeUnresolved:
 		return target.report(AttemptLaunchReconciling, "worktree creation did not complete; later rounds recover it by provenance or settle it after the bounded wait"), WorktreeInfo{}, nil
 	case attemptWorktreeFailed:
 		condition, settleErr := c.settleAttemptLaunchFailure(ctx, handle, in.frozen, target, "worktree creation failed: the created checkout is not the intended repository at the attempt's base")
 		return condition, WorktreeInfo{}, settleErr
 	}
-	condition, err := c.continueAttemptLaunch(ctx, handle, in, target, info, incarnationID)
-	return condition, info, err
+	condition, err := c.continueAttemptLaunch(ctx, handle, in, target, created.info, incarnationID)
+	return condition, created.info, err
 }
 
 // continueAttemptLaunch finishes a launch whose worktree exists: the
@@ -736,13 +784,13 @@ func (c *Controller) continueAttemptLaunch(ctx context.Context, handle RunHandle
 	if disposition, detail, err := c.launchSuppression(ctx, handle); err != nil || disposition != "" {
 		return target.report(disposition, detail), err
 	}
-	outcome, err := c.openChildPane(ctx, handle, target.task.ID, target.attempt.ID, target.session.ID, incarnationID, target.session.Role, worktree, in.hopPath, in.stateRoot, c.Clock.Now())
+	outcome, refusal, err := c.openChildPane(ctx, handle, target.task.ID, target.attempt.ID, target.session.ID, incarnationID, target.session.Role, worktree, in.hopPath, in.stateRoot, c.Clock.Now())
 	if err != nil {
 		return AttemptLaunchCondition{}, err
 	}
 	switch outcome {
-	case paneOpenStopRequested:
-		return target.report(AttemptLaunchStopRequested, "a stop request refused the pane creation; stop handling resolves its pending intent"), nil
+	case paneOpenRefused:
+		return target.report(refusal.disposition, refusal.detail), nil
 	case paneOpenUnresolved:
 		return target.report(AttemptLaunchReconciling, "pane creation did not complete; launch corroboration recovers the pane by its creation label"), nil
 	}
@@ -830,32 +878,78 @@ func featureFailureCauseLocked(ctx context.Context, uow UnitOfWork, wf WorkflowR
 
 // launchSuppression re-reads, in its own unit of work, what forbids a new
 // launch step — a worktree intent, an assignment artifact or a pane — for
-// an assigned attempt: a held stop, or a durable terminal-failure cause.
-// It returns the disposition and fixed detail to report, "" when the
-// launch may proceed. Checked immediately before each such step, so a
-// cause a settlement created earlier in the same round, or a manager
-// exec failure recorded meanwhile, suppresses every later launch.
+// an assigned attempt (launchSuppressionLocked). It returns the
+// disposition and fixed detail to report, "" when the launch may proceed.
+// Checked immediately before each such step, so a cause a settlement
+// created earlier in the same round, or a manager exec failure recorded
+// meanwhile, suppresses every later launch.
 func (c *Controller) launchSuppression(ctx context.Context, handle RunHandle) (disposition, detail string, err error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per launch step.
 	err = c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
-		wf, wfErr := RequireWorkflowRepositories(uow, "attempt launch")
-		if wfErr != nil {
-			return wfErr
-		}
-		r, _, runErr := uow.Runs().Get(ctx, handle.runID)
-		if runErr != nil {
-			return runErr
-		}
-		if r.StopRequested {
-			disposition, detail = AttemptLaunchStopRequested, "a stop is requested; nothing more is launched, and stop handling resolves this launch"
-			return nil
-		}
-		failing, causeErr := featureFailureCauseLocked(ctx, uow, wf, handle.runID)
-		if failing {
-			disposition, detail = AttemptLaunchReconciling, "the run carries a terminal-failure cause; nothing more is launched, and the failure settlement retires this session"
-		}
-		return causeErr
+		var lockedErr error
+		disposition, detail, lockedErr = launchSuppressionLocked(ctx, uow, handle.runID)
+		return lockedErr
 	})
 	return disposition, detail, err
+}
+
+// launchSuppressionLocked reads, inside the caller's transaction, a held
+// stop or a durable terminal-failure cause (featureFailureCauseLocked),
+// returning the launch disposition and fixed detail for it, "" for none.
+func launchSuppressionLocked(ctx context.Context, uow UnitOfWork, runID identity.RunID) (disposition, detail string, err error) {
+	wf, err := RequireWorkflowRepositories(uow, "attempt launch")
+	if err != nil {
+		return "", "", err
+	}
+	r, _, err := uow.Runs().Get(ctx, runID)
+	if err != nil {
+		return "", "", err
+	}
+	if r.StopRequested {
+		return AttemptLaunchStopRequested, "a stop is requested; nothing more is launched, and stop handling resolves this launch", nil
+	}
+	failing, err := featureFailureCauseLocked(ctx, uow, wf, runID)
+	if err != nil || !failing {
+		return "", "", err
+	}
+	return AttemptLaunchReconciling, "the run carries a terminal-failure cause; nothing more is launched, and the failure settlement retires this session", nil
+}
+
+// revalidateChildDispatch is the dispatch revalidation of a feature
+// child's worktree.create or pane.open: the heartbeat CAS, then, in one
+// unit of work, the stop flag and the run's terminal-failure cause. A
+// refusal records the operation failed with refused as its outcome in that
+// same transaction — the act is never dispatched, so cleanup resolves the
+// intent as absent without waiting — and is returned for the report.
+// Heartbeat, store and lease failures are returned as errors, the intent
+// left pending.
+func (c *Controller) revalidateChildDispatch(ctx context.Context, handle RunHandle, opID identity.OperationID, refused func(detail string) any) (dispatchRefusal, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per child dispatch.
+	if err := c.Heartbeat(ctx, handle); err != nil {
+		return dispatchRefusal{}, err
+	}
+	now := c.Clock.Now()
+	var refusal dispatchRefusal
+	err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		disposition, detail, err := launchSuppressionLocked(ctx, uow, handle.runID)
+		if err != nil || disposition == "" {
+			return err
+		}
+		op, err := uow.Operations().Get(ctx, opID)
+		if err != nil {
+			return err
+		}
+		if op.State != OperationPending {
+			return fmt.Errorf("app: operation %s is %s at its dispatch revalidation; failing closed", opID, op.State)
+		}
+		op.State = OperationFailed
+		op.Outcome = refused(detail)
+		op.UpdatedAt = now
+		refusal = dispatchRefusal{disposition: disposition, detail: detail}
+		return uow.Operations().Save(ctx, op)
+	})
+	if err != nil {
+		return dispatchRefusal{}, err
+	}
+	return refusal, nil
 }
 
 // resolveAttemptWorktreesForShutdown resolves every unresolved per-attempt

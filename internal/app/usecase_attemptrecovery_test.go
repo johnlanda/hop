@@ -12,59 +12,83 @@ import (
 	"github.com/johnlanda/hop/internal/domain/run"
 )
 
-// TestAttemptLaunchStopRefusal proves a stop refusing a launch act ends
-// the pass without an error, leaving the pending intent to stop handling,
-// which resolves it before reporting stopped.
+// TestAttemptLaunchStopRefusal proves a stop refusing a child's dispatch
+// ends the pass without an error and records the intent as refused before
+// dispatch — for the worktree.create and for the pane.open — so stop
+// resolves it as never dispatched and reaches stopped in its first round,
+// with no bounded wait and no outstanding launch.
 func TestAttemptLaunchStopRefusal(t *testing.T) {
-	f := newLaunchFixture(t, 2, 3)
-	heartbeats := 0
-	f.tc.Store.HeartbeatHook = func() {
-		heartbeats++
-		if heartbeats == 1 {
-			f.tc.Store.mu.Lock()
-			rRow := f.tc.Store.Runs[f.fr.RunID]
-			rRow.value = rRow.value.RequestStop(f.tc.Clock.Now())
-			rRow.revision++
-			f.tc.Store.mu.Unlock()
-		}
-	}
-	report := f.assign(t)
-	launch := launchFor(t, &report, 1)
-	if launch.Disposition != app.AttemptLaunchStopRequested || len(report.Launches) != 1 {
-		t.Fatalf("report = %+v, want t1 stop-requested and nothing further", report)
-	}
-	f.tc.Store.HeartbeatHook = nil
-	op := f.onlyWorktreeOp(t)
-	if op.State != app.OperationPending || len(f.tc.Runtime.CreateWorktreeRequests) != 0 {
-		t.Fatalf("worktree.create = %s with %d creates, want a pending intent never dispatched", op.State, len(f.tc.Runtime.CreateWorktreeRequests))
-	}
+	for _, tt := range []struct {
+		name string
+		kind app.OperationKind
+		// heartbeat is the dispatch revalidation's heartbeat the stop lands
+		// in: the first is the worktree.create's, the second the pane.open's.
+		heartbeat int
+	}{
+		{"the worktree.create dispatch", app.OpWorktreeCreate, 1},
+		{"the pane.open dispatch", app.OpPaneOpen, 2},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newLaunchFixture(t, 2, 3)
+			heartbeats := 0
+			f.tc.Store.HeartbeatHook = func() {
+				heartbeats++
+				if heartbeats == tt.heartbeat {
+					f.tc.Store.mu.Lock()
+					rRow := f.tc.Store.Runs[f.fr.RunID]
+					rRow.value = rRow.value.RequestStop(f.tc.Clock.Now())
+					rRow.revision++
+					f.tc.Store.mu.Unlock()
+				}
+			}
+			report := f.assign(t)
+			f.tc.Store.HeartbeatHook = nil
+			launch := launchFor(t, &report, 1)
+			if launch.Disposition != app.AttemptLaunchStopRequested || len(report.Launches) != 1 {
+				t.Fatalf("report = %+v, want t1 stop-requested and nothing further", report)
+			}
+			assertPathFree(t, launch.Detail)
+			ops := f.ops(tt.kind)
+			if len(ops) != 1 || ops[0].State != app.OperationFailed {
+				t.Fatalf("%s operations = %+v, want one recorded failed", tt.kind, ops)
+			}
+			var refusal struct {
+				Condition             string `json:"condition"`
+				RefusedBeforeDispatch bool   `json:"refused_before_dispatch"`
+			}
+			decodeInto(t, ops[0].Outcome, &refusal)
+			if refusal.Condition != "refused-before-dispatch" && !refusal.RefusedBeforeDispatch {
+				t.Fatalf("%s outcome = %+v, want refused before dispatch", tt.kind, ops[0].Outcome)
+			}
+			session := f.child(t, f.tasks[0])
+			if tt.kind == app.OpWorktreeCreate && len(f.tc.Runtime.CreateWorktreeRequests) != 0 {
+				t.Fatalf("the refused worktree.create was dispatched")
+			}
+			if _, bound := f.tc.Store.currentBindingLocked(session.ID); bound {
+				t.Fatalf("the refused pane.open left a binding")
+			}
 
-	f.showNoCheckout()
-	f.tc.Runtime.InspectPaneFn = allPanesAbsent
-	stop, err := f.tc.Controller.DriveFeatureStop(context.Background(), f.handle)
-	if err != nil {
-		t.Fatalf("DriveFeatureStop() error = %v", err)
-	}
-	if stop.Terminated || !strings.Contains(strings.Join(stop.Outstanding, "\n"), op.ID.String()) {
-		t.Fatalf("stop within the wait = %+v, want outstanding naming %s", stop, op.ID)
-	}
-	if got := f.tc.Store.Runs[f.fr.RunID].value.State; got != run.RunStopping {
-		t.Fatalf("run = %s, want stopping", got)
-	}
-	f.wait(t, 3*time.Minute)
-	stop, err = f.tc.Controller.DriveFeatureStop(context.Background(), f.handle)
-	if err != nil {
-		t.Fatalf("DriveFeatureStop() error = %v", err)
-	}
-	if !stop.Terminated || stop.RunState != string(run.RunStopped) {
-		t.Fatalf("stop past the wait = %+v, want stopped", stop)
-	}
-	if got := f.tc.Store.Operations[op.ID].State; got != app.OperationFailed {
-		t.Fatalf("worktree.create = %s, want failed before the stopped report", got)
-	}
-	session := f.child(t, f.tasks[0])
-	if session.State != run.SessionTerminated || f.tc.Store.Attempts[session.AttemptID].value.State != run.AttemptInterrupted {
-		t.Fatalf("session %s, attempt %s; want terminated and interrupted", session.State, f.tc.Store.Attempts[session.AttemptID].value.State)
+			f.tc.Runtime.InspectPaneFn = allPanesAbsent
+			stop, err := f.tc.Controller.DriveFeatureStop(context.Background(), f.handle)
+			if err != nil {
+				t.Fatalf("DriveFeatureStop() error = %v", err)
+			}
+			if !stop.Terminated || stop.RunState != string(run.RunStopped) {
+				t.Fatalf("stop = %+v, want stopped in its first round", stop)
+			}
+			session = f.child(t, f.tasks[0])
+			if session.State != run.SessionTerminated || f.tc.Store.Attempts[session.AttemptID].value.State != run.AttemptInterrupted {
+				t.Fatalf("session %s, attempt %s; want terminated and interrupted", session.State, f.tc.Store.Attempts[session.AttemptID].value.State)
+			}
+			if len(f.tc.Runtime.ClosedPanes) != 0 && tt.kind == app.OpPaneOpen {
+				// Only the manager's pane may be closed; the child never had one.
+				for _, pane := range f.tc.Runtime.ClosedPanes {
+					if pane != "pane-mgr" {
+						t.Fatalf("stop closed pane %s; the refused child pane never existed", pane)
+					}
+				}
+			}
+		})
 	}
 }
 

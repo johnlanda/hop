@@ -447,7 +447,9 @@ func (c *Controller) driveSessionLaunchDeadline(ctx context.Context, handle RunH
 	}); err != nil {
 		return false, err
 	}
-	if newest == nil || !LaunchDeadlineExpired(newest.CreatedAt, c.Clock.Now()) {
+	// A launch the dispatch revalidation refused was never dispatched: it
+	// has no launcher to wait for and is never reopened.
+	if newest == nil || refusedBeforeDispatch(newest) || !LaunchDeadlineExpired(newest.CreatedAt, c.Clock.Now()) {
 		return false, nil
 	}
 	if newest.State == OperationReconciling {
