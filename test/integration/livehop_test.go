@@ -146,10 +146,17 @@ func waitForRunStateWithProcessDiagnostics(t *testing.T, server *testServer, art
 // real Claude Code, in the operator's own default profile, driven through
 // the real hop run/hop launch pipeline against the fixture repository with
 // one small brief to a passing check, then a cold-relaunch
-// ("claude --resume <preassigned-uuid>") continuation proving the
-// native-session mechanism end to end against a real harness rather than
-// the fixture worker's own --resume support (fixtureworker_test.go's
-// isResumeInvocation). It never runs in the normal suite or make check —
+// ("claude --resume <preassigned-uuid> <continuation prompt>")
+// continuation proving the native-session mechanism end to end against a
+// real harness rather than the fixture worker's own --resume support
+// (fixtureworker_test.go's isResumeInvocation). The continuation prompt
+// is load-bearing here: interactive Claude Code restores the resumed
+// transcript but does not re-run a pending user turn (observed live
+// 2026-09-15 on claude 2.1.270 — a prompt-less `--resume` left the
+// restored session idle at its input box), so the relaunched run reaches
+// completion only because the positional prompt tells the worker to
+// re-read its assignment, continue and submit. It never runs in the
+// normal suite or make check —
 // only the Makefile's test-live target ever sets HOP_LIVE_HARNESS=1 — and
 // it is never run by this task's own automated verification; a human runs
 // it deliberately.

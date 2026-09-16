@@ -9,3 +9,12 @@ import "github.com/johnlanda/hop/internal/domain/identity"
 func NewRunHandleForTest(runID identity.RunID, lease Lease) RunHandle {
 	return newRunHandle(runID, lease)
 }
+
+// RenderContinuationPromptForTest exposes renderContinuationPrompt to
+// app_test, so scenarios scripting the argv of HOP's own cold-relaunched
+// worker reproduce the pinned relaunch shape
+// (`--resume <native-ref> <continuation prompt>`) from the one production
+// template rather than an ad-hoc string.
+func RenderContinuationPromptForTest(assignmentPath, hopPath string) string {
+	return renderContinuationPrompt(assignmentPath, hopPath)
+}

@@ -137,6 +137,26 @@ alternate-profile/pools work; they are not re-verified here.
   `Not logged in` error), and an unknown UUID failed earlier with
   `No conversation found with session ID: <uuid>`. Resume lookup is scoped to
   `CLAUDE_CONFIG_DIR`, not to the working directory.
+- Resume accepts a positional prompt, and interactive resume does not
+  auto-continue a pending turn (verified 2026-09-15 against 2.1.270,
+  human-run evidence). `claude --help` prints
+  `Usage: claude [options] [command] [prompt]` and `-r, --resume [value]`,
+  so a positional prompt may follow `--resume <id>` as its own argv
+  element. It is needed: an interactive `claude --resume <id>` restores
+  the session's transcript but does NOT re-run a user turn that never got
+  an assistant response — observed live in the human-run
+  `TestLiveClaudeDefaultProfileRun` (main c23b4f0): a worker killed before
+  its first output was relaunched with a prompt-less `--resume <id>`, the
+  restored session displayed the unanswered prompt and sat idle at its
+  input box for nine minutes. HOP's cold relaunch therefore passes a fixed
+  continuation prompt as the positional argument after the adjacent
+  `--resume <native-ref>` pair
+  (`internal/app/usecase_execboundary.go`, `renderContinuationPrompt`:
+  durable run facts only — the frozen assignment path and the
+  `<hop> result submit` command line — telling the worker it was
+  relaunched after an interruption, to re-read its assignment, continue
+  and submit). Version-scoped like every other 2.1.270 fact: re-verify on
+  drift.
 - Transcript portability. Copying the transcript file into a second fresh
   profile under the same `projects/<munged-cwd>/` path made
   `claude -p --resume <uuid>` in that profile find the session (it progressed
@@ -301,7 +321,11 @@ For a worker in a Herdr pane using account profile `<dir>`:
 4. Record the session UUID, profile directory, working directory and account
    label as the session binding. Cold resume needs all four:
    `CLAUDE_CONFIG_DIR=<dir> claude --resume <uuid>` from any directory, though
-   restoring the original cwd preserves project settings and trust.
+   restoring the original cwd preserves project settings and trust. An
+   interactive resume restores the transcript only — it does not
+   auto-continue a pending turn (see the resume-positional-prompt item
+   above), so HOP's own cold relaunch appends its fixed continuation
+   prompt as the positional argument after `--resume <uuid>`.
 
 ## Codex
 
@@ -538,7 +562,13 @@ installed `herdr 0.9.0` documentation):
   Code has an entry: it is the only harness HOP pre-assigns a native
   reference for and the only Phase 2 cold resume. The shape is pinned by
   `TestSpikeRestoreAutoRelaunchBypassesLauncher` (argv exactly
-  `[claude --resume <id>]`).
+  `[claude --resume <id>]`). The predicate requires the adjacent pair and
+  tolerates trailing argv elements, so HOP's own cold-relaunch argv —
+  `claude --resume <native-ref> <continuation prompt>`, three tail
+  elements where Herdr's restore plan has two — also satisfies it; that
+  is deliberate and safe, because the claim-corroboration predicate takes
+  precedence for HOP's own claimed process and positive-evidence
+  retirement only targets an occupant that is not it.
 - The cold-restore path constructs its launch environment as
   `PaneLaunchEnv::from_extra(Vec::new())`
   ([restore implementation](../../repos/herdr/src/persist/restore.rs)), as

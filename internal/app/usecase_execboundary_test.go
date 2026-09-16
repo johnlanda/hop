@@ -592,7 +592,7 @@ func TestPrepareLaunchExec(t *testing.T) {
 		}
 	})
 
-	t.Run("cold relaunch composes resume argv", func(t *testing.T) {
+	t.Run("cold relaunch composes resume argv with the continuation prompt", func(t *testing.T) {
 		lc := ebLaunchContext(t)
 		lc.Attempt.State = run.AttemptRelaunching
 		read := &ebReadStub{launch: lc}
@@ -603,7 +603,14 @@ func TestPrepareLaunchExec(t *testing.T) {
 			t.Fatalf("PrepareLaunchExec: %v", err)
 		}
 
-		want := []string{"/resolved/claude", "--resume", ebNativeRef}
+		// The exact relaunch argv: `--resume` IMMEDIATELY followed by the
+		// durable native reference (the restored-harness predicate's
+		// adjacency rule), then the fixed continuation prompt as one
+		// trailing element.
+		want := []string{
+			"/resolved/claude", "--resume", ebNativeRef,
+			renderContinuationPrompt("/state/runs/"+ebRunID+"/artifacts/assignment.md", "/opt/hop/bin/hop"),
+		}
 		if len(plan.Argv) != len(want) {
 			t.Fatalf("argv = %q, want %q", plan.Argv, want)
 		}
@@ -611,6 +618,18 @@ func TestPrepareLaunchExec(t *testing.T) {
 			if plan.Argv[i] != want[i] {
 				t.Fatalf("argv = %q, want %q", plan.Argv, want)
 			}
+		}
+		prompt := plan.Argv[3]
+		for _, wantIn := range []string{"relaunched after an interruption", "/state/runs/" + ebRunID + "/artifacts/assignment.md", "/opt/hop/bin/hop result submit", "transient"} {
+			if !strings.Contains(prompt, wantIn) {
+				t.Errorf("continuation prompt lacks %q; got %q", wantIn, prompt)
+			}
+		}
+		if strings.Contains(prompt, "secret-value") {
+			t.Errorf("continuation prompt echoes an environment value: %q", prompt)
+		}
+		if len(subs.claims) != 1 || subs.claims[0].ArgvDigest != launchArgvDigest(plan.Argv) {
+			t.Errorf("claim digest does not cover the continuation prompt element: %+v", subs.claims)
 		}
 	})
 
@@ -787,6 +806,14 @@ func TestPrepareLaunchExec(t *testing.T) {
 				lc.Session.NativeSessionRef = ""
 			},
 			wantErr: "no pre-assigned native session reference",
+		},
+		{
+			name: "relative frozen assignment path refuses a cold relaunch",
+			mutate: func(lc *LaunchContext, _ *LaunchExecRequest, _ *ebSubmissionStub) {
+				lc.Attempt.State = run.AttemptRelaunching
+				lc.Snapshot.AssignmentPath = "runs/artifacts/assignment.md"
+			},
+			wantErr: "assignment path is not absolute",
 		},
 		{
 			name: "invalid frozen policy",
