@@ -30,18 +30,48 @@ var _ app.Runtime = (*herdr.Runtime)(nil)
 type controllerAPI interface {
 	StartRun(ctx context.Context, req app.StartRunRequest) (app.StartRunResult, app.RunHandle, error)
 	Resume(ctx context.Context, req app.ResumeRequest) (app.ResumeResult, app.RunHandle, error)
+	ResumeFeature(ctx context.Context, req app.ResumeFeatureRequest) (app.ResumeFeatureResult, app.RunHandle, error)
 	Status(ctx context.Context, req app.StatusRequest) (app.StatusResult, error)
 	RequestStop(ctx context.Context, runID string) error
 	DriveStop(ctx context.Context, handle app.RunHandle) (app.StopReport, error)
+	DriveFeatureStop(ctx context.Context, handle app.RunHandle) (app.StopReport, error)
 	Heartbeat(ctx context.Context, handle app.RunHandle) error
 	Detach(ctx context.Context, handle app.RunHandle) error
 	CorroborateLaunch(ctx context.Context, handle app.RunHandle) (app.LaunchProgress, error)
+	CorroborateSessionLaunches(ctx context.Context, handle app.RunHandle) ([]app.SessionLaunchProgress, error)
 	ClaimAndRunCheck(ctx context.Context, handle app.RunHandle, hopPath string, spawnEnv []string) (app.CheckReport, error)
+	DriveFeatureChecks(ctx context.Context, handle app.RunHandle, hopPath string, spawnEnv []string) (app.FeatureCheckReport, error)
 	CheckSpawnEnvironment(ctx context.Context, handle app.RunHandle, environ []string) ([]string, error)
 	SubmitResult(ctx context.Context, req app.SubmitResultRequest) (app.SubmitResultResult, error)
-	PrepareLaunchExec(ctx context.Context, req app.LaunchExecRequest) (app.LaunchExecPlan, error)
+	PrepareSessionLaunchExec(ctx context.Context, req app.SessionLaunchExecRequest) (app.LaunchExecPlan, error)
 	FailLaunchExec(ctx context.Context, incarnationID, reason string) error
 	PrepareCheckExec(ctx context.Context, req app.CheckExecRequest) (app.CheckExecPlan, error)
+
+	// Feature-mode extended scheduling pass (docs/plan/phase-3-design.md
+	// section 6): the foreground loop calls these in the design's fixed
+	// order for a feature-mode run, alongside the Phase 2 steps above.
+	RetireSettledSessions(ctx context.Context, handle app.RunHandle) (app.RetirementReport, error)
+	RecomputeReleases(ctx context.Context, handle app.RunHandle) (app.ReleaseReport, error)
+	DriveIntegration(ctx context.Context, handle app.RunHandle, hopPath string, spawnEnv []string) (app.IntegrationReport, error)
+	EnsureReviewTask(ctx context.Context, handle app.RunHandle) (bool, error)
+	AssignReadyTasks(ctx context.Context, handle app.RunHandle, opts app.AssignmentOptions) (app.AssignmentReport, error)
+	DriveCompletion(ctx context.Context, handle app.RunHandle) (app.CompletionReport, error)
+	PublishRunPresentation(ctx context.Context, handle app.RunHandle) (app.PresentationReport, error)
+
+	// Worker-plumbing verbs (docs/plan/phase-3-design.md sections 7-8).
+	SendMessage(ctx context.Context, req app.SendMessageRequest) (app.SendMessageResult, error)
+	FetchMessage(ctx context.Context, req app.FetchMessageRequest) (app.FetchMessageResult, error)
+	AckMessage(ctx context.Context, req app.AckMessageRequest) (app.AckMessageResult, error)
+	ShowMessage(ctx context.Context, req app.ShowMessageRequest) (app.ShowMessageResult, error)
+	Answer(ctx context.Context, req app.AnswerRequest) (app.AnswerResult, error)
+	CreateTask(ctx context.Context, req app.CreateTaskRequest) (app.CreateTaskResult, error)
+	RequestRetry(ctx context.Context, req app.RequestRetryRequest) (app.RequestRetryResult, error)
+	ClosePlan(ctx context.Context, req app.ClosePlanRequest) (app.ClosePlanResult, error)
+	SubmitReviewVerdict(ctx context.Context, req app.SubmitReviewRequest) (app.SubmitReviewResult, error)
+
+	// hop view (docs/plan/phase-3-design.md section 9).
+	SelectRunView(ctx context.Context, label string) error
+	ClearRunView(ctx context.Context) error
 }
 
 var _ controllerAPI = (*app.Controller)(nil)
@@ -132,9 +162,16 @@ func openController(ctx context.Context, cfg controllerConfig) (controllerAPI, f
 		return nil, nil, fmt.Errorf("open state store: %w", err)
 	}
 	controller := &app.Controller{
-		Store:         store,
-		Read:          store,
-		Submissions:   store,
+		Store:       store,
+		Read:        store,
+		Submissions: store,
+		// Messages, Plan and Reviews are the Phase 3 worker-authority
+		// stores: the same SQLite Store implements all three, needed by
+		// the worker-plumbing verbs (hop msg/task/plan/review/answer)
+		// regardless of whether this command also wires a Runtime.
+		Messages:      store,
+		Plan:          store,
+		Reviews:       store,
 		Artifacts:     system.ArtifactStore{},
 		Clock:         system.Clock{},
 		IDs:           system.IDGenerator{},
@@ -145,7 +182,12 @@ func openController(ctx context.Context, cfg controllerConfig) (controllerAPI, f
 		GitExecutable: gitExecutable,
 	}
 	if cfg.withRuntime {
-		controller.Runtime = herdr.NewRuntime(cfg.socketPath)
+		runtime := herdr.NewRuntime(cfg.socketPath)
+		controller.Runtime = runtime
+		// Workspaces (manager placement, section 8) is implemented by the
+		// same herdr.Runtime value as a separate port interface.
+		controller.Workspaces = runtime
+		controller.Presentation = herdr.NewPresentation(cfg.socketPath)
 	}
 	return controller, store.Close, nil
 }

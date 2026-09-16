@@ -25,8 +25,8 @@ func TestRunLaunch(t *testing.T) {
 
 	t.Run("prepares, claims and execs the plan; a failed exec settles exec_failed", func(t *testing.T) {
 		ctrl := &fakeController{}
-		var prepared app.LaunchExecRequest
-		ctrl.prepareLaunch = func(req app.LaunchExecRequest) (app.LaunchExecPlan, error) {
+		var prepared app.SessionLaunchExecRequest
+		ctrl.prepareSessionLaunch = func(req app.SessionLaunchExecRequest) (app.LaunchExecPlan, error) {
 			prepared = req
 			return app.LaunchExecPlan{
 				Argv:          []string{"/resolved/claude", "--session-id", "ref", "prompt"},
@@ -86,7 +86,7 @@ func TestRunLaunch(t *testing.T) {
 
 	t.Run("a refused preparation never execs and never settles", func(t *testing.T) {
 		ctrl := &fakeController{}
-		ctrl.prepareLaunch = func(app.LaunchExecRequest) (app.LaunchExecPlan, error) {
+		ctrl.prepareSessionLaunch = func(app.SessionLaunchExecRequest) (app.LaunchExecPlan, error) {
 			return app.LaunchExecPlan{}, errors.New("app: HOP_INCARNATION_ID does not match")
 		}
 		td := newTestDeps(ctrl, workerEnv, t.TempDir())
@@ -209,7 +209,9 @@ func TestRunLaunch(t *testing.T) {
 		args []string
 		want string
 	}{
-		{name: "missing flags", args: nil, want: "--run and --attempt are required"},
+		{name: "missing flags", args: nil, want: "--run is required"},
+		{name: "missing address", args: []string{"--run", testRunID}, want: "exactly one of --attempt and --session is required"},
+		{name: "both addresses", args: []string{"--run", testRunID, "--attempt", testAttemptID, "--session", testIncarnationID}, want: "exactly one of --attempt and --session is required"},
 		{name: "unexpected positional", args: []string{"--run", testRunID, "--attempt", testAttemptID, "extra"}, want: "unexpected argument"},
 		{name: "unknown flag", args: []string{"-json"}, want: "flag provided but not defined"},
 	}

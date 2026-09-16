@@ -22,20 +22,45 @@ type fakeController struct {
 	// command created (the fake signature itself carries no context).
 	lastStatusCtx context.Context //nolint:containedctx // test-only capture of the call's context for deterministic cancellation scripting.
 
-	startRun         func(req app.StartRunRequest) (app.StartRunResult, app.RunHandle, error)
-	resume           func(req app.ResumeRequest) (app.ResumeResult, app.RunHandle, error)
-	status           func(req app.StatusRequest) (app.StatusResult, error)
-	requestStop      func(runID string) error
-	driveStop        func() (app.StopReport, error)
-	heartbeat        func() error
-	detach           func() error
-	corroborate      func() (app.LaunchProgress, error)
-	claimAndRunCheck func(ctx context.Context, hopPath string, spawnEnv []string) (app.CheckReport, error)
-	checkSpawnEnv    func(environ []string) ([]string, error)
-	submitResult     func(req app.SubmitResultRequest) (app.SubmitResultResult, error)
-	prepareLaunch    func(req app.LaunchExecRequest) (app.LaunchExecPlan, error)
-	failLaunch       func(incarnationID, reason string) error
-	prepareCheck     func(req app.CheckExecRequest) (app.CheckExecPlan, error)
+	startRun             func(req app.StartRunRequest) (app.StartRunResult, app.RunHandle, error)
+	resume               func(req app.ResumeRequest) (app.ResumeResult, app.RunHandle, error)
+	resumeFeature        func(req app.ResumeFeatureRequest) (app.ResumeFeatureResult, app.RunHandle, error)
+	status               func(req app.StatusRequest) (app.StatusResult, error)
+	requestStop          func(runID string) error
+	driveStop            func() (app.StopReport, error)
+	driveFeatureStop     func() (app.StopReport, error)
+	heartbeat            func() error
+	detach               func() error
+	corroborate          func() (app.LaunchProgress, error)
+	corroborateSessions  func() ([]app.SessionLaunchProgress, error)
+	claimAndRunCheck     func(ctx context.Context, hopPath string, spawnEnv []string) (app.CheckReport, error)
+	driveFeatureChecks   func(ctx context.Context, hopPath string, spawnEnv []string) (app.FeatureCheckReport, error)
+	checkSpawnEnv        func(environ []string) ([]string, error)
+	submitResult         func(req app.SubmitResultRequest) (app.SubmitResultResult, error)
+	prepareSessionLaunch func(req app.SessionLaunchExecRequest) (app.LaunchExecPlan, error)
+	failLaunch           func(incarnationID, reason string) error
+	prepareCheck         func(req app.CheckExecRequest) (app.CheckExecPlan, error)
+
+	retireSettledSessions func() (app.RetirementReport, error)
+	recomputeReleases     func() (app.ReleaseReport, error)
+	driveIntegration      func(ctx context.Context, hopPath string, spawnEnv []string) (app.IntegrationReport, error)
+	ensureReviewTask      func() (bool, error)
+	assignReadyTasks      func(opts app.AssignmentOptions) (app.AssignmentReport, error)
+	driveCompletion       func() (app.CompletionReport, error)
+	publishPresentation   func() (app.PresentationReport, error)
+
+	sendMessage  func(req app.SendMessageRequest) (app.SendMessageResult, error)
+	fetchMessage func(req app.FetchMessageRequest) (app.FetchMessageResult, error)
+	ackMessage   func(req app.AckMessageRequest) (app.AckMessageResult, error)
+	showMessage  func(req app.ShowMessageRequest) (app.ShowMessageResult, error)
+	answer       func(req app.AnswerRequest) (app.AnswerResult, error)
+	createTask   func(req app.CreateTaskRequest) (app.CreateTaskResult, error)
+	requestRetry func(req app.RequestRetryRequest) (app.RequestRetryResult, error)
+	closePlan    func(req app.ClosePlanRequest) (app.ClosePlanResult, error)
+	submitReview func(req app.SubmitReviewRequest) (app.SubmitReviewResult, error)
+
+	selectRunView func(label string) error
+	clearRunView  func() error
 }
 
 func (f *fakeController) record(name string) {
@@ -149,12 +174,12 @@ func (f *fakeController) SubmitResult(_ context.Context, req app.SubmitResultReq
 	return f.submitResult(req)
 }
 
-func (f *fakeController) PrepareLaunchExec(_ context.Context, req app.LaunchExecRequest) (app.LaunchExecPlan, error) { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.
-	f.record("PrepareLaunchExec")
-	if f.prepareLaunch == nil {
-		return app.LaunchExecPlan{}, errors.New("unexpected PrepareLaunchExec")
+func (f *fakeController) PrepareSessionLaunchExec(_ context.Context, req app.SessionLaunchExecRequest) (app.LaunchExecPlan, error) { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.
+	f.record("PrepareSessionLaunchExec")
+	if f.prepareSessionLaunch == nil {
+		return app.LaunchExecPlan{}, errors.New("unexpected PrepareSessionLaunchExec")
 	}
-	return f.prepareLaunch(req)
+	return f.prepareSessionLaunch(req)
 }
 
 func (f *fakeController) FailLaunchExec(_ context.Context, incarnationID, reason string) error {
@@ -171,6 +196,182 @@ func (f *fakeController) PrepareCheckExec(_ context.Context, req app.CheckExecRe
 		return app.CheckExecPlan{}, errors.New("unexpected PrepareCheckExec")
 	}
 	return f.prepareCheck(req)
+}
+
+func (f *fakeController) ResumeFeature(_ context.Context, req app.ResumeFeatureRequest) (app.ResumeFeatureResult, app.RunHandle, error) { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.
+	f.record("ResumeFeature")
+	if f.resumeFeature == nil {
+		return app.ResumeFeatureResult{}, app.RunHandle{}, errors.New("unexpected ResumeFeature")
+	}
+	return f.resumeFeature(req)
+}
+
+func (f *fakeController) DriveFeatureStop(_ context.Context, _ app.RunHandle) (app.StopReport, error) { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.
+	f.record("DriveFeatureStop")
+	if f.driveFeatureStop == nil {
+		return app.StopReport{}, errors.New("unexpected DriveFeatureStop")
+	}
+	return f.driveFeatureStop()
+}
+
+func (f *fakeController) CorroborateSessionLaunches(_ context.Context, _ app.RunHandle) ([]app.SessionLaunchProgress, error) { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.
+	f.record("CorroborateSessionLaunches")
+	if f.corroborateSessions == nil {
+		return nil, nil
+	}
+	return f.corroborateSessions()
+}
+
+func (f *fakeController) DriveFeatureChecks(ctx context.Context, _ app.RunHandle, hopPath string, spawnEnv []string) (app.FeatureCheckReport, error) { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.
+	f.record("DriveFeatureChecks")
+	if f.driveFeatureChecks == nil {
+		return app.FeatureCheckReport{}, nil
+	}
+	return f.driveFeatureChecks(ctx, hopPath, spawnEnv)
+}
+
+func (f *fakeController) RetireSettledSessions(_ context.Context, _ app.RunHandle) (app.RetirementReport, error) { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.
+	f.record("RetireSettledSessions")
+	if f.retireSettledSessions == nil {
+		return app.RetirementReport{}, nil
+	}
+	return f.retireSettledSessions()
+}
+
+func (f *fakeController) RecomputeReleases(_ context.Context, _ app.RunHandle) (app.ReleaseReport, error) { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.
+	f.record("RecomputeReleases")
+	if f.recomputeReleases == nil {
+		return app.ReleaseReport{}, nil
+	}
+	return f.recomputeReleases()
+}
+
+func (f *fakeController) DriveIntegration(ctx context.Context, _ app.RunHandle, hopPath string, spawnEnv []string) (app.IntegrationReport, error) { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.
+	f.record("DriveIntegration")
+	if f.driveIntegration == nil {
+		return app.IntegrationReport{}, nil
+	}
+	return f.driveIntegration(ctx, hopPath, spawnEnv)
+}
+
+func (f *fakeController) EnsureReviewTask(_ context.Context, _ app.RunHandle) (bool, error) { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.
+	f.record("EnsureReviewTask")
+	if f.ensureReviewTask == nil {
+		return false, nil
+	}
+	return f.ensureReviewTask()
+}
+
+func (f *fakeController) AssignReadyTasks(_ context.Context, _ app.RunHandle, opts app.AssignmentOptions) (app.AssignmentReport, error) { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.
+	f.record("AssignReadyTasks")
+	if f.assignReadyTasks == nil {
+		return app.AssignmentReport{}, nil
+	}
+	return f.assignReadyTasks(opts)
+}
+
+func (f *fakeController) DriveCompletion(_ context.Context, _ app.RunHandle) (app.CompletionReport, error) { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.
+	f.record("DriveCompletion")
+	if f.driveCompletion == nil {
+		return app.CompletionReport{}, nil
+	}
+	return f.driveCompletion()
+}
+
+func (f *fakeController) PublishRunPresentation(_ context.Context, _ app.RunHandle) (app.PresentationReport, error) { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.
+	f.record("PublishRunPresentation")
+	if f.publishPresentation == nil {
+		return app.PresentationReport{}, nil
+	}
+	return f.publishPresentation()
+}
+
+func (f *fakeController) SendMessage(_ context.Context, req app.SendMessageRequest) (app.SendMessageResult, error) { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.
+	f.record("SendMessage")
+	if f.sendMessage == nil {
+		return app.SendMessageResult{}, errors.New("unexpected SendMessage")
+	}
+	return f.sendMessage(req)
+}
+
+func (f *fakeController) FetchMessage(_ context.Context, req app.FetchMessageRequest) (app.FetchMessageResult, error) {
+	f.record("FetchMessage")
+	if f.fetchMessage == nil {
+		return app.FetchMessageResult{}, errors.New("unexpected FetchMessage")
+	}
+	return f.fetchMessage(req)
+}
+
+func (f *fakeController) AckMessage(_ context.Context, req app.AckMessageRequest) (app.AckMessageResult, error) {
+	f.record("AckMessage")
+	if f.ackMessage == nil {
+		return app.AckMessageResult{}, errors.New("unexpected AckMessage")
+	}
+	return f.ackMessage(req)
+}
+
+func (f *fakeController) ShowMessage(_ context.Context, req app.ShowMessageRequest) (app.ShowMessageResult, error) {
+	f.record("ShowMessage")
+	if f.showMessage == nil {
+		return app.ShowMessageResult{}, errors.New("unexpected ShowMessage")
+	}
+	return f.showMessage(req)
+}
+
+func (f *fakeController) Answer(_ context.Context, req app.AnswerRequest) (app.AnswerResult, error) { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.
+	f.record("Answer")
+	if f.answer == nil {
+		return app.AnswerResult{}, errors.New("unexpected Answer")
+	}
+	return f.answer(req)
+}
+
+func (f *fakeController) CreateTask(_ context.Context, req app.CreateTaskRequest) (app.CreateTaskResult, error) { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.
+	f.record("CreateTask")
+	if f.createTask == nil {
+		return app.CreateTaskResult{}, errors.New("unexpected CreateTask")
+	}
+	return f.createTask(req)
+}
+
+func (f *fakeController) RequestRetry(_ context.Context, req app.RequestRetryRequest) (app.RequestRetryResult, error) { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.
+	f.record("RequestRetry")
+	if f.requestRetry == nil {
+		return app.RequestRetryResult{}, errors.New("unexpected RequestRetry")
+	}
+	return f.requestRetry(req)
+}
+
+func (f *fakeController) ClosePlan(_ context.Context, req app.ClosePlanRequest) (app.ClosePlanResult, error) {
+	f.record("ClosePlan")
+	if f.closePlan == nil {
+		return app.ClosePlanResult{}, errors.New("unexpected ClosePlan")
+	}
+	return f.closePlan(req)
+}
+
+func (f *fakeController) SubmitReviewVerdict(_ context.Context, req app.SubmitReviewRequest) (app.SubmitReviewResult, error) { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.
+	f.record("SubmitReviewVerdict")
+	if f.submitReview == nil {
+		return app.SubmitReviewResult{}, errors.New("unexpected SubmitReviewVerdict")
+	}
+	return f.submitReview(req)
+}
+
+func (f *fakeController) SelectRunView(_ context.Context, label string) error {
+	f.record("SelectRunView")
+	if f.selectRunView == nil {
+		return errors.New("unexpected SelectRunView")
+	}
+	return f.selectRunView(label)
+}
+
+func (f *fakeController) ClearRunView(_ context.Context) error {
+	f.record("ClearRunView")
+	if f.clearRunView == nil {
+		return errors.New("unexpected ClearRunView")
+	}
+	return f.clearRunView()
 }
 
 // execCall records one exec-seam invocation.

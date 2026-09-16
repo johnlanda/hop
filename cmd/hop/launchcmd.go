@@ -18,26 +18,31 @@ import (
 // exec itself replaces the process and is not bounded by any context.
 const defaultLaunchPrepTimeout = 30 * time.Second
 
-// runLaunch implements `hop launch --run <uuid> --attempt <uuid>`, the
-// worker exec boundary (design section 6): it requires the launch-provided
+// runLaunch implements `hop launch --run <uuid> --attempt <uuid>` (the
+// permanent solo shim, slice 4) and `hop launch --run <uuid> --session
+// <uuid>` (every feature-mode pane), the worker exec boundary
+// (docs/plan/phase-3-design.md section 6, generalizing
+// docs/plan/phase-2-design.md section 6): it requires the launch-provided
 // absolute HOP_STATE_DIR (never falling back to the default resolution),
-// resolves its own working directory to the symlink-resolved worktree path
-// the workspace-trust seed keys on, prepares the exec through the
-// application — environment validation against the launch context,
-// sanitization under the frozen policy, per-harness argv composition,
-// executable resolution, the workspace-trust pre-seed with its recorded
-// evidence, the exec_pending claim — and execs through the process
-// adapter. On success it never
-// returns. Every failure exits 1 with one stderr line that never echoes an
-// environment value; a failure after the claim (the exec itself) settles
-// the claim exec_failed first.
+// resolves its own working directory to the symlink-resolved worktree (or,
+// for the manager, repository root) path the workspace-trust seed keys on,
+// prepares the exec through the application — session context load,
+// environment validation, sanitization under the frozen policy, per-role
+// argv composition, executable resolution, the workspace-trust pre-seed
+// with its recorded evidence, the session-keyed exec_pending claim — and
+// execs through the process adapter. The two forms are mutually exclusive;
+// solo-mode panes keep the Phase 2 argv byte-identical. On success it
+// never returns. Every failure exits 1 with one stderr line that never
+// echoes an environment value; a failure after the claim (the exec itself)
+// settles the claim exec_failed first.
 func runLaunch(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 	_ = stdout // hop launch's success is an exec; it writes only diagnostics.
 	diagnostics := &recordingWriter{w: stderr}
 	flags := flag.NewFlagSet("hop launch", flag.ContinueOnError)
 	flags.SetOutput(diagnostics)
 	runID := flags.String("run", "", "run id (required)")
-	attemptID := flags.String("attempt", "", "attempt id (required)")
+	attemptID := flags.String("attempt", "", "attempt id (the permanent solo shim; mutually exclusive with --session)")
+	sessionID := flags.String("session", "", "session id (every feature-mode pane; mutually exclusive with --attempt)")
 	if err := flags.Parse(args); err != nil {
 		return exitUsage, diagnostics.err
 	}
@@ -45,8 +50,12 @@ func runLaunch(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 		_, err := fmt.Fprintf(stderr, "hop launch: unexpected argument %q\n", flags.Arg(0))
 		return exitUsage, err
 	}
-	if *runID == "" || *attemptID == "" {
-		_, err := fmt.Fprintln(stderr, "hop launch: --run and --attempt are required")
+	if *runID == "" {
+		_, err := fmt.Fprintln(stderr, "hop launch: --run is required")
+		return exitUsage, err
+	}
+	if (*attemptID == "") == (*sessionID == "") {
+		_, err := fmt.Fprintln(stderr, "hop launch: exactly one of --attempt and --session is required")
 		return exitUsage, err
 	}
 
@@ -75,9 +84,10 @@ func runLaunch(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 	}
 	defer closeStore() //nolint:errcheck // an exec success never reaches this; on failure the store closes on process exit either way.
 
-	plan, err := ctrl.PrepareLaunchExec(ctx, app.LaunchExecRequest{
+	plan, err := ctrl.PrepareSessionLaunchExec(ctx, app.SessionLaunchExecRequest{
 		RunID:            *runID,
 		AttemptID:        *attemptID,
+		SessionID:        *sessionID,
 		HOPPath:          hopPath,
 		WorkerDir:        workerDir,
 		Environ:          d.environ(),

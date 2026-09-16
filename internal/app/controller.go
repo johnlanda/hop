@@ -247,6 +247,30 @@ func recordTransition(ctx context.Context, uow UnitOfWork, kind EntityKind, id, 
 	})
 }
 
+// SelectRunView installs HOP's native Agents view filtered to one run
+// (docs/plan/phase-3-design.md section 9): `hop view set --run`. label is
+// the run's repository-scoped display label (e.g. "r5"), used both as the
+// filter value (matching the hop_run token every session publishes) and
+// the view's human-readable name. Fails closed with the typed sentinel
+// when this Controller carries no Presentation port, before any request is
+// sent.
+func (c *Controller) SelectRunView(ctx context.Context, label string) error {
+	if c.Presentation == nil {
+		return fmt.Errorf("%w: SelectRunView", ErrFeatureModeUnsupported)
+	}
+	return (&Presenter{Presentation: c.Presentation}).Focus(ctx, label, label)
+}
+
+// ClearRunView clears HOP's native Agents view selection, if HOP still
+// owns it: `hop view clear`. Fails closed with the typed sentinel when
+// this Controller carries no Presentation port.
+func (c *Controller) ClearRunView(ctx context.Context) error {
+	if c.Presentation == nil {
+		return fmt.Errorf("%w: ClearRunView", ErrFeatureModeUnsupported)
+	}
+	return (&Presenter{Presentation: c.Presentation}).Clear(ctx)
+}
+
 // withUnitOfWork opens a unit of work bound to lease, runs fn, and commits
 // on success or rolls back on any error fn returns or Commit reports.
 func (c *Controller) withUnitOfWork(ctx context.Context, lease Lease, fn func(uow UnitOfWork) error) error {
