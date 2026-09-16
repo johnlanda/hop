@@ -434,8 +434,10 @@ func TestStoreVectors(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Begin() error = %v", err)
 		}
-		defer func() { _ = uow.Rollback() }()
 		assertWorktreeLookupVector(t, uow, vector)
+		if err := uow.Rollback(); err != nil {
+			t.Fatalf("Rollback() error = %v", err)
+		}
 	})
 }
 

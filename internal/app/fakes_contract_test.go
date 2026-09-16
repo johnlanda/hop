@@ -574,29 +574,31 @@ func TestFakeWorktreeIndexContract(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Begin() error = %v", err)
 	}
-	if _, err := uow.Worktrees().Create(ctx, row); err != nil {
-		t.Fatalf("Worktrees().Create() error = %v", err)
+	if _, createErr := uow.Worktrees().Create(ctx, row); createErr != nil {
+		t.Fatalf("Worktrees().Create() error = %v", createErr)
 	}
 	wf, err := app.RequireWorkflowRepositories(uow, "contract")
 	if err != nil {
 		t.Fatalf("RequireWorkflowRepositories() error = %v", err)
 	}
-	if got, revision, err := wf.WorktreeIndex().ByAttempt(ctx, attempt.ID); err != nil || got != row || revision != 1 {
-		t.Fatalf("ByAttempt in the creating unit of work = %+v rev %d, %v; want %+v rev 1", got, revision, err, row)
+	if got, revision, lookupErr := wf.WorktreeIndex().ByAttempt(ctx, attempt.ID); lookupErr != nil || got != row || revision != 1 {
+		t.Fatalf("ByAttempt in the creating unit of work = %+v rev %d, %v; want %+v rev 1", got, revision, lookupErr, row)
 	}
-	if err := uow.Rollback(); err != nil {
-		t.Fatalf("Rollback() error = %v", err)
+	if rollbackErr := uow.Rollback(); rollbackErr != nil {
+		t.Fatalf("Rollback() error = %v", rollbackErr)
 	}
 
 	uow, err = tc.Store.Begin(ctx, lease)
 	if err != nil {
 		t.Fatalf("Begin() error = %v", err)
 	}
-	defer func() { _ = uow.Rollback() }()
 	if wf, err = app.RequireWorkflowRepositories(uow, "contract"); err != nil {
 		t.Fatalf("RequireWorkflowRepositories() error = %v", err)
 	}
-	if got, _, err := wf.WorktreeIndex().ByAttempt(ctx, attempt.ID); !errors.Is(err, app.ErrNotFound) {
-		t.Fatalf("ByAttempt after the rollback = %+v, %v; want ErrNotFound", got, err)
+	if got, _, lookupErr := wf.WorktreeIndex().ByAttempt(ctx, attempt.ID); !errors.Is(lookupErr, app.ErrNotFound) {
+		t.Fatalf("ByAttempt after the rollback = %+v, %v; want ErrNotFound", got, lookupErr)
+	}
+	if err := uow.Rollback(); err != nil {
+		t.Fatalf("Rollback() error = %v", err)
 	}
 }
