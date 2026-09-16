@@ -29,6 +29,9 @@ type retireFixture struct {
 	// ignoredOnly are checkouts whose only unseen data is ignored files:
 	// the one approved deletion git's own check does not see.
 	ignoredOnly map[string]bool
+	// baseHook is the detection fixture's command hook, which every
+	// onRemoval hook wraps.
+	baseHook func(ctx context.Context, cmd app.Command) (app.CommandResult, bool, error)
 }
 
 // retireAttempt is one seeded attempt worktree.
@@ -49,6 +52,7 @@ func newRetireFixture(t *testing.T) *retireFixture {
 		present:       map[string]bool{detectRoot: true, retireCommon: true},
 		ignoredOnly:   map[string]bool{},
 	}
+	f.baseHook = f.tc.Commands.RunHook
 	t.Cleanup(func() {
 		f.git.requireNoForcedAttemptRemovals(t)
 		_, _, hidden := f.git.attemptLog()
@@ -158,12 +162,13 @@ func (f *retireFixture) rowState(id identity.WorktreeID) run.WorktreeState {
 
 // onRemoval installs a hook that runs when the removal's hop check-exec is
 // spawned, before the inner git runs: it may change the model, and when it
-// returns handled the inner git never runs.
-func (f *retireFixture) onRemoval(hook func() (app.CommandResult, bool, error)) {
-	previous := f.tc.Commands.RunHook
+// returns handled the inner git never runs. It replaces any earlier
+// onRemoval hook.
+func (f *retireFixture) onRemoval(hook func(cmd app.Command) (app.CommandResult, bool, error)) {
+	previous := f.baseHook
 	f.tc.Commands.RunHook = func(ctx context.Context, cmd app.Command) (app.CommandResult, bool, error) {
 		if len(cmd.Argv) > 1 && cmd.Argv[1] == "check-exec" && slices.Contains(cmd.Argv, "remove") {
-			if result, handled, err := hook(); handled {
+			if result, handled, err := hook(cmd); handled {
 				f.spawns = append(f.spawns, cmd)
 				return result, true, err
 			}
@@ -509,7 +514,7 @@ func TestRemoveRunWorktrees(t *testing.T) {
 
 	postAct := []struct {
 		name         string
-		hook         func(f *retireFixture, a *retireAttempt) func() (app.CommandResult, bool, error)
+		hook         func(f *retireFixture, a *retireAttempt) func(app.Command) (app.CommandResult, bool, error)
 		wantRow      string
 		wantState    run.WorktreeState
 		wantOpState  app.OperationState
@@ -522,8 +527,8 @@ func TestRemoveRunWorktrees(t *testing.T) {
 	}{
 		{
 			name: "the checkout became dirty after the pre-check: git refuses, retained with evidence",
-			hook: func(f *retireFixture, a *retireAttempt) func() (app.CommandResult, bool, error) {
-				return func() (app.CommandResult, bool, error) {
+			hook: func(f *retireFixture, a *retireAttempt) func(app.Command) (app.CommandResult, bool, error) {
+				return func(app.Command) (app.CommandResult, bool, error) {
 					w, _ := f.git.attemptWorktree(a.Listed)
 					w.Untracked = true
 					f.git.addAttemptWorktree(a.Listed, w)
@@ -535,8 +540,8 @@ func TestRemoveRunWorktrees(t *testing.T) {
 		},
 		{
 			name: "HAZARD an untracked file appears after the pre-check where status.showUntrackedFiles=no: the override keeps git's refusal",
-			hook: func(f *retireFixture, a *retireAttempt) func() (app.CommandResult, bool, error) {
-				return func() (app.CommandResult, bool, error) {
+			hook: func(f *retireFixture, a *retireAttempt) func(app.Command) (app.CommandResult, bool, error) {
+				return func(app.Command) (app.CommandResult, bool, error) {
 					f.git.setHideUntracked(true)
 					w, _ := f.git.attemptWorktree(a.Listed)
 					w.Untracked = true
@@ -549,8 +554,8 @@ func TestRemoveRunWorktrees(t *testing.T) {
 		},
 		{
 			name: "the checkout was locked after the pre-check: git refuses, retained locked",
-			hook: func(f *retireFixture, a *retireAttempt) func() (app.CommandResult, bool, error) {
-				return func() (app.CommandResult, bool, error) {
+			hook: func(f *retireFixture, a *retireAttempt) func(app.Command) (app.CommandResult, bool, error) {
+				return func(app.Command) (app.CommandResult, bool, error) {
 					w, _ := f.git.attemptWorktree(a.Listed)
 					w.Locked = true
 					f.git.addAttemptWorktree(a.Listed, w)
@@ -562,8 +567,8 @@ func TestRemoveRunWorktrees(t *testing.T) {
 		},
 		{
 			name: "a non-zero exit with nothing to show for it: remove-refused with the exit code",
-			hook: func(*retireFixture, *retireAttempt) func() (app.CommandResult, bool, error) {
-				return func() (app.CommandResult, bool, error) {
+			hook: func(*retireFixture, *retireAttempt) func(app.Command) (app.CommandResult, bool, error) {
+				return func(app.Command) (app.CommandResult, bool, error) {
 					return app.CommandResult{ExitCode: 1, Stderr: []byte("check-exec: refused\n")}, true, nil
 				}
 			},
@@ -572,16 +577,16 @@ func TestRemoveRunWorktrees(t *testing.T) {
 		},
 		{
 			name: "exit 0 with the checkout still listed and present: handled like a refusal",
-			hook: func(*retireFixture, *retireAttempt) func() (app.CommandResult, bool, error) {
-				return func() (app.CommandResult, bool, error) { return app.CommandResult{}, true, nil }
+			hook: func(*retireFixture, *retireAttempt) func(app.Command) (app.CommandResult, bool, error) {
+				return func(app.Command) (app.CommandResult, bool, error) { return app.CommandResult{}, true, nil }
 			},
 			wantRow: "retained", wantState: run.WorktreeActive, wantOpState: app.OperationFailed, wantResult: "refused",
 			wantRetained: app.RetainedRemoveRefused, wantExit: 0, wantEvidence: true,
 		},
 		{
 			name: "the directory went but git still lists it: incomplete, row active",
-			hook: func(f *retireFixture, a *retireAttempt) func() (app.CommandResult, bool, error) {
-				return func() (app.CommandResult, bool, error) {
+			hook: func(f *retireFixture, a *retireAttempt) func(app.Command) (app.CommandResult, bool, error) {
+				return func(app.Command) (app.CommandResult, bool, error) {
 					w, _ := f.git.attemptWorktree(a.Listed)
 					w.Present = false
 					f.git.addAttemptWorktree(a.Listed, w)
@@ -593,8 +598,8 @@ func TestRemoveRunWorktrees(t *testing.T) {
 		},
 		{
 			name: "git dropped its entry but the directory stays: released, left on disk",
-			hook: func(f *retireFixture, a *retireAttempt) func() (app.CommandResult, bool, error) {
-				return func() (app.CommandResult, bool, error) {
+			hook: func(f *retireFixture, a *retireAttempt) func(app.Command) (app.CommandResult, bool, error) {
+				return func(app.Command) (app.CommandResult, bool, error) {
 					w, _ := f.git.attemptWorktree(a.Listed)
 					w.Unlisted = true
 					f.git.addAttemptWorktree(a.Listed, w)
@@ -606,8 +611,8 @@ func TestRemoveRunWorktrees(t *testing.T) {
 		},
 		{
 			name: "the spawn's exit status is lost: reconciling for the next pass",
-			hook: func(*retireFixture, *retireAttempt) func() (app.CommandResult, bool, error) {
-				return func() (app.CommandResult, bool, error) {
+			hook: func(*retireFixture, *retireAttempt) func(app.Command) (app.CommandResult, bool, error) {
+				return func(app.Command) (app.CommandResult, bool, error) {
 					return app.CommandResult{}, true, errors.New("fork/exec: resource temporarily unavailable")
 				}
 			},
@@ -615,8 +620,8 @@ func TestRemoveRunWorktrees(t *testing.T) {
 		},
 		{
 			name: "the checkout cannot be observed after the act: reconciling for the next pass",
-			hook: func(f *retireFixture, a *retireAttempt) func() (app.CommandResult, bool, error) {
-				return func() (app.CommandResult, bool, error) {
+			hook: func(f *retireFixture, a *retireAttempt) func(app.Command) (app.CommandResult, bool, error) {
+				return func(app.Command) (app.CommandResult, bool, error) {
 					f.failPath = a.Recorded
 					return app.CommandResult{}, false, nil
 				}
@@ -673,7 +678,7 @@ func TestRemoveRunWorktrees(t *testing.T) {
 		f := newRetireFixture(t)
 		a := f.addAttempt(1, fakeAttemptWorktree{}, nil)
 		once := true
-		f.onRemoval(func() (app.CommandResult, bool, error) {
+		f.onRemoval(func(app.Command) (app.CommandResult, bool, error) {
 			if !once {
 				return app.CommandResult{}, false, nil
 			}

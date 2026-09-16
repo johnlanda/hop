@@ -103,3 +103,13 @@ func RemoveRunWorktreesForTest(ctx context.Context, c *Controller, handle RunHan
 	}
 	return out, err
 }
+
+// RecoverRetirementForTest exposes the pass's recovery step to app_test,
+// under the handle's lease, returning its blocking detail.
+func RecoverRetirementForTest(ctx context.Context, c *Controller, handle RunHandle, hopPath string, inspect PathInspector) (string, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; test bridge.
+	frozen, err := c.Read.LoadFrozenRun(ctx, handle.runID)
+	if err != nil {
+		return "", err
+	}
+	return c.recoverRetirementOperations(ctx, handle, &frozen, &retirementPassOptions{HOPPath: hopPath, InspectPath: inspect})
+}

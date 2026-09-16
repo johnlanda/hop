@@ -90,30 +90,16 @@ type retirementPassOptions struct {
 	InspectPath PathInspector
 }
 
-// detectForRetirement is the pass's detection step: unresolved checks from
-// earlier passes are recovered first — any blocking one ends detection for
-// this pass — then detectRetirementMerge runs.
+// detectForRetirement is the pass's detection step: unresolved retirement
+// operations from earlier passes are recovered first — any blocking one
+// ends detection for this pass — then detectRetirementMerge runs.
 func (c *Controller) detectForRetirement(ctx context.Context, handle RunHandle, frozen *FrozenRun, opts *retirementPassOptions) (retirementDetection, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per pass.
-	var unresolved []Operation
-	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
-		ops, err := uow.Operations().ByKind(ctx, handle.runID, OpRetirementCheck)
-		for i := range ops {
-			if ops[i].State == OperationPending || ops[i].State == OperationReconciling {
-				unresolved = append(unresolved, ops[i])
-			}
-		}
-		return err
-	}); err != nil {
-		return retirementDetection{}, fmt.Errorf("app: read unresolved retirement checks: %w", err)
+	blocking, err := c.recoverRetirementOperations(ctx, handle, frozen, opts)
+	if err != nil {
+		return retirementDetection{}, err
 	}
-	for i := range unresolved {
-		blocking, err := c.recoverRetirementCheck(ctx, handle, &unresolved[i])
-		if err != nil {
-			return retirementDetection{}, err
-		}
-		if blocking != "" {
-			return retirementDetection{State: detectionBlocked, Detail: blocking}, nil
-		}
+	if blocking != "" {
+		return retirementDetection{State: detectionBlocked, Detail: blocking}, nil
 	}
 	return c.detectRetirementMerge(ctx, handle, frozen, opts)
 }
@@ -331,7 +317,8 @@ func (c *Controller) settleRetirementOperation(ctx context.Context, handle RunHa
 }
 
 // recoverRetirementCheck applies the retirement.check decision-table row
-// to an unresolved check left by an earlier pass. The pass holds a newer
+// to an unresolved check left by an earlier pass
+// (recoverRetirementOperations). The pass holds a newer
 // lease generation than the operation, and ClaimCheckExec refuses any
 // operation of another generation, so a missing claim is decisive: the
 // check never ran and never will. A present claim's group is retired
