@@ -116,6 +116,21 @@ func TestRealProcessRunEndToEnd(t *testing.T) {
 		}
 	}
 
+	// loop.go re-reads the run status once a launch settles, before
+	// driving checks in that same tick, so "running" is guaranteed to
+	// print even when a trivial check (like this fixture's) is claimed
+	// and finishes before the loop's next poll — the order below is that
+	// guarantee, not incidental.
+	settledAt := strings.Index(stdout, "launch settled")
+	runningAt := strings.Index(stdout, "run "+label+" running")
+	completedAt := strings.Index(stdout, "run "+label+" completed")
+	if settledAt == -1 || runningAt == -1 || completedAt == -1 {
+		t.Fatalf("controller stdout missing an expected transition line; got:\n%s", stdout)
+	}
+	if !(settledAt < runningAt && runningAt < completedAt) {
+		t.Errorf("want \"launch settled\" < \"run %s running\" < \"run %s completed\" in controller stdout; got:\n%s", label, label, stdout)
+	}
+
 	// The launched pane's foreground group, observed independently through
 	// pane.process_info (not through the worker's own self-report),
 	// contains the settled claim's pid, and THAT member carries the

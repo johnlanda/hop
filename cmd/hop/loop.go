@@ -204,6 +204,21 @@ func runControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, handle 
 		}
 		return nil
 	}
+	// printRunState prints the run's transition line exactly when state
+	// differs from the last one printed, updating lastState — the single
+	// gate both the ordinary per-tick poll below and the post-settlement
+	// re-read share, so a state observed either way is never printed
+	// twice and never silently skipped.
+	printRunState := func(state string) error {
+		if state == lastState {
+			return nil
+		}
+		if _, werr := fmt.Fprintf(stdout, "run %s %s\n", label, state); werr != nil {
+			return werr
+		}
+		lastState = state
+		return nil
+	}
 	for {
 		select {
 		case err := <-heartbeatFailed:
@@ -221,11 +236,8 @@ func runControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, handle 
 		if detail == nil {
 			return loopResult{}, errors.Join(fmt.Errorf("run %s has no status detail", runID), drainChecks())
 		}
-		if detail.State != lastState {
-			if _, werr := fmt.Fprintf(stdout, "run %s %s\n", label, detail.State); werr != nil {
-				return loopResult{}, errors.Join(werr, drainChecks())
-			}
-			lastState = detail.State
+		if err := printRunState(detail.State); err != nil {
+			return loopResult{}, errors.Join(err, drainChecks())
 		}
 		if isTerminalRunState(detail.State) {
 			if drainErr := drainChecks(); drainErr != nil {
@@ -266,6 +278,29 @@ func runControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, handle 
 						return loopResult{}, errors.Join(werr, drainChecks())
 					}
 					lastProgress = progress
+				}
+				// A settled claim (fresh this round, or already settled by
+				// a concurrent early-acceptance submission with a lifecycle
+				// transition just applied) can move the run to running
+				// without the ordinary top-of-tick poll ever observing it:
+				// a trivial check claimed and finished later in this same
+				// tick would otherwise advance the run straight to
+				// completing/completed before the next poll, and "running"
+				// would never print. Re-reading once here, before checks
+				// are driven, guarantees a user watching the loop always
+				// sees the run reach running.
+				if progress == app.LaunchSettled || progress == app.LaunchAlreadySettled {
+					settled, statusErr := ctrl.Status(ctx, app.StatusRequest{RunID: runID})
+					if statusErr != nil {
+						return loopResult{}, errors.Join(fmt.Errorf("load run status after launch settlement: %w", statusErr), drainChecks())
+					}
+					settledDetail := settled.Detail
+					if settledDetail == nil {
+						return loopResult{}, errors.Join(fmt.Errorf("run %s has no status detail", runID), drainChecks())
+					}
+					if err := printRunState(settledDetail.State); err != nil {
+						return loopResult{}, errors.Join(err, drainChecks())
+					}
 				}
 			}
 			if spawnEnv == nil {

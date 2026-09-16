@@ -139,6 +139,67 @@ func TestRunControllerLoop(t *testing.T) {
 		}
 	})
 
+	t.Run("the run-running line always prints even when a trivial check finishes before the next poll", func(t *testing.T) {
+		// Reproduces the observed flake (TestRealProcessRunEndToEnd): a
+		// tick corroborates the launch settled — moving the run to
+		// running — and then, in that SAME tick, drives a check the
+		// fixture worker already submitted for, which is claimed and
+		// finishes before the loop's next poll. Without a mid-tick
+		// re-read, the ordinary poll never observes "running" at all: it
+		// jumps straight from "launching" to "completed". checkClaimed
+		// gates the status fake exactly on the check being claimed (not
+		// on any real elapsed time), and the check barrier makes the
+		// claim happen-before the next tick's poll deterministically —
+		// so this fails against the unfixed loop on every run, not just
+		// under an unlucky interleaving.
+		var (
+			settled      atomic.Bool
+			checkClaimed atomic.Bool
+		)
+		ctrl := &fakeController{}
+		ctrl.corroborate = func() (app.LaunchProgress, error) {
+			settled.Store(true)
+			return app.LaunchSettled, nil
+		}
+		td := newTestDeps(ctrl, map[string]string{"PATH": "/bin"}, t.TempDir())
+		td.useCheckBarriers()
+		ctrl.claimAndRunCheck = func(ctx context.Context, _ string, _ []string) (app.CheckReport, error) {
+			checkClaimed.Store(true)
+			td.checkStarted <- struct{}{}
+			return app.CheckReport{Ran: true, OperationID: "op-1", Passed: true}, nil
+		}
+		ctrl.status = func(app.StatusRequest) (app.StatusResult, error) {
+			switch {
+			case !settled.Load():
+				return detailStep("launching", "launching", false), nil
+			case !checkClaimed.Load():
+				return detailStep("running", "running", false), nil
+			default:
+				return detailStep("completed", "completed", false), nil
+			}
+		}
+		var stdout bytes.Buffer
+
+		result, err := runControllerLoop(context.Background(), td.deps, ctrl, app.RunHandle{}, testRunID, "r1", "/opt/hop/bin/hop", &stdout)
+		if err != nil {
+			t.Fatalf("runControllerLoop: %v", err)
+		}
+
+		if result.Detached || result.FinalState != "completed" {
+			t.Errorf("result = %+v", result)
+		}
+		out := stdout.String()
+		settledIdx := strings.Index(out, "launch settled\n")
+		runningIdx := strings.Index(out, "run r1 running\n")
+		completedIdx := strings.Index(out, "run r1 completed\n")
+		if settledIdx == -1 || runningIdx == -1 || completedIdx == -1 {
+			t.Fatalf("output missing an expected line; got:\n%s", out)
+		}
+		if !(settledIdx < runningIdx && runningIdx < completedIdx) {
+			t.Errorf("want \"launch settled\" < \"run r1 running\" < \"run r1 completed\"; got:\n%s", out)
+		}
+	})
+
 	t.Run("a stop request interrupts a running check before the stop is driven", func(t *testing.T) {
 		ctrl := &fakeController{}
 		td := newTestDeps(ctrl, nil, t.TempDir())
