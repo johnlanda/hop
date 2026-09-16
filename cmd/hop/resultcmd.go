@@ -18,11 +18,12 @@ const defaultSubmitTimeout = 30 * time.Second
 // exact text, regardless of the store's own Detail. The assignment
 // template's retry instruction (internal/app/usecase_execboundary.go's
 // renderInitialPrompt) tells the worker to retry when the first output
-// line begins with "transient", so this literal constant IS that parsed
-// contract — drift here would silently break it. The store's Detail is
-// diagnostic evidence, printed to stderr instead, never part of the
-// protocol line.
-const transientRetrySignal = "transient: attempt not yet running; retry"
+// line begins with "transient", so this constant IS that parsed
+// contract — quoted from the one grammar constant set (internal/app's
+// grammar.go) so the CLI cannot drift from it silently. The store's
+// Detail is diagnostic evidence, printed to stderr instead, never part of
+// the protocol line.
+const transientRetrySignal = app.GrammarTransientNotRunningLine
 
 // runResult dispatches the `hop result` subcommands; submit is the only
 // one.
