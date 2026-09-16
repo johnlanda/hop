@@ -109,7 +109,12 @@ func (s *Store) ListRuns(ctx context.Context, repositoryRoot string) ([]app.RunS
 	return statuses, nil
 }
 
-// LoadRunStatus assembles the full detail block for one run.
+// LoadRunStatus assembles the full detail block for one run. A solo run
+// keeps the exact Phase 2 single-task shape; a feature run (a non-NULL
+// frozen workflow) has no single task or attempt to name — its TaskID/
+// AttemptID stay zero, SessionID is the current manager session, and the
+// Phase 3 extensions (task table, latest integration, guard shortfalls,
+// mailboxes, pending questions) are populated instead.
 func (s *Store) LoadRunStatus(ctx context.Context, runID identity.RunID) (app.RunDetail, error) {
 	var detail app.RunDetail
 	err := s.inReadTx(ctx, func(tx *sql.Tx) error {
@@ -118,14 +123,6 @@ func (s *Store) LoadRunStatus(ctx context.Context, runID identity.RunID) (app.Ru
 			return err
 		}
 		reconciling, err := runReconciling(ctx, tx, runID)
-		if err != nil {
-			return err
-		}
-		task, _, err := taskByRun(ctx, tx, runID)
-		if err != nil {
-			return err
-		}
-		attempt, _, err := latestAttempt(ctx, tx, task.ID)
 		if err != nil {
 			return err
 		}
@@ -142,34 +139,54 @@ func (s *Store) LoadRunStatus(ctx context.Context, runID identity.RunID) (app.Ru
 				Reconciling:   reconciling,
 				UpdatedAt:     runV.UpdatedAt,
 			},
-			TaskID:       task.ID,
-			AttemptID:    attempt.ID,
-			TaskState:    task.State,
-			AttemptState: attempt.State,
-			StateRoot:    snapshot.StateRoot,
+			StateRoot: snapshot.StateRoot,
 		}
-		worktree, _, err := getWorktree(ctx, tx, "run_id", runID.String())
-		switch {
-		case err == nil:
-			detail.WorktreePath = worktree.Path
-		case errors.Is(err, app.ErrNotFound):
-		default:
-			return err
-		}
-		session, _, ok, err := currentSession(ctx, tx, attempt.ID)
-		if err != nil {
-			return err
-		}
-		if ok {
-			detail.SessionID = session.ID
-			binding, hasBinding, bindingErr := currentBinding(ctx, tx, session.ID)
-			if bindingErr != nil {
-				return bindingErr
+		if snapshot.Workflow.Feature() {
+			// The current manager session is the run-level session identity
+			// a feature run has; its binding and claim surface exactly like
+			// the solo worker's.
+			manager, _, ok, managerErr := managerSession(ctx, tx, runID)
+			if managerErr != nil {
+				return managerErr
 			}
-			if hasBinding {
-				detail.Binding = &binding
-				if detail.Claim, bindingErr = getLaunchClaim(ctx, tx, binding.IncarnationID); bindingErr != nil {
-					return bindingErr
+			if ok {
+				detail.SessionID = manager.ID
+				if bindErr := attachSessionBinding(ctx, tx, &detail, manager.ID); bindErr != nil {
+					return bindErr
+				}
+			}
+			if featureErr := featureRunDetail(ctx, tx, &detail, &snapshot, s.now()); featureErr != nil {
+				return featureErr
+			}
+		} else {
+			task, _, taskErr := taskByRun(ctx, tx, runID)
+			if taskErr != nil {
+				return taskErr
+			}
+			attempt, _, attemptErr := latestAttempt(ctx, tx, task.ID)
+			if attemptErr != nil {
+				return attemptErr
+			}
+			detail.TaskID = task.ID
+			detail.AttemptID = attempt.ID
+			detail.TaskState = task.State
+			detail.AttemptState = attempt.State
+			worktree, _, wtErr := getWorktree(ctx, tx, "run_id", runID.String())
+			switch {
+			case wtErr == nil:
+				detail.WorktreePath = worktree.Path
+			case errors.Is(wtErr, app.ErrNotFound):
+			default:
+				return wtErr
+			}
+			session, _, ok, sessionErr := currentSession(ctx, tx, attempt.ID)
+			if sessionErr != nil {
+				return sessionErr
+			}
+			if ok {
+				detail.SessionID = session.ID
+				if bindErr := attachSessionBinding(ctx, tx, &detail, session.ID); bindErr != nil {
+					return bindErr
 				}
 			}
 		}
@@ -191,6 +208,23 @@ func (s *Store) LoadRunStatus(ctx context.Context, runID identity.RunID) (app.Ru
 		return app.RunDetail{}, err
 	}
 	return detail, nil
+}
+
+// attachSessionBinding surfaces the session's current binding and its
+// incarnation's claim on the detail block, when a binding exists.
+func attachSessionBinding(ctx context.Context, q querier, detail *app.RunDetail, sessionID identity.SessionID) error {
+	binding, hasBinding, err := currentBinding(ctx, q, sessionID)
+	if err != nil {
+		return err
+	}
+	if !hasBinding {
+		return nil
+	}
+	detail.Binding = &binding
+	if detail.Claim, err = getLaunchClaim(ctx, q, binding.IncarnationID); err != nil {
+		return err
+	}
+	return nil
 }
 
 // lastCheckSummary summarizes the run's newest check execution, whatever
@@ -500,10 +534,15 @@ func launchIdentity(ctx context.Context, q querier, runID identity.RunID, sessio
 	}
 }
 
-// LoadCheckExecutionContext loads what the check exec boundary needs,
-// addressed by the check execution's operation ID. The candidate checkout
-// path is the design's fixed layout under the frozen state root:
-// runs/<run>/checks/<operation>/tree.
+// LoadCheckExecutionContext loads what the generalized check exec boundary
+// needs, addressed by the execution's operation ID, dispatching the frozen
+// argv by operation kind (the agreed slice-3/slice-4 contract — no
+// signature change): a check.run returns the snapshot's frozen CheckArgv
+// with the design's fixed checkout layout under the state root
+// (runs/<run>/checks/<operation>/tree); an integration.merge returns the
+// intent's own frozen merge_argv with the intent's scratch tree path.
+// A malformed merge intent fails closed rather than hand the boundary an
+// argv nothing froze.
 func (s *Store) LoadCheckExecutionContext(ctx context.Context, opID identity.OperationID) (app.CheckExecutionContext, error) {
 	var executionContext app.CheckExecutionContext
 	err := s.inReadTx(ctx, func(tx *sql.Tx) error {
@@ -511,23 +550,63 @@ func (s *Store) LoadCheckExecutionContext(ctx context.Context, opID identity.Ope
 		if err != nil {
 			return err
 		}
-		if op.Kind != app.OpCheckRun {
-			return fmt.Errorf("sqlite: operation %s is %q, not a check execution", opID, op.Kind)
-		}
 		snapshot, err := loadSnapshot(ctx, tx, op.RunID)
 		if err != nil {
 			return err
 		}
 		executionContext = app.CheckExecutionContext{
-			EnvPolicy:    snapshot.EnvPolicy,
-			StateRoot:    snapshot.StateRoot,
-			CheckoutPath: filepath.Join(snapshot.StateRoot, "runs", op.RunID.String(), "checks", opID.String(), "tree"),
-			CheckArgv:    snapshot.CheckArgv,
+			EnvPolicy: snapshot.EnvPolicy,
+			StateRoot: snapshot.StateRoot,
 		}
-		return nil
+		switch op.Kind {
+		case app.OpCheckRun:
+			executionContext.CheckoutPath = filepath.Join(snapshot.StateRoot, "runs", op.RunID.String(), "checks", opID.String(), "tree")
+			executionContext.CheckArgv = snapshot.CheckArgv
+			return nil
+		case app.OpIntegrationMerge:
+			argv, treePath, intentErr := mergeIntentExecution(op.Intent)
+			if intentErr != nil {
+				return fmt.Errorf("sqlite: operation %s: %w", opID, intentErr)
+			}
+			executionContext.CheckoutPath = treePath
+			executionContext.CheckArgv = argv
+			return nil
+		default:
+			return fmt.Errorf("sqlite: operation %s is %q, not a check or merge execution", opID, op.Kind)
+		}
 	})
 	if err != nil {
 		return app.CheckExecutionContext{}, err
 	}
 	return executionContext, nil
+}
+
+// mergeIntentExecution reads the frozen merge argv and scratch tree path
+// from a persisted integration.merge intent payload — the documented
+// integrationMergeIntent JSON keys "merge_argv" and "tree_path"
+// (internal/app/usecase_integration.go). The store persists intents
+// without interpreting them, so this reads the generic decoding, failing
+// closed on any missing or mistyped member.
+func mergeIntentExecution(intent any) (argv []string, treePath string, err error) {
+	fields, ok := intent.(map[string]any)
+	if !ok {
+		return nil, "", errors.New("merge intent payload is not a JSON object")
+	}
+	rawArgv, ok := fields["merge_argv"].([]any)
+	if !ok || len(rawArgv) == 0 {
+		return nil, "", errors.New("merge intent carries no frozen merge argv")
+	}
+	argv = make([]string, len(rawArgv))
+	for i, element := range rawArgv {
+		text, isString := element.(string)
+		if !isString {
+			return nil, "", errors.New("merge intent argv carries a non-string element")
+		}
+		argv[i] = text
+	}
+	treePath, ok = fields["tree_path"].(string)
+	if !ok || treePath == "" {
+		return nil, "", errors.New("merge intent carries no scratch tree path")
+	}
+	return argv, treePath, nil
 }

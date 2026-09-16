@@ -196,6 +196,45 @@ func insertMessage(ctx context.Context, q querier, m *run.Message) error {
 	return nil
 }
 
+// messageDeliveries lists one message's delivery history, oldest first,
+// re-serves included.
+func messageDeliveries(ctx context.Context, q querier, id identity.MessageID) ([]run.Delivery, error) {
+	rows, err := q.QueryContext(ctx,
+		`SELECT session_id, incarnation_id, delivered_at FROM message_deliveries WHERE message_id = ? ORDER BY delivered_at, rowid`,
+		id.String(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: list deliveries of message %s: %w", id, err)
+	}
+	defer rows.Close() //nolint:errcheck // the deferred close of a fully-iterated read cursor has no failure the rows.Err check below misses.
+	var deliveries []run.Delivery
+	for rows.Next() {
+		var sessionID, incarnationID, deliveredAt string
+		if err := rows.Scan(&sessionID, &incarnationID, &deliveredAt); err != nil {
+			return nil, fmt.Errorf("sqlite: scan delivery row: %w", err)
+		}
+		parsedSessionID, parseErr := identity.ParseSessionID(sessionID)
+		if parseErr != nil {
+			return nil, fmt.Errorf("sqlite: delivery session id: %w", parseErr)
+		}
+		parsedIncarnationID, parseErr2 := identity.ParseIncarnationID(incarnationID)
+		if parseErr2 != nil {
+			return nil, fmt.Errorf("sqlite: delivery incarnation id: %w", parseErr2)
+		}
+		at, timeErr := parseTime(deliveredAt)
+		if timeErr != nil {
+			return nil, timeErr
+		}
+		deliveries = append(deliveries, run.Delivery{
+			MessageID: id, SessionID: parsedSessionID, IncarnationID: parsedIncarnationID, At: at,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("sqlite: iterate delivery rows: %w", err)
+	}
+	return deliveries, nil
+}
+
 // messageAck loads one message's acknowledgement, or nil when it has none.
 // SessionID and IncarnationID are empty for a human ack.
 func messageAck(ctx context.Context, q querier, id identity.MessageID) (*run.Ack, error) {
