@@ -28,9 +28,15 @@ seeding library.
 
 | File | Entities / functions | Responsibility |
 | --- | --- | --- |
-| [hopfixtures.go](hopfixtures.go) | `Store`, `Base`, `Initialize`, `LaunchBase`, `RunBase`, `SeedLaunchClaim`, `SeedManager`, `SeedImplementTask`, `SeedReviewTask`, `SeedChildSession`, `SeedInterruptedAttempt`, `RunAttempt` | String-typed seeding API: `Initialize` mirrors `InitializeRun`'s own initial reserved state; `LaunchBase`/`RunBase` drive a run's bootstrap task/attempt/session to launching, then fully running (binding, settled launch claim, running lifecycle transitions); `SeedManager` drives a run running with an active, bound manager session (call after `cmd/hop`'s own raw-SQL workflow freeze — see below); `SeedImplementTask`/`SeedReviewTask`/`SeedChildSession`/`RunAttempt` add worker/reviewer sessions bound to tasks and attempts; `SeedInterruptedAttempt` records a terminal prior attempt (the shape `hop task retry` accepts behind a needs-rework task); `SeedLaunchClaim` writes a launch claim under a caller-chosen pid without any lifecycle transition, so a real `hop launch` exec against the same identity observes a claim under a DIFFERENT pid than its own process — the real-binary proof of hop launch's claim-conflict refusal, reached without ever letting a launcher exec |
+| [hopfixtures.go](hopfixtures.go) | `Store`, `Base`, `Initialize`, `LaunchBase`, `ErrBaseAlreadyLaunched`, `RunBase`, `SeedLaunchClaim`, `SeedManager`, `SeedImplementTask`, `SeedReviewTask`, `SeedChildSession`, `SeedInterruptedAttempt`, `RunAttempt` | String-typed seeding API: `Initialize` mirrors `InitializeRun`'s own initial reserved state; `LaunchBase`/`RunBase` drive a run's bootstrap task/attempt/session to launching, then fully running (binding, settled launch claim, running lifecycle transitions); `SeedManager` drives a run running with an active, bound manager session (call after `cmd/hop`'s own raw-SQL workflow freeze — see below); `SeedImplementTask`/`SeedReviewTask`/`SeedChildSession`/`RunAttempt` add worker/reviewer sessions bound to tasks and attempts; `SeedInterruptedAttempt` records a terminal prior attempt (the shape `hop task retry` accepts behind a needs-rework task); `SeedLaunchClaim` writes a launch claim under a caller-chosen pid without any lifecycle transition, so a real `hop launch` exec against the same identity observes a claim under a DIFFERENT pid than its own process — the real-binary proof of hop launch's claim-conflict refusal, reached without ever letting a launcher exec |
 
 ## Invariants
+
+- `LaunchBase` is single-use per `Base`, not idempotent: once the run has
+  left `created`, a second call — or `RunBase` after `LaunchBase`, since
+  `RunBase` launches the Base itself — is refused with
+  `ErrBaseAlreadyLaunched` before anything is written (pinned against the
+  real store by `cmd/hop`'s `TestHopfixturesLaunchBaseIsSingleUse`).
 
 - Every exported parameter and return value is a plain string or a type
   declared in `internal/app` (`app.Lease`, the `Store` interface). No

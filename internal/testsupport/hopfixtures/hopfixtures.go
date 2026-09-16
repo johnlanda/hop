@@ -37,6 +37,7 @@ package hopfixtures
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"time"
@@ -168,6 +169,10 @@ func withUOW(ctx context.Context, store Store, lease app.Lease, fn func(app.Unit
 	return nil
 }
 
+// ErrBaseAlreadyLaunched is LaunchBase's refusal of a Base whose run has
+// already left Initialize's created state.
+var ErrBaseAlreadyLaunched = errors.New("hopfixtures: the base run has already been launched; LaunchBase is single-use per Base")
+
 // LaunchBase drives a Base's run/task/attempt/session from Initialize's
 // initial reserved states through to "launching" (run launching, task
 // active, attempt launching, session launching) and commits a pending
@@ -177,8 +182,20 @@ func withUOW(ctx context.Context, store Store, lease app.Lease, fn func(app.Unit
 // evidence ClaimLaunch itself requires before any binding row exists
 // (internal/adapters/sqlite's own documented contract: the controller
 // commits this intent before dispatching the pane request).
+//
+// LaunchBase is single-use per Base, NOT idempotent: a second call — or
+// RunBase after LaunchBase, since RunBase launches the Base itself — is
+// refused with ErrBaseAlreadyLaunched before anything is written, because
+// the run has already left created.
 func LaunchBase(ctx context.Context, store Store, lease app.Lease, f Base, now time.Time) error { //nolint:gocritic // hugeParam: Base is a small fixture-identity value read once per call, never a hot loop; mirrors this codebase's own convention for domain-shaped DTOs passed by value.
 	return withUOW(ctx, store, lease, func(uow app.UnitOfWork) error {
+		current, _, getErr := uow.Runs().Get(ctx, identity.RunID(f.RunID))
+		if getErr != nil {
+			return fmt.Errorf("hopfixtures: get run: %w", getErr)
+		}
+		if current.State != run.RunCreated {
+			return ErrBaseAlreadyLaunched
+		}
 		if err := launchRun(ctx, uow, f.RunID, now); err != nil {
 			return err
 		}
@@ -231,7 +248,8 @@ const (
 // review, hop result submit) needs from its caller's session. It calls
 // LaunchBase itself first, so callers only ever need Initialize then
 // RunBase to reach a fully running solo (or feature-mode bootstrap)
-// session.
+// session — and must not call LaunchBase themselves first
+// (ErrBaseAlreadyLaunched).
 func RunBase(ctx context.Context, store Store, lease app.Lease, f Base, now time.Time) error { //nolint:gocritic // hugeParam: Base is a small fixture-identity value read once per call, never a hot loop; mirrors this codebase's own convention for domain-shaped DTOs passed by value.
 	if err := LaunchBase(ctx, store, lease, f, now); err != nil {
 		return err

@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -387,4 +389,55 @@ func (f *soloFixture) env(extra map[string]string) map[string]string {
 		vars[k] = v
 	}
 	return vars
+}
+
+// fixtureRowRevisions summarizes, through a read-only raw query, every
+// row a LaunchBase call could write for runID: the run, task, attempt and
+// session revisions and the run's operation count.
+func fixtureRowRevisions(t *testing.T, stateRoot, runID string) string {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(stateRoot, "hop.db")+"?mode=ro&_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open raw db for a read: %v", err)
+	}
+	defer func() {
+		if closeErr := db.Close(); closeErr != nil {
+			t.Errorf("close raw db after a read: %v", closeErr)
+		}
+	}()
+	var summary string
+	err = db.QueryRowContext(context.Background(), `
+		SELECT (SELECT state || ':' || revision FROM runs WHERE id = ?1)
+		    || ' ' || (SELECT group_concat(state || ':' || revision) FROM tasks WHERE run_id = ?1)
+		    || ' ' || (SELECT group_concat(a.state || ':' || a.revision) FROM attempts a JOIN tasks t ON t.id = a.task_id WHERE t.run_id = ?1)
+		    || ' ' || (SELECT group_concat(state || ':' || revision) FROM sessions WHERE run_id = ?1)
+		    || ' ops=' || (SELECT COUNT(*) FROM operations WHERE run_id = ?1)`, runID).Scan(&summary)
+	if err != nil {
+		t.Fatalf("read fixture rows: %v", err)
+	}
+	return summary
+}
+
+// TestHopfixturesLaunchBaseIsSingleUse pins hopfixtures.LaunchBase's
+// documented contract against the real store: it is single-use per Base,
+// so a second call — and RunBase after LaunchBase — is refused with
+// ErrBaseAlreadyLaunched and writes nothing.
+func TestHopfixturesLaunchBaseIsSingleUse(t *testing.T) {
+	f := newSoloReserved(t, 8700)
+	f.launch(t)
+	before := fixtureRowRevisions(t, f.StateRoot, f.RunID)
+	if !strings.HasPrefix(before, "launching:") {
+		t.Fatalf("fixture rows after one launch = %q, want the run launching", before)
+	}
+
+	ctx := context.Background()
+	if err := hopfixtures.LaunchBase(ctx, f.store, f.lease, f.Base, time.Now().UTC()); !errors.Is(err, hopfixtures.ErrBaseAlreadyLaunched) {
+		t.Errorf("second LaunchBase = %v, want ErrBaseAlreadyLaunched", err)
+	}
+	if err := hopfixtures.RunBase(ctx, f.store, f.lease, f.Base, time.Now().UTC()); !errors.Is(err, hopfixtures.ErrBaseAlreadyLaunched) {
+		t.Errorf("RunBase after LaunchBase = %v, want ErrBaseAlreadyLaunched", err)
+	}
+	if after := fixtureRowRevisions(t, f.StateRoot, f.RunID); after != before {
+		t.Errorf("fixture rows changed across the refused calls: %q -> %q", before, after)
+	}
 }
