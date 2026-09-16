@@ -14,10 +14,13 @@ import (
 const ebSessionID = "77777777-7777-4777-8777-777777777777"
 
 // mustSessionID / mustAttemptID parse fixed test UUIDs, failing the test
-// on the impossible parse error instead of blanking it.
-func mustSessionID(t *testing.T, raw string) identity.SessionID {
+// on the impossible parse error instead of blanking it. Every session
+// vector uses the one fixed ebSessionID, so mustSessionID takes no
+// argument; mustAttemptID keeps its parameter because vectors parse both
+// ebAttemptID and a deliberately foreign UUID.
+func mustSessionID(t *testing.T) identity.SessionID {
 	t.Helper()
-	id, err := identity.ParseSessionID(raw)
+	id, err := identity.ParseSessionID(ebSessionID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -321,7 +324,7 @@ func TestPrepareSessionLaunchExec(t *testing.T) {
 	t.Run("solo shim: a present but disagreeing HOP_SESSION_ID refuses", func(t *testing.T) {
 		slc := ebSessionContext(t, run.RoleWorker)
 		read := &ebSessionReadStub{session: slc}
-		sessionID := mustSessionID(t, ebSessionID)
+		sessionID := mustSessionID(t)
 		attemptID := mustAttemptID(t, ebAttemptID)
 		read.detail = RunDetail{AttemptID: attemptID, SessionID: sessionID}
 		subs := &ebSubmissionStub{}
@@ -387,7 +390,7 @@ func TestPrepareSessionLaunchExec(t *testing.T) {
 		slc.AttemptID = other
 		slc.Attempt.ID = other
 		read := &ebSessionReadStub{session: slc}
-		sessionID := mustSessionID(t, ebSessionID)
+		sessionID := mustSessionID(t)
 		attemptID := mustAttemptID(t, ebAttemptID)
 		read.detail = RunDetail{AttemptID: attemptID, SessionID: sessionID}
 		subs := &ebSubmissionStub{}
@@ -799,7 +802,7 @@ func TestSessionLaunchEnvironmentPresentButEmpty(t *testing.T) {
 
 	t.Run("shim: an explicitly empty HOP_SESSION_ID is a disagreement", func(t *testing.T) {
 		read := &ebSessionReadStub{session: ebSessionContext(t, run.RoleWorker)}
-		read.detail = RunDetail{AttemptID: mustAttemptID(t, ebAttemptID), SessionID: mustSessionID(t, ebSessionID)}
+		read.detail = RunDetail{AttemptID: mustAttemptID(t, ebAttemptID), SessionID: mustSessionID(t)}
 		subs := &ebSubmissionStub{}
 		req := ebSessionRequest()
 		req.SessionID = ""
@@ -817,7 +820,7 @@ func TestSessionLaunchEnvironmentPresentButEmpty(t *testing.T) {
 
 	t.Run("shim: an explicitly empty HOP_ROLE is a disagreement", func(t *testing.T) {
 		read := &ebSessionReadStub{session: ebSessionContext(t, run.RoleWorker)}
-		read.detail = RunDetail{AttemptID: mustAttemptID(t, ebAttemptID), SessionID: mustSessionID(t, ebSessionID)}
+		read.detail = RunDetail{AttemptID: mustAttemptID(t, ebAttemptID), SessionID: mustSessionID(t)}
 		subs := &ebSubmissionStub{}
 		req := ebSessionRequest()
 		req.SessionID = ""
