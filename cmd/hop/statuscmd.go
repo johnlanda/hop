@@ -16,8 +16,12 @@ const defaultStatusTimeout = 10 * time.Second
 
 // runStatus implements `hop status`: without -run one line per run of the
 // repository (non-terminal runs by default; -all includes completed,
-// failed and stopped), with -run the full detail block. State is data, not
-// an exit code: rendering success exits 0.
+// failed and stopped), with -run the full detail block. Before rendering,
+// both forms run the repository's worktree-retirement pass under its own
+// bound — a first SIGINT/SIGTERM cancels the pass, a second exits — and its
+// lines follow the rendered output. The pass never dials Herdr and never
+// changes the exit code. State is data, not an exit code: rendering
+// success exits 0.
 func runStatus(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 	diagnostics := &recordingWriter{w: stderr}
 	flags := flag.NewFlagSet("hop status", flag.ContinueOnError)
@@ -44,25 +48,61 @@ func runStatus(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 		return exitUsage, werr
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), defaultStatusTimeout)
-	defer cancel()
-	ctrl, closeStore, err := d.openController(ctx, controllerConfig{stateRoot: stateRoot})
+	openCtx, cancelOpen := context.WithTimeout(context.Background(), defaultStatusTimeout)
+	defer cancelOpen()
+	ctrl, closeStore, err := d.openController(openCtx, controllerConfig{stateRoot: stateRoot})
 	if err != nil {
 		_, werr := fmt.Fprintf(stderr, "hop status: %s\n", describeStoreOpenFailure(err, "the resolved state root"))
 		return exitFailure, werr
 	}
 	defer closeStore() //nolint:errcheck // the store closes on process exit either way; commands report command errors, not pool teardown.
 
-	if *runArg == "" {
+	passLines, err := statusRetirementPass(d, ctrl, repoRoot, stdout, stderr)
+	if err != nil {
+		return exitFailure, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultStatusTimeout)
+	defer cancel()
+	code, err := renderStatus(ctx, ctrl, repoRoot, *runArg, *all, stdout, stderr)
+	if err != nil || code != exitOK {
+		return code, err
+	}
+	if err := printLines(stdout, passLines); err != nil {
+		return exitFailure, err
+	}
+	return exitOK, nil
+}
+
+// statusRetirementPass runs hop status's worktree-retirement pass under
+// its own bound: the first SIGINT/SIGTERM cancels it (a running removal is
+// killed and recovered by a later pass), a second exits immediately. A
+// hop binary that cannot be located skips the pass with one line.
+func statusRetirementPass(d *deps, ctrl controllerAPI, repoRoot string, stdout, stderr io.Writer) ([]string, error) {
+	hopPath, err := hopExecutablePath(d)
+	if err != nil {
+		_, werr := fmt.Fprintln(stderr, "hop status: worktree retirement skipped: the hop executable could not be located")
+		return nil, werr
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), retirementPassTimeout)
+	defer cancel()
+	stopSignals := watchDetachSignals(d, cancel)
+	defer stopSignals()
+	return runWorktreeRetirement(ctx, d, ctrl, repoRoot, "", hopPath, stdout, stderr, "hop status")
+}
+
+// renderStatus renders the listing, or one run's detail block.
+func renderStatus(ctx context.Context, ctrl controllerAPI, repoRoot, runArg string, all bool, stdout, stderr io.Writer) (int, error) {
+	if runArg == "" {
 		result, listErr := ctrl.Status(ctx, app.StatusRequest{RepositoryRoot: repoRoot})
 		if listErr != nil {
 			_, werr := fmt.Fprintf(stderr, "hop status: %v\n", listErr)
 			return exitFailure, werr
 		}
-		return renderRunListing(stdout, result.Runs, *all)
+		return renderRunListing(stdout, result.Runs, all)
 	}
 
-	runID, err := resolveRunArg(ctx, ctrl, repoRoot, *runArg)
+	runID, err := resolveRunArg(ctx, ctrl, repoRoot, runArg)
 	if err != nil {
 		_, werr := fmt.Fprintf(stderr, "hop status: %v\n", err)
 		return exitUsage, werr
@@ -118,7 +158,8 @@ func listingMarkers(r *app.RunSummaryView) string {
 	return " (" + strings.Join(markers, ", ") + ")"
 }
 
-// renderRunDetail prints the full detail block: states, worktree, binding,
+// renderRunDetail prints the full detail block: states, the worktree (one
+// line per row for a feature run), binding,
 // claim, pending operations, last submission, artifacts and the last check
 // execution — including the human's options for an unrepeatable unknown
 // outcome.
@@ -135,8 +176,13 @@ func renderRunDetail(w io.Writer, detail *app.RunDetailView) (int, error) {
 	}
 	lines = append(lines,
 		"  task:          "+orUnset(detail.TaskState),
-		"  attempt:       "+orUnset(detail.AttemptState),
-		"  worktree:      "+orUnset(detail.WorktreePath),
+		"  attempt:       "+orUnset(detail.AttemptState))
+	if isFeatureMode(detail.Mode) {
+		lines = append(lines, worktreeDetailLines(detail.Worktrees)...)
+	} else {
+		lines = append(lines, "  worktree:      "+orUnset(detail.WorktreePath))
+	}
+	lines = append(lines,
 		"  binding:       "+orUnset(detail.BindingSummary),
 		"  launch claim:  "+orUnset(detail.ClaimState),
 		"  trust seed:    "+orUnset(detail.SeedEvidence),

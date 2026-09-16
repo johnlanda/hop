@@ -54,7 +54,13 @@ func (u *unitOfWork) WorktreesForRetirement(ctx context.Context, runID identity.
 	if err := u.requireLeasedRun(runID, "run", runID.String()); err != nil {
 		return nil, err
 	}
-	rows, err := u.tx.QueryContext(ctx, selectWorktreeColumns+` WHERE run_id = ? ORDER BY created_at, rowid`, runID.String())
+	return runWorktrees(ctx, u.tx, runID)
+}
+
+// runWorktrees lists every worktree row of the run in insertion order,
+// with its revision, through any querier.
+func runWorktrees(ctx context.Context, q querier, runID identity.RunID) ([]app.RetirementWorktree, error) {
+	rows, err := q.QueryContext(ctx, selectWorktreeColumns+` WHERE run_id = ? ORDER BY created_at, rowid`, runID.String())
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: list worktrees of run %s: %w", runID, err)
 	}

@@ -78,7 +78,8 @@ func watchDetachSignals(d *deps, cancel context.CancelFunc) (stop func()) {
 	return stopNotify
 }
 
-// runRun implements `hop run "<brief>"`: it freezes and starts a run,
+// runRun implements `hop run "<brief>"`: after the repository's
+// worktree-retirement pass, it freezes and starts a run,
 // prints "run <seq-label> <uuid> started", then stays in the foreground
 // controller loop until the run is terminal or a signal detaches. The
 // workflow is `--workflow solo|feature` when given, else the repository's
@@ -153,6 +154,17 @@ func runRun(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 		_, werr := fmt.Fprintf(stderr, "hop run: %v\n", err)
 		return code, werr
 	}
+	// The repository's worktree-retirement pass runs before this
+	// controller starts, so its own lease never waits on a slow removal;
+	// a new run has no identity yet to exclude.
+	passLines, err := runWorktreeRetirement(ctx, d, ctrl, repoRoot, "", hopPath, stdout, stderr, "hop run")
+	if err != nil {
+		return exitFailure, err
+	}
+	if printErr := printLines(stdout, passLines); printErr != nil {
+		return exitFailure, printErr
+	}
+
 	start, finish := ctrl.StartRun, finishControllerLoop
 	if mode == app.WorkflowModeFeature {
 		start, finish = ctrl.StartFeatureRun, finishFeatureControllerLoop

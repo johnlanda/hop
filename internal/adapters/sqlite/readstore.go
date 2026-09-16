@@ -165,6 +165,9 @@ func (s *Store) LoadRunStatus(ctx context.Context, runID identity.RunID) (app.Ru
 			if featureErr := featureRunDetail(ctx, tx, &detail, &snapshot, s.now()); featureErr != nil {
 				return featureErr
 			}
+			if worktreeErr := featureWorktreeDetail(ctx, tx, &detail); worktreeErr != nil {
+				return worktreeErr
+			}
 		} else {
 			task, _, taskErr := taskByRun(ctx, tx, runID)
 			if taskErr != nil {
@@ -215,6 +218,22 @@ func (s *Store) LoadRunStatus(ctx context.Context, runID identity.RunID) (app.Ru
 		return app.RunDetail{}, err
 	}
 	return detail, nil
+}
+
+// featureWorktreeDetail surfaces a feature run's worktree rows, oldest
+// first, and its worktree.retire operations, newest first, for the
+// per-row status lines; a run without rows gets an empty, non-nil list.
+func featureWorktreeDetail(ctx context.Context, q querier, detail *app.RunDetail) error {
+	rows, err := runWorktrees(ctx, q, detail.RunID)
+	if err != nil {
+		return err
+	}
+	detail.Worktrees = make([]run.Worktree, 0, len(rows))
+	for i := range rows {
+		detail.Worktrees = append(detail.Worktrees, rows[i].Worktree)
+	}
+	detail.WorktreeRetirements, err = operationsByKind(ctx, q, detail.RunID, app.OpWorktreeRetire)
+	return err
 }
 
 // attachSessionBinding surfaces the session's current binding and its

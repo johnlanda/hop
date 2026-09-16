@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -315,4 +316,113 @@ func TestRetireWorktrees(t *testing.T) {
 			t.Fatalf("RetireWorktrees() error = %v, want ErrRetirementNotEligible", err)
 		}
 	})
+}
+
+// TestStatusWorktreeLines covers the per-row status input: after a pass,
+// hop status -run's detail names every feature worktree row with its
+// state, a released row's reason, and an active row's refused category or
+// unfinished removal from its journal; a solo run carries none.
+func TestStatusWorktreeLines(t *testing.T) {
+	f := newRetireFixture(t)
+	removed := f.addAttempt(1, fakeAttemptWorktree{}, nil)
+	absent := f.addAttempt(2, fakeAttemptWorktree{}, func(w *fakeAttemptWorktree) { w.Present, w.Unlisted = false, true })
+	released := f.addAttempt(3, fakeAttemptWorktree{}, func(w *fakeAttemptWorktree) { w.Branch = "" })
+	refused := f.addAttempt(4, fakeAttemptWorktree{}, nil)
+	incomplete := f.addAttempt(5, fakeAttemptWorktree{}, nil)
+	unresolved := f.addAttempt(6, fakeAttemptWorktree{}, nil)
+	dirty := f.addAttempt(7, fakeAttemptWorktree{Modified: true}, nil)
+	f.onRemoval(func(cmd app.Command) (app.CommandResult, bool, error) {
+		target := cmd.Argv[len(cmd.Argv)-1]
+		switch target {
+		case refused.Listed:
+			w, _ := f.git.attemptWorktree(target)
+			w.Locked = true
+			f.git.addAttemptWorktree(target, w)
+		case incomplete.Listed:
+			w, _ := f.git.attemptWorktree(target)
+			w.Present = false
+			f.git.addAttemptWorktree(target, w)
+			return app.CommandResult{ExitCode: 128}, true, nil
+		case unresolved.Listed:
+			return app.CommandResult{}, true, errors.New("fork/exec: resource temporarily unavailable")
+		}
+		return app.CommandResult{}, false, nil
+	})
+	if report, _ := f.pass(); report.Disposition != app.RetirementInProgress {
+		t.Fatalf("pass = %+v, want in progress", report)
+	}
+	status, err := f.tc.Controller.Status(context.Background(), app.StatusRequest{RunID: f.fr.RunID.String()})
+	if err != nil {
+		t.Fatalf("Status() error = %v", err)
+	}
+	want := []app.WorktreeView{
+		{Branch: removed.Branch, Path: removed.Recorded, State: "removed"},
+		{Branch: absent.Branch, Path: absent.Recorded, State: "absent"},
+		{Branch: released.Branch, Path: released.Recorded, State: "released", Released: app.ReleasedDetached},
+		{Branch: refused.Branch, Path: refused.Recorded, State: "active", Retained: app.RetainedLocked},
+		{Branch: incomplete.Branch, Path: incomplete.Recorded, State: "active", Removal: "incomplete"},
+		{Branch: unresolved.Branch, Path: unresolved.Recorded, State: "active", Removal: "unresolved"},
+		{Branch: dirty.Branch, Path: dirty.Recorded, State: "active"},
+	}
+	got := status.Detail.Worktrees
+	if len(got) == len(want) && got[3].EvidencePath != "" {
+		want[3].EvidencePath = got[3].EvidencePath
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("worktree lines =\n%+v\nwant\n%+v", got, want)
+	}
+	if !strings.HasSuffix(got[3].EvidencePath, "/stderr") || !strings.HasPrefix(got[3].EvidencePath, "/state/runs/"+f.fr.RunID.String()+"/retirement/") {
+		t.Fatalf("the refused row's evidence = %q, want its retained stderr", got[3].EvidencePath)
+	}
+
+	// The next pass settles the unresolved removal (no claim: never
+	// executed) and removes it afresh; the interrupted shape comes from a
+	// claimed act that died.
+	f.tc.Commands.RunHook = f.baseHook
+	interrupted := f.addAttempt(8, fakeAttemptWorktree{}, nil)
+	f.onRemoval(func(cmd app.Command) (app.CommandResult, bool, error) {
+		if cmd.Argv[len(cmd.Argv)-1] != interrupted.Listed {
+			return app.CommandResult{}, false, nil
+		}
+		for i, arg := range cmd.Argv {
+			if arg == "--op" {
+				f.git.OnCheckExec(cmd.Argv[i+1], nil)
+			}
+		}
+		return app.CommandResult{}, true, errors.New("controller died")
+	})
+	f.acquire()
+	f.pass()
+	f.tc.Commands.RunHook = f.baseHook
+	f.acquire()
+	if blocking := f.recover(); blocking != "" {
+		t.Fatalf("recovery blocked: %s", blocking)
+	}
+	status, err = f.tc.Controller.Status(context.Background(), app.StatusRequest{RunID: f.fr.RunID.String()})
+	if err != nil {
+		t.Fatalf("Status() error = %v", err)
+	}
+	if got := status.Detail.Worktrees; got[7].Removal != "interrupted" || got[7].State != "active" || got[5].Removal != "" {
+		t.Fatalf("after recovery alone: %+v, want the dead act interrupted and the never-executed one plain", got)
+	}
+	f.acquire()
+	f.pass()
+	status, err = f.tc.Controller.Status(context.Background(), app.StatusRequest{RunID: f.fr.RunID.String()})
+	if err != nil {
+		t.Fatalf("Status() error = %v", err)
+	}
+	lines := status.Detail.Worktrees
+	if len(lines) != 8 || lines[5].State != "removed" || lines[5].Removal != "" || lines[6].Retained != "" {
+		t.Fatalf("after recovery: %+v", lines)
+	}
+	if last := lines[7]; last.State != "removed" {
+		t.Fatalf("the interrupted row = %+v, want removed once its checkout was clean", last)
+	}
+
+	solo := newTestController(defaultPolicy())
+	_, detail := startedRun(t, solo)
+	soloStatus, err := solo.Controller.Status(context.Background(), app.StatusRequest{RunID: detail.RunID.String()})
+	if err != nil || soloStatus.Detail.Worktrees != nil || soloStatus.Detail.WorktreePath == "" {
+		t.Fatalf("a solo run's detail = %+v, %v; want its single worktree path and no per-row lines", soloStatus.Detail, err)
+	}
 }

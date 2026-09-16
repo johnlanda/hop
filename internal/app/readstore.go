@@ -119,12 +119,18 @@ type RunDetail struct {
 	// (docs/plan/phase-3-worktree-retirement.md section 8), nil until the
 	// retirement of every worktree row reaches a final state.
 	WorktreesRetiredAt *time.Time
-	TaskID             identity.TaskID
-	AttemptID          identity.AttemptID
-	SessionID          identity.SessionID
-	TaskState          run.TaskState
-	AttemptState       run.AttemptState
-	WorktreePath       string
+	// Worktrees is a feature run's worktree rows, oldest first, and
+	// WorktreeRetirements its worktree.retire operations in any state,
+	// newest first: the input of each row's status line. Both are nil for
+	// a solo run, whose single worktree is WorktreePath.
+	Worktrees           []run.Worktree
+	WorktreeRetirements []Operation
+	TaskID              identity.TaskID
+	AttemptID           identity.AttemptID
+	SessionID           identity.SessionID
+	TaskState           run.TaskState
+	AttemptState        run.AttemptState
+	WorktreePath        string
 	// StateRoot is the run snapshot's frozen absolute state root: where the
 	// run's artifact directories live, needed by evidence capture.
 	StateRoot         string

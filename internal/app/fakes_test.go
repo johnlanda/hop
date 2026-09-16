@@ -1,10 +1,12 @@
 package app_test
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -545,11 +547,39 @@ func (s *fakeStore) LoadRunStatus(_ context.Context, runID identity.RunID) (app.
 			PremergeHeadOID: integration.PremergeHeadOID, MergeCommitOID: integration.MergeCommitOID, State: integration.State,
 		}
 	}
+	if s.Snapshots[runID].Workflow.Feature() {
+		detail.Worktrees, detail.WorktreeRetirements = s.featureWorktreesLocked(runID)
+	}
 	detail.GuardShortfalls = s.guardShortfallsLocked(runID)
 	detail.Mailboxes = s.mailboxesLocked(runID, s.clock.Now())
 	detail.PendingQuestions = s.pendingQuestionsLocked(runID, s.clock.Now())
 
 	return detail, nil
+}
+
+// featureWorktreesLocked mirrors the real store's feature detail
+// (featureWorktreeDetail): every worktree row of the run in insertion
+// order — a seeded row with no insertion sequence first, by id — as a
+// non-nil list, and the run's worktree.retire operations newest first.
+// Callers hold s.mu.
+func (s *fakeStore) featureWorktreesLocked(runID identity.RunID) ([]run.Worktree, []app.Operation) {
+	rows := []run.Worktree{}
+	for _, row := range s.Worktrees {
+		if row.value.RunID == runID {
+			rows = append(rows, row.value)
+		}
+	}
+	slices.SortFunc(rows, func(a, b run.Worktree) int {
+		return cmp.Or(cmp.Compare(s.worktreeInsertOrder[a.ID], s.worktreeInsertOrder[b.ID]), cmp.Compare(a.ID, b.ID))
+	})
+	var retires []app.Operation
+	for id := range s.Operations {
+		if op := s.Operations[id]; op.RunID == runID && op.Kind == app.OpWorktreeRetire {
+			retires = append(retires, op)
+		}
+	}
+	slices.SortFunc(retires, func(a, b app.Operation) int { return b.CreatedAt.Compare(a.CreatedAt) })
+	return rows, retires
 }
 
 func (s *fakeStore) worktreeByRunLocked(runID identity.RunID) (run.Worktree, bool) {

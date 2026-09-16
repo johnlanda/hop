@@ -693,6 +693,47 @@ consistent with sections 1 to 12.
   An ambiguous head, an unreadable target and a failed check of the same
   pair are reported as `check-failed`, with no lease.
 
+**Commands.**
+
+- **Bound and signals.** `hop status` gives the whole pass a 15-minute
+  bound, separate from its 10-second rendering bound. A first
+  SIGINT/SIGTERM cancels the pass (a running removal is killed and
+  recovered by a later pass), and a second one exits.
+- **An unlocatable hop binary.** If the hop binary cannot be located, the
+  pass is skipped with one line, and `hop status` still renders and
+  exits 0.
+- **Placement.** `hop run` passes after `ResolveRunWorkflow` accepts the
+  workflow, so a usage-refused run removes nothing. `hop resume` passes
+  once its run argument resolves, excluding that run.
+- **Output.** Pass lines print before a controller start's own lines, and
+  after `hop status`'s listing or detail block. The `retiring worktrees
+  of r<seq>…` line prints just before the first removal spawn.
+- **Failures.** A triage, acquisition, pass, heartbeat or release failure
+  is one value-free stderr line naming only the run label, and the
+  remaining runs are still attempted. A run found ineligible at
+  acquisition (a raced read) is silent.
+- **Lines beyond section 6's examples** (same shapes):
+  - `already absent`;
+  - `removal incomplete` and `removal unresolved`, each ending "hop status
+    will finish the removal";
+  - `not removed yet … hop status will retry`;
+  - a post-act release ending "left on disk; no longer managed by HOP";
+  - a refused removal's category carrying its exit code, and an action
+    naming the evidence path;
+  - run-level `skipped` (history missing), `check failed` and
+    `interrupted`.
+
+  Not-merged and nothing-integrated runs print nothing.
+- **`hop status -run` for a feature run.**
+  - The single `worktree:` line is replaced by one line per row: removed,
+    absent, released with its reason ("left on disk; no longer managed by
+    HOP"), retained with the category of its last refused removal and an
+    `action:` line, `removal incomplete|interrupted|unresolved` ("hop
+    status will finish the removal"), or active.
+  - A solo run keeps its single line. `RunDetail` carries the rows and the
+    run's `worktree.retire` operations, and app code derives each row's
+    view.
+
 **Dispatch revalidation (`revalidateRetirementDispatch`).** Both claimed
 acts run it immediately before the spawn:
 

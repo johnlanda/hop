@@ -115,14 +115,7 @@ func retirementCandidateRecord(ctx context.Context, q querier, record app.Retire
 		return record, false, nil
 	}
 
-	checks, err := q.QueryContext(ctx,
-		selectOperationColumns+` WHERE run_id = ? AND kind = ? ORDER BY created_at DESC, rowid DESC`,
-		record.RunID.String(), string(app.OpRetirementCheck),
-	)
-	if err != nil {
-		return record, false, fmt.Errorf("sqlite: list retirement checks of run %s: %w", record.RunID, err)
-	}
-	if record.Checks, err = collectOperations(checks); err != nil {
+	if record.Checks, err = operationsByKind(ctx, q, record.RunID, app.OpRetirementCheck); err != nil {
 		return record, false, err
 	}
 	var unresolved int64

@@ -95,3 +95,67 @@ func TestWorktreesForRetirement(t *testing.T) {
 		t.Fatal(rollbackErr)
 	}
 }
+
+// TestLoadRunStatusWorktreeRows proves the status detail's per-row input:
+// a feature run lists every worktree row oldest first in its current state
+// and its worktree.retire operations newest first (a run without rows an
+// empty list), while a solo run keeps its single worktree path and carries
+// neither.
+func TestLoadRunStatusWorktreeRows(t *testing.T) {
+	f := newFeatureFixture(t)
+	detail, err := f.store.LoadRunStatus(t.Context(), f.spec.RunID)
+	if err != nil {
+		t.Fatalf("LoadRunStatus: %v", err)
+	}
+	if detail.Worktrees == nil || len(detail.Worktrees) != 0 || len(detail.WorktreeRetirements) != 0 {
+		t.Fatalf("a feature run without rows = %+v / %+v, want an empty list", detail.Worktrees, detail.WorktreeRetirements)
+	}
+
+	for i, n := range []int{7840, 7830} {
+		task := f.createFeatureTask(t, n+6, i+2, run.TaskActive)
+		f.createWorkerSession(t, task, run.RoleImplementer, n)
+		f.clock.Advance(time.Second)
+		f.createAttemptWorktree(t, n+5, identity.AttemptID(uid(n)), fmt.Sprintf("/wt/t%da1", i+2), fmt.Sprintf("hop/r1/t%da1", i+2))
+	}
+	f.inUOW(t, func(uow app.UnitOfWork) {
+		row, revision, getErr := uow.Worktrees().Get(t.Context(), identity.WorktreeID(uid(7835)))
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		released, retireErr := row.Retire(run.WorktreeReleased)
+		if retireErr != nil {
+			t.Fatal(retireErr)
+		}
+		if _, saveErr := uow.Worktrees().Save(t.Context(), released, revision); saveErr != nil {
+			t.Fatal(saveErr)
+		}
+	})
+	seedRetirementOperation(t, f.store, f.spec.RunID, 9101, app.OpWorktreeRetire, app.OperationSucceeded,
+		`{"decision":"released","worktree_id":"`+uid(7835)+`"}`, `{"result":"released","released_reason":"detached"}`, 1)
+	seedRetirementOperation(t, f.store, f.spec.RunID, 9102, app.OpWorktreeRetire, app.OperationReconciling,
+		`{"decision":"remove","worktree_id":"`+uid(7845)+`"}`, `"not observed"`, 2)
+	seedRetirementOperation(t, f.store, f.spec.RunID, 9103, app.OpRetirementCheck, app.OperationSucceeded, `{}`, `{"result":"merged"}`, 3)
+
+	detail, err = f.store.LoadRunStatus(t.Context(), f.spec.RunID)
+	if err != nil {
+		t.Fatalf("LoadRunStatus: %v", err)
+	}
+	if len(detail.Worktrees) != 2 || detail.Worktrees[0].ID.String() != uid(7845) || detail.Worktrees[1].ID.String() != uid(7835) {
+		t.Fatalf("rows = %+v, want both rows in insertion order", detail.Worktrees)
+	}
+	if detail.Worktrees[0].State != run.WorktreeActive || detail.Worktrees[1].State != run.WorktreeReleased || detail.Worktrees[1].Branch != "hop/r1/t3a1" {
+		t.Fatalf("row states = %+v", detail.Worktrees)
+	}
+	if len(detail.WorktreeRetirements) != 2 || detail.WorktreeRetirements[0].ID.String() != uid(9102) || detail.WorktreeRetirements[1].ID.String() != uid(9101) {
+		t.Fatalf("retirements = %+v, want the two worktree.retire operations newest first", detail.WorktreeRetirements)
+	}
+
+	solo := newFixture(t)
+	soloDetail, err := solo.store.LoadRunStatus(t.Context(), solo.spec.RunID)
+	if err != nil {
+		t.Fatalf("LoadRunStatus(solo): %v", err)
+	}
+	if soloDetail.Worktrees != nil || soloDetail.WorktreeRetirements != nil {
+		t.Fatalf("a solo run carries per-row input: %+v", soloDetail)
+	}
+}

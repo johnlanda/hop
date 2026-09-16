@@ -218,17 +218,23 @@ func retireDecisionIntent(row *run.Worktree, repositoryRoot string, decision wor
 }
 
 // latestRetireInterrupted reports whether the row's latest settled
-// worktree.retire operation — the newest generation, then the newest
-// creation — recorded an interrupted act.
+// worktree.retire operation recorded an interrupted act.
 func latestRetireInterrupted(retires []Operation, worktreeID identity.WorktreeID) bool {
+	outcome, ok := latestRetireOutcome(retires, worktreeID)
+	return ok && outcome.Result == retireResultInterrupted
+}
+
+// latestRetireOutcome decodes the outcome of the row's latest settled
+// worktree.retire operation — the newest generation, then the newest
+// creation; ok is false when the row has none.
+func latestRetireOutcome(retires []Operation, worktreeID identity.WorktreeID) (worktreeRetireOutcome, bool) {
 	var latest *Operation
 	for i := range retires {
 		op := &retires[i]
 		if op.State != OperationSucceeded && op.State != OperationFailed {
 			continue
 		}
-		intent, ok := decodeOperationPayload[worktreeRetireIntent](op.Intent)
-		if !ok || intent.WorktreeID != worktreeID {
+		if !retireNamesWorktree(op, worktreeID) {
 			continue
 		}
 		if latest == nil || op.Generation > latest.Generation ||
@@ -237,10 +243,49 @@ func latestRetireInterrupted(retires []Operation, worktreeID identity.WorktreeID
 		}
 	}
 	if latest == nil {
-		return false
+		return worktreeRetireOutcome{}, false
 	}
-	outcome, ok := decodeOperationPayload[worktreeRetireOutcome](latest.Outcome)
-	return ok && outcome.Result == retireResultInterrupted
+	return decodeOperationPayload[worktreeRetireOutcome](latest.Outcome)
+}
+
+// retireNamesWorktree reports whether a worktree.retire operation's intent
+// names the row.
+func retireNamesWorktree(op *Operation, worktreeID identity.WorktreeID) bool {
+	intent, ok := decodeOperationPayload[worktreeRetireIntent](op.Intent)
+	return ok && intent.WorktreeID == worktreeID
+}
+
+// worktreeViews renders a feature run's worktree rows for hop status -run:
+// each row's state, a released row's recorded reason, and an active row's
+// last refused category or unfinished removal from its journal.
+func worktreeViews(rows []run.Worktree, retires []Operation) []WorktreeView {
+	if rows == nil {
+		return nil
+	}
+	views := make([]WorktreeView, 0, len(rows))
+	for i := range rows {
+		row := &rows[i]
+		view := WorktreeView{Branch: row.Branch, Path: row.Path, State: string(row.State)}
+		if outcome, ok := latestRetireOutcome(retires, row.ID); ok {
+			switch {
+			case row.State == run.WorktreeReleased:
+				view.Released = outcome.Released
+			case row.State != run.WorktreeActive:
+			case outcome.Result == retireResultRefused:
+				view.Retained, view.EvidencePath = outcome.Retained, outcome.StderrPath
+			case outcome.Result == retireResultIncomplete, outcome.Result == retireResultInterrupted:
+				view.Removal = string(outcome.Result)
+			}
+		}
+		for j := range retires {
+			op := &retires[j]
+			if row.State == run.WorktreeActive && (op.State == OperationPending || op.State == OperationReconciling) && retireNamesWorktree(op, row.ID) {
+				view.Removal, view.Retained, view.EvidencePath = "unresolved", "", ""
+			}
+		}
+		views = append(views, view)
+	}
+	return views
 }
 
 // settleRetireDecision journals a final decision as one settled
