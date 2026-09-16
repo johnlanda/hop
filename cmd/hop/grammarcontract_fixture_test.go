@@ -3,15 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -37,11 +36,11 @@ import (
 // commands — runs under isolatedEnvironment, which never inherits the
 // calling process's environment, always sets a fresh temporary HOME and
 // always points HERDR_SOCKET_PATH at a canary listener that fails the
-// suite if anything ever connects to it (herdrCanary below). The one
-// exception is the read-only `go env` query that locates the operator's
-// Go caches (goBuildVars). Nothing in this file starts a Herdr server or
-// lives under test/integration; the real SQLite adapter is the only
-// production dependency exercised.
+// suite if anything ever connects to it (herdrCanary below). No exception
+// exists: the Go settings the build needs are resolved in-process
+// (goBuildVars), never by running anything. Nothing in this file starts a
+// Herdr server or lives under test/integration; the real SQLite adapter
+// is the only production dependency exercised.
 
 // TestMain builds the hop binary once for every test in this package's
 // `go test` process (buildHopBinary, cached behind hopBinary's sync.Once)
@@ -76,7 +75,7 @@ var hopBinary struct { //nolint:gochecknoglobals // process-lifetime build cache
 // root — no module-root discovery is needed. The build runs under
 // isolatedEnvironment (a HOME of its own inside the build directory, its
 // own canary listener, checked once the build returns) with only the Go
-// settings goBuildVars resolves.
+// settings goBuildVars resolves in-process.
 func buildHopBinary(t *testing.T) string {
 	t.Helper()
 	hopBinary.once.Do(func() {
@@ -94,7 +93,7 @@ func buildHopBinary(t *testing.T) string {
 	return hopBinary.path
 }
 
-// buildTimeout bounds the one go build and its go env query.
+// buildTimeout bounds the one go build.
 const buildTimeout = 2 * time.Minute
 
 // buildInto builds cmd/hop into dir/hop under the isolated build
@@ -120,7 +119,7 @@ func buildInto(dir string) (string, error) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), buildTimeout)
 	defer cancel()
-	goVars, err := goBuildVars(ctx, goBin, canary.path)
+	goVars, err := goBuildVars(os.LookupEnv)
 	if err != nil {
 		return "", err
 	}
@@ -142,58 +141,59 @@ func buildInto(dir string) (string, error) {
 	return out, nil
 }
 
-// goBuildVars resolves the Go settings the isolated build needs, once:
-// GOCACHE, GOMODCACHE and GOPATH from the operator's own `go env` (so the
-// build cache stays warm and no module is fetched), plus GOTOOLCHAIN and
-// GOFLAGS exactly when the operator's environment sets them (make exports
-// GOTOOLCHAIN from go.mod). The `go env` query is the suite's one
-// subprocess that sees the operator's real HOME — Go locates its
-// configuration file and default caches from it — and it is still an
-// explicit allowlist (goEnvQueryKeys) with the canary socket: a read-only
-// configuration query that builds and runs nothing.
-func goBuildVars(ctx context.Context, goBin, herdrSocket string) (map[string]string, error) {
-	query := exec.CommandContext(ctx, goBin, "env", "-json", "GOCACHE", "GOMODCACHE", "GOPATH")
-	query.Env = goEnvQueryEnvironment(herdrSocket)
-	raw, err := query.Output()
-	if err != nil {
-		return nil, fmt.Errorf("go env: %w", err)
-	}
-	var resolved map[string]string
-	if err := json.Unmarshal(raw, &resolved); err != nil {
-		return nil, fmt.Errorf("decode go env: %w", err)
+// goBuildVars resolves, without executing anything, the Go settings the
+// isolated build needs so its caches stay warm and no module is fetched:
+// GOCACHE, GOPATH and GOMODCACHE from the test process's environment when
+// set there, otherwise the go command's documented defaults computed
+// in-process (os.UserCacheDir()/go-build; the home directory's "go";
+// the first GOPATH entry's pkg/mod), plus GOTOOLCHAIN and GOFLAGS exactly
+// when the environment sets them (make exports GOTOOLCHAIN from go.mod).
+// Settings persisted with `go env -w` are not consulted: the build's
+// temporary HOME hides that file, and reading it would mean running go
+// with the operator's HOME. lookup is os.LookupEnv in production.
+func goBuildVars(lookup func(string) (string, bool)) (map[string]string, error) {
+	set := func(key string) (string, bool) {
+		value, ok := lookup(key)
+		return value, ok && value != ""
 	}
 	vars := map[string]string{}
-	for _, key := range []string{"GOCACHE", "GOMODCACHE", "GOPATH"} {
-		value := resolved[key]
-		if !filepath.IsAbs(value) {
-			return nil, fmt.Errorf("go env %s is not an absolute path", key)
+	gocache, ok := set("GOCACHE")
+	if !ok {
+		cacheDir, err := os.UserCacheDir()
+		if err != nil {
+			return nil, fmt.Errorf("default GOCACHE: %w", err)
 		}
-		vars[key] = value
+		gocache = filepath.Join(cacheDir, "go-build")
+	}
+	gopath, ok := set("GOPATH")
+	if !ok {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return nil, fmt.Errorf("default GOPATH: %w", err)
+		}
+		gopath = filepath.Join(home, "go")
+	}
+	gomodcache, ok := set("GOMODCACHE")
+	if !ok {
+		gomodcache = filepath.Join(filepath.SplitList(gopath)[0], "pkg", "mod")
+	}
+	vars["GOCACHE"], vars["GOPATH"], vars["GOMODCACHE"] = gocache, gopath, gomodcache
+	for _, key := range []string{"GOCACHE", "GOMODCACHE"} {
+		if !filepath.IsAbs(vars[key]) {
+			return nil, fmt.Errorf("%s is not an absolute path", key)
+		}
+	}
+	for _, entry := range filepath.SplitList(gopath) {
+		if !filepath.IsAbs(entry) {
+			return nil, errors.New("a GOPATH entry is not an absolute path")
+		}
 	}
 	for _, key := range []string{"GOTOOLCHAIN", "GOFLAGS"} {
-		if value, ok := os.LookupEnv(key); ok && value != "" {
+		if value, ok := set(key); ok {
 			vars[key] = value
 		}
 	}
 	return vars, nil
-}
-
-// goEnvQueryKeys are the calling process's variables the `go env` query
-// may see: where Go finds its configuration and caches, and nothing else.
-func goEnvQueryKeys() []string {
-	return []string{"PATH", "HOME", "TMPDIR", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "GOENV", "GOROOT", "GOPATH", "GOCACHE", "GOMODCACHE", "GOTOOLCHAIN", "GOFLAGS"}
-}
-
-// goEnvQueryEnvironment builds the `go env` query's environment from
-// goEnvQueryKeys and the canary socket.
-func goEnvQueryEnvironment(herdrSocket string) []string {
-	env := []string{envHerdrSocket + "=" + herdrSocket}
-	for _, key := range goEnvQueryKeys() {
-		if value, ok := os.LookupEnv(key); ok {
-			env = append(env, key+"="+value)
-		}
-	}
-	return env
 }
 
 // callTimeout bounds one hop subcommand invocation in this suite; every
@@ -597,13 +597,7 @@ func TestIsolatedEnvironment(t *testing.T) {
 	})
 
 	t.Run("go build", func(t *testing.T) {
-		goBin, err := exec.LookPath("go")
-		if err != nil {
-			t.Skip("the go tool is not on PATH")
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), buildTimeout)
-		defer cancel()
-		vars, err := goBuildVars(ctx, goBin, socket)
+		vars, err := goBuildVars(os.LookupEnv)
 		if err != nil {
 			t.Fatalf("goBuildVars: %v", err)
 		}
@@ -616,24 +610,59 @@ func TestIsolatedEnvironment(t *testing.T) {
 				t.Errorf("the build carries %s, outside the Go allowlist", key)
 			}
 		}
-		for _, required := range []string{"GOCACHE", "GOMODCACHE", "GOPATH"} {
-			if vars[required] == "" {
-				t.Errorf("the build lacks %s; its cache would go cold", required)
-			}
-		}
 		env, err := isolatedEnvironment(home, socket, "", vars)
 		if err != nil {
 			t.Fatal(err)
 		}
 		check(t, env, allowlistedKeys(names...))
-		for _, entry := range goEnvQueryEnvironment(socket) {
-			key, _, _ := strings.Cut(entry, "=")
-			if key != envHerdrSocket && !slices.Contains(goEnvQueryKeys(), key) {
-				t.Errorf("the go env query carries %s, outside its allowlist", key)
+		if envValue(env, envHome) == os.Getenv(envHome) {
+			t.Error("the build environment carries the operator's HOME")
+		}
+	})
+
+	t.Run("go build settings are resolved in-process", func(t *testing.T) {
+		cacheDir, err := os.UserCacheDir()
+		if err != nil {
+			t.Skipf("no user cache dir: %v", err)
+		}
+		userHome, err := os.UserHomeDir()
+		if err != nil {
+			t.Skipf("no user home dir: %v", err)
+		}
+		lookupFrom := func(values map[string]string) func(string) (string, bool) {
+			return func(key string) (string, bool) {
+				value, ok := values[key]
+				return value, ok
 			}
-			if strings.Contains(entry, operatorCanary) {
-				t.Errorf("the go env query carries an operator value: %q", entry)
-			}
+		}
+		defaults, err := goBuildVars(lookupFrom(map[string]string{"GOTOOLCHAIN": "", "GOFLAGS": ""}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := map[string]string{
+			"GOCACHE":    filepath.Join(cacheDir, "go-build"),
+			"GOPATH":     filepath.Join(userHome, "go"),
+			"GOMODCACHE": filepath.Join(userHome, "go", "pkg", "mod"),
+		}
+		if !maps.Equal(defaults, want) {
+			t.Errorf("defaults = %v, want %v", defaults, want)
+		}
+		explicit, err := goBuildVars(lookupFrom(map[string]string{
+			"GOCACHE": "/cache", "GOPATH": "/first" + string(os.PathListSeparator) + "/second",
+			"GOTOOLCHAIN": "go1.27.1", "GOFLAGS": "-mod=mod",
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want = map[string]string{
+			"GOCACHE": "/cache", "GOPATH": "/first" + string(os.PathListSeparator) + "/second",
+			"GOMODCACHE": "/first/pkg/mod", "GOTOOLCHAIN": "go1.27.1", "GOFLAGS": "-mod=mod",
+		}
+		if !maps.Equal(explicit, want) {
+			t.Errorf("explicit = %v, want %v", explicit, want)
+		}
+		if _, err := goBuildVars(lookupFrom(map[string]string{"GOCACHE": "relative"})); err == nil {
+			t.Error("a relative GOCACHE was accepted")
 		}
 	})
 }
