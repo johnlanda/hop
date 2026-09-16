@@ -166,9 +166,13 @@ type SessionRepository interface {
 	Create(ctx context.Context, s run.Session) (int64, error)
 }
 
-// WorktreeRepository loads, creates and saves the run's single Phase 2
-// worktree. InitializeRun never creates the worktree row: worktree.create is
-// a fallible external call performed afterward, so Create records it only
+// WorktreeRepository loads, creates and saves worktree rows: a solo run's
+// single unlinked worktree, or a feature run's per-attempt worktrees, each
+// linked to its attempt and verified base commit (run.NewAttemptWorktree).
+// ByRun serves the solo shape only. Create refuses a link naming an
+// unknown attempt (ErrNotFound) or another run's attempt (ErrFenced).
+// InitializeRun never creates the worktree row: worktree.create is a
+// fallible external call performed afterward, so Create records it only
 // once Runtime.CreateWorktree has actually succeeded.
 type WorktreeRepository interface {
 	Get(ctx context.Context, id identity.WorktreeID) (run.Worktree, int64, error)

@@ -15,8 +15,9 @@ mechanically, not just by convention).
 
 - [internal/testsupport/storevectors](storevectors/AGENTS.md): shared
   refused-input vectors for the Phase 3 worker-authority store ports
-  (`MessagingStore`, `PlanStore`), consumed by `internal/app`'s tests today
-  and by `internal/adapters/sqlite`'s once that adapter lands.
+  (`MessagingStore`, `PlanStore`, `ReviewStore`) and the controller's
+  worktree repository, consumed by both `internal/app`'s and
+  `internal/adapters/sqlite`'s tests.
 - [internal/testsupport/hopfixtures](hopfixtures/AGENTS.md): string-typed
   run/task/session/binding seeding through the application's store port
   interfaces, consumed solely by `cmd/hop`'s real-binary grammar contract
