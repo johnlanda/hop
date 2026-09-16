@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -169,6 +171,489 @@ func TestRunMsgWaitTimeoutDefault(t *testing.T) {
 			if call == "MessageWaitDefault" {
 				t.Fatalf("MessageWaitDefault was called despite a failed environment-validating fetch")
 			}
+		}
+	})
+}
+
+// TestRunMsgSend covers hop msg send's dispatch, happy path, refusal and
+// usage-error surface (design section 7).
+func TestRunMsgSend(t *testing.T) {
+	t.Run("accepted prints the sent line and reads identities from env", func(t *testing.T) {
+		ctrl := &fakeController{}
+		var req app.SendMessageRequest
+		ctrl.sendMessage = func(r app.SendMessageRequest) (app.SendMessageResult, error) {
+			req = r
+			return app.SendMessageResult{Outcome: "accepted", MessageID: "msg-1"}, nil
+		}
+		td := newTestDeps(ctrl, managerEnv(), t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runMsgSend([]string{"--to", "manager", "--kind", "question", "--body", "q?"}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitOK || stdout.String() != "sent msg-1\n" {
+			t.Errorf("code = %d, stdout = %q (stderr: %s)", code, stdout.String(), stderr.String())
+		}
+		if req.RunID != testRunID || req.SessionID == "" || req.IncarnationID == "" {
+			t.Errorf("identities not read from HOP_* env: %+v", req)
+		}
+		if req.To != "manager" || req.Kind != "question" || string(req.Body) != "q?" || !req.Inline {
+			t.Errorf("request = %+v", req)
+		}
+	})
+
+	t.Run("duplicate prints the duplicate line", func(t *testing.T) {
+		ctrl := &fakeController{}
+		ctrl.sendMessage = func(app.SendMessageRequest) (app.SendMessageResult, error) {
+			return app.SendMessageResult{Outcome: "duplicate", MessageID: "msg-1"}, nil
+		}
+		td := newTestDeps(ctrl, managerEnv(), t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runMsgSend([]string{"--to", "manager", "--kind", "question", "--body", "q?"}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitOK || stdout.String() != "duplicate msg-1\n" {
+			t.Errorf("code = %d, stdout = %q", code, stdout.String())
+		}
+	})
+
+	t.Run("a refusal renders refused: <token>", func(t *testing.T) {
+		ctrl := &fakeController{}
+		ctrl.sendMessage = func(app.SendMessageRequest) (app.SendMessageResult, error) {
+			return app.SendMessageResult{Outcome: "refused", Reason: app.GrammarReasonStale, Detail: "incarnation is not current"}, nil
+		}
+		td := newTestDeps(ctrl, managerEnv(), t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runMsgSend([]string{"--to", "manager", "--kind", "question", "--body", "q?"}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitFailure || stdout.String() != "refused: stale\nincarnation is not current\n" {
+			t.Errorf("code = %d, stdout = %q", code, stdout.String())
+		}
+	})
+
+	t.Run("missing --kind is a usage error", func(t *testing.T) {
+		td := newTestDeps(&fakeController{}, managerEnv(), t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runMsgSend([]string{"--to", "manager", "--body", "q?"}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitUsage {
+			t.Errorf("exit code = %d, want %d", code, exitUsage)
+		}
+	})
+
+	t.Run("--to is forbidden for --kind answer", func(t *testing.T) {
+		td := newTestDeps(&fakeController{}, managerEnv(), t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runMsgSend([]string{"--to", "manager", "--kind", "answer", "--reply-to", "q-1", "--body", "a"}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitUsage {
+			t.Errorf("exit code = %d, want %d", code, exitUsage)
+		}
+	})
+
+	t.Run("--reply-to is required for --kind answer", func(t *testing.T) {
+		td := newTestDeps(&fakeController{}, managerEnv(), t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runMsgSend([]string{"--kind", "answer", "--body", "a"}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitUsage {
+			t.Errorf("exit code = %d, want %d", code, exitUsage)
+		}
+	})
+
+	t.Run("--to is required for a non-answer kind", func(t *testing.T) {
+		td := newTestDeps(&fakeController{}, managerEnv(), t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runMsgSend([]string{"--kind", "question", "--body", "q?"}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitUsage {
+			t.Errorf("exit code = %d, want %d", code, exitUsage)
+		}
+	})
+
+	t.Run("--reply-to is forbidden for a non-answer kind", func(t *testing.T) {
+		td := newTestDeps(&fakeController{}, managerEnv(), t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runMsgSend([]string{"--to", "manager", "--kind", "question", "--reply-to", "q-1", "--body", "q?"}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitUsage {
+			t.Errorf("exit code = %d, want %d", code, exitUsage)
+		}
+	})
+
+	t.Run("neither --file nor --body is a usage error", func(t *testing.T) {
+		td := newTestDeps(&fakeController{}, managerEnv(), t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runMsgSend([]string{"--to", "manager", "--kind", "question"}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitUsage {
+			t.Errorf("exit code = %d, want %d", code, exitUsage)
+		}
+	})
+
+	t.Run("both --file and --body is a usage error", func(t *testing.T) {
+		bodyFile := filepath.Join(t.TempDir(), "body.md")
+		if err := os.WriteFile(bodyFile, []byte("q?"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		td := newTestDeps(&fakeController{}, managerEnv(), t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runMsgSend([]string{"--to", "manager", "--kind", "question", "--file", bodyFile, "--body", "q?"}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitUsage {
+			t.Errorf("exit code = %d, want %d", code, exitUsage)
+		}
+	})
+
+	t.Run("unexpected argument is a usage error", func(t *testing.T) {
+		td := newTestDeps(&fakeController{}, managerEnv(), t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runMsgSend([]string{"--to", "manager", "--kind", "question", "--body", "q?", "extra"}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitUsage {
+			t.Errorf("exit code = %d, want %d", code, exitUsage)
+		}
+	})
+}
+
+// TestRunMsgNext covers hop msg next's dispatch, happy path and empty
+// queue.
+func TestRunMsgNext(t *testing.T) {
+	t.Run("a delivered message renders the three-line envelope", func(t *testing.T) {
+		ctrl := &fakeController{}
+		var req app.FetchMessageRequest
+		ctrl.fetchMessage = func(r app.FetchMessageRequest) (app.FetchMessageResult, error) {
+			req = r
+			return app.FetchMessageResult{
+				Delivered: true, MessageID: "msg-1", Kind: "question",
+				SenderKind: "session", SenderSession: "worker-1", BodyPath: "/state/body.md",
+			}, nil
+		}
+		td := newTestDeps(ctrl, managerEnv(), t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runMsgNext(nil, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		want := "message msg-1 kind=question from=worker-1\nbody: /state/body.md\nack: hop msg ack msg-1\n"
+		if code != exitOK || stdout.String() != want {
+			t.Errorf("code = %d, stdout = %q, want %q (stderr: %s)", code, stdout.String(), want, stderr.String())
+		}
+		if req.RunID != testRunID || req.SessionID == "" || req.IncarnationID == "" {
+			t.Errorf("identities not read from HOP_* env: %+v", req)
+		}
+	})
+
+	t.Run("an empty queue prints none", func(t *testing.T) {
+		ctrl := &fakeController{}
+		ctrl.fetchMessage = func(app.FetchMessageRequest) (app.FetchMessageResult, error) {
+			return app.FetchMessageResult{}, nil
+		}
+		td := newTestDeps(ctrl, managerEnv(), t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runMsgNext(nil, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitOK || stdout.String() != "none: no queued message\n" {
+			t.Errorf("code = %d, stdout = %q", code, stdout.String())
+		}
+	})
+
+	t.Run("unexpected argument is a usage error", func(t *testing.T) {
+		td := newTestDeps(&fakeController{}, managerEnv(), t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runMsgNext([]string{"extra"}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitUsage {
+			t.Errorf("exit code = %d, want %d", code, exitUsage)
+		}
+	})
+}
+
+// TestRunMsgAck covers hop msg ack's dispatch, happy path, refusal and
+// usage-error surface.
+func TestRunMsgAck(t *testing.T) {
+	t.Run("accepted prints the acknowledged line", func(t *testing.T) {
+		ctrl := &fakeController{}
+		var req app.AckMessageRequest
+		ctrl.ackMessage = func(r app.AckMessageRequest) (app.AckMessageResult, error) {
+			req = r
+			return app.AckMessageResult{Outcome: "accepted"}, nil
+		}
+		td := newTestDeps(ctrl, managerEnv(), t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runMsgAck([]string{"msg-1"}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitOK || stdout.String() != "acknowledged msg-1\n" {
+			t.Errorf("code = %d, stdout = %q", code, stdout.String())
+		}
+		if req.MessageID != "msg-1" || req.RunID != testRunID {
+			t.Errorf("request = %+v", req)
+		}
+	})
+
+	t.Run("duplicate prints the duplicate line", func(t *testing.T) {
+		ctrl := &fakeController{}
+		ctrl.ackMessage = func(app.AckMessageRequest) (app.AckMessageResult, error) {
+			return app.AckMessageResult{Outcome: "duplicate"}, nil
+		}
+		td := newTestDeps(ctrl, managerEnv(), t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runMsgAck([]string{"msg-1"}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitOK || stdout.String() != "duplicate msg-1\n" {
+			t.Errorf("code = %d, stdout = %q", code, stdout.String())
+		}
+	})
+
+	t.Run("a refusal renders refused: <token>", func(t *testing.T) {
+		ctrl := &fakeController{}
+		ctrl.ackMessage = func(app.AckMessageRequest) (app.AckMessageResult, error) {
+			return app.AckMessageResult{Outcome: "refused", Reason: app.GrammarReasonNotDelivered, Detail: "message was not delivered"}, nil
+		}
+		td := newTestDeps(ctrl, managerEnv(), t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runMsgAck([]string{"msg-1"}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitFailure || !strings.HasPrefix(stdout.String(), "refused: not-delivered\n") {
+			t.Errorf("code = %d, stdout = %q", code, stdout.String())
+		}
+	})
+
+	t.Run("missing message-id argument is a usage error", func(t *testing.T) {
+		td := newTestDeps(&fakeController{}, managerEnv(), t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runMsgAck(nil, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitUsage {
+			t.Errorf("exit code = %d, want %d", code, exitUsage)
+		}
+	})
+}
+
+// TestRunMsgShow covers hop msg show's dispatch, happy path, not-found
+// and usage-error surface. It is the one message verb with no caller
+// identity validation (design section 7).
+func TestRunMsgShow(t *testing.T) {
+	t.Run("found renders the envelope, body and delivery/ack lines", func(t *testing.T) {
+		ctrl := &fakeController{}
+		var req app.ShowMessageRequest
+		at := time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)
+		ctrl.showMessage = func(r app.ShowMessageRequest) (app.ShowMessageResult, error) {
+			req = r
+			return app.ShowMessageResult{
+				Found: true, MessageID: "msg-1", Kind: "question", SenderKind: "session", SenderSession: "worker-1",
+				Recipient: "manager", Seq: 2, BodyPath: "/state/body.md",
+				Deliveries:   []app.ShowMessageDelivery{{SessionID: "manager-1", At: at}},
+				Acknowledged: true, AcknowledgedAt: at,
+			}, nil
+		}
+		td := newTestDeps(ctrl, managerEnv(), t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runMsgShow([]string{"msg-1"}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		want := "message msg-1 kind=question from=worker-1 to=manager seq=2\n" +
+			"body: /state/body.md\n" +
+			"delivered: manager-1 2026-09-14T12:00:00Z\n" +
+			"acknowledged: 2026-09-14T12:00:00Z\n"
+		if code != exitOK || stdout.String() != want {
+			t.Errorf("code = %d, stdout = %q, want %q", code, stdout.String(), want)
+		}
+		if req.MessageID != "msg-1" || req.RunID != testRunID {
+			t.Errorf("request = %+v", req)
+		}
+	})
+
+	t.Run("an unknown message id refuses not-found", func(t *testing.T) {
+		ctrl := &fakeController{}
+		ctrl.showMessage = func(app.ShowMessageRequest) (app.ShowMessageResult, error) {
+			return app.ShowMessageResult{Found: false}, nil
+		}
+		td := newTestDeps(ctrl, managerEnv(), t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runMsgShow([]string{"unknown-id"}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitFailure || stdout.String() != "refused: not-found\n" {
+			t.Errorf("code = %d, stdout = %q", code, stdout.String())
+		}
+	})
+
+	t.Run("--run overrides HOP_RUN_ID", func(t *testing.T) {
+		ctrl := &fakeController{}
+		var req app.ShowMessageRequest
+		ctrl.showMessage = func(r app.ShowMessageRequest) (app.ShowMessageResult, error) {
+			req = r
+			return app.ShowMessageResult{Found: true, MessageID: "msg-1", SenderKind: "human"}, nil
+		}
+		td := newTestDeps(ctrl, managerEnv(), t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runMsgShow([]string{"--run", "other-run", "msg-1"}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitOK {
+			t.Errorf("code = %d, stderr = %s", code, stderr.String())
+		}
+		if req.RunID != "other-run" {
+			t.Errorf("RunID = %q, want the explicit --run value", req.RunID)
+		}
+	})
+
+	t.Run("missing message-id argument is a usage error", func(t *testing.T) {
+		td := newTestDeps(&fakeController{}, managerEnv(), t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runMsgShow(nil, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitUsage {
+			t.Errorf("exit code = %d, want %d", code, exitUsage)
+		}
+	})
+}
+
+// answerEnv is hop answer's own environment: a human/controller-machine
+// command with no HOP_* worker identity at all — it resolves -C/--run
+// instead, so HOME (resolveStateRoot's own fallback) is the only
+// variable it needs.
+func answerEnv() map[string]string {
+	return map[string]string{"HOME": "/home/controller"}
+}
+
+// TestRunAnswer covers hop answer's dispatch, happy path, refusal and
+// usage-error surface, and proves it never reads worker HOP_* env.
+func TestRunAnswer(t *testing.T) {
+	t.Run("accepted prints the sent line and never reads worker env", func(t *testing.T) {
+		ctrl := &fakeController{}
+		var req app.AnswerRequest
+		ctrl.answer = func(r app.AnswerRequest) (app.AnswerResult, error) {
+			req = r
+			return app.AnswerResult{Outcome: "accepted", MessageID: "answer-1"}, nil
+		}
+		td := newTestDeps(ctrl, answerEnv(), t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runAnswer([]string{"--run", testRunID, "--body", "the answer", "question-1"}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitOK || stdout.String() != "sent answer-1\n" {
+			t.Errorf("code = %d, stdout = %q (stderr: %s)", code, stdout.String(), stderr.String())
+		}
+		if req.RunID != testRunID || req.QuestionID != "question-1" || string(req.Body) != "the answer" {
+			t.Errorf("request = %+v", req)
+		}
+	})
+
+	t.Run("a refusal renders refused: <token>", func(t *testing.T) {
+		ctrl := &fakeController{}
+		ctrl.answer = func(app.AnswerRequest) (app.AnswerResult, error) {
+			return app.AnswerResult{Outcome: "refused", Reason: app.GrammarReasonMalformed, Detail: "unknown question"}, nil
+		}
+		td := newTestDeps(ctrl, answerEnv(), t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runAnswer([]string{"--run", testRunID, "--body", "a", "question-1"}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitFailure || !strings.HasPrefix(stdout.String(), "refused: malformed\n") {
+			t.Errorf("code = %d, stdout = %q", code, stdout.String())
+		}
+	})
+
+	t.Run("missing --run is a usage error", func(t *testing.T) {
+		td := newTestDeps(&fakeController{}, answerEnv(), t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runAnswer([]string{"--body", "a", "question-1"}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitUsage {
+			t.Errorf("exit code = %d, want %d", code, exitUsage)
+		}
+	})
+
+	t.Run("missing question-id argument is a usage error", func(t *testing.T) {
+		td := newTestDeps(&fakeController{}, answerEnv(), t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runAnswer([]string{"--run", testRunID, "--body", "a"}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitUsage {
+			t.Errorf("exit code = %d, want %d", code, exitUsage)
+		}
+	})
+
+	t.Run("neither --file nor --body is a usage error", func(t *testing.T) {
+		td := newTestDeps(&fakeController{}, answerEnv(), t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runAnswer([]string{"--run", testRunID, "question-1"}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitUsage {
+			t.Errorf("exit code = %d, want %d", code, exitUsage)
 		}
 	})
 }
