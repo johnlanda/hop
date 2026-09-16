@@ -244,7 +244,8 @@ func (c *Controller) inspectAttemptCheckout(ctx context.Context, candidate *atte
 // listedCheckout reads the root's own `worktree list --porcelain -z` and
 // returns the record whose path resolves to canonicalPath, or nil when git
 // lists no such checkout; ok is false when the listing could not be read
-// or parsed.
+// or parsed, or when a record spelled exactly canonicalPath cannot be
+// resolved.
 func (c *Controller) listedCheckout(ctx context.Context, root, canonicalPath string, inspect PathInspector) (record *listedWorktree, ok bool) {
 	listing, err := c.retirementGitBounded(ctx, root, retirementListingOutputBytes, "worktree", "list", "--porcelain", "-z")
 	if err != nil || listing.ExitCode != 0 {
@@ -256,8 +257,16 @@ func (c *Controller) listedCheckout(ctx context.Context, root, canonicalPath str
 	}
 	for i := range records {
 		listed, _, listErr := inspect(records[i].Path)
-		if listErr == nil && listed == canonicalPath {
+		switch {
+		case listErr == nil && listed == canonicalPath:
 			return &records[i], true
+		case listErr != nil && records[i].Path == canonicalPath:
+			// git names the candidate's own canonical path, yet it no longer
+			// resolves: the filesystem changed during the pass, and the
+			// listing cannot say whether it holds the candidate. A record
+			// that fails to resolve under any other spelling cannot be the
+			// candidate and is skipped.
+			return nil, false
 		}
 	}
 	return nil, true

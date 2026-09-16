@@ -849,6 +849,15 @@ consistent with sections 1 to 12.
   - a path that changed while it was being resolved.
 
   Its errors carry at most the system cause, never the path.
+- **A listed record that no longer resolves.** Git lists realpaths, and
+  a record is the candidate when its inspected path equals the
+  candidate's canonical path. A record that fails inspection while its
+  own text equals that canonical path can only mean the filesystem
+  changed during the pass. The listing then counts as unobservable, with
+  the same outcomes as a failed listing read, so "not listed" never
+  decides `absent` or `released` on it. A record that fails inspection
+  under any other spelling cannot be the candidate and is skipped, so an
+  unrelated broken worktree does not hold up the repository.
 
 **Dispatch revalidation (`revalidateRetirementDispatch`).** Both claimed
 acts run it immediately before the spawn:

@@ -353,6 +353,32 @@ func TestInspectAttemptCheckout(t *testing.T) {
 			want: app.CheckoutVerdictForTest{Disposition: "removable", ListedPath: inspectCanonical},
 		},
 		{
+			name: "git's record of the candidate's canonical path no longer resolves: retained, never released",
+			setup: func(f *inspectFixture) {
+				f.addCheckout(fakeAttemptWorktree{})
+				f.failPath = inspectCanonical
+			},
+			want: app.CheckoutVerdictForTest{Disposition: "retained", Retained: app.RetainedInspectionFailed},
+		},
+		{
+			name: "git's record of a gone candidate's canonical path no longer resolves: retained, never absent",
+			setup: func(f *inspectFixture) {
+				f.addCheckout(fakeAttemptWorktree{})
+				f.mutate(func(w *fakeAttemptWorktree) { w.Present = false })
+				f.failPath = inspectCanonical
+			},
+			want: app.CheckoutVerdictForTest{Disposition: "retained", Retained: app.RetainedInspectionFailed},
+		},
+		{
+			name: "an unrelated listed checkout that no longer resolves is skipped: removable",
+			setup: func(f *inspectFixture) {
+				f.addCheckout(fakeAttemptWorktree{})
+				f.git.addAttemptWorktree("/private/var/wt/a-other", fakeAttemptWorktree{Head: f.head, Present: true})
+				f.failPath = "/private/var/wt/a-other"
+			},
+			want: app.CheckoutVerdictForTest{Disposition: "removable", ListedPath: inspectCanonical},
+		},
+		{
 			name: "the checkout path cannot be resolved: retained",
 			setup: func(f *inspectFixture) {
 				f.addCheckout(fakeAttemptWorktree{})
