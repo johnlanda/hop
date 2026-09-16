@@ -3,6 +3,7 @@ package app_test
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -36,7 +37,7 @@ func TestReviewFixReadPortsStayOutsideTransactions(t *testing.T) {
 		t.Fatalf("Begin() error = %v", err)
 	}
 	defer func() { _ = uow.Rollback() }() //nolint:errcheck // cleanup of a deliberately unused transaction.
-	if _, err := f.tc.Store.LoadFrozenRun(context.Background(), f.fr.RunID); err == nil {
+	if _, loadErr := f.tc.Store.LoadFrozenRun(context.Background(), f.fr.RunID); loadErr == nil {
 		t.Fatalf("LoadFrozenRun inside an open unit of work was not refused")
 	}
 	read, err := app.RequireWorkflowReadStore(f.tc.Store, "test")
@@ -45,6 +46,78 @@ func TestReviewFixReadPortsStayOutsideTransactions(t *testing.T) {
 	}
 	if _, err := read.LoadMessageDetail(context.Background(), f.fr.RunID, identity.MessageID("00000000-0000-4000-8000-000000000001")); err == nil || !strings.Contains(err.Error(), "unit of work is open") {
 		t.Fatalf("LoadMessageDetail inside an open unit of work was not refused: %v", err)
+	}
+}
+
+// TestReviewFixFenceRaceLosingCAS pins finding 1: a fence whose CAS
+// loses to a zombie publish landing on the integration ref journals
+// reconciling and reports OUTSTANDING work — the stop round never
+// commits stopped over the moved ref. The follow-through rounds resolve
+// the race through the fence's own recovery row: the observed head IS
+// the retired publish's candidate, so the fence settles failed, the
+// publish outcome is adopted (the integration enters checking on its
+// published candidate), and the stop reset rolls the candidate back
+// before the run stops.
+func TestReviewFixFenceRaceLosingCAS(t *testing.T) {
+	f := newIntegrationFixture(t, false)
+	id := f.seedIntegrationRow(t, run.IntegrationMerging, "")
+	merged := f.git.newCommit("tree-merged", f.base, f.src)
+	f.seedOperation(t, app.OpIntegrationPublish, app.OperationPending, map[string]any{
+		"integration_id":   id.String(),
+		"ref":              integrationRefName,
+		"new_oid":          merged,
+		"expected_old_oid": f.base,
+	}, nil)
+	row := f.tc.Store.Runs[f.fr.RunID]
+	row.value = row.value.RequestStop(f.tc.Clock.Now())
+	row.revision++
+	f.tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) { return app.PaneProcess{}, app.ErrPaneNotFound }
+
+	// The zombie publisher lands its ref move exactly while the fence's
+	// own update-ref runs: the fence CAS loses against a head it did not
+	// expect.
+	raced := false
+	f.tc.Commands.RunHook = func(ctx context.Context, cmd app.Command) (app.CommandResult, bool, error) {
+		if !raced && slices.Contains(cmd.Argv, "update-ref") {
+			raced = true
+			f.git.setRef(integrationRefName, merged)
+		}
+		return f.git.Hook(ctx, cmd)
+	}
+
+	report, err := f.tc.Controller.DriveFeatureStop(context.Background(), f.fr.Handle)
+	if err != nil {
+		t.Fatalf("DriveFeatureStop() round 1 error = %v", err)
+	}
+	if report.Terminated {
+		t.Fatalf("unsafe: stopped with an unresolved fence and a published unvalidated candidate; report=%+v", report)
+	}
+	if len(report.Outstanding) == 0 {
+		t.Fatalf("the losing fence CAS reported no outstanding work; report=%+v", report)
+	}
+
+	final := report
+	for i := 0; i < 6 && !final.Terminated; i++ {
+		final, err = f.tc.Controller.DriveFeatureStop(context.Background(), f.fr.Handle)
+		if err != nil {
+			t.Fatalf("DriveFeatureStop() round %d error = %v", i+2, err)
+		}
+	}
+	if !final.Terminated {
+		t.Fatalf("stop never terminated after the fence race resolved; report=%+v", final)
+	}
+	fences := f.opsOfKind(app.OpIntegrationFence)
+	if len(fences) != 1 || fences[0].State != app.OperationFailed {
+		t.Fatalf("fence operations = %+v, want exactly one, settled failed by its recovery row", fences)
+	}
+	if got := f.currentIntegrationRow(t).State; got != run.IntegrationRolledBack {
+		t.Fatalf("integration state = %s, want the adopted candidate rolled back under stop", got)
+	}
+	if head := f.git.ref(integrationRefName); head == merged {
+		t.Fatalf("the ref rests on the unvalidated candidate in a stopped run")
+	}
+	if got := f.tc.Store.Runs[f.fr.RunID].value.State; got != run.RunStopped {
+		t.Fatalf("run state = %s, want stopped only after quiescence", got)
 	}
 }
 

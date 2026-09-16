@@ -306,11 +306,11 @@ func (c *Controller) recoverIntegrationReset(ctx context.Context, handle RunHand
 			Reason:      intent.Reason,
 		})
 	case evidence.RollbackOID != "" && observed == intent.RejectedOID:
-		return "", c.actAndSettleReset(ctx, handle, frozen, op.ID, &intent, op.CreatedAt, intent.RejectedOID, evidence.RollbackOID)
+		return c.actAndSettleReset(ctx, handle, frozen, op.ID, &intent, op.CreatedAt, intent.RejectedOID, evidence.RollbackOID)
 	case evidence.RollbackOID == "" && observed == intent.RejectedOID:
 		// A prior orphaned commit-tree object is unreferenced and
 		// harmless; re-act from step (i).
-		return "", c.actAndSettleReset(ctx, handle, frozen, op.ID, &intent, op.CreatedAt, intent.RejectedOID, "")
+		return c.actAndSettleReset(ctx, handle, frozen, op.ID, &intent, op.CreatedAt, intent.RejectedOID, "")
 	default:
 		if err := c.markOperationReconciling(ctx, handle, op.ID, fmt.Sprintf("ref rests at %s; reset recovery is not decidable in place", observed)); err != nil {
 			return "", err
@@ -339,13 +339,62 @@ func (c *Controller) recoverIntegrationFence(ctx context.Context, handle RunHand
 	case evidence.FenceOID != "" && observed == evidence.FenceOID:
 		return "", c.settleFenceOutcome(ctx, handle, op.ID, &intent, evidence.FenceOID)
 	case observed == intent.ObservedHeadOID:
-		return "", c.actAndSettleFence(ctx, handle, frozen, op.ID, &intent, op.CreatedAt, evidence.FenceOID)
+		return c.actAndSettleFence(ctx, handle, frozen, op.ID, &intent, op.CreatedAt, evidence.FenceOID)
 	default:
+		// The losing-fence race: the zombie the fence meant to retire won
+		// instead — the ref reads as the RETIRED PUBLISH intent's own
+		// candidate. The fence settles failed through its own row (its
+		// purpose is moot: the expected-old it wanted to burn is gone) and
+		// the publish is adopted by observation, handing the published
+		// candidate to the standard rollback path. Each operation keeps
+		// its own evidence.
+		if resolved, zombieErr := c.adoptZombiePublishAfterFence(ctx, handle, op.ID, &intent, observed); zombieErr != nil {
+			return "", zombieErr
+		} else if resolved {
+			return "", nil
+		}
 		if err := c.markOperationReconciling(ctx, handle, op.ID, fmt.Sprintf("ref rests at %s, neither the fence nor the recorded head", observed)); err != nil {
 			return "", err
 		}
 		return fmt.Sprintf("integration.fence %s: ref rests at %s; reconciling", op.ID, observed), nil
 	}
+}
+
+// adoptZombiePublishAfterFence resolves the losing-fence race: when the
+// observed ref equals the retired publish intent's candidate, the zombie
+// CAS won — the fence settles failed and the publish is adopted, so the
+// integration enters checking on the published candidate and the
+// shutdown paths roll it back through the standard reset. resolved is
+// false when the observed ref is not the retired intent's candidate.
+func (c *Controller) adoptZombiePublishAfterFence(ctx context.Context, handle RunHandle, fenceOpID identity.OperationID, intent *integrationFenceIntent, observed string) (bool, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
+	if intent.RetiredOperationID == "" {
+		return false, nil
+	}
+	var retiredIntent integrationPublishIntent
+	decoded := false
+	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		retired, getErr := uow.Operations().Get(ctx, identity.OperationID(intent.RetiredOperationID))
+		if getErr != nil {
+			return getErr
+		}
+		if retired.Kind != OpIntegrationPublish {
+			return nil
+		}
+		retiredIntent, decoded = decodeOperationPayload[integrationPublishIntent](retired.Intent)
+		return nil
+	}); err != nil {
+		return false, err
+	}
+	if !decoded || retiredIntent.NewOID != observed {
+		return false, nil
+	}
+	if err := c.settleOperation(ctx, handle, fenceOpID, OperationFailed, fmt.Sprintf("the zombie publish won the race to %s; the fence's expected-old is gone and the standard rollback path retires the published candidate", observed)); err != nil {
+		return false, err
+	}
+	if err := c.adoptPublishOutcome(ctx, handle, identity.OperationID(intent.RetiredOperationID), &retiredIntent); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // recoverIntegrationCheck resolves one unresolved combined-check
@@ -536,7 +585,7 @@ func (c *Controller) retirePublishIntent(ctx context.Context, handle RunHandle, 
 		// candidate through the standard reset.
 		return "", c.adoptPublishOutcome(ctx, handle, op.ID, &intent)
 	case intent.ExpectedOldOID:
-		return "", c.fencePublishIntent(ctx, handle, frozen, op, &intent, observed)
+		return c.fencePublishIntent(ctx, handle, frozen, op, &intent, observed)
 	default:
 		return "", c.settleOperation(ctx, handle, op.ID, OperationFailed, fmt.Sprintf("expected-old %s is no longer current (ref at %s); the CAS is dead and the intent retired by observation", intent.ExpectedOldOID, observed))
 	}
@@ -544,10 +593,11 @@ func (c *Controller) retirePublishIntent(ctx context.Context, handle RunHandle, 
 
 // fencePublishIntent journals and drives one integration.fence operation
 // retiring a publish intent whose expected-old value is still current.
-func (c *Controller) fencePublishIntent(ctx context.Context, handle RunHandle, frozen *FrozenRun, publishOp *Operation, publishIntent *integrationPublishIntent, observedHead string) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
+// outstanding is non-empty while the fence has not settled.
+func (c *Controller) fencePublishIntent(ctx context.Context, handle RunHandle, frozen *FrozenRun, publishOp *Operation, publishIntent *integrationPublishIntent, observedHead string) (string, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
 	fenceOpID, err := c.newOperationID()
 	if err != nil {
-		return err
+		return "", err
 	}
 	intent := integrationFenceIntent{
 		Ref: publishIntent.Ref, ObservedHeadOID: observedHead,
@@ -561,7 +611,7 @@ func (c *Controller) fencePublishIntent(ctx context.Context, handle RunHandle, f
 			CreatedAt: now, UpdatedAt: now,
 		})
 	}); err != nil {
-		return fmt.Errorf("app: record integration.fence intent: %w", err)
+		return "", fmt.Errorf("app: record integration.fence intent: %w", err)
 	}
 	return c.actAndSettleFence(ctx, handle, frozen, fenceOpID, &intent, now, "")
 }
@@ -570,19 +620,28 @@ func (c *Controller) fencePublishIntent(ctx context.Context, handle RunHandle, f
 // carrying the observed head's tree with the head as parent, persist its
 // OID BEFORE the CAS (never only implied), then CAS — and settles the
 // fence and the intent it retires. persistedF, when non-empty, is an
-// already-recorded fence OID whose creation step is skipped.
-func (c *Controller) actAndSettleFence(ctx context.Context, handle RunHandle, frozen *FrozenRun, opID identity.OperationID, intent *integrationFenceIntent, intentTime time.Time, persistedF string) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
+// already-recorded fence OID whose creation step is skipped. outstanding
+// is non-empty when the fence was journaled reconciling instead of
+// settling — a LOSING fence CAS is an unsettled result the caller must
+// carry, never quiescence: the ref then holds whatever won the race
+// (ordinarily the zombie's unvalidated candidate), and the fence's own
+// recovery row resolves it on the next round.
+func (c *Controller) actAndSettleFence(ctx context.Context, handle RunHandle, frozen *FrozenRun, opID identity.OperationID, intent *integrationFenceIntent, intentTime time.Time, persistedF string) (string, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
 	fenceOID := persistedF
 	if fenceOID == "" {
 		if err := c.revalidateForDispatch(ctx, handle, true); err != nil {
-			return fmt.Errorf("app: revalidate before fence commit: %w", err)
+			return "", fmt.Errorf("app: revalidate before fence commit: %w", err)
 		}
 		actCtx, release := handle.actContext(ctx)
 		created, commitErr := c.runGitEnv(actCtx, frozen.RepositoryRoot, gitDeterministicCommitEnv(intentTime),
 			"commit-tree", intent.ObservedHeadOID+"^{tree}", "-p", intent.ObservedHeadOID, "-m", "hop fence "+opID.String())
 		release()
 		if commitErr != nil {
-			return c.markOperationReconciling(ctx, handle, opID, fmt.Sprintf("fence commit could not be created: %v", commitErr))
+			detail := fmt.Sprintf("fence commit could not be created: %v", commitErr)
+			if err := c.markOperationReconciling(ctx, handle, opID, detail); err != nil {
+				return "", err
+			}
+			return fmt.Sprintf("integration.fence %s: %s", opID, detail), nil
 		}
 		fenceOID = created
 		if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
@@ -594,12 +653,12 @@ func (c *Controller) actAndSettleFence(ctx context.Context, handle RunHandle, fr
 			op.UpdatedAt = c.Clock.Now()
 			return uow.Operations().Save(ctx, op)
 		}); err != nil {
-			return fmt.Errorf("app: persist fence commit OID: %w", err)
+			return "", fmt.Errorf("app: persist fence commit OID: %w", err)
 		}
 	}
 
 	if err := c.revalidateForDispatch(ctx, handle, true); err != nil {
-		return fmt.Errorf("app: revalidate before fence CAS: %w", err)
+		return "", fmt.Errorf("app: revalidate before fence CAS: %w", err)
 	}
 	actCtx, release := handle.actContext(ctx)
 	_, casErr := c.runGit(actCtx, frozen.RepositoryRoot, "update-ref", intent.Ref, fenceOID, intent.ObservedHeadOID)
@@ -607,10 +666,14 @@ func (c *Controller) actAndSettleFence(ctx context.Context, handle RunHandle, fr
 	if casErr != nil {
 		observed, obsErr := c.runGit(ctx, frozen.RepositoryRoot, "rev-parse", "--verify", intent.Ref)
 		if obsErr != nil || observed != fenceOID {
-			return c.markOperationReconciling(ctx, handle, opID, fmt.Sprintf("fence CAS refused (%v); observed ref %q", casErr, observed))
+			detail := fmt.Sprintf("fence CAS refused (%v); observed ref %q", casErr, observed)
+			if err := c.markOperationReconciling(ctx, handle, opID, detail); err != nil {
+				return "", err
+			}
+			return fmt.Sprintf("integration.fence %s: %s", opID, detail), nil
 		}
 	}
-	return c.settleFenceOutcome(ctx, handle, opID, intent, fenceOID)
+	return "", c.settleFenceOutcome(ctx, handle, opID, intent, fenceOID)
 }
 
 // settleFenceOutcome settles a landed fence and the ref-move intent it
@@ -675,14 +738,14 @@ func (c *Controller) retireResetIntent(ctx context.Context, handle RunHandle, fr
 			Reason:      intent.Reason,
 		})
 	case evidence.RollbackOID != "" && observed == intent.RejectedOID:
-		return "", c.actAndSettleReset(ctx, handle, frozen, op.ID, &intent, op.CreatedAt, intent.RejectedOID, evidence.RollbackOID)
+		return c.actAndSettleReset(ctx, handle, frozen, op.ID, &intent, op.CreatedAt, intent.RejectedOID, evidence.RollbackOID)
 	case observed == intent.RejectedOID:
-		return "", c.actAndSettleReset(ctx, handle, frozen, op.ID, &intent, op.CreatedAt, intent.RejectedOID, "")
+		return c.actAndSettleReset(ctx, handle, frozen, op.ID, &intent, op.CreatedAt, intent.RejectedOID, "")
 	default:
 		// The ref rests neither on the rejected candidate nor on the
 		// recorded R: rebuild the retirement commit against the observed
 		// head so the pre-merge content still wins.
-		return "", c.actAndSettleReset(ctx, handle, frozen, op.ID, &intent, op.CreatedAt, observed, "")
+		return c.actAndSettleReset(ctx, handle, frozen, op.ID, &intent, op.CreatedAt, observed, "")
 	}
 }
 

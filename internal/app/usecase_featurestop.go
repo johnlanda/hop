@@ -2,11 +2,45 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 
+	"github.com/johnlanda/hop/internal/domain/identity"
 	"github.com/johnlanda/hop/internal/domain/run"
 )
+
+// errRunNotQuiesced marks a stopped/failed commit refused because owned
+// work surfaced between the caller's outstanding checks and the terminal
+// transaction — the round reports outstanding work instead of a terminal
+// state.
+var errRunNotQuiesced = errors.New("run has unquiesced owned work")
+
+// assertRunQuiescedLocked re-validates, INSIDE the terminal transaction,
+// that no execution-bearing operation is pending and no integration
+// occupies the serial slot. The caller's own outstanding checks read
+// state that may have moved (a losing fence CAS journals reconciling and
+// returns unsettled; a racing zombie publish lands between rounds), so
+// the terminal commit re-derives quiescence from the transaction's own
+// repositories rather than trusting the earlier reads.
+func assertRunQuiescedLocked(ctx context.Context, uow UnitOfWork, wf WorkflowRepositories, runID identity.RunID) error {
+	ops, err := uow.Operations().Pending(ctx, runID)
+	if err != nil {
+		return err
+	}
+	for i := range ops {
+		switch ops[i].Kind {
+		case OpCheckRun, OpIntegrationMerge, OpIntegrationPublish, OpIntegrationReset, OpIntegrationFence:
+			return fmt.Errorf("%w: operation %s (%s) is pending", errRunNotQuiesced, ops[i].ID, ops[i].Kind)
+		}
+	}
+	if _, _, occupied, curErr := wf.Integrations().Current(ctx, runID); curErr != nil {
+		return curErr
+	} else if occupied {
+		return fmt.Errorf("%w: an integration occupies the serial slot", errRunNotQuiesced)
+	}
+	return nil
+}
 
 // DriveFeatureStop performs one round of stop interruption for a
 // feature-mode run: it retires every check and merge execution's process
@@ -81,11 +115,14 @@ func (c *Controller) DriveFeatureStop(ctx context.Context, handle RunHandle) (St
 	// settled interrupts; a published-but-unsettled candidate (checking)
 	// is rolled back by the reset; a check-failed one completes its
 	// pending rollback — a half-published rejected candidate is retired,
-	// not abandoned.
+	// not abandoned. A reset that journals without settling is
+	// outstanding work, never quiescence.
 	if len(outstanding) == 0 && refsOutstanding == "" {
-		if settleErr := c.settleIntegrationForStop(ctx, handle, &frozen); settleErr != nil {
+		still, settleErr := c.settleIntegrationForStop(ctx, handle, &frozen)
+		if settleErr != nil {
 			return StopReport{RunState: string(run.RunStopping)}, settleErr
 		}
+		note(still)
 	}
 
 	// Every owned session, manager included, under the close rule.
@@ -102,30 +139,38 @@ func (c *Controller) DriveFeatureStop(ctx context.Context, handle RunHandle) (St
 }
 
 // settleIntegrationForStop settles the run's current integration under
-// stop precedence: merging (merge already settled or never executed) →
-// interrupted; checking → the reset rolls the published candidate back;
-// check-failed → the reset completes.
-func (c *Controller) settleIntegrationForStop(ctx context.Context, handle RunHandle, frozen *FrozenRun) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
+// stop precedence through the shared shutdown procedure.
+func (c *Controller) settleIntegrationForStop(ctx context.Context, handle RunHandle, frozen *FrozenRun) (string, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
+	return c.settleIntegrationForShutdown(ctx, handle, frozen, "stop")
+}
+
+// settleIntegrationForShutdown settles the run's current integration on
+// a shutdown boundary (stop, or terminal failure): merging (merge
+// already settled or never executed) → interrupted; checking → the
+// reset rolls the published candidate back; check-failed → the reset
+// completes. cause names the boundary in the recorded reasons.
+// outstanding is non-empty while a reset journaled without settling.
+func (c *Controller) settleIntegrationForShutdown(ctx context.Context, handle RunHandle, frozen *FrozenRun, cause string) (string, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
 	integ, exists, err := c.currentIntegration(ctx, handle)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if !exists {
-		return nil
+		return "", nil
 	}
 	switch integ.State {
 	case run.IntegrationMerging:
-		return c.settleIntegrationTerminal(ctx, handle, frozen, integ.ID, integrationSettlement{
+		return "", c.settleIntegrationTerminal(ctx, handle, frozen, integ.ID, integrationSettlement{
 			OpID: "", OpState: "", OpOutcome: nil,
 			TargetState: run.IntegrationInterrupted,
-			Reason:      "stop before a candidate was published",
+			Reason:      cause + " before a candidate was published",
 		})
 	case run.IntegrationChecking:
-		return c.driveIntegrationReset(ctx, handle, frozen, &integ, "stop with a published-but-unsettled candidate")
+		return c.driveIntegrationReset(ctx, handle, frozen, &integ, cause+" with a published-but-unsettled candidate")
 	case run.IntegrationCheckFailed:
-		return c.driveIntegrationReset(ctx, handle, frozen, &integ, "stop completing a pending rollback")
+		return c.driveIntegrationReset(ctx, handle, frozen, &integ, cause+" completing a pending rollback")
 	default:
-		return nil
+		return "", nil
 	}
 }
 
@@ -223,6 +268,9 @@ func (c *Controller) finishFeatureStop(ctx context.Context, handle RunHandle) (S
 		if wfErr != nil {
 			return wfErr
 		}
+		if quiesceErr := assertRunQuiescedLocked(ctx, uow, wf, handle.runID); quiesceErr != nil {
+			return quiesceErr
+		}
 		generation := gen(handle.lease.Generation)
 		tasks, taskErr := wf.TaskIndex().ByRun(ctx, handle.runID)
 		if taskErr != nil {
@@ -279,6 +327,9 @@ func (c *Controller) finishFeatureStop(ctx context.Context, handle RunHandle) (S
 		}
 		return markRunStopped(ctx, uow, handle.runID, generation, now)
 	})
+	if errors.Is(err, errRunNotQuiesced) {
+		return StopReport{RunState: string(run.RunStopping), Outstanding: []string{err.Error()}}, nil
+	}
 	if err != nil {
 		return StopReport{}, fmt.Errorf("app: finish feature stop: %w", err)
 	}

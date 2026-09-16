@@ -280,10 +280,13 @@ func (c *Controller) DriveIntegration(ctx context.Context, handle RunHandle, hop
 	case run.IntegrationChecking:
 		return c.advanceChecking(ctx, handle, &frozen, hopPath, spawnEnv, &integ)
 	case run.IntegrationCheckFailed:
-		if err := c.driveIntegrationReset(ctx, handle, &frozen, &integ, "combined check failed"); err != nil {
-			return report, err
+		still, resetErr := c.driveIntegrationReset(ctx, handle, &frozen, &integ, "combined check failed")
+		if resetErr != nil {
+			return report, resetErr
 		}
-		return c.reportCurrentIntegrationState(ctx, handle, integ.ID)
+		final, reportErr := c.reportCurrentIntegrationState(ctx, handle, integ.ID)
+		final.Blocked = still
+		return final, reportErr
 	default:
 		return report, nil
 	}
@@ -952,11 +955,13 @@ func (c *Controller) settledIntegrationCheckReceipt(ctx context.Context, handle 
 // validated pre-merge tree with the rejected candidate as parent, R's
 // OID persisted BEFORE the CAS, then the compare-and-swap ref move and
 // the settling transaction (integration rolled-back, task consequence,
-// manager notice).
-func (c *Controller) driveIntegrationReset(ctx context.Context, handle RunHandle, frozen *FrozenRun, integ *run.Integration, reason string) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per reset.
+// manager notice). outstanding is non-empty when the reset journaled
+// but did NOT settle — a reconciling operation is an unsettled result,
+// never quiescence.
+func (c *Controller) driveIntegrationReset(ctx context.Context, handle RunHandle, frozen *FrozenRun, integ *run.Integration, reason string) (string, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per reset.
 	opID, err := c.newOperationID()
 	if err != nil {
-		return err
+		return "", err
 	}
 	ref := integrationRef(frozen.Snapshot.Workflow.IntegrationBranch)
 	intent := integrationResetIntent{
@@ -972,7 +977,7 @@ func (c *Controller) driveIntegrationReset(ctx context.Context, handle RunHandle
 			CreatedAt: now, UpdatedAt: now,
 		})
 	}); err != nil {
-		return fmt.Errorf("app: record integration.reset intent: %w", err)
+		return "", fmt.Errorf("app: record integration.reset intent: %w", err)
 	}
 	return c.actAndSettleReset(ctx, handle, frozen, opID, &intent, now, integ.MergeCommitOID, "")
 }
@@ -983,8 +988,12 @@ func (c *Controller) driveIntegrationReset(ctx context.Context, handle RunHandle
 // parent (the rejected candidate ordinarily; the fencing rule's reset
 // completion passes a later observed head). persistedR, when non-empty,
 // is an already-recorded rollback OID whose creation step is skipped
-// (the recovery rows "R recorded" cases).
-func (c *Controller) actAndSettleReset(ctx context.Context, handle RunHandle, frozen *FrozenRun, opID identity.OperationID, intent *integrationResetIntent, intentTime time.Time, expectedOld, persistedR string) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
+// (the recovery rows "R recorded" cases). outstanding is non-empty when
+// the operation was journaled reconciling instead of settling: a losing
+// CAS or a failed commit-tree is an UNSETTLED result the caller must
+// carry — returning nil alone would let a shutdown path mistake a
+// reconciling ref intent for quiescence.
+func (c *Controller) actAndSettleReset(ctx context.Context, handle RunHandle, frozen *FrozenRun, opID identity.OperationID, intent *integrationResetIntent, intentTime time.Time, expectedOld, persistedR string) (string, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
 	rollbackOID := persistedR
 	if rollbackOID == "" {
 		// Step (i): create R and persist its OID in act evidence — a plain
@@ -992,14 +1001,18 @@ func (c *Controller) actAndSettleReset(ctx context.Context, handle RunHandle, fr
 		// content and keeps the rejected candidate reachable as its
 		// parent.
 		if err := c.revalidateForDispatch(ctx, handle, true); err != nil {
-			return fmt.Errorf("app: revalidate before rollback commit: %w", err)
+			return "", fmt.Errorf("app: revalidate before rollback commit: %w", err)
 		}
 		actCtx, release := handle.actContext(ctx)
 		created, commitErr := c.runGitEnv(actCtx, frozen.RepositoryRoot, gitDeterministicCommitEnv(intentTime),
 			"commit-tree", intent.PremergeOID+"^{tree}", "-p", expectedOld, "-m", "hop rollback "+opID.String())
 		release()
 		if commitErr != nil {
-			return c.markOperationReconciling(ctx, handle, opID, fmt.Sprintf("rollback commit could not be created: %v", commitErr))
+			detail := fmt.Sprintf("rollback commit could not be created: %v", commitErr)
+			if err := c.markOperationReconciling(ctx, handle, opID, detail); err != nil {
+				return "", err
+			}
+			return fmt.Sprintf("integration.reset %s: %s", opID, detail), nil
 		}
 		rollbackOID = created
 		if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
@@ -1011,13 +1024,13 @@ func (c *Controller) actAndSettleReset(ctx context.Context, handle RunHandle, fr
 			op.UpdatedAt = c.Clock.Now()
 			return uow.Operations().Save(ctx, op)
 		}); err != nil {
-			return fmt.Errorf("app: persist rollback commit OID: %w", err)
+			return "", fmt.Errorf("app: persist rollback commit OID: %w", err)
 		}
 	}
 
 	// Step (ii): the compare-and-swap ref move.
 	if err := c.revalidateForDispatch(ctx, handle, true); err != nil {
-		return fmt.Errorf("app: revalidate before reset CAS: %w", err)
+		return "", fmt.Errorf("app: revalidate before reset CAS: %w", err)
 	}
 	actCtx, release := handle.actContext(ctx)
 	_, casErr := c.runGit(actCtx, frozen.RepositoryRoot, "update-ref", intent.Ref, rollbackOID, expectedOld)
@@ -1025,11 +1038,15 @@ func (c *Controller) actAndSettleReset(ctx context.Context, handle RunHandle, fr
 	if casErr != nil {
 		observed, obsErr := c.runGit(ctx, frozen.RepositoryRoot, "rev-parse", "--verify", intent.Ref)
 		if obsErr != nil || observed != rollbackOID {
-			return c.markOperationReconciling(ctx, handle, opID, fmt.Sprintf("reset CAS refused (%v); observed ref %q", casErr, observed))
+			detail := fmt.Sprintf("reset CAS refused (%v); observed ref %q", casErr, observed)
+			if err := c.markOperationReconciling(ctx, handle, opID, detail); err != nil {
+				return "", err
+			}
+			return fmt.Sprintf("integration.reset %s: %s", opID, detail), nil
 		}
 	}
 
-	return c.settleIntegrationTerminal(ctx, handle, frozen, identity.IntegrationID(intent.IntegrationID), integrationSettlement{
+	return "", c.settleIntegrationTerminal(ctx, handle, frozen, identity.IntegrationID(intent.IntegrationID), integrationSettlement{
 		OpID: opID, OpState: OperationSucceeded,
 		OpOutcome:   fmt.Sprintf("ref reset to rollback commit %s", rollbackOID),
 		TargetState: run.IntegrationRolledBack,
