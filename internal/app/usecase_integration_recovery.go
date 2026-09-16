@@ -743,7 +743,7 @@ func (c *Controller) actAndSettleFence(ctx context.Context, handle RunHandle, fr
 		return "", fmt.Errorf("app: revalidate before fence CAS: %w", err)
 	}
 	actCtx, release := handle.actContext(ctx)
-	_, casErr := c.runGit(actCtx, frozen.RepositoryRoot, "update-ref", intent.Ref, fenceOID, intent.ObservedHeadOID)
+	_, casErr := c.runGit(actCtx, frozen.RepositoryRoot, "update-ref", "--no-deref", intent.Ref, fenceOID, intent.ObservedHeadOID)
 	release()
 	if casErr != nil {
 		observed, obsErr := c.runGit(ctx, frozen.RepositoryRoot, "rev-parse", "--verify", intent.Ref)

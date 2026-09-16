@@ -78,12 +78,16 @@ func watchDetachSignals(d *deps, cancel context.CancelFunc) (stop func()) {
 	return stopNotify
 }
 
-// runRun implements `hop run "<brief>"`: it freezes and starts a run
-// through Controller.StartRun, prints "run <seq-label> <uuid> started",
-// then stays in the foreground controller loop until the run is terminal
-// or a signal detaches. Exit 0 only on completed; 1 on failed, stopped,
-// detach or error; 2 on usage, including every StartRun refusal that
-// happens before any side effect.
+// runRun implements `hop run "<brief>"`: it freezes and starts a run,
+// prints "run <seq-label> <uuid> started", then stays in the foreground
+// controller loop until the run is terminal or a signal detaches. The
+// workflow is `--workflow solo|feature` when given, else the repository's
+// [workflow] mode (solo by default), as Controller.ResolveRunWorkflow
+// decides: solo drives Controller.StartRun and the Phase 2 loop verbatim;
+// feature drives Controller.StartFeatureRun and the feature-mode loop.
+// Exit 0 only on completed; 1 on failed, stopped, detach or error; 2 on
+// usage, including every start refusal that happens before any side
+// effect.
 func runRun(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 	diagnostics := &recordingWriter{w: stderr}
 	flags := flag.NewFlagSet("hop run", flag.ContinueOnError)
@@ -95,11 +99,16 @@ func runRun(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 	_ = flags.String("herdr", "", "herdr binary (accepted as in doctor; unused by run)")
 	var passthrough stringList
 	flags.Var(&passthrough, "env-passthrough", "environment variable kept for the worker (repeatable; merged into the frozen policy)")
+	workflow := flags.String("workflow", "", "solo or feature (default: the repository's [workflow] mode, solo when unset)")
 	if err := flags.Parse(args); err != nil {
 		return exitUsage, diagnostics.err
 	}
 	if flags.NArg() != 1 {
 		_, err := fmt.Fprintln(stderr, "hop run: exactly one brief argument is required")
+		return exitUsage, err
+	}
+	if *workflow != "" && *workflow != app.WorkflowModeSolo && *workflow != app.WorkflowModeFeature {
+		_, err := fmt.Fprintf(stderr, "hop run: --workflow must be %s or %s\n", app.WorkflowModeSolo, app.WorkflowModeFeature)
 		return exitUsage, err
 	}
 	brief := flags.Arg(0)
@@ -135,7 +144,21 @@ func runRun(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 	}
 	defer closeStore() //nolint:errcheck // the store closes on process exit either way; commands report command errors, not pool teardown.
 
-	result, handle, err := ctrl.StartRun(ctx, app.StartRunRequest{
+	mode, err := ctrl.ResolveRunWorkflow(ctx, repoRoot, *workflow)
+	if err != nil {
+		code := exitFailure
+		if errors.Is(err, app.ErrStartRefused) {
+			code = exitUsage
+		}
+		_, werr := fmt.Fprintf(stderr, "hop run: %v\n", err)
+		return code, werr
+	}
+	start, finish := ctrl.StartRun, finishControllerLoop
+	if mode == app.WorkflowModeFeature {
+		start, finish = ctrl.StartFeatureRun, finishFeatureControllerLoop
+	}
+
+	result, handle, err := start(ctx, app.StartRunRequest{
 		RepositoryRoot: repoRoot,
 		Brief:          brief,
 		ControllerID:   d.newID(),
@@ -156,7 +179,7 @@ func runRun(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 		return exitFailure, err
 	}
 
-	return finishControllerLoop(ctx, d, ctrl, handle, result.RunID, label, hopPath, stdout, stderr, "hop run")
+	return finish(ctx, d, ctrl, handle, result.RunID, label, hopPath, stdout, stderr, "hop run")
 }
 
 // finishControllerLoop runs the shared foreground loop and maps its ending

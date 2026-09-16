@@ -27,7 +27,23 @@ const selectLease = `SELECT controller_id, generation, state, expires_at FROM ru
 // resolved root path), the run with its repository-scoped sequence number,
 // the frozen snapshot, the task, attempt and session rows, and the initial
 // controller lease at generation 1, in one immediate transaction.
+//
+// A feature-mode spec (Snapshot.Workflow.Feature()) branches: the same
+// transaction creates the run, the snapshot with its workflow JSON, the
+// manager session (role manager, no attempt, no parent, the pre-assigned
+// native reference) and the lease, and inserts no task, attempt or
+// worktree row (docs/plan/phase-3-design.md section 9). A malformed
+// feature spec is refused with app.ErrFeatureRunSpecInvalid before the
+// transaction begins, and a frozen integration branch that does not name
+// the assigned sequence with app.ErrRunSequenceMismatch inside it; the
+// one-manager partial unique index backs the manager row either way.
 func (s *Store) InitializeRun(ctx context.Context, spec app.NewRunSpec) (identity.RunID, app.Lease, error) { //nolint:gocritic // hugeParam: the port passes the spec by value; the adapter mirrors its signature.
+	feature := spec.Snapshot.Workflow.Feature()
+	if feature {
+		if err := app.ValidateFeatureRunSpec(&spec); err != nil {
+			return "", app.Lease{}, err
+		}
+	}
 	now := spec.Now
 	if now.IsZero() {
 		now = s.now()
@@ -45,6 +61,11 @@ func (s *Store) InitializeRun(ctx context.Context, spec app.NewRunSpec) (identit
 		).Scan(&seq); err != nil {
 			return fmt.Errorf("sqlite: next run sequence: %w", err)
 		}
+		if feature {
+			if err := app.RequireIntegrationBranchForSequence(&spec.Snapshot.Workflow, int(seq)); err != nil {
+				return err
+			}
+		}
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO runs (id, repository_id, seq, brief, brief_digest, state, stop_requested_at, revision, created_at, updated_at)
 			 VALUES (?, ?, ?, ?, ?, ?, NULL, 1, ?, ?)`,
@@ -54,6 +75,14 @@ func (s *Store) InitializeRun(ctx context.Context, spec app.NewRunSpec) (identit
 		}
 		if err := insertSnapshot(ctx, tx, spec.RunID, &spec.Snapshot, at); err != nil {
 			return err
+		}
+		if feature {
+			if err := insertManagerSession(ctx, tx, &spec, at); err != nil {
+				return err
+			}
+			granted, leaseErr := insertInitialLease(ctx, tx, &spec, now, at, s.leaseTTL)
+			lease = granted
+			return leaseErr
 		}
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO tasks (id, run_id, instructions_digest, state, revision, updated_at) VALUES (?, ?, ?, ?, 1, ?)`,
@@ -75,21 +104,44 @@ func (s *Store) InitializeRun(ctx context.Context, spec app.NewRunSpec) (identit
 		); err != nil {
 			return fmt.Errorf("sqlite: insert session: %w", err)
 		}
-		expires := now.Add(s.leaseTTL)
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO run_leases (run_id, controller_id, generation, state, acquired_at, heartbeat_at, expires_at)
-			 VALUES (?, ?, 1, ?, ?, ?, ?)`,
-			spec.RunID.String(), spec.ControllerID, leaseHeld, at, at, formatTime(expires),
-		); err != nil {
-			return fmt.Errorf("sqlite: insert initial lease: %w", err)
-		}
-		lease = app.Lease{Run: spec.RunID, ControllerID: spec.ControllerID, Generation: 1, ExpiresAt: expires}
-		return nil
+		granted, leaseErr := insertInitialLease(ctx, tx, &spec, now, at, s.leaseTTL)
+		lease = granted
+		return leaseErr
 	})
 	if err != nil {
 		return "", app.Lease{}, err
 	}
 	return spec.RunID, lease, nil
+}
+
+// insertManagerSession inserts a feature run's manager session: role
+// manager, no attempt, no parent, reserved, with the pre-assigned native
+// reference. The sessions_one_manager_per_run partial unique index makes a
+// second non-terminal manager for the run unrepresentable.
+func insertManagerSession(ctx context.Context, tx *sql.Tx, spec *app.NewRunSpec, at string) error {
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO sessions (id, run_id, attempt_id, parent_session_id, role, harness, native_session_ref, native_ref_source, state, revision, updated_at)
+		 VALUES (?, ?, NULL, NULL, ?, ?, ?, ?, ?, 1, ?)`,
+		spec.SessionID.String(), spec.RunID.String(), string(run.RoleManager), string(spec.Harness),
+		nullString(spec.NativeSessionRef), nativeRefSource(spec.NativeSessionRef), string(run.SessionReserved), at,
+	); err != nil {
+		return fmt.Errorf("sqlite: insert manager session: %w", err)
+	}
+	return nil
+}
+
+// insertInitialLease inserts the run's lease row, held at generation 1 by
+// the spec's controller, and returns the lease it grants.
+func insertInitialLease(ctx context.Context, tx *sql.Tx, spec *app.NewRunSpec, now time.Time, at string, ttl time.Duration) (app.Lease, error) {
+	expires := now.Add(ttl)
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO run_leases (run_id, controller_id, generation, state, acquired_at, heartbeat_at, expires_at)
+		 VALUES (?, ?, 1, ?, ?, ?, ?)`,
+		spec.RunID.String(), spec.ControllerID, leaseHeld, at, at, formatTime(expires),
+	); err != nil {
+		return app.Lease{}, fmt.Errorf("sqlite: insert initial lease: %w", err)
+	}
+	return app.Lease{Run: spec.RunID, ControllerID: spec.ControllerID, Generation: 1, ExpiresAt: expires}, nil
 }
 
 // nativeRefSource returns the stored native_ref_source for a pre-assigned

@@ -62,6 +62,77 @@ type fakeRuntime struct {
 	// server process identity could not be established (unknown).
 	ServerInstanceValue string
 	ServerInstanceErr   error
+
+	// CreateWorkspaceErr, CreateWorkspaceFn and FindWorkspaceByLabelFn
+	// script the WorkspaceRuntime half; CreateWorkspaceRequests and
+	// FindWorkspaceLabels record every call as received.
+	CreateWorkspaceErr      error
+	CreateWorkspaceFn       func(app.WorkspaceRequest) (app.WorkspaceHandle, error)
+	CreateWorkspaceRequests []app.WorkspaceRequest
+	FindWorkspaceByLabelFn  func(label string) (app.WorkspaceRef, bool, error)
+	FindWorkspaceLabels     []string
+	// Workspaces is what an unscripted FindWorkspaceByLabel resolves: every
+	// workspace an unscripted CreateWorkspace created, keyed by label, with
+	// the S8-pinned sole-tab/sole-root-pane shape.
+	Workspaces map[string]app.WorkspaceRef
+}
+
+var _ app.WorkspaceRuntime = (*fakeRuntime)(nil)
+
+// CreateWorkspace enforces the herdr adapter's documented request contract
+// (internal/adapters/herdr/workspace.go): an explicit absolute cwd and a
+// unique, non-empty creation label naming the workspace. The unscripted
+// response has the S8-pinned shape — the workspace, its sole tab and that
+// tab's sole root pane — and is remembered by label for recovery.
+func (r *fakeRuntime) CreateWorkspace(_ context.Context, req app.WorkspaceRequest) (app.WorkspaceHandle, error) {
+	if err := r.store.refuseInsideTransaction("WorkspaceRuntime.CreateWorkspace"); err != nil {
+		return app.WorkspaceHandle{}, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.CreateWorkspaceRequests = append(r.CreateWorkspaceRequests, req)
+	if !filepath.IsAbs(req.Cwd) {
+		return app.WorkspaceHandle{}, fmt.Errorf("app_test: WorkspaceRequest cwd is not an absolute path")
+	}
+	if req.Label == "" {
+		return app.WorkspaceHandle{}, fmt.Errorf("app_test: WorkspaceRequest carries no creation label; recovery by label would be impossible")
+	}
+	if r.CreateWorkspaceFn != nil {
+		return r.CreateWorkspaceFn(req)
+	}
+	if r.CreateWorkspaceErr != nil {
+		return app.WorkspaceHandle{}, r.CreateWorkspaceErr
+	}
+	r.nextPaneN++
+	handle := app.WorkspaceHandle{
+		WorkspaceID: fmt.Sprintf("workspace-%d", r.nextPaneN),
+		TabID:       fmt.Sprintf("tab-%d", r.nextPaneN),
+		PaneID:      fmt.Sprintf("pane-%d", r.nextPaneN),
+	}
+	if r.Workspaces == nil {
+		r.Workspaces = map[string]app.WorkspaceRef{}
+	}
+	r.Workspaces[req.Label] = app.WorkspaceRef(handle)
+	return handle, nil
+}
+
+// FindWorkspaceByLabel enforces the adapter's refusal of an empty lookup
+// label; unscripted, it resolves the workspaces CreateWorkspace created.
+func (r *fakeRuntime) FindWorkspaceByLabel(_ context.Context, label string) (app.WorkspaceRef, bool, error) {
+	if err := r.store.refuseInsideTransaction("WorkspaceRuntime.FindWorkspaceByLabel"); err != nil {
+		return app.WorkspaceRef{}, false, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.FindWorkspaceLabels = append(r.FindWorkspaceLabels, label)
+	if label == "" {
+		return app.WorkspaceRef{}, false, fmt.Errorf("app_test: find workspace by label: label must not be empty")
+	}
+	if r.FindWorkspaceByLabelFn != nil {
+		return r.FindWorkspaceByLabelFn(label)
+	}
+	ref, ok := r.Workspaces[label]
+	return ref, ok, nil
 }
 
 func newFakeRuntime() *fakeRuntime {

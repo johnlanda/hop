@@ -2,10 +2,12 @@ package herdr_test
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/johnlanda/hop/internal/adapters/herdr"
 	"github.com/johnlanda/hop/internal/app"
+	"github.com/johnlanda/hop/internal/testsupport/storevectors"
 )
 
 func TestRuntimeCreateWorkspace(t *testing.T) {
@@ -29,16 +31,46 @@ func TestRuntimeCreateWorkspace(t *testing.T) {
 		`{"cwd":"/repo","focus":false,"label":"hop-manager-1","env":{"HOP_RUN_ID":"r1"}}`)
 }
 
-func TestRuntimeCreateWorkspaceOmitsEmptyOptionalFields(t *testing.T) {
+func TestRuntimeCreateWorkspaceOmitsEmptyEnv(t *testing.T) {
 	runtime, got := startFakeRuntime(t, `{"type":"workspace_created",`+
 		`"workspace":{"workspace_id":"w1"},"tab":{"tab_id":"t1"},"root_pane":{"pane_id":"w1:p1"}}`)
 
-	_, err := runtime.CreateWorkspace(testContext(t), app.WorkspaceRequest{Cwd: "/repo"})
+	_, err := runtime.CreateWorkspace(testContext(t), app.WorkspaceRequest{Cwd: "/repo", Label: "op-1"})
 	if err != nil {
 		t.Fatalf("CreateWorkspace: %v", err)
 	}
 
-	assertRequestParams(t, <-got, "workspace.create", `{"cwd":"/repo","focus":false}`)
+	assertRequestParams(t, <-got, "workspace.create", `{"cwd":"/repo","focus":false,"label":"op-1"}`)
+}
+
+// TestRuntimeCreateWorkspaceRefusesInvalidRequests drives the shared
+// storevectors.WorkspaceRequestsRefused vectors (internal/app's fake
+// runtime refuses the identical requests): each is refused with its typed
+// error, echoes no value, and sends nothing.
+func TestRuntimeCreateWorkspaceRefusesInvalidRequests(t *testing.T) {
+	for _, vector := range storevectors.WorkspaceRequestsRefused() {
+		t.Run(vector.Name, func(t *testing.T) {
+			runtime, got := startFakeRuntime(t, `{"type":"workspace_created",`+
+				`"workspace":{"workspace_id":"w1"},"tab":{"tab_id":"t1"},"root_pane":{"pane_id":"w1:p1"}}`)
+
+			handle, err := runtime.CreateWorkspace(testContext(t), vector.Request)
+
+			if !errors.Is(err, herdr.ErrWorkspaceCwdNotAbsolute) && !errors.Is(err, herdr.ErrWorkspaceLabelRequired) {
+				t.Fatalf("CreateWorkspace(%s) error = %v, want a typed argument refusal", vector.Name, err)
+			}
+			if vector.Request.Cwd != "" && strings.Contains(err.Error(), vector.Request.Cwd) {
+				t.Errorf("the refusal echoes the refused cwd: %v", err)
+			}
+			if handle != (app.WorkspaceHandle{}) {
+				t.Errorf("handle = %+v, want the zero value", handle)
+			}
+			select {
+			case <-got:
+				t.Errorf("CreateWorkspace(%s) sent a request", vector.Name)
+			default:
+			}
+		})
+	}
 }
 
 func TestRuntimeCreateWorkspaceNeverRequestsFocus(t *testing.T) {
@@ -66,7 +98,7 @@ func TestRuntimeCreateWorkspaceNeverRequestsFocus(t *testing.T) {
 func TestRuntimeCreateWorkspaceMapsAPIError(t *testing.T) {
 	runtime := startFakeRuntimeError(t, "invalid_cwd", "cwd does not exist")
 
-	_, err := runtime.CreateWorkspace(testContext(t), app.WorkspaceRequest{Cwd: "/nope"})
+	_, err := runtime.CreateWorkspace(testContext(t), app.WorkspaceRequest{Cwd: "/nope", Label: "op-1"})
 
 	var apiErr *herdr.APIError
 	if !errors.As(err, &apiErr) || apiErr.Code != "invalid_cwd" {
@@ -89,7 +121,7 @@ func TestRuntimeCreateWorkspaceMapsPartialResponse(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			runtime, _ := startFakeRuntime(t, tc.result)
 
-			handle, err := runtime.CreateWorkspace(testContext(t), app.WorkspaceRequest{Cwd: "/repo"})
+			handle, err := runtime.CreateWorkspace(testContext(t), app.WorkspaceRequest{Cwd: "/repo", Label: "op-1"})
 
 			if err == nil {
 				t.Fatalf("CreateWorkspace with a %s response did not error; handle = %+v", tc.name, handle)

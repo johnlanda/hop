@@ -25,11 +25,7 @@ type mailboxFixture struct {
 func newMailboxFixtureAt(t *testing.T, store *sqlite.Store, clock *fakeClock) *mailboxFixture {
 	t.Helper()
 	spec := newSpec("/repos/mailbox", specStride, clock.Now())
-	spec.Snapshot.Workflow = featureWorkflow()
-	_, lease, err := store.InitializeRun(t.Context(), spec)
-	if err != nil {
-		t.Fatalf("InitializeRun: %v", err)
-	}
+	lease := initLegacyFeatureRun(t, store, &spec)
 	f := &featureFixture{
 		fixture:            &fixture{store: store, clock: clock, spec: spec, lease: lease},
 		ManagerID:          identity.SessionID(uid(offManager)),

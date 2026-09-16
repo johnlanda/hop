@@ -5,10 +5,9 @@
 // worker through Herdr. It exists solely for cmd/hop's real-binary
 // grammar contract tests (docs/plan/phase-3-design.md section 11), which
 // need a fixture state root behind the built hop binary but must never
-// start a Herdr server: none of Phase 3's own verbs can bootstrap a
-// feature-mode run through the CLI (that is slice 6b's `hop run
-// --workflow feature`), so the fixture has to be built directly against
-// the store.
+// start a Herdr server: the only CLI bootstrap of a feature-mode run,
+// `hop run --workflow feature`, places the manager through Herdr, so the
+// fixture has to be built directly against the store.
 //
 // Every exported identity is a plain string and every exported parameter
 // or return type is either a string or a type from internal/app: cmd/hop
@@ -25,13 +24,13 @@
 // One exception stays out of this package by the manager's own ruling:
 // promoting a seeded run to feature mode requires writing the frozen
 // app.WorkflowSnapshot into run_snapshots.workflow, a raw SQL write
-// against the store file (InitializeRun always writes NULL there —
-// solo — and no port method sets it after the fact; that is slice 6b's
-// future `hop run --workflow feature` bootstrap, not this pre-6b
-// technique). That single write lives in cmd/hop's own test file, using
-// database/sql directly, because composition code may import any
-// standard package and the sqlite driver is registered by cmd/hop's own
-// adapter import — see cmd/hop/grammarcontract_fixture_test.go's
+// against the store file (the solo InitializeRun this package drives
+// writes NULL there, and no port method sets it after the fact; the
+// feature InitializeRun creates its own manager session and refuses the
+// solo base this package seeds). That single write lives in cmd/hop's
+// own test file, using database/sql directly, because composition code
+// may import any standard package and the sqlite driver is registered by
+// cmd/hop's own adapter import — see cmd/hop/grammarcontract_seed_test.go's
 // freezeWorkflowSnapshot.
 package hopfixtures
 

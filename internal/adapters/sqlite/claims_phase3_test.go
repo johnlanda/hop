@@ -148,11 +148,7 @@ func TestClaimLaunchManagerSession(t *testing.T) {
 	clock := newFakeClock()
 	store := openStoreAt(t, t.TempDir(), clock)
 	spec := newSpec("/repos/manager-claim", specStride, clock.Now())
-	spec.Snapshot.Workflow = featureWorkflow()
-	_, lease, err := store.InitializeRun(t.Context(), spec)
-	if err != nil {
-		t.Fatalf("InitializeRun: %v", err)
-	}
+	lease := initLegacyFeatureRun(t, store, &spec)
 	f := &featureFixture{fixture: &fixture{store: store, clock: clock, spec: spec, lease: lease}}
 	managerID := identity.SessionID(uid(7731))
 	incarnation := identity.IncarnationID(uid(7732))

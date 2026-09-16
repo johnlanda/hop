@@ -456,7 +456,7 @@ func (c *Controller) recoverPaneOpen(ctx context.Context, handle RunHandle, op *
 
 // recordBoundedWait persists the ambiguous operation's wait window as act
 // evidence, once, so the deadline a later round enforces is durable.
-func (c *Controller) recordBoundedWait(ctx context.Context, handle RunHandle, op *Operation, window time.Duration, detail string) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per ambiguous round.
+func (c *Controller) recordBoundedWait(ctx context.Context, handle RunHandle, op *Operation, window time.Duration, detail string) error { //nolint:gocritic,unparam // hugeParam: RunHandle carries a Lease value by design; called once per ambiguous round. unparam: each caller passes its own named window (worktree, launch, workspace); they share a value today, not a meaning.
 	if recorded, ok := decodeOperationPayload[boundedWaitEvidence](op.ActEvidence); ok && recorded.WaitingSince != "" {
 		return nil
 	}

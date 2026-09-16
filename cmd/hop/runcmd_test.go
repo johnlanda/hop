@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -327,4 +329,265 @@ func TestRunRun(t *testing.T) {
 			t.Errorf("stderr echoes the refused value: %q", stderr.String())
 		}
 	})
+}
+
+// TestRunRunWorkflowDispatch pins hop run's --workflow surface (design
+// section 10): the resolved workflow selects StartRun and the Phase 2
+// loop, or StartFeatureRun and the feature-mode loop, and the exit codes
+// keep the Phase 2 discipline for both.
+func TestRunRunWorkflowDispatch(t *testing.T) {
+	env := map[string]string{"HOME": "/home/u", "PATH": "/bin"}
+	started := func(seq int) func(app.StartRunRequest) (app.StartRunResult, app.RunHandle, error) {
+		return func(app.StartRunRequest) (app.StartRunResult, app.RunHandle, error) {
+			return app.StartRunResult{RunID: testRunID, Sequence: seq}, app.RunHandle{}, nil
+		}
+	}
+	contains := func(calls []string, name string) bool {
+		for _, call := range calls {
+			if call == name {
+				return true
+			}
+		}
+		return false
+	}
+
+	for _, tt := range []struct {
+		name         string
+		args         []string
+		resolved     string
+		wantOverride string
+		wantFeature  bool
+	}{
+		{"no flag, solo policy: StartRun and the solo loop", []string{"brief"}, app.WorkflowModeSolo, "", false},
+		{"no flag, feature policy: StartFeatureRun and the feature loop", []string{"brief"}, app.WorkflowModeFeature, "", true},
+		{"--workflow feature overrides the policy", []string{"-workflow", "feature", "brief"}, app.WorkflowModeFeature, app.WorkflowModeFeature, true},
+		{"--workflow solo overrides the policy", []string{"--workflow=solo", "brief"}, app.WorkflowModeSolo, app.WorkflowModeSolo, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctrl := &fakeController{}
+			var gotOverride, gotRoot string
+			ctrl.resolveRunWorkflow = func(root, override string) (string, error) {
+				gotRoot, gotOverride = root, override
+				return tt.resolved, nil
+			}
+			var request app.StartRunRequest
+			start := func(req app.StartRunRequest) (app.StartRunResult, app.RunHandle, error) {
+				request = req
+				return started(4)(req)
+			}
+			if tt.wantFeature {
+				ctrl.startFeatureRun = start
+			} else {
+				ctrl.startRun = start
+			}
+			ctrl.status = scriptStatus(detailStep("running", "running", false), detailStep("completed", "completed", false))
+			repo := t.TempDir()
+			td := newTestDeps(ctrl, env, repo)
+			var stdout, stderr bytes.Buffer
+
+			code, err := runRun(tt.args, &stdout, &stderr, td.deps)
+			if err != nil {
+				t.Fatalf("write error: %v", err)
+			}
+			if code != exitOK {
+				t.Fatalf("exit code = %d, want %d (stderr: %s)", code, exitOK, stderr.String())
+			}
+			if gotOverride != tt.wantOverride || gotRoot != request.RepositoryRoot || gotRoot == "" {
+				t.Fatalf("ResolveRunWorkflow(%q, %q), start root %q; want the override %q and the resolved repository root", gotRoot, gotOverride, request.RepositoryRoot, tt.wantOverride)
+			}
+			if request.Brief != "brief" || request.HOPPath != "/opt/hop/bin/hop" || request.StateRoot != "/home/u/.local/state/hop" || request.ControllerID == "" {
+				t.Fatalf("start request = %+v", request)
+			}
+			if !strings.Contains(stdout.String(), "run r4 "+testRunID+" started\n") {
+				t.Fatalf("stdout lacks the start line:\n%s", stdout.String())
+			}
+			calls := ctrl.recorded()
+			if contains(calls, "StartRun") == tt.wantFeature || contains(calls, "StartFeatureRun") != tt.wantFeature {
+				t.Fatalf("calls = %v; want exactly the %v start", calls, map[bool]string{true: "feature", false: "solo"}[tt.wantFeature])
+			}
+			if contains(calls, "CorroborateSessionLaunches") != tt.wantFeature || contains(calls, "ClaimAndRunCheck") == tt.wantFeature {
+				t.Fatalf("calls = %v; want the %s loop", calls, map[bool]string{true: "feature", false: "solo"}[tt.wantFeature])
+			}
+		})
+	}
+
+	for _, tt := range []struct {
+		name     string
+		args     []string
+		resolve  func(string, string) (string, error)
+		start    func(app.StartRunRequest) (app.StartRunResult, app.RunHandle, error)
+		status   []app.StatusResult
+		wantCode int
+		wantErr  string
+		wantOpen bool
+	}{
+		{
+			name: "an unknown --workflow is a usage error before the store opens",
+			args: []string{"-workflow", "parallel", "brief"}, wantCode: exitUsage,
+			wantErr: "--workflow must be solo or feature",
+		},
+		{
+			name:     "a refused resolution is a usage error",
+			args:     []string{"brief"},
+			resolve:  func(string, string) (string, error) { return "", fmt.Errorf("%w: bad", app.ErrStartRefused) },
+			wantCode: exitUsage, wantErr: "hop run:", wantOpen: true,
+		},
+		{
+			name:    "a feature refusal before any side effect is a usage error",
+			args:    []string{"-workflow", "feature", "brief"},
+			resolve: func(_, o string) (string, error) { return o, nil },
+			start: func(app.StartRunRequest) (app.StartRunResult, app.RunHandle, error) {
+				return app.StartRunResult{}, app.RunHandle{}, fmt.Errorf("%w: load repository policy: bad key", app.ErrStartRefused)
+			},
+			wantCode: exitUsage, wantErr: "hop run: app: run refused before any side effect: load repository policy: bad key", wantOpen: true,
+		},
+		{
+			name:    "a feature failure after InitializeRun exits 1",
+			args:    []string{"-workflow", "feature", "brief"},
+			resolve: func(_, o string) (string, error) { return o, nil },
+			start: func(app.StartRunRequest) (app.StartRunResult, app.RunHandle, error) {
+				return app.StartRunResult{}, app.RunHandle{}, fmt.Errorf("%w: refs/heads/hop/r1/integration is already present", app.ErrIntegrationBranchExists)
+			},
+			wantCode: exitFailure, wantErr: "refs/heads/hop/r1/integration", wantOpen: true,
+		},
+		{
+			name:     "a failed feature run exits 1",
+			args:     []string{"-workflow", "feature", "brief"},
+			resolve:  func(_, o string) (string, error) { return o, nil },
+			start:    started(1),
+			status:   []app.StatusResult{detailStep("launching", "", false), detailStep("failed", "", false)},
+			wantCode: exitFailure, wantOpen: true,
+		},
+		{
+			name:     "a stopped feature run exits 1",
+			args:     []string{"-workflow", "feature", "brief"},
+			resolve:  func(_, o string) (string, error) { return o, nil },
+			start:    started(1),
+			status:   []app.StatusResult{detailStep("stopped", "", false)},
+			wantCode: exitFailure, wantOpen: true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctrl := &fakeController{resolveRunWorkflow: tt.resolve, startFeatureRun: tt.start}
+			if len(tt.status) > 0 {
+				ctrl.status = scriptStatus(tt.status...)
+			}
+			td := newTestDeps(ctrl, env, t.TempDir())
+			var stdout, stderr bytes.Buffer
+
+			code, err := runRun(tt.args, &stdout, &stderr, td.deps)
+			if err != nil {
+				t.Fatalf("write error: %v", err)
+			}
+			if code != tt.wantCode {
+				t.Fatalf("exit code = %d, want %d (stderr: %s)", code, tt.wantCode, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), tt.wantErr) {
+				t.Fatalf("stderr = %q, want it to contain %q", stderr.String(), tt.wantErr)
+			}
+			if opened := len(td.openCalls) > 0; opened != tt.wantOpen {
+				t.Fatalf("store opened = %v, want %v", opened, tt.wantOpen)
+			}
+			if tt.wantOpen && !td.openCalls[0].withRuntime {
+				t.Fatalf("hop run must wire the runtime for either workflow")
+			}
+		})
+	}
+
+	t.Run("SIGINT detaches a feature run without stopping it", func(t *testing.T) {
+		ctrl := &fakeController{startFeatureRun: started(2)}
+		td := newTestDeps(ctrl, env, t.TempDir())
+		statusCalls := 0
+		ctrl.status = func(app.StatusRequest) (app.StatusResult, error) {
+			statusCalls++
+			if statusCalls == 2 {
+				td.signals <- syscall.SIGINT
+			}
+			return detailStep("launching", "", false), nil
+		}
+		var stdout, stderr bytes.Buffer
+
+		code, err := runRun([]string{"-workflow", "feature", "brief"}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitFailure || !strings.Contains(stdout.String(), "resume with: hop resume "+testRunID) {
+			t.Fatalf("exit %d, stdout %q; want the detach exit and the resume instruction", code, stdout.String())
+		}
+		calls := ctrl.recorded()
+		if !contains(calls, "Detach") || contains(calls, "RequestStop") || contains(calls, "DriveFeatureStop") {
+			t.Fatalf("calls = %v; a signal detaches and never stops", calls)
+		}
+	})
+}
+
+// TestRunFeatureFromRepositorySubdirectory proves a feature run started
+// while the working directory is a subdirectory of the repository is
+// scheduled in the root it froze: hop run hands StartFeatureRun the -C
+// repository (the invoking directory only when -C is absent), and the
+// feature loop's AssignReadyTasks receives exactly the frozen roots
+// AssignmentDefaults serves — never the invoking directory. The scripted
+// start freezes the request's roots, as the real StartFeatureRun does
+// (internal/app TestStartFeatureRunHandsOffToLaunchCorroboration pins
+// AssignmentDefaults against the bootstrap's request).
+func TestRunFeatureFromRepositorySubdirectory(t *testing.T) {
+	env := map[string]string{"HOME": "/home/u", "PATH": "/bin"}
+	for _, tt := range []struct {
+		name     string
+		withC    bool
+		wantRoot func(repo, sub string) string
+	}{
+		{"-C names the repository", true, func(repo, _ string) string { return repo }},
+		{"no -C: the invoking directory is the repository hop run was given", false, func(_, sub string) string { return sub }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			repo, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatalf("resolve temp dir: %v", err)
+			}
+			sub := filepath.Join(repo, "pkg", "inner")
+			if mkErr := os.MkdirAll(sub, 0o700); mkErr != nil {
+				t.Fatalf("mkdir: %v", mkErr)
+			}
+			ctrl := &fakeController{}
+			var request app.StartRunRequest
+			ctrl.startFeatureRun = func(req app.StartRunRequest) (app.StartRunResult, app.RunHandle, error) {
+				request = req
+				ctrl.frozenRepositoryRoot, ctrl.frozenStateRoot = req.RepositoryRoot, req.StateRoot
+				return app.StartRunResult{RunID: testRunID, Sequence: 1}, app.RunHandle{}, nil
+			}
+			var assigned []app.AssignmentOptions
+			ctrl.assignReadyTasks = func(opts app.AssignmentOptions) (app.AssignmentReport, error) {
+				assigned = append(assigned, opts)
+				return app.AssignmentReport{}, nil
+			}
+			ctrl.status = scriptStatus(detailStep("running", "", false), detailStep("running", "", false), detailStep("completed", "", false))
+			td := newTestDeps(ctrl, env, sub)
+			args := []string{"-workflow", "feature", "brief"}
+			if tt.withC {
+				args = append([]string{"-C", repo}, args...)
+			}
+			var stdout, stderr bytes.Buffer
+
+			code, err := runRun(args, &stdout, &stderr, td.deps)
+			if err != nil {
+				t.Fatalf("write error: %v", err)
+			}
+			if code != exitOK {
+				t.Fatalf("exit code = %d, want %d (stderr: %s)", code, exitOK, stderr.String())
+			}
+			want := tt.wantRoot(repo, sub)
+			if request.RepositoryRoot != want || request.StateRoot != "/home/u/.local/state/hop" {
+				t.Fatalf("StartFeatureRun roots = %q, %q; want %q and the resolved state root", request.RepositoryRoot, request.StateRoot, want)
+			}
+			if len(assigned) == 0 {
+				t.Fatalf("the feature loop never assigned; calls = %v", ctrl.recorded())
+			}
+			for _, opts := range assigned {
+				if opts.RepositoryRoot != want || opts.StateRoot != request.StateRoot || opts.HOPPath != "/opt/hop/bin/hop" {
+					t.Fatalf("AssignReadyTasks options = %+v; want the frozen roots %q, %q", opts, want, request.StateRoot)
+				}
+			}
+		})
+	}
 }

@@ -42,7 +42,7 @@ func newTestController(policy app.RunPolicy) *testController { //nolint:gocritic
 	return &testController{
 		Controller: &app.Controller{
 			Store: store, Read: store, Submissions: store,
-			Runtime: runtime, Artifacts: artifacts, Clock: clock, IDs: ids,
+			Runtime: runtime, Workspaces: runtime, Artifacts: artifacts, Clock: clock, IDs: ids,
 			Commands: commands, Groups: groups, Config: config,
 			// Phase 3: fakeStore also implements MessagingStore/PlanStore/
 			// ReviewStore; wiring them here does not change any Phase 2

@@ -802,7 +802,7 @@ func TestRuntimeHonorsCancellation(t *testing.T) {
 		{"InspectPane", func(ctx context.Context) error { _, err := runtime.InspectPane(ctx, "w1:p1"); return err }},
 		{"ClosePane", func(ctx context.Context) error { return runtime.ClosePane(ctx, "w1:p1") }},
 		{"CreateWorkspace", func(ctx context.Context) error {
-			_, err := runtime.CreateWorkspace(ctx, app.WorkspaceRequest{Cwd: "/repo"})
+			_, err := runtime.CreateWorkspace(ctx, app.WorkspaceRequest{Cwd: "/repo", Label: "op-1"})
 			return err
 		}},
 		{"FindWorkspaceByLabel", func(ctx context.Context) error {

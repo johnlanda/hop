@@ -9,10 +9,10 @@ application's store port interfaces (`app.StateStore`, `app.SubmissionStore`,
 (`docs/plan/phase-3-design.md` section 11, L1569;
 `cmd/hop/grammarcontract_*_test.go`). Those tests exec the built `hop`
 binary against a fixture state root and must never start a Herdr server
-or call `hop run` (which places a worker through Herdr) — but none of
-Phase 3's own verbs can bootstrap a feature-mode run through the CLI
-either (that is slice 6b's `hop run --workflow feature`), so the fixture
-state has to be built directly against the store, through the SAME
+or call `hop run` (which places a worker, or with `--workflow feature`
+the manager, through Herdr) — the only CLI bootstrap of a feature-mode
+run — so the fixture state has to be built directly against the store,
+through the SAME
 `internal/adapters/sqlite` production package `cmd/hop/compose.go`
 wires — this package makes that possible without `cmd/hop`'s test files
 ever importing a domain type, which `internal/arch_test.go`'s
@@ -46,9 +46,11 @@ seeding library.
   architecture checker forbids from importing them (composition category,
   enforced on `_test.go` files too).
 - This package does NOT write `run_snapshots.workflow` (the frozen
-  feature-mode policy `InitializeRun` always leaves NULL). That one raw
+  feature-mode policy the solo `InitializeRun` this package drives leaves
+  NULL; the feature `InitializeRun` creates its own manager session and
+  refuses the solo base `Initialize` seeds). That one raw
   SQL write against the store file stays in `cmd/hop`'s own test file
-  (`grammarcontract_fixture_test.go`'s `freezeWorkflowSnapshot`), by the
+  (`grammarcontract_seed_test.go`'s `freezeWorkflowSnapshot`), by the
   manager's own ruling: composition code may import any standard package
   (`database/sql`), and the sqlite driver is registered transitively by
   `cmd/hop`'s own `internal/adapters/sqlite` import — this package has no

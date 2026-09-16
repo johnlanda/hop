@@ -139,7 +139,14 @@ func (c *Controller) corroborateSessionLaunch(ctx context.Context, handle RunHan
 		// whose session activation — or, for the manager, the run's own
 		// launching->running consequence — was lost): apply what is still
 		// missing, idempotently. No fresh occupant evidence is available
-		// here.
+		// here. Settlement happens only against a bound pane, so a
+		// settled claim with no binding waits for the label recovery.
+		if !bindingFound {
+			if recoverErr := c.recoverSessionBindingByLabel(ctx, handle, session, bindingFound, binding); recoverErr != nil {
+				return "", recoverErr
+			}
+			return LaunchPending, nil
+		}
 		if runErr := c.settleManagerRunRunningIfNeeded(ctx, handle, session); runErr != nil {
 			return "", runErr
 		}

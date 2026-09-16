@@ -47,6 +47,7 @@ func newIntegrationFixture(t *testing.T, srcIsAncestor bool) *integrationFixture
 
 	git := newFakeGitRepo("/usr/bin/git", integrationHopPath)
 	tc.Commands.RunHook = git.Hook
+	t.Cleanup(func() { git.requireNoDerefUpdates(t) })
 
 	var base, src string
 	if srcIsAncestor {
@@ -1002,7 +1003,7 @@ func TestIntegrationBarrierUnmovedHeadWindow(t *testing.T) {
 
 		// A's late CAS, dispatched after the retirement: expected-old
 		// burned, dead at the ref store.
-		result := f.git.runGitArgv([]string{"update-ref", integrationRefName, merged, f.base})
+		result := f.git.runGitArgv([]string{"update-ref", "--no-deref", integrationRefName, merged, f.base})
 		if result.ExitCode == 0 {
 			t.Fatalf("A's zombie publish CAS succeeded; the fencing rule must have burned its expected-old value")
 		}
@@ -1015,7 +1016,7 @@ func TestIntegrationBarrierUnmovedHeadWindow(t *testing.T) {
 		f := newIntegrationFixture(t, false)
 		merged := seedPendingPublish(t, f)
 		// A's CAS wins the race before the retirement runs.
-		if result := f.git.runGitArgv([]string{"update-ref", integrationRefName, merged, f.base}); result.ExitCode != 0 {
+		if result := f.git.runGitArgv([]string{"update-ref", "--no-deref", integrationRefName, merged, f.base}); result.ExitCode != 0 {
 			t.Fatalf("the zombie CAS could not land: %s", result.Stderr)
 		}
 		requestStop(f)
@@ -1137,10 +1138,10 @@ func TestIntegrationBarrierZombieAfterTakeover(t *testing.T) {
 
 	// A resumes: its zombie publish CAS (expected-old = the original
 	// pre-merge head) dies at the ref store under never-revisit.
-	if result := f.git.runGitArgv([]string{"update-ref", integrationRefName, merged, f.base}); result.ExitCode == 0 {
+	if result := f.git.runGitArgv([]string{"update-ref", "--no-deref", integrationRefName, merged, f.base}); result.ExitCode == 0 {
 		t.Fatalf("A's zombie publish CAS succeeded against the advanced branch")
 	}
-	if result := f.git.runGitArgv([]string{"update-ref", integrationRefName, f.base, merged}); result.ExitCode == 0 {
+	if result := f.git.runGitArgv([]string{"update-ref", "--no-deref", integrationRefName, f.base, merged}); result.ExitCode == 0 {
 		t.Fatalf("A's zombie reset CAS succeeded against the advanced branch")
 	}
 	if got := f.git.ref(integrationRefName); got != head {
