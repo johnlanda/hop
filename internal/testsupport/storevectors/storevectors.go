@@ -28,18 +28,23 @@ import (
 	"github.com/johnlanda/hop/internal/domain/run"
 )
 
+// TaskCreateSelfDependencyReason is TaskCreateSelfDependency's expected
+// refusal reason token.
+const TaskCreateSelfDependencyReason = app.GrammarReasonDependencyCycle
+
 // TaskCreateSelfDependency returns a PlanStore.CreateTask request whose
 // sole dependency is its own not-yet-created task id — the cheapest
 // possible malformed dependency graph, needing no pre-existing graph
-// state. Refused app.WorkflowRefused, detail "dependency is not in this
-// run": CreateTask resolves DependsOn against already-persisted tasks
-// before it ever reaches acyclicity, and the new task's own id can never
-// be found among them (it does not exist until this call succeeds) — so
-// no caller can construct a genuine multi-node cycle through this port at
-// all: every dependency edge is created pointing only at an
-// already-existing task, so the persisted graph is a DAG by construction.
-// internal/domain/run's own ValidateAcyclic check exists as defense in
-// depth for exactly that reason, not because this port can reach it.
+// state. Refused app.WorkflowRefused (reason TaskCreateSelfDependencyReason),
+// detail "dependency is not in this run": CreateTask resolves DependsOn
+// against already-persisted tasks before it ever reaches acyclicity, and
+// the new task's own id can never be found among them (it does not exist
+// until this call succeeds) — so no caller can construct a genuine
+// multi-node cycle through this port at all: every dependency edge is
+// created pointing only at an already-existing task, so the persisted
+// graph is a DAG by construction. internal/domain/run's own
+// ValidateAcyclic check exists as defense in depth for exactly that
+// reason, not because this port can reach it.
 func TaskCreateSelfDependency(runID identity.RunID, session identity.SessionID, incarnation identity.IncarnationID, taskID identity.TaskID) app.TaskCreate {
 	return app.TaskCreate{
 		ID: taskID, RunID: runID, Session: session, IncarnationID: incarnation,
@@ -48,15 +53,20 @@ func TaskCreateSelfDependency(runID identity.RunID, session identity.SessionID, 
 	}
 }
 
+// TaskCreateRequestIDConflictReason is TaskCreateRequestIDConflictSecond's
+// expected refusal reason token.
+const TaskCreateRequestIDConflictReason = app.GrammarReasonConflicting
+
 // TaskCreateRequestIDConflictFirst is the SETUP half of the reused-
 // request-ID vector: submitted first against a store, it is accepted.
 // TaskCreateRequestIDConflictSecond shares its requestID but a different
 // Title; submitted second against the SAME store, it is refused
-// app.WorkflowRefused, detail "request id reused with different content"
-// — section 7's canonical request-digest rule (an identical retry is
-// idempotent; a conflicting reuse is refused). The request key is (run,
-// verb, request id) alone, so the two calls may share or differ in every
-// other field including their task id.
+// app.WorkflowRefused (reason TaskCreateRequestIDConflictReason), detail
+// "request id reused with different content" — section 7's canonical
+// request-digest rule (an identical retry is idempotent; a conflicting
+// reuse is refused). The request key is (run, verb, request id) alone, so
+// the two calls may share or differ in every other field including their
+// task id.
 func TaskCreateRequestIDConflictFirst(runID identity.RunID, session identity.SessionID, incarnation identity.IncarnationID, taskID identity.TaskID, requestID string) app.TaskCreate {
 	return app.TaskCreate{
 		ID: taskID, RunID: runID, Session: session, IncarnationID: incarnation,
@@ -75,12 +85,16 @@ func TaskCreateRequestIDConflictSecond(runID identity.RunID, session identity.Se
 	}
 }
 
+// TaskCreateNonManagerCallerReason is TaskCreateNonManagerCaller's expected
+// refusal reason token.
+const TaskCreateNonManagerCallerReason = app.GrammarReasonNotManager
+
 // TaskCreateNonManagerCaller returns a CreateTask request from a session
 // that is not the run's manager (any implementer/reviewer session, from
-// the caller's own fixture) — refused app.WorkflowRefused, detail "caller
-// is not the run's manager": PlanStore.CreateTask is a manager-only verb
-// (section 6's one-level delegation — "workers get no verb that creates
-// work").
+// the caller's own fixture) — refused app.WorkflowRefused (reason
+// TaskCreateNonManagerCallerReason), detail "caller is not the run's
+// manager": PlanStore.CreateTask is a manager-only verb (section 6's
+// one-level delegation — "workers get no verb that creates work").
 func TaskCreateNonManagerCaller(runID identity.RunID, nonManagerSession identity.SessionID, nonManagerIncarnation identity.IncarnationID, taskID identity.TaskID) app.TaskCreate {
 	return app.TaskCreate{
 		ID: taskID, RunID: runID, Session: nonManagerSession, IncarnationID: nonManagerIncarnation,
@@ -88,13 +102,17 @@ func TaskCreateNonManagerCaller(runID identity.RunID, nonManagerSession identity
 	}
 }
 
+// TaskCreateOversizedTitleReason is TaskCreateOversizedTitle's expected
+// refusal reason token.
+const TaskCreateOversizedTitleReason = app.GrammarReasonMalformed
+
 // TaskCreateOversizedTitle returns a CreateTask request whose Title
-// exceeds app.TaskTitleLimit by one byte — refused app.WorkflowMalformed,
-// detail "title is empty or exceeds the size bound": CreateTask validates
-// title/instructions bounds INSIDE its own transaction (section 3),
-// independent of usecase_plan.go's own pre-check, so a caller reaching the
-// port directly (bypassing the CreateTask driving use case) is still
-// refused.
+// exceeds app.TaskTitleLimit by one byte — refused app.WorkflowMalformed
+// (reason TaskCreateOversizedTitleReason), detail "title is empty or
+// exceeds the size bound": CreateTask validates title/instructions bounds
+// INSIDE its own transaction (section 3), independent of usecase_plan.go's
+// own pre-check, so a caller reaching the port directly (bypassing the
+// CreateTask driving use case) is still refused.
 func TaskCreateOversizedTitle(runID identity.RunID, session identity.SessionID, incarnation identity.IncarnationID, taskID identity.TaskID) app.TaskCreate {
 	return app.TaskCreate{
 		ID: taskID, RunID: runID, Session: session, IncarnationID: incarnation,

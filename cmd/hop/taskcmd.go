@@ -116,7 +116,7 @@ func taskCreateLines(result *app.CreateTaskResult) []string {
 	case "duplicate":
 		return []string{app.GrammarTaskCreateDuplicateLine(result.TaskID, result.Seq)}
 	default:
-		return renderRefusal(planRefusalToken(result.Outcome, result.Detail), result.Detail)
+		return renderRefusal(planRefusalToken(result.Reason), result.Detail)
 	}
 }
 
@@ -177,7 +177,7 @@ func taskRetryLines(taskArg string, result *app.RequestRetryResult) []string {
 	case "duplicate":
 		return []string{fmt.Sprintf("duplicate %s attempt %d", taskArg, result.AttemptNumber)}
 	default:
-		return renderRefusal(planRefusalToken(result.Outcome, result.Detail), result.Detail)
+		return renderRefusal(planRefusalToken(result.Reason), result.Detail)
 	}
 }
 
@@ -237,7 +237,7 @@ func planCloseLines(result *app.ClosePlanResult) []string {
 	case "duplicate":
 		return []string{app.GrammarPlanCloseDuplicateLine}
 	default:
-		return renderRefusal(planRefusalToken(result.Outcome, result.Detail), result.Detail)
+		return renderRefusal(planRefusalToken(result.Reason), result.Detail)
 	}
 }
 

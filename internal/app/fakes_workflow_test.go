@@ -766,46 +766,50 @@ func (s *fakeStore) CreateTask(_ context.Context, req app.TaskCreate) (app.TaskC
 		if prior, ok := s.RequestReceipts[key]; ok {
 			out, ok := receiptOutcome[app.TaskCreated](prior)
 			if !ok {
-				return app.TaskCreated{Outcome: app.WorkflowMalformed, Detail: "corrupt receipt"}, nil
+				return app.TaskCreated{Outcome: app.WorkflowMalformed, Reason: app.GrammarReasonMalformed, Detail: "corrupt receipt"}, nil
 			}
 			if prior.digest == digest {
 				return app.TaskCreated{Outcome: app.WorkflowDuplicate, TaskID: out.TaskID, Seq: out.Seq}, nil
 			}
-			return app.TaskCreated{Outcome: app.WorkflowRefused, Detail: "request id reused with different content"}, nil
+			return app.TaskCreated{Outcome: app.WorkflowRefused, Reason: app.GrammarReasonConflicting, Detail: "request id reused with different content"}, nil
 		}
 	}
 
 	sRow, ok := s.Sessions[req.Session]
 	if !ok || sRow.value.Role != run.RoleManager || sRow.value.RunID != req.RunID {
-		return app.TaskCreated{Outcome: app.WorkflowRefused, Detail: "caller is not the run's manager"}, nil
+		return app.TaskCreated{Outcome: app.WorkflowRefused, Reason: app.GrammarReasonNotManager, Detail: "caller is not the run's manager"}, nil
 	}
 	binding, hasBinding := s.currentBindingLocked(req.Session)
 	if !hasBinding || binding.IncarnationID != req.IncarnationID || binding.Superseded {
-		return app.TaskCreated{Outcome: app.WorkflowRefused, Detail: "incarnation is not current"}, nil
+		return app.TaskCreated{Outcome: app.WorkflowRefused, Reason: app.GrammarReasonStale, Detail: "incarnation is not current"}, nil
 	}
 	rRow, ok := s.Runs[req.RunID]
 	if !ok {
-		return app.TaskCreated{Outcome: app.WorkflowMalformed, Detail: "unknown run"}, nil
+		return app.TaskCreated{Outcome: app.WorkflowMalformed, Reason: app.GrammarReasonMalformed, Detail: "unknown run"}, nil
 	}
 	if err := rRow.value.CanAcceptManagerVerb(); err != nil {
-		return app.TaskCreated{Outcome: app.WorkflowRefused, Detail: err.Error()}, nil
+		reason := app.GrammarReasonUnauthorized
+		if errors.Is(err, run.ErrRunNotAccepting) {
+			reason = app.GrammarReasonRunNotAccepting
+		}
+		return app.TaskCreated{Outcome: app.WorkflowRefused, Reason: reason, Detail: err.Error()}, nil
 	}
 	if req.Title == "" || len(req.Title) > app.TaskTitleLimit || req.InstructionsDigest == "" {
-		return app.TaskCreated{Outcome: app.WorkflowMalformed, Detail: "invalid title or instructions"}, nil
+		return app.TaskCreated{Outcome: app.WorkflowMalformed, Reason: app.GrammarReasonMalformed, Detail: "invalid title or instructions"}, nil
 	}
 
 	edges := make([]run.TaskDependency, 0, len(req.DependsOn))
 	for _, dep := range req.DependsOn {
 		depRow, ok := s.Tasks[dep]
 		if !ok || depRow.value.RunID != req.RunID {
-			return app.TaskCreated{Outcome: app.WorkflowRefused, Detail: "dependency is not in this run"}, nil
+			return app.TaskCreated{Outcome: app.WorkflowRefused, Reason: app.GrammarReasonDependencyCycle, Detail: "dependency is not in this run"}, nil
 		}
 		edge, err := run.NewTaskDependency(req.ID, dep, now)
 		if err != nil {
-			return app.TaskCreated{Outcome: app.WorkflowRefused, Detail: err.Error()}, nil
+			return app.TaskCreated{Outcome: app.WorkflowRefused, Reason: app.GrammarReasonDependencyCycle, Detail: err.Error()}, nil
 		}
 		if err := run.ValidateAcyclic(s.TaskDependencies, edge); err != nil {
-			return app.TaskCreated{Outcome: app.WorkflowRefused, Detail: err.Error()}, nil
+			return app.TaskCreated{Outcome: app.WorkflowRefused, Reason: app.GrammarReasonDependencyCycle, Detail: err.Error()}, nil
 		}
 		edges = append(edges, edge)
 	}
@@ -836,39 +840,43 @@ func (s *fakeStore) RequestRetry(_ context.Context, req app.RetryRequest) (app.R
 		if prior, ok := s.RequestReceipts[key]; ok {
 			out, ok := receiptOutcome[app.RetryAccepted](prior)
 			if !ok {
-				return app.RetryAccepted{Outcome: app.WorkflowMalformed, Detail: "corrupt receipt"}, nil
+				return app.RetryAccepted{Outcome: app.WorkflowMalformed, Reason: app.GrammarReasonMalformed, Detail: "corrupt receipt"}, nil
 			}
 			if prior.digest == digest {
 				return app.RetryAccepted{Outcome: app.WorkflowDuplicate, AttemptNumber: out.AttemptNumber}, nil
 			}
-			return app.RetryAccepted{Outcome: app.WorkflowRefused, Detail: "request id reused with different content"}, nil
+			return app.RetryAccepted{Outcome: app.WorkflowRefused, Reason: app.GrammarReasonConflicting, Detail: "request id reused with different content"}, nil
 		}
 	}
 
 	sRow, ok := s.Sessions[req.Session]
 	if !ok || sRow.value.Role != run.RoleManager || sRow.value.RunID != req.RunID {
-		return app.RetryAccepted{Outcome: app.WorkflowRefused, Detail: "caller is not the run's manager"}, nil
+		return app.RetryAccepted{Outcome: app.WorkflowRefused, Reason: app.GrammarReasonNotManager, Detail: "caller is not the run's manager"}, nil
 	}
 	binding, hasBinding := s.currentBindingLocked(req.Session)
 	if !hasBinding || binding.IncarnationID != req.IncarnationID || binding.Superseded {
-		return app.RetryAccepted{Outcome: app.WorkflowRefused, Detail: "incarnation is not current"}, nil
+		return app.RetryAccepted{Outcome: app.WorkflowRefused, Reason: app.GrammarReasonStale, Detail: "incarnation is not current"}, nil
 	}
 	rRow, ok := s.Runs[req.RunID]
 	if !ok {
-		return app.RetryAccepted{Outcome: app.WorkflowMalformed, Detail: "unknown run"}, nil
+		return app.RetryAccepted{Outcome: app.WorkflowMalformed, Reason: app.GrammarReasonMalformed, Detail: "unknown run"}, nil
 	}
 	if err := rRow.value.CanAcceptManagerVerb(); err != nil {
-		return app.RetryAccepted{Outcome: app.WorkflowRefused, Detail: err.Error()}, nil
+		reason := app.GrammarReasonUnauthorized
+		if errors.Is(err, run.ErrRunNotAccepting) {
+			reason = app.GrammarReasonRunNotAccepting
+		}
+		return app.RetryAccepted{Outcome: app.WorkflowRefused, Reason: reason, Detail: err.Error()}, nil
 	}
 	tRow, ok := s.Tasks[req.TaskID]
 	if !ok || tRow.value.RunID != req.RunID {
-		return app.RetryAccepted{Outcome: app.WorkflowMalformed, Detail: "unknown task"}, nil
+		return app.RetryAccepted{Outcome: app.WorkflowMalformed, Reason: app.GrammarReasonMalformed, Detail: "unknown task"}, nil
 	}
 	if tRow.value.State != run.TaskNeedsRework {
-		return app.RetryAccepted{Outcome: app.WorkflowRefused, Detail: "task is not needs-rework"}, nil
+		return app.RetryAccepted{Outcome: app.WorkflowRefused, Reason: app.GrammarReasonRetryNotTerminal, Detail: "task is not needs-rework"}, nil
 	}
 	if s.RetryRequestStates[req.TaskID] == app.RetryRequestPending {
-		return app.RetryAccepted{Outcome: app.WorkflowRefused, Detail: "a retry request is already pending for this task"}, nil
+		return app.RetryAccepted{Outcome: app.WorkflowRefused, Reason: app.GrammarReasonConflicting, Detail: "a retry request is already pending for this task"}, nil
 	}
 
 	var attempts []run.Attempt
@@ -878,7 +886,7 @@ func (s *fakeStore) RequestRetry(_ context.Context, req app.RetryRequest) (app.R
 		}
 	}
 	if len(attempts) == 0 {
-		return app.RetryAccepted{Outcome: app.WorkflowMalformed, Detail: "task has no attempts"}, nil
+		return app.RetryAccepted{Outcome: app.WorkflowMalformed, Reason: app.GrammarReasonMalformed, Detail: "task has no attempts"}, nil
 	}
 	prior := attempts[0]
 	for _, a := range attempts[1:] {
@@ -894,11 +902,11 @@ func (s *fakeStore) RequestRetry(_ context.Context, req app.RetryRequest) (app.R
 	nextID := identity.AttemptID(fmt.Sprintf("retry-%s-%d", req.TaskID, prior.Number+1))
 	next, err := run.NewRetryAttempt(nextID, prior, limit, now)
 	if err != nil {
-		reason := "retry limit reached"
+		reason, detail := app.GrammarReasonRetryLimit, "retry limit reached"
 		if errors.Is(err, run.ErrRetryNotTerminal) {
-			reason = "prior attempt is not terminal"
+			reason, detail = app.GrammarReasonRetryNotTerminal, "prior attempt is not terminal"
 		}
-		return app.RetryAccepted{Outcome: app.WorkflowRefused, Detail: reason}, nil
+		return app.RetryAccepted{Outcome: app.WorkflowRefused, Reason: reason, Detail: detail}, nil
 	}
 	s.Attempts[next.ID] = &entityRow[run.Attempt]{value: next, revision: 1}
 
@@ -940,21 +948,21 @@ func (s *fakeStore) ClosePlan(_ context.Context, req app.PlanClose) (app.PlanClo
 			if prior.digest == digest {
 				return app.PlanCloseResult{Outcome: app.WorkflowDuplicate}, nil
 			}
-			return app.PlanCloseResult{Outcome: app.WorkflowRefused, Detail: "request id reused with different content"}, nil
+			return app.PlanCloseResult{Outcome: app.WorkflowRefused, Reason: app.GrammarReasonConflicting, Detail: "request id reused with different content"}, nil
 		}
 	}
 
 	sRow, ok := s.Sessions[req.Session]
 	if !ok || sRow.value.Role != run.RoleManager || sRow.value.RunID != req.RunID {
-		return app.PlanCloseResult{Outcome: app.WorkflowRefused, Detail: "caller is not the run's manager"}, nil
+		return app.PlanCloseResult{Outcome: app.WorkflowRefused, Reason: app.GrammarReasonNotManager, Detail: "caller is not the run's manager"}, nil
 	}
 	binding, hasBinding := s.currentBindingLocked(req.Session)
 	if !hasBinding || binding.IncarnationID != req.IncarnationID || binding.Superseded {
-		return app.PlanCloseResult{Outcome: app.WorkflowRefused, Detail: "incarnation is not current"}, nil
+		return app.PlanCloseResult{Outcome: app.WorkflowRefused, Reason: app.GrammarReasonStale, Detail: "incarnation is not current"}, nil
 	}
 	rRow, ok := s.Runs[req.RunID]
 	if !ok {
-		return app.PlanCloseResult{Outcome: app.WorkflowMalformed, Detail: "unknown run"}, nil
+		return app.PlanCloseResult{Outcome: app.WorkflowMalformed, Reason: app.GrammarReasonMalformed, Detail: "unknown run"}, nil
 	}
 	hasImplementTask := false
 	for _, t := range s.Tasks {
@@ -965,11 +973,14 @@ func (s *fakeStore) ClosePlan(_ context.Context, req app.PlanClose) (app.PlanClo
 	}
 	closed, err := rRow.value.ClosePlan(hasImplementTask, now)
 	if err != nil {
-		reason := err.Error()
-		if errors.Is(err, run.ErrEmptyPlan) {
-			reason = "plan has no implement task"
+		reason, detail := app.GrammarReasonUnauthorized, err.Error()
+		switch {
+		case errors.Is(err, run.ErrEmptyPlan):
+			reason, detail = app.GrammarReasonEmptyPlan, "plan has no implement task"
+		case errors.Is(err, run.ErrRunNotAccepting):
+			reason = app.GrammarReasonRunNotAccepting
 		}
-		return app.PlanCloseResult{Outcome: app.WorkflowRefused, Detail: reason}, nil
+		return app.PlanCloseResult{Outcome: app.WorkflowRefused, Reason: reason, Detail: detail}, nil
 	}
 	rRow.value = closed
 	rRow.revision++

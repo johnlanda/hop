@@ -51,10 +51,15 @@ type TaskCreate struct {
 // `duplicate <uuid> t<seq>` (an identical request-ID retry) / a refusal
 // (non-manager caller, cross-run or cyclic dependency, run not accepting,
 // kind=review is never requested here since this verb never creates one).
+// Reason is one of grammar.go's GrammarReason* tokens, set by the store at
+// its exact decision point (never derived from Detail text downstream) on
+// every WorkflowRefused or WorkflowMalformed outcome; empty on
+// accepted/duplicate.
 type TaskCreated struct {
 	Outcome WorkflowOutcomeKind
 	TaskID  identity.TaskID
 	Seq     int
+	Reason  string
 	Detail  string
 }
 
@@ -72,10 +77,14 @@ type RetryRequest struct {
 
 // RetryAccepted is RequestRetry's outcome: `retry accepted t<seq> attempt
 // <n>` / `duplicate t<seq> attempt <n>` / a refusal (not needs-rework, not
-// terminal, retry limit reached, non-manager caller).
+// terminal, retry limit reached, non-manager caller). Reason is one of
+// grammar.go's GrammarReason* tokens, set by the store at its exact
+// decision point, on every WorkflowRefused or WorkflowMalformed outcome;
+// empty on accepted/duplicate.
 type RetryAccepted struct {
 	Outcome       WorkflowOutcomeKind
 	AttemptNumber int
+	Reason        string
 	Detail        string
 }
 
@@ -89,9 +98,12 @@ type PlanClose struct {
 
 // PlanCloseResult is ClosePlan's outcome: `plan closed` / `duplicate plan
 // closed` / a refusal (zero implement tasks, non-manager caller, run not
-// accepting).
+// accepting). Reason is one of grammar.go's GrammarReason* tokens, set by
+// the store at its exact decision point, on every WorkflowRefused or
+// WorkflowMalformed outcome; empty on accepted/duplicate.
 type PlanCloseResult struct {
 	Outcome WorkflowOutcomeKind
+	Reason  string
 	Detail  string
 }
 

@@ -23,8 +23,8 @@ func TestStoreVectors(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CreateTask() error = %v", err)
 		}
-		if got.Outcome != app.WorkflowRefused {
-			t.Fatalf("CreateTask(self-dependency) = %+v, want refused", got)
+		if got.Outcome != app.WorkflowRefused || got.Reason != storevectors.TaskCreateSelfDependencyReason {
+			t.Fatalf("CreateTask(self-dependency) = %+v, want refused/%s", got, storevectors.TaskCreateSelfDependencyReason)
 		}
 	})
 
@@ -42,8 +42,8 @@ func TestStoreVectors(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CreateTask(second) error = %v", err)
 		}
-		if second.Outcome != app.WorkflowRefused {
-			t.Fatalf("CreateTask(second, conflicting request id) = %+v, want refused", second)
+		if second.Outcome != app.WorkflowRefused || second.Reason != storevectors.TaskCreateRequestIDConflictReason {
+			t.Fatalf("CreateTask(second, conflicting request id) = %+v, want refused/%s", second, storevectors.TaskCreateRequestIDConflictReason)
 		}
 	})
 
@@ -55,8 +55,8 @@ func TestStoreVectors(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CreateTask() error = %v", err)
 		}
-		if got.Outcome != app.WorkflowRefused {
-			t.Fatalf("CreateTask(non-manager caller) = %+v, want refused", got)
+		if got.Outcome != app.WorkflowRefused || got.Reason != storevectors.TaskCreateNonManagerCallerReason {
+			t.Fatalf("CreateTask(non-manager caller) = %+v, want refused/%s", got, storevectors.TaskCreateNonManagerCallerReason)
 		}
 	})
 
@@ -66,8 +66,8 @@ func TestStoreVectors(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CreateTask() error = %v", err)
 		}
-		if got.Outcome != app.WorkflowMalformed {
-			t.Fatalf("CreateTask(oversized title) = %+v, want malformed", got)
+		if got.Outcome != app.WorkflowMalformed || got.Reason != storevectors.TaskCreateOversizedTitleReason {
+			t.Fatalf("CreateTask(oversized title) = %+v, want malformed/%s", got, storevectors.TaskCreateOversizedTitleReason)
 		}
 	})
 

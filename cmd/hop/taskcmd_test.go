@@ -56,7 +56,7 @@ func TestRunTaskCreate(t *testing.T) {
 	t.Run("a refusal renders refused: <token>", func(t *testing.T) {
 		ctrl := &fakeController{}
 		ctrl.createTask = func(app.CreateTaskRequest) (app.CreateTaskResult, error) {
-			return app.CreateTaskResult{Outcome: "refused", Detail: "caller is not the run's manager"}, nil
+			return app.CreateTaskResult{Outcome: "refused", Reason: app.GrammarReasonNotManager, Detail: "caller is not the run's manager"}, nil
 		}
 		td := newTestDeps(ctrl, managerEnv(), t.TempDir())
 		var stdout, stderr bytes.Buffer
@@ -145,7 +145,7 @@ func TestRunPlanClose(t *testing.T) {
 	t.Run("an empty plan refuses", func(t *testing.T) {
 		ctrl := &fakeController{}
 		ctrl.closePlan = func(app.ClosePlanRequest) (app.ClosePlanResult, error) {
-			return app.ClosePlanResult{Outcome: "refused", Detail: "plan has no implement task"}, nil
+			return app.ClosePlanResult{Outcome: "refused", Reason: app.GrammarReasonEmptyPlan, Detail: "plan has no implement task"}, nil
 		}
 		td := newTestDeps(ctrl, managerEnv(), t.TempDir())
 		var stdout, stderr bytes.Buffer

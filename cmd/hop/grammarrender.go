@@ -73,39 +73,20 @@ func reviewRefusalToken(outcome string) string {
 	}
 }
 
-// planRefusalToken classifies a CreateTask/RequestRetry/ClosePlan
-// WorkflowOutcomeKind: "malformed" outcomes map directly, but every
-// "refused" outcome shares one generic kind across every plan verb, so
-// classification falls to Detail — the literal strings
-// internal/adapters/sqlite/plan.go records for each refusal today.
-func planRefusalToken(outcome, detail string) string {
-	if outcome == "malformed" {
-		return app.GrammarReasonMalformed
-	}
-	switch detail {
-	case "request id reused with different content", "a retry request is already pending for this task":
-		return app.GrammarReasonConflicting
-	case "caller is not the run's manager":
-		return app.GrammarReasonNotManager
-	case "incarnation is not current":
-		return app.GrammarReasonStale
-	case "dependency is not in this run":
-		return app.GrammarReasonDependencyCycle
-	case "task is not needs-rework", "prior attempt is not terminal":
-		return app.GrammarReasonRetryNotTerminal
-	case "retry limit reached":
-		return app.GrammarReasonRetryLimit
-	case "plan has no implement task":
-		return app.GrammarReasonEmptyPlan
-	}
-	switch {
-	case strings.HasPrefix(detail, "run: dependency cycle"):
-		return app.GrammarReasonDependencyCycle
-	case strings.HasPrefix(detail, "run: run is not accepting this request"):
-		return app.GrammarReasonRunNotAccepting
-	default:
+// planRefusalToken renders a CreateTask/RequestRetry/ClosePlan refusal's
+// typed reason token: PlanStore (internal/adapters/sqlite/plan.go) and its
+// fake set Reason directly at each decision point (errors.Is against the
+// domain's typed errors, or the adapter's own fixed decision), so cmd/hop
+// never re-derives a token from Detail text — Detail stays free-text and
+// human-readable, printed as the follow-on line. An empty reason on a
+// refused/malformed outcome is a defect the store side must never produce
+// (TestPlanRefusalsAlwaysCarryAReason, internal/app); this renders the
+// generic fallback token rather than guessing which refusal occurred.
+func planRefusalToken(reason string) string {
+	if reason == "" {
 		return app.GrammarReasonUnauthorized
 	}
+	return reason
 }
 
 // renderRefusal renders a refused/malformed outcome as the grammar's
