@@ -2,6 +2,7 @@ package app_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -343,4 +344,168 @@ func requireManagerRetiredOnResume(t *testing.T, f *featureStart, result *app.Re
 	if n := len(f.paneCalls); n != 1 {
 		t.Fatalf("pane.open ran %d times, want the one bootstrap act", n)
 	}
+}
+
+// TestFeatureTerminalFailureResolvesIntegrationInit proves the feature
+// terminal failure honors the integration.init quiescence rule the way
+// stop does: the failed report waits until an unresolved init is
+// resolved, and the failure path resolves it with the stop path's
+// completing act. No bootstrap path launches the manager before its init
+// settles, so the failing shape — a launching run whose exec-failed
+// manager coexists with an unresolved init — is seeded.
+func TestFeatureTerminalFailureResolvesIntegrationInit(t *testing.T) {
+	seed := func(t *testing.T) (*featureStart, app.RunHandle) {
+		t.Helper()
+		f := newFeatureStart(t)
+		f.onHeartbeat = func(n int) {
+			if n == 1 {
+				f.killController()
+			}
+		}
+		f.crash()
+		f.onHeartbeat = nil
+		if f.opState(app.OpIntegrationInit) != app.OperationPending || len(f.git.UpdateRefCalls) != 0 {
+			t.Fatalf("want the init intent pending with no act dispatched")
+		}
+		runID := f.runID()
+		manager := f.manager()
+		incarnation := identity.IncarnationID(f.tc.IDs.NewID())
+		f.tc.Store.mu.Lock()
+		f.tc.Store.Runs[runID].value.State = run.RunLaunching
+		f.tc.Store.Sessions[manager.ID].value.State = run.SessionLaunching
+		f.tc.Store.Bindings[manager.ID] = append(f.tc.Store.Bindings[manager.ID], run.NewRuntimeBinding(
+			manager.ID, incarnation, "", "peer-pid:1", "workspace-m", "tab-m", "pane-m", "label-m", run.LaunchInitial, f.tc.Clock.Now()))
+		f.tc.Store.mu.Unlock()
+		f.recordManagerClaim(incarnation, app.LaunchClaimExecFailed)
+		f.tc.Clock.Advance(leaseTTL + time.Second)
+		lease, err := f.tc.Store.AcquireLease(context.Background(), runID, "controller-2")
+		if err != nil {
+			t.Fatalf("AcquireLease() error = %v", err)
+		}
+		return f, app.NewRunHandleForTest(runID, lease)
+	}
+
+	t.Run("an absent ref is completed by the same create-only CAS before the run fails", func(t *testing.T) {
+		f, handle := seed(t)
+		if _, err := f.tc.Controller.CorroborateSessionLaunches(context.Background(), handle); err != nil {
+			t.Fatalf("CorroborateSessionLaunches() error = %v", err)
+		}
+		if got := f.opState(app.OpIntegrationInit); got != app.OperationSucceeded {
+			t.Fatalf("integration.init state = %s, want succeeded", got)
+		}
+		if got := f.git.ref(featureRef); got != f.base {
+			t.Fatalf("integration ref = %q, want the frozen base", got)
+		}
+		if n := len(f.git.UpdateRefCalls); n != 1 {
+			t.Fatalf("update-ref ran %d times, want the one completing act", n)
+		}
+		f.requireManagerLaunchFailed()
+	})
+
+	t.Run("an unobservable ref keeps the run failing, never failed, until it can be read", func(t *testing.T) {
+		f, handle := seed(t)
+		f.onGit = refReadFails
+		report, err := f.tc.Controller.RetireSettledSessions(context.Background(), handle)
+		if err != nil {
+			t.Fatalf("RetireSettledSessions() error = %v", err)
+		}
+		if !report.RunFailing || report.RunFailed {
+			t.Fatalf("RetireSettledSessions() = %+v, want RunFailing", report)
+		}
+		if !strings.Contains(strings.Join(report.Outstanding, "\n"), "integration.init") {
+			t.Fatalf("outstanding = %v, want the unresolved integration.init named", report.Outstanding)
+		}
+		if got := f.runValue().State; got != run.RunLaunching {
+			t.Fatalf("run state = %s, want launching while the init is unresolved", got)
+		}
+		if got := f.opState(app.OpIntegrationInit); got != app.OperationReconciling {
+			t.Fatalf("integration.init state = %s, want reconciling", got)
+		}
+
+		f.onGit = nil
+		report, err = f.tc.Controller.RetireSettledSessions(context.Background(), handle)
+		if err != nil {
+			t.Fatalf("RetireSettledSessions() round 2 error = %v", err)
+		}
+		if !report.RunFailed {
+			t.Fatalf("round 2 = %+v, want RunFailed", report)
+		}
+		f.requireManagerLaunchFailed()
+	})
+
+	t.Run("a colliding ref settles the init failed and the run still fails", func(t *testing.T) {
+		f, handle := seed(t)
+		foreign := f.git.newCommit("tree-foreign", f.base)
+		f.git.setRef(featureRef, foreign)
+		report, err := f.tc.Controller.RetireSettledSessions(context.Background(), handle)
+		if err != nil {
+			t.Fatalf("RetireSettledSessions() error = %v", err)
+		}
+		if !report.RunFailed {
+			t.Fatalf("RetireSettledSessions() = %+v, want RunFailed", report)
+		}
+		if got := f.opState(app.OpIntegrationInit); got != app.OperationFailed {
+			t.Fatalf("integration.init state = %s, want failed", got)
+		}
+		if got := f.git.ref(featureRef); got != foreign || len(f.git.UpdateRefCalls) != 0 {
+			t.Fatalf("the failure path moved a colliding ref (%q, %d update-refs)", got, len(f.git.UpdateRefCalls))
+		}
+		f.requireManagerLaunchFailed()
+	})
+}
+
+// TestFeatureTerminalFailureWaitsOnUnplacedLaunch proves the session-keyed
+// unplaced-launch rule composes with the terminal failure's halting: a
+// failed task's run stays failing while a child's launch is unplaced and
+// unresolved, and fails once the recovered pane is observed closed.
+func TestFeatureTerminalFailureWaitsOnUnplacedLaunch(t *testing.T) {
+	failTask := func(u *unplacedLaunch) {
+		attemptID := u.tc.Store.Sessions[u.sessionID].value.AttemptID
+		taskID := u.tc.Store.Attempts[attemptID].value.TaskID
+		u.tc.Store.Tasks[taskID].value.State = run.TaskFailed
+	}
+	retire := func(t *testing.T, u *unplacedLaunch) app.RetirementReport {
+		t.Helper()
+		report, err := u.tc.Controller.RetireSettledSessions(context.Background(), u.handle)
+		if err != nil {
+			t.Fatalf("RetireSettledSessions() error = %v", err)
+		}
+		return report
+	}
+
+	t.Run("found: recovered and closed before the run fails", func(t *testing.T) {
+		u := unplacedWorkerWith(t, true, false)
+		failTask(u)
+		report := retire(t, u)
+		if !report.RunFailed {
+			t.Fatalf("report = %+v, want RunFailed once the recovered pane is observed closed", report)
+		}
+		if len(u.tc.Runtime.ClosedPanes) == 0 || u.tc.Runtime.ClosedPanes[0] != u.paneID {
+			t.Fatalf("ClosedPanes = %v, want the recovered pane closed first", u.tc.Runtime.ClosedPanes)
+		}
+		if got := u.tc.Store.Sessions[u.sessionID].value.State; got != run.SessionTerminated {
+			t.Fatalf("worker state = %s, want terminated", got)
+		}
+		if got := u.tc.Store.Runs[u.runID].value.State; got != run.RunFailed {
+			t.Fatalf("run state = %s, want failed", got)
+		}
+	})
+
+	t.Run("absent: the run stays failing, never failed", func(t *testing.T) {
+		u := unplacedWorkerWith(t, true, false)
+		failTask(u)
+		delete(u.panes, u.label)
+		for range 3 {
+			report := retire(t, u)
+			if !report.RunFailing || report.RunFailed {
+				t.Fatalf("report = %+v, want RunFailing while the launch is unresolved", report)
+			}
+			if !strings.Contains(strings.Join(report.Outstanding, "\n"), "no pane answers for launch label") {
+				t.Fatalf("outstanding = %v, want the unanswered label", report.Outstanding)
+			}
+		}
+		if got := u.tc.Store.Runs[u.runID].value.State; got != run.RunRunning {
+			t.Fatalf("run state = %s, want running while the failure waits", got)
+		}
+	})
 }

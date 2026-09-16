@@ -113,7 +113,7 @@ func (c *Controller) DriveFeatureStop(ctx context.Context, handle RunHandle) (St
 	// integration.init is a ref-move intent too: it is resolved (adopted,
 	// failed, or completed by its own create-only CAS) before any terminal
 	// report, so nothing can create the ref afterward.
-	initOutstanding, initErr := c.settleIntegrationInitForStop(ctx, handle)
+	initOutstanding, initErr := c.settleIntegrationInitForShutdown(ctx, handle)
 	if initErr != nil {
 		return StopReport{RunState: string(run.RunStopping)}, initErr
 	}

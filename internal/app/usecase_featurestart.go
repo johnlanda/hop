@@ -1081,16 +1081,17 @@ func (c *Controller) returnRunToLaunching(ctx context.Context, handle RunHandle)
 	})
 }
 
-// settleIntegrationInitForStop resolves every unresolved integration.init
-// before a stopped report (design section 4: a run never reports a
-// terminal state with a ref-move intent unresolved). Each follows its
-// recovery row with the stop path's completing act: the ref at the
-// intent's base is adopted; another value fails the operation as a
+// settleIntegrationInitForShutdown resolves every unresolved
+// integration.init before a stopped or failed report (design section 4: a
+// run never reports a terminal state with a ref-move intent unresolved).
+// Each follows its recovery row with the stop path's completing act, a
+// retirement that revalidates the lease but not the stop flag: the ref at
+// the intent's base is adopted; another value fails the operation as a
 // collision; a ref not observed present is completed by the same
 // create-only CAS — a zombie of the dead controller landing first is
 // adopted — so nothing can create the ref after the terminal report; a
 // read that cannot be made stays outstanding, never absence.
-func (c *Controller) settleIntegrationInitForStop(ctx context.Context, handle RunHandle) ([]string, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per stop round.
+func (c *Controller) settleIntegrationInitForShutdown(ctx context.Context, handle RunHandle) ([]string, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per stop or terminal-failure round.
 	var unresolved []identity.OperationID
 	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 		pending, pendErr := uow.Operations().Pending(ctx, handle.runID)
