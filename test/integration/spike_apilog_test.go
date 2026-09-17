@@ -298,12 +298,45 @@ func firstLineIndex(lines []string, substr string) (int, bool) {
 	return -1, false
 }
 
+// countLinesContainingAll returns how many lines in lines contain EVERY
+// one of substrs. One API call logs TWO lines (its own start and
+// complete/fail record), each sharing the same method="..." text, so
+// asserting a method was called exactly once needs event="..." folded
+// into the count too -- counting raw lines by method alone would always
+// be even and never equal 1 for a method genuinely called once.
+func countLinesContainingAll(lines []string, substrs ...string) int {
+	n := 0
+	for _, line := range lines {
+		all := true
+		for _, s := range substrs {
+			if !strings.Contains(line, s) {
+				all = false
+				break
+			}
+		}
+		if all {
+			n++
+		}
+	}
+	return n
+}
+
 // requireLine returns the line within lines[startIdx+1:endIdx] containing
 // every one of substrs, failing the test unless exactly one such line
 // exists.
 func requireLine(t *testing.T, lines []string, startIdx, endIdx int, substrs ...string) string {
 	t.Helper()
-	var found string
+	return lines[requireLineIndex(t, lines, startIdx, endIdx, substrs...)]
+}
+
+// requireLineIndex returns the index within lines[startIdx+1:endIdx] of the
+// line containing every one of substrs, failing the test unless exactly one
+// such line exists. Callers that must exclude a located line from a later
+// scan (by index, never by string equality, since two distinct lines can be
+// byte-identical) use this instead of requireLine.
+func requireLineIndex(t *testing.T, lines []string, startIdx, endIdx int, substrs ...string) int {
+	t.Helper()
+	foundIdx := -1
 	matches := 0
 	for i := startIdx + 1; i < endIdx; i++ {
 		line := lines[i]
@@ -315,14 +348,14 @@ func requireLine(t *testing.T, lines []string, startIdx, endIdx int, substrs ...
 			}
 		}
 		if all {
-			found = line
+			foundIdx = i
 			matches++
 		}
 	}
 	if matches != 1 {
 		t.Fatalf("expected exactly one log line containing %v within the capture window, found %d", substrs, matches)
 	}
-	return found
+	return foundIdx
 }
 
 // logLevelPattern matches a request-log line's level token: a timestamp,
