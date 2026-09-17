@@ -148,7 +148,11 @@ func startManagerSessionCountSampler(t *testing.T, dbPath, runID string) *manage
 			}
 		}
 	}()
-	t.Cleanup(func() { s.Stop() })
+	t.Cleanup(func() {
+		if _, stopErr := s.Stop(); stopErr != nil {
+			t.Logf("cleanup: manager session count sampler: %v", stopErr)
+		}
+	})
 	return s
 }
 

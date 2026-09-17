@@ -62,7 +62,9 @@ func withStopMidIntegrationCheck(t *testing.T, repo *fixtureRepo, opts featureFi
 		if err != nil {
 			return
 		}
-		_ = gate.Close()
+		if err := gate.Close(); err != nil {
+			t.Logf("cleanup: close stop-mid-integration check gate: %v", err)
+		}
 	})
 	repo.writeFile(t, stopMidIntegrationCheckScriptName, stopMidIntegrationCheckScriptSource(markerPath, gatePath), 0o755)
 	repo.writeFile(t, configRelPath, featureConfigTOML([]string{"sh", stopMidIntegrationCheckScriptName}, opts.MaxWorkers, opts.RetryLimit, opts.MessageWaitTimeout, opts.MessageAttentionAfter), 0o644)
