@@ -1219,6 +1219,123 @@ func TestFixtureManagerVerdictRejectedCorrelation(t *testing.T) {
 	})
 }
 
+// runNeedsReworkCase drives the compiled fixture principal as a manager
+// against ONE scripted info notice at noticeBodyPath, reporting whether it
+// retried task t1 (parseNeedsReworkLabel matched and hop task retry ran)
+// and its stdout for further assertions. A harmless evidence-inconsistent
+// status shortfall is scripted so a non-matching notice's fallback path
+// (statusOutcomeForNotice, hop status) has something safe to correlate
+// against rather than an unset fake-hop default.
+func runNeedsReworkCase(t *testing.T, artifacts *artifactDir, noticeBodyPath string) (retried bool, stdout string) {
+	t.Helper()
+	fx := buildManagerScriptDispatchFixture(t, artifacts)
+	scriptDir := filepath.Dir(fx.counterPath)
+	block := fakeMessageBlock("cccccccc-0000-4000-8000-000000000001", "info", "controller", "", "", noticeBodyPath)
+	scriptPath, indexPath := writeFakeHopMsgScript(t, scriptDir, []string{block})
+
+	const rolePath, cribPath = "/state/runs/a1/artifacts/roles/manager.md", "/state/runs/a1/artifacts/worker-protocol.md"
+	prompt := testManagerInitialPrompt(fx.assignmentPath, rolePath, cribPath, fx.fakeHop)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, fx.principal, "--session-id", "22222222-2222-2222-2222-222222222222", prompt) //nolint:gosec // G204: fixed test-owned binary and arguments.
+	cmd.Dir = fx.cwd
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOP_STATE_DIR=" + fx.stateDir,
+		"HOP_RUN_ID=" + fx.runID,
+		"HOP_SESSION_ID=33333333-3333-3333-3333-333333333333",
+		"HOP_INCARNATION_ID=44444444-4444-4444-4444-444444444444",
+		"HOP_ROLE=manager",
+		"FAKE_HOP_MSG_SCRIPT=" + scriptPath,
+		"FAKE_HOP_MSG_INDEX=" + indexPath,
+		"FAKE_HOP_TASK_COUNTER_FILE=" + fx.counterPath,
+		"FAKE_HOP_LOG=" + fx.logPath,
+		"FAKE_HOP_STATUS_SHORTFALL=evidence-inconsistent",
+	}
+	var out strings.Builder
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	_ = cmd.Run() //nolint:errcheck // the context deadline killing this intentionally endless manager is the expected outcome once its scripted notice is exhausted, asserted on its captured stdout below, never on this error.
+	stdout = out.String()
+	return strings.Contains(stdout, "FIXTURE-RETRIED label=[t1]"), stdout
+}
+
+// TestFixtureManagerNeedsReworkNoticeShapes proves parseNeedsReworkLabel
+// recognizes BOTH production notice renderers' shapes (manager review
+// finding: the fixture's own earlier "first line only" rule was an
+// over-specification neither renderer nor design section 7 actually
+// promises) with an ANCHORED, exact-line match — never a substring
+// search, so a reason or evidence line merely naming "needs-rework", or
+// the task line appearing at any position other than the one each shape
+// allows, can never trigger a retry.
+func TestFixtureManagerNeedsReworkNoticeShapes(t *testing.T) {
+	t.Run("task line first (renderTaskNotice: worker interruption, per-task check failure)", func(t *testing.T) {
+		artifacts := newArtifactDir(t)
+		noticePath := filepath.Join(artifacts.dir(t, "notice-bodies"), "notice.txt")
+		if err := os.WriteFile(noticePath, []byte("task t1 needs-rework\nreason: worker self-exit\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		retried, stdout := runNeedsReworkCase(t, artifacts, noticePath)
+		if !retried {
+			t.Errorf("manager did not retry t1 for a renderTaskNotice-shaped body; stdout:\n%s", stdout)
+		}
+	})
+
+	t.Run("task line second (renderIntegrationNotice: merge conflict)", func(t *testing.T) {
+		artifacts := newArtifactDir(t)
+		noticePath := filepath.Join(artifacts.dir(t, "notice-bodies"), "notice.txt")
+		if err := os.WriteFile(noticePath, []byte("integration cccccccc-1111-4ccc-8ccc-cccccccccccc conflicted\ntask t1 needs-rework\nreason: merge conflict\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		retried, stdout := runNeedsReworkCase(t, artifacts, noticePath)
+		if !retried {
+			t.Errorf("manager did not retry t1 for a renderIntegrationNotice-shaped (conflicted) body; stdout:\n%s", stdout)
+		}
+	})
+
+	t.Run("task line second (renderIntegrationNotice: rolled back)", func(t *testing.T) {
+		artifacts := newArtifactDir(t)
+		noticePath := filepath.Join(artifacts.dir(t, "notice-bodies"), "notice.txt")
+		if err := os.WriteFile(noticePath, []byte("integration dddddddd-2222-4ddd-8ddd-dddddddddddd rolled-back\ntask t1 needs-rework\nreason: combined check failed\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		retried, stdout := runNeedsReworkCase(t, artifacts, noticePath)
+		if !retried {
+			t.Errorf("manager did not retry t1 for a renderIntegrationNotice-shaped (rolled-back) body; stdout:\n%s", stdout)
+		}
+	})
+
+	t.Run("task line at any other position never retries", func(t *testing.T) {
+		artifacts := newArtifactDir(t)
+		noticePath := filepath.Join(artifacts.dir(t, "notice-bodies"), "notice.txt")
+		// The task line is real but sits at position 2 behind an
+		// unrecognized first line (not one of renderIntegrationNotice's own
+		// states) — never anchored at a position either shape allows.
+		if err := os.WriteFile(noticePath, []byte("some other notice line\ntask t1 needs-rework\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		retried, stdout := runNeedsReworkCase(t, artifacts, noticePath)
+		if retried {
+			t.Errorf("manager retried t1 for a task line at an unrecognized position; want no retry; stdout:\n%s", stdout)
+		}
+	})
+
+	t.Run("reason line merely naming needs-rework never retries", func(t *testing.T) {
+		artifacts := newArtifactDir(t)
+		noticePath := filepath.Join(artifacts.dir(t, "notice-bodies"), "notice.txt")
+		// A substring search would wrongly match this: "needs-rework" and
+		// even "task t1" both appear, but never as an anchored, exact line.
+		if err := os.WriteFile(noticePath, []byte("integration eeeeeeee-3333-4eee-8eee-eeeeeeeeeeee conflicted\nreason: see task t1 needs-rework for context\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		retried, stdout := runNeedsReworkCase(t, artifacts, noticePath)
+		if retried {
+			t.Errorf("manager retried t1 for a reason line merely mentioning needs-rework; want no retry (anchored match only); stdout:\n%s", stdout)
+		}
+	})
+}
+
 // TestFixtureReviewerRejectOnce drives the compiled fixture principal as a
 // reviewer-reject-once reviewer (HOP_ROLE=reviewer) TWICE against the fake
 // hop stub, sharing the same HOP_STATE_DIR/HOP_RUN_ID across both
