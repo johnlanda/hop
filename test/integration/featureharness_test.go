@@ -76,7 +76,7 @@ type featureFixtureOptions struct {
 // review task's own assignment carries no manager-authored free text at
 // all) and the feature-mode config.toml. server is passed to
 // registerWorktreeCleanup exactly as newFixtureRepo's is.
-func newFeatureFixtureRepo(t *testing.T, artifacts *artifactDir, server *testServer, name string, opts featureFixtureOptions) *fixtureRepo { //nolint:gocritic,unparam // hugeParam: featureFixtureOptions is a one-shot scenario-build options struct, constructed once per test; a pointer would only complicate every call site. unparam: name is forwarded to initFixtureRepo like newFixtureRepo's own; every current scenario happens to pass "repo", but it is a real, independent parameter, not a decorative one.
+func newFeatureFixtureRepo(t *testing.T, artifacts *artifactDir, server *testServer, name string, opts featureFixtureOptions) *fixtureRepo { //nolint:gocritic // hugeParam: featureFixtureOptions is a one-shot scenario-build options struct, constructed once per test; a pointer would only complicate every call site.
 	t.Helper()
 	repo := initFixtureRepo(t, artifacts, name)
 	repo.writeFile(t, "hello.go", trivialSourceFile, 0o644)
