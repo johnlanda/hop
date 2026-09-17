@@ -109,6 +109,24 @@ func (c *Controller) CorroborateLaunch(ctx context.Context, handle RunHandle) (L
 	return LaunchPending, nil
 }
 
+// launchClaimedLocked reports whether op's launch intent already has a
+// claim, read inside the caller's transaction. The launch-claim deadline
+// bounds only a launch with NO claim, and the caller's no-claim read
+// happened before this transaction: a claim the launcher wrote meanwhile
+// ends the deadline, and the intent must stay pending — the session's
+// pre-binding principal authority is its newest PENDING launch intent, so
+// flipping it to reconciling would refuse that very launcher's own verbs
+// until a later round recovers its binding by label. An undecodable or
+// incarnation-less intent is no claim: the deadline applies, as before.
+func launchClaimedLocked(ctx context.Context, uow UnitOfWork, op *Operation) (bool, error) {
+	intent, ok := decodeOperationPayload[paneOpenIntent](op.Intent)
+	if !ok || intent.IncarnationID == "" {
+		return false, nil
+	}
+	_, found, err := uow.LaunchClaims().Get(ctx, intent.IncarnationID)
+	return found, err
+}
+
 // driveLaunchDeadline enforces the launch-claim deadline: once
 // LaunchClaimDeadline has passed since the launch operation was journaled
 // with no claim row appearing, the operation goes reconciling with a pane
@@ -148,6 +166,7 @@ func (c *Controller) driveLaunchDeadline(ctx context.Context, handle RunHandle, 
 		}
 	}
 	now := c.Clock.Now()
+	claimed := false
 	err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 		op, getErr := uow.Operations().Get(ctx, newest.ID)
 		if getErr != nil {
@@ -155,6 +174,10 @@ func (c *Controller) driveLaunchDeadline(ctx context.Context, handle RunHandle, 
 		}
 		if op.State == OperationReconciling {
 			return nil
+		}
+		var claimErr error
+		if claimed, claimErr = launchClaimedLocked(ctx, uow, &op); claimErr != nil || claimed {
+			return claimErr
 		}
 		op.State = OperationReconciling
 		op.Outcome = "no launch claim appeared within the launch-claim deadline; reconciling, never re-sent"
@@ -167,7 +190,7 @@ func (c *Controller) driveLaunchDeadline(ctx context.Context, handle RunHandle, 
 	if err != nil {
 		return false, fmt.Errorf("app: record launch deadline: %w", err)
 	}
-	return true, nil
+	return !claimed, nil
 }
 
 // launchMarkers derives the argv markers the corroboration predicate

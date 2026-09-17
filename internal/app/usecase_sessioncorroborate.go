@@ -507,6 +507,7 @@ func (c *Controller) driveSessionLaunchDeadline(ctx context.Context, handle RunH
 		}
 	}
 	now := c.Clock.Now()
+	claimed := false
 	err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 		op, getErr := uow.Operations().Get(ctx, newest.ID)
 		if getErr != nil {
@@ -514,6 +515,10 @@ func (c *Controller) driveSessionLaunchDeadline(ctx context.Context, handle RunH
 		}
 		if op.State == OperationReconciling {
 			return nil
+		}
+		var claimErr error
+		if claimed, claimErr = launchClaimedLocked(ctx, uow, &op); claimErr != nil || claimed {
+			return claimErr
 		}
 		op.State = OperationReconciling
 		op.Outcome = "no launch claim appeared within the launch-claim deadline; reconciling, never re-sent"
@@ -526,5 +531,5 @@ func (c *Controller) driveSessionLaunchDeadline(ctx context.Context, handle RunH
 	if err != nil {
 		return false, fmt.Errorf("app: record session launch deadline: %w", err)
 	}
-	return true, nil
+	return !claimed, nil
 }

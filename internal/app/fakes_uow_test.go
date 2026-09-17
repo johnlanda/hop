@@ -162,6 +162,14 @@ type fakeUnitOfWork struct {
 	done bool
 }
 
+// dropBinding removes a session's binding rows: the shape of a launch
+// whose pane.open outcome was never recorded.
+func (s *fakeStore) dropBinding(sessionID identity.SessionID) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.Bindings, sessionID)
+}
+
 func (u *fakeUnitOfWork) ensureOpen() {
 	if u.done {
 		panic("app_test: unit of work used after Commit or Rollback")
