@@ -87,6 +87,15 @@ func jsonStringField(t *testing.T, jsonText, field string) string {
 	return v
 }
 
+// stopInterruptBound is the ceiling this scenario holds the interval
+// between issuing `hop stop` and observing it complete to: well under the
+// fixture's own configured `[check]` timeout (30s, featureConfigTOML), so
+// a pass here is evidence the combined check's own process group was
+// killed on stop's own cadence rather than merely outlived by its
+// configured timeout — the two are otherwise indistinguishable by exit
+// code alone, since either path eventually reports "stopped".
+const stopInterruptBound = 15 * time.Second
+
 // TestRealProcessStopDuringFeatureRun is the Layers row's own stop-mid-
 // integration scenario: `hop stop` arrives while a single task's
 // candidate has already been merged and published to the integration
@@ -99,10 +108,12 @@ func jsonStringField(t *testing.T, jsonText, field string) string {
 // integration branch reset to exactly that commit, and the rejected
 // (unvalidated) merge candidate kept reachable as the rollback's own
 // parent, never orphaned; every session (manager and the already-retired
-// implementer alike) ends terminated; and the run reaches "stopped" only
-// once termination is observed, never merely requested.
+// implementer alike) ends terminated; the run reaches "stopped" only once
+// termination is observed, never merely requested; and stop's own
+// interval — request to observed completion — stays under
+// stopInterruptBound, proving the combined check was interrupted rather
+// than outlived.
 func TestRealProcessStopDuringFeatureRun(t *testing.T) {
-	t.Skip("STOP-2: the combined integration check runs synchronously in the feature loop, so stop cannot interrupt it; unskip when STOP-2 lands")
 	artifacts := newArtifactDir(t)
 	server := prepareServer(t, artifacts)
 	worker := buildFixtureWorker(t, artifacts)
@@ -172,12 +183,25 @@ func TestRealProcessStopDuringFeatureRun(t *testing.T) {
 		t.Fatalf("combined check's own check_exec_claims pid = %q, want a positive integer", checkPIDStr)
 	}
 
+	// stopRequestedAt anchors the interval this scenario's whole point
+	// rests on: `hop stop` itself polls until it observes "stopped" (or
+	// its own deadline), so the CLI's own return is the observed
+	// consequence, and the gap between the two wall-clock reads is the
+	// interrupt latency STOP-2 exists to bound — never the test's own
+	// total wall time, most of which is the run reaching "checking" in
+	// the first place.
+	stopRequestedAt := time.Now()
 	result := runHop(t, fx.env, fx.repo.Root, "stop", "-C", fx.repo.Root, fx.runID)
+	stopInterval := time.Since(stopRequestedAt)
 	if result.ExitCode != 0 {
 		t.Fatalf("hop stop exit=%d, want 0; stdout=%q stderr=%q", result.ExitCode, result.Stdout, result.Stderr)
 	}
 	if !strings.Contains(result.Stdout, "stopped") {
 		t.Errorf("hop stop stdout = %q, want it to report stopped", result.Stdout)
+	}
+	t.Logf("hop stop request to observed completion: %s (bound %s)", stopInterval, stopInterruptBound)
+	if stopInterval > stopInterruptBound {
+		t.Errorf("hop stop took %s to observe \"stopped\", want under %s: the combined check's own configured 30s timeout, not stop's own interruption, is the more likely explanation", stopInterval, stopInterruptBound)
 	}
 
 	status := waitForControllerExit(t, fx.controller, 30*time.Second)
