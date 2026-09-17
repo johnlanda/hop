@@ -100,6 +100,50 @@ func TestCribRetryableLinesPerVerb(t *testing.T) {
 	}
 }
 
+// TestCribRefusalShapes pins the crib's refusal lines: the preamble's
+// `refused: <reason-token>` shape names the verbs that print another one,
+// hop result submit's section lists its own `<kind>: <detail>` lines,
+// the fetch section says a refused fetch prints no first line, and no
+// other section claims a refusal shape of its own.
+func TestCribRefusalShapes(t *testing.T) {
+	crib := string(renderWorkerProtocolCrib())
+	preamble, _, _ := strings.Cut(crib, "\n## hop ")
+	wantPreamble := "A refusal exits 1 with the first line `" + GrammarRefusalLine("<reason-token>") +
+		"` and detail lines after it, unless its section below names another refusal shape (hop " +
+		GrammarVerbResultSubmit + ", hop " + GrammarVerbMsgNext + " and hop " + GrammarVerbMsgWait + ")."
+	if !strings.Contains(oneLine(preamble), wantPreamble) {
+		t.Errorf("crib preamble = %q, want it to state %q", preamble, wantPreamble)
+	}
+
+	resultRefusal := "Refusal: `" + GrammarResultRefusalLine(GrammarReasonStale, "<detail>") + "`, `" +
+		GrammarResultRefusalLine(GrammarReasonConflicting, "<detail>") + "` or `" +
+		GrammarResultRefusalLine(GrammarReasonMalformed, "<detail>") + "` (the detail on the first line, no `refused:` prefix)."
+	fetchRefusal := "A refused fetch prints no first line at all: nothing on stdout, one diagnostic on stderr, exit 1."
+	for _, part := range strings.Split(crib, "\n## hop ")[1:] {
+		heading, body, _ := strings.Cut(part, "\n")
+		refusalLines := 0
+		for line := range strings.SplitSeq(body, "\n") {
+			if strings.HasPrefix(line, "Refusal: ") {
+				refusalLines++
+			}
+		}
+		switch heading {
+		case GrammarVerbResultSubmit:
+			if refusalLines != 1 || !strings.Contains(body, resultRefusal+"\n") {
+				t.Errorf("section %q = %q, want exactly the refusal line %q", heading, body, resultRefusal)
+			}
+		case GrammarVerbMsgNext + " / hop " + GrammarVerbMsgWait:
+			if refusalLines != 0 || !strings.Contains(oneLine(body), fetchRefusal) {
+				t.Errorf("section %q = %q, want no refusal line and the sentence %q", heading, body, fetchRefusal)
+			}
+		default:
+			if refusalLines != 0 || strings.Contains(body, "refused fetch") {
+				t.Errorf("section %q = %q, want the preamble's refusal shape only", heading, body)
+			}
+		}
+	}
+}
+
 // TestTemplatesQuoteGrammar is the template half of the golden-grammar
 // countermeasure (design section 11, L1569): every protocol line or verb
 // a template renders must be a QUOTATION of the grammar constant set, so
@@ -223,6 +267,10 @@ func TestTemplatesQuoteGrammar(t *testing.T) {
 			" means your review is done: end your turn without polling for messages.",
 		"A first line of " + GrammarRefusalLine(GrammarReasonStale) + " or " + GrammarRefusalLine(GrammarReasonNotReviewer) +
 			" means this session is no longer this review's current session: stop, and do not retry.",
+		"A first line of " + GrammarRefusalLine(GrammarReasonMalformed) +
+			" means the command itself is wrong: fix the problem its detail names and resubmit.",
+		"A first line of " + GrammarRefusalLine(GrammarReasonConflicting) +
+			" means this review already has a verdict recorded with other content: stop, and do not retry.",
 	} {
 		if !strings.Contains(oneLine(review), sentence) {
 			t.Errorf("review assignment does not state %q", sentence)

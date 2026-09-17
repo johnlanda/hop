@@ -65,8 +65,9 @@ func renderWorkerProtocolCrib() []byte {
 	b.WriteString("# HOP worker protocol reference\n\n")
 	b.WriteString("Every hop verb below prints a fixed FIRST LINE; parse only these\n")
 	b.WriteString("lines. A refusal exits 1 with the first line\n")
-	b.WriteString("`" + GrammarRefusalLine("<reason-token>") + "` and detail lines after it. The\n")
-	b.WriteString("enumerated reason tokens are: " + strings.Join([]string{
+	b.WriteString("`" + GrammarRefusalLine("<reason-token>") + "` and detail lines after it, unless its section\n")
+	b.WriteString("below names another refusal shape (hop " + GrammarVerbResultSubmit + ", hop " + GrammarVerbMsgNext + " and\n")
+	b.WriteString("hop " + GrammarVerbMsgWait + "). The enumerated reason tokens are: " + strings.Join([]string{
 		GrammarReasonNotFound, GrammarReasonUnauthorized, GrammarReasonMalformed,
 		GrammarReasonConflicting, GrammarReasonStale, GrammarReasonNotDelivered,
 		GrammarReasonRunNotAccepting, GrammarReasonMailboxClosed, GrammarReasonNotManager,
@@ -77,7 +78,11 @@ func renderWorkerProtocolCrib() []byte {
 	b.WriteString("## hop " + GrammarVerbResultSubmit + "\n\n")
 	b.WriteString("First line: `" + GrammarResultAcceptedLine("<result-uuid>") + "` or `" + GrammarResultDuplicateLine("<result-uuid>") + "`.\n")
 	b.WriteString("Retryable: `" + GrammarTransientNotRunningLine + "` — wait briefly, rerun the same command.\n")
-	b.WriteString("Retryable: `" + GrammarTransientUndeliveredLine + "`.\n\n")
+	b.WriteString("Retryable: `" + GrammarTransientUndeliveredLine + "`.\n")
+	b.WriteString("Refusal: `" + GrammarResultRefusalLine(GrammarReasonStale, "<detail>") + "`, `" +
+		GrammarResultRefusalLine(GrammarReasonConflicting, "<detail>") + "` or `" +
+		GrammarResultRefusalLine(GrammarReasonMalformed, "<detail>") + "` (the detail on the first line, no `" +
+		strings.TrimSpace(GrammarRefusalPrefix) + "` prefix).\n\n")
 
 	b.WriteString("## hop " + GrammarVerbMsgNext + " / hop " + GrammarVerbMsgWait + "\n\n")
 	b.WriteString("A served message prints three lines (optional fields appear only when set):\n\n")
@@ -87,7 +92,8 @@ func renderWorkerProtocolCrib() []byte {
 	b.WriteString("`origin` names the ORIGINAL question behind a relayed answer; forward\n")
 	b.WriteString("using only it. Empty queue: `" + GrammarMsgNoneLine + "` (next), or\n")
 	b.WriteString("`" + GrammarMsgWaitNoneLine(50*time.Second) + "` (wait; the timeout varies —\n")
-	b.WriteString("rerun the same command).\n\n")
+	b.WriteString("rerun the same command). A refused fetch prints no first line at all:\n")
+	b.WriteString("nothing on stdout, one diagnostic on stderr, exit 1.\n\n")
 
 	b.WriteString("## hop " + GrammarVerbMsgShow + " <message-uuid>\n\n")
 	b.WriteString("Read-only envelope lookup:\n\n")
@@ -377,14 +383,18 @@ its instruction and run the exact same command again. A first line of
 review is done: end your turn without polling for messages. A first
 line of %s or %s means this
 session is no longer this review's current session: stop, and do not
-retry.
+retry. A first line of %s means the command itself is
+wrong: fix the problem its detail names and resubmit. A first line of
+%s means this review already has a verdict recorded
+with other content: stop, and do not retry.
 `,
 		f.RunID, f.TaskID, f.TaskSeq, f.AttemptID, f.AttemptNumber,
 		f.SubjectCommitOID, f.SubjectTreeOID, f.DiffBaseOID, f.SubjectCommitOID,
 		GrammarReasonSubjectMismatch,
 		f.AssignmentPath, f.RolePath, f.HOPPath, f.SubjectCommitOID,
 		GrammarVerdictAcceptedLine("<review-uuid>"), GrammarVerdictDuplicateLine("<review-uuid>"),
-		GrammarRefusalLine(GrammarReasonStale), GrammarRefusalLine(GrammarReasonNotReviewer))
+		GrammarRefusalLine(GrammarReasonStale), GrammarRefusalLine(GrammarReasonNotReviewer),
+		GrammarRefusalLine(GrammarReasonMalformed), GrammarRefusalLine(GrammarReasonConflicting))
 }
 
 // WorkflowFreezeRequest is FreezeWorkflowArtifacts's input: the loaded

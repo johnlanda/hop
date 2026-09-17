@@ -1173,9 +1173,12 @@ each CHECKED, not merely documented:
 The harness agents' behavior is specified, not assumed, and every line
 HOP renders for it quotes the section 7 grammar constants. The manager's
 launch prompt names its polling command and points at its assignment,
-its frozen role artifact and the worker protocol reference (the crib),
-which quote every verb's lines; its assignment states the wait-and-ack
-loop and the verdict channel. The implementer's and reviewer's launch
+its frozen role artifact and the worker protocol reference (the crib).
+The crib quotes every verb's success and retryable lines and its refusal
+shape: `refused: <reason-token>` unless the verb's own section names
+another (`hop result submit`'s `<kind>: <detail>` lines, and a refused
+`hop msg next`/`wait`, which prints no first line). The manager's
+assignment states the wait-and-ack loop and the verdict channel. The implementer's and reviewer's launch
 prompts name their submit command and one retry rule — on a first line
 beginning with `transient`, follow that line's instruction, then wait
 briefly and rerun the exact same command, so the drain line is drained
@@ -1656,9 +1659,10 @@ incarnation is current, whose run has no stop request and whose attempt
 can still accept — exactly a caller whose own `hop msg next` is served —
 while a caller that can never be accepted gets the final stale outcome
 instead (`stale: <detail>` from `hop result submit`, `refused: stale`
-from `hop review submit`). The assignment templates, the crib and the
-launch prompts quote these lines from the same constants, so template,
-CLI and fixture can never drift apart silently.
+from `hop review submit`). The assignment templates, the crib — its
+preamble giving the `refused:` shape and naming the verbs whose sections
+give their own — and the launch prompts quote these lines from the same
+constants, so template, CLI and fixture can never drift apart silently.
 
 ## 8. The built-in feature workflow: review, guards, serial integration
 
