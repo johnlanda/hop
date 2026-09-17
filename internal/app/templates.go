@@ -100,17 +100,23 @@ func renderWorkerProtocolCrib() []byte {
 	b.WriteString("## hop " + GrammarVerbMsgAck + " <message-uuid>\n\n")
 	b.WriteString("First line: `" + GrammarAckAcceptedLine("<message-uuid>") + "` or `" + GrammarAckDuplicateLine("<message-uuid>") + "`.\n\n")
 
+	runNotRunning := "Retryable: `" + GrammarTransientRunNotRunningLine + "` — wait briefly, rerun the same command with the same --request-id.\n\n"
+
 	b.WriteString("## hop " + GrammarVerbMsgSend + "\n\n")
-	b.WriteString("First line: `" + GrammarSentLine("<message-uuid>") + "` or `" + GrammarSendDuplicateLine("<message-uuid>") + "`.\n\n")
+	b.WriteString("First line: `" + GrammarSentLine("<message-uuid>") + "` or `" + GrammarSendDuplicateLine("<message-uuid>") + "`.\n")
+	b.WriteString(runNotRunning)
 
 	b.WriteString("## hop " + GrammarVerbTaskCreate + " (manager only)\n\n")
-	b.WriteString("First line: `" + GrammarTaskCreatedLine("<task-uuid>", 0) + "` or `" + GrammarTaskCreateDuplicateLine("<task-uuid>", 0) + "` (t0 stands for t<seq>).\n\n")
+	b.WriteString("First line: `" + GrammarTaskCreatedLine("<task-uuid>", 0) + "` or `" + GrammarTaskCreateDuplicateLine("<task-uuid>", 0) + "` (t0 stands for t<seq>).\n")
+	b.WriteString(runNotRunning)
 
 	b.WriteString("## hop " + GrammarVerbTaskRetry + " (manager only)\n\n")
-	b.WriteString("First line: `" + GrammarRetryAcceptedLine(0, 0) + "` or `" + GrammarRetryDuplicateLine(0, 0) + "` (t0/0 stand for t<seq>/<n>).\n\n")
+	b.WriteString("First line: `" + GrammarRetryAcceptedLine(0, 0) + "` or `" + GrammarRetryDuplicateLine(0, 0) + "` (t0/0 stand for t<seq>/<n>).\n")
+	b.WriteString(runNotRunning)
 
 	b.WriteString("## hop " + GrammarVerbPlanClose + " (manager only)\n\n")
-	b.WriteString("First line: `" + GrammarPlanClosedLine + "` or `" + GrammarPlanCloseDuplicateLine + "`.\n\n")
+	b.WriteString("First line: `" + GrammarPlanClosedLine + "` or `" + GrammarPlanCloseDuplicateLine + "`.\n")
+	b.WriteString(runNotRunning)
 
 	b.WriteString("## hop " + GrammarVerbReviewSubmit + " (reviewer only)\n\n")
 	b.WriteString("First line: `" + GrammarVerdictAcceptedLine("<review-uuid>") + "` or `" + GrammarVerdictDuplicateLine("<review-uuid>") + "`.\n")

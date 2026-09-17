@@ -42,6 +42,50 @@ func (a *tmplArtifacts) ReadArtifact(_ context.Context, path string) ([]byte, er
 	return content, nil
 }
 
+// TestCribRetryableLinesPerVerb pins which crib sections list which
+// retryable first line: the run-not-running line under exactly the verbs
+// whose accepting transaction checks the run state (task create, task
+// retry, plan close, msg send), and nowhere else.
+func TestCribRetryableLinesPerVerb(t *testing.T) {
+	sections := map[string]string{}
+	for _, part := range strings.Split(string(renderWorkerProtocolCrib()), "\n## hop ")[1:] {
+		heading, body, _ := strings.Cut(part, "\n")
+		sections[heading] = body
+	}
+	retryable := func(line string) string { return "Retryable: `" + line + "`" }
+	want := map[string][]string{
+		GrammarVerbResultSubmit:                             {retryable(GrammarTransientNotRunningLine), retryable(GrammarTransientUndeliveredLine)},
+		GrammarVerbMsgNext + " / hop " + GrammarVerbMsgWait: nil,
+		GrammarVerbMsgShow + " <message-uuid>":              nil,
+		GrammarVerbMsgAck + " <message-uuid>":               nil,
+		GrammarVerbMsgSend:                                  {retryable(GrammarTransientRunNotRunningLine)},
+		GrammarVerbTaskCreate + " (manager only)":           {retryable(GrammarTransientRunNotRunningLine)},
+		GrammarVerbTaskRetry + " (manager only)":            {retryable(GrammarTransientRunNotRunningLine)},
+		GrammarVerbPlanClose + " (manager only)":            {retryable(GrammarTransientRunNotRunningLine)},
+		GrammarVerbReviewSubmit + " (reviewer only)":        {retryable(GrammarTransientUndeliveredLine)},
+	}
+	if len(sections) != len(want) {
+		t.Fatalf("crib sections = %d, want %d", len(sections), len(want))
+	}
+	for heading, lines := range want {
+		body, ok := sections[heading]
+		if !ok {
+			t.Errorf("crib has no section %q", heading)
+			continue
+		}
+		var got []string
+		for line := range strings.SplitSeq(body, "\n") {
+			if rest, found := strings.CutPrefix(line, "Retryable: `"); found {
+				quoted, _, _ := strings.Cut(rest, "`")
+				got = append(got, retryable(quoted))
+			}
+		}
+		if strings.Join(got, "\n") != strings.Join(lines, "\n") {
+			t.Errorf("section %q retryable lines = %q, want %q", heading, got, lines)
+		}
+	}
+}
+
 // TestTemplatesQuoteGrammar is the template half of the golden-grammar
 // countermeasure (design section 11, L1569): every protocol line or verb
 // a template renders must be a QUOTATION of the grammar constant set, so
@@ -55,6 +99,7 @@ func TestTemplatesQuoteGrammar(t *testing.T) {
 		GrammarResultDuplicateLine("<result-uuid>"),
 		GrammarTransientNotRunningLine,
 		GrammarTransientUndeliveredLine,
+		GrammarTransientRunNotRunningLine,
 		GrammarMsgNoneLine,
 		GrammarMsgWaitNoneLine(50 * time.Second),
 		GrammarMessageLine("<message-uuid>", "<kind>", "<sender>", "<reply-to-uuid>", "<relay-of-uuid>", "<origin-uuid>"),

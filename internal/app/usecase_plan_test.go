@@ -199,11 +199,13 @@ func TestClosePlanRefusesEmptyPlan(t *testing.T) {
 	}
 }
 
-func TestRequestRetry(t *testing.T) {
-	tc := newTestController(defaultPolicy())
-	fr := seedFeatureRun(t, tc, 2)
-	taskB := seedImplementTask(t, tc, fr.RunID, 1, "B", false, run.TaskReady)
-	workerID, _ := seedWorkerSession(t, tc, fr, taskB)
+// seedNeedsReworkTask seeds an implement task whose launched first
+// attempt was interrupted and which is now needs-rework: the one shape
+// RequestRetry accepts.
+func seedNeedsReworkTask(t *testing.T, tc *testController, fr featureRun, seq int, title string) identity.TaskID { //nolint:gocritic // hugeParam: featureRun is a small test fixture value passed once per call, never a hot loop.
+	t.Helper()
+	taskID := seedImplementTask(t, tc, fr.RunID, seq, title, false, run.TaskReady)
+	workerID, _ := seedWorkerSession(t, tc, fr, taskID)
 
 	// Establish a terminal first attempt: interrupt the launched one.
 	attemptID := tc.Store.Sessions[workerID].value.AttemptID
@@ -217,11 +219,111 @@ func TestRequestRetry(t *testing.T) {
 		t.Fatalf("Interrupt() error = %v", err)
 	}
 	tc.Store.Attempts[attemptID].value = interrupted
-	needsRework, err := tc.Store.Tasks[taskB].value.NeedsRework(tc.Clock.Now())
+	needsRework, err := tc.Store.Tasks[taskID].value.NeedsRework(tc.Clock.Now())
 	if err != nil {
 		t.Fatalf("NeedsRework() error = %v", err)
 	}
-	tc.Store.Tasks[taskB].value = needsRework
+	tc.Store.Tasks[taskID].value = needsRework
+	return taskID
+}
+
+// TestPlanVerbsTransientUntilRunning proves the retryable half of the
+// run-acceptance split through the driving Controller: while the run is
+// launching, resuming or completing, every plan verb from the validated
+// manager is transient (empty reason, the state-only detail, nothing
+// changed), and the SAME request retried once the run is running is
+// accepted, then reported duplicate.
+func TestPlanVerbsTransientUntilRunning(t *testing.T) {
+	for _, state := range []run.RunState{run.RunLaunching, run.RunResuming, run.RunCompleting} {
+		t.Run(string(state), func(t *testing.T) {
+			tc := newTestController(defaultPolicy())
+			fr := seedFeatureRun(t, tc, 2)
+			taskB := seedNeedsReworkTask(t, tc, fr, 1, "B")
+			rRow := tc.Store.Runs[fr.RunID]
+			rRow.value.State = state
+			revision := rRow.revision
+			tasksBefore, attemptsBefore := len(tc.Store.Tasks), len(tc.Store.Attempts)
+
+			create := defaultCreateTaskRequest(fr, "A")
+			create.RequestID = "create-a"
+			retry := app.RequestRetryRequest{
+				RunID: fr.RunID.String(), SessionID: fr.ManagerID.String(), IncarnationID: fr.ManagerIncarnation.String(),
+				TaskID: taskB.String(), Reason: "flaky", RequestID: "retry-b",
+			}
+			closePlan := app.ClosePlanRequest{
+				RunID: fr.RunID.String(), SessionID: fr.ManagerID.String(), IncarnationID: fr.ManagerIncarnation.String(),
+				RequestID: "close",
+			}
+			wantDetail := "run is " + string(state) + ", not yet running"
+
+			createResult, err := tc.Controller.CreateTask(context.Background(), create)
+			if err != nil || createResult.Outcome != string(app.WorkflowTransient) || createResult.Reason != "" || createResult.Detail != wantDetail || createResult.TaskID != "" {
+				t.Fatalf("CreateTask() = %+v, %v; want transient with detail %q", createResult, err, wantDetail)
+			}
+			retryResult, err := tc.Controller.RequestRetry(context.Background(), retry)
+			if err != nil || retryResult.Outcome != string(app.WorkflowTransient) || retryResult.Reason != "" || retryResult.Detail != wantDetail || retryResult.AttemptNumber != 0 {
+				t.Fatalf("RequestRetry() = %+v, %v; want transient with detail %q", retryResult, err, wantDetail)
+			}
+			closeResult, err := tc.Controller.ClosePlan(context.Background(), closePlan)
+			if err != nil || closeResult.Outcome != string(app.WorkflowTransient) || closeResult.Reason != "" || closeResult.Detail != wantDetail {
+				t.Fatalf("ClosePlan() = %+v, %v; want transient with detail %q", closeResult, err, wantDetail)
+			}
+			if len(tc.Store.Tasks) != tasksBefore || len(tc.Store.Attempts) != attemptsBefore {
+				t.Fatalf("tasks/attempts = %d/%d, want unchanged %d/%d", len(tc.Store.Tasks), len(tc.Store.Attempts), tasksBefore, attemptsBefore)
+			}
+			if rRow.revision != revision || rRow.value.PlanClosed || rRow.value.State != state {
+				t.Fatalf("run row = %+v (revision %d), want unchanged at revision %d", rRow.value, rRow.revision, revision)
+			}
+			if got := tc.Store.Tasks[taskB].value.State; got != run.TaskNeedsRework {
+				t.Fatalf("retried task state = %s, want unchanged needs-rework", got)
+			}
+
+			rRow.value.State = run.RunRunning
+			var created app.CreateTaskResult
+			for _, pass := range []app.WorkflowOutcomeKind{app.WorkflowAccepted, app.WorkflowDuplicate} {
+				createResult, err = tc.Controller.CreateTask(context.Background(), create)
+				if err != nil || createResult.Outcome != string(pass) || createResult.TaskID == "" {
+					t.Fatalf("CreateTask() once running = %+v, %v; want %s", createResult, err, pass)
+				}
+				if pass == app.WorkflowAccepted {
+					created = createResult
+				} else if createResult.TaskID != created.TaskID || createResult.Seq != created.Seq {
+					t.Fatalf("CreateTask() duplicate = %+v, want the accepted task %s t%d", createResult, created.TaskID, created.Seq)
+				}
+				retryResult, err = tc.Controller.RequestRetry(context.Background(), retry)
+				if err != nil || retryResult.Outcome != string(pass) || retryResult.AttemptNumber != 2 {
+					t.Fatalf("RequestRetry() once running = %+v, %v; want %s attempt 2", retryResult, err, pass)
+				}
+				closeResult, err = tc.Controller.ClosePlan(context.Background(), closePlan)
+				if err != nil || closeResult.Outcome != string(pass) {
+					t.Fatalf("ClosePlan() once running = %+v, %v; want %s", closeResult, err, pass)
+				}
+			}
+		})
+	}
+
+	t.Run("a resuming run with a stop request refuses", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		fr := seedFeatureRun(t, tc, 2)
+		rRow := tc.Store.Runs[fr.RunID]
+		rRow.value = rRow.value.RequestStop(tc.Clock.Now())
+		resuming, err := rRow.value.EnterResuming(tc.Clock.Now())
+		if err != nil {
+			t.Fatalf("EnterResuming() error = %v", err)
+		}
+		rRow.value = resuming
+
+		result, err := tc.Controller.CreateTask(context.Background(), defaultCreateTaskRequest(fr, "A"))
+		if err != nil || result.Outcome != string(app.WorkflowRefused) || result.Reason != app.GrammarReasonRunNotAccepting {
+			t.Fatalf("CreateTask() over a stop-requested resuming run = %+v, %v; want refused/%s", result, err, app.GrammarReasonRunNotAccepting)
+		}
+	})
+}
+
+func TestRequestRetry(t *testing.T) {
+	tc := newTestController(defaultPolicy())
+	fr := seedFeatureRun(t, tc, 2)
+	taskB := seedNeedsReworkTask(t, tc, fr, 1, "B")
 
 	result, err := tc.Controller.RequestRetry(context.Background(), app.RequestRetryRequest{
 		RunID: fr.RunID.String(), SessionID: fr.ManagerID.String(), IncarnationID: fr.ManagerIncarnation.String(),
@@ -275,7 +377,7 @@ func TestPlanRefusalReasonsAlwaysSet(t *testing.T) {
 		}
 	})
 
-	t.Run("a run that left running refuses every plan verb", func(t *testing.T) {
+	t.Run("a run that can never accept refuses every plan verb", func(t *testing.T) {
 		tc := newTestController(defaultPolicy())
 		fr := seedFeatureRun(t, tc, 2)
 		rRow := tc.Store.Runs[fr.RunID]
@@ -283,7 +385,11 @@ func TestPlanRefusalReasonsAlwaysSet(t *testing.T) {
 		if err != nil {
 			t.Fatalf("EnterCompleting() error = %v", err)
 		}
-		rRow.value = completing
+		completed, err := completing.Complete(tc.Clock.Now())
+		if err != nil {
+			t.Fatalf("Complete() error = %v", err)
+		}
+		rRow.value = completed
 
 		createResult, err := tc.Controller.CreateTask(context.Background(), defaultCreateTaskRequest(fr, "A"))
 		if err != nil {

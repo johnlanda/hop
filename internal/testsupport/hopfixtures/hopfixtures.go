@@ -22,12 +22,13 @@
 // ports) and pass the opened value in directly.
 //
 // One exception stays out of this package by the manager's own ruling:
-// promoting a seeded run to feature mode requires writing the frozen
-// app.WorkflowSnapshot into run_snapshots.workflow, a raw SQL write
-// against the store file (the solo InitializeRun this package drives
-// writes NULL there, and no port method sets it after the fact; the
-// feature InitializeRun creates its own manager session and refuses the
-// solo base this package seeds). That single write lives in cmd/hop's
+// promoting a solo-seeded run (Initialize) to feature mode requires
+// writing the frozen app.WorkflowSnapshot into run_snapshots.workflow, a
+// raw SQL write against the store file (the solo InitializeRun writes NULL
+// there, and no port method sets it after the fact; the feature
+// InitializeRun creates its own manager session and refuses the solo base
+// Initialize seeds). InitializeFeature is the store-port alternative for a
+// run that starts as a feature run. That single write lives in cmd/hop's
 // own test file, using database/sql directly, because composition code
 // may import any standard package and the sqlite driver is registered by
 // cmd/hop's own adapter import — see cmd/hop/grammarcontract_seed_test.go's
@@ -772,4 +773,148 @@ func activateSession(ctx context.Context, uow app.UnitOfWork, sessionID string, 
 		return fmt.Errorf("hopfixtures: save session: %w", err)
 	}
 	return nil
+}
+
+// FeatureBase is a feature-mode run seeded through the feature
+// InitializeRun, exactly as `hop run --workflow feature` leaves it before
+// placing the manager: the run created, one reserved manager session (a
+// Claude harness with a pre-assigned native reference), the lease, and no
+// task, attempt or worktree. ManagerIncarnation is the incarnation
+// LaunchManager gives the manager's pane.
+type FeatureBase struct {
+	RunID              string
+	ManagerID          string
+	ManagerIncarnation string
+}
+
+// InitializeFeature seeds a fresh FeatureBase through the store's feature
+// InitializeRun. workflow is the frozen feature policy; its
+// IntegrationBranch must name the sequence the store assigns
+// (app.IntegrationBranchName(seq) — 1 in a fresh state root), or
+// InitializeRun refuses with app.ErrRunSequenceMismatch. stateRoot and
+// repositoryRoot must be resolved exactly as Initialize requires.
+func InitializeFeature(ctx context.Context, store Store, stateRoot, repositoryRoot string, workflow app.WorkflowSnapshot, seed int, now time.Time) (FeatureBase, app.Lease, error) { //nolint:gocritic // hugeParam: WorkflowSnapshot is a fixture value built and consumed once per call, never a hot loop.
+	runID := uid(seed + offRun)
+	spec := app.NewRunSpec{
+		RepositoryRoot: repositoryRoot,
+		RunID:          identity.RunID(runID),
+		SessionID:      identity.SessionID(uid(seed + offSession)),
+		Brief:          "grammar contract feature fixture",
+		BriefDigest:    "brief-digest",
+		Snapshot: app.RunSnapshot{
+			CheckArgv:        []string{"sh", "-c", "true"},
+			CheckTimeout:     10 * time.Minute,
+			EnvPolicy:        app.EnvPolicy{Version: app.EnvPolicyVersion1, Harness: app.HarnessClaude},
+			Harness:          app.HarnessClaude,
+			StateRoot:        stateRoot,
+			AssignmentPath:   stateRoot + "/runs/" + runID + "/artifacts/assignment.md",
+			AssignmentDigest: "assignment-digest",
+			Workflow:         workflow,
+		},
+		Harness:          run.HarnessClaude,
+		NativeSessionRef: uid(seed + offNativeRef),
+		ControllerID:     "grammar-contract-fixture",
+		Now:              now,
+	}
+	_, lease, err := store.InitializeRun(ctx, spec)
+	if err != nil {
+		return FeatureBase{}, app.Lease{}, fmt.Errorf("hopfixtures: initialize feature run: %w", err)
+	}
+	return FeatureBase{
+		RunID:              runID,
+		ManagerID:          spec.SessionID.String(),
+		ManagerIncarnation: uid(seed + offIncarnation),
+	}, lease, nil
+}
+
+// LaunchManager places a FeatureBase's manager the way the feature
+// bootstrap does, in its two units of work: the launch intent (run
+// created -> launching, manager reserved -> launching, a pending pane.open
+// operation naming the manager and its incarnation), then the act's
+// recorded outcome (the manager's runtime binding, the operation
+// succeeded). The manager's launcher can then claim (SeedLaunchClaim,
+// with no attempt), leaving the claim exec_pending and the run launching
+// until SettleManagerLaunch.
+func LaunchManager(ctx context.Context, store Store, lease app.Lease, f FeatureBase, now time.Time) error {
+	opID := identity.OperationID(derivedUID(f.ManagerID + "-manager-pane-open"))
+	label := opID.String()
+	if err := withUOW(ctx, store, lease, func(uow app.UnitOfWork) error {
+		if err := launchRun(ctx, uow, f.RunID, now); err != nil {
+			return err
+		}
+		if err := launchSession(ctx, uow, f.ManagerID, now); err != nil {
+			return err
+		}
+		if err := uow.Operations().Create(ctx, app.Operation{
+			ID: opID, RunID: identity.RunID(f.RunID), Generation: lease.Generation,
+			Kind: app.OpPaneOpen, State: app.OperationPending,
+			Intent: map[string]any{
+				"session_id":     f.ManagerID,
+				"incarnation_id": f.ManagerIncarnation,
+				"label":          label,
+			},
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			return fmt.Errorf("hopfixtures: create manager launch intent: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	return withUOW(ctx, store, lease, func(uow app.UnitOfWork) error {
+		binding := run.NewRuntimeBinding(
+			identity.SessionID(f.ManagerID), identity.IncarnationID(f.ManagerIncarnation),
+			fixtureSocketPath, fixtureServerInstance, "fixture-workspace-mgr", "fixture-tab-mgr", "fixture-pane-mgr",
+			label, run.LaunchInitial, now,
+		)
+		if err := uow.Bindings().Create(ctx, binding); err != nil {
+			return fmt.Errorf("hopfixtures: create manager binding: %w", err)
+		}
+		op, err := uow.Operations().Get(ctx, opID)
+		if err != nil {
+			return fmt.Errorf("hopfixtures: get manager launch intent: %w", err)
+		}
+		op.State = app.OperationSucceeded
+		op.UpdatedAt = now
+		if err := uow.Operations().Save(ctx, op); err != nil {
+			return fmt.Errorf("hopfixtures: record manager pane.open outcome: %w", err)
+		}
+		return nil
+	})
+}
+
+// SettleManagerLaunch applies what the controller's corroboration of the
+// manager's claim commits (the scheduling pass's settleSessionExeced for
+// the manager), in one unit of work: the run launching -> running, the
+// claim exec_pending -> execed with pid as the corroborated occupant and
+// the incarnation as its argv marker, that evidence observed on the
+// manager's binding, and the manager session launching -> active. Call it
+// after LaunchManager and the manager's SeedLaunchClaim with the same pid.
+func SettleManagerLaunch(ctx context.Context, store Store, lease app.Lease, f FeatureBase, pid int, now time.Time) error {
+	return withUOW(ctx, store, lease, func(uow app.UnitOfWork) error {
+		if err := markRunRunning(ctx, uow, f.RunID, now); err != nil {
+			return err
+		}
+		if err := uow.LaunchClaims().Settle(ctx, identity.IncarnationID(f.ManagerIncarnation), app.LaunchClaimSettlement{
+			State: app.LaunchClaimExeced, PaneID: "fixture-pane-mgr", PID: pid,
+			Executable: "/opt/harness/fixture-claude", ArgvMarker: f.ManagerIncarnation, At: now,
+		}); err != nil {
+			return fmt.Errorf("hopfixtures: settle manager launch claim: %w", err)
+		}
+		binding, found, err := uow.Bindings().Current(ctx, identity.SessionID(f.ManagerID))
+		if err != nil {
+			return fmt.Errorf("hopfixtures: get manager binding: %w", err)
+		}
+		if !found {
+			return fmt.Errorf("hopfixtures: the manager has no binding; call LaunchManager first")
+		}
+		observed, err := binding.Observe(run.OccupantEvidence{Label: binding.CreationLabel, ArgvMarker: f.ManagerIncarnation, PID: pid}, now)
+		if err != nil {
+			return fmt.Errorf("hopfixtures: observe manager occupant: %w", err)
+		}
+		if err := uow.Bindings().Save(ctx, observed); err != nil {
+			return fmt.Errorf("hopfixtures: save manager binding: %w", err)
+		}
+		return activateSession(ctx, uow, f.ManagerID, now)
+	})
 }

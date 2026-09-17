@@ -102,10 +102,13 @@ func sendRequestDigest(send *app.MessageSend) string {
 // ID with different content is refused), then the caller session's OWN
 // run (send.RunID is caller-supplied and never trusted alone), the
 // current incarnation, and — for an ordinary send — addressing legality,
-// run state and the recipient mailbox; an answer's destination is derived
-// from the referenced question's sender, never caller-chosen. Every
-// outcome leaves a receipt; only an acceptance occupies the (run, verb,
-// request ID) key.
+// the run's acceptance (run.Run.CanAcceptManagerVerb: transient while the
+// run can still reach running, refused once it never will) and the
+// recipient mailbox; an answer's destination is derived from the
+// referenced question's sender, never caller-chosen, and an answer has no
+// run-state gate. Every outcome leaves a receipt; only an acceptance
+// occupies the (run, verb, request ID) key, so a request retried after a
+// transient receipt is decided afresh.
 func (s *Store) SendMessage(ctx context.Context, send app.MessageSend) (app.MessageOutcome, error) { //nolint:gocritic // hugeParam: the port passes the send value; the adapter mirrors its signature.
 	var outcome app.MessageOutcome
 	err := s.inWriteTx(ctx, func(tx *sql.Tx) error {
@@ -176,8 +179,11 @@ func (s *Store) SendMessage(ctx context.Context, send app.MessageSend) (app.Mess
 		if addrErr := run.ValidateSendAddressing(send.SenderAddress, send.Kind, send.Recipient); addrErr != nil {
 			return record(app.MessageRefused, "", app.GrammarReasonUnauthorized, addrErr.Error())
 		}
-		if runV.State != run.RunRunning {
-			return record(app.MessageRunNotAccept, "", app.GrammarReasonRunNotAccepting, "run is not accepting messages")
+		if acceptErr := runV.CanAcceptManagerVerb(); acceptErr != nil {
+			if errors.Is(acceptErr, run.ErrRunNotYetRunning) {
+				return record(app.MessageTransient, "", "", app.RunNotRunningDetail(runV.State))
+			}
+			return record(app.MessageRunNotAccept, "", runAcceptanceReason(acceptErr), "run is not accepting messages")
 		}
 		if send.Recipient.Kind == run.AddressTask {
 			task, _, taskErr := getTask(ctx, tx, send.Recipient.TaskID)

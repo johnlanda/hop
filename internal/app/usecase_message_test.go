@@ -204,6 +204,91 @@ func TestMessagingReferenceTraceRelayedQuestion(t *testing.T) {
 	}
 }
 
+// TestMessageVerbsAcrossRunNotRunning proves the messaging half of the
+// run-acceptance split through the driving Controller, in the manager-
+// keeps-running-while-the-controller-resumes shape: while the run is
+// resuming, an ordinary (relaying) send is transient and enqueues nothing,
+// while fetch, ack and a session answer — which carry no run-state gate —
+// proceed; the same relay retried once the run is running is accepted,
+// then reported duplicate.
+func TestMessageVerbsAcrossRunNotRunning(t *testing.T) {
+	tc := newTestController(defaultPolicy())
+	fr := seedFeatureRun(t, tc, 2)
+	taskB := seedImplementTask(t, tc, fr.RunID, 1, "B", false, run.TaskReady)
+	workerID, workerIncarnation := seedWorkerSession(t, tc, fr, taskB)
+	ctx := context.Background()
+
+	sendQ1, err := tc.Controller.SendMessage(ctx, app.SendMessageRequest{
+		RunID: fr.RunID.String(), SessionID: workerID.String(), IncarnationID: workerIncarnation.String(),
+		StateRoot: "/state", To: "manager", Kind: "question", Body: []byte("X?"), Inline: true, RequestID: "worker-q1",
+	})
+	if err != nil || sendQ1.Outcome != string(app.MessageAccepted) {
+		t.Fatalf("SendMessage(q1) = %+v, %v; want accepted", sendQ1, err)
+	}
+	fetchQ1, err := tc.Controller.FetchMessage(ctx, app.FetchMessageRequest{
+		RunID: fr.RunID.String(), SessionID: fr.ManagerID.String(), IncarnationID: fr.ManagerIncarnation.String(),
+	})
+	if err != nil || !fetchQ1.Delivered || fetchQ1.MessageID != sendQ1.MessageID {
+		t.Fatalf("FetchMessage(manager) = %+v, %v; want q1", fetchQ1, err)
+	}
+
+	rRow := tc.Store.Runs[fr.RunID]
+	resuming, err := rRow.value.EnterResuming(tc.Clock.Now())
+	if err != nil {
+		t.Fatalf("EnterResuming() error = %v", err)
+	}
+	rRow.value = resuming
+	messagesBefore := len(tc.Store.Messages)
+
+	relay := app.SendMessageRequest{
+		RunID: fr.RunID.String(), SessionID: fr.ManagerID.String(), IncarnationID: fr.ManagerIncarnation.String(),
+		StateRoot: "/state", To: "human", Kind: "question", RelayOf: sendQ1.MessageID,
+		Body: []byte("please decide X"), Inline: true, RequestID: "manager-relay",
+	}
+	transient, err := tc.Controller.SendMessage(ctx, relay)
+	if err != nil || transient.Outcome != string(app.MessageTransient) || transient.Reason != "" ||
+		transient.Detail != "run is resuming, not yet running" || transient.MessageID != "" {
+		t.Fatalf("SendMessage(relay while resuming) = %+v, %v; want transient", transient, err)
+	}
+	if len(tc.Store.Messages) != messagesBefore {
+		t.Fatalf("messages = %d, want unchanged %d after a transient send", len(tc.Store.Messages), messagesBefore)
+	}
+
+	ack, err := tc.Controller.AckMessage(ctx, app.AckMessageRequest{
+		RunID: fr.RunID.String(), MessageID: sendQ1.MessageID, SessionID: fr.ManagerID.String(), IncarnationID: fr.ManagerIncarnation.String(),
+	})
+	if err != nil || ack.Outcome != string(app.AckAccepted) {
+		t.Fatalf("AckMessage(q1 while resuming) = %+v, %v; want accepted (no run-state gate)", ack, err)
+	}
+	answer, err := tc.Controller.SendMessage(ctx, app.SendMessageRequest{
+		RunID: fr.RunID.String(), SessionID: fr.ManagerID.String(), IncarnationID: fr.ManagerIncarnation.String(),
+		StateRoot: "/state", Kind: "answer", ReplyTo: sendQ1.MessageID, Body: []byte("do Y"), Inline: true, RequestID: "manager-a1",
+	})
+	if err != nil || answer.Outcome != string(app.MessageAccepted) {
+		t.Fatalf("SendMessage(answer while resuming) = %+v, %v; want accepted (no run-state gate)", answer, err)
+	}
+	fetchA1, err := tc.Controller.FetchMessage(ctx, app.FetchMessageRequest{
+		RunID: fr.RunID.String(), SessionID: workerID.String(), IncarnationID: workerIncarnation.String(),
+	})
+	if err != nil || !fetchA1.Delivered || fetchA1.MessageID != answer.MessageID {
+		t.Fatalf("FetchMessage(worker while resuming) = %+v, %v; want the answer (no run-state gate)", fetchA1, err)
+	}
+
+	running, err := rRow.value.MarkRunning(tc.Clock.Now())
+	if err != nil {
+		t.Fatalf("MarkRunning() error = %v", err)
+	}
+	rRow.value = running
+	accepted, err := tc.Controller.SendMessage(ctx, relay)
+	if err != nil || accepted.Outcome != string(app.MessageAccepted) || accepted.MessageID == "" {
+		t.Fatalf("SendMessage(relay once running) = %+v, %v; want accepted", accepted, err)
+	}
+	duplicate, err := tc.Controller.SendMessage(ctx, relay)
+	if err != nil || duplicate.Outcome != string(app.MessageDuplicate) || duplicate.MessageID != accepted.MessageID {
+		t.Fatalf("SendMessage(relay retried) = %+v, %v; want duplicate %s", duplicate, err, accepted.MessageID)
+	}
+}
+
 func TestSendMessageValidation(t *testing.T) {
 	t.Run("a worker cannot send info to a task address (kind/address legality)", func(t *testing.T) {
 		tc := newTestController(defaultPolicy())
@@ -659,7 +744,7 @@ func TestFetchMessageEmptyQueueCommitsNothing(t *testing.T) {
 // defect) and checks the exact grammar.go token each one sets, through
 // the driving Controller exactly as cmd/hop renders it.
 func TestMessageRefusalReasonsAlwaysSet(t *testing.T) {
-	t.Run("a run that left running refuses a send", func(t *testing.T) {
+	t.Run("a run that can never accept refuses a send", func(t *testing.T) {
 		tc := newTestController(defaultPolicy())
 		fr := seedFeatureRun(t, tc, 2)
 		rRow := tc.Store.Runs[fr.RunID]
@@ -667,7 +752,11 @@ func TestMessageRefusalReasonsAlwaysSet(t *testing.T) {
 		if err != nil {
 			t.Fatalf("EnterCompleting() error = %v", err)
 		}
-		rRow.value = completing
+		completed, err := completing.Complete(tc.Clock.Now())
+		if err != nil {
+			t.Fatalf("Complete() error = %v", err)
+		}
+		rRow.value = completed
 
 		result, err := tc.Controller.SendMessage(context.Background(), app.SendMessageRequest{
 			RunID: fr.RunID.String(), SessionID: fr.ManagerID.String(), IncarnationID: fr.ManagerIncarnation.String(),

@@ -152,21 +152,39 @@ func (r Run) MarkStopped(now time.Time) (Run, error) { return r.transition(RunSt
 func (r Run) EnterResuming(now time.Time) (Run, error) { return r.transition(RunResuming, now) } //nolint:gocritic // hugeParam: Run is an immutable domain value returned by every transition; a pointer receiver would let a caller's original be mutated through it, breaking the pure-transition contract.
 
 // CanAcceptManagerVerb reports whether r currently accepts a manager verb
-// (CreateTask, RequestRetry, ClosePlan): only while running.
-// ErrRunNotAccepting otherwise, the fate of a late request racing
-// completion — validated inside the same accepting transaction so nothing
-// can race it.
+// (CreateTask, RequestRetry, ClosePlan) or an ordinary message send. The
+// caller validates it inside the same accepting transaction, after the
+// caller's own authority and incarnation, so no state change can race it.
+//
+//   - running with no stop request: accepted (nil).
+//   - created, launching, resuming or completing with no stop request:
+//     ErrRunNotYetRunning, retryable. Each can still reach running: the
+//     manager's launch claim settles, resume restores the run, or a
+//     completion whose readiness re-validation fails returns it to
+//     running. A retry terminates either way, because a run that never
+//     gets there reaches a final state.
+//   - completed, failed, stopping or stopped, or any state with a stop
+//     request: ErrRunNotAccepting, final. A stopping run can be resumed,
+//     but it keeps its monotonic stop request, so it never accepts again.
 func (r Run) CanAcceptManagerVerb() error { //nolint:gocritic // hugeParam: Run is an immutable domain value returned by every transition; a pointer receiver would let a caller's original be mutated through it, breaking the pure-transition contract.
-	if r.State != RunRunning {
+	if r.StopRequested {
+		return fmt.Errorf("%w: run %s: stop requested", ErrRunNotAccepting, r.ID)
+	}
+	switch r.State {
+	case RunRunning:
+		return nil
+	case RunCreated, RunLaunching, RunResuming, RunCompleting:
+		return fmt.Errorf("%w: run %s: state %s", ErrRunNotYetRunning, r.ID, r.State)
+	default:
 		return fmt.Errorf("%w: run %s: state %s", ErrRunNotAccepting, r.ID, r.State)
 	}
-	return nil
 }
 
 // ClosePlan sets the plan flag: the manager has finished submitting its
 // plan. hasImplementTask must be true — a plan with zero implement tasks
 // is ErrEmptyPlan, a usage error surfaced to the manager rather than a
-// silently-vacuous readiness. Also validates CanAcceptManagerVerb.
+// silently-vacuous readiness. CanAcceptManagerVerb is validated first, and
+// its retryable or final error is returned unchanged.
 func (r Run) ClosePlan(hasImplementTask bool, now time.Time) (Run, error) { //nolint:gocritic // hugeParam: Run is an immutable domain value returned by every transition; a pointer receiver would let a caller's original be mutated through it, breaking the pure-transition contract.
 	if err := r.CanAcceptManagerVerb(); err != nil {
 		return r, err

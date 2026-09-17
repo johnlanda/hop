@@ -52,6 +52,14 @@ const (
 	// of hop result submit AND hop review submit: the section 5 mailbox
 	// rule — drain before submitting.
 	GrammarTransientUndeliveredLine = "transient: undelivered messages; drain with hop msg next, ack, then resubmit"
+	// GrammarTransientRunNotRunningLine is the retryable line of hop task
+	// create, hop task retry, hop plan close and hop msg send: the run is
+	// created, launching, resuming or completing and can still reach
+	// running (run.ErrRunNotYetRunning). The request changed nothing; the
+	// caller reruns the same command after a short delay.
+	GrammarTransientRunNotRunningLine = "transient: run not yet running; retry"
+	// GrammarTransientPrefix begins every retryable first line (exit 1).
+	GrammarTransientPrefix = "transient: "
 	// GrammarMsgNoneLine is hop msg next's empty-queue line; the fetch
 	// commits nothing.
 	GrammarMsgNoneLine = "none: no queued message"
@@ -89,8 +97,9 @@ const (
 	// GrammarReasonNotDelivered: an ack of a message never delivered to
 	// the acking session itself.
 	GrammarReasonNotDelivered = "not-delivered"
-	// GrammarReasonRunNotAccepting: a manager verb after the run left
-	// running.
+	// GrammarReasonRunNotAccepting: a manager verb or message send against
+	// a run that can never accept one again (completed, failed, stopping or
+	// stopped, or a stop request; run.ErrRunNotAccepting).
 	GrammarReasonRunNotAccepting = "run-not-accepting"
 	// GrammarReasonMailboxClosed: a send addressed to a task whose mailbox
 	// admission has closed.
