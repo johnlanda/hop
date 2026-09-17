@@ -148,6 +148,193 @@ func TestStoreVectors(t *testing.T) {
 		}
 	})
 
+	t.Run("MessageSendAnswerNotRecipient", func(t *testing.T) {
+		f := newMessagingFixture(t)
+		humanQuestion := seedHumanQuestion(t, f.store, f, 8060)
+		answerID := identity.MessageID(uid(8062))
+
+		// The worker is current and in the run, but the question is the
+		// human's to answer.
+		got, err := f.store.SendMessage(t.Context(), storevectors.MessageSendAnswerNotRecipient(
+			f.spec.RunID, f.WorkerID, run.TaskAddress(f.TaskB), f.WorkerIncarnation, answerID, humanQuestion, "/state/body.md", "digest", 3,
+		))
+		if err != nil {
+			t.Fatalf("SendMessage() error = %v", err)
+		}
+		if got.Kind != app.MessageRefused || got.Reason != storevectors.MessageSendAnswerNotRecipientReason || got.Detail != storevectors.MessageSendAnswerNotRecipientDetail {
+			t.Fatalf("SendMessage(answer by a non-recipient) = %+v, want refused/%s %q", got, storevectors.MessageSendAnswerNotRecipientReason, storevectors.MessageSendAnswerNotRecipientDetail)
+		}
+		if n := countRows(t, f.store, `SELECT COUNT(*) FROM messages WHERE id = ? OR reply_to = ?`, answerID.String(), humanQuestion.String()); n != 0 {
+			t.Fatalf("refused answer left %d envelope(s); want none", n)
+		}
+		if n := countRows(t, f.store, `SELECT COUNT(*) FROM message_acks WHERE message_id = ?`, humanQuestion.String()); n != 0 {
+			t.Fatalf("refused answer acknowledged the human question (%d ack rows); want none", n)
+		}
+	})
+
+	t.Run("MessageSendAnswerMailboxClosed", func(t *testing.T) {
+		clock := newFakeClock()
+		store := openStoreAt(t, t.TempDir(), clock)
+		f := newMailboxFixtureAt(t, store, clock)
+		question := app.MessageSend{
+			ID: identity.MessageID(uid(8063)), RunID: f.spec.RunID,
+			Sender: run.SessionPrincipal(f.WorkerID), SenderAddress: run.TaskAddress(f.TaskB),
+			IncarnationID: f.WorkerIncarnation, Recipient: run.ManagerAddress(), Kind: run.MessageQuestion,
+			BodyPath: "/state/q.md", BodyDigest: "digest-q", BodyBytes: 1,
+		}
+		if outcome, err := store.SendMessage(t.Context(), question); err != nil || outcome.Kind != app.MessageAccepted {
+			t.Fatalf("seed worker question: %+v, %v", outcome, err)
+		}
+		// The worker's own mailbox is empty, so its result is accepted and
+		// the task mailbox closes in the same commit.
+		if outcome, err := store.SubmitResult(t.Context(), f.resultFor(8064)); err != nil || outcome.Kind != app.SubmissionAccepted {
+			t.Fatalf("SubmitResult() = %+v, %v; want accepted", outcome, err)
+		}
+		answerID := identity.MessageID(uid(8065))
+
+		got, err := store.SendMessage(t.Context(), storevectors.MessageSendAnswerMailboxClosed(
+			f.spec.RunID, f.ManagerID, run.ManagerAddress(), f.ManagerIncarnation, answerID, question.ID, "/state/a.md", "digest-a", 1,
+		))
+		if err != nil {
+			t.Fatalf("SendMessage() error = %v", err)
+		}
+		if got.Kind != storevectors.MessageSendAnswerMailboxClosedKind || got.Reason != storevectors.MessageSendAnswerMailboxClosedReason {
+			t.Fatalf("SendMessage(answer into a closed mailbox) = %+v, want %s/%s", got, storevectors.MessageSendAnswerMailboxClosedKind, storevectors.MessageSendAnswerMailboxClosedReason)
+		}
+		if n := countRows(t, store, `SELECT COUNT(*) FROM messages WHERE id = ? OR recipient_address = ?`, answerID.String(), app.AddressString(run.TaskAddress(f.TaskB))); n != 0 {
+			t.Fatalf("refused answer left %d envelope(s) for the closed task; want none", n)
+		}
+	})
+
+	t.Run("MessageSendClaimedAddressMismatch", func(t *testing.T) {
+		f := newMessagingFixture(t)
+		taskC := f.createFeatureTask(t, 8070, 3, run.TaskActive)
+		workerC, workerCIncarnation := f.createWorkerSession(t, taskC, run.RoleImplementer, 8071)
+		fromC := app.MessageSend{
+			ID: identity.MessageID(uid(8075)), RunID: f.spec.RunID,
+			Sender: run.SessionPrincipal(workerC), SenderAddress: run.TaskAddress(taskC),
+			IncarnationID: workerCIncarnation, Recipient: run.ManagerAddress(), Kind: run.MessageQuestion,
+			BodyPath: "/state/q.md", BodyDigest: "digest-q", BodyBytes: 1,
+		}
+		if outcome, err := f.store.SendMessage(t.Context(), fromC); err != nil || outcome.Kind != app.MessageAccepted {
+			t.Fatalf("seed task C question: %+v, %v", outcome, err)
+		}
+		cases := []struct {
+			name    string
+			n       int
+			claimed run.Address
+			kind    run.MessageKind
+			to      run.Address
+			replyTo *identity.MessageID
+		}{
+			{"a worker claiming manager sends info to another task", 8076, run.ManagerAddress(), run.MessageInfo, run.TaskAddress(taskC), nil},
+			{"a worker claiming manager asks the human", 8077, run.ManagerAddress(), run.MessageQuestion, run.HumanAddress(), nil},
+			{"a worker claiming manager answers a manager-addressed question", 8078, run.ManagerAddress(), run.MessageAnswer, run.Address{}, &fromC.ID},
+			{"a worker claiming another task asks the manager", 8079, run.TaskAddress(taskC), run.MessageQuestion, run.ManagerAddress(), nil},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				messageID := identity.MessageID(uid(tc.n))
+				before := messageReceiptCount(t, f.store, f.spec.RunID)
+				got, err := f.store.SendMessage(t.Context(), storevectors.MessageSendClaimedAddressMismatch(
+					f.spec.RunID, f.WorkerID, tc.claimed, f.WorkerIncarnation, messageID, tc.kind, tc.to, tc.replyTo, "/state/body.md", "digest", 3,
+				))
+				if err != nil {
+					t.Fatalf("SendMessage() error = %v", err)
+				}
+				if got.Kind != app.MessageRefused || got.Reason != storevectors.MessageSendClaimedAddressMismatchReason || got.Detail != storevectors.MessageSendClaimedAddressMismatchDetail {
+					t.Fatalf("SendMessage(claimed address) = %+v, want refused/%s %q", got, storevectors.MessageSendClaimedAddressMismatchReason, storevectors.MessageSendClaimedAddressMismatchDetail)
+				}
+				if n := countRows(t, f.store, `SELECT COUNT(*) FROM messages WHERE id = ?`, messageID.String()); n != 0 {
+					t.Fatal("the refused send created an envelope; want none")
+				}
+				if after := messageReceiptCount(t, f.store, f.spec.RunID); after != before+1 {
+					t.Fatalf("the refusal left %d receipts, want exactly one more than %d", after, before)
+				}
+			})
+		}
+		if n := countRows(t, f.store, `SELECT COUNT(*) FROM messages WHERE kind = 'answer' AND reply_to = ?`, fromC.ID.String()); n != 0 {
+			t.Errorf("task C's question has %d answers after the refused claim; want none", n)
+		}
+
+		t.Run("a session with no messaging role claims a task address", func(t *testing.T) {
+			solo := newFixture(t)
+			solo.createBinding(t)
+			messageID := identity.MessageID(uid(8080))
+			got, err := solo.store.SendMessage(t.Context(), storevectors.MessageSendClaimedAddressMismatch(
+				solo.spec.RunID, solo.spec.SessionID, run.TaskAddress(solo.spec.TaskID), solo.spec.IncarnationID, messageID,
+				run.MessageQuestion, run.ManagerAddress(), nil, "/state/body.md", "digest", 3,
+			))
+			if err != nil {
+				t.Fatalf("SendMessage() error = %v", err)
+			}
+			if got.Kind != app.MessageRefused || got.Reason != storevectors.MessageSendClaimedAddressMismatchReason || got.Detail != storevectors.MessageSendClaimedAddressMismatchDetail {
+				t.Fatalf("SendMessage(solo session) = %+v, want refused/%s %q", got, storevectors.MessageSendClaimedAddressMismatchReason, storevectors.MessageSendClaimedAddressMismatchDetail)
+			}
+			if n := countRows(t, solo.store, `SELECT COUNT(*) FROM messages`); n != 0 {
+				t.Fatalf("the refused send left %d envelopes; want none", n)
+			}
+		})
+	})
+
+	t.Run("MessageSendClaimedAddressReplay", func(t *testing.T) {
+		f := newMessagingFixture(t)
+		taskC := f.createFeatureTask(t, 8100, 3, run.TaskActive)
+		workerC, workerCIncarnation := f.createWorkerSession(t, taskC, run.RoleImplementer, 8101)
+		question := f.workerSend(8105, run.MessageQuestion, "q-1")
+		requireSendOutcome(t, f.store, "task B question", question, app.MessageAccepted, "")
+		requireSendOutcome(t, f.store, "manager answer", f.managerAnswer(8106, question.ID, "fwd-1", "secret-body"), app.MessageAccepted, "")
+		info := app.MessageSend{
+			ID: identity.MessageID(uid(8107)), RunID: f.spec.RunID,
+			Sender: run.SessionPrincipal(f.ManagerID), SenderAddress: run.ManagerAddress(),
+			IncarnationID: f.ManagerIncarnation, Recipient: run.TaskAddress(f.TaskB), Kind: run.MessageInfo,
+			RequestID: "info-1", BodyPath: "/state/info.md", BodyDigest: "info-body", BodyBytes: 4,
+		}
+		requireSendOutcome(t, f.store, "manager info to task B", info, app.MessageAccepted, "")
+
+		cases := []struct {
+			name      string
+			n         int
+			claimed   run.Address
+			kind      run.MessageKind
+			to        run.Address
+			replyTo   *identity.MessageID
+			requestID string
+			digest    string
+		}{
+			{"the manager's answer, same body", 8110, run.ManagerAddress(), run.MessageAnswer, run.Address{}, &question.ID, "fwd-1", "secret-body"},
+			{"the manager's answer, another body", 8111, run.ManagerAddress(), run.MessageAnswer, run.Address{}, &question.ID, "fwd-1", "guess-body"},
+			{"the manager's info, same body", 8112, run.ManagerAddress(), run.MessageInfo, run.TaskAddress(f.TaskB), nil, "info-1", "info-body"},
+			{"the manager's info, another body", 8113, run.ManagerAddress(), run.MessageInfo, run.TaskAddress(f.TaskB), nil, "info-1", "guess-body"},
+			{"task B's question, same body", 8114, run.TaskAddress(f.TaskB), run.MessageQuestion, run.ManagerAddress(), nil, "q-1", question.BodyDigest},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				messageID := identity.MessageID(uid(tc.n))
+				before := messageReceiptCount(t, f.store, f.spec.RunID)
+				got, err := f.store.SendMessage(t.Context(), storevectors.MessageSendClaimedAddressReplay(
+					f.spec.RunID, workerC, tc.claimed, workerCIncarnation, messageID, tc.kind, tc.to, tc.replyTo, tc.requestID, "/state/body.md", tc.digest, 3,
+				))
+				if err != nil {
+					t.Fatalf("SendMessage() error = %v", err)
+				}
+				if got.Kind != app.MessageRefused || got.Reason != storevectors.MessageSendClaimedAddressReplayReason ||
+					got.Detail != storevectors.MessageSendClaimedAddressReplayDetail || got.MessageID != "" {
+					t.Fatalf("SendMessage(claimed-address replay) = %+v, want refused/%s %q naming no message", got, storevectors.MessageSendClaimedAddressReplayReason, storevectors.MessageSendClaimedAddressReplayDetail)
+				}
+				if n := countRows(t, f.store, `SELECT COUNT(*) FROM messages WHERE id = ?`, messageID.String()); n != 0 {
+					t.Fatal("the refused replay created an envelope; want none")
+				}
+				if after := messageReceiptCount(t, f.store, f.spec.RunID); after != before+1 {
+					t.Fatalf("the refusal left %d receipts, want exactly one more than %d", after, before)
+				}
+			})
+		}
+		if n := countRows(t, f.store, `SELECT COUNT(*) FROM messages WHERE reply_to = ? OR recipient_address = ?`, question.ID.String(), app.AddressString(run.TaskAddress(f.TaskB))); n != 2 {
+			t.Errorf("envelopes answering task B's question or addressed to task B = %d; want the manager's answer and info only", n)
+		}
+	})
+
 	t.Run("MessageSendCrossRun", func(t *testing.T) {
 		clock := newFakeClock()
 		store := openStoreAt(t, t.TempDir(), clock)
@@ -185,6 +372,113 @@ func TestStoreVectors(t *testing.T) {
 		if !errors.Is(err, app.ErrMessagingUnauthorized) {
 			t.Fatalf("FetchNextMessage(cross-run) error = %v, want ErrMessagingUnauthorized", err)
 		}
+	})
+
+	t.Run("MessageFetchSupersededAttempt", func(t *testing.T) {
+		f := newTaskLineageFixture(t)
+		f.retireAndRetry(t)
+		message := queueTaskInfo(t, f.featureFixture, f.Task, 8090)
+		requireFetchRefused(t, f.store, ptr(storevectors.MessageFetchSupersededAttempt(f.spec.RunID, f.OldSession, f.OldIncarnation, f.Task)), storevectors.MessageFetchSupersededAttemptDetail)
+		if delivery, served, err := f.store.FetchNextMessage(t.Context(), f.fetch(f.NewSession, f.NewIncarnation)); err != nil || !served || delivery.Message.ID != message {
+			t.Fatalf("successor fetch = %+v, %t, %v; want the message", delivery, served, err)
+		}
+		if n := countRows(t, f.store, `SELECT COUNT(*) FROM message_deliveries WHERE message_id = ?`, message.String()); n != 1 {
+			t.Fatalf("delivery rows = %d, want the successor's first delivery only", n)
+		}
+	})
+
+	t.Run("AckMessageSupersededAttempt", func(t *testing.T) {
+		f := newTaskLineageFixture(t)
+		message := queueTaskInfo(t, f.featureFixture, f.Task, 8091)
+		if _, served, err := f.store.FetchNextMessage(t.Context(), f.fetch(f.OldSession, f.OldIncarnation)); err != nil || !served {
+			t.Fatalf("fetch while current = %t, %v", served, err)
+		}
+		f.retireAndRetry(t)
+		got, err := f.store.AckMessage(t.Context(), storevectors.AckMessageSupersededAttempt(f.spec.RunID, message, f.OldSession, f.OldIncarnation))
+		if err != nil || got.Kind != app.AckRefused || got.Reason != storevectors.AckMessageSupersededAttemptReason {
+			t.Fatalf("AckMessage(superseded attempt) = %+v, %v; want refused/%s", got, err, storevectors.AckMessageSupersededAttemptReason)
+		}
+		if n := countRows(t, f.store, `SELECT COUNT(*) FROM message_acks`); n != 0 {
+			t.Fatalf("ack rows = %d, want none", n)
+		}
+		if delivery, served, err := f.store.FetchNextMessage(t.Context(), f.fetch(f.NewSession, f.NewIncarnation)); err != nil || !served || delivery.Message.ID != message {
+			t.Fatalf("successor fetch = %+v, %t, %v; want the message re-served", delivery, served, err)
+		}
+		if ack, err := f.store.AckMessage(t.Context(), f.ack(message, f.NewSession, f.NewIncarnation)); err != nil || ack.Kind != app.AckAccepted {
+			t.Fatalf("successor ack = %+v, %v; want accepted", ack, err)
+		}
+	})
+
+	t.Run("MessageFetchEndedManager", func(t *testing.T) {
+		f := newMessagingFixture(t)
+		send := f.workerSend(8092, run.MessageQuestion, "")
+		if outcome, err := f.store.SendMessage(t.Context(), send); err != nil || outcome.Kind != app.MessageAccepted {
+			t.Fatalf("seed question: %+v, %v", outcome, err)
+		}
+		successor, successorIncarnation := endManagerWithSuccessor(t, f.featureFixture, 8093)
+		requireFetchRefused(t, f.store, ptr(storevectors.MessageFetchEndedManager(f.spec.RunID, f.ManagerID, f.ManagerIncarnation)), storevectors.MessageFetchEndedManagerDetail)
+		fetch := app.MessageFetch{RunID: f.spec.RunID, SessionID: successor, IncarnationID: successorIncarnation, Address: run.ManagerAddress()}
+		if delivery, served, err := f.store.FetchNextMessage(t.Context(), fetch); err != nil || !served || delivery.Message.ID != send.ID {
+			t.Fatalf("successor manager fetch = %+v, %t, %v; want the question", delivery, served, err)
+		}
+	})
+
+	t.Run("AckMessageEndedManager", func(t *testing.T) {
+		f := newMessagingFixture(t)
+		send := f.workerSend(8096, run.MessageQuestion, "")
+		if outcome, err := f.store.SendMessage(t.Context(), send); err != nil || outcome.Kind != app.MessageAccepted {
+			t.Fatalf("seed question: %+v, %v", outcome, err)
+		}
+		if _, served, err := f.store.FetchNextMessage(t.Context(), f.managerFetch()); err != nil || !served {
+			t.Fatalf("manager fetch while current = %t, %v", served, err)
+		}
+		endManagerWithSuccessor(t, f.featureFixture, 8097)
+		got, err := f.store.AckMessage(t.Context(), storevectors.AckMessageEndedManager(f.spec.RunID, send.ID, f.ManagerID, f.ManagerIncarnation))
+		if err != nil || got.Kind != app.AckRefused || got.Reason != storevectors.AckMessageEndedManagerReason {
+			t.Fatalf("AckMessage(ended manager) = %+v, %v; want refused/%s", got, err, storevectors.AckMessageEndedManagerReason)
+		}
+		if n := countRows(t, f.store, `SELECT COUNT(*) FROM message_acks`); n != 0 {
+			t.Fatalf("ack rows = %d, want none", n)
+		}
+	})
+
+	t.Run("MessageSendSupersededAttempt", func(t *testing.T) {
+		f := newTaskLineageFixture(t)
+		question := queueTaskQuestion(t, f.featureFixture, f.Task, 8120)
+		if _, served, err := f.store.FetchNextMessage(t.Context(), f.fetch(f.OldSession, f.OldIncarnation)); err != nil || !served {
+			t.Fatalf("fetch while current = %t, %v", served, err)
+		}
+		f.retireAndRetry(t)
+		answerID := identity.MessageID(uid(8121))
+		got, err := f.store.SendMessage(t.Context(), storevectors.MessageSendSupersededAttempt(f.spec.RunID, f.OldSession, f.Task, f.OldIncarnation, answerID, question, "/state/a.md", "stale-answer", 5))
+		if err != nil || got.Kind != app.MessageRefused || got.Reason != storevectors.MessageSendSupersededAttemptReason || got.Detail != storevectors.MessageSendSupersededAttemptDetail {
+			t.Fatalf("SendMessage(superseded attempt) = %+v, %v; want refused/%s %q", got, err, storevectors.MessageSendSupersededAttemptReason, storevectors.MessageSendSupersededAttemptDetail)
+		}
+		if n := countRows(t, f.store, `SELECT COUNT(*) FROM messages WHERE id = ? OR reply_to = ?`, answerID.String(), question.String()); n != 0 {
+			t.Fatalf("the refused answer left %d envelope(s); want none", n)
+		}
+		if delivery, served, err := f.store.FetchNextMessage(t.Context(), f.fetch(f.NewSession, f.NewIncarnation)); err != nil || !served || delivery.Message.ID != question {
+			t.Fatalf("successor fetch = %+v, %t, %v; want the question re-served", delivery, served, err)
+		}
+		requireSendOutcome(t, f.store, "successor's answer",
+			sessionAnswer(f.spec.RunID, 8122, f.NewSession, run.TaskAddress(f.Task), f.NewIncarnation, question, "", "fresh-answer"),
+			app.MessageAccepted, "")
+	})
+
+	t.Run("MessageSendEndedManager", func(t *testing.T) {
+		f := newMessagingFixture(t)
+		successor, successorIncarnation := endManagerWithSuccessor(t, f.featureFixture, 8123)
+		messageID := identity.MessageID(uid(8126))
+		got, err := f.store.SendMessage(t.Context(), storevectors.MessageSendEndedManager(f.spec.RunID, f.ManagerID, f.ManagerIncarnation, messageID, f.TaskB, "/state/i.md", "ended-info", 4))
+		if err != nil || got.Kind != app.MessageRefused || got.Reason != storevectors.MessageSendEndedManagerReason || got.Detail != storevectors.MessageSendEndedManagerDetail {
+			t.Fatalf("SendMessage(ended manager) = %+v, %v; want refused/%s %q", got, err, storevectors.MessageSendEndedManagerReason, storevectors.MessageSendEndedManagerDetail)
+		}
+		if n := countRows(t, f.store, `SELECT COUNT(*) FROM messages`); n != 0 {
+			t.Fatalf("the refused send left %d envelope(s); want none", n)
+		}
+		requireSendOutcome(t, f.store, "successor manager's info",
+			storevectors.MessageSendEndedManager(f.spec.RunID, successor, successorIncarnation, identity.MessageID(uid(8127)), f.TaskB, "/state/i.md", "successor-info", 4),
+			app.MessageAccepted, "")
 	})
 
 	t.Run("AckMessageCrossRun", func(t *testing.T) {

@@ -176,7 +176,7 @@ func (s *Store) LoadRunStatus(ctx context.Context, runID identity.RunID) (app.Ru
 			if taskErr != nil {
 				return taskErr
 			}
-			attempt, _, attemptErr := latestAttempt(ctx, tx, task.ID)
+			attempt, attemptErr := latestAttempt(ctx, tx, task.ID)
 			if attemptErr != nil {
 				return attemptErr
 			}

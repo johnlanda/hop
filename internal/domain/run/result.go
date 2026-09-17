@@ -35,12 +35,17 @@ type ResultSubmission struct {
 // AcceptanceContext is the complete, application-assembled context a result
 // acceptance decision needs beyond the current Run, Task, Attempt and any
 // prior accepted result: whether the submission's incarnation is the
-// session's current, non-superseded binding, and whether that incarnation's
+// session's current, non-superseded binding; whether that incarnation's
 // launch claim has settled to execed (meaningful only while the attempt is
-// launching or relaunching, the early-submission case).
+// launching or relaunching, the early-submission case); and whether the
+// task's mailbox is CLEAR — no queued or delivered-unacknowledged message
+// addresses it (section 5's drain-then-submit contract; a solo task, which
+// no message ever addresses, is clear). Every field's zero value refuses,
+// so a caller that forgets one fails closed.
 type AcceptanceContext struct {
 	IncarnationCurrent bool
 	LaunchClaimSettled bool
+	MailboxClear       bool
 }
 
 // AcceptanceOutcome is the state AcceptResult decided: the result (existing,
@@ -62,10 +67,14 @@ type AcceptanceOutcome struct {
 // unequal digest is ErrConflictingResult and never disturbs the accepted
 // result); then, only for a first acceptance, eligibility — the
 // submission's incarnation must be current (else ErrStaleSubmission), the
-// run must have no stop request (else ErrStaleSubmission), and the attempt
+// run must have no stop request (else ErrStaleSubmission), the attempt
 // must be running, or launching/relaunching with a settled launch claim for
 // that incarnation (the early-submission case; an unsettled claim there is
-// ErrTransientNotRunning) — any other attempt state is ErrStaleSubmission.
+// ErrTransientNotRunning) — any other attempt state is ErrStaleSubmission —
+// and only then the task's mailbox must be clear (else ErrMailboxNotClear,
+// the retryable "drain and resubmit" outcome). This is AcceptVerdict's
+// order: a caller that can never be accepted is told so before it is told
+// to drain, and a caller told to drain is one whose fetch the store serves.
 // On acceptance, Attempt moves to submitted, Task to checking, and — when
 // the run has not yet reached it — Run from launching to running, all as
 // one atomic handoff.
@@ -95,6 +104,10 @@ func AcceptResult(run Run, task Task, attempt Attempt, prior *Result, ctx Accept
 		}
 	default:
 		return unchanged, fmt.Errorf("%w: attempt %s: state %s does not accept a result", ErrStaleSubmission, attempt.ID, attempt.State)
+	}
+
+	if !ctx.MailboxClear {
+		return unchanged, fmt.Errorf("%w: task %s", ErrMailboxNotClear, task.ID)
 	}
 
 	nextAttempt, err := attempt.Submit(now)

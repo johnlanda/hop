@@ -152,9 +152,6 @@ type fakeStore struct {
 	Messages          map[identity.MessageID]run.Message
 	MessageDeliveries map[identity.MessageID][]run.Delivery
 	MessageAcks       map[identity.MessageID]run.Ack
-	// enqueueSeq is the durable per-(run, recipient address) sequence
-	// counter SendMessage/AnswerQuestion assign from.
-	enqueueSeq map[string]int
 
 	// Reviews is the run's accepted verdicts, at most one per attempt.
 	Reviews map[identity.AttemptID]run.Review
@@ -228,7 +225,6 @@ func newFakeStore(clock interface{ Now() time.Time }) *fakeStore {
 		Messages:           map[identity.MessageID]run.Message{},
 		MessageDeliveries:  map[identity.MessageID][]run.Delivery{},
 		MessageAcks:        map[identity.MessageID]run.Ack{},
-		enqueueSeq:         map[string]int{},
 		Reviews:            map[identity.AttemptID]run.Review{},
 		Integrations:       map[identity.IntegrationID]*entityRow[run.Integration]{},
 		RetryRequests:      map[identity.TaskID]app.RetryRequestRecord{},
@@ -248,12 +244,28 @@ func (s *fakeStore) nextTaskSeqLocked(runID identity.RunID) int {
 	return s.taskSeqByRun[runID]
 }
 
-// nextEnqueueSeq assigns the next durable per-(run, recipient address)
-// message sequence number — the FIFO authority (section 7).
-func nextEnqueueSeq(s *fakeStore, runID identity.RunID, address run.Address) int {
-	key := runID.String() + "|" + app.AddressString(address)
-	s.enqueueSeq[key]++
-	return s.enqueueSeq[key]
+// nextEnqueueSeq is the next durable per-(run, recipient address) message
+// sequence number — the FIFO authority (section 7) — computed exactly as
+// the adapter does: one more than the highest sequence any stored message
+// to that address carries, or any of staged (a unit of work's own
+// uncommitted messages). Reading it consumes nothing, so a decision that
+// refuses leaves no gap, and a message seeded directly into s.Messages
+// counts like any other. Callers hold s.mu.
+func nextEnqueueSeq(s *fakeStore, runID identity.RunID, address run.Address, staged ...run.Message) int {
+	highest := 0
+	consider := func(m *run.Message) {
+		if m.RunID == runID && m.Recipient.Equal(address) && m.EnqueueSeq > highest {
+			highest = m.EnqueueSeq
+		}
+	}
+	for id := range s.Messages {
+		m := s.Messages[id]
+		consider(&m)
+	}
+	for i := range staged {
+		consider(&staged[i])
+	}
+	return highest + 1
 }
 
 // --- StateStore ---
@@ -951,6 +963,14 @@ func (s *fakeStore) RequestStop(_ context.Context, runID identity.RunID) error {
 func (s *fakeStore) SubmitResult(_ context.Context, submission app.ResultSubmission) (app.SubmissionOutcome, error) { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.submitResultLocked(&submission, nil), nil
+}
+
+// submitResultLocked decides and records one result submission. onAccept,
+// when non-nil, runs after an acceptance is applied and before the lock is
+// released, as the real store's accepting transaction commits its own side
+// effects. Callers hold s.mu.
+func (s *fakeStore) submitResultLocked(submission *app.ResultSubmission, onAccept func()) app.SubmissionOutcome {
 	now := s.clock.Now()
 
 	// Section 7 step 2 first: existence and agreement (attempt belongs to
@@ -961,14 +981,14 @@ func (s *fakeStore) SubmitResult(_ context.Context, submission app.ResultSubmiss
 	if !ok {
 		outcome := app.SubmissionOutcome{Kind: app.SubmissionMalformed, Detail: "unknown attempt"}
 		s.Submissions = append(s.Submissions, outcome)
-		return outcome, nil
+		return outcome
 	}
 	tRow := s.Tasks[submission.TaskID]
 	rRow := s.Runs[submission.RunID]
 	if tRow == nil || rRow == nil || aRow.value.TaskID != submission.TaskID || tRow.value.RunID != submission.RunID {
 		outcome := app.SubmissionOutcome{Kind: app.SubmissionMalformed, Detail: "attempt/task/run do not agree"}
 		s.Submissions = append(s.Submissions, outcome)
-		return outcome, nil
+		return outcome
 	}
 
 	// Step 3 onward is the domain's AcceptResult, handed any prior
@@ -986,8 +1006,12 @@ func (s *fakeStore) SubmitResult(_ context.Context, submission app.ResultSubmiss
 	}
 	claim, hasClaim := s.LaunchClaims[submission.IncarnationID]
 	launchClaimSettled := hasClaim && claim.State == app.LaunchClaimExeced
+	// The real store re-reads the task's mailbox inside the accepting
+	// transaction and hands it to AcceptResult, which consults it last; a
+	// solo task, which no message ever addresses, is clear.
+	mailboxClear := s.mailboxClearLocked(submission.TaskID)
 
-	ctx := run.AcceptanceContext{IncarnationCurrent: incarnationCurrent, LaunchClaimSettled: launchClaimSettled}
+	ctx := run.AcceptanceContext{IncarnationCurrent: incarnationCurrent, LaunchClaimSettled: launchClaimSettled, MailboxClear: mailboxClear}
 	outcomeVal, err := run.AcceptResult(rRow.value, tRow.value, aRow.value, prior, ctx, run.ResultSubmission{
 		ID: submission.ID, CommitOID: submission.CommitOID, Summary: submission.Summary, Digest: submission.Digest,
 	}, now)
@@ -1010,17 +1034,27 @@ func (s *fakeStore) SubmitResult(_ context.Context, submission app.ResultSubmiss
 			State: app.CheckRequestRequested, CreatedAt: now,
 		}
 		outcome = app.SubmissionOutcome{Kind: app.SubmissionAccepted, ResultID: submission.ID}
+		if onAccept != nil {
+			onAccept()
+		}
 	case errors.Is(err, run.ErrDuplicateResult):
 		outcome = app.SubmissionOutcome{Kind: app.SubmissionDuplicate, ResultID: outcomeVal.Result.ID}
 	case errors.Is(err, run.ErrConflictingResult):
 		outcome = app.SubmissionOutcome{Kind: app.SubmissionConflicting, ResultID: outcomeVal.Result.ID}
-	case errors.Is(err, run.ErrTransientNotRunning):
-		outcome = app.SubmissionOutcome{Kind: app.SubmissionTransient, Detail: "attempt not yet running; retry"}
+	case errors.Is(err, run.ErrTransientNotRunning), errors.Is(err, run.ErrMailboxNotClear):
+		reason, _ := app.TransientReasonOf(err)
+		// The real store's details: the drain line itself for a pending
+		// mailbox, the domain error's own text otherwise.
+		detail := err.Error()
+		if reason == app.TransientUndeliveredMessages {
+			detail = app.GrammarTransientUndeliveredLine
+		}
+		outcome = app.SubmissionOutcome{Kind: app.SubmissionTransient, Detail: detail, Transient: reason}
 	default:
 		outcome = app.SubmissionOutcome{Kind: app.SubmissionStale, Detail: err.Error()}
 	}
 	s.Submissions = append(s.Submissions, outcome)
-	return outcome, nil
+	return outcome
 }
 
 func (s *fakeStore) RecordMalformed(_ context.Context, claimed app.ClaimedSubmission) (app.SubmissionOutcome, error) { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.

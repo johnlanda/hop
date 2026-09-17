@@ -34,7 +34,7 @@ func TestAcceptResultOrdinaryAcceptance(t *testing.T) {
 	task := baseTask(run.TaskActive)
 	attempt := baseAttempt(run.AttemptRunning)
 
-	outcome, err := run.AcceptResult(r, task, attempt, nil, run.AcceptanceContext{IncarnationCurrent: true}, acceptedSubmission(), epoch())
+	outcome, err := run.AcceptResult(r, task, attempt, nil, run.AcceptanceContext{IncarnationCurrent: true, MailboxClear: true}, acceptedSubmission(), epoch())
 	if err != nil {
 		t.Fatalf("AcceptResult: unexpected error: %v", err)
 	}
@@ -66,7 +66,7 @@ func TestAcceptResultEarlySubmission(t *testing.T) {
 			r := baseRun(run.RunLaunching, false)
 			task := baseTask(run.TaskActive)
 			attempt := baseAttempt(attemptState)
-			ctx := run.AcceptanceContext{IncarnationCurrent: true, LaunchClaimSettled: true}
+			ctx := run.AcceptanceContext{IncarnationCurrent: true, LaunchClaimSettled: true, MailboxClear: true}
 
 			outcome, err := run.AcceptResult(r, task, attempt, nil, ctx, acceptedSubmission(), epoch())
 			if err != nil {
@@ -94,7 +94,7 @@ func TestAcceptResultTransient(t *testing.T) {
 			r := baseRun(run.RunLaunching, false)
 			task := baseTask(run.TaskActive)
 			attempt := baseAttempt(attemptState)
-			ctx := run.AcceptanceContext{IncarnationCurrent: true, LaunchClaimSettled: false}
+			ctx := run.AcceptanceContext{IncarnationCurrent: true, LaunchClaimSettled: false, MailboxClear: true}
 
 			outcome, err := run.AcceptResult(r, task, attempt, nil, ctx, acceptedSubmission(), epoch())
 
@@ -115,7 +115,7 @@ func TestAcceptResultStaleByIncarnation(t *testing.T) {
 	r := baseRun(run.RunRunning, false)
 	task := baseTask(run.TaskActive)
 	attempt := baseAttempt(run.AttemptRunning)
-	ctx := run.AcceptanceContext{IncarnationCurrent: false}
+	ctx := run.AcceptanceContext{IncarnationCurrent: false, MailboxClear: true}
 
 	_, err := run.AcceptResult(r, task, attempt, nil, ctx, acceptedSubmission(), epoch())
 
@@ -131,7 +131,7 @@ func TestAcceptResultStaleByStopRequest(t *testing.T) {
 	r := baseRun(run.RunStopping, true)
 	task := baseTask(run.TaskActive)
 	attempt := baseAttempt(run.AttemptRunning)
-	ctx := run.AcceptanceContext{IncarnationCurrent: true}
+	ctx := run.AcceptanceContext{IncarnationCurrent: true, MailboxClear: true}
 
 	_, err := run.AcceptResult(r, task, attempt, nil, ctx, acceptedSubmission(), epoch())
 
@@ -152,12 +152,86 @@ func TestAcceptResultStaleByAttemptState(t *testing.T) {
 			r := baseRun(run.RunRunning, false)
 			task := baseTask(run.TaskActive)
 			attempt := baseAttempt(state)
-			ctx := run.AcceptanceContext{IncarnationCurrent: true, LaunchClaimSettled: true}
+			ctx := run.AcceptanceContext{IncarnationCurrent: true, LaunchClaimSettled: true, MailboxClear: true}
 
 			_, err := run.AcceptResult(r, task, attempt, nil, ctx, acceptedSubmission(), epoch())
 
 			if !errors.Is(err, run.ErrStaleSubmission) {
 				t.Fatalf("AcceptResult from %s: error = %v, want ErrStaleSubmission", state, err)
+			}
+		})
+	}
+}
+
+// TestAcceptResultMailboxNotClear proves the section 5 drain-then-submit
+// rule on an otherwise eligible first acceptance: a task mailbox that is
+// not clear refuses with the retryable ErrMailboxNotClear and changes
+// nothing, and MailboxClear's zero value is that refusal, so a caller that
+// never sets it fails closed.
+func TestAcceptResultMailboxNotClear(t *testing.T) {
+	cases := []struct {
+		name    string
+		run     run.Run
+		attempt run.Attempt
+		ctx     run.AcceptanceContext
+	}{
+		{"running attempt", baseRun(run.RunRunning, false), baseAttempt(run.AttemptRunning), run.AcceptanceContext{IncarnationCurrent: true, MailboxClear: false}},
+		{"launching attempt with a settled claim", baseRun(run.RunLaunching, false), baseAttempt(run.AttemptLaunching), run.AcceptanceContext{IncarnationCurrent: true, LaunchClaimSettled: true, MailboxClear: false}},
+		{"relaunching attempt with a settled claim", baseRun(run.RunRunning, false), baseAttempt(run.AttemptRelaunching), run.AcceptanceContext{IncarnationCurrent: true, LaunchClaimSettled: true, MailboxClear: false}},
+		{"MailboxClear left at its zero value", baseRun(run.RunRunning, false), baseAttempt(run.AttemptRunning), run.AcceptanceContext{IncarnationCurrent: true, LaunchClaimSettled: true}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			task := baseTask(run.TaskActive)
+			outcome, err := run.AcceptResult(tc.run, task, tc.attempt, nil, tc.ctx, acceptedSubmission(), epoch())
+			if !errors.Is(err, run.ErrMailboxNotClear) {
+				t.Fatalf("AcceptResult: error = %v, want ErrMailboxNotClear", err)
+			}
+			if outcome.Run != tc.run || outcome.Task != task || outcome.Attempt != tc.attempt || outcome.Result != (run.Result{}) {
+				t.Fatalf("AcceptResult changed state on a pending mailbox: %+v", outcome)
+			}
+		})
+	}
+}
+
+// TestAcceptResultEligibilityBeforeMailbox proves AcceptVerdict's order for
+// results: with a pending mailbox, every caller that can never be accepted
+// is refused stale, and an attempt still launching with an unsettled claim
+// is attempt-not-running, before the mailbox is consulted. A caller is told
+// to drain only when draining can lead to its acceptance.
+func TestAcceptResultEligibilityBeforeMailbox(t *testing.T) {
+	pending := func(incarnationCurrent, claimSettled bool) run.AcceptanceContext {
+		return run.AcceptanceContext{IncarnationCurrent: incarnationCurrent, LaunchClaimSettled: claimSettled, MailboxClear: false}
+	}
+	type orderCase struct {
+		name    string
+		run     run.Run
+		attempt run.Attempt
+		ctx     run.AcceptanceContext
+		want    error
+	}
+	cases := []orderCase{
+		{"a superseded incarnation", baseRun(run.RunRunning, false), baseAttempt(run.AttemptRunning), pending(false, true), run.ErrStaleSubmission},
+		{"a stop request", baseRun(run.RunStopping, true), baseAttempt(run.AttemptRunning), pending(true, true), run.ErrStaleSubmission},
+		{"an unsettled claim on a launching attempt", baseRun(run.RunLaunching, false), baseAttempt(run.AttemptLaunching), pending(true, false), run.ErrTransientNotRunning},
+		{"an unsettled claim on a relaunching attempt", baseRun(run.RunRunning, false), baseAttempt(run.AttemptRelaunching), pending(true, false), run.ErrTransientNotRunning},
+		{"a superseded incarnation on a launching attempt", baseRun(run.RunLaunching, false), baseAttempt(run.AttemptLaunching), pending(false, false), run.ErrStaleSubmission},
+	}
+	for _, state := range []run.AttemptState{
+		run.AttemptReserved, run.AttemptSubmitted, run.AttemptChecking,
+		run.AttemptCompleted, run.AttemptFailed, run.AttemptInterrupted, run.AttemptReconciling,
+	} {
+		cases = append(cases, orderCase{"attempt " + string(state), baseRun(run.RunRunning, false), baseAttempt(state), pending(true, true), run.ErrStaleSubmission})
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			task := baseTask(run.TaskActive)
+			outcome, err := run.AcceptResult(tc.run, task, tc.attempt, nil, tc.ctx, acceptedSubmission(), epoch())
+			if !errors.Is(err, tc.want) || errors.Is(err, run.ErrMailboxNotClear) {
+				t.Fatalf("AcceptResult: error = %v, want %v and not ErrMailboxNotClear", err, tc.want)
+			}
+			if outcome.Run != tc.run || outcome.Task != task || outcome.Attempt != tc.attempt {
+				t.Fatalf("AcceptResult changed state on a refusal: %+v", outcome)
 			}
 		})
 	}
@@ -173,7 +247,7 @@ func TestAcceptResultPropagatesInconsistentTaskState(t *testing.T) {
 	task := baseTask(run.TaskInterrupted)
 	attempt := baseAttempt(run.AttemptRunning)
 
-	outcome, err := run.AcceptResult(r, task, attempt, nil, run.AcceptanceContext{IncarnationCurrent: true}, acceptedSubmission(), epoch())
+	outcome, err := run.AcceptResult(r, task, attempt, nil, run.AcceptanceContext{IncarnationCurrent: true, MailboxClear: true}, acceptedSubmission(), epoch())
 
 	if !errors.Is(err, run.ErrInvalidTransition) {
 		t.Fatalf("AcceptResult with an inconsistent task: error = %v, want ErrInvalidTransition", err)
@@ -200,7 +274,7 @@ func TestAcceptResultDuplicateIsIdempotentInEveryState(t *testing.T) {
 				attempt := baseAttempt(state)
 				resubmission := run.ResultSubmission{ID: identityOtherResultID, CommitOID: "deadbeef", Summary: "resubmit", Digest: "digest-v1"}
 
-				outcome, err := run.AcceptResult(r, task, attempt, &prior, run.AcceptanceContext{IncarnationCurrent: true}, resubmission, later())
+				outcome, err := run.AcceptResult(r, task, attempt, &prior, run.AcceptanceContext{IncarnationCurrent: true, MailboxClear: true}, resubmission, later())
 
 				if !errors.Is(err, run.ErrDuplicateResult) {
 					t.Fatalf("AcceptResult: error = %v, want ErrDuplicateResult", err)
@@ -238,28 +312,35 @@ func TestAcceptResultDuplicateOrderingIsAdversarial(t *testing.T) {
 			run:     baseRun(run.RunRunning, false),
 			task:    baseTask(run.TaskChecking),
 			attempt: baseAttempt(run.AttemptRunning),
-			ctx:     run.AcceptanceContext{IncarnationCurrent: false},
+			ctx:     run.AcceptanceContext{IncarnationCurrent: false, MailboxClear: true},
 		},
 		{
 			name:    "non-current incarnation, terminal completed attempt",
 			run:     baseRun(run.RunCompleted, false),
 			task:    baseTask(run.TaskCompleted),
 			attempt: baseAttempt(run.AttemptCompleted),
-			ctx:     run.AcceptanceContext{IncarnationCurrent: false},
+			ctx:     run.AcceptanceContext{IncarnationCurrent: false, MailboxClear: true},
 		},
 		{
 			name:    "non-current incarnation, terminal failed attempt",
 			run:     baseRun(run.RunFailed, false),
 			task:    baseTask(run.TaskFailed),
 			attempt: baseAttempt(run.AttemptFailed),
-			ctx:     run.AcceptanceContext{IncarnationCurrent: false},
+			ctx:     run.AcceptanceContext{IncarnationCurrent: false, MailboxClear: true},
 		},
 		{
 			name:    "run stopping with an active stop request",
 			run:     baseRun(run.RunStopping, true),
 			task:    baseTask(run.TaskChecking),
 			attempt: baseAttempt(run.AttemptChecking),
-			ctx:     run.AcceptanceContext{IncarnationCurrent: true},
+			ctx:     run.AcceptanceContext{IncarnationCurrent: true, MailboxClear: true},
+		},
+		{
+			name:    "a pending mailbox, running attempt",
+			run:     baseRun(run.RunRunning, false),
+			task:    baseTask(run.TaskChecking),
+			attempt: baseAttempt(run.AttemptRunning),
+			ctx:     run.AcceptanceContext{IncarnationCurrent: true, MailboxClear: false},
 		},
 	}
 	for _, tc := range cases {
@@ -292,7 +373,7 @@ func TestAcceptResultConflictingNeverDisturbsAcceptedResult(t *testing.T) {
 			attempt := baseAttempt(state)
 			conflicting := run.ResultSubmission{ID: identityOtherResultID, CommitOID: "c0ffee", Summary: "different work", Digest: "digest-v2"}
 
-			outcome, err := run.AcceptResult(r, task, attempt, &prior, run.AcceptanceContext{IncarnationCurrent: true}, conflicting, later())
+			outcome, err := run.AcceptResult(r, task, attempt, &prior, run.AcceptanceContext{IncarnationCurrent: true, MailboxClear: true}, conflicting, later())
 
 			if !errors.Is(err, run.ErrConflictingResult) {
 				t.Fatalf("AcceptResult: error = %v, want ErrConflictingResult", err)

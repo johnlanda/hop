@@ -14,11 +14,10 @@ import (
 // domain sentinel, or the adapter's own fixed decision) — never a literal
 // Detail string or substring cmd/hop would have to re-parse; refusalToken
 // only applies the shared fallback for the empty-reason defect case.
-// ReviewStore's outcome kind alone already names a distinct reason per
-// refusal shape (malformed/conflicting/stale; accepted, duplicate and
-// transient are rendered before ever reaching a refusal line), so
-// reviewRefusalToken maps by kind directly — TestReviewRefusalTokenIsExhaustive
-// (cmd/hop) pins that no other kind reaches its default branch.
+// ReviewStore's outcomes carry the same kind of store-set Reason, which
+// SubmitReviewVerdict checks against the outcome kind; reviewRefusalToken
+// renders only such a reason and never guesses one —
+// TestReviewRefusalTokenIsExhaustive (cmd/hop) pins every admitted pair.
 
 // refusalToken renders a store-set Reason directly. An empty reason on a
 // refused/malformed outcome is a defect the store side must never produce
@@ -32,21 +31,17 @@ func refusalToken(reason string) string {
 	return reason
 }
 
-// reviewRefusalToken classifies a SubmitReviewVerdict ReviewOutcomeKind:
-// the only kinds SubmitReviewResult can carry here are malformed,
-// conflicting and stale (accepted/duplicate/transient are rendered by the
-// caller before this is ever called).
-func reviewRefusalToken(outcome string) string {
-	switch outcome {
-	case "malformed":
-		return app.GrammarReasonMalformed
-	case "conflicting":
-		return app.GrammarReasonConflicting
-	case "stale":
-		return app.GrammarReasonStale
-	default:
-		return app.GrammarReasonUnauthorized
+// reviewRefusalToken returns a refused SubmitReviewVerdict outcome's
+// grammar reason token: the store-set Reason, when the outcome kind admits
+// it (app.ReviewReasonAdmitted — stale admits stale, not-reviewer and
+// subject-mismatch; malformed and conflicting admit only their own token).
+// ok is false for any other pair, and the caller then prints no protocol
+// line.
+func reviewRefusalToken(outcome, reason string) (token string, ok bool) {
+	if reason == "" || !app.ReviewReasonAdmitted(app.ReviewOutcomeKind(outcome), reason) {
+		return "", false
 	}
+	return reason, true
 }
 
 // renderRefusal renders a refused/malformed outcome as the grammar's

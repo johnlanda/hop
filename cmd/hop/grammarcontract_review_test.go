@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/johnlanda/hop/internal/app"
+	"github.com/johnlanda/hop/internal/testsupport/hopfixtures"
 )
 
 // initFixtureGitRepo creates a minimal git repository with one commit at
@@ -235,31 +238,67 @@ func TestGrammarContractReviewSubmitAccepted(t *testing.T) {
 	}
 }
 
-// TestGrammarContractReviewSubmitStale drives hop review submit's
-// `refused: stale` shape two ways: a subject that resolves as a real git
-// commit but does not match the review task's frozen subject, and a
-// caller session that is not the review task's reviewer.
-func TestGrammarContractReviewSubmitStale(t *testing.T) {
-	rf := newReviewFixture(t, 7200)
-	reasons := writeReasonsFile(t, rf.StateRoot)
-	want := app.GrammarRefusalLine(app.GrammarReasonStale)
+// TestGrammarContractReviewSubmitRefusals drives hop review submit's typed
+// refusal lines, each printed from the store's reason with its detail after
+// it, exit 1 and no verdict recorded: a subject that resolves as a real git
+// commit but is not the review task's frozen subject prints exactly
+// `refused: subject-mismatch`, and the same reviewer's resubmission with
+// the frozen subject is then accepted; a caller session that is not the
+// review attempt's reviewer prints exactly `refused: not-reviewer`; and the
+// reviewer after its binding was superseded prints exactly
+// `refused: stale`.
+func TestGrammarContractReviewSubmitRefusals(t *testing.T) {
+	reviewCount := func(t *testing.T, rf reviewFixture) int {
+		t.Helper()
+		return readOnlyCount(t, rf.StateRoot, `SELECT COUNT(*) FROM reviews`)
+	}
 
 	t.Run("subject mismatch", func(t *testing.T) {
+		rf := newReviewFixture(t, 7200)
+		reasons := writeReasonsFile(t, rf.StateRoot)
 		otherCommit := commitFixtureChange(t, rf.repoRoot)
 		result := rf.submit(t, "approve", otherCommit, reasons)
-		if got := result.FirstStdoutLine(); got != want {
-			t.Errorf("first line = %q, want %q; stdout=%q stderr=%q", got, want, result.Stdout, result.Stderr)
+		want := app.GrammarRefusalLine(app.GrammarReasonSubjectMismatch) + "\n" + "run: verdict subject mismatch: task " + rf.reviewer.TaskID + "\n"
+		if result.ExitCode != exitFailure || result.Stdout != want || result.Stderr != "" {
+			t.Fatalf("exit=%d stdout=%q stderr=%q; want exit %d and stdout %q", result.ExitCode, result.Stdout, result.Stderr, exitFailure, want)
+		}
+		if n := reviewCount(t, rf); n != 0 {
+			t.Fatalf("reviews after the refusal = %d, want 0", n)
+		}
+		if accepted := rf.submit(t, "approve", rf.subjectCommit, reasons); accepted.ExitCode != exitOK || !strings.HasPrefix(accepted.FirstStdoutLine(), "verdict accepted ") {
+			t.Fatalf("resubmission with the frozen subject: exit=%d stdout=%q stderr=%q; want accepted", accepted.ExitCode, accepted.Stdout, accepted.Stderr)
 		}
 	})
 
 	t.Run("non-reviewer caller", func(t *testing.T) {
+		rf := newReviewFixture(t, 7500)
+		reasons := writeReasonsFile(t, rf.StateRoot)
 		env := rf.reviewer.env(rf.featureManager, map[string]string{
 			"HOP_SESSION_ID":     rf.ManagerID,
 			"HOP_INCARNATION_ID": rf.ManagerIncarnation,
 		})
 		result := execHop(t, env, rf.StateRoot, "review", "submit", "--verdict", "approve", "--subject", rf.subjectCommit, "--reasons-file", reasons)
-		if got := result.FirstStdoutLine(); got != want {
-			t.Errorf("first line = %q, want %q; stdout=%q stderr=%q", got, want, result.Stdout, result.Stderr)
+		want := app.GrammarRefusalLine(app.GrammarReasonNotReviewer) + "\n" + app.ReviewNotReviewerDetail + "\n"
+		if result.ExitCode != exitFailure || result.Stdout != want || result.Stderr != "" {
+			t.Fatalf("exit=%d stdout=%q stderr=%q; want exit %d and stdout %q", result.ExitCode, result.Stdout, result.Stderr, exitFailure, want)
+		}
+		if n := reviewCount(t, rf); n != 0 {
+			t.Fatalf("reviews after the refusal = %d, want 0", n)
+		}
+	})
+
+	t.Run("reviewer whose binding was superseded", func(t *testing.T) {
+		rf := newReviewFixture(t, 7800)
+		reasons := writeReasonsFile(t, rf.StateRoot)
+		if err := hopfixtures.SupersedeBinding(context.Background(), rf.store, rf.lease, rf.reviewer.SessionID, time.Now().UTC()); err != nil {
+			t.Fatalf("supersede reviewer binding: %v", err)
+		}
+		result := rf.submit(t, "approve", rf.subjectCommit, reasons)
+		if result.ExitCode != exitFailure || result.FirstStdoutLine() != app.GrammarRefusalLine(app.GrammarReasonStale) || result.Stderr != "" {
+			t.Fatalf("exit=%d stdout=%q stderr=%q; want exit %d and first line %q", result.ExitCode, result.Stdout, result.Stderr, exitFailure, app.GrammarRefusalLine(app.GrammarReasonStale))
+		}
+		if n := reviewCount(t, rf); n != 0 {
+			t.Fatalf("reviews after the refusal = %d, want 0", n)
 		}
 	})
 }

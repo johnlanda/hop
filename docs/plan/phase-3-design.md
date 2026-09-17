@@ -203,8 +203,10 @@ newer.
 
 ```go
 type MessagingStore interface {
-    // Section 7. All validate the caller's session and incarnation
-    // currency; every outcome except an empty fetch commits a receipt.
+    // Section 7. All session verbs validate the caller's session, its
+    // incarnation currency and its address currency (only the address's
+    // current session sends, fetches or acks); every outcome except an
+    // empty fetch commits a receipt.
     // Mutating verbs carry an optional caller-stable RequestID: an
     // identical retry returns the original outcome, a conflicting reuse
     // is refused (ErrRequestConflict).
@@ -715,8 +717,8 @@ artifact and its row; `hop task create` refuses `kind=review`.
 | From | To | Cause |
 | --- | --- | --- |
 | queued | delivered | first fetch by the recipient address's current session (delivery row written in the fetch transaction) |
-| delivered | delivered | re-serve: any later fetch while unacknowledged (a new delivery row each time — at-least-once, journaled) |
-| delivered | acknowledged | first valid ack: a delivery row exists for the acking session itself, at its current incarnation (section 7 — a predecessor's delivery never authorizes a successor's ack) |
+| delivered | delivered | re-serve: any later fetch by the address's current session while unacknowledged (a new delivery row each time — at-least-once, journaled) |
+| delivered | acknowledged | first valid ack: a delivery row exists for the acking session itself, at its current incarnation, and the session is still its address's current session (section 7 — a predecessor's delivery never authorizes a successor's ack, and a retired session's ack never settles its successor's message) |
 | queued, delivered | acknowledged | `human`-addressed questions only: the accepted `hop answer` acknowledges the question in the same transaction — directly from `queued`, since a human question is never fetched (its rendering in `hop status` is not a delivery) |
 
 Per-recipient serialization: for each recipient address (`manager`,
@@ -727,8 +729,18 @@ durable per-address sequence assigned inside the send transaction, so
 FIFO means commit order, never caller clocks (a delayed writer or a clock
 adjustment cannot jump the queue). The table above is exhaustive about
 acks too: `queued → acknowledged` exists ONLY for the human-answer row —
-a session's ack of a message that was never delivered to its lineage is
-refused (`ErrNotDelivered`), so a message can never be silently skipped.
+a session's ack of a message that was never delivered to it is refused
+(`ErrNotDelivered`), so a message can never be silently skipped.
+An address's "current session" is one lineage member, never the whole
+lineage: for `manager`, the run's manager session that has not ended;
+for `task:<id>`, the session of the task's CURRENT attempt — the task's
+newest (highest-numbered) attempt, not terminal — that has not ended. A
+retired attempt's session (its attempt terminal or succeeded by a retry,
+or the session itself lost or terminated, whatever its binding says) is
+never served the address, cannot acknowledge a message it was served
+while current — that message stays in flight and is re-served to the
+current session, which acknowledges it after its own fetch — and cannot
+send anything: no answer, question or info (section 7).
 There is no message TTL and no expiry in Phase 3; an unfetched queue ages
 visibly in `hop status` (section 7's attention condition).
 
@@ -742,7 +754,19 @@ delivered-unacknowledged message addresses the task, the submission is
 refused with the retryable outcome `transient: undelivered messages;
 drain with hop msg next, ack, then resubmit` (a receipt, no state
 change); if the mailbox is clear, acceptance commits AND closes the
-mailbox atomically. Closure is not only acceptance's: EVERY transaction
+mailbox atomically. Results and verdicts share ONE acceptance order
+(`AcceptResult`, `AcceptVerdict`): a prior accepted result or verdict
+first (duplicate or conflicting), then the caller's incarnation
+currency, the run's stop request, the attempt's state and launch claim,
+and only then the mailbox. A caller that can never be accepted — a
+superseded or replaced incarnation, a run with a stop request, an attempt
+already terminal — therefore gets the final stale outcome
+(`stale: <detail>` from `hop result submit`, `refused: stale` from
+`hop review submit`, section 7's grammar) rather than being told to
+drain a queue its own fetch could never serve, and an attempt still
+launching with an unsettled claim is told `transient: attempt not yet
+running; retry` whatever its mailbox holds; only an otherwise eligible
+caller gets the drain line. Closure is not only acceptance's: EVERY transaction
 that makes the recipient permanently non-resumable closes admission in
 the same commit — a task settling `failed` (retry exhaustion or an
 unretryable terminal attempt, with or without any accepted result)
@@ -774,9 +798,15 @@ analogue of closure) refuses `refused: run-not-accepting`; a run that
 can still reach `running` (created, launching, resuming or completing)
 answers the retryable `transient: run not yet running; retry` instead
 (section 7, "Run-state acceptance"); a closed mailbox refuses
-`refused: mailbox-closed`. Every outcome leaves a receipt — the sender's
+`refused: mailbox-closed`. A session `answer` whose DERIVED destination
+is a task is admitted by the same mailbox rule, with no run-state gate:
+once any prior answer to the question is resolved (a replay of an answer
+accepted before the closure stays a duplicate), a closed destination
+mailbox refuses it `refused: mailbox-closed` and nothing is inserted —
+otherwise a task could proceed past acceptance with an unconsumed
+answer. Every outcome leaves a receipt — the sender's
 CLI failure is the manager's signal, never a stranded row. SQLite serializes every
-send/close pair, so exactly one order exists: either the send lands
+send/close pair, answers included, so exactly one order exists: either the send lands
 first (a pending acceptance is refused `transient` until the worker
 drains it; a pending failure settlement records the just-landed message
 among the orphaned obligations), or the closure lands first and the send
@@ -1004,7 +1034,11 @@ current AT ITS CREATION — historical provenance, never rewritten — while
 `ClosePlan` validate against, and the recipient of the `manager` address)
 is always the run's sole non-terminal manager-role session. A retired
 manager incarnation's verbs and acks fail the ordinary
-incarnation-currency checks; nothing special is added for it.
+incarnation-currency checks, and a manager session that has ended (lost
+or terminated) is never served the `manager` address, nor able to ack a
+message it was served or send one, even while its binding is still
+current (section 7's address currency) — so it can never consume its
+successor's queue or speak for it.
 
 ### Integration branch and worktree bases
 
@@ -1136,11 +1170,28 @@ each CHECKED, not merely documented:
 
 ### Recipient operating contract
 
-The harness agents' behavior is specified, not assumed: every launch
-prompt and role artifact states the polling contract verbatim (quoting the
-section 7 grammar constants), and the fixture principals implement exactly
-it, so the deterministic suite proves the contract is followable as
-written.
+The harness agents' behavior is specified, not assumed, and every line
+HOP renders for it quotes the section 7 grammar constants. The manager's
+launch prompt names its polling command and points at its assignment,
+its frozen role artifact and the worker protocol reference (the crib).
+The crib quotes every verb's success and retryable lines and its refusal
+shape: `refused: <reason-token>` unless the verb's own section names
+another (`hop result submit`'s `<kind>: <detail>` lines, and a refused
+`hop msg next`/`wait`, which prints no first line). The manager's
+assignment states the wait-and-ack loop and the verdict channel. The implementer's and reviewer's launch
+prompts name their submit command and one retry rule — on a first line
+beginning with `transient`, follow that line's instruction, then wait
+briefly and rerun the exact same command, so the drain line is drained
+before the resubmission — and their assignment artifacts state the
+exits: an accepted or duplicate submission means the work is done and
+the turn ends without polling; a stale line means stop without
+retrying. The worker's question-and-wait loop and its drain before
+submitting are in no HOP-rendered worker text: they are the repository's
+implementer and reviewer role instructions' to state, which HOP freezes
+verbatim and renders nothing into. The fixture principals implement exactly this split — the fixture
+worker drains when the drain line tells it to, and before submitting —
+so the deterministic suite proves the rendered instructions are
+followable as written.
 
 - **Manager**: after acting on its plan (creating tasks, sending
   messages), the manager's standing instruction is to run
@@ -1165,10 +1216,13 @@ written.
   before `hop result submit` it must drain its queue (`hop msg next`
   until `none:`, acking each). After an accepted or duplicate submission
   its instruction is to end its turn — the controller owns everything
-  after submission, and the pane closes when the process exits.
+  after submission, and the pane closes when the process exits; once its
+  attempt is terminal its own `hop msg next`/`wait`/`ack`/`send` are
+  refused (message verbs below), never answered.
 - **Reviewer**: reads the frozen subject, may ask the manager questions
   under the same wait-loop rule, submits exactly one verdict, ends its
-  turn.
+  turn; the accepted verdict completes its attempt, after which its own
+  message verbs are refused.
 - Every ack is issued only after the body file has been read — the ack is
   the recipient's statement of receipt-and-read, which is what makes the
   serialization rule (next message only after ack) a pacing mechanism
@@ -1263,7 +1317,15 @@ the pane's own command and can claim before the controller records the
 outcome leaves exactly this state. A live principal in it — manager or
 child — is therefore never refused `stale` for the missing binding; its
 verbs proceed normally, the run-state acceptance below still applying
-(`transient` while the run can still reach `running`). The change reaches
+(`transient` while the run can still reach `running`). For a child whose
+attempt is still launching behind an `exec_pending` claim (pinned on
+both stores), that means: `hop result submit` and
+`hop review submit` print `transient: attempt not yet running; retry`
+whether or not a message is queued to the task (section 5's one
+acceptance order), a queued message is served, and an ack is accepted
+after the session's own fetch and `not-delivered` before it; with a
+pending intent naming another incarnation, or none at all, the same
+caller is `stale` for both submissions and its fetch is refused. The change reaches
 the Phase 2 solo result submission too: a solo worker submitting before
 its binding is recorded is `transient`, the currency its own claim
 already had. The intent source is `pending` only, the claim's own: a
@@ -1271,6 +1333,19 @@ already had. The intent source is `pending` only, the claim's own: a
 after the launcher had already claimed is not read, so that principal is
 `stale` until label recovery commits the binding (LAUNCH-6, an accepted
 residual; widening it widens the claim rule with it).
+
+"Current session", wherever a verb requires it, is likewise ONE rule —
+section 5's address currency (`run.CurrentAddressSession`) — applied
+identically by `msg send` (every kind: question, info and answer),
+`msg next`/`msg wait` and `msg ack`, each after the caller's own run, its
+address and its current incarnation, inside the deciding transaction: a
+session that has ended (lost or terminated) never is; a manager needs
+nothing more; a worker or reviewer must belong to its task's newest
+attempt, and that attempt must not be terminal. A send or first ack from
+any other session is `refused: stale`, and a fetch is refused with no
+protocol line (Fetch below); each records a receipt whose detail names no
+value ("session is not its task's current attempt session", or "session
+is not the run's current manager session").
 
 Every mutating verb here and in section 8 (`msg send`, `answer`,
 `task create`, `task retry`, `plan close`; `review submit` already has
@@ -1303,7 +1378,30 @@ response; the request ID covers a lost MUTATION response, which
 re-running would otherwise duplicate. The flag is optional at the CLI
 (omitted → server-minted, retry then not idempotent) but the templates
 and fixtures ALWAYS pass it; the duplicate lookup by request key runs
-before any other validation (receipt-before-eligibility, as everywhere).
+before any eligibility check (receipt-before-eligibility, as everywhere).
+A session's `msg send` first establishes only who is asking — the
+session's own run and its re-derived logical address, which must equal
+the address the request digest covers (Send, below) — so a session that
+claims another principal's address never reads a duplicate or
+conflicting verdict about that principal's requests.
+
+The threat model these checks serve: every session of a run runs as the
+same OS user, with read access to the run's state root and its message
+bodies, so message content is not a confidentiality boundary between a
+run's sessions. Nor is the incarnation id a secret: the run's store,
+which every session's own `hop` process opens read-write, records every
+session's current incarnation in plain text. The session, run and
+incarnation ids a caller names are claims checked against the store's
+rows. The incarnation and address-currency checks, which decide who may
+send, answer, fetch, acknowledge or submit, keep a principal acting on
+its own launch identity from acting as a stale, retired or mistaken one.
+They are not a boundary against a same-user process that reads another
+session's ids and incarnation from the store and presents them, or that
+writes the store directly. A caller that names another session's id (ids
+are printed in `from=` fields) with its own incarnation passes the
+address check but can reach at most a receipt verdict (duplicate or
+conflicting) before the incarnation check refuses it, and never a
+mutation: an accepted residual of receipt-before-eligibility.
 
 Run-state acceptance follows the Phase 2 result-submission precedent
 ([phase-2-design.md](phase-2-design.md) section 7, step 4: a submission
@@ -1344,12 +1442,44 @@ the retryable nor the final line applies to them.
 
 - **Send** (`hop msg send --to manager|task:<id> --kind question|info
   [--relay-of <id>] --file <path>`, or `--kind answer --reply-to <id>
-  --file <path>` with NO `--to`): parse and bound. Kind/address legality
+  --file <path>` with NO `--to`): parse and bound. The sender's logical
+  address is re-derived from its own session row inside the accepting
+  transaction for every kind, after the session's own run and BEFORE the
+  request-ID receipt lookup and the incarnation check; a sender whose row
+  resolves to no address, or to a different one than the request claims
+  (the address the request digest covers), is `refused: unauthorized`
+  with a receipt whatever request ID and body it carries, and every
+  decision below uses only the derived address. A session at its OWN
+  address that reuses another principal's request ID is `refused:
+  conflicting`: the request key is run-wide and the digest names the
+  sender's address, so the digest never matches and the outcome is the
+  same whatever the body — the caller learns only that the ID is taken,
+  never whether its content matches. After the receipt and the
+  incarnation, the sender must be its address's current session (the
+  rule above), whatever the kind: a retired attempt's session or an
+  ended manager is `refused: stale` with that rule's value-free detail
+  and nothing inserted, while its own already-accepted request still
+  replays as duplicate from the receipt. Kind/address legality
   by role: workers and reviewers → `question`/`info` to `manager` only;
   the manager → `question` to `human` or `question`/`info` to `task:<id>`;
-  an `answer` is legal from ANY session answering a question addressed to
-  its own address — no `--to` legality applies, since the destination is
-  derived; `info` to `human` is refused at send — humans have no fetch or ack verb,
+  an `answer` is legal only from the session answering a question
+  addressed to its own address — no `--to` legality applies, since the
+  destination is derived. Recipient authority is checked in the accepting
+  transaction: the answering session's logical address is re-derived from
+  its own session row (never taken from the request) and must equal the
+  question's recipient, else `refused: unauthorized` with a receipt. No
+  session therefore ever answers a `human`-addressed question — only
+  `hop answer` does, and a session's answer can never bundle a human
+  question's acknowledgement — and no session answers a question
+  addressed to another task or to the manager. The check follows the
+  request-ID receipt lookup (a same-request-ID retry still resolves as
+  duplicate or conflicting first) and precedes the prior-answer
+  comparison below, so a non-recipient never reads a duplicate or
+  conflicting verdict about someone else's answer — one claiming the
+  recipient's address is refused before the receipt, above; a
+  recipient's address is lineage-stable, so its own retries are decided
+  exactly as before.
+  `info` to `human` is refused at send — humans have no fetch or ack verb,
   so a human-addressed info could never settle (the only human-addressed
   kind is `question`, settled by its answer). An `answer`'s destination is
   never caller-chosen: it is DERIVED from the referenced question's
@@ -1366,9 +1496,14 @@ the retryable nor the final line applies to them.
   a question or info, the run-state acceptance above — `transient` while
   the run can still reach `running`, `refused: run-not-accepting` (the
   section 5 run-level closure) once it never will; and for a
-  `task:<id>` destination an OPEN mailbox — a closed one is
-  `refused: mailbox-closed` with a receipt, per the
-  section 5 closure rule); accept: body artifact written durably BEFORE the
+  `task:<id>` destination — the requested recipient of a question or
+  info, the DERIVED destination of an answer — an OPEN mailbox: a closed
+  one is `refused: mailbox-closed` with a receipt, per the section 5
+  closure rule. An answer carries no run-state gate, but its admission
+  check applies after the duplicate/conflict resolution, so an answer
+  accepted before its destination closed still replays as duplicate
+  while a first answer to a closed mailbox is refused and inserts
+  nothing); accept: body artifact written durably BEFORE the
   row's transaction (temp-file-then-rename, digest recorded), then
   envelope row (enqueue sequence assigned here) + receipt in one
   transaction. Controller info notices follow the same file-first
@@ -1381,7 +1516,31 @@ the retryable nor the final line applies to them.
   resolve the caller's address (`manager` for the manager session;
   `task:<id>` for a worker or reviewer via its attempt's task;
   lineage-based, so a cold-relaunched or retried successor session fetches
-  its predecessors' queue without any re-addressing write); serve the
+  its predecessors' queue without any re-addressing write); after the
+  caller's own run, its current incarnation and its address, require it to
+  be that address's CURRENT session (section 5): a session that has not
+  ended (lost or terminated) and, for a task address, belongs to the
+  task's newest attempt, which is not terminal — the attempt numbering
+  read inside the fetch transaction. Any other caller is refused
+  (`ErrMessagingUnauthorized`: no protocol line, a stderr diagnostic,
+  exit 1) with a refusal receipt whose detail names no value ("session is
+  not its task's current attempt session", or "session is not the run's
+  current manager session") and nothing served, so a retired attempt's
+  session can never consume its successor's messages. In particular,
+  once a session's attempt is TERMINAL its fetch (and its first ack, see
+  Ack) is refused rather than answered `none:` — an accepted verdict
+  completes the review attempt at once; an accepted result's attempt
+  stays `submitted`/`checking` until its per-task check settles it
+  `completed` or `failed`, but the same acceptance commits the session's
+  retirement intent (section 6), and once that retirement terminates the
+  session it is never current — so fetch answers (and finds nothing, since acceptance required a clear
+  mailbox and closed it) until the attempt settles or the session ends,
+  whichever comes first; an interrupted or failed attempt is terminal
+  immediately. The session has nothing left
+  to consume there, and a terminal attempt's session must never take a
+  message a retry's successor is meant to read; the recipient operating
+  contract already ends the turn after an accepted submission, so a
+  well-behaved agent never polls again; serve the
   in-flight delivered-unacknowledged message if one exists, else the
   lowest-enqueue-sequence queued message; write the delivery row and
   receipt in the same transaction that decides; print the envelope and
@@ -1397,15 +1556,31 @@ the retryable nor the final line applies to them.
   successor saw. A successor session therefore always fetches (and is
   re-served) before it can acknowledge; an ack of a message the acking
   session never fetched is refused (`ErrNotDelivered`, receipt recorded).
-  A stale incarnation or a foreign session is refused with a receipt; the
-  ack row commits with its receipt.
+  A stale incarnation or a foreign session is refused with a receipt; so,
+  after those checks, is a session that is no longer its address's
+  current session (the Fetch rule; `refused: stale`, `ErrStaleAck`): the
+  message it was served stays in flight and is re-served to the current
+  session. The order is fixed: a message unknown to the stated run is
+  `refused: not-found` and a session of another run `refused:
+  unauthorized` first; then an already-acknowledged message is an
+  idempotent duplicate; then the delivery to this session (a retired
+  session never served the message is `not-delivered`); then the
+  incarnation; then address currency. The ack row commits with its
+  receipt.
 - **Answer** (`hop answer <question-id> --file <path> | --body "<text>"`):
   validates the question is `human`-addressed and unanswered; the answer
   body artifact is written durably BEFORE the transaction (the same
   file-first protocol as Send), then the answer message row (sender
   `human`, recipient `manager`), the question's acknowledgement and the
   receipt commit in one transaction. Duplicate (equal digest) idempotent;
-  conflicting refused.
+  conflicting refused. The human is the answering address, and the
+  derived destination is always `manager` — only the manager may address
+  the human — so a human answer never enters a task mailbox: it is
+  accepted even after the relayed worker's task mailbox has closed, and
+  it is the manager's forward to that task that the closed mailbox
+  refuses. The acceptance still runs the same admission check as a
+  session answer, so the rule holds by construction rather than by the
+  addressing matrix alone.
 
 ### Exactly what is journaled
 
@@ -1434,7 +1609,7 @@ parsing those same lines (section 11):
 
 | Verb | First line on success | First line on retryable non-success |
 | --- | --- | --- |
-| `hop result submit` | `accepted <result-uuid>` / `duplicate <result-uuid>` | `transient: attempt not yet running; retry` (Phase 2, unchanged); feature mode adds `transient: undelivered messages; drain with hop msg next, ack, then resubmit` (the section 5 mailbox rule; also the retryable line of `hop review submit`) |
+| `hop result submit` | `accepted <result-uuid>` / `duplicate <result-uuid>` | `transient: attempt not yet running; retry` (Phase 2, unchanged: the attempt's launch claim has not settled — checked before the mailbox); feature mode adds `transient: undelivered messages; drain with hop msg next, ack, then resubmit` (the section 5 mailbox rule) |
 | `hop msg next` | `message <uuid> kind=<kind> from=<principal>[ reply-to=<uuid>][ relay-of=<uuid>][ origin=<uuid>]` then `body: <abs path>` then `ack: hop msg ack <uuid>` — `origin` appears on an `answer` whose reply-to question carries relay provenance: the store resolves reply-to → relayed_from server-side and prints the ORIGINAL question's ID, so a restarted manager forwards a human answer using only the envelope, no store spelunking | `none: no queued message` |
 | `hop msg wait` | as `next` | `none: no message within <timeout>; run hop msg wait again` |
 | `hop msg show <uuid>` | `message <uuid> kind=<kind> from=<principal> to=<address>[ reply-to=<uuid>][ relay-of=<uuid>] seq=<n>` then `body: <abs path>` then one `delivered: <session> <time>` line per delivery and `acknowledged: <time>` when acked — a READ-ONLY same-run envelope lookup (any of the run's sessions, or the human context), the historical recovery surface for relay chains and audits; it writes nothing, delivers nothing and never substitutes for `next` | `refused: not-found` |
@@ -1443,15 +1618,51 @@ parsing those same lines (section 11):
 | `hop task create` | `task <uuid> t<seq> created` / `duplicate <uuid> t<seq>` (request-ID retry) | `transient: run not yet running; retry` (run-state acceptance above) |
 | `hop task retry` | `retry accepted t<seq> attempt <n>` / `duplicate t<seq> attempt <n>` | `transient: run not yet running; retry` (run-state acceptance above) |
 | `hop plan close` | `plan closed` / `duplicate plan closed` | `transient: run not yet running; retry` (run-state acceptance above) |
-| `hop review submit` | `verdict accepted <review-uuid>` / `duplicate <review-uuid>` | — |
+| `hop review submit` | `verdict accepted <review-uuid>` / `duplicate <review-uuid>` | the same two lines as `hop result submit`: `transient: attempt not yet running; retry` (the review attempt's launch claim has not settled — checked before the mailbox) or `transient: undelivered messages; drain with hop msg next, ack, then resubmit` (the section 5 mailbox rule) |
 
 Refusals exit 1 with one first line `refused: <reason-token>` and detail
 lines after; reason tokens are enumerated in the same grammar constant
-set. A retryable first line (`transient: …`) also exits 1. It is the only
+set, and every token is the store's typed reason, set where it decides —
+never inferred from detail text. `hop review submit`'s refusals are
+`subject-mismatch` (a verdict about any candidate but the review task's
+frozen subject: resubmit with the subject the review assignment names),
+`not-reviewer` (the caller is not the review attempt's own reviewer
+session), `stale` (every other ineligibility), `malformed` and
+`conflicting`; a refused outcome naming no token its kind admits prints
+no protocol line. `hop result submit` is the one verb without the
+`refused:` prefix (Phase 2's shape, unchanged): its final non-success
+first line is the outcome kind with the detail on the same line —
+`stale: <detail>`, `conflicting: <detail>` or `malformed: <detail>` —
+and it too exits 1. `hop msg next` and `hop msg wait` have no refusal
+line: a fetch refused for authority (another run's session, a stale
+incarnation, an address the session does not resolve to, or a session
+that is not its address's current session) prints nothing on stdout,
+one `hop msg next: …` / `hop msg wait: …` diagnostic on stderr, and
+exits 1; `refused: stale` from `hop msg ack` and `hop msg send` also
+covers a session that is no longer its address's current session.
+
+A retryable first line (`transient: …`) also exits 1. It is the only
 stdout line, any detail goes to stderr, nothing changed, and the caller
-reruns the same command (same `--request-id`) after a short delay. The assignment and role templates quote these lines verbatim from the
-same constants, so template, CLI and fixture can never drift apart
-silently.
+follows the line's own instruction, then reruns the same command after
+a short delay — with the same `--request-id` for the verbs that take
+one (the submit verbs have none: their idempotency is the per-attempt
+digest). The two submit verbs each have two retryable lines that demand
+different actions (rerun after a short delay, or drain first), so their
+store outcome carries a TYPED transient reason — attempt-not-running or
+undelivered-messages, set where the store decides — and the CLI prints
+exactly the line that reason selects, never inferring it from detail
+text; a transient outcome naming no known reason is an error and prints
+no protocol line. A worker that could not tell the two apart would
+retry an undrained submission forever. Both verbs decide in section 5's
+one acceptance order, so the drain line reaches only a caller whose
+incarnation is current, whose run has no stop request and whose attempt
+can still accept — exactly a caller whose own `hop msg next` is served —
+while a caller that can never be accepted gets the final stale outcome
+instead (`stale: <detail>` from `hop result submit`, `refused: stale`
+from `hop review submit`). The assignment templates, the crib — its
+preamble giving the `refused:` shape and naming the verbs whose sections
+give their own — and the launch prompts quote these lines from the same
+constants, so template, CLI and fixture can never drift apart silently.
 
 ## 8. The built-in feature workflow: review, guards, serial integration
 
@@ -1598,17 +1809,20 @@ the head's commit + tree object IDs, frozen into the task row and the
 review assignment artifact) and assigns it into a concurrency slot like
 any task. `SubmitReview`'s validation order: parse and bound (verdict
 token, reasons ≤ 64 KiB, subject a full object-ID pair); existence and
-agreement (attempt belongs to the review task, task to the run); prior
-accepted verdict for the attempt — equal reasons digest and verdict →
-duplicate, idempotent; different → conflicting, refused, accepted verdict
-undisturbed; eligibility — caller session is the attempt's current session
-with a current incarnation, session role `reviewer`, run not
-stopping/stopped, attempt `running` (or `launching`/`relaunching` with a
-settled claim — the Phase 2 early-submission rule), the review task's
-mailbox clear (else the section 5 `transient: undelivered messages`
-refusal), AND the submitted
-subject equals the review task's frozen subject (`ErrVerdictSubjectMismatch`
-→ refused: the reviewer reviewed the wrong candidate); accept atomically —
+agreement (attempt belongs to the review task, task to the run;
+`refused: malformed` otherwise); prior accepted verdict for the attempt —
+equal reasons digest and verdict → duplicate, idempotent; different →
+`refused: conflicting`, accepted verdict undisturbed; eligibility — the
+caller session is the attempt's own reviewer session (a `reviewer` of the
+run bound to this attempt; `refused: not-reviewer` otherwise), with a
+current incarnation, run not stopping/stopped, attempt `running` (or
+`launching`/`relaunching` with a settled claim — the Phase 2
+early-submission rule; `refused: stale` for any of these), the review
+task's mailbox clear (else the section 5 `transient: undelivered
+messages` refusal), AND the submitted subject equals the review task's
+frozen subject (`ErrVerdictSubjectMismatch` → `refused: subject-mismatch`:
+the reviewer reviewed the wrong candidate and resubmits with the frozen
+subject); accept atomically —
 verdict row, receipt, `Attempt.Submit` then the review-only
 `Attempt.CompleteReview` transition (section 5: review attempts never
 enter `checking`) and `Task→completed`, with their evidence rows, and the

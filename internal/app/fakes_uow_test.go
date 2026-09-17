@@ -294,6 +294,10 @@ func (u *fakeUnitOfWork) Commit() error {
 		}
 	}
 	for _, m := range u.messagesCreated { //nolint:gocritic // rangeValCopy: test fake; the domain snapshot is small and read-only here, and indexing would only obscure the loop.
+		// The adapter assigns the sequence inside its immediate
+		// transaction, which no other writer interleaves; the fake
+		// assigns it again here, under the store lock, in staging order.
+		m.EnqueueSeq = nextEnqueueSeq(s, m.RunID, m.Recipient)
 		s.Messages[m.ID] = m
 	}
 	for id, i := range u.integrationCreated { //nolint:gocritic // rangeValCopy: test fake; map iteration has no indexing alternative, and the domain snapshot is small and read-only here.

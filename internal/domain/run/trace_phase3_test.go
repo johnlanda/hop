@@ -64,7 +64,7 @@ func TestReferenceTraceFeatureHappyPathDependencyRelease(t *testing.T) {
 	// A submits, and the acceptance commits with it the retirement
 	// intent for A's session.
 	submissionA := run.ResultSubmission{ID: testResultID, CommitOID: "a-commit", Summary: "A done", Digest: "digest-a1"}
-	resultOutcome, err := run.AcceptResult(r, taskA, attemptA, nil, run.AcceptanceContext{IncarnationCurrent: true}, submissionA, later())
+	resultOutcome, err := run.AcceptResult(r, taskA, attemptA, nil, run.AcceptanceContext{IncarnationCurrent: true, MailboxClear: true}, submissionA, later())
 	mustNoError(t, err)
 	r, taskA, attemptA = resultOutcome.Run, resultOutcome.Task, resultOutcome.Attempt
 	mustState(t, "taskA", string(taskA.State), string(run.TaskChecking))
@@ -126,7 +126,7 @@ func TestReferenceTraceFeatureHappyPathDependencyRelease(t *testing.T) {
 	mustNoError(t, err)
 
 	submissionB := run.ResultSubmission{ID: identityOtherResultID, CommitOID: "b-commit", Summary: "B done", Digest: "digest-b1"}
-	resultOutcome, err = run.AcceptResult(r, taskB, attemptB, nil, run.AcceptanceContext{IncarnationCurrent: true}, submissionB, later())
+	resultOutcome, err = run.AcceptResult(r, taskB, attemptB, nil, run.AcceptanceContext{IncarnationCurrent: true, MailboxClear: true}, submissionB, later())
 	mustNoError(t, err)
 	r, taskB, attemptB = resultOutcome.Run, resultOutcome.Task, resultOutcome.Attempt
 	implB, err = implB.Stop(later())
@@ -239,7 +239,7 @@ func TestReferenceTraceRelayedQuestion(t *testing.T) {
 	if q2.RelayedFrom == nil || *q2.RelayedFrom != q1.ID {
 		t.Fatalf("q2.RelayedFrom = %v, want %s", q2.RelayedFrom, q1.ID)
 	}
-	q1AckOutcome, err := run.AcceptAck(q1, nil, run.AckContext{DeliveredToSession: true, IncarnationCurrent: true}, run.Ack{SessionID: testManagerSessionID, IncarnationID: testIncarnation}, later())
+	q1AckOutcome, err := run.AcceptAck(q1, nil, run.AckContext{DeliveredToSession: true, IncarnationCurrent: true, AttemptCurrent: true}, run.Ack{SessionID: testManagerSessionID, IncarnationID: testIncarnation}, later())
 	mustNoError(t, err)
 	q1 = q1AckOutcome.Message
 	mustState(t, "q1", string(q1.State), string(run.MessageAcknowledged))
@@ -247,7 +247,7 @@ func TestReferenceTraceRelayedQuestion(t *testing.T) {
 	// Human hop answer on q2 (answer a2 accepted, q2 acknowledged,
 	// atomically).
 	a2Submission := run.AnswerSubmission{ID: testThirdMessageID, BodyPath: "/a2", BodyDigest: "digest-a2", BodyBytes: 8}
-	a2Outcome, err := run.AcceptAnswer(q2, nil, run.ManagerAddress(), run.HumanPrincipal(), a2Submission, 1, later())
+	a2Outcome, err := run.AcceptAnswer(q2, nil, run.AnswerContext{AnswererAddress: run.HumanAddress()}, run.ManagerAddress(), run.HumanPrincipal(), a2Submission, 1, later())
 	mustNoError(t, err)
 	q2, a2 := a2Outcome.Question, a2Outcome.Answer
 	mustState(t, "q2", string(q2.State), string(run.MessageAcknowledged))
@@ -266,7 +266,7 @@ func TestReferenceTraceRelayedQuestion(t *testing.T) {
 	// before-ack, so a manager crash between the two re-serves a2 and
 	// the forward's request ID makes the redo idempotent).
 	a1Submission := run.AnswerSubmission{ID: testFourthMessageID, BodyPath: "/a1", BodyDigest: "digest-a1", BodyBytes: 8}
-	a1Outcome, err := run.AcceptAnswer(q1, nil, workerAddress, run.SessionPrincipal(testManagerSessionID), a1Submission, 2, later())
+	a1Outcome, err := run.AcceptAnswer(q1, nil, run.AnswerContext{AnswererAddress: run.ManagerAddress()}, workerAddress, run.SessionPrincipal(testManagerSessionID), a1Submission, 2, later())
 	mustNoError(t, err)
 	q1Reconfirmed, a1 := a1Outcome.Question, a1Outcome.Answer
 	// q1 was not human-addressed, so answering it does not itself
@@ -277,7 +277,7 @@ func TestReferenceTraceRelayedQuestion(t *testing.T) {
 		t.Fatalf("a1 = %+v, want recipient=%v reply-to=%s", a1, workerAddress, q1.ID)
 	}
 
-	a2AckOutcome, err := run.AcceptAck(a2, nil, run.AckContext{DeliveredToSession: true, IncarnationCurrent: true}, run.Ack{SessionID: testManagerSessionID, IncarnationID: testIncarnation}, later())
+	a2AckOutcome, err := run.AcceptAck(a2, nil, run.AckContext{DeliveredToSession: true, IncarnationCurrent: true, AttemptCurrent: true}, run.Ack{SessionID: testManagerSessionID, IncarnationID: testIncarnation}, later())
 	mustNoError(t, err)
 	a2 = a2AckOutcome.Message
 	mustState(t, "a2", string(a2.State), string(run.MessageAcknowledged))
@@ -285,7 +285,7 @@ func TestReferenceTraceRelayedQuestion(t *testing.T) {
 	// Worker fetch (a1 delivered), worker acks, continues.
 	a1, err = a1.Deliver()
 	mustNoError(t, err)
-	a1AckOutcome, err := run.AcceptAck(a1, nil, run.AckContext{DeliveredToSession: true, IncarnationCurrent: true}, run.Ack{SessionID: testSecondSessionID, IncarnationID: testIncarnation}, later())
+	a1AckOutcome, err := run.AcceptAck(a1, nil, run.AckContext{DeliveredToSession: true, IncarnationCurrent: true, AttemptCurrent: true}, run.Ack{SessionID: testSecondSessionID, IncarnationID: testIncarnation}, later())
 	mustNoError(t, err)
 	a1 = a1AckOutcome.Message
 	mustState(t, "a1", string(a1.State), string(run.MessageAcknowledged))
@@ -310,13 +310,13 @@ func TestReferenceTraceDuplicateAndAmbiguousDelivery(t *testing.T) {
 	mustState(t, "m1", string(m1.State), string(run.MessageDelivered))
 
 	// Old incarnation's late ack refused (stale, receipt recorded).
-	_, err = run.AcceptAck(m1, nil, run.AckContext{DeliveredToSession: true, IncarnationCurrent: false}, run.Ack{SessionID: testSessionID, IncarnationID: testIncarnation}, later())
+	_, err = run.AcceptAck(m1, nil, run.AckContext{DeliveredToSession: true, IncarnationCurrent: false, AttemptCurrent: true}, run.Ack{SessionID: testSessionID, IncarnationID: testIncarnation}, later())
 	if !errors.Is(err, run.ErrStaleAck) {
 		t.Fatalf("late ack from the superseded incarnation: error = %v, want ErrStaleAck", err)
 	}
 
 	// New worker acks (acknowledged).
-	ackOutcome, err := run.AcceptAck(m1, nil, run.AckContext{DeliveredToSession: true, IncarnationCurrent: true}, run.Ack{SessionID: testSessionID, IncarnationID: testSecondIncarnation}, later())
+	ackOutcome, err := run.AcceptAck(m1, nil, run.AckContext{DeliveredToSession: true, IncarnationCurrent: true, AttemptCurrent: true}, run.Ack{SessionID: testSessionID, IncarnationID: testSecondIncarnation}, later())
 	mustNoError(t, err)
 	m1 = ackOutcome.Message
 	ack := ackOutcome.Ack
@@ -411,7 +411,7 @@ func TestReferenceTraceWorkerInterruptionRetryProvenance(t *testing.T) {
 
 		submission := run.ResultSubmission{ID: testResultID, CommitOID: "b2-commit", Summary: "B retried", Digest: "digest-b2"}
 		r := run.Run{ID: testRunID, State: run.RunRunning}
-		outcome, err := run.AcceptResult(r, taskB, attemptB2, nil, run.AcceptanceContext{IncarnationCurrent: true}, submission, later())
+		outcome, err := run.AcceptResult(r, taskB, attemptB2, nil, run.AcceptanceContext{IncarnationCurrent: true, MailboxClear: true}, submission, later())
 		mustNoError(t, err)
 		attemptB2, taskB = outcome.Attempt, outcome.Task
 		attemptB2, err = attemptB2.EnterChecking(later())
@@ -502,7 +502,7 @@ func TestReferenceTraceReviewerRejectionAndReReview(t *testing.T) {
 	fixAttempt, err = fixAttempt.MarkRunning(later())
 	mustNoError(t, err)
 	fixSubmission := run.ResultSubmission{ID: testResultID, CommitOID: "fix-commit", Summary: "fix", Digest: "digest-fix-1"}
-	resultOutcome, err := run.AcceptResult(r, fixTask, fixAttempt, nil, run.AcceptanceContext{IncarnationCurrent: true}, fixSubmission, later())
+	resultOutcome, err := run.AcceptResult(r, fixTask, fixAttempt, nil, run.AcceptanceContext{IncarnationCurrent: true, MailboxClear: true}, fixSubmission, later())
 	mustNoError(t, err)
 	r, fixTask, fixAttempt = resultOutcome.Run, resultOutcome.Task, resultOutcome.Attempt
 	fixAttempt, err = fixAttempt.EnterChecking(later())

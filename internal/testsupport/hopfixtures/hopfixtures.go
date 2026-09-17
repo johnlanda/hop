@@ -480,6 +480,95 @@ func SeedChildSession(ctx context.Context, store Store, lease app.Lease, runID, 
 	return sessionID, incarnationID, attemptID, nil
 }
 
+// SupersedeBinding supersedes sessionID's current runtime binding, with
+// fixed replacement-occupant evidence and no successor: the incarnation it
+// carried is no longer current for any verb, and with a binding row
+// present no pending launch intent can make it current again.
+func SupersedeBinding(ctx context.Context, store Store, lease app.Lease, sessionID string, now time.Time) error {
+	return withUOW(ctx, store, lease, func(uow app.UnitOfWork) error {
+		binding, ok, err := uow.Bindings().Current(ctx, identity.SessionID(sessionID))
+		if err != nil {
+			return fmt.Errorf("hopfixtures: current binding: %w", err)
+		}
+		if !ok {
+			return fmt.Errorf("hopfixtures: session %s has no current binding", sessionID)
+		}
+		superseded, err := binding.Supersede("fixture: replacement occupant observed", now)
+		if err != nil {
+			return fmt.Errorf("hopfixtures: supersede binding: %w", err)
+		}
+		if err := uow.Bindings().Save(ctx, superseded); err != nil {
+			return fmt.Errorf("hopfixtures: save superseded binding: %w", err)
+		}
+		return nil
+	})
+}
+
+// SettleWorkerTermination applies the live controller's worker-termination
+// settlement to a child's running attempt: attemptID interrupted, taskID
+// needs-rework, and sessionID stopped then terminated — its binding left
+// current, exactly as the settlement leaves it.
+func SettleWorkerTermination(ctx context.Context, store Store, lease app.Lease, taskID, attemptID, sessionID string, now time.Time) error {
+	return withUOW(ctx, store, lease, func(uow app.UnitOfWork) error {
+		attempt, attemptRev, err := uow.Attempts().Get(ctx, identity.AttemptID(attemptID))
+		if err != nil {
+			return fmt.Errorf("hopfixtures: get attempt: %w", err)
+		}
+		if attempt, err = attempt.Interrupt(now); err != nil {
+			return fmt.Errorf("hopfixtures: interrupt attempt: %w", err)
+		}
+		if _, saveErr := uow.Attempts().Save(ctx, attempt, attemptRev); saveErr != nil {
+			return fmt.Errorf("hopfixtures: save attempt: %w", saveErr)
+		}
+		task, taskRev, err := uow.Tasks().Get(ctx, identity.TaskID(taskID))
+		if err != nil {
+			return fmt.Errorf("hopfixtures: get task: %w", err)
+		}
+		if task, err = task.NeedsRework(now); err != nil {
+			return fmt.Errorf("hopfixtures: task needs rework: %w", err)
+		}
+		if _, saveErr := uow.Tasks().Save(ctx, task, taskRev); saveErr != nil {
+			return fmt.Errorf("hopfixtures: save task: %w", saveErr)
+		}
+		session, sessionRev, err := uow.Sessions().Get(ctx, identity.SessionID(sessionID))
+		if err != nil {
+			return fmt.Errorf("hopfixtures: get session: %w", err)
+		}
+		if session, err = session.Stop(now); err != nil {
+			return fmt.Errorf("hopfixtures: stop session: %w", err)
+		}
+		if sessionRev, err = uow.Sessions().Save(ctx, session, sessionRev); err != nil {
+			return fmt.Errorf("hopfixtures: save session: %w", err)
+		}
+		if session, err = session.Terminate(now); err != nil {
+			return fmt.Errorf("hopfixtures: terminate session: %w", err)
+		}
+		if _, saveErr := uow.Sessions().Save(ctx, session, sessionRev); saveErr != nil {
+			return fmt.Errorf("hopfixtures: save session: %w", saveErr)
+		}
+		return nil
+	})
+}
+
+// ConsumeRetry moves a needs-rework taskID back to active through ready:
+// the consumed retry under which the next SeedChildSession reserves the
+// task's next attempt.
+func ConsumeRetry(ctx context.Context, store Store, lease app.Lease, taskID string, now time.Time) error {
+	return withUOW(ctx, store, lease, func(uow app.UnitOfWork) error {
+		task, rev, err := uow.Tasks().Get(ctx, identity.TaskID(taskID))
+		if err != nil {
+			return fmt.Errorf("hopfixtures: get task: %w", err)
+		}
+		if task, err = task.Reopen(now); err != nil {
+			return fmt.Errorf("hopfixtures: reopen task: %w", err)
+		}
+		if _, saveErr := uow.Tasks().Save(ctx, task, rev); saveErr != nil {
+			return fmt.Errorf("hopfixtures: save task: %w", saveErr)
+		}
+		return activateTask(ctx, uow, taskID, now)
+	})
+}
+
 // SeedInterruptedAttempt reserves the next attempt on taskID and records
 // it straight in its terminal "interrupted" state (reserved ->
 // interrupted is a legal transition): the terminal prior attempt a
@@ -524,6 +613,16 @@ func RunAttempt(ctx context.Context, store Store, lease app.Lease, attemptID str
 			return err
 		}
 		return markAttemptRunning(ctx, uow, attemptID, now)
+	})
+}
+
+// LaunchAttempt drives attemptID from its freshly reserved state to
+// launching only, with no launch claim: the early-submission window in
+// which a result or verdict is refused `transient: attempt not yet running;
+// retry` because the claim has not settled.
+func LaunchAttempt(ctx context.Context, store Store, lease app.Lease, attemptID string, now time.Time) error {
+	return withUOW(ctx, store, lease, func(uow app.UnitOfWork) error {
+		return launchAttempt(ctx, uow, attemptID, now)
 	})
 }
 

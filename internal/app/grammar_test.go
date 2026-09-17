@@ -76,6 +76,8 @@ func TestGoldenGrammar(t *testing.T) {
 
 		{"result accepted", app.GrammarResultAcceptedLine(msgID), "accepted " + msgID},
 		{"result duplicate", app.GrammarResultDuplicateLine(msgID), "duplicate " + msgID},
+		{"result stale", app.GrammarResultRefusalLine(app.GrammarReasonStale, "incarnation is not current"), "stale: incarnation is not current"},
+		{"result refusal without detail", app.GrammarResultRefusalLine(app.GrammarReasonMalformed, ""), "malformed"},
 
 		{
 			"message line minimal",
@@ -207,5 +209,27 @@ func TestGoldenGrammar(t *testing.T) {
 				t.Errorf("rendered %q, golden %q", tc.got, tc.want)
 			}
 		})
+	}
+
+	transientLines := []struct {
+		reason app.TransientReason
+		want   string
+		known  bool
+	}{
+		{"attempt-not-running", "transient: attempt not yet running; retry", true},
+		{"undelivered-messages", "transient: undelivered messages; drain with hop msg next, ack, then resubmit", true},
+		{"", "", false},
+		{"run-not-running", "", false},
+	}
+	for _, tc := range transientLines {
+		t.Run("submission transient line for "+string(tc.reason), func(t *testing.T) {
+			got, known := app.GrammarSubmissionTransientLine(tc.reason)
+			if got != tc.want || known != tc.known {
+				t.Errorf("GrammarSubmissionTransientLine(%q) = %q, %t; golden %q, %t", tc.reason, got, known, tc.want, tc.known)
+			}
+		})
+	}
+	if app.TransientAttemptNotRunning != "attempt-not-running" || app.TransientUndeliveredMessages != "undelivered-messages" {
+		t.Errorf("transient reasons = %q, %q; golden %q, %q", app.TransientAttemptNotRunning, app.TransientUndeliveredMessages, "attempt-not-running", "undelivered-messages")
 	}
 }

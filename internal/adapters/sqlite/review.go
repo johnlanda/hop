@@ -63,8 +63,8 @@ func (s *Store) SubmitReview(ctx context.Context, submission app.ReviewSubmissio
 	var outcome app.ReviewOutcome
 	err := s.inWriteTx(ctx, func(tx *sql.Tx) error {
 		now := s.now()
-		record := func(kind app.ReviewOutcomeKind, reviewID identity.ReviewID, detail string) error {
-			outcome = app.ReviewOutcome{Kind: kind, ReviewID: reviewID, Detail: detail}
+		record := func(kind app.ReviewOutcomeKind, reason string, reviewID identity.ReviewID, detail string) error {
+			outcome = app.ReviewOutcome{Kind: kind, ReviewID: reviewID, Reason: reason, Detail: detail}
 			return insertReviewReceipt(ctx, tx, &reviewReceipt{
 				runID: submission.RunID.String(), taskID: submission.TaskID.String(),
 				attemptID: submission.AttemptID.String(), incarnationID: submission.IncarnationID.String(),
@@ -76,27 +76,27 @@ func (s *Store) SubmitReview(ctx context.Context, submission app.ReviewSubmissio
 
 		runV, runRevision, err := getRun(ctx, tx, submission.RunID)
 		if errors.Is(err, app.ErrNotFound) {
-			return record(app.ReviewMalformed, "", "attempt/task/run do not agree")
+			return record(app.ReviewMalformed, app.GrammarReasonMalformed, "", "attempt/task/run do not agree")
 		}
 		if err != nil {
 			return err
 		}
 		task, taskRevision, err := getTask(ctx, tx, submission.TaskID)
 		if errors.Is(err, app.ErrNotFound) {
-			return record(app.ReviewMalformed, "", "attempt/task/run do not agree")
+			return record(app.ReviewMalformed, app.GrammarReasonMalformed, "", "attempt/task/run do not agree")
 		}
 		if err != nil {
 			return err
 		}
 		attempt, attemptRevision, err := getAttempt(ctx, tx, submission.AttemptID)
 		if errors.Is(err, app.ErrNotFound) {
-			return record(app.ReviewMalformed, "", "attempt/task/run do not agree")
+			return record(app.ReviewMalformed, app.GrammarReasonMalformed, "", "attempt/task/run do not agree")
 		}
 		if err != nil {
 			return err
 		}
 		if attempt.TaskID != submission.TaskID || task.RunID != submission.RunID {
-			return record(app.ReviewMalformed, "", "attempt/task/run do not agree")
+			return record(app.ReviewMalformed, app.GrammarReasonMalformed, "", "attempt/task/run do not agree")
 		}
 
 		prior, err := reviewByAttempt(ctx, tx, submission.AttemptID)
@@ -108,12 +108,12 @@ func (s *Store) SubmitReview(ctx context.Context, submission app.ReviewSubmissio
 		// eligibility; only a FIRST acceptance validates the reviewer
 		// session.
 		if prior == nil {
-			session, sessionErr := reviewerSessionEligible(ctx, tx, &submission, &task)
+			eligible, sessionErr := reviewerSessionEligible(ctx, tx, &submission, &task)
 			if sessionErr != nil {
 				return sessionErr
 			}
-			if session != "" {
-				return record(app.ReviewStale, "", session)
+			if !eligible {
+				return record(app.ReviewStale, app.GrammarReasonNotReviewer, "", app.ReviewNotReviewerDetail)
 			}
 		}
 
@@ -142,13 +142,17 @@ func (s *Store) SubmitReview(ctx context.Context, submission app.ReviewSubmissio
 		switch {
 		case err == nil:
 		case errors.Is(err, run.ErrDuplicateResult):
-			return record(app.ReviewDuplicate, outcomeVal.Review.ID, err.Error())
+			return record(app.ReviewDuplicate, "", outcomeVal.Review.ID, err.Error())
 		case errors.Is(err, run.ErrConflictingResult):
-			return record(app.ReviewConflicting, outcomeVal.Review.ID, err.Error())
+			return record(app.ReviewConflicting, app.GrammarReasonConflicting, outcomeVal.Review.ID, err.Error())
 		case errors.Is(err, run.ErrTransientNotRunning), errors.Is(err, run.ErrMailboxNotClear):
-			return record(app.ReviewTransient, "", err.Error())
+			if recordErr := record(app.ReviewTransient, "", "", err.Error()); recordErr != nil {
+				return recordErr
+			}
+			outcome.Transient, _ = app.TransientReasonOf(err)
+			return nil
 		default:
-			return record(app.ReviewStale, "", err.Error())
+			return record(app.ReviewStale, app.ReviewRefusalReasonOf(err), "", err.Error())
 		}
 
 		if err := persistVerdictAcceptance(ctx, tx, &submission, &outcomeVal, verdictRevisions{
@@ -156,7 +160,7 @@ func (s *Store) SubmitReview(ctx context.Context, submission app.ReviewSubmissio
 		}, verdictStates{run: runV.State, task: task.State, attempt: attempt.State}, now); err != nil {
 			return err
 		}
-		return record(app.ReviewAccepted, submission.ID, "")
+		return record(app.ReviewAccepted, "", submission.ID, "")
 	})
 	if err != nil {
 		return app.ReviewOutcome{}, err
@@ -171,22 +175,18 @@ func (s *Store) SubmitReview(ctx context.Context, submission app.ReviewSubmissio
 // live reviewer from another run, or one assigned to a different review
 // attempt of this run, is refused before any of ITS binding or launch
 // claim ever reaches the acceptance context (a foreign session's currency
-// must never vouch for this attempt's verdict). It returns the refusal
-// detail ("" when eligible).
-func reviewerSessionEligible(ctx context.Context, q querier, submission *app.ReviewSubmission, task *run.Task) (string, error) {
-	const refusal = "caller is not the review task's reviewer session"
+// must never vouch for this attempt's verdict). A caller it reports
+// ineligible is refused not-reviewer.
+func reviewerSessionEligible(ctx context.Context, q querier, submission *app.ReviewSubmission, task *run.Task) (bool, error) {
 	session, _, err := getSession(ctx, q, submission.Session)
 	if errors.Is(err, app.ErrNotFound) {
-		return refusal, nil
+		return false, nil
 	}
 	if err != nil {
-		return "", err
+		return false, err
 	}
-	if session.Role != run.RoleReviewer || task.Kind != run.TaskKindReview ||
-		session.RunID != submission.RunID || session.AttemptID != submission.AttemptID {
-		return refusal, nil
-	}
-	return "", nil
+	return session.Role == run.RoleReviewer && task.Kind == run.TaskKindReview &&
+		session.RunID == submission.RunID && session.AttemptID == submission.AttemptID, nil
 }
 
 // verdictRevisions carries the revisions the acceptance read for its

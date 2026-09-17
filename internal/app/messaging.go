@@ -21,18 +21,20 @@ const (
 // ErrMessagingUnauthorized reports that FetchNextMessage's caller session
 // is not authorized for the fetch it claims: the session does not belong
 // to the stated run, its current incarnation does not match the one
-// claimed, or its resolved logical address does not match the one
-// claimed. FetchNextMessage has no outcome-kind field to carry a business
-// refusal the way SendMessage/AckMessage/AnswerQuestion do (an empty
-// fetch's ok-false already means "nothing queued"), so this is that
-// signal instead — every implementation validates all three independently
-// of whatever the driving use case already checked (section 7: "all
-// validate the caller's session and incarnation currency"), since a
-// direct caller of the port, or a future real adapter, must refuse
-// exactly like the fake does, never trust a caller-supplied identity
-// field at face value. SendMessage and AckMessage express the identical
-// session/run/incarnation validation through their own MessageOutcomeKind/
-// MessageAckOutcomeKind (Refused), never through this error.
+// claimed, its resolved logical address does not match the one claimed,
+// or it is not that address's current session (run.CurrentAddressSession:
+// an ended session, or one whose attempt is terminal or no longer its
+// task's newest). FetchNextMessage has no outcome-kind field to carry a
+// business refusal the way SendMessage/AckMessage/AnswerQuestion do (an
+// empty fetch's ok-false already means "nothing queued"), so this is that
+// signal instead — every implementation validates all four independently
+// of whatever the driving use case already checked, in that order, since
+// a direct caller of the port must be refused exactly like the fake
+// refuses it, never trusting a caller-supplied identity field at face
+// value. SendMessage and AckMessage express the same session, run,
+// incarnation and currency validation through their own
+// MessageOutcomeKind/MessageAckOutcomeKind (Refused), never through this
+// error.
 var ErrMessagingUnauthorized = errors.New("app: messaging session is not authorized for this request")
 
 // AddressString renders a's canonical, stable form for the request digest
@@ -93,16 +95,23 @@ type MessageOutcome struct {
 // call, per the file-first protocol. Kind MessageAnswer leaves Recipient
 // the zero Address: the destination is derived by the store from the
 // referenced question's sender, never caller-chosen, and Recipient is
-// never consulted for that kind.
+// never consulted for that kind. The store re-derives the sender's
+// address from its session row for every kind (an unresolvable address,
+// or one that disagrees with SenderAddress, is refused unauthorized) and
+// decides only by the derived address; it accepts a send of any kind only
+// from that address's current session, an answer only when that address
+// is the question's recipient, and only while a task destination's
+// mailbox is open.
 type MessageSend struct {
 	ID            identity.MessageID
 	RunID         identity.RunID
 	Sender        run.Principal
 	SenderAddress run.Address
 	// IncarnationID is the sending session's current incarnation: section
-	// 7 requires eligibility (current incarnation; the run accepting per
-	// run.Run.CanAcceptManagerVerb; for a task:<id> destination, an open
-	// mailbox) before an ordinary send is accepted.
+	// 7 requires, for every kind, a current incarnation and the session
+	// being its address's current session (stale otherwise), and for an
+	// ordinary send the run accepting per run.Run.CanAcceptManagerVerb and,
+	// for a task:<id> destination, an open mailbox.
 	IncarnationID identity.IncarnationID
 	Recipient     run.Address
 	Kind          run.MessageKind
@@ -196,10 +205,14 @@ type HumanAnswer struct {
 // "Validated by the caller's session" is never satisfied by trusting a
 // caller-supplied field at face value: SendMessage/FetchNextMessage/
 // AckMessage each independently resolve the caller SessionID's OWN
-// current run and (Fetch) resolved address, and refuse when they disagree
-// with the request's stated RunID/Address — a session belongs to exactly
+// current run and (Send, Fetch) resolved address, and refuse when they
+// disagree with the request's stated RunID/SenderAddress/Address — a
+// session belongs to exactly
 // one run, and only the session row itself is authoritative for which
-// one. This holds even when a driving use case already performed the
+// one. SendMessage makes both checks BEFORE reading the request-ID
+// receipt, so a session claiming another address never learns whether
+// that address's request was accepted or what its content was. This
+// holds even when a driving use case already performed the
 // identical check (SendMessage/FetchMessage/AckMessage,
 // usecase_message.go, via WorkflowReadStore.LoadMessagingContext): a
 // direct caller of this port must be refused exactly like one that went
@@ -215,9 +228,10 @@ type MessagingStore interface {
 	// principal-incarnation rule (docs/plan/phase-3-design.md section 7:
 	// the committed binding's incarnation, else — before any binding row —
 	// the session's pending launch intent's, a disagreement failing
-	// closed); and its resolved logical address equals
-	// fetch.Address — any disagreement is ErrMessagingUnauthorized, never
-	// silently treated as an empty fetch.
+	// closed); its resolved logical address equals fetch.Address; and it
+	// is that address's current session (run.CurrentAddressSession) — any
+	// disagreement is ErrMessagingUnauthorized with a value-free refusal
+	// receipt, never silently treated as an empty fetch.
 	FetchNextMessage(ctx context.Context, fetch MessageFetch) (MessageDelivery, bool, error)
 	AckMessage(ctx context.Context, ack MessageAck) (MessageAckOutcome, error)
 	AnswerQuestion(ctx context.Context, answer HumanAnswer) (MessageOutcome, error)
