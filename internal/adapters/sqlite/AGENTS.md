@@ -299,7 +299,14 @@ this package never resolves environment variables or defaults.
   claim, review and result submission, each against a committed binding,
   a pending intent only, a disagreeing binding and intent, and a
   superseded binding — `TestPrincipalIncarnationPendingIntentKeepsRunStateRule`
-  and the solo `TestPrincipalIncarnationSoloResult`); the Phase 3 reads
+  and the solo `TestPrincipalIncarnationSoloResult`) and its relaunch
+  safety (`TestFeatureColdRelaunchSuccessorIsCurrent` for an implementer,
+  a reviewer and the manager, `TestSoloColdRelaunchSuccessorIsCurrent`
+  after an attestation and after a restored occupant's retirement: each
+  path's transactions replayed in the application's order — every
+  relaunch mints a new session, so the successor's claim and first verb
+  are current before and after its pane.open outcome while the prior
+  incarnation stays stale); the Phase 3 reads
   (`TestLoadSessionLaunchContext` — worktree rows written through the
   production repository, including the one-unlinked-row fallback and the
   several-unlinked-rows refusal — `TestLoadMessagingContext`,
