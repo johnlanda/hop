@@ -246,7 +246,7 @@ func TestSubmitReviewForeignReviewerRefused(t *testing.T) {
 		if err != nil {
 			t.Fatalf("SubmitReview() error = %v", err)
 		}
-		if outcome.Kind != app.ReviewStale || !strings.Contains(outcome.Detail, "caller is not the review task's reviewer session") {
+		if outcome.Kind != app.ReviewStale || outcome.Reason != storevectors.ReviewSubmitForeignReviewerReason || outcome.Detail != storevectors.ReviewSubmitForeignReviewerDetail {
 			t.Fatalf("SubmitReview(cross-run reviewer) = %+v, want the reviewer refusal", outcome)
 		}
 		assertNothingCommitted(t, f)
@@ -273,7 +273,7 @@ func TestSubmitReviewForeignReviewerRefused(t *testing.T) {
 		if err != nil {
 			t.Fatalf("SubmitReview() error = %v", err)
 		}
-		if outcome.Kind != app.ReviewStale || !strings.Contains(outcome.Detail, "caller is not the review task's reviewer session") {
+		if outcome.Kind != app.ReviewStale || outcome.Reason != storevectors.ReviewSubmitForeignReviewerReason || outcome.Detail != storevectors.ReviewSubmitForeignReviewerDetail {
 			t.Fatalf("SubmitReview(wrong review attempt) = %+v, want the reviewer refusal", outcome)
 		}
 		assertNothingCommitted(t, f)

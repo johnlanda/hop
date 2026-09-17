@@ -2,9 +2,11 @@ package app
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/johnlanda/hop/internal/domain/identity"
+	"github.com/johnlanda/hop/internal/domain/run"
 )
 
 // LaunchClaimState is a launch claim's own small lifecycle.
@@ -111,12 +113,48 @@ type ResultSubmission struct {
 	Digest        string
 }
 
+// TransientReason names why a result or verdict submission was refused as
+// retryable (SubmissionTransient, ReviewTransient): each reason has its own
+// worker-facing first line (GrammarSubmissionTransientLine), and the worker
+// must act differently on each, so the reason is typed rather than
+// inferred from Detail text.
+type TransientReason string
+
+// Transient reasons.
+const (
+	// TransientAttemptNotRunning: the attempt is launching or relaunching
+	// with a launch claim that has not settled (run.ErrTransientNotRunning);
+	// the caller reruns the same command after a short delay.
+	TransientAttemptNotRunning TransientReason = "attempt-not-running"
+	// TransientUndeliveredMessages: the task's mailbox still holds a queued
+	// or delivered-unacknowledged message (run.ErrMailboxNotClear); the
+	// caller drains it with hop msg next and ack before resubmitting.
+	TransientUndeliveredMessages TransientReason = "undelivered-messages"
+)
+
+// TransientReasonOf classifies an acceptance decision's error as a
+// transient reason; ok is false for every error that is not retryable.
+// Stores and fakes derive SubmissionOutcome.Transient and
+// ReviewOutcome.Transient through this one mapping.
+func TransientReasonOf(err error) (reason TransientReason, ok bool) {
+	switch {
+	case errors.Is(err, run.ErrTransientNotRunning):
+		return TransientAttemptNotRunning, true
+	case errors.Is(err, run.ErrMailboxNotClear):
+		return TransientUndeliveredMessages, true
+	default:
+		return "", false
+	}
+}
+
 // SubmissionOutcome is the recorded result of one submission attempt.
-// ResultID is set for Accepted and Duplicate.
+// ResultID is set for Accepted and Duplicate. Transient is set exactly when
+// Kind is SubmissionTransient.
 type SubmissionOutcome struct {
-	Kind     SubmissionOutcomeKind
-	ResultID identity.ResultID
-	Detail   string
+	Kind      SubmissionOutcomeKind
+	ResultID  identity.ResultID
+	Detail    string
+	Transient TransientReason
 }
 
 // ClaimedSubmissionFieldLimit bounds every ClaimedSubmission field the

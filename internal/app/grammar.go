@@ -44,13 +44,14 @@ const (
 
 // Fixed whole-line constants.
 const (
-	// GrammarTransientNotRunningLine is hop result submit's Phase 2
-	// retryable line, unchanged: the attempt is launching or relaunching
-	// with an unsettled claim.
+	// GrammarTransientNotRunningLine is the retryable line of hop result
+	// submit (Phase 2, unchanged) AND hop review submit: the attempt is
+	// launching or relaunching with an unsettled claim
+	// (TransientAttemptNotRunning).
 	GrammarTransientNotRunningLine = "transient: attempt not yet running; retry"
 	// GrammarTransientUndeliveredLine is the feature-mode retryable line
 	// of hop result submit AND hop review submit: the section 5 mailbox
-	// rule — drain before submitting.
+	// rule — drain before submitting (TransientUndeliveredMessages).
 	GrammarTransientUndeliveredLine = "transient: undelivered messages; drain with hop msg next, ack, then resubmit"
 	// GrammarTransientRunNotRunningLine is the retryable line of hop task
 	// create, hop task retry, hop plan close and hop msg send: the run is
@@ -82,8 +83,10 @@ const (
 	// identically so envelope content never leaks across runs.
 	GrammarReasonNotFound = "not-found"
 	// GrammarReasonUnauthorized: the caller session does not belong to the
-	// stated run, or its resolved address or incarnation disagrees with
-	// the request.
+	// stated run, or its resolved address disagrees with the request or
+	// with the addressing rules — including an answer from a session whose
+	// address is not the question's recipient (no session answers a human
+	// question). An incarnation that is not current is stale instead.
 	GrammarReasonUnauthorized = "unauthorized"
 	// GrammarReasonMalformed: parse or bounds failure (section 7 step 1).
 	GrammarReasonMalformed = "malformed"
@@ -91,8 +94,9 @@ const (
 	// content, or a resubmission conflicting with accepted content; the
 	// accepted entity is never disturbed.
 	GrammarReasonConflicting = "conflicting"
-	// GrammarReasonStale: a stale incarnation, or a submission against an
-	// entity no longer eligible to accept it.
+	// GrammarReasonStale: a stale incarnation; a send or ack from a session
+	// that is no longer its address's current session; or a submission
+	// against an entity no longer eligible to accept it.
 	GrammarReasonStale = "stale"
 	// GrammarReasonNotDelivered: an ack of a message never delivered to
 	// the acking session itself.
@@ -101,15 +105,16 @@ const (
 	// a run that can never accept one again (completed, failed, stopping or
 	// stopped, or a stop request; run.ErrRunNotAccepting).
 	GrammarReasonRunNotAccepting = "run-not-accepting"
-	// GrammarReasonMailboxClosed: a send addressed to a task whose mailbox
-	// admission has closed.
+	// GrammarReasonMailboxClosed: a send, or an answer whose derived
+	// destination is a task, addressed to a task whose mailbox admission
+	// has closed.
 	GrammarReasonMailboxClosed = "mailbox-closed"
 	// GrammarReasonNotManager: a plan verb (task create/retry, plan close)
 	// from a session that is not the run's current manager.
 	GrammarReasonNotManager = "not-manager"
-	// GrammarReasonNotReviewer: a review submission from a session whose
-	// role is not reviewer, or that is not the review attempt's current
-	// session.
+	// GrammarReasonNotReviewer: a first review submission from a session
+	// that is not the review attempt's own reviewer session (another role,
+	// another run, or another attempt).
 	GrammarReasonNotReviewer = "not-reviewer"
 	// GrammarReasonDependencyCycle: a task create whose dependency edges
 	// would close a cycle.
@@ -126,6 +131,22 @@ const (
 	// the review task's frozen subject.
 	GrammarReasonSubjectMismatch = "subject-mismatch"
 )
+
+// GrammarSubmissionTransientLine renders hop result submit's and hop
+// review submit's retryable first line for a typed transient reason: the
+// one line that tells the worker what to do before rerunning. ok is false
+// for any other reason; a caller then prints no protocol line at all rather
+// than guess one.
+func GrammarSubmissionTransientLine(reason TransientReason) (line string, ok bool) {
+	switch reason {
+	case TransientAttemptNotRunning:
+		return GrammarTransientNotRunningLine, true
+	case TransientUndeliveredMessages:
+		return GrammarTransientUndeliveredLine, true
+	default:
+		return "", false
+	}
+}
 
 // GrammarRefusalLine renders a refusal's first line from one enumerated
 // reason token.
@@ -154,6 +175,18 @@ func GrammarResultAcceptedLine(resultID string) string { return "accepted " + re
 
 // GrammarResultDuplicateLine is the idempotent-resubmission line.
 func GrammarResultDuplicateLine(resultID string) string { return "duplicate " + resultID }
+
+// GrammarResultRefusalLine renders hop result submit's final non-success
+// first line: the outcome kind ("stale", "conflicting" or "malformed", each
+// spelled as its GrammarReason token), then ": " and the detail when there
+// is one. Unlike the other verbs' `refused: <token>` lines, the detail is
+// part of the first line.
+func GrammarResultRefusalLine(kind, detail string) string {
+	if detail == "" {
+		return kind
+	}
+	return kind + ": " + detail
+}
 
 // GrammarMessageLine renders hop msg next/wait's first line. replyTo,
 // relayOf and origin are optional ("" omits the field); origin appears on

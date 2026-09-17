@@ -482,13 +482,21 @@ func waitForRunState(t *testing.T, env []string, repoRoot, runID string, deadlin
 // already uses git and ps, so no new Go dependency is needed for direct
 // evidence a rendered `hop status` block does not carry (row history, not
 // just current state). dbPath is always this test's own isolated
-// HOP_STATE_DIR/hop.db, never a real one. Returns trimmed combined output;
-// fails the test on any error.
+// HOP_STATE_DIR/hop.db, never a real one. `-cmd ".timeout 5000"` gives
+// this one-shot CLI connection the SAME busy-timeout SQLite itself already
+// applies to every production connection (internal/adapters/sqlite/
+// sqlite.go's dsn: `busy_timeout(5000)`) — SQLite's own blocking retry
+// against a transient WAL lock (most likely to appear in the brief window
+// right after a scenario SIGKILLs the store's own writer mid-transaction),
+// deterministic and bounded, rather than this test package re-detecting
+// and re-implementing the same behavior by matching "database is locked"
+// in the CLI's own error text. Returns trimmed combined output; fails the
+// test on any error.
 func querySQLite(t *testing.T, dbPath, query string) string {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "sqlite3", dbPath, query).CombinedOutput() //nolint:gosec // G204: fixed sqlite3 invocation against this test's own database path and a query it composed itself.
+	out, err := exec.CommandContext(ctx, "sqlite3", "-cmd", ".timeout 5000", dbPath, query).CombinedOutput() //nolint:gosec // G204: fixed sqlite3 invocation against this test's own database path and a query it composed itself.
 	if err != nil {
 		t.Fatalf("sqlite3 %s %q: %v\n%s", dbPath, query, err, out)
 	}

@@ -31,12 +31,16 @@ func TestRunResultSubmit(t *testing.T) {
 	// "transient" as a prefix — using it here, not an idealized value,
 	// is what proves the protocol line does not depend on it.
 	const realTransientDetail = "run: attempt not yet running: attempt 01931db3-0000-7000-8000-000000000000"
+	// realUndeliveredDetail is the Detail the same store carries for the
+	// mailbox rule's transient outcome.
+	const realUndeliveredDetail = "transient: undelivered messages; drain with hop msg next, ack, then resubmit"
 
 	outcomes := []struct {
 		name       string
 		result     app.SubmitResultResult
 		wantCode   int
 		firstLine  string
+		wantStdout string // non-empty: stdout must equal this exactly
 		wantStderr string // non-empty: stderr must contain this
 	}{
 		{
@@ -53,14 +57,53 @@ func TestRunResultSubmit(t *testing.T) {
 		},
 		{
 			// The fake outcome carries the REAL sqlite Detail text, not an
-			// idealized one: the protocol line is transientRetrySignal
-			// regardless of what Detail says, and Detail itself lands on
-			// stderr as diagnostics, never on the stdout protocol line.
-			name:       "transient exits 1 with the fixed retry line first, real Detail on stderr",
-			result:     app.SubmitResultResult{Kind: "transient", Detail: realTransientDetail},
+			// idealized one: the protocol line is the one the typed reason
+			// selects, and Detail itself lands on stderr as diagnostics,
+			// never on the stdout protocol line.
+			name:       "transient attempt-not-running exits 1 with the not-running line alone, real Detail on stderr",
+			result:     app.SubmitResultResult{Kind: "transient", Detail: realTransientDetail, TransientReason: string(app.TransientAttemptNotRunning)},
 			wantCode:   exitFailure,
-			firstLine:  transientRetrySignal,
+			firstLine:  app.GrammarTransientNotRunningLine,
+			wantStdout: app.GrammarTransientNotRunningLine + "\n",
 			wantStderr: realTransientDetail,
+		},
+		{
+			name:       "transient undelivered-messages exits 1 with the drain line alone, real Detail on stderr",
+			result:     app.SubmitResultResult{Kind: "transient", Detail: realUndeliveredDetail, TransientReason: string(app.TransientUndeliveredMessages)},
+			wantCode:   exitFailure,
+			firstLine:  "transient: undelivered messages; drain with hop msg next, ack, then resubmit",
+			wantStdout: app.GrammarTransientUndeliveredLine + "\n",
+			wantStderr: realUndeliveredDetail,
+		},
+		{
+			// The reason decides, never the Detail text: each detail is
+			// swapped onto the other reason.
+			name:       "the undelivered reason wins over a not-running Detail",
+			result:     app.SubmitResultResult{Kind: "transient", Detail: realTransientDetail, TransientReason: string(app.TransientUndeliveredMessages)},
+			wantCode:   exitFailure,
+			firstLine:  app.GrammarTransientUndeliveredLine,
+			wantStdout: app.GrammarTransientUndeliveredLine + "\n",
+		},
+		{
+			name:       "the not-running reason wins over an undelivered Detail",
+			result:     app.SubmitResultResult{Kind: "transient", Detail: realUndeliveredDetail, TransientReason: string(app.TransientAttemptNotRunning)},
+			wantCode:   exitFailure,
+			firstLine:  app.GrammarTransientNotRunningLine,
+			wantStdout: app.GrammarTransientNotRunningLine + "\n",
+		},
+		{
+			name:       "a transient outcome with no reason prints no protocol line",
+			result:     app.SubmitResultResult{Kind: "transient", Detail: realUndeliveredDetail},
+			wantCode:   exitFailure,
+			firstLine:  "",
+			wantStderr: "hop result submit: transient outcome names no known retry reason",
+		},
+		{
+			name:       "a transient outcome with an unknown reason prints no protocol line",
+			result:     app.SubmitResultResult{Kind: "transient", TransientReason: "run-not-running"},
+			wantCode:   exitFailure,
+			firstLine:  "",
+			wantStderr: "hop result submit: transient outcome names no known retry reason",
 		},
 		{
 			name:      "stale exits 1",
@@ -104,6 +147,12 @@ func TestRunResultSubmit(t *testing.T) {
 			if lines[0] != tc.firstLine {
 				t.Errorf("first line = %q, want %q", lines[0], tc.firstLine)
 			}
+			if tc.firstLine == "" && stdout.Len() != 0 {
+				t.Errorf("stdout = %q, want nothing", stdout.String())
+			}
+			if tc.wantStdout != "" && stdout.String() != tc.wantStdout {
+				t.Errorf("stdout = %q, want exactly %q", stdout.String(), tc.wantStdout)
+			}
 			if tc.wantStderr != "" && !strings.Contains(stderr.String(), tc.wantStderr) {
 				t.Errorf("stderr = %q, want it to contain %q", stderr.String(), tc.wantStderr)
 			}
@@ -119,17 +168,22 @@ func TestRunResultSubmit(t *testing.T) {
 		})
 	}
 
-	// The assignment template's own retry instruction
-	// (internal/app/usecase_execboundary.go's renderInitialPrompt) tells
-	// the worker to retry when "the first output line begins with
-	// \"transient\"". This package cannot call that unexported function
-	// directly, but this assertion ties the two contracts together: if
-	// transientRetrySignal ever stopped satisfying the prompt's own prefix
-	// check, this fails immediately instead of the two silently drifting
-	// apart.
-	t.Run("the fixed retry line satisfies the prompt's own retry prefix check", func(t *testing.T) {
-		if !strings.HasPrefix(transientRetrySignal, "transient") {
-			t.Fatalf("transientRetrySignal = %q does not begin with %q, which the prompt instructs the worker to check for", transientRetrySignal, "transient")
+	// The launch prompt's retry instruction
+	// (internal/app/usecase_execboundary.go's renderInitialPrompt, pinned by
+	// internal/app's TestWorkerPromptsFollowTheTransientLine) tells the
+	// worker, when "the first output line begins with \"transient\"", to
+	// follow that line's instruction before rerunning. This package cannot
+	// call that unexported function directly, but this assertion ties the
+	// two contracts together: each retry line this command prints begins
+	// with the prompt's prefix and names its own instruction, so a worker
+	// told to drain is never told only to rerun.
+	t.Run("every retry line carries the prompt's prefix and its own instruction", func(t *testing.T) {
+		for _, reason := range []app.TransientReason{app.TransientAttemptNotRunning, app.TransientUndeliveredMessages} {
+			line, ok := app.GrammarSubmissionTransientLine(reason)
+			_, instruction, named := strings.Cut(line, "; ")
+			if !ok || !strings.HasPrefix(line, "transient") || !named || instruction == "" {
+				t.Fatalf("retry line for %s = %q (known %t), want one beginning with %q and naming its instruction after \"; \"", reason, line, ok, "transient")
+			}
 		}
 	})
 

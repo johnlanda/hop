@@ -30,15 +30,15 @@ this package never resolves environment variables or defaults.
 | [migrations/003_manager_workers_messages.sql](migrations/003_manager_workers_messages.sql) | — | The Phase 3 schema (design section 4; its text's "002"): ten new tables (task_dependencies, messages, message_deliveries, message_acks, message_receipts, reviews, review_submissions, integrations, retry_requests, workflow_receipts) with the partial unique acceptance/serialization indexes; additive columns on runs (plan_closed_at), run_snapshots (workflow), worktrees (attempt_id, base_commit) and tasks (kind/seq/title/instructions_path/retry_count/subjects/mailbox_closed_at/created_at, defaults = the solo backfill); STRICT rebuilds of sessions (attempt_id relaxed, parent_session_id, the one-manager partial index), launch_claims (session_id NOT NULL, backfilled from the binding else the historical launch intent) and check_requests (typed subject, old rows re-keyed id=result_id, subject_kind='result') |
 | [migrations/004_run_worktrees_retired.sql](migrations/004_run_worktrees_retired.sql) | — | The post-merge worktree retirement run fact ([phase-3-worktree-retirement.md](../../../docs/plan/phase-3-worktree-retirement.md)): `runs.worktrees_retired_at` (nullable TEXT, no default), NULL on every pre-migration row; an additive ALTER on the ordinary migration path, no rebuild. Nothing reads or writes it yet |
 | [workflow_uow.go](workflow_uow.go) | `unitOfWork` as `app.WorkflowRepositories`: `TaskDependencies`, `TaskIndex`, `AttemptIndex`, `SessionIndex`, `WorktreeIndex`, `Messages`, `Reviews`, `Integrations`, `RetryRequests`, `ManagerSession` | The Phase 3 controller-transaction repositories on the same fenced unit of work (the additive packaging rule's slice-3 half); controller review-task creation, the store-assigned enqueue sequence, the sorted PendingByAddress mailbox-closure snapshot, the serial integration slot, and `WorktreeIndex().ByAttempt` (the newest row linked to an attempt, in attemptWorktreePath's order; `app.ErrNotFound` otherwise) |
-| [messaging.go](messaging.go) | `SendMessage`, `FetchNextMessage`, `AckMessage`, `AnswerQuestion`, `insertMessageReceipt`, `acceptedMessageReceipt`, `sendRequestDigest` | The section 7 worker-authority messaging port: request-ID receipts first, the caller session's OWN run and current incarnation re-derived per verb, derived answer destinations, the bundled human-question ack, receipts for every outcome except the deliberately receipt-free empty fetch. Only an ordinary send checks the run state (`Run.CanAcceptManagerVerb`: a `transient` receipt while the run can still reach running, `refused-run-not-accepting` once it never will); fetch, ack and both answer paths have no run-state gate |
+| [messaging.go](messaging.go) | `SendMessage`, `FetchNextMessage`, `AckMessage`, `AnswerQuestion`, `insertMessageReceipt`, `acceptedMessageReceipt`, `sendRequestDigest`, `decideAnswer`, `recordAnswerOutcome`, `answerDestinationClosed` | The section 7 worker-authority messaging port: the caller session's OWN run re-derived per verb; every sender's logical address re-derived from its session row before its request-ID receipt is read (unresolvable or different from the claimed `SenderAddress`: `unauthorized`, so a session claiming another address never reads that address's receipts); request-ID receipts before every eligibility check; the current incarnation re-derived per verb; after both, a send of any kind only from its address's CURRENT session (`addressSessionCurrent`; refused `stale` with `addressSessionRefusal`'s value-free detail otherwise, while the session's own accepted request still replays as duplicate); answer recipient authority (that derived address required to equal the question's recipient, via `run.AcceptAnswer`'s `AnswerContext`, so no session answers a human question), derived answer destinations admitted only into an open task mailbox (`decideAnswer`, `recordAnswerOutcome`, `answerDestinationClosed`, shared by both answer paths), the bundled human-question ack, fetch and ack authority for the address's CURRENT session only (after the run, incarnation and address checks, `addressSessionCurrent` in messages.go: a fetch from any other session is `app.ErrMessagingUnauthorized` with a refused receipt carrying `addressSessionRefusal`'s value-free detail and nothing served; an ack is `AckContext.AttemptCurrent`, refused `stale`), receipts for every outcome except the deliberately receipt-free empty fetch. Only an ordinary send checks the run state (`Run.CanAcceptManagerVerb`: a `transient` receipt while the run can still reach running, `refused-run-not-accepting` once it never will); fetch, ack and both answer paths have no run-state gate |
 | [plan.go](plan.go) | `CreateTask`, `RequestRetry`, `ClosePlan`, `insertWorkflowReceipt`, `acceptedWorkflowReceipt`, `requireManagerCaller`, `runAcceptanceReason` | The section 8 worker-authority plan port: manager-only verbs, run-state-gated after the caller checks (`Run.CanAcceptManagerVerb`: a `transient` receipt and nothing else while the run can still reach running, `refused` with `run-not-accepting` once it never will), the retry's successor attempt reserved in the accepting transaction (its outcome carries the task's seq and the attempt number, re-read on a receipt replay), the plan flag set/cleared on runs.plan_closed_at, one authoritative acceptance per (run, verb, request ID) |
-| [review.go](review.go) | `SubmitReview`, `persistVerdictAcceptance`, `reviewerSessionEligible` | The section 8 worker-authority verdict write: SubmitResult's order mirrored, acceptance persisting the review, completing attempt and task, closing the mailbox and committing the controller's reasons-bearing manager notice atomically |
+| [review.go](review.go) | `SubmitReview`, `persistVerdictAcceptance`, `reviewerSessionEligible` | The section 8 worker-authority verdict write: SubmitResult's order mirrored (a transient verdict carries `app.TransientReasonOf` its `AcceptVerdict` error; every refusal carries its grammar token — `not-reviewer` from `reviewerSessionEligible`, `app.ReviewRefusalReasonOf` its `AcceptVerdict` error, so a subject mismatch is `subject-mismatch` — with the receipt's outcome and detail unchanged), acceptance persisting the review, completing attempt and task, closing the mailbox and committing the controller's reasons-bearing manager notice atomically |
 | [workflow_read.go](workflow_read.go) | `LoadSessionLaunchContext`, `sessionLaunchIdentity`, `sessionLaunchIncarnation`, `LoadMessagingContext`, `LoadMessageDetail`, `worktreePathForAttempt`, `attemptWorktreePath`, `featureRunDetail`, `runNeedsAttentionLocked`, `mailboxStatuses`, `guardShortfalls`, `recordedSubjects`, `pendingQuestions`, `sessionSummaries` | The Phase 3 lease-free reads (`app.WorkflowReadStore`): session-addressed launch context (binding else the SESSION-keyed pending intent, fail closed — `sessionLaunchIncarnation`, the resolution the status read model shares; the attempt row, worktree path and Relaunch successor fact), the messaging context, hop msg show's detail, and RunDetail's feature extensions. The launch context's worktree comes from the newest row linked to the attempt, else the run's only row while that row is unlinked, else ""; a row linked to another attempt is never served, and several rows are never guessed among. The status task table uses the linked row alone. `sessionSummaries` (STATUS-1) lists every session of the run, oldest first (`ORDER BY rowid`), each with `getAttempt`'s task/number for a delegated child and `currentBinding`'s current (non-superseded) binding whatever the session's own state — a terminated session's last binding is still reported, as evidence of where it ran. `runNeedsAttentionLocked` (Astra F4, called from `readstore.go`'s `ListRuns`) is false for a solo run, else the OR-reduction of the SAME `mailboxStatuses` call `featureRunDetail`'s own `Mailboxes` population makes — one implementation of the attention threshold rule, so the bare listing and the `-run` detail can never disagree about one run. `guardShortfalls` evaluates through `app.StatusGuardShortfalls`: the head commit is the newest integrated row's merge commit, and `recordedSubjects` lists the subjects recorded for exactly that commit (review tasks' `subject_commit_oid`/`subject_tree_oid` and reviews' subject columns) that supply its tree — the integration row records no tree, and the merge commit id is never used as one |
-| [messages.go](messages.go) | `parseAddress`, `scanMessage`, `getMessage`, `messagesByAddress`, `nextEnqueueSeq`, `insertMessage`, `messageDeliveries`, `messageAck`, `resolveSessionAddress` | Shared message row mapping: Message.State reconstructed from the delivery/ack rows in the same snapshot (never a persisted column), the per-(run, recipient) FIFO sequence, lineage-based address resolution |
+| [messages.go](messages.go) | `parseAddress`, `scanMessage`, `getMessage`, `messagesByAddress`, `nextEnqueueSeq`, `insertMessage`, `messageDeliveries`, `messageAck`, `resolveSessionAddress` | Shared message row mapping: Message.State reconstructed from the delivery/ack rows in the same snapshot (never a persisted column), the per-(run, recipient) FIFO sequence, lineage-based address resolution, and `addressSessionCurrent`/`addressSessionRefusal`: `run.CurrentAddressSession` over the session's own attempt row and its task's newest attempt by the store's numbering (`latestAttempt`), both read in the caller's transaction, with no attempt row read for an attempt-less manager |
 | [statestore.go](statestore.go) | `InitializeRun`, `AcquireLease`, `Heartbeat`, `ReleaseLease`, `Begin`, `validateLease` | The controller authority: run bootstrap in one transaction (the snapshot's workflow JSON round-tripped, NULL for solo; a feature spec inserts the run, snapshot, manager session and lease only, refusing `app.ErrFeatureRunSpecInvalid` before the transaction and `app.ErrRunSequenceMismatch` inside it), lease CAS with monotonic generations, fenced unit-of-work begin |
 | [uow.go](uow.go) | `unitOfWork` and the typed repositories (`Runs`…`CheckExecClaims`), `OperationRepository.Pending`/`ByKind`, `Commit`, `Rollback` | One immediate transaction per unit of work; optimistic-concurrency saves; append-only bindings and transitions; journal payloads persisted as uninterpreted JSON; controller-side launch-claim settlement |
 | [entities.go](entities.go) | `getRun`, `getTask`, `getAttempt`, `getSession`, `currentSession`, `currentBinding`, `getWorktree`, `scanWorktree`, `selectWorktreeColumns`, `getLaunchClaim`, `acceptedResult`, `incarnationCurrent`, `sessionIncarnationCurrent`, `pendingLaunchIntentDisagrees`, `pendingLaunchIntentOfSession` | Row ↔ domain-value mapping shared by all three authorities through the `querier` interface; `sessionIncarnationCurrent` is the one principal-incarnation rule every caller-incarnation check decides through (see Invariants) (`getWorktree` and the listing's `scanWorktree` map NULL `attempt_id`/`base_commit` to the solo row's empty links; a worktree's `state` column is read verbatim, including the retirement states `removed`/`absent`/`released`) |
-| [submission.go](submission.go) | `SubmitResult`, `RecordMalformed`, `ClaimLaunch`, `SettleLaunchFailure`, `ClaimCheckExec`, `RequestStop`, `insertReceipt` | The worker authority: the section 7 validation order with the domain's `AcceptResult` inside one transaction, receipts for every outcome, the pre-exec claim contracts, the monotonic stop request |
+| [submission.go](submission.go) | `SubmitResult`, `RecordMalformed`, `ClaimLaunch`, `SettleLaunchFailure`, `ClaimCheckExec`, `RequestStop`, `insertReceipt` | The worker authority: the section 7 validation order with the domain's `AcceptResult` inside one transaction — the task's mailbox passed in as `AcceptanceContext.MailboxClear` and consulted after every other eligibility check, `SubmitReview`'s order — receipts for every outcome (a transient result carries `app.TransientReasonOf` its acceptance error: undelivered-messages from `ErrMailboxNotClear`, with the drain line `app.GrammarTransientUndeliveredLine` itself as its detail, attempt-not-running from `ErrTransientNotRunning`), the pre-exec claim contracts, the monotonic stop request |
 | [readstore.go](readstore.go) | `ListRuns`, `LoadRunStatus`, `attachSessionBinding`, `LoadFrozenRun`, `LoadCheckExecutionContext`, `lastCheckSummary`, `retirementIntentExecution` | Lease-free reads, each inside one deferred read transaction for a consistent WAL snapshot; `LoadRunStatus` names the solo worker's (or feature manager's) session, its current binding and the claim of the incarnation `sessionLaunchIncarnation` resolves (`attachSessionBinding`: the binding's, else the session's newest pending launch intent's, none when any pending launch intent of the session disagrees with the binding), and carries the snapshot's frozen `TargetBranch` and the run's `worktrees_retired_at` fact, and for a feature run `featureWorktreeDetail` adds every worktree row (oldest first, non-nil) and the run's `worktree.retire` operations (newest first, through the shared `operationsByKind`) |
 | [worktreeretirement_read.go](worktreeretirement_read.go) | `Store` as `app.RetirementReadStore`: `ListRetirementCandidates`, `terminalUnretiredRuns`, `retirementCandidateRecord`, `collectIntegrations` | The worktree-retirement triage read, in one read transaction. It returns the repository's completed, failed and stopped runs whose fact is unset, whose frozen workflow is feature mode with a target, and that integrated at least one row adding content, in sequence order. Each record carries its integrated rows (oldest first), its `retirement.check` operations (newest first) and whether any `retirement.check` or `worktree.retire` is pending or reconciling. An unknown root has no candidates |
 | [worktreeretirement.go](worktreeretirement.go) | `unitOfWork` as `app.WorktreeRetirementRepositories`: `WorktreesForRetirement`, `WorktreesRetiredAt`, `MarkWorktreesRetired`; `runWorktrees`, `runWorktreesRetiredAt` | `WorktreesForRetirement` lists every worktree row of the leased run (another run is `ErrFenced`) in insertion order (`created_at, rowid`), any state, with its revision; row state saves go through `Worktrees().Save`. `WorktreesRetiredAt` reads the leased run's fact inside the transaction (another run is `ErrFenced`). Migration 004's worktrees-retired run fact: written once inside the fenced unit of work (the leased run only; the UPDATE applies only while NULL, so a repeat keeps the first value; a set-once housekeeping column that does not move `runs.revision`), read back as nil for NULL or the canonical time (anything else fails closed) |
@@ -90,7 +90,7 @@ this package never resolves environment variables or defaults.
   commit-time clock reading.
 - `SubmitResult` runs the domain's `run.AcceptResult` inside one write
   transaction (load run/task/attempt/prior accepted result and the
-  incarnation/claim context → decide → persist), and every outcome —
+  incarnation, claim and mailbox context → decide → persist), and every outcome —
   accepted, duplicate, stale, conflicting, transient, malformed — commits a
   `result_submissions` receipt whose claimed identities are plain text with
   no foreign keys. Recorded outcomes return a nil error; a non-nil error is
@@ -175,9 +175,16 @@ this package never resolves environment variables or defaults.
   principal stale until label recovery binds it (LAUNCH-6, accepted).
 - Worker-authority request idempotency is receipt-first: every mutating
   messaging/plan verb resolves the (run, verb, request ID) acceptance key
-  before anything else — an identical retry returns the original outcome
-  as duplicate, a conflicting reuse is refused — and every outcome leaves
-  a receipt row EXCEPT an empty fetch, which commits nothing. A
+  before any eligibility check — an identical retry returns the original
+  outcome as duplicate, a conflicting reuse is refused — and every outcome
+  leaves a receipt row EXCEPT an empty fetch, which commits nothing. A
+  session's `SendMessage` first establishes who is asking: the run, the
+  session's own run and its re-derived address, which must equal the
+  claimed `SenderAddress` the request digest covers (`unauthorized`
+  otherwise), so a session claiming another address never reads that
+  address's receipts; a non-recipient at its own address that reuses a
+  request id is `conflicting` whatever its body, since its digest names a
+  different sender. A
   `transient` receipt (a run-gated verb while the run can still reach
   running) sits outside the accepted-only partial unique index, so the
   same request retried later is decided afresh and accepted at most once.
@@ -186,12 +193,16 @@ this package never resolves environment variables or defaults.
   delivery/ack rows, the enqueue sequence is assigned in commit order
   inside the send transaction (FIFO authority, never caller clocks), and
   a successful serve's evidence is its append-only delivery row.
-- Acceptance closes the mailbox in the same commit: `SubmitResult`'s
-  first acceptance re-reads the task mailbox (queued or
-  delivered-unacknowledged → the retryable transient outcome with the
-  drain grammar) and closes it atomically, as does `SubmitReview`'s,
-  which also commits the controller's reasons-bearing info notice to the
-  manager; `PlanStore.RequestRetry` is the only reopen path, and
+- Acceptance closes the mailbox in the same commit: `SubmitResult` and
+  `SubmitReview` re-read the task mailbox inside the accepting transaction
+  and hand it to `AcceptResult`/`AcceptVerdict`, which consult it only
+  after the receipt, the incarnation, the stop request and the attempt
+  state and claim (queued or delivered-unacknowledged → the retryable
+  transient outcome with the drain grammar, so a stale or superseded
+  caller is refused `stale` rather than told to drain); a first acceptance
+  closes it atomically, and `SubmitReview`'s also commits the controller's
+  reasons-bearing info notice to the manager;
+  `PlanStore.RequestRetry` is the only reopen path, and
   `taskRepository.Save` persists the flag under the revision discipline
   for the controller's failure-closure settlement.
 - `runtime_bindings.server_instance` maps to
@@ -280,7 +291,10 @@ this package never resolves environment variables or defaults.
   `TestSendRefusalMatrix`, `TestUnauthorizedFetchLeavesReceipt`,
   `TestRelayedAnswerLineage`, `TestReceiptAcceptanceKey`,
   `TestHumanAnswerDigestVectors`, `TestCreateTask*`, `TestClosePlan`,
-  `TestRequestRetry*`, `TestSubmitReview*`,
+  `TestRequestRetry*`, `TestSubmitReview*` (`TestSubmitReviewRefusalReasons`:
+  subject-mismatch, not-reviewer, stale and malformed each with its
+  receipt and no review row, accepted and duplicate with no reason, a
+  different verdict conflicting),
   `TestRunGatedVerbsAcrossRunStates` — task create, task retry, plan
   close, a relayed question and a task notice against every run state
   with and without a stop request: accepted while running, transient
@@ -288,7 +302,75 @@ this package never resolves environment variables or defaults.
   completing, then accepted exactly once and duplicate under the same
   request IDs once running, refused `run-not-accepting` once completed,
   failed, stopping or stopped or with a stop request; fetch, ack and an
-  answer proceeding in every state); the raced contracts across
+  answer proceeding in every state); the answer authority and admission
+  suites (`answer_admission_test.go`: `TestAnswerFromNonRecipientRefused`
+  — a worker, or the manager, answering a human question or relay is
+  refused `unauthorized` with a receipt per attempt, no envelope and no
+  ack row, and the human's answer is then accepted and forwarded —
+  `TestAnswerToAnotherAddressRefused`, `TestAnswerRetryPrecedence` — the
+  sender's derived address, then the request-ID receipt, then authority,
+  then prior content, one receipt per decision; a non-recipient at its own
+  address reusing the recipient's request id is conflicting whatever its
+  body, and one claiming the recipient's address is unauthorized whatever
+  it replays — `TestAnswerReplayByMisclaimedAddress` (a right body guess, a
+  wrong one and a fresh request id each refused unauthorized, naming no
+  message), `TestAnswerAcceptanceBothOrders` and `TestAnswerAcceptanceRaced`
+  from separate handles, `TestAnswerAfterFailureClosureRefused`,
+  `TestHumanAnswerAfterOriginClosure`); the typed transient reasons
+  (`transient_reason_test.go`: `TestSubmitResultTransientReasons`,
+  `TestSubmitReviewTransientReasons` — both reasons for results and
+  verdicts with Detail and the transient receipt unchanged, a launching
+  review attempt with a pending mailbox attempt-not-running, accepted
+  outcomes carrying none); the one acceptance order for results
+  (`result_eligibility_test.go`: `TestSubmitResultEligibilityBeforeMailbox`
+  — with a message queued to the task, a superseded binding, an
+  incarnation a relaunch replaced, a stop request and an interrupted
+  attempt whose session is still bound are each stale on the first
+  submission and a retry, a launching attempt with an exec_pending claim is
+  attempt-not-running, and only a running attempt is told to drain, each
+  with its receipt and no result row —
+  `TestSubmitResultOldIncarnationStaysStaleWhileTheSuccessorDrains`: the
+  replaced incarnation stays stale before and after its successor
+  incarnation fetches, acks and is accepted); the fetch and ack authority
+  (`messaging_currency_test.go`, over `taskLineageFixture` — attempt 1
+  settled by the worker-termination shape with its binding left current,
+  then the retry's attempt 2 behind its own session:
+  `TestFetchRequiresTheTaskCurrentAttemptSession` — the retired session
+  after a retry, an interrupted attempt's still-active session, a
+  terminated session on a live attempt and a live session on an attempt
+  that is not its task's newest are each refused with the value-free
+  detail, a refused receipt and no delivery row, while the successor, or
+  the current session, is served —
+  `TestAckRequiresTheTaskCurrentAttemptSession` — the retired session's
+  ack of a message it was served is refused stale with no ack row, its ack
+  of a message it was never served is not-delivered, the successor is
+  re-served, acks and is recorded as the acker, and the retired session's
+  repeat is then a duplicate —
+  `TestManagerMessagingRequiresAManagerSessionThatHasNotEnded` — a
+  terminated manager whose binding is still current is refused fetch and
+  ack, and its successor manager is re-served and acks —
+  `TestSendRequiresTheAddressCurrentSession` — the retired session's
+  answer, info and question, an interrupted attempt's stopping session's
+  answer, a terminated session's info on a live attempt and an ended
+  manager's info are each refused stale with the value-free detail, a
+  refused receipt and no envelope; the retired session's identical retry
+  of an answer accepted while it was current is still duplicate, its
+  reused request id with another body conflicting and a fresh request id
+  stale, and a replaced incarnation is refused for the incarnation first;
+  the successor is re-served the question and its answer is accepted as
+  the manager's first message, and the successor manager's info is
+  accepted); the pre-binding
+  launch window (`prebinding_window_test.go`: a child whose
+  attempt and session are launching with no binding row, under an
+  agreeing, a disagreeing or an absent pending intent, each with and
+  without a message queued to the task —
+  `TestPreBindingWindowResultAndMessaging`: agreeing, the result is
+  attempt-not-running before and after the drain, the fetch serves the
+  message, an ack before it is not-delivered and after it accepted;
+  disagreeing or absent, the result is stale, the fetch refused as not
+  current and an ack of a message delivered to that incarnation stale —
+  `TestPreBindingWindowReviewSubmit`: the verdict attempt-not-running
+  with an agreeing intent and stale otherwise, with no review row); the raced contracts across
   separate handles (`TestFetchFetchRaced` — one serialized in-flight
   message, a delivery row per serve — `TestAckAckRaced`,
   `TestAnswerAnswerRaced`, `TestRequestIDReuseRaced`,

@@ -80,6 +80,8 @@ const fixtureWorkerSource = `package main
 import (
 	"bufio"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -265,6 +267,21 @@ func vanishOnceOrProceed(scratchDir, taskID string) {
 	os.Exit(0)
 }
 
+// waitForControlFile blocks until controlPath exists, polling at the same
+// low frequency watchForSelfKill uses, for a control file whose own
+// purpose is not a kill -- worker-fetch-crash's resumed-incarnation
+// release gate (design section 11 scenario 3), letting a test finish its
+// own stale-ack assertion deterministically before this session's own ack
+// call ever lands.
+func waitForControlFile(controlPath string) {
+	for {
+		if _, err := os.Stat(controlPath); err == nil {
+			return
+		}
+		time.Sleep(selfKillPollInterval)
+	}
+}
+
 // isResumeInvocation reports whether argv is a resume-SHAPED invocation:
 // any element equals the exact "--resume". Detection only — it routes the
 // invocation to requireResumeShape's strict validation, so a malformed
@@ -388,7 +405,7 @@ func parseBehavior(content string) (behavior string, args []string) {
 // policy-strip variable absent even when seeded into the server's own
 // environment, HERDR_*/HOP_* present, and passthrough/profile entries
 // exactly as configured (docs/plan/phase-2-design.md section 6).
-func writeObservation(path, role, assignmentPath, promptAssignmentPath, hopPath, assignmentContent, behavior string, behaviorArgs []string) {
+func writeObservation(path, role, assignmentPath, promptAssignmentPath, hopPath, assignmentContent, behavior string, behaviorArgs []string, instructionsPath, instructionsContent string) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "pid=%d\n", os.Getpid())
 	// os.Executable() is this process's own resolved image path — the
@@ -413,6 +430,21 @@ func writeObservation(path, role, assignmentPath, promptAssignmentPath, hopPath,
 		fmt.Fprintf(&b, "env:%s\n", entry)
 	}
 	fmt.Fprintf(&b, "assignment_content_begin\n%s\nassignment_content_end\n", assignmentContent)
+	// A feature-mode implementer's own read of its manager-authored task
+	// instructions, at the path it resolved independently: the digest
+	// and length prove THIS PROCESS'S OWN os.ReadFile call observed
+	// exactly these bytes at that exact path — never a copy the test
+	// handed it — the byte-exact-delivery evidence design section 11's
+	// injection scenario needs for this channel specifically, since a
+	// feature-mode implementer's OWN per-attempt assignment.md (dumped
+	// above) only names the instructions file by path and never embeds
+	// its content.
+	if instructionsPath != "" {
+		sum := sha256.Sum256([]byte(instructionsContent))
+		fmt.Fprintf(&b, "instructions_path=%s\n", instructionsPath)
+		fmt.Fprintf(&b, "instructions_sha256=%s\n", hex.EncodeToString(sum[:]))
+		fmt.Fprintf(&b, "instructions_bytes=%d\n", len(instructionsContent))
+	}
 	atomicWriteFile(path, b.String())
 }
 
@@ -427,6 +459,23 @@ func atomicWriteFile(path, content string) {
 	if err := os.Rename(tmp, path); err != nil {
 		fatalf("rename %s into place: %v", path, err)
 	}
+}
+
+// writeContentDigest dumps this process's own digest and length of
+// content — already read from a path this process resolved or was
+// handed by hop msg next/wait, never re-derived — as byte-exact-delivery
+// evidence for a channel writeObservation's own fixed shape does not
+// cover (a fetched message body: every behavior that reads one
+// otherwise discards it once acked). id names the entity the digest
+// belongs to (a message id), so a scenario can cross-check it against
+// the store's own row without ambiguity.
+func writeContentDigest(path, id, content string) {
+	var b strings.Builder
+	sum := sha256.Sum256([]byte(content))
+	fmt.Fprintf(&b, "id=%s\n", id)
+	fmt.Fprintf(&b, "sha256=%s\n", hex.EncodeToString(sum[:]))
+	fmt.Fprintf(&b, "bytes=%d\n", len(content))
+	atomicWriteFile(path, b.String())
 }
 
 // readFileOrFatal reads path, failing the run loudly on any error — every
@@ -536,6 +585,25 @@ func newRequestID() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
+// deterministicUUIDFrom derives a UUID-shaped, DETERMINISTIC string from
+// seed -- never random, unlike newRequestID above -- so recomputing it from
+// the SAME seed always yields the identical value. The manager's forward of
+// a relayed human answer (handleManagerMessage's "answer" case) uses this,
+// seeded with the answer's own message id (CLI-returned data the manager
+// never persists), so a cold-relaunched successor recomputes the IDENTICAL
+// request id with no hidden state of its own -- design trace 2: "the
+// forward's request ID makes any redo idempotent". Not a cryptographic
+// UUIDv5 (no real namespace semantics needed here), just a stable,
+// collision-resistant hash rendered in UUID form for readability.
+func deterministicUUIDFrom(seed string) string {
+	sum := sha256.Sum256([]byte("hop-fixture-manager-forward-request-id:" + seed))
+	var b [16]byte
+	copy(b[:], sum[:16])
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
 // runHopCLIRetryable runs hopPath with args, retrying while the response's
 // first line begins with "transient:" — Phase 2's own hop result submit
 // retry convention (submitOnce), generalized here to every OTHER mutating
@@ -560,11 +628,21 @@ func runHopCLIRetryable(hopPath string, args ...string) hopResult {
 	}
 }
 
+// fixtureGrammarTransientUndeliveredLine mirrors internal/app/grammar.go's
+// GrammarTransientUndeliveredLine exactly (retyped, never imported, the
+// same convention every other worker-protocol grammar constant in this
+// string uses): feature mode's own mailbox-drain transient first line
+// (design section 5: "before hop result submit it must drain its queue").
+const fixtureGrammarTransientUndeliveredLine = "transient: undelivered messages; drain with hop msg next, ack, then resubmit"
+
 // submitOnce runs "<hopPath> result submit --summary <summary> --commit
 // <oid>", retrying while the first stdout line begins with "transient" (the
 // assignment template's own retry instruction), bounded so a persistent
-// rejection does not hang the worker forever.
-func submitOnce(hopPath, oid, summary string) {
+// rejection does not hang the worker forever. observationPath, when
+// non-empty, dumps every attempt's exact first line, one per line, in
+// order -- direct evidence of the real binary's rendered sequence,
+// never inferred from the outcome rows alone.
+func submitOnce(hopPath, oid, summary, observationPath string) {
 	// The retry budget must comfortably outlast the controller's own
 	// corroboration polling: launch claim settlement depends on real pane
 	// creation, InspectPane polling and (in the early-submission case) this
@@ -573,19 +651,29 @@ func submitOnce(hopPath, oid, summary string) {
 	// deadline ("wait briefly and run the exact same command again"); this
 	// bounds it only so a persistently broken run does not hang forever.
 	deadline := time.Now().Add(2 * time.Minute)
+	var firstLines []string
 	for {
 		res := runHopCLI(hopPath, "result", "submit", "--summary", summary, "--commit", oid)
 		fmt.Printf("FIXTURE-SUBMIT-RESULT exit=[%d] first-line=[%s]\n", res.ExitCode, res.FirstLine())
+		firstLines = append(firstLines, res.FirstLine())
+		if observationPath != "" {
+			atomicWriteFile(observationPath, strings.Join(firstLines, "\n")+"\n")
+		}
 		if !strings.HasPrefix(res.FirstLine(), "transient") || !time.Now().Before(deadline) {
 			return
 		}
-		// Feature mode's own mailbox-drain transient (design section 5:
-		// "transient: undelivered messages; drain with hop msg next, ack,
-		// then resubmit") names a SPECIFIC required action, distinct from
-		// solo's "attempt not yet running" retry: the identical resubmit
-		// would see the SAME pending message forever without this drain.
-		// Solo never renders this line, so this never fires for it.
-		if strings.HasPrefix(res.FirstLine(), "transient: undelivered messages") {
+		// Feature mode's own mailbox-drain transient names a SPECIFIC
+		// required action, distinct from solo's "attempt not yet running"
+		// retry: the identical resubmit would see the SAME pending
+		// message forever without this drain. Matched EXACTLY, never by
+		// prefix -- a trailing-text drift in the real renderer
+		// must fail this loop loudly (an unhandled transient line falls
+		// through to the deadline-bounded retry below with no drain,
+		// which for a genuinely undelivered-messages case would spin
+		// without ever clearing the mailbox) rather than silently keep
+		// "working" by accident. Solo never renders this line, so this
+		// never fires for it.
+		if res.FirstLine() == fixtureGrammarTransientUndeliveredLine {
 			drainMailbox(hopPath)
 		}
 		time.Sleep(fixtureRetryInterval)
@@ -678,6 +766,67 @@ func parseDeliveredMessage(stdout string) (deliveredMessage, bool) {
 		fatalf("delivered message %s carries no body: line", msg.ID)
 	}
 	return msg, true
+}
+
+// fixtureFetchLoopDeadline bounds how long fetchDeliveredMessage tolerates
+// a transient refusal before giving up loudly, rather than spinning
+// silently forever against a permanent regression.
+const fixtureFetchLoopDeadline = 2 * time.Minute
+
+// fixtureMessagingUnauthorizedText mirrors internal/app/messaging.go's
+// ErrMessagingUnauthorized.Error() exactly (retyped, never imported): design
+// section 7's Fetch prints NO protocol line on stdout for any authority
+// refusal -- only a stderr diagnostic ("hop msg wait: app: fetch message: "
+// +this text+": <detail>"), which runHopCLI's merged capture still
+// surfaces as the line's own stable substring. A pending launch intent
+// that agrees with the caller's own incarnation serves a pre-binding-
+// window fetch (design section 7); a disagreeing or absent one refuses
+// it. One case still refuses a live, claimed principal this way: a
+// pane.open whose own act errors after the launcher already claimed is
+// recorded with no binding and no readable pending intent, so that
+// session's fetch stays refused until label recovery later commits the
+// binding.
+const fixtureMessagingUnauthorizedText = "messaging session is not authorized for this request"
+
+// fetchDeliveredMessage runs "<hopPath> msg wait" in a loop until a
+// message is delivered, classifying and pacing every non-delivery outcome
+// instead of retrying unconditionally on anything -- worker-hold's and
+// worker-fetch-crash's shared fetch loop:
+//   - "none: ..." (no message within the wait timeout) continues at once;
+//     the server-side wait itself already paced that call, so no sleep is
+//     added on top of it.
+//   - "transient: ..." sleeps fixtureRetryInterval within
+//     fixtureFetchLoopDeadline and prints the line.
+//   - a line carrying fixtureMessagingUnauthorizedText's stable substring
+//     fatalf's at once, naming the line: a fixture session with an
+//     agreeing pending launch intent is served, so this outcome means
+//     either an authority bug or the one accepted residual
+//     fixtureMessagingUnauthorizedText's own doc comment names -- a
+//     scenario should surface either rather than silently wait it out.
+//   - anything else also fatalf's immediately, naming the exact line,
+//     rather than looping silently against a permanent regression.
+func fetchDeliveredMessage(hopPath string) deliveredMessage {
+	deadline := time.Now().Add(fixtureFetchLoopDeadline)
+	for {
+		out := runHopCLI(hopPath, "msg", "wait")
+		if msg, delivered := parseDeliveredMessage(out.Stdout); delivered {
+			return msg
+		}
+		first := out.FirstLine()
+		switch {
+		case strings.HasPrefix(first, "none:"):
+		case strings.Contains(first, fixtureMessagingUnauthorizedText):
+			fatalf("hop msg wait returned an unauthorized fetch refusal for what should be a current session: %q", first)
+		case strings.HasPrefix(first, "transient:"):
+			if !time.Now().Before(deadline) {
+				fatalf("hop msg wait kept returning %q past the %s retry deadline", first, fixtureFetchLoopDeadline)
+			}
+			fmt.Println(first)
+			time.Sleep(fixtureRetryInterval)
+		default:
+			fatalf("hop msg wait returned an unexpected line: %q", first)
+		}
+	}
 }
 
 // waitForGo blocks on stdin for a line reading exactly "FIXTURE-GO",
@@ -832,13 +981,20 @@ func runWorker() {
 
 	assignmentContent := readFileOrFatal(assignmentPath)
 	behavior, behaviorArgs := parseBehavior(assignmentContent)
+	// instructionsPath/instructionsContent stay "" for a solo run: only a
+	// feature-mode implementer has a separate manager-authored
+	// instructions artifact distinct from its own per-attempt
+	// assignment.md, and only its OWN read of that exact path (never a
+	// copy the test handed it) is byte-exact-delivery evidence.
+	var instructionsPath, instructionsContent string
 	if feature {
 		// The manager-authored task instructions carry the directive for a
 		// feature-mode implementer; assignment.md itself is fully computed
 		// (no manager-authored free text), so parseBehavior would find
 		// nothing there.
-		instructionsPath := filepath.Join(env["HOP_STATE_DIR"], "runs", env["HOP_RUN_ID"], "tasks", env["HOP_TASK_ID"]+".md")
-		behavior, behaviorArgs = parseBehavior(readFileOrFatal(instructionsPath))
+		instructionsPath = filepath.Join(env["HOP_STATE_DIR"], "runs", env["HOP_RUN_ID"], "tasks", env["HOP_TASK_ID"]+".md")
+		instructionsContent = readFileOrFatal(instructionsPath)
+		behavior, behaviorArgs = parseBehavior(instructionsContent)
 	}
 
 	// Every Phase 3 behavior's directive carries a test-owned scratch
@@ -857,28 +1013,39 @@ func runWorker() {
 		// A real-process scenario that ends this attempt mid-flight (design
 		// section 11 scenario 4) must never signal a pid it only OBSERVED
 		// via pane.process_info: Herdr could reap and the OS could recycle
-		// that pid before the signal lands. This watcher is the ONLY safe
-		// channel — the test asks this verified
+		// that pid before the signal lands. This
+		// watcher is the ONLY safe channel — the test asks this verified
 		// process to kill ITSELF (os.Getpid()) by writing a control file
 		// under the run's own scratch directory, never HOP_STATE_DIR and
 		// never a pane/typed-input path.
 		go watchForSelfKill(filepath.Join(scratchDir, "self-kill-"+env["HOP_ATTEMPT_ID"]))
 	}
-	writeObservation(observationPath, cmp(role, "solo"), assignmentPath, promptAssignmentPath, hopPath, assignmentContent, behavior, behaviorArgs)
+	writeObservation(observationPath, cmp(role, "solo"), assignmentPath, promptAssignmentPath, hopPath, assignmentContent, behavior, behaviorArgs, instructionsPath, instructionsContent)
 	fmt.Println("FIXTURE-WORKER-READY")
 
 	switch behavior {
 	case "submit-valid":
 		oid := commitChange("fixture worker change")
-		submitOnce(hopPath, oid, "fixture worker result")
+		submitOnce(hopPath, oid, "fixture worker result", "")
+	case "submit-valid-held":
+		// An opt-in first-submit gate: otherwise identical to submit-valid,
+		// but blocks immediately before its OWN first hop result submit call
+		// until this test-controlled release gate appears -- giving
+		// MailboxClosureRace/Race a guaranteed happens-before
+		// relationship between its own race message send and this
+		// worker's first submit attempt, rather than relying on how fast
+		// a real worker process happens to launch and reach it.
+		oid := commitChange("fixture worker change")
+		waitForControlFile(filepath.Join(scratchDir, "submit-held-release-"+env["HOP_ATTEMPT_ID"]))
+		submitOnce(hopPath, oid, "fixture worker result", filepath.Join(scratchDir, "submit-observed-"+env["HOP_ATTEMPT_ID"]+".txt"))
 	case "submit-stale":
 		waitForGo()
 		oid := commitChange("fixture worker stale change")
-		submitOnce(hopPath, oid, "fixture worker stale result")
+		submitOnce(hopPath, oid, "fixture worker stale result", "")
 	case "submit-twice":
 		oid := commitChange("fixture worker change")
-		submitOnce(hopPath, oid, "fixture worker result")
-		submitOnce(hopPath, oid, "fixture worker result")
+		submitOnce(hopPath, oid, "fixture worker result", "")
+		submitOnce(hopPath, oid, "fixture worker result", "")
 	case "exit-without-submitting":
 		waitForGo()
 		return
@@ -894,7 +1061,7 @@ func runWorker() {
 	case "worker-implement":
 		oid := commitChange("fixture implementer change")
 		drainMailbox(hopPath)
-		submitOnce(hopPath, oid, "fixture implementer result")
+		submitOnce(hopPath, oid, "fixture implementer result", "")
 	case "worker-conflict":
 		// The manager's own directive rendering always appends the scratch
 		// directory as this behavior's one argument (requireScratchDir), so
@@ -904,7 +1071,7 @@ func runWorker() {
 		// tasks need.
 		oid := commitConflictingChange(env["HOP_TASK_ID"])
 		drainMailbox(hopPath)
-		submitOnce(hopPath, oid, "fixture implementer result (conflict "+env["HOP_TASK_ID"]+")")
+		submitOnce(hopPath, oid, "fixture implementer result (conflict "+env["HOP_TASK_ID"]+")", "")
 	case "worker-hold":
 		oid := commitChange("fixture implementer change (held)")
 		questionPath := filepath.Join(scratchDir, "hold-question-"+env["HOP_ATTEMPT_ID"]+".txt")
@@ -916,19 +1083,25 @@ func runWorker() {
 		}
 		fmt.Printf("FIXTURE-HOLD-SENT question=[%s]\n", question)
 		for {
-			answer, delivered := parseDeliveredMessage(runHopCLI(hopPath, "msg", "wait").Stdout)
-			if !delivered {
-				continue
-			}
-			readFileOrFatal(answer.BodyPath)
+			answer := fetchDeliveredMessage(hopPath)
+			answerBody := readFileOrFatal(answer.BodyPath)
 			ackAndRequireSuccess(hopPath, answer.ID)
 			if answer.Kind == "answer" && answer.ReplyTo == question {
+				// This process's OWN read of the body file hop msg wait
+				// itself named — never a copy the test handed it — dumped
+				// as a digest, the byte-exact-delivery evidence design
+				// section 11's injection scenario needs for the answer
+				// channel: no existing dump captures a fetched message's
+				// content, since every other behavior discards it once
+				// read (design section 7: an ack is the statement of
+				// receipt-and-read, not a promise to retain the bytes).
+				writeContentDigest(filepath.Join(scratchDir, "answer-observed-"+env["HOP_ATTEMPT_ID"]+".txt"), answer.ID, answerBody)
 				fmt.Printf("FIXTURE-HOLD-RELEASED answer=[%s]\n", answer.ID)
 				break
 			}
 		}
 		drainMailbox(hopPath)
-		submitOnce(hopPath, oid, "fixture implementer result (released)")
+		submitOnce(hopPath, oid, "fixture implementer result (released)", "")
 	case "idle-self-kill":
 		// Exactly the unnamed default's own behavior (submit nothing, stay
 		// alive) but named and scratch-dir-registered solely so the self-
@@ -937,6 +1110,68 @@ func runWorker() {
 		// safe way to end THIS worker's own process without signaling a pid
 		// it only observed via pane inspection, the same reasoning
 		// scratchDirRequiringBehaviors documents above.
+	case "worker-block":
+		// A purely unresponsive worker: never calls hop msg wait, never
+		// commits, never submits. Its ONLY liveness signal is existing
+		// until this test's own self-kill control file appears -- the
+		// background watchForSelfKill goroutine already started above is
+		// the sole mechanism that ever ends it. Structurally, this lets a
+		// scenario send to this worker's still-open mailbox WHILE it is
+		// provably alive (this behavior never drains, so
+		// nothing it does can race the send), THEN self-kills it, THEN
+		// lets the live controller settle the failure -- no "comfortably
+		// ahead of the controller's cadence" timing assumption needed at
+		// all. A bare "select {}" would deadlock only if no other
+		// goroutine could ever become runnable; the background self-kill
+		// watcher's own time.Sleep loop is always eventually runnable, so
+		// this blocks safely until that goroutine's SIGKILL ends the
+		// process.
+		select {}
+	case "worker-fetch-crash":
+		msg := fetchDeliveredMessage(hopPath)
+		msgBody := readFileOrFatal(msg.BodyPath)
+		// This process's OWN read of the fetched message, dumped as a
+		// digest naming its id -- the deterministic-kill-point evidence a
+		// test waits for before triggering the self-kill (design section
+		// 11 scenario 3, mirroring RelayedQuestion's manager barrier).
+		writeContentDigest(filepath.Join(scratchDir, "fetch-crash-observed-"+env["HOP_ATTEMPT_ID"]+".txt"), msg.ID, msgBody)
+		fmt.Printf("FIXTURE-FETCH-CRASH-OBSERVED id=[%s] resumed=[%t]\n", msg.ID, resumed)
+		if !resumed {
+			// Blocks here until this process's own self-kill control file
+			// appears (already watched by the background watchForSelfKill
+			// goroutine started above): the message is deliberately never
+			// acked on this incarnation.
+			watchForSelfKill(filepath.Join(scratchDir, "self-kill-"+env["HOP_ATTEMPT_ID"]))
+		}
+		// Resumed: the SAME message is re-served to this new incarnation
+		// (design trace 3's "second delivery row"). Before acking, wait
+		// for a SEPARATE, test-controlled release gate -- distinct from
+		// the self-kill control file above -- so a scenario can issue a
+		// stale-incarnation late-ack assertion with a guaranteed
+		// happens-before relationship against this session's own ack,
+		// rather than racing how quickly this relaunched process happens
+		// to reach its own ack call (AcceptAck checks "already
+		// acknowledged" before incarnation currency, so ordering decides
+		// whether a late ack observes "stale" or "duplicate").
+		waitForControlFile(filepath.Join(scratchDir, "fetch-crash-release-"+env["HOP_ATTEMPT_ID"]))
+		ackAndRequireSuccess(hopPath, msg.ID)
+		fmt.Printf("FIXTURE-FETCH-CRASH-ACKED id=[%s]\n", msg.ID)
+		oid := commitChange("fixture implementer change (fetch-crash resumed)")
+		drainMailbox(hopPath)
+		// A THIRD, separate gate -- distinct from both the self-kill
+		// control file and the ack-release gate above -- so a scenario can
+		// check the section 7 attention line's absence WHILE this session
+		// is still active, pinning that check to the run's own mid-flight
+		// state (design section 11 scenario 3's own status-surface
+		// assertion needs the drain to have already happened -- both m1
+		// and m2 acked -- but this process not yet exited). Dumps an
+		// observation the instant the post-drain, pre-submit checkpoint is
+		// reached, then blocks until released.
+		presubmitObservedPath := filepath.Join(scratchDir, "fetch-crash-presubmit-observed-"+env["HOP_ATTEMPT_ID"]+".txt")
+		writeContentDigest(presubmitObservedPath, env["HOP_ATTEMPT_ID"], "fetch-crash-presubmit-hold")
+		fmt.Printf("FIXTURE-FETCH-CRASH-PRESUBMIT-HOLD attempt=[%s]\n", env["HOP_ATTEMPT_ID"])
+		waitForControlFile(filepath.Join(scratchDir, "fetch-crash-presubmit-release-"+env["HOP_ATTEMPT_ID"]))
+		submitOnce(hopPath, oid, "fixture implementer result (fetch-crash resumed)", "")
 	default:
 		// Unknown or empty directive: submit nothing, just stay alive, so a
 		// scenario that only needs a settled, idle worker still gets one.
@@ -965,6 +1200,9 @@ var scratchDirRequiringBehaviors = map[string]bool{
 	"worker-hold":          true,
 	"worker-conflict":      true,
 	"idle-self-kill":       true,
+	"worker-fetch-crash":   true,
+	"worker-block":         true,
+	"submit-valid-held":    true,
 	"manager-feature":      true,
 	"reviewer-approve":     true,
 	"reviewer-reject-once": true,
@@ -1209,7 +1447,7 @@ func parseNeedsReworkLabel(body string) (label string, ok bool) {
 // scripted table, relaying a barrier question to the human when scripted,
 // forwarding a human's answer back through the relay chain using only the
 // envelope's own origin field, retrying a task on its needs-rework notice,
-// and — the ONLY channel section 8/STATUS-1 actually name for a reject
+// and — the ONLY channel design section 8 names for a reject
 // verdict, since the acceptance notice's own body is just the reviewer's
 // raw reasons text with no distinguishing marker — checking hop status
 // for the rendered guard shortfall on any other info notice
@@ -1230,10 +1468,19 @@ func runManager() {
 	behavior, behaviorArgs := parseBehavior(assignmentContent)
 	scratchDir := requireScratchDir(behavior, behaviorArgs)
 	observationPath := filepath.Join(filepath.Dir(assignmentPath), "manager-observed.txt")
+	var selfKillControlPath string
 	if scratchDir != "" {
 		observationPath = filepath.Join(scratchDir, "manager-observed.txt")
+		// The same safe self-kill channel runWorker's own attempts use: a
+		// test asks this VERIFIED process to kill ITSELF by writing a
+		// control file, never signals a pid it
+		// only observed. Named by this session's own id (the manager has
+		// no attempt id) so a cold-relaunched successor's watcher never
+		// collides with its predecessor's already-consumed control file.
+		selfKillControlPath = filepath.Join(scratchDir, "self-kill-"+env["HOP_SESSION_ID"])
+		go watchForSelfKill(selfKillControlPath)
 	}
-	writeObservation(observationPath, "manager", assignmentPath, promptAssignmentPath, hopPath, assignmentContent, behavior, nil)
+	writeObservation(observationPath, "manager", assignmentPath, promptAssignmentPath, hopPath, assignmentContent, behavior, nil, "", "")
 	fmt.Println("FIXTURE-MANAGER-READY")
 
 	if behavior != "manager-feature" {
@@ -1249,37 +1496,53 @@ func runManager() {
 		fatalf("resolve manager working directory: %v", err)
 	}
 	labelToID := map[string]string{}
-	for _, task := range script.Tasks {
-		instructionsPath := writeTempInstructions(cwd, task.Behavior, scratchDir)
-		args := []string{"task", "create", "--title", task.Title, "--file", instructionsPath, "--request-id", newRequestID()}
-		for _, dep := range task.DependsOn {
-			depID, known := labelToID[dep]
-			if !known {
-				fatalf("manager script: TASK %s depends on unknown label %s (declare it earlier)", task.Label, dep)
+	if !resumed {
+		// A cold-relaunched successor re-reads the SAME assignment (and
+		// therefore the same script) but must never re-plan: every task
+		// this script names was already created by a PRIOR incarnation
+		// (each hop task create call mints a FRESH --request-id per
+		// invocation, so request-id idempotency alone would not catch a
+		// resumed re-run, and the design's own reopen-on-create rule
+		// means a redundant create would not even be refused). Skipping
+		// this block on resume leaves labelToID/fixCounter's later use
+		// (a needs-rework retry, a reject-verdict fix task) unavailable
+		// to a cold-relaunched manager -- out of scope for the scenarios
+		// that exercise this resume path today, which never combine it
+		// with a retry or a fix task.
+		for _, task := range script.Tasks {
+			instructionsPath := writeTempInstructions(cwd, task.Behavior, scratchDir)
+			args := []string{"task", "create", "--title", task.Title, "--file", instructionsPath, "--request-id", newRequestID()}
+			for _, dep := range task.DependsOn {
+				depID, known := labelToID[dep]
+				if !known {
+					fatalf("manager script: TASK %s depends on unknown label %s (declare it earlier)", task.Label, dep)
+				}
+				args = append(args, "--depends-on", depID)
 			}
-			args = append(args, "--depends-on", depID)
+			res := runHopCLIRetryable(hopPath, args...)
+			taskID, ok := parseCreatedTaskID(res.Stdout)
+			if !ok {
+				fatalf("manager script: hop task create for %s was refused: %s", task.Label, res.FirstLine())
+			}
+			labelToID[task.Label] = taskID
+			fmt.Printf("FIXTURE-TASK-CREATED label=[%s] id=[%s]\n", task.Label, taskID)
 		}
-		res := runHopCLIRetryable(hopPath, args...)
-		taskID, ok := parseCreatedTaskID(res.Stdout)
-		if !ok {
-			fatalf("manager script: hop task create for %s was refused: %s", task.Label, res.FirstLine())
+		if res := runHopCLIRetryable(hopPath, "plan", "close", "--request-id", newRequestID()); res.ExitCode != 0 && !strings.HasPrefix(res.FirstLine(), "duplicate") {
+			fatalf("manager script: hop plan close was refused: %s", res.FirstLine())
 		}
-		labelToID[task.Label] = taskID
-		fmt.Printf("FIXTURE-TASK-CREATED label=[%s] id=[%s]\n", task.Label, taskID)
+		fmt.Println("FIXTURE-PLAN-CLOSED")
 	}
-	if res := runHopCLIRetryable(hopPath, "plan", "close", "--request-id", newRequestID()); res.ExitCode != 0 && !strings.HasPrefix(res.FirstLine(), "duplicate") {
-		fatalf("manager script: hop plan close was refused: %s", res.FirstLine())
-	}
-	fmt.Println("FIXTURE-PLAN-CLOSED")
 
 	fixCounter := len(script.Tasks)
 	plannedFixReviews := map[string]bool{}
 	for {
-		msg, delivered := parseDeliveredMessage(runHopCLI(hopPath, "msg", "wait").Stdout)
-		if !delivered {
-			continue
-		}
-		handleManagerMessage(hopPath, cwd, env["HOP_RUN_ID"], scratchDir, script, labelToID, &fixCounter, plannedFixReviews, &msg)
+		// The same discipline as the worker loops' own shared fetch loop:
+		// continue on none:, retry transient: with pacing and a bounded
+		// deadline, fatalf on anything else -- a relaunched manager's OWN
+		// first fetch runs in the identical pre-binding window a
+		// relaunched worker's does.
+		msg := fetchDeliveredMessage(hopPath)
+		handleManagerMessage(hopPath, cwd, env["HOP_RUN_ID"], env["HOP_SESSION_ID"], scratchDir, script, labelToID, &fixCounter, plannedFixReviews, &msg, resumed, selfKillControlPath)
 	}
 }
 
@@ -1287,7 +1550,7 @@ func runManager() {
 // (internal/app/grammar.go, itself mirroring run.ShortfallVerdictRejected):
 // EvaluateReadiness's reject-verdict guard-shortfall kind token,
 // "verdict-rejected". The manager's standing instruction (design section
-// 7/8, STATUS-1's manager verdict channel, internal/app/templates.go's
+// 7/8's manager verdict channel, internal/app/templates.go's
 // renderManagerAssignment) is to run hop status after any controller info
 // notice it does not otherwise recognize and read its shortfall lines —
 // the ONLY channel that names a reject verdict at all, since the
@@ -1344,7 +1607,7 @@ const verdictRejectedLinePrefix = "shortfall: " + verdictRejectedShortfallToken 
 
 // verdictRejection is one parsed "shortfall: verdict-rejected
 // review=<id> subject=<oid> reasons=<path>" line
-// (app.GrammarVerdictRejectedLine, STATUS-1): the specific review's
+// (app.GrammarVerdictRejectedLine): the specific review's
 // identity, its subject commit and its reasons artifact path — the three
 // fields the manager's own verdict-channel instruction says a
 // verdict-rejected shortfall carries so a manager can tell WHICH review
@@ -1414,6 +1677,65 @@ func statusOutcomeForNotice(hopPath, repoDir, runID, noticeBodyPath string) (rej
 	return verdictRejection{}, false, statusHasEvidenceInconsistentShortfall(res.Stdout)
 }
 
+// preForwardBarrierControlFile is the fixed name of the opt-in control
+// file a test creates under the manager's own scratch directory BEFORE
+// starting the run, to enable RelayedQuestion's deterministic pre-forward
+// barrier (design section 11 scenario 2): absent (every existing
+// scenario), the manager forwards a fetched human answer immediately,
+// exactly as it always has; present, the manager's FIRST incarnation
+// (never a resumed one -- the barrier is one-shot, keyed to the
+// incarnation via runManager's own resumed flag, since a cold-relaunched
+// manager's argv is always --resume-shaped) blocks after fetching the
+// answer and before forwarding it, until self-killed.
+const preForwardBarrierControlFile = "manager-pre-forward-barrier"
+
+// preForwardBarrierObservedFile is where the barrier dumps its own digest
+// of the fetched answer id/body (writeContentDigest's shape) before
+// blocking, so a test can wait for this file rather than guessing when
+// the barrier took effect.
+const preForwardBarrierObservedFile = "manager-pre-forward-observed.txt"
+
+// preForwardBarrierEnabled reports whether a test has created
+// preForwardBarrierControlFile under scratchDir.
+func preForwardBarrierEnabled(scratchDir string) bool {
+	if scratchDir == "" {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(scratchDir, preForwardBarrierControlFile))
+	return err == nil
+}
+
+// postForwardBarrierControlFile is the fixed name of the opt-in control
+// file a test creates under the manager's own scratch directory BEFORE
+// starting the run, to enable RelayedQuestion's idempotency-proving
+// post-forward, pre-ack kill variant (design trace 2: "a manager crash
+// between the two [forward and ack] re-serves a2, and the forward's
+// request ID makes any redo idempotent"): absent (every existing scenario,
+// including the pre-forward-kill variant above), the manager acks a2
+// immediately after its forward is accepted or found duplicate, exactly as
+// it always has; present, the manager's FIRST incarnation (never a
+// resumed one -- also one-shot, keyed the same way as the pre-forward
+// barrier) self-kills immediately after the forward call returns and
+// before its own ack of a2. Mutually exclusive with the pre-forward
+// barrier in practice (no scenario enables both), but nothing enforces
+// that here -- each is checked independently, at its own point in the
+// case.
+const postForwardBarrierControlFile = "manager-post-forward-barrier"
+
+// postForwardBarrierObservedFile is where the post-forward barrier dumps
+// its own digest of the fetched answer id/body, before blocking.
+const postForwardBarrierObservedFile = "manager-post-forward-observed.txt"
+
+// postForwardBarrierEnabled reports whether a test has created
+// postForwardBarrierControlFile under scratchDir.
+func postForwardBarrierEnabled(scratchDir string) bool {
+	if scratchDir == "" {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(scratchDir, postForwardBarrierControlFile))
+	return err == nil
+}
+
 // handleManagerMessage dispatches one delivered message per the section 7
 // manager operating contract, acknowledging it before the next wait in
 // every case. plannedFixReviews tracks every review id this manager has
@@ -1421,8 +1743,14 @@ func statusOutcomeForNotice(hopPath, repoDir, runID, noticeBodyPath string) (rej
 // re-served or redelivered rejection notice for a review already acted on
 // never plans a second fix (the verdict-channel instruction's own rule:
 // "never plan a second fix from the same shortfall once its path has
-// already matched a notice you acted on").
-func handleManagerMessage(hopPath, cwd, runID, scratchDir string, script *managerScript, labelToID map[string]string, fixCounter *int, plannedFixReviews map[string]bool, msg *deliveredMessage) {
+// already matched a notice you acted on"). resumed and selfKillControlPath
+// support the opt-in pre-forward barrier above: resumed is runManager's
+// own resolvePrompt flag (false on this incarnation's first launch, true
+// on every cold relaunch), and selfKillControlPath is the same self-kill
+// control file runManager's own background watchForSelfKill goroutine
+// already watches ("" when the manager has no scratch directory, in which
+// case the barrier can never be enabled either).
+func handleManagerMessage(hopPath, cwd, runID, sessionID, scratchDir string, script *managerScript, labelToID map[string]string, fixCounter *int, plannedFixReviews map[string]bool, msg *deliveredMessage, resumed bool, selfKillControlPath string) {
 	body := readFileOrFatal(msg.BodyPath)
 	switch msg.Kind {
 	case "question":
@@ -1441,8 +1769,46 @@ func handleManagerMessage(hopPath, cwd, runID, scratchDir string, script *manage
 		if msg.From != "human" || msg.Origin == "" {
 			fatalf("manager received an answer it did not expect (from=%s origin=%s); the fixture manager only ever asks the human via a relay", msg.From, msg.Origin)
 		}
-		runHopCLIRetryable(hopPath, "msg", "send", "--kind", "answer", "--reply-to", msg.Origin, "--file", msg.BodyPath, "--request-id", newRequestID())
-		fmt.Printf("FIXTURE-FORWARDED origin=[%s]\n", msg.Origin)
+		if !resumed && selfKillControlPath != "" && preForwardBarrierEnabled(scratchDir) {
+			writeContentDigest(filepath.Join(scratchDir, preForwardBarrierObservedFile), msg.ID, body)
+			fmt.Printf("FIXTURE-PRE-FORWARD-BARRIER answer=[%s]\n", msg.ID)
+			// Blocks here: watchForSelfKill polls the same control file its
+			// own already-running background goroutine watches and
+			// SIGKILLs this process the instant a test writes it -- this
+			// call's only purpose is to keep this goroutine from ever
+			// reaching the forward call below in the meantime.
+			watchForSelfKill(selfKillControlPath)
+		}
+		// The forward's own request id is derived DETERMINISTICALLY from
+		// a2's own id (CLI-returned data, never generated fresh and never
+		// persisted anywhere by this fixture) -- a relaunched manager
+		// recomputes the IDENTICAL value with no hidden state, making its
+		// own redo of this exact call idempotent under request-ID reuse
+		// (design trace 2).
+		forwardRequestID := deterministicUUIDFrom(msg.ID)
+		forwardRes := runHopCLIRetryable(hopPath, "msg", "send", "--kind", "answer", "--reply-to", msg.Origin, "--file", msg.BodyPath, "--request-id", forwardRequestID)
+		forwardFirst := forwardRes.FirstLine()
+		if !strings.HasPrefix(forwardFirst, "sent ") && !strings.HasPrefix(forwardFirst, "duplicate ") {
+			fatalf("manager's forward of origin=%s was neither accepted nor duplicate: %s", msg.Origin, forwardFirst)
+		}
+		fmt.Printf("FIXTURE-FORWARDED origin=[%s] request-id=[%s] result=[%s]\n", msg.Origin, forwardRequestID, forwardFirst)
+		// The forward's own rendered first line, dumped per CALLING
+		// SESSION (never overwritten across incarnations, unlike a fixed
+		// path): a scenario asserting idempotency needs the exact text
+		// EACH incarnation's own forward call printed, not merely the
+		// store's duplicate-receipt outcome, since the CLI's own rendered
+		// line is what a real manager acts on.
+		atomicWriteFile(filepath.Join(scratchDir, "manager-forward-result-"+sessionID+".txt"), forwardFirst+"\n")
+		if !resumed && selfKillControlPath != "" && postForwardBarrierEnabled(scratchDir) {
+			writeContentDigest(filepath.Join(scratchDir, postForwardBarrierObservedFile), msg.ID, body)
+			fmt.Printf("FIXTURE-POST-FORWARD-BARRIER answer=[%s]\n", msg.ID)
+			// Blocks here, exactly like the pre-forward barrier above, but
+			// AFTER the forward has already landed and BEFORE this
+			// process ever reaches the shared ack call at the end of this
+			// function -- design trace 2's "crash between forward and
+			// ack" idempotency case.
+			watchForSelfKill(selfKillControlPath)
+		}
 	case "info":
 		if label, ok := parseNeedsReworkLabel(body); ok {
 			taskID, known := labelToID[label]
@@ -1454,7 +1820,7 @@ func handleManagerMessage(hopPath, cwd, runID, scratchDir string, script *manage
 			break
 		}
 		// Not a task-consequence notice: per the manager's own
-		// verdict-channel instruction (design section 7/8, STATUS-1), run
+		// verdict-channel instruction (design section 7/8), run
 		// hop status and correlate its verdict-rejected shortfall lines
 		// against THIS notice's own body path — the ONLY way to know WHICH
 		// review a reject verdict's notice reports, since the notice's body
@@ -1544,7 +1910,7 @@ func runReviewer() {
 	behavior, behaviorArgs := parseBehavior(roleContent)
 	scratchDir := requireScratchDir(behavior, behaviorArgs)
 
-	writeObservation(filepath.Join(scratchDir, "reviewer-observed-"+env["HOP_ATTEMPT_ID"]+".txt"), "reviewer", assignmentPath, promptAssignmentPath, hopPath, assignmentContent, behavior, nil)
+	writeObservation(filepath.Join(scratchDir, "reviewer-observed-"+env["HOP_ATTEMPT_ID"]+".txt"), "reviewer", assignmentPath, promptAssignmentPath, hopPath, assignmentContent, behavior, nil, "", "")
 	fmt.Println("FIXTURE-REVIEWER-READY")
 
 	verdict, reasons := "approve", "fixture reviewer reasons: approve\n"
@@ -1563,6 +1929,39 @@ func runReviewer() {
 	idle()
 }
 `
+
+// requireSelfKilled asserts wait (the process's already-resolved
+// cmd.Wait error) shows it was SIGKILLed by ITS OWN doing (a fixture
+// principal's watchForSelfKill, via its self-kill control file), never by
+// the caller's own context deadline expiring first. A bare non-zero exit,
+// or even a confirmed SIGKILL exit status alone, cannot tell the two
+// apart: exec.CommandContext kills the process the IDENTICAL way once
+// its context is done, so a self-kill mechanism that never fires at all
+// would still exit non-zero, via the test's own context timeout, and
+// pass a check that only looks at the exit error. ctxErr (the caller's
+// own ctx.Err(), read at the moment wait() returns) == nil proves the
+// context had NOT yet fired, so any kill observed is provably the
+// fixture's own self-kill channel.
+func requireSelfKilled(t *testing.T, ctxErr, waitErr error) {
+	t.Helper()
+	if ctxErr != nil {
+		t.Fatalf("context is already done (%v) by the time the process exited; a context-deadline kill cannot be distinguished from a genuine self-kill here", ctxErr)
+	}
+	if waitErr == nil {
+		t.Fatal("process exited 0; want it SIGKILLed by its own self-kill channel")
+	}
+	exitErr, ok := waitErr.(*exec.ExitError) //nolint:errorlint // a direct type assertion suffices for this fixture's own exec of a single known binary.
+	if !ok {
+		t.Fatalf("wait error = %v (%T), want *exec.ExitError", waitErr, waitErr)
+	}
+	ws, ok := exitErr.Sys().(syscall.WaitStatus)
+	if !ok {
+		t.Fatalf("exit status %#v is not a syscall.WaitStatus", exitErr.Sys())
+	}
+	if !ws.Signaled() || ws.Signal() != syscall.SIGKILL {
+		t.Fatalf("exit status = %+v, want signaled by SIGKILL", ws)
+	}
+}
 
 // fixtureWorkerBrief renders a hop run brief whose text embeds the fixture
 // worker's scripted behavior directive, so the brief -> assignment.md
@@ -1674,7 +2073,7 @@ func buildFixtureWorker(t *testing.T, artifacts *artifactDir) string {
 func testAssignmentPrompt(assignmentPath, hopPath string) string {
 	return fmt.Sprintf("Read your assignment at %s and complete it. "+
 		"When your work is committed, submit it by running: %s result submit --summary \"<one-line summary>\" --commit <commit-oid>. "+
-		"If the first output line begins with \"transient\", wait briefly and run the exact same command again.",
+		"If the first output line begins with \"transient\", follow its instruction, then wait briefly and run the exact same command again.",
 		assignmentPath, hopPath)
 }
 
@@ -1689,7 +2088,7 @@ func testContinuationPrompt(assignmentPath, hopPath string) string {
 	return fmt.Sprintf("You were relaunched after an interruption; your restored session may show earlier, unfinished work. "+
 		"Re-read your assignment at %s and continue it. "+
 		"When your work is committed, submit it by running: %s result submit --summary \"<one-line summary>\" --commit <commit-oid>. "+
-		"If the first output line begins with \"transient\", wait briefly and run the exact same command again.",
+		"If the first output line begins with \"transient\", follow its instruction, then wait briefly and run the exact same command again.",
 		assignmentPath, hopPath)
 }
 
@@ -2219,30 +2618,17 @@ func TestFixtureWorkerSelfKillOnControlFile(t *testing.T) {
 		t.Fatalf("rename self-kill control file into place: %v", err)
 	}
 
-	if err := wait(); err == nil {
-		t.Fatalf("worker exited 0 after the self-kill control file was written; want it SIGKILLed; output:\n%s", out.snapshot())
-	}
-	// A context-cancel kill (exec.CommandContext's own 30s deadline) must
-	// never be mistaken for the self-kill watcher's own doing: both
-	// produce a SIGKILL exit, so ruling out ctx.Err() here is what makes
-	// this assertion mean "the watcher fired", not merely "the process is
-	// dead" — a missing scratchDirRequiringBehaviors entry would otherwise
-	// leave this watcher never wired, and the process would still die by
-	// SIGKILL on the deadline alone, a false pass this check rules out.
-	if err := ctx.Err(); err != nil {
-		t.Fatalf("test context ended (%v) before the self-kill watcher could act; the exit below cannot be attributed to it", err)
-	}
-	exitErr, ok := waitErr.(*exec.ExitError) //nolint:errorlint // a direct type assertion suffices for this test's own exec of a single known binary.
-	if !ok {
-		t.Fatalf("worker wait error = %v (%T), want *exec.ExitError", waitErr, waitErr)
-	}
-	ws, ok := exitErr.Sys().(syscall.WaitStatus)
-	if !ok {
-		t.Fatalf("worker exit status %#v is not a syscall.WaitStatus", exitErr.Sys())
-	}
-	if !ws.Signaled() || ws.Signal() != syscall.SIGKILL {
-		t.Fatalf("worker exit status = %+v, want signaled by SIGKILL", ws)
-	}
+	// ctx.Err() == nil at this exact moment proves this SIGKILL is
+	// the fixture's own self-kill channel firing, never the context's own
+	// 30s deadline masking a self-kill that never happened (a bare
+	// non-zero-exit or even a confirmed-SIGKILL check alone cannot tell
+	// the two apart, since exec.CommandContext kills the process the
+	// identical way once its context is done). wait() is called FIRST, on
+	// its own line: Go evaluates call arguments left to right, so
+	// inlining ctx.Err() as an argument would read it BEFORE wait() ever
+	// blocks, defeating the entire check.
+	finalWaitErr := wait()
+	requireSelfKilled(t, ctx.Err(), finalWaitErr)
 }
 
 // TestFixtureWorkerVanishOnce proves the "worker-vanish-once" behavior
@@ -2515,28 +2901,15 @@ func TestFixtureWorkerIdleSelfKillOnControlFile(t *testing.T) {
 		t.Fatalf("rename self-kill control file into place: %v", err)
 	}
 
-	if err := wait(); err == nil {
-		t.Fatalf("worker exited 0 after the self-kill control file was written; want it SIGKILLed; output:\n%s", out.snapshot())
-	}
-	// A context-cancel kill (exec.CommandContext's own 30s deadline) must
-	// never be mistaken for the self-kill watcher's own doing: both
-	// produce a SIGKILL exit, so ruling out ctx.Err() here is what makes
-	// this assertion mean "the watcher fired", not merely "the process is
-	// dead" — a missing scratchDirRequiringBehaviors entry would otherwise
-	// leave this watcher never wired, and the process would still die by
-	// SIGKILL on the deadline alone, a false pass this check rules out.
-	if err := ctx.Err(); err != nil {
-		t.Fatalf("test context ended (%v) before the self-kill watcher could act; the exit below cannot be attributed to it", err)
-	}
-	exitErr, ok := waitErr.(*exec.ExitError) //nolint:errorlint // a direct type assertion suffices for this test's own exec of a single known binary.
-	if !ok {
-		t.Fatalf("worker wait error = %v (%T), want *exec.ExitError", waitErr, waitErr)
-	}
-	ws, ok := exitErr.Sys().(syscall.WaitStatus)
-	if !ok {
-		t.Fatalf("worker exit status %#v is not a syscall.WaitStatus", exitErr.Sys())
-	}
-	if !ws.Signaled() || ws.Signal() != syscall.SIGKILL {
-		t.Fatalf("worker exit status = %+v, want signaled by SIGKILL", ws)
-	}
+	// ctx.Err() == nil at this exact moment proves this SIGKILL is
+	// the fixture's own self-kill channel firing, never the context's own
+	// 30s deadline masking a self-kill that never happened (a bare
+	// non-zero-exit or even a confirmed-SIGKILL check alone cannot tell
+	// the two apart, since exec.CommandContext kills the process the
+	// identical way once its context is done). wait() is called FIRST, on
+	// its own line: Go evaluates call arguments left to right, so
+	// inlining ctx.Err() as an argument would read it BEFORE wait() ever
+	// blocks, defeating the entire check.
+	finalWaitErr := wait()
+	requireSelfKilled(t, ctx.Err(), finalWaitErr)
 }

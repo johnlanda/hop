@@ -61,8 +61,8 @@ lint: golangci-lint ## Pinned linter with schema-validated config, vet and modul
 	go mod tidy -diff
 
 .PHONY: test
-test: ## Race and shuffle tests, including the architecture and guide checks
-	go test -race -shuffle=on ./...
+test: ## Race and shuffle tests, including the architecture and guide checks; explicit 30m timeout (go test's own 10m default is too short for the real-process suite)
+	go test -race -shuffle=on -timeout 30m ./...
 
 .PHONY: check
 check: fmt-check docs-check lint test ## Non-mutating gate: fmt-check, docs-check, lint and test

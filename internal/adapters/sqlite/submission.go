@@ -77,13 +77,16 @@ func (s *Store) RecordMalformed(ctx context.Context, claimed app.ClaimedSubmissi
 
 // SubmitResult applies the section 7 validation order atomically inside
 // one write transaction: existence and agreement (step 2, malformed on
-// disagreement), the prior accepted result before any state or incarnation
-// precondition (duplicate or conflicting), then eligibility and acceptance
-// through the domain's AcceptResult, persisting on acceptance the result,
-// the receipt, the unique check request and every implied transition with
-// its evidence rows — all in the same transaction. Every recorded outcome
-// returns a nil error; a non-nil error is an infrastructure failure with
-// nothing recorded.
+// disagreement), then the domain's AcceptResult over the prior accepted
+// result (duplicate or conflicting before any precondition), the caller's
+// incarnation currency, the launch-claim settlement fact and the task's
+// mailbox — AcceptVerdict's order, so a pending mailbox is reported only
+// to a caller that is otherwise eligible — persisting on acceptance the
+// result, the receipt, the unique check request and every implied
+// transition with its evidence rows, all in the same transaction. A
+// transient outcome's typed reason is app.TransientReasonOf its acceptance
+// error. Every recorded outcome returns a nil error; a non-nil error is an
+// infrastructure failure with nothing recorded.
 func (s *Store) SubmitResult(ctx context.Context, submission app.ResultSubmission) (app.SubmissionOutcome, error) { //nolint:gocritic // hugeParam: the port passes the submission by value; the adapter mirrors its signature.
 	var outcome app.SubmissionOutcome
 	err := s.inWriteTx(ctx, func(tx *sql.Tx) error {
@@ -125,22 +128,6 @@ func (s *Store) SubmitResult(ctx context.Context, submission app.ResultSubmissio
 		if err != nil {
 			return err
 		}
-		// Receipt before eligibility: only a FIRST acceptance re-reads the
-		// task's mailbox — a queued or delivered-unacknowledged message
-		// refuses the submission with the retryable transient outcome
-		// (section 5's drain-then-submit contract; vacuously clear for a
-		// solo task, which no message ever addresses).
-		if prior == nil {
-			boxClear, mailboxErr := mailboxClear(ctx, tx, submission.TaskID)
-			if mailboxErr != nil {
-				return mailboxErr
-			}
-			if !boxClear {
-				const detail = "transient: undelivered messages; drain with hop msg next, ack, then resubmit"
-				outcome = app.SubmissionOutcome{Kind: app.SubmissionTransient, Detail: detail}
-				return insertReceipt(ctx, tx, submissionReceipt(&submission, app.SubmissionTransient, "", detail), now)
-			}
-		}
 		incarnationIsCurrent, err := incarnationCurrent(ctx, tx, submission.AttemptID, submission.IncarnationID)
 		if err != nil {
 			return err
@@ -149,10 +136,19 @@ func (s *Store) SubmitResult(ctx context.Context, submission app.ResultSubmissio
 		if err != nil {
 			return err
 		}
+		// The task's mailbox is re-read inside the accepting transaction
+		// (section 5's drain-then-submit contract); a solo task, which no
+		// message ever addresses, is vacuously clear. AcceptResult consults
+		// it only after every other eligibility check.
+		boxClear, err := mailboxClear(ctx, tx, submission.TaskID)
+		if err != nil {
+			return err
+		}
 		acceptance, err := run.AcceptResult(runV, task, attempt, prior,
 			run.AcceptanceContext{
 				IncarnationCurrent: incarnationIsCurrent,
 				LaunchClaimSettled: claim != nil && claim.State == app.LaunchClaimExeced,
+				MailboxClear:       boxClear,
 			},
 			run.ResultSubmission{ID: submission.ID, CommitOID: submission.CommitOID, Summary: submission.Summary, Digest: submission.Digest},
 			now,
@@ -168,9 +164,16 @@ func (s *Store) SubmitResult(ctx context.Context, submission app.ResultSubmissio
 		case errors.Is(err, run.ErrStaleSubmission):
 			outcome = app.SubmissionOutcome{Kind: app.SubmissionStale, Detail: err.Error()}
 			return insertReceipt(ctx, tx, submissionReceipt(&submission, app.SubmissionStale, "", err.Error()), now)
-		case errors.Is(err, run.ErrTransientNotRunning):
-			outcome = app.SubmissionOutcome{Kind: app.SubmissionTransient, Detail: err.Error()}
-			return insertReceipt(ctx, tx, submissionReceipt(&submission, app.SubmissionTransient, "", err.Error()), now)
+		case errors.Is(err, run.ErrTransientNotRunning), errors.Is(err, run.ErrMailboxNotClear):
+			reason, _ := app.TransientReasonOf(err)
+			// A pending mailbox records the drain line itself as its
+			// detail; the not-running outcome keeps the domain error's.
+			detail := err.Error()
+			if reason == app.TransientUndeliveredMessages {
+				detail = app.GrammarTransientUndeliveredLine
+			}
+			outcome = app.SubmissionOutcome{Kind: app.SubmissionTransient, Detail: detail, Transient: reason}
+			return insertReceipt(ctx, tx, submissionReceipt(&submission, app.SubmissionTransient, "", detail), now)
 		default:
 			return fmt.Errorf("sqlite: acceptance decision: %w", err)
 		}

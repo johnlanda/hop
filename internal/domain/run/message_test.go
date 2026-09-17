@@ -107,28 +107,28 @@ func TestAcceptAck(t *testing.T) {
 	})
 
 	t.Run("not delivered", func(t *testing.T) {
-		_, err := run.AcceptAck(baseMessage(run.MessageQueued), nil, run.AckContext{DeliveredToSession: true, IncarnationCurrent: true}, ack, later())
+		_, err := run.AcceptAck(baseMessage(run.MessageQueued), nil, run.AckContext{DeliveredToSession: true, IncarnationCurrent: true, AttemptCurrent: true}, ack, later())
 		if !errors.Is(err, run.ErrNotDelivered) {
 			t.Fatalf("AcceptAck(queued): error = %v, want ErrNotDelivered", err)
 		}
 	})
 
 	t.Run("no delivery to this session", func(t *testing.T) {
-		_, err := run.AcceptAck(baseMessage(run.MessageDelivered), nil, run.AckContext{DeliveredToSession: false, IncarnationCurrent: true}, ack, later())
+		_, err := run.AcceptAck(baseMessage(run.MessageDelivered), nil, run.AckContext{DeliveredToSession: false, IncarnationCurrent: true, AttemptCurrent: true}, ack, later())
 		if !errors.Is(err, run.ErrNotDelivered) {
 			t.Fatalf("AcceptAck(no delivery to session): error = %v, want ErrNotDelivered", err)
 		}
 	})
 
 	t.Run("stale incarnation", func(t *testing.T) {
-		_, err := run.AcceptAck(baseMessage(run.MessageDelivered), nil, run.AckContext{DeliveredToSession: true, IncarnationCurrent: false}, ack, later())
+		_, err := run.AcceptAck(baseMessage(run.MessageDelivered), nil, run.AckContext{DeliveredToSession: true, IncarnationCurrent: false, AttemptCurrent: true}, ack, later())
 		if !errors.Is(err, run.ErrStaleAck) {
 			t.Fatalf("AcceptAck(stale incarnation): error = %v, want ErrStaleAck", err)
 		}
 	})
 
 	t.Run("accepted", func(t *testing.T) {
-		outcome, err := run.AcceptAck(baseMessage(run.MessageDelivered), nil, run.AckContext{DeliveredToSession: true, IncarnationCurrent: true}, ack, later())
+		outcome, err := run.AcceptAck(baseMessage(run.MessageDelivered), nil, run.AckContext{DeliveredToSession: true, IncarnationCurrent: true, AttemptCurrent: true}, ack, later())
 		if err != nil {
 			t.Fatalf("AcceptAck: unexpected error: %v", err)
 		}
@@ -185,11 +185,13 @@ func TestAcceptAnswer(t *testing.T) {
 		return run.Message{ID: testMessageID, RunID: testRunID, Kind: run.MessageQuestion, Recipient: recipient, State: state}
 	}
 	submission := run.AnswerSubmission{ID: testSecondMessageID, BodyPath: "/body", BodyDigest: "digest-v1", BodyBytes: 4}
+	byManager := run.AnswerContext{AnswererAddress: run.ManagerAddress()}
+	byHuman := run.AnswerContext{AnswererAddress: run.HumanAddress()}
 
 	t.Run("accepted, ordinary session-addressed question is not auto-acked", func(t *testing.T) {
 		q := question(run.MessageDelivered, run.ManagerAddress())
 
-		outcome, err := run.AcceptAnswer(q, nil, run.TaskAddress(testTaskID), run.SessionPrincipal(testManagerSessionID), submission, 1, epoch())
+		outcome, err := run.AcceptAnswer(q, nil, byManager, run.TaskAddress(testTaskID), run.SessionPrincipal(testManagerSessionID), submission, 1, epoch())
 		if err != nil {
 			t.Fatalf("AcceptAnswer: unexpected error: %v", err)
 		}
@@ -204,10 +206,23 @@ func TestAcceptAnswer(t *testing.T) {
 		}
 	})
 
+	t.Run("accepted, a task-addressed question answered by that task", func(t *testing.T) {
+		q := question(run.MessageDelivered, run.TaskAddress(testTaskID))
+		byTask := run.AnswerContext{AnswererAddress: run.TaskAddress(testTaskID)}
+
+		outcome, err := run.AcceptAnswer(q, nil, byTask, run.ManagerAddress(), run.SessionPrincipal(testSessionID), submission, 1, epoch())
+		if err != nil {
+			t.Fatalf("AcceptAnswer: unexpected error: %v", err)
+		}
+		if outcome.Answer.Recipient != run.ManagerAddress() || outcome.Question.State != run.MessageDelivered {
+			t.Fatalf("AcceptAnswer: outcome = %+v, want an answer to the manager and the question unchanged", outcome)
+		}
+	})
+
 	t.Run("accepted, human-addressed question is acked atomically", func(t *testing.T) {
 		q := question(run.MessageQueued, run.HumanAddress())
 
-		outcome, err := run.AcceptAnswer(q, nil, run.ManagerAddress(), run.HumanPrincipal(), submission, 1, epoch())
+		outcome, err := run.AcceptAnswer(q, nil, byHuman, run.ManagerAddress(), run.HumanPrincipal(), submission, 1, epoch())
 		if err != nil {
 			t.Fatalf("AcceptAnswer: unexpected error: %v", err)
 		}
@@ -217,10 +232,14 @@ func TestAcceptAnswer(t *testing.T) {
 	})
 
 	t.Run("not a question", func(t *testing.T) {
-		notQuestion := run.Message{ID: testMessageID, Kind: run.MessageInfo}
-		_, err := run.AcceptAnswer(notQuestion, nil, run.ManagerAddress(), run.HumanPrincipal(), submission, 1, epoch())
-		if !errors.Is(err, run.ErrInvalidTransition) {
-			t.Fatalf("AcceptAnswer(not a question): error = %v, want ErrInvalidTransition", err)
+		notQuestion := run.Message{ID: testMessageID, Kind: run.MessageInfo, Recipient: run.ManagerAddress()}
+		// The shape check precedes authority: a non-question is refused
+		// as not a question whoever answers it.
+		for _, answerer := range []run.AnswerContext{byHuman, byManager} {
+			_, err := run.AcceptAnswer(notQuestion, nil, answerer, run.ManagerAddress(), run.HumanPrincipal(), submission, 1, epoch())
+			if !errors.Is(err, run.ErrInvalidTransition) {
+				t.Fatalf("AcceptAnswer(not a question, answerer %s): error = %v, want ErrInvalidTransition", answerer.AnswererAddress.Kind, err)
+			}
 		}
 	})
 
@@ -232,7 +251,7 @@ func TestAcceptAnswer(t *testing.T) {
 		// above.
 		q := question(run.MessageAcknowledged, run.ManagerAddress())
 
-		outcome, err := run.AcceptAnswer(q, nil, run.TaskAddress(testTaskID), run.SessionPrincipal(testManagerSessionID), submission, 1, epoch())
+		outcome, err := run.AcceptAnswer(q, nil, byManager, run.TaskAddress(testTaskID), run.SessionPrincipal(testManagerSessionID), submission, 1, epoch())
 		if err != nil {
 			t.Fatalf("AcceptAnswer(already acknowledged, ordinary question): unexpected error: %v", err)
 		}
@@ -245,7 +264,7 @@ func TestAcceptAnswer(t *testing.T) {
 		q := question(run.MessageDelivered, run.ManagerAddress())
 		prior := run.Message{ID: testThirdMessageID, BodyDigest: "digest-v1"}
 
-		outcome, err := run.AcceptAnswer(q, &prior, run.TaskAddress(testTaskID), run.SessionPrincipal(testManagerSessionID), submission, 1, epoch())
+		outcome, err := run.AcceptAnswer(q, &prior, byManager, run.TaskAddress(testTaskID), run.SessionPrincipal(testManagerSessionID), submission, 1, epoch())
 		if !errors.Is(err, run.ErrDuplicateAnswer) {
 			t.Fatalf("AcceptAnswer(duplicate): error = %v, want ErrDuplicateAnswer", err)
 		}
@@ -258,12 +277,114 @@ func TestAcceptAnswer(t *testing.T) {
 		q := question(run.MessageDelivered, run.ManagerAddress())
 		prior := run.Message{ID: testThirdMessageID, BodyDigest: "different-digest"}
 
-		outcome, err := run.AcceptAnswer(q, &prior, run.TaskAddress(testTaskID), run.SessionPrincipal(testManagerSessionID), submission, 1, epoch())
+		outcome, err := run.AcceptAnswer(q, &prior, byManager, run.TaskAddress(testTaskID), run.SessionPrincipal(testManagerSessionID), submission, 1, epoch())
 		if !errors.Is(err, run.ErrConflictingAnswer) {
 			t.Fatalf("AcceptAnswer(conflicting): error = %v, want ErrConflictingAnswer", err)
 		}
 		if outcome.Answer != prior {
 			t.Fatalf("AcceptAnswer(conflicting): Answer = %+v, want the prior answer unchanged: %+v", outcome.Answer, prior)
+		}
+	})
+}
+
+// TestAcceptAnswerRecipientAuthority pins section 7's answer authority: only
+// the principal whose logical address IS the question's recipient may
+// answer it, checked before any prior answer so a refused answerer never
+// receives a duplicate or conflicting verdict about someone else's answer,
+// and a refusal leaves the question exactly as it was (a human question is
+// never acknowledged by a refused answer).
+func TestAcceptAnswerRecipientAuthority(t *testing.T) {
+	submission := run.AnswerSubmission{ID: testSecondMessageID, BodyPath: "/body", BodyDigest: "digest-v1", BodyBytes: 4}
+	sameBodyPrior := run.Message{ID: testThirdMessageID, BodyDigest: "digest-v1"}
+	otherBodyPrior := run.Message{ID: testThirdMessageID, BodyDigest: "digest-other"}
+	cases := []struct {
+		name      string
+		recipient run.Address
+		answerer  run.Address
+		prior     *run.Message
+	}{
+		{"a task session answering a human question", run.HumanAddress(), run.TaskAddress(testTaskID), nil},
+		{"the manager answering a human question", run.HumanAddress(), run.ManagerAddress(), nil},
+		{"a task answering another task's question", run.TaskAddress(testTaskID), run.TaskAddress(testSecondTaskID), nil},
+		{"the manager answering a task's question", run.TaskAddress(testTaskID), run.ManagerAddress(), nil},
+		{"a task answering the manager's own inbound question", run.ManagerAddress(), run.TaskAddress(testTaskID), nil},
+		{"the human answering a manager-addressed question", run.ManagerAddress(), run.HumanAddress(), nil},
+		{"a non-recipient repeating the accepted body", run.HumanAddress(), run.TaskAddress(testTaskID), &sameBodyPrior},
+		{"a non-recipient sending a different body", run.HumanAddress(), run.TaskAddress(testTaskID), &otherBodyPrior},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			q := run.Message{ID: testMessageID, RunID: testRunID, Kind: run.MessageQuestion, Recipient: tc.recipient, State: run.MessageQueued}
+			outcome, err := run.AcceptAnswer(q, tc.prior, run.AnswerContext{AnswererAddress: tc.answerer}, run.ManagerAddress(), run.SessionPrincipal(testSessionID), submission, 1, epoch())
+			if !errors.Is(err, run.ErrAnswerNotRecipient) {
+				t.Fatalf("AcceptAnswer: error = %v, want ErrAnswerNotRecipient", err)
+			}
+			if errors.Is(err, run.ErrDuplicateAnswer) || errors.Is(err, run.ErrConflictingAnswer) {
+				t.Fatalf("AcceptAnswer: error = %v also reports the prior answer's verdict", err)
+			}
+			if outcome.Question != q || outcome.Answer != (run.Message{}) {
+				t.Fatalf("AcceptAnswer: outcome = %+v, want the question unchanged and no answer", outcome)
+			}
+		})
+	}
+}
+
+// TestAcceptAnswerClosedDestination pins section 5's admission rule for
+// answers: a closed destination mailbox refuses a FIRST acceptance, after
+// the prior answer is resolved, so an answer accepted before the closure
+// still replays as duplicate (or conflicting) rather than as a closure
+// refusal.
+func TestAcceptAnswerClosedDestination(t *testing.T) {
+	submission := run.AnswerSubmission{ID: testSecondMessageID, BodyPath: "/body", BodyDigest: "digest-v1", BodyBytes: 4}
+	closed := run.AnswerContext{AnswererAddress: run.ManagerAddress(), DestinationMailboxClosed: true}
+	q := run.Message{ID: testMessageID, RunID: testRunID, Kind: run.MessageQuestion, Recipient: run.ManagerAddress(), State: run.MessageAcknowledged}
+
+	t.Run("a first answer is refused", func(t *testing.T) {
+		outcome, err := run.AcceptAnswer(q, nil, closed, run.TaskAddress(testTaskID), run.SessionPrincipal(testManagerSessionID), submission, 1, epoch())
+		if !errors.Is(err, run.ErrMailboxClosed) {
+			t.Fatalf("AcceptAnswer: error = %v, want ErrMailboxClosed", err)
+		}
+		if outcome.Question != q || outcome.Answer != (run.Message{}) {
+			t.Fatalf("AcceptAnswer: outcome = %+v, want the question unchanged and no answer", outcome)
+		}
+	})
+
+	t.Run("an identical answer accepted before the closure is a duplicate", func(t *testing.T) {
+		prior := run.Message{ID: testThirdMessageID, BodyDigest: "digest-v1"}
+		outcome, err := run.AcceptAnswer(q, &prior, closed, run.TaskAddress(testTaskID), run.SessionPrincipal(testManagerSessionID), submission, 1, epoch())
+		if !errors.Is(err, run.ErrDuplicateAnswer) || errors.Is(err, run.ErrMailboxClosed) {
+			t.Fatalf("AcceptAnswer: error = %v, want ErrDuplicateAnswer alone", err)
+		}
+		if outcome.Answer != prior {
+			t.Fatalf("AcceptAnswer: Answer = %+v, want the prior answer %+v", outcome.Answer, prior)
+		}
+	})
+
+	t.Run("a different answer after the closure is conflicting", func(t *testing.T) {
+		prior := run.Message{ID: testThirdMessageID, BodyDigest: "digest-other"}
+		_, err := run.AcceptAnswer(q, &prior, closed, run.TaskAddress(testTaskID), run.SessionPrincipal(testManagerSessionID), submission, 1, epoch())
+		if !errors.Is(err, run.ErrConflictingAnswer) || errors.Is(err, run.ErrMailboxClosed) {
+			t.Fatalf("AcceptAnswer: error = %v, want ErrConflictingAnswer alone", err)
+		}
+	})
+
+	t.Run("a human answer is refused too, and the question stays unacknowledged", func(t *testing.T) {
+		humanQ := run.Message{ID: testMessageID, RunID: testRunID, Kind: run.MessageQuestion, Recipient: run.HumanAddress(), State: run.MessageQueued}
+		humanClosed := run.AnswerContext{AnswererAddress: run.HumanAddress(), DestinationMailboxClosed: true}
+		outcome, err := run.AcceptAnswer(humanQ, nil, humanClosed, run.TaskAddress(testTaskID), run.HumanPrincipal(), submission, 1, epoch())
+		if !errors.Is(err, run.ErrMailboxClosed) {
+			t.Fatalf("AcceptAnswer: error = %v, want ErrMailboxClosed", err)
+		}
+		if outcome.Question.State != run.MessageQueued {
+			t.Fatalf("AcceptAnswer: Question.State = %s, want queued (no bundled ack on a refusal)", outcome.Question.State)
+		}
+	})
+
+	t.Run("authority precedes the closure", func(t *testing.T) {
+		stranger := run.AnswerContext{AnswererAddress: run.TaskAddress(testSecondTaskID), DestinationMailboxClosed: true}
+		_, err := run.AcceptAnswer(q, nil, stranger, run.TaskAddress(testTaskID), run.SessionPrincipal(testSessionID), submission, 1, epoch())
+		if !errors.Is(err, run.ErrAnswerNotRecipient) {
+			t.Fatalf("AcceptAnswer: error = %v, want ErrAnswerNotRecipient", err)
 		}
 	})
 }

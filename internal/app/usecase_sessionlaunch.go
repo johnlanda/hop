@@ -487,7 +487,7 @@ func workerProtocolCribPath(stateRoot string, runID identity.RunID) string {
 func renderReviewerInitialPrompt(assignmentPath, hopPath string) string {
 	return fmt.Sprintf("Read your review assignment at %s and evaluate the frozen subject it names. "+
 		"When your review is complete, submit your verdict by running: %s %s --verdict <approve|reject> --subject <commit-oid> --reasons-file <absolute path>. "+
-		"If the first output line begins with \"transient\", wait briefly and run the exact same command again.",
+		"If the first output line begins with \"transient\", follow its instruction, then wait briefly and run the exact same command again.",
 		assignmentPath, hopPath, GrammarVerbReviewSubmit)
 }
 
@@ -500,7 +500,7 @@ func renderReviewerContinuationPrompt(assignmentPath, hopPath string) string {
 	return fmt.Sprintf("You were relaunched after an interruption; your restored session may show earlier, unfinished work. "+
 		"Re-read your review assignment at %s and continue it. "+
 		"When your review is complete, submit your verdict by running: %s %s --verdict <approve|reject> --subject <commit-oid> --reasons-file <absolute path>. "+
-		"If the first output line begins with \"transient\", wait briefly and run the exact same command again.",
+		"If the first output line begins with \"transient\", follow its instruction, then wait briefly and run the exact same command again.",
 		assignmentPath, hopPath, GrammarVerbReviewSubmit)
 }
 

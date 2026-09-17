@@ -192,6 +192,121 @@ func MessageSendAnswerUnknownQuestion(runID identity.RunID, session identity.Ses
 	}
 }
 
+// MessageSendAnswerNotRecipientReason and
+// MessageSendAnswerNotRecipientDetail are MessageSendAnswerNotRecipient's
+// expected refusal reason token and detail — the detail is what separates
+// this refusal from MessageSendClaimedAddressMismatch's, which shares the
+// token.
+const (
+	MessageSendAnswerNotRecipientReason = app.GrammarReasonUnauthorized
+	MessageSendAnswerNotRecipientDetail = "session is not the question's recipient"
+)
+
+// MessageSendAnswerNotRecipient returns a MessagingStore.SendMessage request
+// (Kind answer) from a current session of the run whose logical address
+// (senderAddress, its true resolved address) is NOT the recipient of
+// questionID — refused app.MessageRefused (reason
+// MessageSendAnswerNotRecipientReason), detail
+// MessageSendAnswerNotRecipientDetail, with no answer envelope created and the question
+// left unacknowledged: only the addressed recipient may answer (section 7),
+// so no session ever answers a human-addressed question and no task answers
+// another address's question.
+func MessageSendAnswerNotRecipient(runID identity.RunID, session identity.SessionID, senderAddress run.Address, incarnation identity.IncarnationID, answerID, questionID identity.MessageID, bodyPath, bodyDigest string, bodyBytes int64) app.MessageSend {
+	return answerSend(runID, session, senderAddress, incarnation, answerID, questionID, bodyPath, bodyDigest, bodyBytes)
+}
+
+// MessageSendAnswerMailboxClosedKind and MessageSendAnswerMailboxClosedReason
+// are MessageSendAnswerMailboxClosed's expected outcome kind and refusal
+// reason token.
+const (
+	MessageSendAnswerMailboxClosedKind   = app.MessageMailboxClose
+	MessageSendAnswerMailboxClosedReason = app.GrammarReasonMailboxClosed
+)
+
+// MessageSendAnswerMailboxClosed returns a MessagingStore.SendMessage
+// request (Kind answer) from the question's own recipient (senderAddress,
+// its true resolved address) to a question whose originator's task mailbox
+// has closed and which has no accepted answer yet — refused
+// MessageSendAnswerMailboxClosedKind (reason
+// MessageSendAnswerMailboxClosedReason), detail "mailbox is closed", with
+// no answer envelope created: an answer's derived task destination is
+// admitted only while that mailbox is open (section 5), exactly like an
+// ordinary send, and with no run-state gate.
+func MessageSendAnswerMailboxClosed(runID identity.RunID, session identity.SessionID, senderAddress run.Address, incarnation identity.IncarnationID, answerID, questionID identity.MessageID, bodyPath, bodyDigest string, bodyBytes int64) app.MessageSend {
+	return answerSend(runID, session, senderAddress, incarnation, answerID, questionID, bodyPath, bodyDigest, bodyBytes)
+}
+
+// answerSend is the shared answer-request shape: no Recipient (an answer's
+// destination is derived) and no request ID.
+func answerSend(runID identity.RunID, session identity.SessionID, senderAddress run.Address, incarnation identity.IncarnationID, answerID, questionID identity.MessageID, bodyPath, bodyDigest string, bodyBytes int64) app.MessageSend {
+	return app.MessageSend{
+		ID: answerID, RunID: runID, Sender: run.SessionPrincipal(session), SenderAddress: senderAddress,
+		IncarnationID: incarnation, Kind: run.MessageAnswer, ReplyTo: &questionID,
+		BodyPath: bodyPath, BodyDigest: bodyDigest, BodyBytes: bodyBytes,
+	}
+}
+
+// MessageSendClaimedAddressMismatchReason and
+// MessageSendClaimedAddressMismatchDetail are
+// MessageSendClaimedAddressMismatch's expected refusal reason token and
+// detail.
+const (
+	MessageSendClaimedAddressMismatchReason = app.GrammarReasonUnauthorized
+	MessageSendClaimedAddressMismatchDetail = "session does not resolve to the claimed address"
+)
+
+// MessageSendClaimedAddressMismatch returns a MessagingStore.SendMessage
+// request from a current session of the run that claims claimedAddress as
+// its logical address when its own session row resolves to a different
+// address, or to none (a session with no messaging role) — refused
+// app.MessageRefused (reason MessageSendClaimedAddressMismatchReason),
+// detail MessageSendClaimedAddressMismatchDetail, with no envelope created:
+// every send re-derives the sender's address from its session row and
+// decides only by that, whatever the kind. Callers choose kind, recipient
+// (ignored for an answer) and replyTo (answers only, nil otherwise) so the
+// request is one the store WOULD accept from a session truly at
+// claimedAddress — otherwise an addressing or authority refusal, which
+// shares the reason token, would pass the test for the wrong reason.
+func MessageSendClaimedAddressMismatch(runID identity.RunID, session identity.SessionID, claimedAddress run.Address, incarnation identity.IncarnationID, messageID identity.MessageID, kind run.MessageKind, recipient run.Address, replyTo *identity.MessageID, bodyPath, bodyDigest string, bodyBytes int64) app.MessageSend {
+	send := app.MessageSend{
+		ID: messageID, RunID: runID, Sender: run.SessionPrincipal(session), SenderAddress: claimedAddress,
+		IncarnationID: incarnation, Kind: kind, ReplyTo: replyTo,
+		BodyPath: bodyPath, BodyDigest: bodyDigest, BodyBytes: bodyBytes,
+	}
+	if kind != run.MessageAnswer {
+		send.Recipient = recipient
+	}
+	return send
+}
+
+// MessageSendClaimedAddressReplayReason and
+// MessageSendClaimedAddressReplayDetail are
+// MessageSendClaimedAddressReplay's expected refusal reason token and
+// detail: the claimed-address refusal itself.
+const (
+	MessageSendClaimedAddressReplayReason = MessageSendClaimedAddressMismatchReason
+	MessageSendClaimedAddressReplayDetail = MessageSendClaimedAddressMismatchDetail
+)
+
+// MessageSendClaimedAddressReplay returns MessageSendClaimedAddressMismatch's
+// request carrying requestID: a current session of the run claims
+// claimedAddress, another principal's address, and replays that
+// principal's request ID. The consuming fixture has already accepted a
+// request with requestID from the session truly at claimedAddress; with
+// the same kind, recipient, replyTo and body digest the replay's request
+// digest equals the accepted one, and with another body digest it differs.
+// Either way it is refused app.MessageRefused (reason
+// MessageSendClaimedAddressReplayReason), detail
+// MessageSendClaimedAddressReplayDetail, with no envelope created — never
+// duplicate (which would name the accepted message) and never conflicting
+// (which would tell the caller its body differs): the sender's address is
+// re-derived and compared before the request-ID receipt is read.
+func MessageSendClaimedAddressReplay(runID identity.RunID, session identity.SessionID, claimedAddress run.Address, incarnation identity.IncarnationID, messageID identity.MessageID, kind run.MessageKind, recipient run.Address, replyTo *identity.MessageID, requestID, bodyPath, bodyDigest string, bodyBytes int64) app.MessageSend {
+	send := MessageSendClaimedAddressMismatch(runID, session, claimedAddress, incarnation, messageID, kind, recipient, replyTo, bodyPath, bodyDigest, bodyBytes)
+	send.RequestID = requestID
+	return send
+}
+
 // MessageSendCrossRunReason is MessageSendCrossRun's expected refusal
 // reason token.
 const MessageSendCrossRunReason = app.GrammarReasonUnauthorized
@@ -228,6 +343,123 @@ func MessageFetchCrossRun(claimedRunID identity.RunID, session identity.SessionI
 	return app.MessageFetch{RunID: claimedRunID, SessionID: session, IncarnationID: incarnation, Address: address}
 }
 
+// MessageFetchSupersededAttemptDetail is the refusal detail
+// MessageFetchSupersededAttempt's error carries, and the real store's
+// refusal receipt records.
+const MessageFetchSupersededAttemptDetail = "session is not its task's current attempt session"
+
+// MessageFetchSupersededAttempt returns a MessagingStore.FetchNextMessage
+// request from a task address's RETIRED session: the consuming fixture's
+// attempt 1 is terminal (interrupted) and its session terminated with its
+// binding NOT superseded — the live controller's worker-termination shape,
+// so incarnation is still the binding's — while the task's attempt 2 runs
+// with its own bound session and a message is queued to the task. Refused
+// with an error wrapping app.ErrMessagingUnauthorized whose text contains
+// MessageFetchSupersededAttemptDetail, with nothing served: no delivery row,
+// and attempt 2's session is then served the message as its first
+// delivery. Only the current session of the task's newest, non-terminal
+// attempt consumes the task address (section 7).
+func MessageFetchSupersededAttempt(runID identity.RunID, retiredSession identity.SessionID, incarnation identity.IncarnationID, task identity.TaskID) app.MessageFetch {
+	return app.MessageFetch{RunID: runID, SessionID: retiredSession, IncarnationID: incarnation, Address: run.TaskAddress(task)}
+}
+
+// AckMessageSupersededAttemptReason is AckMessageSupersededAttempt's
+// expected refusal reason token.
+const AckMessageSupersededAttemptReason = app.GrammarReasonStale
+
+// AckMessageSupersededAttempt returns a MessagingStore.AckMessage request
+// from a task address's RETIRED session for a message that session WAS
+// served while it was current: the consuming fixture fetches messageID
+// through attempt 1's session, then retires that attempt and session
+// exactly as MessageFetchSupersededAttempt describes (binding not
+// superseded) and runs attempt 2 with its own bound session. Refused
+// app.AckRefused (reason AckMessageSupersededAttemptReason) with no ack
+// row: the message stays delivered, attempt 2's session is re-served it
+// and its own ack is accepted. The delivery check comes first, so a
+// retired session acking a message it was never served is refused
+// AckMessageNotDeliveredReason instead.
+func AckMessageSupersededAttempt(runID identity.RunID, messageID identity.MessageID, retiredSession identity.SessionID, incarnation identity.IncarnationID) app.MessageAck {
+	return app.MessageAck{RunID: runID, MessageID: messageID, SessionID: retiredSession, IncarnationID: incarnation}
+}
+
+// MessageFetchEndedManagerDetail is the refusal detail
+// MessageFetchEndedManager's error carries, and the real store's refusal
+// receipt records.
+const MessageFetchEndedManagerDetail = "session is not the run's current manager session"
+
+// MessageFetchEndedManager returns a MessagingStore.FetchNextMessage
+// request from a manager session that has ENDED (terminated) while its
+// binding is still current, so incarnation is still the binding's; the
+// consuming fixture gives the run a successor manager session with its own
+// binding and queues a message to the manager address. Refused with an
+// error wrapping app.ErrMessagingUnauthorized whose text contains
+// MessageFetchEndedManagerDetail, with nothing served; the successor is
+// then served the message.
+func MessageFetchEndedManager(runID identity.RunID, endedManager identity.SessionID, incarnation identity.IncarnationID) app.MessageFetch {
+	return app.MessageFetch{RunID: runID, SessionID: endedManager, IncarnationID: incarnation, Address: run.ManagerAddress()}
+}
+
+// AckMessageEndedManagerReason is AckMessageEndedManager's expected refusal
+// reason token.
+const AckMessageEndedManagerReason = app.GrammarReasonStale
+
+// AckMessageEndedManager returns a MessagingStore.AckMessage request from
+// the manager session MessageFetchEndedManager describes, for a message it
+// WAS served before it ended. Refused app.AckRefused (reason
+// AckMessageEndedManagerReason) with no ack row: the successor manager is
+// re-served the message and acks it itself.
+func AckMessageEndedManager(runID identity.RunID, messageID identity.MessageID, endedManager identity.SessionID, incarnation identity.IncarnationID) app.MessageAck {
+	return app.MessageAck{RunID: runID, MessageID: messageID, SessionID: endedManager, IncarnationID: incarnation}
+}
+
+// MessageSendSupersededAttemptReason and MessageSendSupersededAttemptDetail
+// are MessageSendSupersededAttempt's expected refusal reason token and
+// detail: a stale incarnation's token, with the fetch refusal's value-free
+// detail.
+const (
+	MessageSendSupersededAttemptReason = app.GrammarReasonStale
+	MessageSendSupersededAttemptDetail = MessageFetchSupersededAttemptDetail
+)
+
+// MessageSendSupersededAttempt returns a MessagingStore.SendMessage request
+// (Kind answer) from a task address's RETIRED session, at its true lineage
+// address, answering questionID: the consuming fixture queues a manager
+// question to the task, serves it to attempt 1's session, then retires that
+// attempt and session exactly as MessageFetchSupersededAttempt describes
+// (binding not superseded) and runs attempt 2 behind its own bound session.
+// Refused app.MessageRefused (reason MessageSendSupersededAttemptReason),
+// detail MessageSendSupersededAttemptDetail, with no answer envelope and no
+// enqueue sequence consumed: only an address's current session sends,
+// whatever the kind, so attempt 2's session is re-served the question and
+// its own answer is accepted. The check follows the request-ID receipt and
+// the incarnation, so the retired session's already-accepted request still
+// replays as duplicate.
+func MessageSendSupersededAttempt(runID identity.RunID, retiredSession identity.SessionID, task identity.TaskID, incarnation identity.IncarnationID, answerID, questionID identity.MessageID, bodyPath, bodyDigest string, bodyBytes int64) app.MessageSend {
+	return answerSend(runID, retiredSession, run.TaskAddress(task), incarnation, answerID, questionID, bodyPath, bodyDigest, bodyBytes)
+}
+
+// MessageSendEndedManagerReason and MessageSendEndedManagerDetail are
+// MessageSendEndedManager's expected refusal reason token and detail.
+const (
+	MessageSendEndedManagerReason = app.GrammarReasonStale
+	MessageSendEndedManagerDetail = MessageFetchEndedManagerDetail
+)
+
+// MessageSendEndedManager returns a MessagingStore.SendMessage request (Kind
+// info) to task from the ended manager session MessageFetchEndedManager
+// describes (terminated, its binding still current, beside a bound
+// successor), whose incarnation is still the binding's. Refused
+// app.MessageRefused (reason MessageSendEndedManagerReason), detail
+// MessageSendEndedManagerDetail, with no envelope created; the successor
+// manager's own send to the task is accepted.
+func MessageSendEndedManager(runID identity.RunID, endedManager identity.SessionID, incarnation identity.IncarnationID, messageID identity.MessageID, task identity.TaskID, bodyPath, bodyDigest string, bodyBytes int64) app.MessageSend {
+	return app.MessageSend{
+		ID: messageID, RunID: runID, Sender: run.SessionPrincipal(endedManager), SenderAddress: run.ManagerAddress(),
+		IncarnationID: incarnation, Recipient: run.TaskAddress(task), Kind: run.MessageInfo,
+		BodyPath: bodyPath, BodyDigest: bodyDigest, BodyBytes: bodyBytes,
+	}
+}
+
 // AckMessageCrossRunReason is AckMessageCrossRun's expected refusal reason
 // token.
 const AckMessageCrossRunReason = app.GrammarReasonUnauthorized
@@ -240,6 +472,14 @@ func AckMessageCrossRun(claimedRunID identity.RunID, messageID identity.MessageI
 	return app.MessageAck{RunID: claimedRunID, MessageID: messageID, SessionID: session, IncarnationID: incarnation}
 }
 
+// ReviewSubmitForeignReviewerReason and ReviewSubmitForeignReviewerDetail
+// are ReviewSubmitForeignReviewer's expected refusal reason token and
+// detail.
+const (
+	ReviewSubmitForeignReviewerReason = app.GrammarReasonNotReviewer
+	ReviewSubmitForeignReviewerDetail = app.ReviewNotReviewerDetail
+)
+
 // ReviewSubmitForeignReviewer returns a ReviewStore.SubmitReview request
 // whose submitting session is a live, currently-bound reviewer that is
 // NOT the claimed attempt's own reviewer session: a reviewer of another
@@ -247,8 +487,9 @@ func AckMessageCrossRun(claimedRunID identity.RunID, messageID identity.MessageI
 // consuming test's fixture decides which shape it builds — both must be
 // refused identically). foreignIncarnation is that session's own CURRENT
 // incarnation, so nothing but the session-to-attempt binding can be the
-// refusal's cause. Refused app.ReviewStale, detail "caller is not the
-// review task's reviewer session", with NO review row and NO state
+// refusal's cause. Refused app.ReviewStale (reason
+// ReviewSubmitForeignReviewerReason), detail
+// ReviewSubmitForeignReviewerDetail, with NO review row and NO state
 // transition committed: the acceptance context is never assembled from a
 // foreign session's binding or launch claim, which would otherwise let a
 // live reviewer elsewhere complete this attempt.

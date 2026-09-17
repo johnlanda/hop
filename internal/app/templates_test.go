@@ -45,7 +45,10 @@ func (a *tmplArtifacts) ReadArtifact(_ context.Context, path string) ([]byte, er
 // TestCribRetryableLinesPerVerb pins which crib sections list which
 // retryable first line: the run-not-running line under exactly the verbs
 // whose accepting transaction checks the run state (task create, task
-// retry, plan close, msg send), and nowhere else.
+// retry, plan close, msg send), and nowhere else; the attempt-not-running
+// and undelivered-messages lines, byte-identical to the grammar
+// constants, under exactly the two submit verbs whose typed transient
+// reason selects between them.
 func TestCribRetryableLinesPerVerb(t *testing.T) {
 	sections := map[string]string{}
 	for _, part := range strings.Split(string(renderWorkerProtocolCrib()), "\n## hop ")[1:] {
@@ -62,7 +65,7 @@ func TestCribRetryableLinesPerVerb(t *testing.T) {
 		GrammarVerbTaskCreate + " (manager only)":           {retryable(GrammarTransientRunNotRunningLine)},
 		GrammarVerbTaskRetry + " (manager only)":            {retryable(GrammarTransientRunNotRunningLine)},
 		GrammarVerbPlanClose + " (manager only)":            {retryable(GrammarTransientRunNotRunningLine)},
-		GrammarVerbReviewSubmit + " (reviewer only)":        {retryable(GrammarTransientUndeliveredLine)},
+		GrammarVerbReviewSubmit + " (reviewer only)":        {retryable(GrammarTransientNotRunningLine), retryable(GrammarTransientUndeliveredLine)},
 	}
 	if len(sections) != len(want) {
 		t.Fatalf("crib sections = %d, want %d", len(sections), len(want))
@@ -82,6 +85,61 @@ func TestCribRetryableLinesPerVerb(t *testing.T) {
 		}
 		if strings.Join(got, "\n") != strings.Join(lines, "\n") {
 			t.Errorf("section %q retryable lines = %q, want %q", heading, got, lines)
+		}
+	}
+
+	// hop result submit and hop review submit print the same two retry
+	// lines for the same two typed reasons, so a worker reads the same
+	// whole crib line, instruction included, under either verb.
+	submitRetryable := "Retryable: `" + GrammarTransientNotRunningLine + "` — wait briefly, rerun the same command.\n" +
+		"Retryable: `" + GrammarTransientUndeliveredLine + "`.\n"
+	for _, heading := range []string{GrammarVerbResultSubmit, GrammarVerbReviewSubmit + " (reviewer only)"} {
+		if !strings.Contains(sections[heading], submitRetryable) {
+			t.Errorf("section %q = %q, want the retry lines %q verbatim", heading, sections[heading], submitRetryable)
+		}
+	}
+}
+
+// TestCribRefusalShapes pins the crib's refusal lines: the preamble's
+// `refused: <reason-token>` shape names the verbs that print another one,
+// hop result submit's section lists its own `<kind>: <detail>` lines,
+// the fetch section says a refused fetch prints no first line, and no
+// other section claims a refusal shape of its own.
+func TestCribRefusalShapes(t *testing.T) {
+	crib := string(renderWorkerProtocolCrib())
+	preamble, _, _ := strings.Cut(crib, "\n## hop ")
+	wantPreamble := "A refusal exits 1 with the first line `" + GrammarRefusalLine("<reason-token>") +
+		"` and detail lines after it, unless its section below names another refusal shape (hop " +
+		GrammarVerbResultSubmit + ", hop " + GrammarVerbMsgNext + " and hop " + GrammarVerbMsgWait + ")."
+	if !strings.Contains(oneLine(preamble), wantPreamble) {
+		t.Errorf("crib preamble = %q, want it to state %q", preamble, wantPreamble)
+	}
+
+	resultRefusal := "Refusal: `" + GrammarResultRefusalLine(GrammarReasonStale, "<detail>") + "`, `" +
+		GrammarResultRefusalLine(GrammarReasonConflicting, "<detail>") + "` or `" +
+		GrammarResultRefusalLine(GrammarReasonMalformed, "<detail>") + "` (the detail on the first line, no `refused:` prefix)."
+	fetchRefusal := "A refused fetch prints no first line at all: nothing on stdout, one diagnostic on stderr, exit 1."
+	for _, part := range strings.Split(crib, "\n## hop ")[1:] {
+		heading, body, _ := strings.Cut(part, "\n")
+		refusalLines := 0
+		for line := range strings.SplitSeq(body, "\n") {
+			if strings.HasPrefix(line, "Refusal: ") {
+				refusalLines++
+			}
+		}
+		switch heading {
+		case GrammarVerbResultSubmit:
+			if refusalLines != 1 || !strings.Contains(body, resultRefusal+"\n") {
+				t.Errorf("section %q = %q, want exactly the refusal line %q", heading, body, resultRefusal)
+			}
+		case GrammarVerbMsgNext + " / hop " + GrammarVerbMsgWait:
+			if refusalLines != 0 || !strings.Contains(oneLine(body), fetchRefusal) {
+				t.Errorf("section %q = %q, want no refusal line and the sentence %q", heading, body, fetchRefusal)
+			}
+		default:
+			if refusalLines != 0 || strings.Contains(body, "refused fetch") {
+				t.Errorf("section %q = %q, want the preamble's refusal shape only", heading, body)
+			}
 		}
 	}
 }
@@ -171,6 +229,22 @@ func TestTemplatesQuoteGrammar(t *testing.T) {
 	if !strings.Contains(task, GrammarRefusalLine("<reason-token>")) {
 		t.Errorf("task assignment does not quote the refusal shape")
 	}
+	// The worker's exits, compared across the template's line wrapping:
+	// done after an accepted or duplicate result, stop on a stale line,
+	// and the result verb's own refusal lines.
+	for _, sentence := range []string{
+		"A first line of " + GrammarResultAcceptedLine("<result-uuid>") + " or " + GrammarResultDuplicateLine("<result-uuid>") +
+			" means your work is done: end your turn without polling for messages.",
+		"A first line of " + GrammarResultRefusalLine(GrammarReasonStale, "<detail>") + " (or " + GrammarRefusalLine(GrammarReasonStale) +
+			" from any hop verb) means this session is no longer current: stop, and do not retry.",
+		"Any other refusal prints " + GrammarResultRefusalLine(GrammarReasonConflicting, "<detail>") + " or " +
+			GrammarResultRefusalLine(GrammarReasonMalformed, "<detail>") + " as its first line, or " + GrammarRefusalLine("<reason-token>") +
+			" from the other hop verbs; read the detail before acting.",
+	} {
+		if !strings.Contains(oneLine(task), sentence) {
+			t.Errorf("task assignment does not state %q", sentence)
+		}
+	}
 
 	review := string(renderReviewAssignment(&reviewAssignmentFields{
 		RunID: "r", TaskID: "t", AttemptID: "a", TaskSeq: 2, AttemptNumber: 1,
@@ -186,6 +260,28 @@ func TestTemplatesQuoteGrammar(t *testing.T) {
 			t.Errorf("review assignment does not quote %q", quote)
 		}
 	}
+	for _, sentence := range []string{
+		"refused with " + GrammarRefusalLine(GrammarReasonSubjectMismatch) +
+			". On that first line, resubmit with the subject commit this assignment names.",
+		"A first line of " + GrammarVerdictAcceptedLine("<review-uuid>") + " or " + GrammarVerdictDuplicateLine("<review-uuid>") +
+			" means your review is done: end your turn without polling for messages.",
+		"A first line of " + GrammarRefusalLine(GrammarReasonStale) + " or " + GrammarRefusalLine(GrammarReasonNotReviewer) +
+			" means this session is no longer this review's current session: stop, and do not retry.",
+		"A first line of " + GrammarRefusalLine(GrammarReasonMalformed) +
+			" means the command itself is wrong: fix the problem its detail names and resubmit.",
+		"A first line of " + GrammarRefusalLine(GrammarReasonConflicting) +
+			" means this review already has a verdict recorded with other content: stop, and do not retry.",
+	} {
+		if !strings.Contains(oneLine(review), sentence) {
+			t.Errorf("review assignment does not state %q", sentence)
+		}
+	}
+}
+
+// oneLine joins text's whitespace-separated words with single spaces, so a
+// sentence can be compared across a template's line wrapping.
+func oneLine(text string) string {
+	return strings.Join(strings.Fields(text), " ")
 }
 
 // TestPosixShellQuoteRoundTrips proves posixShellQuote's output, fed back

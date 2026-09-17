@@ -43,7 +43,7 @@ func TestReferenceTraceFixtureWorkerSubmitsBeforeRunning(t *testing.T) {
 		// Submission arrives with the claim still unsettled: transient, no
 		// transitions.
 		submission := run.ResultSubmission{ID: testResultID, CommitOID: "deadbeef", Summary: "done", Digest: "digest-v1"}
-		outcome, err := run.AcceptResult(r, task, attempt, nil, run.AcceptanceContext{IncarnationCurrent: true, LaunchClaimSettled: false}, submission, later())
+		outcome, err := run.AcceptResult(r, task, attempt, nil, run.AcceptanceContext{IncarnationCurrent: true, LaunchClaimSettled: false, MailboxClear: true}, submission, later())
 		if !errors.Is(err, run.ErrTransientNotRunning) {
 			t.Fatalf("early submission before settlement: error = %v, want ErrTransientNotRunning", err)
 		}
@@ -65,7 +65,7 @@ func TestReferenceTraceFixtureWorkerSubmitsBeforeRunning(t *testing.T) {
 
 		// Resubmission accepted: Run running (idempotent, already there),
 		// Task checking, Attempt submitted.
-		outcome, err = run.AcceptResult(r, task, attempt, nil, run.AcceptanceContext{IncarnationCurrent: true}, submission, later())
+		outcome, err = run.AcceptResult(r, task, attempt, nil, run.AcceptanceContext{IncarnationCurrent: true, MailboxClear: true}, submission, later())
 		mustNoError(t, err)
 		r, task, attempt = outcome.Run, outcome.Task, outcome.Attempt
 		mustState(t, "run", string(r.State), string(run.RunRunning))
@@ -102,7 +102,7 @@ func TestReferenceTraceFixtureWorkerSubmitsBeforeRunning(t *testing.T) {
 		// Run launching->running, Task active->checking, Attempt
 		// launching->submitted, all in this one call.
 		submission := run.ResultSubmission{ID: testResultID, CommitOID: "deadbeef", Summary: "done", Digest: "digest-v1"}
-		outcome, err := run.AcceptResult(r, task, attempt, nil, run.AcceptanceContext{IncarnationCurrent: true, LaunchClaimSettled: true}, submission, later())
+		outcome, err := run.AcceptResult(r, task, attempt, nil, run.AcceptanceContext{IncarnationCurrent: true, LaunchClaimSettled: true, MailboxClear: true}, submission, later())
 		mustNoError(t, err)
 		r, task, attempt = outcome.Run, outcome.Task, outcome.Attempt
 		mustState(t, "run", string(r.State), string(run.RunRunning))
@@ -144,7 +144,7 @@ func TestReferenceTraceColdRelaunchSubmitBeforeRunning(t *testing.T) {
 	// Attempt relaunching->submitted, Run launching->running, Task
 	// active->checking.
 	submission := run.ResultSubmission{ID: testResultID, CommitOID: "deadbeef", Summary: "done", Digest: "digest-v1"}
-	outcome, err := run.AcceptResult(r, task, attempt, nil, run.AcceptanceContext{IncarnationCurrent: true, LaunchClaimSettled: true}, submission, later())
+	outcome, err := run.AcceptResult(r, task, attempt, nil, run.AcceptanceContext{IncarnationCurrent: true, LaunchClaimSettled: true, MailboxClear: true}, submission, later())
 	mustNoError(t, err)
 	r, task, attempt = outcome.Run, outcome.Task, outcome.Attempt
 	mustState(t, "run", string(r.State), string(run.RunRunning))
