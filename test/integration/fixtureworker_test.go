@@ -2176,6 +2176,16 @@ func TestFixtureWorkerSelfKillOnControlFile(t *testing.T) {
 	if err := wait(); err == nil {
 		t.Fatalf("worker exited 0 after the self-kill control file was written; want it SIGKILLed; output:\n%s", out.snapshot())
 	}
+	// A context-cancel kill (exec.CommandContext's own 30s deadline) must
+	// never be mistaken for the self-kill watcher's own doing: both
+	// produce a SIGKILL exit, so ruling out ctx.Err() here is what makes
+	// this assertion mean "the watcher fired", not merely "the process is
+	// dead" (Astra/manager review finding: a missing scratchDirRequiring
+	// Behaviors entry once let exactly this false pass through, caught
+	// only by a suspiciously round pass duration matching the deadline).
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("test context ended (%v) before the self-kill watcher could act; the exit below cannot be attributed to it", err)
+	}
 	exitErr, ok := waitErr.(*exec.ExitError) //nolint:errorlint // a direct type assertion suffices for this test's own exec of a single known binary.
 	if !ok {
 		t.Fatalf("worker wait error = %v (%T), want *exec.ExitError", waitErr, waitErr)
@@ -2277,6 +2287,16 @@ func TestFixtureWorkerIdleSelfKillOnControlFile(t *testing.T) {
 
 	if err := wait(); err == nil {
 		t.Fatalf("worker exited 0 after the self-kill control file was written; want it SIGKILLed; output:\n%s", out.snapshot())
+	}
+	// A context-cancel kill (exec.CommandContext's own 30s deadline) must
+	// never be mistaken for the self-kill watcher's own doing: both
+	// produce a SIGKILL exit, so ruling out ctx.Err() here is what makes
+	// this assertion mean "the watcher fired", not merely "the process is
+	// dead" (Astra/manager review finding: a missing scratchDirRequiring
+	// Behaviors entry once let exactly this false pass through, caught
+	// only by a suspiciously round pass duration matching the deadline).
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("test context ended (%v) before the self-kill watcher could act; the exit below cannot be attributed to it", err)
 	}
 	exitErr, ok := waitErr.(*exec.ExitError) //nolint:errorlint // a direct type assertion suffices for this test's own exec of a single known binary.
 	if !ok {
