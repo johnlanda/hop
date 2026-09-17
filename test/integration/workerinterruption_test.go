@@ -138,7 +138,7 @@ func TestRealProcessWorkerInterruption(t *testing.T) {
 
 	// Release attempt 2's own barrier (the same behavior the task
 	// instructions still name) and let it complete normally.
-	question2ID := fx.relayedQuestionFor(t, session2ID, featureRunTimeout)
+	question2ID := fx.relayedQuestionFor(t, session2ID)
 	fx.answerHuman(t, question2ID, "release the retried attempt")
 	fx.requireSessionState(t, session2ID, "terminated")
 

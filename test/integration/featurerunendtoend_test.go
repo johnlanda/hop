@@ -93,7 +93,7 @@ func TestRealProcessFeatureRunEndToEnd(t *testing.T) {
 	// both relay through the same manager to the same human address. The
 	// relayed body carries the ORIGINAL barrier content unchanged (the
 	// manager relays, never rewrites).
-	t1QuestionID := fx.relayedQuestionFor(t, t1SessionID, featureRunTimeout)
+	t1QuestionID := fx.relayedQuestionFor(t, t1SessionID)
 	if body := fx.messageBodyContent(t, t1QuestionID); !strings.Contains(body, fixtureHoldMarker) {
 		t.Errorf("relayed question %s body = %q, want it to carry %q unchanged", t1QuestionID, body, fixtureHoldMarker)
 	}
@@ -125,7 +125,7 @@ func TestRealProcessFeatureRunEndToEnd(t *testing.T) {
 	fx.requireTaskState(t, t2, "active", "checking", "completed", "integrating", "integrated")
 
 	// Release t3's barrier the same way, matched by its own relay chain.
-	t3QuestionID := fx.relayedQuestionFor(t, t3SessionID, featureRunTimeout)
+	t3QuestionID := fx.relayedQuestionFor(t, t3SessionID)
 	fx.answerHuman(t, t3QuestionID, "release t3")
 	fx.requireSessionState(t, t3SessionID, "terminated")
 

@@ -1134,42 +1134,123 @@ func runManager() {
 	fmt.Println("FIXTURE-PLAN-CLOSED")
 
 	fixCounter := len(script.Tasks)
+	plannedFixReviews := map[string]bool{}
 	for {
 		msg, delivered := parseDeliveredMessage(runHopCLI(hopPath, "msg", "wait").Stdout)
 		if !delivered {
 			continue
 		}
-		handleManagerMessage(hopPath, cwd, env["HOP_RUN_ID"], scratchDir, script, labelToID, &fixCounter, &msg)
+		handleManagerMessage(hopPath, cwd, env["HOP_RUN_ID"], scratchDir, script, labelToID, &fixCounter, plannedFixReviews, &msg)
 	}
 }
 
-// verdictRejectedShortfallToken is EvaluateReadiness's reject-verdict
-// guard-shortfall kind token (run.ShortfallVerdictRejected =
-// "verdict-rejected"): the manager's standing instruction (design section
-// 8, STATUS-1) is to run hop status after any controller info notice it
-// does not otherwise recognize and act on a rendered verdict-rejected
-// shortfall — the ONLY channel that names a reject verdict at all, since
-// the acceptance notice's own body is just the reviewer's raw reasons
-// text (sqlite/review.go's persistVerdictAcceptance), never a marker.
-// statusReportsVerdictRejected is this fixture's one parsing helper for
-// it, pending STATUS-1's landing (cmd/hop does not render guard
-// shortfalls yet); it matches the kind token itself, not a full rendered
-// line, so a single narrow update here absorbs whatever exact line
-// STATUS-1 ships.
+// verdictRejectedShortfallToken mirrors app.GrammarShortfallVerdictRejected
+// (internal/app/grammar.go, itself mirroring run.ShortfallVerdictRejected):
+// EvaluateReadiness's reject-verdict guard-shortfall kind token,
+// "verdict-rejected". The manager's standing instruction (design section
+// 7/8, STATUS-1's manager verdict channel, internal/app/templates.go's
+// renderManagerAssignment) is to run hop status after any controller info
+// notice it does not otherwise recognize and read its shortfall lines —
+// the ONLY channel that names a reject verdict at all, since the
+// acceptance notice's own body is just the reviewer's raw reasons text
+// (sqlite/review.go's persistVerdictAcceptance), never a marker.
 const verdictRejectedShortfallToken = "verdict-rejected"
 
-// statusReportsVerdictRejected runs "hop status -C <repoDir> -run
-// <runID>" and reports whether its output names the verdict-rejected
-// guard shortfall.
-func statusReportsVerdictRejected(hopPath, repoDir, runID string) (rejected bool, output string) {
+// evidenceInconsistentShortfallToken mirrors
+// app.GrammarShortfallEvidenceInconsistent: the status read model's own
+// value-free shortfall kind, reported in place of the check and verdict
+// guards when the recorded evidence about the current head contradicts
+// itself. Named here only for documentation — parseVerdictRejectedLines
+// already skips it (and every other shortfall shape) by construction, so
+// the manager never mistakes it for a rejection.
+const evidenceInconsistentShortfallToken = "evidence-inconsistent"
+
+// verdictRejectedLinePrefix mirrors the fixed text
+// app.GrammarVerdictRejectedLine renders before its review= field
+// (grammar.go's GrammarVerdictRejectedLine: "shortfall: " plus the
+// verdict-rejected token plus " review="), so parsing fails loudly on any
+// drift rather than matching a bare substring anywhere in the output.
+const verdictRejectedLinePrefix = "shortfall: " + verdictRejectedShortfallToken + " review="
+
+// verdictRejection is one parsed "shortfall: verdict-rejected
+// review=<id> subject=<oid> reasons=<path>" line
+// (app.GrammarVerdictRejectedLine, STATUS-1): the specific review's
+// identity, its subject commit and its reasons artifact path — the three
+// fields the manager's own verdict-channel instruction says a
+// verdict-rejected shortfall carries so a manager can tell WHICH review
+// is being reported, never just "the latest one".
+type verdictRejection struct {
+	reviewID, subjectCommitOID, reasonsPath string
+}
+
+// parseVerdictRejectedLines extracts every verdict-rejected shortfall
+// line from one "hop status -run" rendering. A reasons path
+// cmd/hop's safeRenderExternal rendered through strconv.Quote (rather
+// than raw) is unquoted here: safeRenderExternal's own contract is that a
+// raw field never begins with a double quote — that shape is reserved for
+// the quoted form, which always starts with one — so a leading '"'
+// unambiguously means the field must be unquoted, never a literal
+// character of the real path. Any other line shape, including a
+// value-free "shortfall: evidence-inconsistent" line (which names no
+// review at all), is not this shape and is silently skipped: the
+// manager's standing instruction treats evidence-inconsistent, and every
+// notice or shortfall it does not otherwise recognize, as never a
+// rejection.
+func parseVerdictRejectedLines(statusOutput string) []verdictRejection {
+	var out []verdictRejection
+	for _, line := range strings.Split(statusOutput, "\n") {
+		rest, ok := strings.CutPrefix(strings.TrimSpace(line), verdictRejectedLinePrefix)
+		if !ok {
+			continue
+		}
+		reviewID, rest, ok := strings.Cut(rest, " subject=")
+		if !ok || reviewID == "" {
+			fatalf("manager: malformed verdict-rejected shortfall line: %q", line)
+		}
+		subjectCommitOID, rawReasons, ok := strings.Cut(rest, " reasons=")
+		if !ok || subjectCommitOID == "" {
+			fatalf("manager: malformed verdict-rejected shortfall line: %q", line)
+		}
+		reasonsPath := rawReasons
+		if strings.HasPrefix(reasonsPath, "\"") {
+			unquoted, err := strconv.Unquote(reasonsPath)
+			if err != nil {
+				fatalf("manager: could not unquote status reasons path %q: %v", reasonsPath, err)
+			}
+			reasonsPath = unquoted
+		}
+		out = append(out, verdictRejection{reviewID: reviewID, subjectCommitOID: subjectCommitOID, reasonsPath: reasonsPath})
+	}
+	return out
+}
+
+// verdictRejectionMatchingNotice runs "hop status -C <repoDir> -run
+// <runID>" and reports the verdict-rejected shortfall, if any, whose
+// reasons path equals noticeBodyPath — the manager's own verdict-channel
+// correlation rule (internal/app/templates.go's renderManagerAssignment):
+// EQUAL means this notice IS that review's rejection; DIFFERENT (or no
+// verdict-rejected line at all) means it is not, and the notice is acted
+// on as itself instead (a needs-rework notice already has its own path,
+// handled before this is ever called).
+func verdictRejectionMatchingNotice(hopPath, repoDir, runID, noticeBodyPath string) (rejection verdictRejection, matched bool) {
 	res := runHopCLI(hopPath, "status", "-C", repoDir, "-run", runID)
-	return strings.Contains(res.Stdout, verdictRejectedShortfallToken), res.Stdout
+	for _, r := range parseVerdictRejectedLines(res.Stdout) {
+		if r.reasonsPath == noticeBodyPath {
+			return r, true
+		}
+	}
+	return verdictRejection{}, false
 }
 
 // handleManagerMessage dispatches one delivered message per the section 7
 // manager operating contract, acknowledging it before the next wait in
-// every case.
-func handleManagerMessage(hopPath, cwd, runID, scratchDir string, script *managerScript, labelToID map[string]string, fixCounter *int, msg *deliveredMessage) {
+// every case. plannedFixReviews tracks every review id this manager has
+// already planned a fix task for, keyed by the review's own id, so a
+// re-served or redelivered rejection notice for a review already acted on
+// never plans a second fix (the verdict-channel instruction's own rule:
+// "never plan a second fix from the same shortfall once its path has
+// already matched a notice you acted on").
+func handleManagerMessage(hopPath, cwd, runID, scratchDir string, script *managerScript, labelToID map[string]string, fixCounter *int, plannedFixReviews map[string]bool, msg *deliveredMessage) {
 	body := readFileOrFatal(msg.BodyPath)
 	switch msg.Kind {
 	case "question":
@@ -1200,12 +1281,19 @@ func handleManagerMessage(hopPath, cwd, runID, scratchDir string, script *manage
 			fmt.Printf("FIXTURE-RETRIED label=[%s] result=[%s]\n", label, res.FirstLine())
 			break
 		}
-		// Not a task-consequence notice: per the standing instruction,
-		// check hop status for the rendered guard shortfall.
-		rejected, statusOutput := statusReportsVerdictRejected(hopPath, cwd, runID)
-		fmt.Printf("FIXTURE-STATUS-CHECKED rejected=[%t]\n", rejected)
-		_ = statusOutput
-		if rejected {
+		// Not a task-consequence notice: per the manager's own
+		// verdict-channel instruction (design section 7/8, STATUS-1), run
+		// hop status and correlate its verdict-rejected shortfall lines
+		// against THIS notice's own body path — the ONLY way to know WHICH
+		// review a reject verdict's notice reports, since the notice's body
+		// is only the reviewer's raw reasons text with no distinguishing
+		// marker. An evidence-inconsistent shortfall, or no matching line
+		// at all, is never a rejection: plan no fix, act on the notice
+		// itself (already done above for needs-rework), and just ack.
+		rejection, matched := verdictRejectionMatchingNotice(hopPath, cwd, runID, msg.BodyPath)
+		fmt.Printf("FIXTURE-STATUS-CHECKED matched=[%t]\n", matched)
+		if matched && !plannedFixReviews[rejection.reviewID] {
+			plannedFixReviews[rejection.reviewID] = true
 			*fixCounter++
 			label := "fix" + strconv.Itoa(*fixCounter)
 			instructionsPath := writeTempInstructions(cwd, script.FixBehavior, scratchDir)
@@ -1215,7 +1303,7 @@ func handleManagerMessage(hopPath, cwd, runID, scratchDir string, script *manage
 				fatalf("manager script: fix task creation was refused: %s", res.FirstLine())
 			}
 			labelToID[label] = taskID
-			fmt.Printf("FIXTURE-FIX-TASK-CREATED label=[%s] id=[%s]\n", label, taskID)
+			fmt.Printf("FIXTURE-FIX-TASK-CREATED label=[%s] id=[%s] review=[%s]\n", label, taskID, rejection.reviewID)
 			if closeRes := runHopCLIRetryable(hopPath, "plan", "close", "--request-id", newRequestID()); closeRes.ExitCode != 0 && !strings.HasPrefix(closeRes.FirstLine(), "duplicate") {
 				fatalf("manager script: hop plan close after the fix task was refused: %s", closeRes.FirstLine())
 			}

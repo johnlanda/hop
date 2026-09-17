@@ -354,9 +354,9 @@ func (f *featureRun) killSession(t *testing.T, sessionID, attemptID string) {
 // bounds the wait for the manager to have relayed it yet; the failure
 // names the originating session so it is clear which barrier was still
 // pending.
-func (f *featureRun) relayedQuestionFor(t *testing.T, originSessionID string, deadline time.Duration) (questionID string) {
+func (f *featureRun) relayedQuestionFor(t *testing.T, originSessionID string) (questionID string) {
 	t.Helper()
-	ok := waitUntilDeadline(deadline, func() bool {
+	ok := waitUntilDeadline(featureRunTimeout, func() bool {
 		id := f.scalar(t, fmt.Sprintf(
 			"SELECT h.id FROM messages h JOIN messages orig ON h.relayed_from = orig.id "+
 				"WHERE h.run_id = '%s' AND h.recipient_address = 'human' AND orig.sender_session_id = '%s' LIMIT 1;",
@@ -368,7 +368,7 @@ func (f *featureRun) relayedQuestionFor(t *testing.T, originSessionID string, de
 		return true
 	})
 	if !ok {
-		t.Fatalf("no relayed human question observed for the barrier originating from session %s within %s", originSessionID, deadline)
+		t.Fatalf("no relayed human question observed for the barrier originating from session %s within %s", originSessionID, featureRunTimeout)
 	}
 	return questionID
 }

@@ -2,6 +2,7 @@ package integration
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -428,7 +429,14 @@ func runReviewSubmit(args []string) {
 }
 
 // runStatus validates hop status's own minimal contract as this fake's
-// only non-worker-plumbing verb: -C and -run required.
+// only non-worker-plumbing verb: -C and -run required. Its guard-shortfall
+// line reproduces STATUS-1's real rendering verbatim
+// (internal/app/grammar.go's GrammarVerdictRejectedLine/GrammarShortfallLine,
+// cmd/hop/statuscmd.go's featureDetailLines): FAKE_HOP_STATUS_SHORTFALL
+// selects "verdict-rejected" (rendered from FAKE_HOP_STATUS_REVIEW/
+// FAKE_HOP_STATUS_SUBJECT/FAKE_HOP_STATUS_REASONS) or
+// "evidence-inconsistent" (value-free); absent or any other value renders
+// no shortfall line at all — the current head has no unmet verdict guard.
 func runStatus(args []string) {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	repoDir := fs.String("C", "", "")
@@ -443,10 +451,13 @@ func runStatus(args []string) {
 	if *runArg == "" {
 		usageFail("status: -run is required")
 	}
-	if os.Getenv("FAKE_HOP_STATUS_REJECTED") == "1" {
-		fmt.Println("run r1 aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\n  state:         running\n  guard shortfall: verdict-rejected")
-	} else {
-		fmt.Println("run r1 aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\n  state:         running")
+	fmt.Println("run r1 aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\n  state:         running")
+	switch os.Getenv("FAKE_HOP_STATUS_SHORTFALL") {
+	case "verdict-rejected":
+		fmt.Println("  shortfall: verdict-rejected review=" + os.Getenv("FAKE_HOP_STATUS_REVIEW") +
+			" subject=" + os.Getenv("FAKE_HOP_STATUS_SUBJECT") + " reasons=" + os.Getenv("FAKE_HOP_STATUS_REASONS"))
+	case "evidence-inconsistent":
+		fmt.Println("  shortfall: evidence-inconsistent")
 	}
 }
 
@@ -641,10 +652,10 @@ func countLogLinesWithPrefix(log, prefix string) int {
 // field, a needs-rework notice triggering hop task retry against the
 // correct task id, and an unrecognized info notice (the review verdict's
 // own notice carries no marker at all — the fixture reviewer's reasons
-// text is opaque prose) triggering a hop status check that names the
-// verdict-rejected guard shortfall (STATUS-1, scripted via
-// FAKE_HOP_STATUS_REJECTED), which plans a fix task and a second plan
-// close.
+// text is opaque prose) triggering a hop status check whose verdict-rejected
+// guard shortfall (STATUS-1, scripted via FAKE_HOP_STATUS_SHORTFALL) names
+// a reasons path equal to this exact notice's own body path, which plans a
+// fix task and a second plan close.
 func TestFixtureManagerScriptDispatch(t *testing.T) {
 	artifacts := newArtifactDir(t)
 	principal := buildFixtureWorker(t, artifacts)
@@ -727,11 +738,16 @@ func TestFixtureManagerScriptDispatch(t *testing.T) {
 		"FAKE_HOP_MSG_INDEX=" + indexPath,
 		"FAKE_HOP_TASK_COUNTER_FILE=" + counterPath,
 		"FAKE_HOP_LOG=" + logPath,
-		// STATUS-1 has not landed (defect id reported and confirmed);
-		// this scripts the fake hop's status output to carry the
-		// verdict-rejected shortfall so the manager's own hop-status
-		// polling branch is exercised in isolation ahead of it.
-		"FAKE_HOP_STATUS_REJECTED=1",
+		// Scripts the fake hop's status output to carry STATUS-1's real
+		// verdict-rejected shortfall line, its reasons path equal to
+		// rejectNoticeBody — the exact body path the scripted reject
+		// notice above carries — so the manager's own correlation rule
+		// (STATUS-1's manager verdict channel) matches this notice and
+		// plans a fix from it.
+		"FAKE_HOP_STATUS_SHORTFALL=verdict-rejected",
+		"FAKE_HOP_STATUS_REVIEW=99999999-9999-4999-8999-999999999999",
+		"FAKE_HOP_STATUS_SUBJECT=cccccccccccccccccccccccccccccccccccccccc",
+		"FAKE_HOP_STATUS_REASONS=" + rejectNoticeBody,
 	}
 	var out strings.Builder
 	cmd.Stdout = &out
@@ -752,11 +768,11 @@ func TestFixtureManagerScriptDispatch(t *testing.T) {
 		"FIXTURE-RELAYED question=[msg-hold-question]",
 		"FIXTURE-FORWARDED origin=[msg-hold-question]",
 		"FIXTURE-RETRIED label=[t1] result=[retry accepted t0 attempt 2]",
-		"FIXTURE-STATUS-CHECKED rejected=[true]",
+		"FIXTURE-STATUS-CHECKED matched=[true]",
 		// fixCounter starts at len(script.Tasks) (2: t1, t2), so the first
 		// fix task's own local label is "fix3", not "fix1" — a manager-side
 		// bookkeeping label distinct from the store's own t<seq> numbering.
-		"FIXTURE-FIX-TASK-CREATED label=[fix3] id=[00000000-0000-4000-8000-000000000003]",
+		"FIXTURE-FIX-TASK-CREATED label=[fix3] id=[00000000-0000-4000-8000-000000000003] review=[99999999-9999-4999-8999-999999999999]",
 	} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("manager stdout missing %q; got:\n%s", want, stdout)
@@ -977,6 +993,147 @@ func TestFixtureManagerNeverRetriesRefused(t *testing.T) {
 	if got := countLogLinesWithPrefix(log, "task\tcreate\t--title\tImplement t1\t"); got != 1 {
 		t.Errorf("task create invocation count for t1 = %d, want exactly 1 (a refused: line must never be retried); log:\n%s", got, log)
 	}
+}
+
+// runVerdictCorrelationCase drives the compiled fixture principal as a
+// manager-feature manager against noticeBodyPaths' info notices, in
+// order, under the fake hop stub's scripted hop-status output
+// (statusEnv), and reports how many "fix from reject" task-create
+// invocations it made. The manager never exits on its own; a context
+// deadline (matching TestFixtureManagerScriptDispatch's own pattern)
+// bounds it once the scripted notices are exhausted.
+func runVerdictCorrelationCase(t *testing.T, artifacts *artifactDir, noticeBodyPaths, statusEnv []string) (fixTaskCreates int, stdout string) {
+	t.Helper()
+	fx := buildManagerScriptDispatchFixture(t, artifacts)
+
+	scriptDir := filepath.Dir(fx.counterPath)
+	var blocks []string
+	for i, body := range noticeBodyPaths {
+		blocks = append(blocks, fakeMessageBlock(fmt.Sprintf("msg-notice-%d", i), "info", "controller", "", "", body))
+	}
+	scriptPath, indexPath := writeFakeHopMsgScript(t, scriptDir, blocks)
+
+	const rolePath, cribPath = "/state/runs/a1/artifacts/roles/manager.md", "/state/runs/a1/artifacts/worker-protocol.md"
+	prompt := testManagerInitialPrompt(fx.assignmentPath, rolePath, cribPath, fx.fakeHop)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, fx.principal, "--session-id", "22222222-2222-2222-2222-222222222222", prompt) //nolint:gosec // G204: fixed test-owned binary and arguments.
+	cmd.Dir = fx.cwd
+	cmd.Env = append([]string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOP_STATE_DIR=" + fx.stateDir,
+		"HOP_RUN_ID=" + fx.runID,
+		"HOP_SESSION_ID=33333333-3333-3333-3333-333333333333",
+		"HOP_INCARNATION_ID=44444444-4444-4444-4444-444444444444",
+		"HOP_ROLE=manager",
+		"FAKE_HOP_MSG_SCRIPT=" + scriptPath,
+		"FAKE_HOP_MSG_INDEX=" + indexPath,
+		"FAKE_HOP_TASK_COUNTER_FILE=" + fx.counterPath,
+		"FAKE_HOP_LOG=" + fx.logPath,
+	}, statusEnv...)
+	var out strings.Builder
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	_ = cmd.Run() //nolint:errcheck // the context deadline killing this intentionally endless manager is the expected outcome once its scripted notices are exhausted, asserted on its captured stdout/log below, never on this error.
+
+	log := readFakeHopLog(t, fx.logPath)
+	return countLogLinesWithPrefix(log, "task\tcreate\t--title\tfix from reject\t"), out.String()
+}
+
+// TestFixtureManagerVerdictRejectedCorrelation proves the manager's own
+// STATUS-1 verdict-channel correlation rule in isolation
+// (fixtureworker_test.go's verdictRejectionMatchingNotice/
+// parseVerdictRejectedLines, per internal/app/templates.go's
+// renderManagerAssignment): a verdict-rejected shortfall plans a fix task
+// only when its reasons path equals the fetched notice's own body path; a
+// different reasons path plans none; a repeated notice for a review
+// already acted on never plans a SECOND fix; and an evidence-inconsistent
+// shortfall is never treated as a rejection.
+func TestFixtureManagerVerdictRejectedCorrelation(t *testing.T) {
+	t.Run("matching path gives one fix", func(t *testing.T) {
+		artifacts := newArtifactDir(t)
+		noticePath := filepath.Join(artifacts.dir(t, "notice-bodies"), "reject-notice.txt")
+		if err := os.WriteFile(noticePath, []byte("fixture reviewer reasons: reject\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		fixes, stdout := runVerdictCorrelationCase(t, artifacts, []string{noticePath}, []string{
+			"FAKE_HOP_STATUS_SHORTFALL=verdict-rejected",
+			"FAKE_HOP_STATUS_REVIEW=aaaaaaaa-1111-4aaa-8aaa-aaaaaaaaaaaa",
+			"FAKE_HOP_STATUS_SUBJECT=cccccccccccccccccccccccccccccccccccccccc",
+			"FAKE_HOP_STATUS_REASONS=" + noticePath,
+		})
+		if fixes != 1 {
+			t.Errorf("fix task creates = %d, want exactly 1 for a matching reasons path; stdout:\n%s", fixes, stdout)
+		}
+		if !strings.Contains(stdout, "FIXTURE-STATUS-CHECKED matched=[true]") {
+			t.Errorf("manager stdout does not report a matched shortfall; got:\n%s", stdout)
+		}
+	})
+
+	t.Run("different path gives none", func(t *testing.T) {
+		artifacts := newArtifactDir(t)
+		bodyDir := artifacts.dir(t, "notice-bodies")
+		noticePath := filepath.Join(bodyDir, "reject-notice.txt")
+		if err := os.WriteFile(noticePath, []byte("fixture reviewer reasons: reject\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		otherReasonsPath := filepath.Join(bodyDir, "a-different-reviews-reasons.txt")
+		fixes, stdout := runVerdictCorrelationCase(t, artifacts, []string{noticePath}, []string{
+			"FAKE_HOP_STATUS_SHORTFALL=verdict-rejected",
+			"FAKE_HOP_STATUS_REVIEW=bbbbbbbb-2222-4bbb-8bbb-bbbbbbbbbbbb",
+			"FAKE_HOP_STATUS_SUBJECT=cccccccccccccccccccccccccccccccccccccccc",
+			"FAKE_HOP_STATUS_REASONS=" + otherReasonsPath,
+		})
+		if fixes != 0 {
+			t.Errorf("fix task creates = %d, want 0 when the shortfall's reasons path differs from this notice's own body path; stdout:\n%s", fixes, stdout)
+		}
+		if !strings.Contains(stdout, "FIXTURE-STATUS-CHECKED matched=[false]") {
+			t.Errorf("manager stdout does not report an unmatched shortfall; got:\n%s", stdout)
+		}
+	})
+
+	t.Run("repeated notice gives no second fix", func(t *testing.T) {
+		artifacts := newArtifactDir(t)
+		noticePath := filepath.Join(artifacts.dir(t, "notice-bodies"), "reject-notice.txt")
+		if err := os.WriteFile(noticePath, []byte("fixture reviewer reasons: reject\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		// The SAME review's rejection notice, delivered twice (a re-served,
+		// unacknowledged notice re-fetched after a fresh hop msg wait) —
+		// both messages carry the identical body path, and hop status keeps
+		// reporting the same verdict-rejected shortfall for as long as no
+		// fix has integrated. Only the FIRST delivery may plan a fix.
+		fixes, stdout := runVerdictCorrelationCase(t, artifacts, []string{noticePath, noticePath}, []string{
+			"FAKE_HOP_STATUS_SHORTFALL=verdict-rejected",
+			"FAKE_HOP_STATUS_REVIEW=aaaaaaaa-1111-4aaa-8aaa-aaaaaaaaaaaa",
+			"FAKE_HOP_STATUS_SUBJECT=cccccccccccccccccccccccccccccccccccccccc",
+			"FAKE_HOP_STATUS_REASONS=" + noticePath,
+		})
+		if fixes != 1 {
+			t.Errorf("fix task creates = %d, want exactly 1 across two deliveries of the same review's notice (never a second fix from the same review); stdout:\n%s", fixes, stdout)
+		}
+		if got := strings.Count(stdout, "FIXTURE-STATUS-CHECKED matched=[true]"); got != 2 {
+			t.Errorf("matched status checks = %d, want 2 (both deliveries correlate to the same shortfall; only fix-planning is deduplicated); stdout:\n%s", got, stdout)
+		}
+	})
+
+	t.Run("evidence-inconsistent gives none", func(t *testing.T) {
+		artifacts := newArtifactDir(t)
+		noticePath := filepath.Join(artifacts.dir(t, "notice-bodies"), "reject-notice.txt")
+		if err := os.WriteFile(noticePath, []byte("fixture reviewer reasons: reject\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		fixes, stdout := runVerdictCorrelationCase(t, artifacts, []string{noticePath}, []string{
+			"FAKE_HOP_STATUS_SHORTFALL=evidence-inconsistent",
+		})
+		if fixes != 0 {
+			t.Errorf("fix task creates = %d, want 0 for an evidence-inconsistent shortfall (never a rejection); stdout:\n%s", fixes, stdout)
+		}
+		if !strings.Contains(stdout, "FIXTURE-STATUS-CHECKED matched=[false]") {
+			t.Errorf("manager stdout does not report an unmatched shortfall for evidence-inconsistent; got:\n%s", stdout)
+		}
+	})
 }
 
 // TestFixtureReviewerRejectOnce drives the compiled fixture principal as a
