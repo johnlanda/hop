@@ -1952,20 +1952,37 @@ pane and the claimed process are both observed gone
 sequences). The real-process proof of the row covers a manager whose
 harness ends right after exec
 (`TestRealProcessManagerLaunchVanishesBeforeCorroboration`); a worker
-dying before settlement is proved by the app tables now and joins the
-fixture-principal scenarios later.
+dying before settlement is proved by the app tables and by the real-
+process fixture-principal scenario
+`TestRealProcessWorkerLaunchEndsBeforeSettlement`.
 
 A placed-but-uncorroborated child launch across a controller kill
 (`ChildLaunchInFlightAcrossResume`, LAUNCH-5) is deferred as a real-
-process scenario for the same reason: no fixture-only barrier holds that
-window (the pane's command is the controller's own executable, resolved
-by `os.Executable` at launch time — `cmd/hop/runcmd.go`'s
-`hopExecutablePath` — so no test-owned gated launcher can be substituted
-for it), and the controller's own corroboration step can settle the
-claim within the same scheduling pass that placed it, closing the window
-before an external observer could react. The rule is covered by the app
-tables for resume's in-flight rule (`TestResumeFeatureChildLaunchInFlight`
-and its siblings).
+process scenario. Two separate windows are both closed to a fixture-only
+barrier, for two different reasons: the FIRST — before a child pane's
+own `hop launch` invocation has execed into its harness at all — cannot
+be held because the pane's placed command there is the controller's own
+executable, resolved once per `hop run`/`hop resume` invocation
+(`cmd/hop/runcmd.go`'s `hopExecutablePath`, called from `runRun`/
+`runResume`) rather than looked up on PATH, so no test-owned stand-in
+can be substituted for it. The SECOND — after that exec, once the
+process is already claude-identified — could in principle be held (a
+gated `claude` PATH stub can hold a claim unsettleable for its whole
+life, as `launchvanish_test.go`'s own vanishing stub shows for the
+manager's launch), but not safely here: the one `claude` stub serves
+EVERY role in this suite, so gating it would force the manager and
+reviewer sessions through the same exec-chain topology that exposes
+WEDGE-1 (a forking-wrapper false classification a scenario's own worker
+launch tripped by accident, fixed in this branch by removing the exec
+chain rather than by gating it). An IN-fixture gate avoids that
+topology, but corroborates within the SAME scheduling pass that placed
+it regardless (`runFeatureSchedulingPass`: `AssignReadyTasks` then
+`CorroborateSessionLaunches`), closing the window before an external
+observer could react — for a reason unrelated to WEDGE-1. This scenario
+stays deferred until WEDGE-1 is fixed; a controller-fix slice may then
+make a gated `claude` stub usable for the second window. The rule is
+covered by the app tables for resume's in-flight rule
+(`TestResumeFeatureChildLaunchInFlight` and its siblings).
 
 ## 12. Work breakdown
 
