@@ -33,7 +33,7 @@ integration — without changing any Phase 2 transition's legality.
 | [integration.go](integration.go) | `Integration`, `IntegrationState`, `NewIntegration`, `EnterChecking`, `Conflict`, `Integrate`, `FailCheck`, `RollBack`, `Interrupt` | Serial per-task integration's state machine (section 5, "Integration") |
 | [readiness.go](readiness.go) | `GuardContext`, `CheckReceipt`, `GuardShortfall`, `ShortfallKind`, `EvaluateReadiness` | The run-completion guard (section 8): a pure function meant to gate `Run.Complete` in feature mode (the actual wiring is a later application slice — see Invariants) |
 | [artifact.go](artifact.go) | `Artifact`, `ArtifactKind`, `NewArtifact`, `NewResultArtifact` | File references owned by a run or a result |
-| [errors.go](errors.go) | `ErrInvalidTransition`, `ErrStaleSubmission`, `ErrConflictingResult`, `ErrDuplicateResult`, `ErrTransientNotRunning`, `ErrDependencyCycle`, `ErrDependencyNotIntegrated`, `ErrDependencyEvidenceMissing`, `ErrDelegationDepth`, `ErrDuplicateAnswer`, `ErrConflictingAnswer`, `ErrStaleAck`, `ErrNotDelivered`, `ErrVerdictSubjectMismatch`, `ErrRetryNotTerminal`, `ErrRetryLimit`, `ErrRunNotAccepting`, `ErrEmptyPlan`, `ErrMailboxClosed`, `ErrMailboxNotClear`, `ErrRequestConflict`, `ErrTaskNotReleased` | Typed errors every transition and cross-entity acceptance function returns |
+| [errors.go](errors.go) | `ErrInvalidTransition`, `ErrStaleSubmission`, `ErrConflictingResult`, `ErrDuplicateResult`, `ErrTransientNotRunning`, `ErrDependencyCycle`, `ErrDependencyNotIntegrated`, `ErrDependencyEvidenceMissing`, `ErrDelegationDepth`, `ErrDuplicateAnswer`, `ErrConflictingAnswer`, `ErrStaleAck`, `ErrNotDelivered`, `ErrVerdictSubjectMismatch`, `ErrRetryNotTerminal`, `ErrRetryLimit`, `ErrRunNotAccepting`, `ErrRunNotYetRunning`, `ErrEmptyPlan`, `ErrMailboxClosed`, `ErrMailboxNotClear`, `ErrRequestConflict`, `ErrTaskNotReleased` | Typed errors every transition and cross-entity acceptance function returns |
 | [transition.go](transition.go) | `transitionTable`, `fromAny`, `concatPairs` | The generic, table-driven legality check shared by every entity's state machine |
 
 ## Invariants
@@ -68,8 +68,12 @@ integration — without changing any Phase 2 transition's legality.
   sets it (refusing `ErrEmptyPlan` for zero implement tasks) and
   `ReopenPlan` clears it; both are additive to Phase 2 — solo runs never
   call either and never consult the flag. Every manager verb (`ClosePlan`
-  included) first calls the shared `CanAcceptManagerVerb`
-  (`ErrRunNotAccepting` outside `running`).
+  included) and every ordinary message send first calls the shared
+  `CanAcceptManagerVerb`: nil only for `running` with no stop request;
+  `ErrRunNotYetRunning` (retryable) for `created`, `launching`,
+  `resuming` and `completing`, each of which can still reach `running`;
+  `ErrRunNotAccepting` (final) for `completed`, `failed`, `stopping` and
+  `stopped`, and for every state once `StopRequested` is set.
 - `Task.Kind` dispatches which of two exhaustive tables `Task.transition`
   validates against: `TaskKindReview` uses the shorter review table
   (`ready`→`active`→`completed`, no `checking`/`integrating`/`integrated`);
@@ -247,6 +251,10 @@ integration — without changing any Phase 2 transition's legality.
   different task, an empty prerequisite set against a real dependency,
   and edges disagreeing with `HasDependencies` in either direction);
   `NewAttemptWorktree`'s required attempt and base-commit links;
+  `CanAcceptManagerVerb`'s outcome for every run state with and without a
+  stop request (`TestRunCanAcceptManagerVerb`) and across completion
+  (`TestRunCanAcceptManagerVerbAcrossCompletion`: completing is
+  retryable, accepted after a return to running, final once completed);
   `Worktree.Retire`'s table (`TestWorktreeRetireTransitions`: every state
   pair plus unknown targets, each final state only from active);
   `NewChildSession`'s delegation-depth, role and full parent-shape checks

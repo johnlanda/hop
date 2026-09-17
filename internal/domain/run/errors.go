@@ -76,8 +76,17 @@ var ErrRetryNotTerminal = errors.New("run: prior attempt is not terminal")
 var ErrRetryLimit = errors.New("run: retry limit reached")
 
 // ErrRunNotAccepting reports a manager verb (CreateTask, RequestRetry,
-// ClosePlan) against a run that has left running.
+// ClosePlan) or an ordinary message send against a run that can never
+// accept one again: completed, failed, stopping or stopped, or with a stop
+// request. It is final.
 var ErrRunNotAccepting = errors.New("run: run is not accepting this request")
+
+// ErrRunNotYetRunning reports a manager verb or an ordinary message send
+// against a run that is not running now but can still reach running:
+// created, launching, resuming or completing, with no stop request. The
+// caller is expected to retry, like ErrTransientNotRunning for a result
+// submission.
+var ErrRunNotYetRunning = errors.New("run: run not yet running")
 
 // ErrEmptyPlan reports a plan closure attempted with zero implement tasks
 // created.

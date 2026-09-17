@@ -43,6 +43,8 @@ func TestGoldenGrammar(t *testing.T) {
 
 		{"transient not running", app.GrammarTransientNotRunningLine, "transient: attempt not yet running; retry"},
 		{"transient undelivered", app.GrammarTransientUndeliveredLine, "transient: undelivered messages; drain with hop msg next, ack, then resubmit"},
+		{"transient run not running", app.GrammarTransientRunNotRunningLine, "transient: run not yet running; retry"},
+		{"transient prefix", app.GrammarTransientPrefix, "transient: "},
 		{"msg none", app.GrammarMsgNoneLine, "none: no queued message"},
 		{"plan closed", app.GrammarPlanClosedLine, "plan closed"},
 		{"plan close duplicate", app.GrammarPlanCloseDuplicateLine, "duplicate plan closed"},

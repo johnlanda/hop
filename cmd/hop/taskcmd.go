@@ -55,7 +55,9 @@ func runTask(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 // only, identities from HOP_* env, the instructions body read from --file
 // before any store call (file-first protocol). First line:
 // GrammarTaskCreatedLine / GrammarTaskCreateDuplicateLine on success,
-// refused: <token> on refusal.
+// GrammarTransientRunNotRunningLine while the run is not yet running
+// (exit 1, rerun with the same --request-id), refused: <token> on
+// refusal.
 func runTaskCreate(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 	diagnostics := &recordingWriter{w: stderr}
 	flags := flag.NewFlagSet("hop task create", flag.ContinueOnError)
@@ -105,7 +107,7 @@ func runTaskCreate(args []string, stdout, stderr io.Writer, d *deps) (int, error
 		_, werr := fmt.Fprintf(stderr, "hop task create: %v\n", err)
 		return exitFailure, werr
 	}
-	return writeLinesAndExit(stdout, taskCreateLines(&result))
+	return writeVerbOutcomeAndExit(stdout, stderr, "hop task create", result.Outcome == string(app.WorkflowTransient), result.Detail, taskCreateLines(&result))
 }
 
 // taskCreateLines renders CreateTaskResult as the grammar's fixed lines.
@@ -115,6 +117,8 @@ func taskCreateLines(result *app.CreateTaskResult) []string {
 		return []string{app.GrammarTaskCreatedLine(result.TaskID, result.Seq)}
 	case "duplicate":
 		return []string{app.GrammarTaskCreateDuplicateLine(result.TaskID, result.Seq)}
+	case string(app.WorkflowTransient):
+		return []string{app.GrammarTransientRunNotRunningLine}
 	default:
 		return renderRefusal(refusalToken(result.Reason), result.Detail)
 	}
@@ -162,7 +166,7 @@ func runTaskRetry(args []string, stdout, stderr io.Writer, d *deps) (int, error)
 		_, werr := fmt.Fprintf(stderr, "hop task retry: %v\n", err)
 		return exitFailure, werr
 	}
-	return writeLinesAndExit(stdout, taskRetryLines(&result))
+	return writeVerbOutcomeAndExit(stdout, stderr, "hop task retry", result.Outcome == string(app.WorkflowTransient), result.Detail, taskRetryLines(&result))
 }
 
 // taskRetryLines renders RequestRetryResult as the grammar's fixed lines:
@@ -175,6 +179,8 @@ func taskRetryLines(result *app.RequestRetryResult) []string {
 		return []string{app.GrammarRetryAcceptedLine(result.TaskSeq, result.AttemptNumber)}
 	case "duplicate":
 		return []string{app.GrammarRetryDuplicateLine(result.TaskSeq, result.AttemptNumber)}
+	case string(app.WorkflowTransient):
+		return []string{app.GrammarTransientRunNotRunningLine}
 	default:
 		return renderRefusal(refusalToken(result.Reason), result.Detail)
 	}
@@ -225,7 +231,7 @@ func runPlanClose(args []string, stdout, stderr io.Writer, d *deps) (int, error)
 		_, werr := fmt.Fprintf(stderr, "hop plan close: %v\n", err)
 		return exitFailure, werr
 	}
-	return writeLinesAndExit(stdout, planCloseLines(&result))
+	return writeVerbOutcomeAndExit(stdout, stderr, "hop plan close", result.Outcome == string(app.WorkflowTransient), result.Detail, planCloseLines(&result))
 }
 
 // planCloseLines renders ClosePlanResult as the grammar's fixed lines.
@@ -235,6 +241,8 @@ func planCloseLines(result *app.ClosePlanResult) []string {
 		return []string{app.GrammarPlanClosedLine}
 	case "duplicate":
 		return []string{app.GrammarPlanCloseDuplicateLine}
+	case string(app.WorkflowTransient):
+		return []string{app.GrammarTransientRunNotRunningLine}
 	default:
 		return renderRefusal(refusalToken(result.Reason), result.Detail)
 	}
@@ -242,16 +250,33 @@ func planCloseLines(result *app.ClosePlanResult) []string {
 
 // writeLinesAndExit writes lines to stdout and maps the first line to the
 // design's worker-protocol exit convention: exit 0 unless the first line
-// is a refusal, which always exits 1 (refusals are never a usage error —
-// the CLI syntax was fine; the request itself was refused).
+// is a refusal or a retryable transient line, which always exit 1
+// (neither is a usage error — the CLI syntax was fine; the request itself
+// was refused, or must be rerun).
 func writeLinesAndExit(w io.Writer, lines []string) (int, error) {
 	for _, line := range lines {
 		if _, err := fmt.Fprintln(w, line); err != nil {
 			return exitFailure, err
 		}
 	}
-	if len(lines) > 0 && strings.HasPrefix(lines[0], app.GrammarRefusalPrefix) {
+	if len(lines) > 0 && (strings.HasPrefix(lines[0], app.GrammarRefusalPrefix) || strings.HasPrefix(lines[0], app.GrammarTransientPrefix)) {
 		return exitFailure, nil
 	}
 	return exitOK, nil
+}
+
+// writeVerbOutcomeAndExit renders one plan or message verb's outcome: its
+// lines on stdout through writeLinesAndExit, then, for a transient outcome
+// only, the store's value-free detail on stderr as "<verb>: <detail>" —
+// hop result submit's convention, so the detail never lands on the stdout
+// line a caller parses by prefix.
+func writeVerbOutcomeAndExit(stdout, stderr io.Writer, verb string, transient bool, detail string, lines []string) (int, error) {
+	code, err := writeLinesAndExit(stdout, lines)
+	if err != nil || !transient || detail == "" {
+		return code, err
+	}
+	if _, err := fmt.Fprintf(stderr, "%s: %s\n", verb, detail); err != nil {
+		return exitFailure, err
+	}
+	return code, nil
 }

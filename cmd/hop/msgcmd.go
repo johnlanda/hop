@@ -66,7 +66,8 @@ func runMsg(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 // --kind select the destination and message kind; --reply-to is required
 // for kind=answer and forbidden otherwise (an answer's destination is
 // derived server-side from the question, never caller-chosen); --relay-of
-// is optional, question-only.
+// is optional, question-only. An ordinary send while the run is not yet
+// running prints GrammarTransientRunNotRunningLine (exit 1).
 func runMsgSend(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 	diagnostics := &recordingWriter{w: stderr}
 	flags := flag.NewFlagSet("hop msg send", flag.ContinueOnError)
@@ -139,7 +140,7 @@ func runMsgSend(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 		_, werr := fmt.Fprintf(stderr, "hop msg send: %v\n", err)
 		return exitFailure, werr
 	}
-	return writeLinesAndExit(stdout, sendMessageLines(&result))
+	return writeVerbOutcomeAndExit(stdout, stderr, "hop msg send", result.Outcome == string(app.MessageTransient), result.Detail, sendMessageLines(&result))
 }
 
 // sendMessageLines renders SendMessageResult as the grammar's fixed lines.
@@ -149,6 +150,8 @@ func sendMessageLines(result *app.SendMessageResult) []string {
 		return []string{app.GrammarSentLine(result.MessageID)}
 	case "duplicate":
 		return []string{app.GrammarSendDuplicateLine(result.MessageID)}
+	case string(app.MessageTransient):
+		return []string{app.GrammarTransientRunNotRunningLine}
 	default:
 		return renderRefusal(refusalToken(result.Reason), result.Detail)
 	}
@@ -491,6 +494,8 @@ func answerLines(result *app.AnswerResult) []string {
 		return []string{app.GrammarSentLine(result.MessageID)}
 	case "duplicate":
 		return []string{app.GrammarSendDuplicateLine(result.MessageID)}
+	case string(app.MessageTransient):
+		return []string{app.GrammarTransientRunNotRunningLine}
 	default:
 		return renderRefusal(refusalToken(result.Reason), result.Detail)
 	}

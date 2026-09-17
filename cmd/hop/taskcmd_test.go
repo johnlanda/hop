@@ -180,3 +180,107 @@ func TestRunPlanClose(t *testing.T) {
 		}
 	})
 }
+
+// TestVerbsRenderTransientRunNotRunning pins the retryable shape of every
+// verb whose accepting transaction checks the run state: the transient
+// line alone on stdout, the store's value-free detail as one
+// "<verb>: <detail>" stderr line, exit 1, and no refusal token anywhere.
+func TestVerbsRenderTransientRunNotRunning(t *testing.T) {
+	instructions := filepath.Join(t.TempDir(), "instructions.md")
+	if err := os.WriteFile(instructions, []byte("do the thing"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	detail := app.RunNotRunningDetail("launching")
+	cases := []struct {
+		verb   string
+		script func(*fakeController)
+		run    func(stdout, stderr *bytes.Buffer, d *deps) (int, error)
+	}{
+		{
+			verb: "hop task create",
+			script: func(ctrl *fakeController) {
+				ctrl.createTask = func(app.CreateTaskRequest) (app.CreateTaskResult, error) {
+					return app.CreateTaskResult{Outcome: string(app.WorkflowTransient), Detail: detail}, nil
+				}
+			},
+			run: func(stdout, stderr *bytes.Buffer, d *deps) (int, error) {
+				return runTask([]string{"create", "--title", "x", "--file", instructions, "--request-id", "r1"}, stdout, stderr, d)
+			},
+		},
+		{
+			verb: "hop task retry",
+			script: func(ctrl *fakeController) {
+				ctrl.requestRetry = func(app.RequestRetryRequest) (app.RequestRetryResult, error) {
+					return app.RequestRetryResult{Outcome: string(app.WorkflowTransient), Detail: detail}, nil
+				}
+			},
+			run: func(stdout, stderr *bytes.Buffer, d *deps) (int, error) {
+				return runTask([]string{"retry", "--reason", "flaky", "task-9"}, stdout, stderr, d)
+			},
+		},
+		{
+			verb: "hop plan close",
+			script: func(ctrl *fakeController) {
+				ctrl.closePlan = func(app.ClosePlanRequest) (app.ClosePlanResult, error) {
+					return app.ClosePlanResult{Outcome: string(app.WorkflowTransient), Detail: detail}, nil
+				}
+			},
+			run: func(stdout, stderr *bytes.Buffer, d *deps) (int, error) {
+				return runPlan([]string{"close"}, stdout, stderr, d)
+			},
+		},
+		{
+			verb: "hop msg send",
+			script: func(ctrl *fakeController) {
+				ctrl.sendMessage = func(app.SendMessageRequest) (app.SendMessageResult, error) {
+					return app.SendMessageResult{Outcome: string(app.MessageTransient), Detail: detail}, nil
+				}
+			},
+			run: func(stdout, stderr *bytes.Buffer, d *deps) (int, error) {
+				return runMsg([]string{"send", "--to", "human", "--kind", "question", "--body", "q?"}, stdout, stderr, d)
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.verb, func(t *testing.T) {
+			ctrl := &fakeController{}
+			tc.script(ctrl)
+			td := newTestDeps(ctrl, managerEnv(), t.TempDir())
+			var stdout, stderr bytes.Buffer
+
+			code, err := tc.run(&stdout, &stderr, td.deps)
+			if err != nil {
+				t.Fatalf("write error: %v", err)
+			}
+			if code != exitFailure {
+				t.Errorf("exit code = %d, want %d", code, exitFailure)
+			}
+			if got, want := stdout.String(), "transient: run not yet running; retry\n"; got != want {
+				t.Errorf("stdout = %q, want %q", got, want)
+			}
+			if got, want := stderr.String(), tc.verb+": run is launching, not yet running\n"; got != want {
+				t.Errorf("stderr = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// TestWriteLinesAndExitCodes pins the worker-protocol exit mapping by
+// first line: success exits 0, a refusal or a transient line exits 1.
+func TestWriteLinesAndExitCodes(t *testing.T) {
+	for _, tt := range []struct {
+		first string
+		want  int
+	}{
+		{app.GrammarPlanClosedLine, exitOK},
+		{app.GrammarRefusalLine(app.GrammarReasonRunNotAccepting), exitFailure},
+		{app.GrammarTransientRunNotRunningLine, exitFailure},
+		{app.GrammarTransientUndeliveredLine, exitFailure},
+	} {
+		var stdout bytes.Buffer
+		code, err := writeLinesAndExit(&stdout, []string{tt.first, "detail"})
+		if err != nil || code != tt.want || stdout.String() != tt.first+"\ndetail\n" {
+			t.Errorf("writeLinesAndExit(%q) = %d, %v, stdout %q; want %d", tt.first, code, err, stdout.String(), tt.want)
+		}
+	}
+}

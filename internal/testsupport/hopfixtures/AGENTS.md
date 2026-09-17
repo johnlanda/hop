@@ -28,7 +28,7 @@ seeding library.
 
 | File | Entities / functions | Responsibility |
 | --- | --- | --- |
-| [hopfixtures.go](hopfixtures.go) | `Store`, `Base`, `Initialize`, `LaunchBase`, `ErrBaseAlreadyLaunched`, `RunBase`, `SeedLaunchClaim`, `SeedManager`, `SeedImplementTask`, `SeedReviewTask`, `SeedChildSession`, `SeedInterruptedAttempt`, `RunAttempt`, `SeedIntegratedTask`, `SeedAttemptWorktree`, `FinishRun` | String-typed seeding API: `Initialize` mirrors `InitializeRun`'s own initial reserved state; `LaunchBase`/`RunBase` drive a run's bootstrap task/attempt/session to launching, then fully running (binding, settled launch claim, running lifecycle transitions); `SeedManager` drives a run running with an active, bound manager session (call after `cmd/hop`'s own raw-SQL workflow freeze — see below); `SeedImplementTask`/`SeedReviewTask`/`SeedChildSession`/`RunAttempt` add worker/reviewer sessions bound to tasks and attempts; `SeedInterruptedAttempt` records a terminal prior attempt (the shape `hop task retry` accepts behind a needs-rework task); `SeedLaunchClaim` writes a launch claim under a caller-chosen pid without any lifecycle transition, so a real `hop launch` exec against the same identity observes a claim under a DIFFERENT pid than its own process — the real-binary proof of hop launch's claim-conflict refusal, reached without ever letting a launcher exec. Worktree retirement ([phase-3-worktree-retirement.md](../../../docs/plan/phase-3-worktree-retirement.md)): `SeedIntegratedTask` seeds an implement task whose result was accepted through `SubmitResult` and whose integration row was driven merging → checking → integrated over caller-given pre-merge and merge commits (the task left integrated); `SeedAttemptWorktree` records an attempt's worktree the way the assignment act does, as a succeeded `worktree.create` operation in the store's persisted JSON shape plus the linked row, in one unit of work; `FinishRun` drives a running run to completed, failed or stopped and releases its lease |
+| [hopfixtures.go](hopfixtures.go) | `Store`, `Base`, `Initialize`, `LaunchBase`, `ErrBaseAlreadyLaunched`, `RunBase`, `SeedLaunchClaim`, `SeedManager`, `SeedImplementTask`, `SeedReviewTask`, `SeedChildSession`, `SeedInterruptedAttempt`, `RunAttempt`, `SeedIntegratedTask`, `SeedAttemptWorktree`, `FinishRun`, `FeatureBase`, `InitializeFeature`, `LaunchManager`, `SettleManagerLaunch` | String-typed seeding API: `Initialize` mirrors `InitializeRun`'s own initial reserved state; `LaunchBase`/`RunBase` drive a run's bootstrap task/attempt/session to launching, then fully running (binding, settled launch claim, running lifecycle transitions); `SeedManager` drives a run running with an active, bound manager session (call after `cmd/hop`'s own raw-SQL workflow freeze — see below); `SeedImplementTask`/`SeedReviewTask`/`SeedChildSession`/`RunAttempt` add worker/reviewer sessions bound to tasks and attempts; `SeedInterruptedAttempt` records a terminal prior attempt (the shape `hop task retry` accepts behind a needs-rework task); `SeedLaunchClaim` writes a launch claim under a caller-chosen pid without any lifecycle transition, so a real `hop launch` exec against the same identity observes a claim under a DIFFERENT pid than its own process — the real-binary proof of hop launch's claim-conflict refusal, reached without ever letting a launcher exec. Worktree retirement ([phase-3-worktree-retirement.md](../../../docs/plan/phase-3-worktree-retirement.md)): `SeedIntegratedTask` seeds an implement task whose result was accepted through `SubmitResult` and whose integration row was driven merging → checking → integrated over caller-given pre-merge and merge commits (the task left integrated); `SeedAttemptWorktree` records an attempt's worktree the way the assignment act does, as a succeeded `worktree.create` operation in the store's persisted JSON shape plus the linked row, in one unit of work; `FinishRun` drives a running run to completed, failed or stopped and releases its lease. A freshly started feature run (LAUNCH-1's window): `InitializeFeature` goes through the store's feature `InitializeRun` with the caller's frozen workflow (a reserved manager, no task, attempt or worktree); `LaunchManager` commits the bootstrap's manager launch intent (run and manager launching, a pending `pane.open` naming the manager's incarnation) and then its recorded outcome (the binding, the operation succeeded); `SeedLaunchClaim` with no attempt then leaves the manager's claim `exec_pending`; `SettleManagerLaunch` applies the corroboration's commit (run running, claim execed with the occupant pid and marker, the binding observed, the manager active) |
 
 ## Invariants
 
@@ -57,7 +57,11 @@ seeding library.
   reason to know the driver exists at all, since its own `Store`
   parameter is satisfied structurally by whatever the caller opened.
   `SeedManager` must be called AFTER that freeze; it does not itself
-  touch the snapshot row.
+  touch the snapshot row. `InitializeFeature` is the other way to a
+  feature run: the store's own feature `InitializeRun` writes the
+  workflow it is given, and the caller's `IntegrationBranch` must name
+  the sequence the store assigns (`app.IntegrationBranchName(1)` in a
+  fresh state root).
 - `Store` composes exactly `app.StateStore` and `app.SubmissionStore` —
   the two port interfaces every fixture function needs (unit-of-work
   access, and the launcher's pre-exec claim write). The real
@@ -97,7 +101,9 @@ seeding library.
   (`go test ./cmd/hop -run TestGrammarContract` and the package's full
   suite), which is where a seeding defect would surface — there is
   nothing meaningful to assert about a fixture builder in isolation from
-  the real commands it sets up state for.
+  the real commands it sets up state for. The feature launch helpers are
+  pinned by `TestGrammarContractManagerVerbsWhileLaunching`, whose raw
+  read asserts the run, manager and claim states each helper leaves.
 
 ## Related guides
 
