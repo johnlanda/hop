@@ -450,7 +450,14 @@ sides together. `cmd/hop` never imports domain or identity types: every
   (`sessionIncarnationCurrentLocked`: the current binding, a disagreeing
   pending intent failing closed, else the session's newest pending intent
   with no binding row at all — `TestFakeStorePrincipalIncarnationRule`
-  runs the real store's verb-by-shape table against it),
+  runs the real store's verb-by-shape table against it), `LoadRunStatus`
+  resolves the session within the run (the feature manager, the solo
+  attempt's current session) and surfaces the claim the session launch
+  context resolves (`sessionLaunchIncarnationLocked` — binding, else
+  pending intent, none on a disagreement;
+  `TestFakeRunStatusResolvesTheLaunchContextClaim` mirrors the real
+  store's table, and `TestSoloCorroborationReadsAPreBindingClaim` proves
+  solo corroboration decides by that claim state),
   `ClaimCheckExec` requires a pending
   exec-claimable operation (`OperationKind.ExecClaimable`) of the current
   generation, and every Runtime, CommandRunner,

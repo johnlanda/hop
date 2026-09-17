@@ -493,32 +493,29 @@ func (s *fakeStore) LoadRunStatus(_ context.Context, runID identity.RunID) (app.
 	if w, ok := s.worktreeByRunLocked(runID); ok {
 		detail.WorktreePath = w.Path
 	}
-	if sessionID, binding, ok := s.currentBindingByAttemptLocked(attemptID); ok {
-		detail.SessionID = sessionID
-		b := binding
-		detail.Binding = &b
-		if claim, ok := s.LaunchClaims[binding.IncarnationID]; ok {
-			c := claim
-			detail.Claim = &c
-		}
-	} else if incarnation, sessionID, ok := s.pendingIntentLocked(attemptID); ok {
-		// Pre-binding: the pane.open outcome (and so the binding) has not
-		// committed yet, but the launcher may already have claimed against
-		// the pending intent's incarnation — surface that claim so the
-		// controller never needs a binding to see it.
-		detail.SessionID = sessionID
-		if claim, ok := s.LaunchClaims[incarnation]; ok {
-			c := claim
-			detail.Claim = &c
+	// The real store's session surface (sqlite LoadRunStatus): a feature
+	// run's current manager session, a solo run's attempt's current
+	// non-terminated session — each resolved within this run and
+	// independent of any binding — that session's current binding, and the
+	// claim of the incarnation its launch context resolves
+	// (sessionLaunchIncarnationLocked).
+	sessionID, hasSession := s.currentManagerOfRunLocked(runID)
+	if !s.Snapshots[runID].Workflow.Feature() {
+		sessionID, hasSession = "", false
+		if attemptID != "" {
+			sessionID, hasSession = s.currentSessionOfAttemptLocked(attemptID)
 		}
 	}
-	if detail.SessionID == "" {
-		// The attempt's current non-terminated session, independent of any
-		// binding: a reserved attempt has a session but no placement yet.
-		for id, sess := range s.Sessions {
-			if sess.value.AttemptID == attemptID && sess.value.State != run.SessionTerminated && sess.value.State != run.SessionLost {
-				detail.SessionID = id
-				break
+	if hasSession {
+		detail.SessionID = sessionID
+		if binding, ok := s.currentBindingLocked(sessionID); ok {
+			b := binding
+			detail.Binding = &b
+		}
+		if incarnation, ok := s.sessionLaunchIncarnationLocked(sessionID); ok {
+			if claim, ok := s.LaunchClaims[incarnation]; ok {
+				c := claim
+				detail.Claim = &c
 			}
 		}
 	}
@@ -659,28 +656,6 @@ func (s *fakeStore) worktreePathForAttemptLocked(runID identity.RunID, attemptID
 	return ""
 }
 
-func (s *fakeStore) currentBindingByAttemptLocked(attemptID identity.AttemptID) (identity.SessionID, run.RuntimeBinding, bool) {
-	for sessionID, history := range s.Bindings {
-		sess, ok := s.Sessions[sessionID]
-		if !ok || sess.value.AttemptID != attemptID {
-			continue
-		}
-		// Phase 2: at most one non-terminated session per attempt at any
-		// instant; a lost or terminated session's binding is history, not
-		// the attempt's current one, even though the binding row itself
-		// was never marked superseded (only the session ended).
-		if sess.value.State == run.SessionLost || sess.value.State == run.SessionTerminated {
-			continue
-		}
-		for i := len(history) - 1; i >= 0; i-- {
-			if !history[i].Superseded {
-				return sessionID, history[i], true
-			}
-		}
-	}
-	return "", run.RuntimeBinding{}, false
-}
-
 func (s *fakeStore) LoadFrozenRun(_ context.Context, runID identity.RunID) (app.FrozenRun, error) {
 	if err := s.refuseInsideTransaction("ReadStore.LoadFrozenRun"); err != nil {
 		return app.FrozenRun{}, err
@@ -747,6 +722,17 @@ func (s *fakeStore) ClaimLaunch(_ context.Context, claim app.LaunchClaim) error 
 	return nil
 }
 
+// currentManagerOfRunLocked resolves the run's non-terminated manager
+// session, as the real store's managerSession does.
+func (s *fakeStore) currentManagerOfRunLocked(runID identity.RunID) (identity.SessionID, bool) {
+	for id, row := range s.Sessions {
+		if row.value.RunID == runID && row.value.Role == run.RoleManager && sessionCurrent(&row.value) {
+			return id, true
+		}
+	}
+	return "", false
+}
+
 // currentSessionOfAttemptLocked resolves the attempt's non-terminated
 // session, as the real store's currentSession does.
 func (s *fakeStore) currentSessionOfAttemptLocked(attemptID identity.AttemptID) (identity.SessionID, bool) {
@@ -807,35 +793,29 @@ func (s *fakeStore) pendingSessionIntentLocked(sessionID identity.SessionID) (id
 	return newestInc, found
 }
 
-// pendingIntentLocked resolves the newest pending pane.open/launch.send
-// operation intent for the attempt: the incarnation and session it named.
-func (s *fakeStore) pendingIntentLocked(attemptID identity.AttemptID) (identity.IncarnationID, identity.SessionID, bool) {
-	var (
-		newest     time.Time
-		newestInc  identity.IncarnationID
-		newestSess identity.SessionID
-		found      bool
-	)
-	for _, op := range s.Operations { //nolint:gocritic // rangeValCopy: test fake; the journal is small and read-only here.
-		if op.State != app.OperationPending || (op.Kind != app.OpPaneOpen && op.Kind != app.OpLaunchSend) {
-			continue
-		}
-		intent, ok := decodePaneOpenIntent(op.Intent)
-		if !ok || intent.SessionID == "" {
-			continue
-		}
-		sess, ok := s.Sessions[identity.SessionID(intent.SessionID)]
-		if !ok || sess.value.AttemptID != attemptID {
-			continue
-		}
-		if !found || op.CreatedAt.After(newest) {
-			newest = op.CreatedAt
-			newestInc = identity.IncarnationID(intent.IncarnationID)
-			newestSess = identity.SessionID(intent.SessionID)
-			found = true
+// sessionLaunchIncarnationLocked mirrors the real store's one
+// launch-identity resolution (sqlite sessionLaunchIncarnation), which the
+// launch context and the status read model share: the session's current
+// binding's incarnation, else its newest pending launch intent's; a
+// binding and a pending intent that disagree, or a malformed intent
+// identity, resolve nothing.
+func (s *fakeStore) sessionLaunchIncarnationLocked(sessionID identity.SessionID) (identity.IncarnationID, bool) {
+	intent, hasIntent := s.pendingSessionIntentLocked(sessionID)
+	if hasIntent {
+		if _, err := identity.ParseIncarnationID(intent.String()); err != nil {
+			return "", false
 		}
 	}
-	return newestInc, newestSess, found
+	binding, hasBinding := s.currentBindingLocked(sessionID)
+	switch {
+	case hasBinding && hasIntent && intent != binding.IncarnationID:
+		return "", false
+	case hasBinding:
+		return binding.IncarnationID, true
+	case hasIntent:
+		return intent, true
+	}
+	return "", false
 }
 
 // checkOutcomeFields are the check outcome JSON keys the fake's status
