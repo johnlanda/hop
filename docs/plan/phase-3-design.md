@@ -1131,6 +1131,36 @@ rule) except `hop answer`, which is a human/controller-machine command.
 Validation orders are normative and mirror section 7 of the Phase 2
 design (receipt before eligibility):
 
+"Current incarnation", wherever a verb requires it, is ONE rule — the
+principal-incarnation rule — applied identically by `hop launch`'s claim,
+`task create`, `task retry`, `plan close`, `msg send`, `msg next`/`msg
+wait`, `msg ack`, `review submit` and `result submit` (solo and feature
+alike; a result submission resolves the attempt's non-terminated session
+first). The claimed incarnation is current for the session iff:
+
+- the session's committed, non-superseded binding carries it, and no
+  pending launch intent of the session names a different incarnation (a
+  binding and a pending intent that disagree fail closed, exactly as the
+  launch context does); or
+- the session has no binding row at all (a superseded row without a
+  successor retires its incarnation and disables this fallback), and the
+  session's newest pending `pane.open`/`launch.send` intent names it.
+
+The second branch is the claim's own pre-binding rule: the launcher is
+the pane's own command and can claim before the controller records the
+`pane.open` outcome, and a controller that dies between the act and that
+outcome leaves exactly this state. A live principal in it — manager or
+child — is therefore never refused `stale` for the missing binding; its
+verbs proceed normally, the run-state acceptance below still applying
+(`transient` while the run can still reach `running`). The change reaches
+the Phase 2 solo result submission too: a solo worker submitting before
+its binding is recorded is `transient`, the currency its own claim
+already had. The intent source is `pending` only, the claim's own: a
+`pane.open` recorded `reconciling` because its act returned an error
+after the launcher had already claimed is not read, so that principal is
+`stale` until label recovery commits the binding (LAUNCH-6, an accepted
+residual; widening it widens the claim rule with it).
+
 Every mutating verb here and in section 8 (`msg send`, `answer`,
 `task create`, `task retry`, `plan close`; `review submit` already has
 per-attempt digest idempotency) takes a caller-stable

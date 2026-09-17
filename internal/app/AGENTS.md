@@ -175,8 +175,9 @@ sides together. `cmd/hop` never imports domain or identity types: every
   `Commit` succeeds.
 - `pane.open`'s intent transaction carries `IncarnationID` and `SessionID` in
   its JSON payload under the stable keys `incarnation_id` and `session_id`:
-  `SubmissionStore.ClaimLaunch`'s pre-binding fallback matches against these
-  fields on the newest pending `pane.open` operation for the attempt.
+  the store's principal-incarnation rule (the claim's pre-binding
+  fallback, and every verb's) matches against these fields on the
+  session's newest pending `pane.open` operation.
   Persisted intents and outcomes are decoded only through
   `decodeOperationPayload`, never Go type identity, and callers validate
   required fields and fail closed on a failed decode.
@@ -442,8 +443,15 @@ sides together. `cmd/hop` never imports domain or identity types: every
   commit atomically), `SubmitResult` applies existence/agreement before
   receipts and moves the same row revisions the real acceptance and stop
   transactions do (`TestWorkerWritesMoveRevisions`), `ClaimLaunch`
-  enforces the stop/incarnation-currency/different-pid rules with the
-  pre-binding intent fallback, `ClaimCheckExec` requires a pending
+  enforces the stop/incarnation-currency/different-pid rules, every
+  caller-incarnation check (the claim, the plan verbs, message send, fetch
+  and ack, review and result submission) decides through ONE fake helper
+  mirroring the store's principal-incarnation rule
+  (`sessionIncarnationCurrentLocked`: the current binding, a disagreeing
+  pending intent failing closed, else the session's newest pending intent
+  with no binding row at all — `TestFakeStorePrincipalIncarnationRule`
+  runs the real store's verb-by-shape table against it),
+  `ClaimCheckExec` requires a pending
   exec-claimable operation (`OperationKind.ExecClaimable`) of the current
   generation, and every Runtime, CommandRunner,
   ProcessGroupInspector and ArtifactStore fake refuses any call made while

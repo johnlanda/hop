@@ -37,7 +37,7 @@ this package never resolves environment variables or defaults.
 | [messages.go](messages.go) | `parseAddress`, `scanMessage`, `getMessage`, `messagesByAddress`, `nextEnqueueSeq`, `insertMessage`, `messageDeliveries`, `messageAck`, `resolveSessionAddress` | Shared message row mapping: Message.State reconstructed from the delivery/ack rows in the same snapshot (never a persisted column), the per-(run, recipient) FIFO sequence, lineage-based address resolution |
 | [statestore.go](statestore.go) | `InitializeRun`, `AcquireLease`, `Heartbeat`, `ReleaseLease`, `Begin`, `validateLease` | The controller authority: run bootstrap in one transaction (the snapshot's workflow JSON round-tripped, NULL for solo; a feature spec inserts the run, snapshot, manager session and lease only, refusing `app.ErrFeatureRunSpecInvalid` before the transaction and `app.ErrRunSequenceMismatch` inside it), lease CAS with monotonic generations, fenced unit-of-work begin |
 | [uow.go](uow.go) | `unitOfWork` and the typed repositories (`Runs`…`CheckExecClaims`), `OperationRepository.Pending`/`ByKind`, `Commit`, `Rollback` | One immediate transaction per unit of work; optimistic-concurrency saves; append-only bindings and transitions; journal payloads persisted as uninterpreted JSON; controller-side launch-claim settlement |
-| [entities.go](entities.go) | `getRun`, `getTask`, `getAttempt`, `getSession`, `currentSession`, `currentBinding`, `getWorktree`, `scanWorktree`, `selectWorktreeColumns`, `getLaunchClaim`, `acceptedResult`, `incarnationCurrent`, `launchIncarnationCurrent`, `pendingLaunchIntent` | Row ↔ domain-value mapping shared by all three authorities through the `querier` interface (`getWorktree` and the listing's `scanWorktree` map NULL `attempt_id`/`base_commit` to the solo row's empty links; a worktree's `state` column is read verbatim, including the retirement states `removed`/`absent`/`released`) |
+| [entities.go](entities.go) | `getRun`, `getTask`, `getAttempt`, `getSession`, `currentSession`, `currentBinding`, `getWorktree`, `scanWorktree`, `selectWorktreeColumns`, `getLaunchClaim`, `acceptedResult`, `incarnationCurrent`, `sessionIncarnationCurrent`, `pendingLaunchIntentOfSession` | Row ↔ domain-value mapping shared by all three authorities through the `querier` interface; `sessionIncarnationCurrent` is the one principal-incarnation rule every caller-incarnation check decides through (see Invariants) (`getWorktree` and the listing's `scanWorktree` map NULL `attempt_id`/`base_commit` to the solo row's empty links; a worktree's `state` column is read verbatim, including the retirement states `removed`/`absent`/`released`) |
 | [submission.go](submission.go) | `SubmitResult`, `RecordMalformed`, `ClaimLaunch`, `SettleLaunchFailure`, `ClaimCheckExec`, `RequestStop`, `insertReceipt` | The worker authority: the section 7 validation order with the domain's `AcceptResult` inside one transaction, receipts for every outcome, the pre-exec claim contracts, the monotonic stop request |
 | [readstore.go](readstore.go) | `ListRuns`, `LoadRunStatus`, `LoadFrozenRun`, `LoadCheckExecutionContext`, `lastCheckSummary`, `retirementIntentExecution` | Lease-free reads, each inside one deferred read transaction for a consistent WAL snapshot; `LoadRunStatus` carries the snapshot's frozen `TargetBranch` and the run's `worktrees_retired_at` fact, and for a feature run `featureWorktreeDetail` adds every worktree row (oldest first, non-nil) and the run's `worktree.retire` operations (newest first, through the shared `operationsByKind`) |
 | [worktreeretirement_read.go](worktreeretirement_read.go) | `Store` as `app.RetirementReadStore`: `ListRetirementCandidates`, `terminalUnretiredRuns`, `retirementCandidateRecord`, `collectIntegrations` | The worktree-retirement triage read, in one read transaction. It returns the repository's completed, failed and stopped runs whose fact is unset, whose frozen workflow is feature mode with a target, and that integrated at least one row adding content, in sequence order. Each record carries its integrated rows (oldest first), its `retirement.check` operations (newest first) and whether any `retirement.check` or `worktree.retire` is pending or reconciling. An unknown root has no candidates |
@@ -106,21 +106,21 @@ this package never resolves environment variables or defaults.
   same-pid retry on the same tuple is accepted only while the claim is
   exec_pending and its executable and argv digest match. It refreshes
   only seed_evidence to the retry's outcome; all invocation identity
-  fields remain unchanged, and settled claims refuse retries. Currency:
-  the
-  attempt's current session's current binding decides when one exists;
-  before ANY binding row exists for that session (the launcher is the
-  pane's own command and can claim before the controller records the
-  pane.open outcome), the authority is the run's newest pending launch
-  operation (kind pane.open or launch.send), whose intent JSON must carry
-  BOTH the claim's incarnation and the current session's id under the keys
+  fields remain unchanged, and settled claims refuse retries. Currency is
+  the principal-incarnation rule below: the session's current binding
+  decides when one exists (a pending intent naming another incarnation
+  fails it closed); before ANY binding row exists for that session (the
+  launcher is the pane's own command and can claim before the controller
+  records the pane.open outcome), the authority is the session's newest
+  pending launch operation (kind pane.open or launch.send), whose intent
+  JSON carries the claim's incarnation and the session's id under the keys
   `incarnation_id` and `session_id` — a documented contract between the
   application (which commits the intent before dispatching the pane
-  request) and this store (which reads them with `json_extract`). The
-  session conjunct keeps a retired incarnation's still-pending old intent
-  from authorizing a claim after a cold relaunch replaces the session, and
-  a superseded binding without a successor retires the incarnation: any
-  existing binding row disables the intent fallback.
+  request) and this store (which reads them with `json_extract`). Keying
+  the intent to the session keeps a retired incarnation's still-pending old
+  intent from authorizing a claim after a cold relaunch replaces the
+  session, and a superseded binding without a successor retires the
+  incarnation: any existing binding row disables the intent fallback.
   `LaunchClaims().Settle` moves exec_pending to execed or exec_failed only,
   idempotent per target state. `ClaimCheckExec` requires a pending
   operation whose kind `app.OperationKind.ExecClaimable` accepts
@@ -151,6 +151,21 @@ this package never resolves environment variables or defaults.
   fails closed with `app.ErrNotFound`; slice 6 deleted the Phase 2
   run-keyed `LoadLaunchContext`, so this is the only launch-context read
   now — every role, the permanent solo shim included.
+- One principal-incarnation rule (`sessionIncarnationCurrent`,
+  docs/plan/phase-3-design.md section 7) decides every caller-incarnation
+  check: `ClaimLaunch`, `CreateTask`/`RequestRetry`/`ClosePlan`
+  (`requireManagerCaller`), `SendMessage`, `FetchNextMessage`,
+  `AckMessage`, `SubmitReview` and `SubmitResult` (through
+  `incarnationCurrent`, which resolves the attempt's non-terminated session
+  first — solo included). Current means: the session's current binding
+  carries the incarnation and no pending launch intent of the session names
+  another one (a disagreement fails closed); or no binding row exists at
+  all and the session's newest PENDING launch intent names it. A principal
+  whose pane.open outcome was never recorded therefore proceeds normally
+  (the run-state rule still applies); a superseded binding without a
+  successor stays stale. The intent source is `pending` only, so a
+  pane.open recorded reconciling after its launcher claimed leaves the
+  principal stale until label recovery binds it (LAUNCH-6, accepted).
 - Worker-authority request idempotency is receipt-first: every mutating
   messaging/plan verb resolves the (run, verb, request ID) acceptance key
   before anything else — an identical retry returns the original outcome
@@ -231,8 +246,9 @@ this package never resolves environment variables or defaults.
   two receipts and one check request; `ClaimLaunch` idempotence,
   different-pid rejection (raced), run/attempt agreement (mixed tuples
   refused before and after the owner stops), the pre-binding intent
-  fallback (matching intent accepted, stale incarnation refused, binding
-  precedence, supersession retirement, replacement-session refusal);
+  fallback (matching intent accepted, stale incarnation refused, a binding
+  and a differing intent failing closed, supersession retirement,
+  replacement-session refusal);
   `SettleLaunchFailure` and controller settlement transitions;
   `ClaimCheckExec` generation/kind/state matrix; monotonic `RequestStop`;
   the read-store loads (`LoadFrozenRun`; the session-keyed launch-context
@@ -277,7 +293,13 @@ this package never resolves environment variables or defaults.
   (`TestClaimLaunchSessionKeyedIntents` — B2 —
   `TestClaimLaunchByAttemptResolvesSession`,
   `TestClaimLaunchManagerSession`,
-  `TestClaimCheckExecAcceptsMergeOperations`); the Phase 3 reads
+  `TestClaimCheckExecAcceptsMergeOperations`); the one
+  principal-incarnation rule (`TestPrincipalIncarnationRule` — task
+  create, task retry, plan close, message send, fetch and ack, the launch
+  claim, review and result submission, each against a committed binding,
+  a pending intent only, a disagreeing binding and intent, and a
+  superseded binding — `TestPrincipalIncarnationPendingIntentKeepsRunStateRule`
+  and the solo `TestPrincipalIncarnationSoloResult`); the Phase 3 reads
   (`TestLoadSessionLaunchContext` — worktree rows written through the
   production repository, including the one-unlinked-row fallback and the
   several-unlinked-rows refusal — `TestLoadMessagingContext`,
