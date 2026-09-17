@@ -80,10 +80,18 @@ type IntegrationView struct {
 
 // GuardShortfallView is one unmet completion guard, rendered verbatim from
 // EvaluateReadiness's missing list. TaskID is "" except for
-// "task-not-integrated".
+// "task-not-integrated". ReviewID, SubjectCommitOID and ReasonsPath are ""
+// except for "verdict-rejected", where they identify exactly which review
+// is being reported — the controller notice a caller fetches for it names
+// no verdict, so a caller correlates by comparing ReasonsPath (computed
+// the same way the accepting transaction's own notice body is) against
+// the fetched notice's body path (STATUS-1's manager verdict channel).
 type GuardShortfallView struct {
-	Kind   string
-	TaskID string
+	Kind             string
+	TaskID           string
+	ReviewID         string
+	SubjectCommitOID string
+	ReasonsPath      string
 }
 
 // MailboxView is one recipient address's queue condition: section 7's
@@ -286,6 +294,11 @@ func runDetailView(d RunDetail) RunDetailView { //nolint:gocritic // hugeParam: 
 		gv := GuardShortfallView{Kind: string(s.Kind)}
 		if s.Kind == run.ShortfallTaskNotIntegrated {
 			gv.TaskID = s.TaskID.String()
+		}
+		if s.Kind == run.ShortfallVerdictRejected {
+			gv.ReviewID = s.ReviewID.String()
+			gv.SubjectCommitOID = s.SubjectCommitOID
+			gv.ReasonsPath = reviewReasonsPath(d.StateRoot, d.RunID, s.ReviewID)
 		}
 		view.GuardShortfalls = append(view.GuardShortfalls, gv)
 	}

@@ -28,10 +28,17 @@ const (
 )
 
 // GuardShortfall is one reason EvaluateReadiness is not satisfied, in the
-// shape RunDetail renders verbatim in status output.
+// shape RunDetail renders verbatim in status output. ReviewID and
+// SubjectCommitOID are set only for ShortfallVerdictRejected — the one
+// shortfall kind a caller must correlate against a specific review to
+// act on correctly (STATUS-1's manager verdict channel): a controller
+// notice names no verdict, so the shortfall itself must name which
+// review it is reporting, not just that the latest one was a reject.
 type GuardShortfall struct {
-	Kind   ShortfallKind
-	TaskID identity.TaskID
+	Kind             ShortfallKind
+	TaskID           identity.TaskID
+	ReviewID         identity.ReviewID
+	SubjectCommitOID string
 }
 
 // CheckReceipt is the settled outcome of the combined-candidate check
@@ -72,6 +79,21 @@ type GuardContext struct {
 // commit and tree object IDs equal that same head. ready is true only
 // when missing is empty; missing lists every unsatisfied guard, not just
 // the first.
+//
+// The verdict guard checks SUBJECT CURRENCY BEFORE the verdict value: a
+// latest review whose subject differs from the head is
+// ShortfallVerdictStaleSubject whether it approved or rejected — an old
+// review, of either verdict, says nothing about the current candidate —
+// and ShortfallVerdictRejected means specifically a reject of the
+// CURRENT head. Reordering this the other way would let a rejected
+// review of a long-superseded head keep reporting "rejected" forever,
+// resurrecting feedback a later integration already addressed (a fix
+// task's own new review, once accepted, is the only review that can
+// clear it). ShortfallVerdictRejected alone carries the review's own
+// identity and subject (GuardShortfall.ReviewID/SubjectCommitOID): the
+// controller notice a caller fetches for it names no verdict, so the
+// shortfall itself is the only place that names WHICH review is being
+// reported.
 func EvaluateReadiness(ctx GuardContext) (ready bool, missing []GuardShortfall) { //nolint:gocritic // hugeParam: GuardContext is an application-assembled value passed by value throughout this package, mirroring AcceptanceContext.
 	if !ctx.PlanClosed {
 		missing = append(missing, GuardShortfall{Kind: ShortfallPlanOpen})
@@ -87,10 +109,12 @@ func EvaluateReadiness(ctx GuardContext) (ready bool, missing []GuardShortfall) 
 	switch {
 	case ctx.LatestReview == nil:
 		missing = append(missing, GuardShortfall{Kind: ShortfallVerdictMissing})
-	case ctx.LatestReview.Verdict != VerdictApprove:
-		missing = append(missing, GuardShortfall{Kind: ShortfallVerdictRejected})
 	case ctx.LatestReview.SubjectCommitOID != ctx.HeadCommitOID || ctx.LatestReview.SubjectTreeOID != ctx.HeadTreeOID:
 		missing = append(missing, GuardShortfall{Kind: ShortfallVerdictStaleSubject})
+	case ctx.LatestReview.Verdict != VerdictApprove:
+		missing = append(missing, GuardShortfall{
+			Kind: ShortfallVerdictRejected, ReviewID: ctx.LatestReview.ID, SubjectCommitOID: ctx.LatestReview.SubjectCommitOID,
+		})
 	}
 
 	return len(missing) == 0, missing

@@ -338,7 +338,8 @@ func TestRunStatusDetail(t *testing.T) {
 // TestRunStatusFeatureDetailBlock pins every section 10 feature-mode
 // detail line renderRunDetail renders: the task table (with dependencies,
 // attempt count and worktree), the latest integration, guard shortfalls
-// (one naming a task, one — verdict-rejected — that never does), the
+// (one naming a task, one — verdict-rejected — naming a review's own id,
+// subject and reasons path instead, per Astra F3), the
 // section 7 per-mailbox attention lines (in-flight-only, queued-only, a
 // task and a human address, attention with a known live-session binding,
 // attention with a live address but no known binding, and one mailbox
@@ -356,6 +357,7 @@ func TestRunStatusFeatureDetailBlock(t *testing.T) {
 		mgrSessionID  = "70000000-0000-4000-8000-000000000007"
 		implSessionID = "80000000-0000-4000-8000-000000000008"
 		revSessionID  = "90000000-0000-4000-8000-000000000009"
+		rejectedID    = "a0000000-0000-4000-8000-00000000000a"
 	)
 	detail := &app.RunDetailView{
 		RunSummaryView: app.RunSummaryView{RunID: testRunID, Sequence: 1, State: "running"},
@@ -370,7 +372,7 @@ func TestRunStatusFeatureDetailBlock(t *testing.T) {
 		},
 		GuardShortfalls: []app.GuardShortfallView{
 			{Kind: "task-not-integrated", TaskID: t2ID},
-			{Kind: "verdict-rejected"},
+			{Kind: "verdict-rejected", ReviewID: rejectedID, SubjectCommitOID: "rejectedhead", ReasonsPath: "/state/runs/r1/reviews/" + rejectedID},
 		},
 		Mailboxes: []app.MailboxView{
 			{Address: "task:" + t2ID, InFlightMessageID: inFlightID, InFlightAge: 5 * time.Minute, AddressLive: true, Attention: true},
@@ -418,7 +420,7 @@ func TestRunStatusFeatureDetailBlock(t *testing.T) {
 		"  task t3 " + t3ID + ": kind=review state=completed deps=(none) attempts=1 worktree=/worktrees/r1/t3a1",
 		"  integration " + integID + ": task=t1 state=integrated source=src1 premerge=pre1 merge=merge1",
 		"  shortfall: task-not-integrated t2 " + t2ID,
-		"  shortfall: verdict-rejected",
+		"  shortfall: verdict-rejected review=" + rejectedID + " subject=rejectedhead reasons=/state/runs/r1/reviews/" + rejectedID,
 		"  attention: messages pending for task:" + t2ID + " (t2): in-flight 5m0s (message " + inFlightID + ")",
 		"    action:      open ws2/tab2/pane2 and check that the agent is following its polling instructions",
 		"  attention: messages pending for manager: queued 1, oldest 10m0s",
@@ -473,6 +475,36 @@ func TestRunStatusFeatureDetailNeverForgesALine(t *testing.T) {
 	}
 	if !strings.Contains(out, "body: "+strconv.Quote(hostilePath)) {
 		t.Errorf("output does not render the hostile body path quoted; got:\n%q", out)
+	}
+}
+
+// TestRunStatusVerdictRejectedHostileReasonsPathNeverForgesALine proves
+// F2's escaping composes with F3's review-carrying shortfall line: a
+// hostile reasons path (the one field a manager-authored reasons file's
+// own storage location could carry unescaped bytes through) renders
+// quoted, never raw, in the shortfall line itself.
+func TestRunStatusVerdictRejectedHostileReasonsPathNeverForgesALine(t *testing.T) {
+	hostileReasons := "/state/reviews/\x1b[2J\n  shortfall: task-not-integrated t9 evil\nid"
+	detail := &app.RunDetailView{
+		Mode: "feature",
+		GuardShortfalls: []app.GuardShortfallView{
+			{Kind: "verdict-rejected", ReviewID: "11111111-1111-4111-8111-111111111111", SubjectCommitOID: "headoid", ReasonsPath: hostileReasons},
+		},
+	}
+	var stdout bytes.Buffer
+	if _, err := renderRunDetail(&stdout, detail); err != nil {
+		t.Fatalf("renderRunDetail() error = %v", err)
+	}
+	out := stdout.String()
+
+	if strings.Contains(out, "\x1b") {
+		t.Errorf("output contains a raw ESC byte:\n%q", out)
+	}
+	if strings.Contains(out, "\n  shortfall: task-not-integrated t9 evil\n") {
+		t.Errorf("output contains a forged shortfall line:\n%q", out)
+	}
+	if !strings.Contains(out, "reasons="+strconv.Quote(hostileReasons)) {
+		t.Errorf("output does not render the hostile reasons path quoted; got:\n%q", out)
 	}
 }
 

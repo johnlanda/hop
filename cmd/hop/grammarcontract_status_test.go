@@ -14,15 +14,23 @@ import (
 // TestGrammarContractStatusFeatureDetailSections drives hop status -run's
 // section 10/section 7 feature-mode detail block through the built binary
 // end to end: a shortfall naming a task (task-not-integrated, an implement
-// task seeded ready) alongside one that never names a task
-// (verdict-rejected, produced by a REAL hop review submit --verdict
-// reject), a mailbox attention line (a REAL hop msg send left queued and
-// undelivered), and a pending human question with its exact hop answer
-// invocation. Crossing the run's frozen [messages] attention_after
-// threshold to also prove the nested action line and the listing's
-// "blocked, needs attention" marker is left to the in-process unit tests
-// (cmd/hop's own TestRunStatusFeatureDetailBlock and internal/app's
-// fake-store TestStatusMailboxesAndAttention): this suite has no seam to
+// task seeded ready), a mailbox attention line (a REAL hop msg send left
+// queued and undelivered), and a pending human question with its exact
+// hop answer invocation. A REAL hop review submit --verdict reject runs
+// too, but this fixture never records a matching integration for the
+// reviewed subject, so EvaluateReadiness correctly reports
+// verdict-stale-subject here (Astra F3(a): subject currency is checked
+// before the verdict value) — the review-carrying verdict-rejected shape
+// (its id, subject and reasons path) is exercised at the read-model
+// layer instead, by internal/app's TestStatusVerdictRejectedShortfallCorrelation,
+// which controls the fake git's tree resolution to make the review's
+// subject match a recorded integration exactly; hopfixtures has no
+// integration-seeding helper this suite could reuse for that shape.
+// Crossing the run's frozen [messages] attention_after threshold to also
+// prove the nested action line and the listing's "blocked, needs
+// attention" marker is left to the in-process unit tests (cmd/hop's own
+// TestRunStatusFeatureDetailBlock and internal/app's fake-store
+// TestStatusMailboxesAndAttention): this suite has no seam to
 // fast-forward the exec'd binary's own wall clock, and the attention
 // LINE itself (this test's concern) renders unconditionally on a
 // non-empty queue regardless of age.
@@ -57,7 +65,7 @@ func TestGrammarContractStatusFeatureDetailSections(t *testing.T) {
 	for _, want := range []string{
 		"task t7710 " + impl.TaskID + ": kind=implement state=ready",
 		"shortfall: task-not-integrated t7710 " + impl.TaskID,
-		"shortfall: verdict-rejected",
+		"shortfall: verdict-stale-subject",
 		"attention: messages pending for task:" + impl.TaskID + " (t7710): queued 1, oldest ",
 		"question " + questionID,
 		"hop answer " + questionID + " --file <path>",
@@ -65,6 +73,9 @@ func TestGrammarContractStatusFeatureDetailSections(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("status -run output missing %q; got:\n%s", want, out)
 		}
+	}
+	if strings.Contains(out, "shortfall: verdict-rejected") {
+		t.Errorf("status -run output reports verdict-rejected for a review of a head no integration recorded; want verdict-stale-subject only:\n%s", out)
 	}
 }
 

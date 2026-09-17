@@ -2,6 +2,7 @@ package app_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -232,6 +233,145 @@ func containsShortfall(shortfalls []app.GuardShortfallView, kind string) bool {
 		}
 	}
 	return false
+}
+
+// shortfallOf finds shortfalls' entry of kind, failing the test if absent.
+func shortfallOf(t *testing.T, shortfalls []app.GuardShortfallView, kind string) app.GuardShortfallView {
+	t.Helper()
+	for _, s := range shortfalls {
+		if s.Kind == kind {
+			return s
+		}
+	}
+	t.Fatalf("shortfalls = %+v, want %s among them", shortfalls, kind)
+	return app.GuardShortfallView{}
+}
+
+// TestStatusVerdictRejectedShortfallCorrelation exercises STATUS-1's
+// manager verdict channel end to end at the read-model layer (Astra F3):
+// a real hop review submit --verdict reject through SubmitReviewVerdict
+// writes the controller notice (body = the reasons artifact path) in the
+// same transaction as the review row, and hop status's verdict-rejected
+// shortfall must name EXACTLY that review — its id, subject commit and
+// reasons path — so a manager comparing a fetched notice's body path
+// against the shortfall's reasons path can tell whether that notice IS
+// this rejection. The reasons path is scoped by review id
+// (".../reviews/<review-id>"), so a different review — hence any
+// unrelated notice, which is never shaped like this review's own
+// reasons path — can never collide with it (the "no second fix"
+// guarantee). Once a fix integrates a new head, the same review becomes
+// stale-subject, not rejected, clearing the correlation fields (F3(a)'s
+// reordering, proven end to end through the read model this time, not
+// just the domain function in isolation).
+func TestStatusVerdictRejectedShortfallCorrelation(t *testing.T) {
+	rf := newReviewFixture(t)
+
+	// The guard compares commit AND tree object IDs together, and the
+	// completion guard's head collapses both to one Integration.MergeCommitOID
+	// (no separate tree field, by design) — so a review can only ever
+	// match "the current head" when ITS OWN subject commit and tree are
+	// equal. newReviewFixture's review task is frozen with DIFFERENT
+	// commit and tree (rf.SubjectCommit and the fake git's constant
+	// fakeSubjectTree) precisely so other tests never accidentally
+	// depend on a match; widen just this task's frozen subject tree to
+	// equal its commit, and script this one subject's git tree
+	// resolution to match, so a real hop review submit (through
+	// SubmitReviewVerdict, exactly as production runs it) accepts a
+	// review whose commit and tree are both rf.SubjectCommit.
+	task := rf.tc.Store.Tasks[rf.TaskID]
+	task.value.SubjectTreeOID = rf.SubjectCommit
+	rf.tc.Commands.Results["/usr/bin/git -C /repo rev-parse "+rf.SubjectCommit+"^{tree}"] = app.CommandResult{
+		ExitCode: 0, Stdout: []byte(rf.SubjectCommit + "\n"),
+	}
+
+	integrationID, err := identity.ParseIntegrationID(rf.tc.IDs.NewID())
+	if err != nil {
+		t.Fatalf("parse integration id: %v", err)
+	}
+	resultID, err := identity.ParseResultID(rf.tc.IDs.NewID())
+	if err != nil {
+		t.Fatalf("parse result id: %v", err)
+	}
+	now := rf.tc.Clock.Now()
+	integ := run.NewIntegration(integrationID, rf.fr.RunID, rf.TaskID, resultID, rf.SubjectCommit, "premerge-oid", now)
+	if integ, err = integ.EnterChecking(rf.SubjectCommit, now); err != nil {
+		t.Fatalf("EnterChecking() error = %v", err)
+	}
+	if integ, err = integ.Integrate(now); err != nil {
+		t.Fatalf("Integrate() error = %v", err)
+	}
+	rf.tc.Store.Integrations[integrationID] = &entityRow[run.Integration]{value: integ, revision: 1}
+
+	result := rf.submit(t, "reject", rf.SubjectCommit, []byte("looks wrong"))
+	if result.Outcome != string(app.ReviewAccepted) {
+		t.Fatalf("submit reject: result = %+v, want accepted", result)
+	}
+
+	view := mustStatusDetail(t, rf.tc, rf.fr.RunID)
+	shortfall := shortfallOf(t, view.GuardShortfalls, "verdict-rejected")
+	if shortfall.ReviewID != result.ReviewID || shortfall.SubjectCommitOID != rf.SubjectCommit || shortfall.ReasonsPath == "" {
+		t.Fatalf("verdict-rejected shortfall = %+v, want ReviewID %s SubjectCommitOID %s", shortfall, result.ReviewID, rf.SubjectCommit)
+	}
+	if !strings.HasSuffix(shortfall.ReasonsPath, "/reviews/"+shortfall.ReviewID) {
+		t.Fatalf("reasons path = %q, want it scoped by this review's own id (no other review's notice can ever share it)", shortfall.ReasonsPath)
+	}
+
+	// The manager fetches the controller notice: its body path must equal
+	// the shortfall's reasons path exactly — the correlating case, where
+	// planning exactly one fix task is correct.
+	fetch, err := rf.tc.Controller.FetchMessage(context.Background(), app.FetchMessageRequest{
+		RunID: rf.fr.RunID.String(), SessionID: rf.fr.ManagerID.String(), IncarnationID: rf.fr.ManagerIncarnation.String(),
+	})
+	if err != nil {
+		t.Fatalf("FetchMessage() error = %v", err)
+	}
+	if !fetch.Delivered || fetch.BodyPath != shortfall.ReasonsPath {
+		t.Fatalf("controller notice body = %q delivered=%v, want it to equal the shortfall's reasons path %q", fetch.BodyPath, fetch.Delivered, shortfall.ReasonsPath)
+	}
+
+	// A fix integrates a new head (a second integration row, settled
+	// later — guardShortfallsLocked picks the newest INTEGRATED row by
+	// UpdatedAt): the
+	// same review's subject is now stale, so the shortfall flips to
+	// stale-subject and carries neither a review id nor a reasons path —
+	// there is nothing to act on for it any more, in either direction.
+	fixIntegrationID, err := identity.ParseIntegrationID(rf.tc.IDs.NewID())
+	if err != nil {
+		t.Fatalf("parse fix integration id: %v", err)
+	}
+	fixResultID, err := identity.ParseResultID(rf.tc.IDs.NewID())
+	if err != nil {
+		t.Fatalf("parse fix result id: %v", err)
+	}
+	later := now.Add(time.Minute)
+	fixIntegration := mustReintegrateAt(t, fixIntegrationID, rf.fr.RunID, rf.TaskID, fixResultID, "fixed-head-oid", later)
+	rf.tc.Store.Integrations[fixIntegrationID] = &entityRow[run.Integration]{value: fixIntegration, revision: 1}
+
+	view = mustStatusDetail(t, rf.tc, rf.fr.RunID)
+	if containsShortfall(view.GuardShortfalls, "verdict-rejected") {
+		t.Fatalf("GuardShortfalls = %+v, want no verdict-rejected once the head has moved", view.GuardShortfalls)
+	}
+	stale := shortfallOf(t, view.GuardShortfalls, "verdict-stale-subject")
+	if stale.ReviewID != "" || stale.SubjectCommitOID != "" || stale.ReasonsPath != "" {
+		t.Fatalf("verdict-stale-subject shortfall = %+v, want no review-correlation fields", stale)
+	}
+}
+
+// mustReintegrateAt builds a fresh, already-integrated Integration row at
+// a new head object id, standing in for "a fix landed a new candidate" —
+// a second integration row a real run would create through DriveIntegration,
+// simplified here to the read model's own construction helper.
+func mustReintegrateAt(t *testing.T, id identity.IntegrationID, runID identity.RunID, taskID identity.TaskID, resultID identity.ResultID, headOID string, now time.Time) run.Integration {
+	t.Helper()
+	integ := run.NewIntegration(id, runID, taskID, resultID, headOID, "premerge-2", now)
+	integ, err := integ.EnterChecking(headOID, now)
+	if err != nil {
+		t.Fatalf("EnterChecking() error = %v", err)
+	}
+	if integ, err = integ.Integrate(now); err != nil {
+		t.Fatalf("Integrate() error = %v", err)
+	}
+	return integ
 }
 
 func TestStatusMailboxesAndAttention(t *testing.T) {

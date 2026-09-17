@@ -296,6 +296,10 @@ func featureDetailLines(detail *app.RunDetailView) []string {
 	}
 
 	for _, s := range detail.GuardShortfalls {
+		if s.Kind == app.GrammarShortfallVerdictRejected {
+			lines = append(lines, "  "+app.GrammarVerdictRejectedLine(s.ReviewID, s.SubjectCommitOID, safeRenderExternal(s.ReasonsPath)))
+			continue
+		}
 		taskLabel := ""
 		if s.TaskID != "" {
 			taskLabel = taskLabelFor(s.TaskID, labels)

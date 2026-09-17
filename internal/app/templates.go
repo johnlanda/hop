@@ -201,12 +201,17 @@ controller info notice, run:
 
     %s status -C %s -run %s
 
-and read its shortfall lines. A shortfall naming verdict-rejected means
-the last review was rejected: read the reasons file the notice named,
-then plan a fix task from it — integrating it produces a new head, which
-gets its own new review task. A needs-rework task notice already carries
-its own retry path (%s task retry <task-uuid> --reason "<why>"); this
-channel is for verdicts, which commit no task-state notice of their own.
+and read its shortfall lines. A shortfall naming verdict-rejected names
+its own review's id, subject commit and reasons path — never just "the
+latest review", since an older rejection stays reported only until a
+fix's new head gets its own new review. Compare that reasons path
+against the notice you just fetched: EQUAL means this notice IS that
+review's rejection — plan exactly one fix task for it, from the reasons
+it names. DIFFERENT (or no verdict-rejected line at all) means the
+notice is not this shortfall; act on the notice itself instead — a
+needs-rework notice already carries its own retry path (%s task retry
+<task-uuid> --reason "<why>") — and never plan a second fix from the
+same shortfall once its path has already matched a notice you acted on.
 `,
 		f.RunID, f.Brief, f.AssignmentPath, f.RolePath, f.CribPath,
 		f.HOPPath, f.HOPPath, f.HOPPath, f.HOPPath, f.HOPPath, f.HOPPath,

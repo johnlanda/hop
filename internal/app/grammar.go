@@ -344,12 +344,29 @@ const GrammarShortfallVerdictRejected = "verdict-rejected"
 // (section 10): the kind token exactly as the domain defines it, plus the
 // task's label AND uuid when the shortfall names a task
 // (task-not-integrated) — taskLabel is "" for every other shortfall kind.
+// verdict-rejected carries its own review identity instead: see
+// GrammarVerdictRejectedLine.
 func GrammarShortfallLine(kind, taskLabel, taskID string) string {
 	line := "shortfall: " + kind
 	if taskLabel != "" {
 		line += " " + taskLabel + " " + taskID
 	}
 	return line
+}
+
+// GrammarVerdictRejectedLine renders the one shortfall kind that names a
+// specific review rather than a task: the review's id and subject commit,
+// then — last, since a path may contain spaces — its reasons artifact
+// path, already resolved by the caller to the exact path the accepting
+// transaction used as the controller notice's own body (templates.go's
+// reviewReasonsPath) and already rendered safe by the caller's F2
+// rendering boundary. A caller correlates this shortfall to a fetched
+// controller notice by comparing reasonsPath against the notice's own
+// body path (STATUS-1's manager verdict channel): the notice names no
+// verdict, so this line is the only place a review's rejection and its
+// identity are stated together.
+func GrammarVerdictRejectedLine(reviewID, subjectCommitOID, safeReasonsPath string) string {
+	return "shortfall: " + GrammarShortfallVerdictRejected + " review=" + reviewID + " subject=" + subjectCommitOID + " reasons=" + safeReasonsPath
 }
 
 // GrammarQuestionLine renders one pending human-addressed question
