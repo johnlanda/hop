@@ -135,12 +135,33 @@ type managerAssignmentFields struct {
 	RepositoryRoot string
 }
 
+// posixShellQuote renders s as a single POSIX shell word: wrapped in
+// single quotes, each embedded single quote closed, escaped and reopened
+// ('\”), the standard POSIX technique and the only one that neutralizes
+// every shell metacharacter (spaces, $(...), backticks, semicolons,
+// newlines) with no exceptions. Used only for the verdict-channel
+// instruction's concrete arguments (hop path, repository root, run id):
+// a repository root or an installation path can legitimately contain a
+// space, and this run's id and repository root are otherwise the only
+// arguments in this file interpolated into shell syntax rather than a
+// plain instruction sentence. Every other verb line's argument
+// placeholders (<task-uuid>, <message-uuid>, ...) stay unquoted,
+// exactly as before: those are literal placeholders a human or agent
+// retypes, never a frozen run fact substituted in here, and they are
+// pinned prompt goldens a later slice parses byte for byte.
+func posixShellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
 // renderManagerAssignment renders the manager's brief assignment
 // artifact: the brief, the two companion artifacts by absolute path, and
 // the manager's verb surface quoted from the grammar constants. Pure and
 // deterministic like renderAssignment, whose solo shape it deliberately
 // does not touch.
 func renderManagerAssignment(f *managerAssignmentFields) []byte {
+	hopPath := posixShellQuote(f.HOPPath)
+	repositoryRoot := posixShellQuote(f.RepositoryRoot)
+	runID := posixShellQuote(f.RunID)
 	return fmt.Appendf(nil, `# HOP Manager Assignment
 
 Run: %s
@@ -189,7 +210,7 @@ channel is for verdicts, which commit no task-state notice of their own.
 `,
 		f.RunID, f.Brief, f.AssignmentPath, f.RolePath, f.CribPath,
 		f.HOPPath, f.HOPPath, f.HOPPath, f.HOPPath, f.HOPPath, f.HOPPath,
-		f.HOPPath, f.RepositoryRoot, f.RunID, f.HOPPath)
+		hopPath, repositoryRoot, runID, f.HOPPath)
 }
 
 // priorAttemptFeedback is the retry section of a task assignment: the
