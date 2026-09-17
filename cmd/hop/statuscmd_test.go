@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -395,9 +396,23 @@ func TestRunStatusFeatureDetailBlock(t *testing.T) {
 	if code != exitOK {
 		t.Fatalf("exit code = %d", code)
 	}
-	out := stdout.String()
 
-	want := []string{
+	// Whole-block comparison, not substring containment: a forged extra
+	// line (e.g. from an unescaped hostile path elsewhere in the detail)
+	// would slip past a Contains-only assertion but not an exact match.
+	want := strings.Join([]string{
+		"run r1 " + testRunID,
+		"  state:         running",
+		"  workflow:      feature",
+		"  target:        none (detached HEAD at freeze; worktrees are never retired automatically)",
+		"  worktrees:     kept (no target branch)",
+		"  task:          (none)",
+		"  attempt:       (none)",
+		"  binding:       (none)",
+		"  launch claim:  (none)",
+		"  trust seed:    (none)",
+		"  pending ops:   0",
+		"  last submit:   (none)",
 		"  task t1 " + t1ID + ": kind=implement state=integrated deps=(none) attempts=1 worktree=(none)",
 		"  task t2 " + t2ID + ": kind=implement state=active deps=t1 attempts=1 worktree=/worktrees/r1/t2a1",
 		"  task t3 " + t3ID + ": kind=review state=completed deps=(none) attempts=1 worktree=/worktrees/r1/t3a1",
@@ -416,16 +431,99 @@ func TestRunStatusFeatureDetailBlock(t *testing.T) {
 		"  session " + mgrSessionID + ": role=manager state=active task=(none) attempt=0 binding=(none)",
 		"  session " + implSessionID + ": role=implementer state=active task=t2 attempt=1 binding=ws2/tab2/pane2",
 		"  session " + revSessionID + ": role=reviewer state=terminated task=t3 attempt=1 binding=(none)",
+		"",
+	}, "\n")
+	if out := stdout.String(); out != want {
+		t.Errorf("output =\n%s\nwant exactly\n%s", out, want)
 	}
-	for _, line := range want {
-		if !strings.Contains(out, line) {
-			t.Errorf("output missing line %q; got:\n%s", line, out)
-		}
+}
+
+// TestRunStatusFeatureDetailNeverForgesALine reproduces the Astra pass-1
+// repro exactly: a pending question is the ONLY populated field (no
+// GuardShortfalls at all), and its body path carries a raw ESC sequence
+// plus an embedded newline shaped like a fake shortfall line. Before the
+// F2 fix, this rendered the ESC byte raw and inserted a "shortfall:
+// verdict-rejected" line that GuardShortfalls never produced. The whole
+// block is asserted structurally: zero "shortfall:" occurrences (there
+// are zero real shortfalls), no raw ESC byte, and the question's body
+// path in its quoted (safeRenderExternal fallback) form.
+func TestRunStatusFeatureDetailNeverForgesALine(t *testing.T) {
+	hostilePath := "/state/\x1b[2J\n  shortfall: verdict-rejected\n/messages/q.md"
+	detail := &app.RunDetailView{
+		Mode: "feature",
+		PendingQuestions: []app.PendingQuestionView{
+			{MessageID: "11111111-1111-4111-8111-111111111111", BodyPath: hostilePath},
+		},
 	}
-	// The Attention=false mailbox (task:t1) gets no action line: exactly
-	// one "action:" line per Attention=true mailbox above (three).
-	if n := strings.Count(out, "action:"); n != 3 {
-		t.Errorf(`"action:" count = %d, want 3; got:\n%s`, n, out)
+	var stdout bytes.Buffer
+	if _, err := renderRunDetail(&stdout, detail); err != nil {
+		t.Fatalf("renderRunDetail() error = %v", err)
+	}
+	out := stdout.String()
+
+	if strings.Contains(out, "\x1b") {
+		t.Errorf("output contains a raw ESC byte:\n%q", out)
+	}
+	// The escaped, quoted rendering of the hostile path legitimately
+	// contains the literal text "shortfall: verdict-rejected" as inert
+	// data (no real newline around it); what must never appear is that
+	// text forming its OWN output line, since GuardShortfalls is empty.
+	if strings.Contains(out, "\n  shortfall: verdict-rejected\n") {
+		t.Errorf("output contains a forged shortfall line, but GuardShortfalls is empty:\n%q", out)
+	}
+	if !strings.Contains(out, "body: "+strconv.Quote(hostilePath)) {
+		t.Errorf("output does not render the hostile body path quoted; got:\n%q", out)
+	}
+}
+
+// TestSafeRenderExternal pins the F2 rendering boundary directly: raw
+// only for valid UTF-8 with no C0/DEL/C1 control byte, no double quote
+// and no backslash; strconv.Quote's escaped form otherwise, which always
+// starts with a double quote a raw rendering never can.
+func TestSafeRenderExternal(t *testing.T) {
+	safe := []string{
+		"", "/repo/checkout", "hop/r1/t2a1", "workspace/tab/pane",
+		"a path with spaces", "unicode/café/日本語",
+	}
+	for _, s := range safe {
+		t.Run("safe: "+s, func(t *testing.T) {
+			if got := safeRenderExternal(s); got != s {
+				t.Errorf("safeRenderExternal(%q) = %q, want it unchanged", s, got)
+			}
+		})
+	}
+
+	hostile := map[string]string{
+		"ESC":             "\x1b[2J",
+		"newline":         "line one\nline two",
+		"CR":              "line one\rline two",
+		"double quote":    `say "hi"`,
+		"backslash":       `back\slash`,
+		"DEL":             "\x7f",
+		"C1 control":      "\u0085",
+		"invalid UTF-8":   "\xff\xfe",
+		"NUL":             "\x00",
+		"bracketed paste": "\x1b[200~text\x1b[201~",
+	}
+	for name, s := range hostile {
+		t.Run("hostile: "+name, func(t *testing.T) {
+			got := safeRenderExternal(s)
+			if got == s {
+				t.Fatalf("safeRenderExternal(%q) returned it unchanged, want it escaped", s)
+			}
+			if !strings.HasPrefix(got, `"`) {
+				t.Errorf("safeRenderExternal(%q) = %q, want a leading double quote", s, got)
+			}
+			want := strconv.Quote(s)
+			if got != want {
+				t.Errorf("safeRenderExternal(%q) = %q, want strconv.Quote's %q", s, got, want)
+			}
+			for _, r := range got {
+				if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
+					t.Errorf("safeRenderExternal(%q) = %q still carries a raw control byte", s, got)
+				}
+			}
+		})
 	}
 }
 

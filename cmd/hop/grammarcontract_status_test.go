@@ -1,8 +1,14 @@
 package main
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/johnlanda/hop/internal/testsupport/hopfixtures"
 )
 
 // TestGrammarContractStatusFeatureDetailSections drives hop status -run's
@@ -59,5 +65,64 @@ func TestGrammarContractStatusFeatureDetailSections(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("status -run output missing %q; got:\n%s", want, out)
 		}
+	}
+}
+
+// TestGrammarContractStatusHostileStateRootNeverForgesALine proves the
+// F2 fix (Astra pass 1) end to end: a state root containing a raw ESC
+// sequence and a literal newline — bytes resolveStateRoot/
+// requireWorkerStateRoot (stateroot.go) accept without rejecting
+// controls — propagates into every path derived from it, here a pending
+// question's body path (messageBodyPath joins the selected root with a
+// generated suffix). No production code sanitizes it before hop status
+// renders it, so the render boundary itself must: no raw control byte
+// reaches the output, no forged extra line appears, and the hostile
+// path renders in its strconv.Quote form (safeRenderExternal's fallback
+// whenever a path fails the raw-safety test).
+func TestGrammarContractStatusHostileStateRootNeverForgesALine(t *testing.T) {
+	repoRoot := realDir(t)
+	hostileLeaf := "state\x1b[2J\n  shortfall: verdict-rejected\nend"
+	stateRoot := filepath.Join(t.TempDir(), hostileLeaf)
+	if err := os.MkdirAll(stateRoot, 0o700); err != nil {
+		t.Fatalf("create hostile state root: %v", err)
+	}
+
+	store := openFixtureStore(t, stateRoot)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	const seed = 7900
+	base, lease, err := hopfixtures.Initialize(ctx, store, stateRoot, repoRoot, seed, now)
+	if err != nil {
+		t.Fatalf("initialize feature run base: %v", err)
+	}
+	freezeWorkflowSnapshot(t, stateRoot, base.RunID, featureWorkflowSnapshot(base.RunID, defaultMessageWait))
+	managerID, managerIncarnation, err := hopfixtures.SeedManager(ctx, store, lease, base.RunID, seed, now)
+	if err != nil {
+		t.Fatalf("seed feature manager: %v", err)
+	}
+
+	managerEnv := map[string]string{
+		"HOP_STATE_DIR": stateRoot, "HOP_RUN_ID": base.RunID,
+		"HOP_SESSION_ID": managerID, "HOP_INCARNATION_ID": managerIncarnation,
+	}
+	question := execHop(t, managerEnv, stateRoot, "msg", "send", "--to", "human", "--kind", "question", "--body", "proceed?")
+	if question.ExitCode != exitOK {
+		t.Fatalf("msg send (human question): exit=%d stdout=%q stderr=%q", question.ExitCode, question.Stdout, question.Stderr)
+	}
+
+	detail := execHop(t, map[string]string{"HOP_STATE_DIR": stateRoot}, repoRoot, "status", "-C", repoRoot, "-run", base.RunID)
+	if detail.ExitCode != exitOK {
+		t.Fatalf("status -run: exit=%d stdout=%q stderr=%q", detail.ExitCode, detail.Stdout, detail.Stderr)
+	}
+	out := detail.Stdout
+
+	if strings.Contains(out, "\x1b") {
+		t.Errorf("status -run output contains a raw ESC byte:\n%q", out)
+	}
+	if strings.Contains(out, "\n  shortfall: verdict-rejected\n") {
+		t.Errorf("status -run output contains a forged shortfall line:\n%q", out)
+	}
+	if !strings.Contains(out, `body: "`) {
+		t.Errorf("status -run output does not quote the hostile body path; got:\n%q", out)
 	}
 }

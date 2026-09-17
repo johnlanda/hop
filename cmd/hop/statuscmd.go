@@ -5,14 +5,59 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/johnlanda/hop/internal/app"
 )
 
 // defaultStatusTimeout bounds one hop status invocation.
 const defaultStatusTimeout = 10 * time.Second
+
+// safeRenderExternal renders a path or an opaque Herdr-assigned
+// identifier for a status line: raw when it is valid UTF-8 with no
+// control character (C0, DEL, C1), no double quote and no backslash —
+// the shapes that could otherwise forge a line boundary (a newline
+// inserting a fake protocol line), emit a terminal control sequence, or
+// make the two rendering forms ambiguous. Otherwise it renders as Go's
+// quoted-string form (strconv.Quote), which escapes exactly those bytes
+// and always starts with a double quote — so a raw rendering never
+// starts with one, and a reader can always tell which form a field
+// took. Ordinary paths and identifiers are untouched, so every existing
+// render table stays byte-identical. Applied to every path and every
+// Herdr binding identifier hop status prints: these are operator- or
+// principal-selected strings (a checkout location, a workspace/tab/pane
+// id), never HOP-generated, and reach rendering unvalidated by the
+// stores that accept and pass them through (design's "paths appear only
+// where the design names them" invariant is about WHICH fields carry a
+// path, not about what bytes those fields may contain).
+func safeRenderExternal(s string) string {
+	if isSafeExternalString(s) {
+		return s
+	}
+	return strconv.Quote(s)
+}
+
+// isSafeExternalString reports whether s can render raw per
+// safeRenderExternal's contract.
+func isSafeExternalString(s string) bool {
+	if !utf8.ValidString(s) {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r == '"' || r == '\\':
+			return false
+		case r < 0x20 || r == 0x7f: // C0 controls and DEL
+			return false
+		case r >= 0x80 && r <= 0x9f: // C1 controls
+			return false
+		}
+	}
+	return true
+}
 
 // runStatus implements `hop status`: without -run one line per run of the
 // repository (non-terminal runs by default; -all includes completed,
@@ -195,8 +240,8 @@ func renderRunDetail(w io.Writer, detail *app.RunDetailView) (int, error) {
 		"  last submit:   "+orUnset(detail.LastSubmission),
 	)
 	for _, op := range detail.WorktreeOperations {
-		lines = append(lines, "  worktree op:   "+op.OperationID+" "+orUnset(op.Branch)+" ("+op.State+")",
-			"    action:      "+op.Action)
+		lines = append(lines, "  worktree op:   "+op.OperationID+" "+safeRenderExternal(orUnset(op.Branch))+" ("+op.State+")",
+			"    "+app.GrammarActionPrefix+"      "+op.Action)
 	}
 	for _, artifact := range detail.Artifacts {
 		lines = append(lines, "  artifact:      "+artifact)
@@ -239,7 +284,7 @@ func featureDetailLines(detail *app.RunDetailView) []string {
 	for _, t := range detail.Tasks {
 		lines = append(lines, "  "+app.GrammarTaskLine(
 			app.GrammarTaskLabel(t.Seq), t.TaskID, t.Kind, t.State, depLabels(t.DependsOn, labels),
-			t.AttemptCount, orUnset(t.WorktreePath),
+			t.AttemptCount, safeRenderExternal(orUnset(t.WorktreePath)),
 		))
 	}
 
@@ -268,15 +313,15 @@ func featureDetailLines(detail *app.RunDetailView) []string {
 		if m.Attention {
 			action := app.GrammarAttentionActionHuman
 			if m.Address != "human" {
-				action = app.GrammarAttentionActionSession(sessionBindingFor(m.Address, detail.Sessions))
+				action = app.GrammarAttentionActionSession(safeRenderExternal(sessionBindingFor(m.Address, detail.Sessions)))
 			}
-			lines = append(lines, "    action:      "+action)
+			lines = append(lines, "    "+app.GrammarActionPrefix+"      "+action)
 		}
 	}
 
 	for _, q := range detail.PendingQuestions {
 		lines = append(lines,
-			"  "+app.GrammarQuestionLine(q.MessageID, q.Age, q.BodyPath),
+			"  "+app.GrammarQuestionLine(q.MessageID, q.Age, safeRenderExternal(q.BodyPath)),
 			"    "+app.GrammarAnswerInvocationLine(q.MessageID),
 		)
 	}
@@ -286,7 +331,7 @@ func featureDetailLines(detail *app.RunDetailView) []string {
 		if s.TaskID != "" {
 			taskLabel = taskLabelFor(s.TaskID, labels)
 		}
-		lines = append(lines, "  "+app.GrammarSessionLine(s.SessionID, s.Role, s.State, taskLabel, s.AttemptNumber, orUnset(s.BindingSummary)))
+		lines = append(lines, "  "+app.GrammarSessionLine(s.SessionID, s.Role, s.State, taskLabel, s.AttemptNumber, safeRenderExternal(orUnset(s.BindingSummary))))
 	}
 
 	return lines

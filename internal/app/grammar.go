@@ -301,6 +301,14 @@ const GrammarAttentionActionHuman = "answer pending human questions with hop ans
 // listing and the detail block's state line.
 const GrammarAttentionMarker = "blocked, needs attention"
 
+// GrammarActionPrefix is the literal "action:" token beginning every
+// nested human-action line hop status renders — under an attention
+// condition, a worktree-create operation, or a retirement worktree row.
+// Callers own their own surrounding indentation, which differs by
+// context (the aligned detail block pads it; the flat retirement report
+// list does not); this constant is only the shared word itself.
+const GrammarActionPrefix = "action:"
+
 // GrammarTaskLabel renders a task's stable display label: "t<seq>".
 func GrammarTaskLabel(seq int) string { return "t" + strconv.Itoa(seq) }
 
