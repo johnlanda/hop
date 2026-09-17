@@ -3,6 +3,7 @@ package integration
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -72,10 +73,20 @@ func runManagerVerb(t *testing.T, env []string, dir string, args ...string) hopR
 func (f *featureRun) managerEnv(t *testing.T) []string {
 	t.Helper()
 	sessionID := f.managerSessionID(t)
+	return f.sessionEnv(sessionID, f.incarnationForSession(t, sessionID))
+}
+
+// sessionEnv returns the environment for a one-shot hop CLI invocation
+// authenticated as an arbitrary session/incarnation pair -- the same
+// technique managerEnv uses for the manager's own current identity,
+// generalized so a scenario can issue a call under a RETIRED (superseded)
+// session's identity too, e.g. RelayedQuestion/DuplicateAndAmbiguousDelivery
+// issuing a stale incarnation's late ack directly.
+func (f *featureRun) sessionEnv(sessionID, incarnationID string) []string {
 	return append(append([]string{}, f.env...),
 		"HOP_RUN_ID="+f.runID,
 		"HOP_SESSION_ID="+sessionID,
-		"HOP_INCARNATION_ID="+f.incarnationForSession(t, sessionID),
+		"HOP_INCARNATION_ID="+incarnationID,
 	)
 }
 
@@ -198,5 +209,106 @@ func requireByteExactFile(t *testing.T, path, want string) {
 	}
 	if string(got) != want {
 		t.Fatalf("content of %s is not byte-exact: got %q (%d bytes), want %q (%d bytes)", path, got, len(got), want, len(want))
+	}
+}
+
+// nativeSessionRef reads one session's recorded native_session_ref --
+// shared by RelayedQuestion and DuplicateAndAmbiguousDelivery to prove a
+// cold relaunch's successor session binds to the SAME native reference as
+// its prior session (usecase_featureresume.go's coldRelaunchFeatureSession:
+// "successor.AssignNativeRef(prior.NativeSessionRef, ...)").
+func (f *featureRun) nativeSessionRef(t *testing.T, sessionID string) string {
+	t.Helper()
+	ref := f.scalar(t, fmt.Sprintf("SELECT native_session_ref FROM sessions WHERE id = '%s';", sessionID))
+	if ref == "" {
+		t.Fatalf("no native_session_ref recorded for session %s", sessionID)
+	}
+	return ref
+}
+
+// ackRefusalReceiptRecorded reports whether a msg-ack receipt row exists
+// for messageID claimed by sessionID with outcome "refused" -- design
+// section 7's "a receipt row for every verb outcome including refusals"
+// (internal/adapters/sqlite/messaging.go's msgAckVerb = "msg-ack";
+// AckMessage's own record closure always writes outcome=string(kind), and
+// app.AckRefused's string value is "refused").
+func (f *featureRun) ackRefusalReceiptRecorded(t *testing.T, messageID, sessionID string) bool {
+	t.Helper()
+	return f.scalar(t, fmt.Sprintf(
+		"SELECT count(*) FROM message_receipts WHERE run_id = '%s' AND op = 'msg-ack' AND claimed_message_id = '%s' AND claimed_session_id = '%s' AND outcome = 'refused';",
+		f.runID, messageID, sessionID)) != "0"
+}
+
+// grammarTaskAddress mirrors internal/app/grammar.go's GrammarTaskAddress
+// (retyped, never imported): a task mailbox's display address exactly as
+// hop status -run's feature-mode detail block renders it -- the uuid form
+// section 7's message verbs themselves take, alongside its t<seq> label
+// for readability.
+func grammarTaskAddress(taskID, label string) string {
+	return "task:" + taskID + " (" + label + ")"
+}
+
+// attentionLineBothClausesExact retypes internal/app/grammar.go's
+// GrammarAttentionLine rendering for the shape this suite's scenarios
+// need -- both the in-flight and queued clauses present, joined with
+// ", " -- never imported, and requires an EXACT, anchored match against
+// wantAddress/wantInFlightID/wantQueued (never a substring/Contains
+// check): a task address itself carries a colon ("task:<uuid> (t<seq>)"),
+// so this cuts on the address's own known value rather than guessing
+// where it ends. The two ages are the line's only free values, parsed
+// back with time.ParseDuration (GrammarAttentionLine renders them via
+// time.Duration.String(), never a fixed-width or custom format) rather
+// than compared as text. ok is false for any line that is not this exact
+// shape for this exact address/id/count, including a line for a
+// different address or a queued count that does not match.
+func attentionLineBothClausesExact(line, wantAddress, wantInFlightID string, wantQueued int) (inFlightAge, oldestAge time.Duration, ok bool) {
+	prefix := "attention: messages pending for " + wantAddress + ": in-flight "
+	rest, ok := strings.CutPrefix(line, prefix)
+	if !ok {
+		return 0, 0, false
+	}
+	mid := " (message " + wantInFlightID + "), queued " + strconv.Itoa(wantQueued) + ", oldest "
+	inFlightStr, oldestStr, ok := strings.Cut(rest, mid)
+	if !ok {
+		return 0, 0, false
+	}
+	inFlightAge, err := time.ParseDuration(inFlightStr)
+	if err != nil {
+		return 0, 0, false
+	}
+	oldestAge, err = time.ParseDuration(oldestStr)
+	if err != nil {
+		return 0, 0, false
+	}
+	return inFlightAge, oldestAge, true
+}
+
+// requireAttentionLineBothClausesExact scans one full "hop status -run"
+// rendering for the ONE line matching attentionLineBothClausesExact,
+// failing the test loudly (naming the full output) if no line matches --
+// never a loose Contains check on the rendering as a whole.
+func requireAttentionLineBothClausesExact(t *testing.T, statusOutput, wantAddress, wantInFlightID string, wantQueued int) (inFlightAge, oldestAge time.Duration) {
+	t.Helper()
+	for _, line := range strings.Split(statusOutput, "\n") {
+		if age1, age2, ok := attentionLineBothClausesExact(strings.TrimSpace(line), wantAddress, wantInFlightID, wantQueued); ok {
+			return age1, age2
+		}
+	}
+	t.Fatalf("hop status output carries no attention line matching address=%q in-flight=%q queued=%d; full output:\n%s",
+		wantAddress, wantInFlightID, wantQueued, statusOutput)
+	return 0, 0
+}
+
+// requireNoAttentionLineForAddress asserts one full "hop status -run"
+// rendering carries no attention line for wantAddress at all -- the
+// mailbox condition (design section 7) has fully cleared. Checked against
+// the full output, never just a first line or a single field.
+func requireNoAttentionLineForAddress(t *testing.T, statusOutput, wantAddress string) {
+	t.Helper()
+	prefix := "attention: messages pending for " + wantAddress + ":"
+	for _, line := range strings.Split(statusOutput, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), prefix) {
+			t.Fatalf("hop status output still carries an attention line for %s after it should have cleared: %q; full output:\n%s", wantAddress, line, statusOutput)
+		}
 	}
 }
