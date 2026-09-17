@@ -210,7 +210,7 @@ func (f *featureRun) attemptState(t *testing.T, attemptID string) string {
 
 // requireAttemptState polls attemptState until it is one of want, bounded
 // by featureRunTimeout, naming the attempt id on timeout.
-func (f *featureRun) requireAttemptState(t *testing.T, attemptID string, want ...string) string {
+func (f *featureRun) requireAttemptState(t *testing.T, attemptID string, want ...string) {
 	t.Helper()
 	var state string
 	reached := waitUntilDeadline(featureRunTimeout, func() bool {
@@ -220,7 +220,6 @@ func (f *featureRun) requireAttemptState(t *testing.T, attemptID string, want ..
 	if !reached {
 		t.Fatalf("attempt %s ended %q, want one of %v after %s", attemptID, state, want, featureRunTimeout)
 	}
-	return state
 }
 
 // sessionForAttempt resolves an attempt's current (non-terminal) session,
@@ -702,6 +701,20 @@ func (f *featureRun) launchClaimPID(t *testing.T, sessionID string) (pid int, ok
 		t.Fatalf("launch claim pid %q for session %s does not parse: %v", row, sessionID, err)
 	}
 	return n, true
+}
+
+// claimState reads one session's newest recorded launch claim state
+// ("exec_pending", "execed", "exec_failed"). A caller that has already
+// polled the session into "active" (settleSessionExeced settles the
+// claim and activates the session in the SAME transaction) can read this
+// directly rather than poll it again — used to assert explicitly, not
+// merely infer, that a claim has settled before a scenario deliberately
+// kills its own process (design section 11 scenario 4: a worker killed
+// mid-attempt means AFTER its own launch settled, never a race against
+// the controller's own corroboration).
+func (f *featureRun) claimState(t *testing.T, sessionID string) string {
+	t.Helper()
+	return f.scalar(t, fmt.Sprintf("SELECT state FROM launch_claims WHERE session_id = '%s' ORDER BY claimed_at DESC, rowid DESC LIMIT 1;", sessionID))
 }
 
 // resultCount counts result rows submitted for one attempt (0 for an

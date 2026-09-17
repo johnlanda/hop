@@ -64,9 +64,24 @@ func TestRealProcessWorkerInterruption(t *testing.T) {
 		t.Errorf("attempt 1's worktree base = %s, want the frozen base commit %s", worktree1Base, repo.Base)
 	}
 
+	// Design section 11 scenario 4 is "a worker killed mid-attempt" —
+	// AFTER its own launch settled, never a race against the controller's
+	// own launch corroboration (that race is LAUNCH-2's own coverage,
+	// deliberately kept out of this scenario: a worker-hold worker reaches
+	// its message barrier within about a second of exec, well inside the
+	// controller's 2s corroboration poll interval, so killing immediately
+	// after the checks above could catch it before settlement). Wait for,
+	// and explicitly assert, the settled precondition first.
+	fx.requireAttemptState(t, attempt1ID, "running")
+	fx.requireSessionState(t, session1ID, "active")
+	if state := fx.claimState(t, session1ID); state != "execed" {
+		t.Fatalf("attempt 1's launch claim state = %q before the kill, want execed (settled)", state)
+	}
+
 	// Kill the worker mid-attempt (blocked on its own barrier, holding no
-	// accepted result) — the live controller, never a crashed one, must
-	// reconcile this on its own next scheduling pass.
+	// accepted result, its own launch already settled) — the live
+	// controller, never a crashed one, must reconcile this on its own
+	// next scheduling pass.
 	killed := fx.killSession(t, session1ID)
 	if killed <= 0 {
 		t.Fatalf("killSession returned a non-positive pid %d", killed)
