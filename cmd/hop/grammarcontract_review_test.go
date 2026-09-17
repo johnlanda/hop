@@ -248,7 +248,7 @@ func TestGrammarContractReviewSubmitAccepted(t *testing.T) {
 // reviewer after its binding was superseded prints exactly
 // `refused: stale`.
 func TestGrammarContractReviewSubmitRefusals(t *testing.T) {
-	reviewCount := func(t *testing.T, rf reviewFixture) int { //nolint:gocritic // hugeParam: reviewFixture is a small fixture value read once per call.
+	reviewCount := func(t *testing.T, rf reviewFixture) int {
 		t.Helper()
 		return readOnlyCount(t, rf.StateRoot, `SELECT COUNT(*) FROM reviews`)
 	}

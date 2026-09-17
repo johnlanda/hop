@@ -124,7 +124,7 @@ func (s fixedSubmissionStore) SubmitResult(context.Context, app.ResultSubmission
 // fixedReviewStore returns one scripted outcome from SubmitReview.
 type fixedReviewStore struct{ outcome app.ReviewOutcome }
 
-func (s fixedReviewStore) SubmitReview(context.Context, app.ReviewSubmission) (app.ReviewOutcome, error) {
+func (s fixedReviewStore) SubmitReview(context.Context, app.ReviewSubmission) (app.ReviewOutcome, error) { //nolint:gocritic // hugeParam: a scripted port value, assigned by value in each test like fixedSubmissionStore.
 	return s.outcome, nil
 }
 

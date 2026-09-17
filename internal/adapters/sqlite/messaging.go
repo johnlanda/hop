@@ -169,9 +169,9 @@ func (s *Store) SendMessage(ctx context.Context, send app.MessageSend) (app.Mess
 		}
 
 		if send.RequestID != "" {
-			priorDigest, createdEntity, ok, err := acceptedMessageReceipt(ctx, tx, send.RunID.String(), msgSendVerb, send.RequestID)
-			if err != nil {
-				return err
+			priorDigest, createdEntity, ok, receiptErr := acceptedMessageReceipt(ctx, tx, send.RunID.String(), msgSendVerb, send.RequestID)
+			if receiptErr != nil {
+				return receiptErr
 			}
 			if ok {
 				if priorDigest == digest {

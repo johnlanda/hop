@@ -359,7 +359,7 @@ func TestFakeEnqueueSequenceIsTheAdaptersMaxPlusOne(t *testing.T) {
 	fr, workerB, workerC := seedTwoWorkers(t, tc)
 	seeded := mintMessageID(t, tc)
 	tc.Store.Messages[seeded] = run.NewInfo(seeded, fr.RunID, run.ControllerPrincipal(), run.ManagerAddress(), "", "/state/n", "n", 1, 1, tc.Clock.Now())
-	seqOf := func(t *testing.T, label string, send app.MessageSend) int { //nolint:gocritic // hugeParam: the port passes the send value; the helper mirrors it.
+	seqOf := func(t *testing.T, label string, send app.MessageSend) int {
 		t.Helper()
 		accepted := requireFakeSend(t, tc, label, send, app.MessageAccepted, "")
 		return tc.Store.Messages[accepted.MessageID].EnqueueSeq
