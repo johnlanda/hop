@@ -1570,8 +1570,10 @@ func runReviewer() {
 // separate plumbing through the controller's fixed HOP_* env keys. Known
 // solo/implementer behavior names: "submit-valid", "submit-stale",
 // "submit-twice", "exit-without-submitting", "exec-keep-pid",
-// "worker-implement", "worker-hold"; an empty or unrecognized behavior
-// makes the worker idle without ever submitting. A feature-mode
+// "worker-implement", "worker-hold", "worker-conflict",
+// "worker-vanish-once", "idle-self-kill" (solo only); an empty or
+// unrecognized behavior makes the worker idle without ever submitting. A
+// feature-mode
 // implementer's behavior travels through its task's own manager-authored
 // instructions file instead (fixtureManagerScript's TASK lines), never the
 // run's top-level brief.
