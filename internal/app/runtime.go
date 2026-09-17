@@ -125,6 +125,9 @@ type Runtime interface {
 	// inspection failure and never counts as absence.
 	InspectPane(ctx context.Context, paneID string) (PaneProcess, error)
 	// ClosePane requests pane closure; callers apply the close rule above.
+	// A pane id the server does not have is reported as an error wrapping
+	// ErrPaneNotFound: nothing was closed, and the caller's own absence
+	// observation decides what that means.
 	ClosePane(ctx context.Context, paneID string) error
 	// ServerInstance returns an opaque, adapter-formatted identity scoped
 	// to BOTH the configured socket path and the server process behind it:

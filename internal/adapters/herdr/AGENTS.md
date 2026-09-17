@@ -16,7 +16,7 @@ occupant inspection for the worker-launch use case.
 | [client.go](client.go) | `Client`, `NewClient`, `Call`, `Subscribe`, `EventStream`, `EventSubscription`, `RawEvent` | One connection per call and per subscription, mirroring the herdr CLI; correlates the response ID, decodes results into caller structs, streams pushed events in arrival order after the subscribe acknowledgement, and closes the subscription's connection exactly once through a shared `sync.Once` regardless of whether `Close`, context cancellation or the read pump's own exit triggers it first |
 | [errors.go](errors.go) | `APIError`, `ProtocolError` | Server error responses keep their code and message; protocol violations (ID mismatch, non-protocol frames, oversized lines) are distinct from transport errors |
 | [probe.go](probe.go) | `InstallationProbe`, `parseSchema` | Implements `app.Probe`: resolves executables, reads `--version` lines, extracts protocol and method constants from `herdr api schema --json`, pings the configured socket |
-| [presentation.go](presentation.go) | `Presentation`, `NewPresentation` | Implements `app.AgentPresentation`: `pane.report_metadata` token patches, `agent.view.set` with a manager-first token sort and `agent.view.clear` — all under HOP's fixed source so its view is owned and clearable |
+| [presentation.go](presentation.go) | `Presentation`, `NewPresentation` | Implements `app.AgentPresentation`: `pane.report_metadata` token patches, `agent.view.set` with a manager-first token sort and `agent.view.clear` — all under HOP's fixed source so its view is owned and clearable. A `pane_not_found` answer to `pane.report_metadata` ("pane <id> not found": an id the server no longer resolves, or a pane with no terminal) wraps both `app.ErrPaneNotFound` and `ErrPaneNotFound`; every other error keeps its own type |
 | [observation.go](observation.go) | `Observer`, `NewObserver`, `statusStream`, `DrainRemaining`, `flushBacklog` | Implements `app.Observer`: one `pane.agent_status_changed` subscription per watched pane, normalized into `app.StatusEvent`, and a `session.snapshot` reduced to `app.PaneObservation`; on stop-intake, the decode pump moves its pending event and the rest of the raw backlog into an overflow slice that `DrainRemaining` exposes |
 | [runtime.go](runtime.go) | `Runtime`, `NewRuntime`, `ErrPaneNotFound`, `ErrWorkspaceIDRequired` | Implements `app.Runtime`: `worktree.create` (cwd/branch/base, plus an S9 creation label sent only when the caller supplies one), `layout.apply` worker-pane creation, pane recovery by creation label via `session.snapshot`, `pane.read` scrollback capture, `pane.process_info` occupant inspection, `pane.close`, and `ServerInstance`'s dial-inspect-close socket-peer-pid lookup |
 | [workspace.go](workspace.go) | `Runtime.CreateWorkspace`, `Runtime.FindWorkspaceByLabel`, `ErrWorkspaceCwdNotAbsolute`, `ErrWorkspaceLabelRequired` | Implements `app.WorkspaceRuntime` on the same `Runtime` type: `workspace.create` (explicit absolute cwd, additive env, a required unique creation label — an empty or relative cwd and an empty label are refused with the typed errors before any request is sent — focus always false) and its S8 recovery lookup — resolve the labeled workspace via `session.snapshot`, then descend to its sole tab and that tab's sole pane |
@@ -127,7 +127,10 @@ occupant inspection for the worker-launch use case.
   pane-addressed `Runtime` method (`ReadPane`, `InspectPane`, `ClosePane`)
   maps Herdr's `pane_not_found` API error onto, through the
   shared `wrapPaneError` helper; every other error keeps its own type under
-  the added pane-address context. For `InspectPane` specifically, Herdr
+  the added pane-address context. `InspectPane` and `ClosePane`, whose port
+  contracts report absence, map it through `wrapAbsentPaneError` instead,
+  which wraps both `ErrPaneNotFound` and `app.ErrPaneNotFound`; `pane.close`
+  resolves the id alone, so its `pane_not_found` means no pane has the id. For `InspectPane` specifically, Herdr
   returns this same code both for no such pane and for a pane that exists
   but has no live runtime yet (the delayed-restore window), so the caller
   reads it as "no runtime," not strictly "no such pane." `InspectPane`
@@ -233,7 +236,14 @@ occupant inspection for the worker-launch use case.
   socket errors with an empty token) and
   `TestRuntimeInspectPaneAppErrPaneNotFoundClassification` (a table proving
   `errors.Is(err, app.ErrPaneNotFound)` holds only for the `pane_not_found`
-  case, never for a transport, unrelated-API-code or protocol failure).
+  case, never for a transport, unrelated-API-code or protocol failure),
+  with its siblings `TestRuntimeClosePaneAppErrPaneNotFoundClassification`
+  and `TestPresentationReportMetadataNotFoundClassification`. The wire
+  shapes these tables use for a vanished pane — `pane.process_info`
+  answering `pane_not_found` "pane not found", `pane.report_metadata` and
+  `pane.close` answering `pane_not_found` "pane <id> not found" — are
+  pinned against a real server by test/integration's
+  `TestSpikeVanishedPaneShapes`.
   `TestRuntimeCreateWorktreeSendsLabelWhenSet` proves the S9 label is sent
   only when the request carries one, alongside the pre-existing unlabeled
   fixture asserted byte-identical.

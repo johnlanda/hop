@@ -3,9 +3,11 @@ package herdr_test
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/johnlanda/hop/internal/adapters/herdr"
@@ -162,6 +164,72 @@ func TestPresentationClearViewIsOwned(t *testing.T) {
 	}
 	if source := paramsOf(t, request)["source"]; source != app.PresentationSource {
 		t.Errorf("clear source = %v, want %q so another owner's view stays intact", source, app.PresentationSource)
+	}
+}
+
+// startFakePresentationError runs a fake endpoint that answers every
+// request with the given error code and message.
+func startFakePresentationError(t *testing.T, code, message string) *herdr.Presentation {
+	t.Helper()
+	endpoint := startFakeEndpoint(t, func(t *testing.T, conn net.Conn) {
+		request := readRequestLine(t, bufio.NewReader(conn))
+		if request == nil {
+			return
+		}
+		writeLine(t, conn, fmt.Sprintf(`{"id":%q,"error":{"code":%q,"message":%q}}`, requestID(t, request), code, message))
+	})
+	return herdr.NewPresentation(endpoint.socketPath)
+}
+
+// TestPresentationReportMetadataNotFoundClassification proves
+// ReportMetadata satisfies app.ErrPaneNotFound for Herdr's pane_not_found
+// answer — "pane <id> not found", the shape spike_panevanish pins against
+// a real server for a vanished pane — and only for it: every other API
+// error and a transport failure satisfy neither sentinel.
+func TestPresentationReportMetadataNotFoundClassification(t *testing.T) {
+	cases := []struct {
+		name         string
+		presentation func(t *testing.T) *herdr.Presentation
+		wantNotFound bool
+	}{
+		{
+			name: "pane_not_found API error",
+			presentation: func(t *testing.T) *herdr.Presentation {
+				return startFakePresentationError(t, "pane_not_found", "pane w2:p2 not found")
+			},
+			wantNotFound: true,
+		},
+		{
+			name: "invalid_metadata_token API error",
+			presentation: func(t *testing.T) *herdr.Presentation {
+				return startFakePresentationError(t, "invalid_metadata_token", "token names must be at most 32 characters")
+			},
+		},
+		{
+			name:         "transport error (dead socket)",
+			presentation: func(t *testing.T) *herdr.Presentation { return herdr.NewPresentation(deadSocket(t)) },
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.presentation(t).ReportMetadata(testContext(t), app.PaneMetadata{PaneID: "w2:p2", Tokens: map[string]string{app.FieldRun: "r1"}})
+
+			if err == nil {
+				t.Fatalf("ReportMetadata did not error for %s", tc.name)
+			}
+			if got := errors.Is(err, app.ErrPaneNotFound); got != tc.wantNotFound {
+				t.Errorf("errors.Is(err, app.ErrPaneNotFound) = %v, want %v (err = %v)", got, tc.wantNotFound, err)
+			}
+			if got := errors.Is(err, herdr.ErrPaneNotFound); got != tc.wantNotFound {
+				t.Errorf("errors.Is(err, herdr.ErrPaneNotFound) = %v, want %v (err = %v)", got, tc.wantNotFound, err)
+			}
+			if !tc.wantNotFound {
+				return
+			}
+			if want := "report metadata for pane w2:p2: "; !strings.HasPrefix(err.Error(), want) {
+				t.Errorf("error = %q, want the pane-address context %q", err, want)
+			}
+		})
 	}
 }
 
