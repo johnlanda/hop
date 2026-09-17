@@ -80,6 +80,8 @@ const fixtureWorkerSource = `package main
 import (
 	"bufio"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -353,7 +355,7 @@ func parseBehavior(content string) (behavior string, args []string) {
 // policy-strip variable absent even when seeded into the server's own
 // environment, HERDR_*/HOP_* present, and passthrough/profile entries
 // exactly as configured (docs/plan/phase-2-design.md section 6).
-func writeObservation(path, role, assignmentPath, promptAssignmentPath, hopPath, assignmentContent, behavior string, behaviorArgs []string) {
+func writeObservation(path, role, assignmentPath, promptAssignmentPath, hopPath, assignmentContent, behavior string, behaviorArgs []string, instructionsPath, instructionsContent string) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "pid=%d\n", os.Getpid())
 	// os.Executable() is this process's own resolved image path — the
@@ -378,6 +380,21 @@ func writeObservation(path, role, assignmentPath, promptAssignmentPath, hopPath,
 		fmt.Fprintf(&b, "env:%s\n", entry)
 	}
 	fmt.Fprintf(&b, "assignment_content_begin\n%s\nassignment_content_end\n", assignmentContent)
+	// A feature-mode implementer's own read of its manager-authored task
+	// instructions, at the path it resolved independently: the digest
+	// and length prove THIS PROCESS'S OWN os.ReadFile call observed
+	// exactly these bytes at that exact path — never a copy the test
+	// handed it — the byte-exact-delivery evidence design section 11's
+	// injection scenario needs for this channel specifically, since a
+	// feature-mode implementer's OWN per-attempt assignment.md (dumped
+	// above) only names the instructions file by path and never embeds
+	// its content.
+	if instructionsPath != "" {
+		sum := sha256.Sum256([]byte(instructionsContent))
+		fmt.Fprintf(&b, "instructions_path=%s\n", instructionsPath)
+		fmt.Fprintf(&b, "instructions_sha256=%s\n", hex.EncodeToString(sum[:]))
+		fmt.Fprintf(&b, "instructions_bytes=%d\n", len(instructionsContent))
+	}
 	atomicWriteFile(path, b.String())
 }
 
@@ -392,6 +409,23 @@ func atomicWriteFile(path, content string) {
 	if err := os.Rename(tmp, path); err != nil {
 		fatalf("rename %s into place: %v", path, err)
 	}
+}
+
+// writeContentDigest dumps this process's own digest and length of
+// content — already read from a path this process resolved or was
+// handed by hop msg next/wait, never re-derived — as byte-exact-delivery
+// evidence for a channel writeObservation's own fixed shape does not
+// cover (a fetched message body: every behavior that reads one
+// otherwise discards it once acked). id names the entity the digest
+// belongs to (a message id), so a scenario can cross-check it against
+// the store's own row without ambiguity.
+func writeContentDigest(path, id, content string) {
+	var b strings.Builder
+	sum := sha256.Sum256([]byte(content))
+	fmt.Fprintf(&b, "id=%s\n", id)
+	fmt.Fprintf(&b, "sha256=%s\n", hex.EncodeToString(sum[:]))
+	fmt.Fprintf(&b, "bytes=%d\n", len(content))
+	atomicWriteFile(path, b.String())
 }
 
 // readFileOrFatal reads path, failing the run loudly on any error — every
@@ -780,13 +814,20 @@ func runWorker() {
 
 	assignmentContent := readFileOrFatal(assignmentPath)
 	behavior, behaviorArgs := parseBehavior(assignmentContent)
+	// instructionsPath/instructionsContent stay "" for a solo run: only a
+	// feature-mode implementer has a separate manager-authored
+	// instructions artifact distinct from its own per-attempt
+	// assignment.md, and only its OWN read of that exact path (never a
+	// copy the test handed it) is byte-exact-delivery evidence.
+	var instructionsPath, instructionsContent string
 	if feature {
 		// The manager-authored task instructions carry the directive for a
 		// feature-mode implementer; assignment.md itself is fully computed
 		// (no manager-authored free text), so parseBehavior would find
 		// nothing there.
-		instructionsPath := filepath.Join(env["HOP_STATE_DIR"], "runs", env["HOP_RUN_ID"], "tasks", env["HOP_TASK_ID"]+".md")
-		behavior, behaviorArgs = parseBehavior(readFileOrFatal(instructionsPath))
+		instructionsPath = filepath.Join(env["HOP_STATE_DIR"], "runs", env["HOP_RUN_ID"], "tasks", env["HOP_TASK_ID"]+".md")
+		instructionsContent = readFileOrFatal(instructionsPath)
+		behavior, behaviorArgs = parseBehavior(instructionsContent)
 	}
 
 	// Every Phase 3 behavior's directive carries a test-owned scratch
@@ -809,7 +850,7 @@ func runWorker() {
 		// never a pane/typed-input path.
 		go watchForSelfKill(filepath.Join(scratchDir, "self-kill-"+env["HOP_ATTEMPT_ID"]))
 	}
-	writeObservation(observationPath, cmp(role, "solo"), assignmentPath, promptAssignmentPath, hopPath, assignmentContent, behavior, behaviorArgs)
+	writeObservation(observationPath, cmp(role, "solo"), assignmentPath, promptAssignmentPath, hopPath, assignmentContent, behavior, behaviorArgs, instructionsPath, instructionsContent)
 	fmt.Println("FIXTURE-WORKER-READY")
 
 	switch behavior {
@@ -849,9 +890,18 @@ func runWorker() {
 			if !delivered {
 				continue
 			}
-			readFileOrFatal(answer.BodyPath)
+			answerBody := readFileOrFatal(answer.BodyPath)
 			ackAndRequireSuccess(hopPath, answer.ID)
 			if answer.Kind == "answer" && answer.ReplyTo == question {
+				// This process's OWN read of the body file hop msg wait
+				// itself named — never a copy the test handed it — dumped
+				// as a digest, the byte-exact-delivery evidence design
+				// section 11's injection scenario needs for the answer
+				// channel: no existing dump captures a fetched message's
+				// content, since every other behavior discards it once
+				// read (design section 7: an ack is the statement of
+				// receipt-and-read, not a promise to retain the bytes).
+				writeContentDigest(filepath.Join(scratchDir, "answer-observed-"+env["HOP_ATTEMPT_ID"]+".txt"), answer.ID, answerBody)
 				fmt.Printf("FIXTURE-HOLD-RELEASED answer=[%s]\n", answer.ID)
 				break
 			}
@@ -1096,7 +1146,7 @@ func runManager() {
 	if scratchDir != "" {
 		observationPath = filepath.Join(scratchDir, "manager-observed.txt")
 	}
-	writeObservation(observationPath, "manager", assignmentPath, promptAssignmentPath, hopPath, assignmentContent, behavior, nil)
+	writeObservation(observationPath, "manager", assignmentPath, promptAssignmentPath, hopPath, assignmentContent, behavior, nil, "", "")
 	fmt.Println("FIXTURE-MANAGER-READY")
 
 	if behavior != "manager-feature" {
@@ -1407,7 +1457,7 @@ func runReviewer() {
 	behavior, behaviorArgs := parseBehavior(roleContent)
 	scratchDir := requireScratchDir(behavior, behaviorArgs)
 
-	writeObservation(filepath.Join(scratchDir, "reviewer-observed-"+env["HOP_ATTEMPT_ID"]+".txt"), "reviewer", assignmentPath, promptAssignmentPath, hopPath, assignmentContent, behavior, nil)
+	writeObservation(filepath.Join(scratchDir, "reviewer-observed-"+env["HOP_ATTEMPT_ID"]+".txt"), "reviewer", assignmentPath, promptAssignmentPath, hopPath, assignmentContent, behavior, nil, "", "")
 	fmt.Println("FIXTURE-REVIEWER-READY")
 
 	verdict, reasons := "approve", "fixture reviewer reasons: approve\n"

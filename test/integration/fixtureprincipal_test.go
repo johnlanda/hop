@@ -1402,6 +1402,38 @@ func TestFixtureWorkerHoldBarrier(t *testing.T) {
 	if head == repo.Base {
 		t.Error("worker-hold did not commit a change before submitting")
 	}
+
+	// Byte-exact-delivery evidence (design section 11's injection
+	// scenario): the worker's OWN observation dump carries a digest of
+	// its OWN read of the task instructions file, at the path it
+	// resolved itself -- never a copy this test handed it.
+	instructionsContent := "FIXTURE-BEHAVIOR: worker-hold " + scratchDir + "\n"
+	workerObs := readWorkerObservation(t, filepath.Join(scratchDir, "worker-observed-"+attemptID+".txt"))
+	if workerObs.Fields["instructions_path"] != instructionsPath {
+		t.Errorf("worker observation instructions_path = %q, want %q", workerObs.Fields["instructions_path"], instructionsPath)
+	}
+	if want := sha256HexOf(instructionsContent); workerObs.Fields["instructions_sha256"] != want {
+		t.Errorf("worker observation instructions_sha256 = %q, want %q (sha256 of the exact instructions content)", workerObs.Fields["instructions_sha256"], want)
+	}
+	if want := fmt.Sprintf("%d", len(instructionsContent)); workerObs.Fields["instructions_bytes"] != want {
+		t.Errorf("worker observation instructions_bytes = %q, want %q", workerObs.Fields["instructions_bytes"], want)
+	}
+
+	// Same evidence for the answer channel: the worker's own read of the
+	// body file hop msg wait itself named for the barrier-release
+	// answer, dumped as a digest (no other dump captures a fetched
+	// message's content).
+	answerObs := readWorkerObservation(t, filepath.Join(scratchDir, "answer-observed-"+attemptID+".txt"))
+	if answerObs.Fields["id"] != msgAnswerID {
+		t.Errorf("answer observation id = %q, want %q", answerObs.Fields["id"], msgAnswerID)
+	}
+	answerContent := "released\n"
+	if want := sha256HexOf(answerContent); answerObs.Fields["sha256"] != want {
+		t.Errorf("answer observation sha256 = %q, want %q (sha256 of the exact answer content)", answerObs.Fields["sha256"], want)
+	}
+	if want := fmt.Sprintf("%d", len(answerContent)); answerObs.Fields["bytes"] != want {
+		t.Errorf("answer observation bytes = %q, want %q", answerObs.Fields["bytes"], want)
+	}
 }
 
 // TestFixtureWorkerHoldMissingBodyFailsLoudly proves the negative side of
