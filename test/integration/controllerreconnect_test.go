@@ -23,12 +23,18 @@ import (
 // (no fork), so unlike `cat path`, there is no child process whose own
 // fork/exec latency could widen the window between the ready marker and
 // the actual blocking open. Once releaseCheckGate's writer opens and
-// closes gatePath, every already-blocked reader — both gated invocations
-// alike — unblocks in the same instant (a real FIFO rendezvous, verified
-// against this exact mechanism: a busy-polling wait for both markers
+// closes gatePath, every reader already blocked on the FIFO at that
+// moment unblocks together (a real FIFO rendezvous, verified against
+// this exact mechanism: a busy-polling wait for both markers
 // reintroduces the fork-latency race by starving the shells of CPU, so
-// the marker poll below uses waitUntil's own sleeping loop, never a tight
-// spin). "$@" after `shift 2` is the hop binary path plus its own
+// the marker poll below uses waitUntil's own sleeping loop, never a
+// tight spin) — best-effort, not guaranteed simultaneity: since the
+// ready marker is written before the blocking open, a reader that has
+// not yet reached it when releaseCheckGate renames a regular file over
+// gatePath instead finds that file and proceeds without ever blocking.
+// The assertions below never depend on true simultaneity, only on both
+// invocations eventually starting. "$@" after `shift 2` is the hop
+// binary path plus its own
 // arguments, exec'd in place so the wrapper never lingers as an extra
 // process the harness would need to reap separately from the real
 // controller/loser it fronts.
@@ -85,19 +91,28 @@ func readNamedLog(t *testing.T, artifacts *artifactDir, fileName string) string 
 // already have settled back to one by the time a single poll looked. It
 // never calls testing.T from the sampling goroutine (T.Fatal is only safe
 // from the test's own goroutine); Stop joins the goroutine and hands its
-// accumulated result back for the caller to assert on directly.
+// accumulated result back for the caller to assert on directly. Stop is
+// idempotent (a sync.Once-guarded channel close), so both an explicit
+// call and the t.Cleanup startManagerSessionCountSampler registers are
+// always safe, whichever runs first — including on a t.Fatal between
+// them, which would otherwise leak the goroutine (and its own sqlite3
+// invocation every 10ms) for the rest of the test binary.
 type managerSessionCountSampler struct {
-	stop chan struct{}
-	done chan struct{}
-	mu   sync.Mutex
-	max  int
-	err  error
+	stop     chan struct{}
+	done     chan struct{}
+	stopOnce sync.Once
+	mu       sync.Mutex
+	max      int
+	err      error
 }
 
 // startManagerSessionCountSampler begins sampling immediately, at a short,
 // fixed interval well under the lease race's own expected duration (a
-// local process start plus one sqlite transaction).
-func startManagerSessionCountSampler(dbPath, runID string) *managerSessionCountSampler {
+// local process start plus one sqlite transaction), and registers Stop
+// with t.Cleanup so the goroutine never outlives the test regardless of
+// how it ends.
+func startManagerSessionCountSampler(t *testing.T, dbPath, runID string) *managerSessionCountSampler {
+	t.Helper()
 	s := &managerSessionCountSampler{stop: make(chan struct{}), done: make(chan struct{})}
 	go func() {
 		defer close(s.done)
@@ -119,7 +134,13 @@ func startManagerSessionCountSampler(dbPath, runID string) *managerSessionCountS
 						s.err = fmt.Errorf("sample manager session count: %w: %s", err, out)
 					}
 				default:
-					if n, perr := strconv.Atoi(strings.TrimSpace(string(out))); perr == nil && n > s.max {
+					n, perr := strconv.Atoi(strings.TrimSpace(string(out)))
+					switch {
+					case perr != nil:
+						if s.err == nil {
+							s.err = fmt.Errorf("parse sampled manager session count %q: %w", out, perr)
+						}
+					case n > s.max:
 						s.max = n
 					}
 				}
@@ -127,14 +148,16 @@ func startManagerSessionCountSampler(dbPath, runID string) *managerSessionCountS
 			}
 		}
 	}()
+	t.Cleanup(func() { s.Stop() })
 	return s
 }
 
 // Stop ends sampling and returns the maximum non-terminal manager-session
-// count observed across every sample, plus the first sampling error (if
-// any query itself failed to run — never a manager-session-count finding).
+// count observed across every sample, plus the first sampling error (a
+// failed query, or one whose output failed to parse — never a manager-
+// session-count finding). Safe to call more than once (idempotent).
 func (s *managerSessionCountSampler) Stop() (maxCount int, err error) {
-	close(s.stop)
+	s.stopOnce.Do(func() { close(s.stop) })
 	<-s.done
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -200,6 +223,16 @@ func TestRealProcessControllerReconnectNoSecondClaimant(t *testing.T) {
 		t.Fatalf("no settled launch claim pid recorded for worker session %s before the kill", workerSessionID)
 	}
 
+	// The dead holder's own lease identity, captured before the kill: the
+	// winner's takeover must actually rewrite both fields, not merely
+	// leave a lease row that happens to still satisfy the loser's regex.
+	beforeControllerID := fx.scalar(t, fmt.Sprintf("SELECT controller_id FROM run_leases WHERE run_id = '%s';", fx.runID))
+	beforeGenerationStr := fx.scalar(t, fmt.Sprintf("SELECT generation FROM run_leases WHERE run_id = '%s';", fx.runID))
+	beforeGeneration, err := strconv.Atoi(beforeGenerationStr)
+	if beforeControllerID == "" || err != nil {
+		t.Fatalf("no run_leases row found for run %s before the kill (controller_id=%q generation=%q)", fx.runID, beforeControllerID, beforeGenerationStr)
+	}
+
 	// Kill the controller through its own owned process handle: never a
 	// pid this test only observed via pane inspection (killControllerLeader
 	// signals sp.leaderCmd.Process, the *exec.Cmd this harness itself
@@ -217,7 +250,7 @@ func TestRealProcessControllerReconnectNoSecondClaimant(t *testing.T) {
 	raceA, readyA := startGatedResume(t, server, artifacts, fx.stateDir, "resume-a", gatePath, "resume", "-C", fx.repo.Root, fx.runID)
 	raceB, readyB := startGatedResume(t, server, artifacts, fx.stateDir, "resume-b", gatePath, "resume", "-C", fx.repo.Root, fx.runID)
 
-	sampler := startManagerSessionCountSampler(fx.dbPath(), fx.runID)
+	sampler := startManagerSessionCountSampler(t, fx.dbPath(), fx.runID)
 
 	// Wait, via waitUntil's own bounded sleeping poll (never a busy spin,
 	// which would starve the two shells and reopen the very race this
@@ -278,6 +311,20 @@ func TestRealProcessControllerReconnectNoSecondClaimant(t *testing.T) {
 	if winnerControllerID == "" {
 		t.Fatalf("no run_leases row found for run %s after the race", fx.runID)
 	}
+	// The takeover actually rewrote the lease identity, not merely a row
+	// that happens to still satisfy the loser's regex below: a new
+	// controller id, and the generation advanced by exactly one.
+	if winnerControllerID == beforeControllerID {
+		t.Errorf("lease controller_id after the race = %s, want it changed from the pre-kill holder %s", winnerControllerID, beforeControllerID)
+	}
+	winnerGenerationStr := fx.scalar(t, fmt.Sprintf("SELECT generation FROM run_leases WHERE run_id = '%s';", fx.runID))
+	winnerGeneration, genErr := strconv.Atoi(winnerGenerationStr)
+	if genErr != nil {
+		t.Fatalf("lease generation %q after the race does not parse: %v", winnerGenerationStr, genErr)
+	}
+	if winnerGeneration != beforeGeneration+1 {
+		t.Errorf("lease generation after the race = %d, want exactly %d (one past the pre-kill generation %d)", winnerGeneration, beforeGeneration+1, beforeGeneration)
+	}
 	wantLoserPattern := regexp.MustCompile(
 		`^hop resume: app: acquire lease: sqlite: run ` + regexp.QuoteMeta(fx.runID) +
 			` lease is held by "` + regexp.QuoteMeta(winnerControllerID) + `" until \S+: app: lease is held\n$`)
@@ -287,13 +334,16 @@ func TestRealProcessControllerReconnectNoSecondClaimant(t *testing.T) {
 
 	// The winner warm-reattaches the manager and the held worker under the
 	// one corroboration predicate: "resumed" outcome, both sessions "warm".
-	winnerStdout := waitForControllerLog(t, artifacts, winnerName, "resume resumed:")
-	if !strings.Contains(winnerStdout, "resume resumed:") {
-		t.Fatalf("%s stdout never reported \"resume resumed:\"; got:\n%s", winnerName, winnerStdout)
-	}
+	// The header and each session's own line are separate writes, so
+	// waiting on the header alone could return a snapshot taken between
+	// them; waiting on the worker's own line — printed last, after the
+	// manager's — guarantees every earlier line is already present too.
+	implementerWarmLine := fmt.Sprintf("session %s (implementer): warm", workerSessionID)
+	winnerStdout := waitForControllerLog(t, artifacts, winnerName, implementerWarmLine)
 	for _, want := range []string{
+		"resume resumed:",
 		fmt.Sprintf("session %s (manager): warm", managerID),
-		fmt.Sprintf("session %s (implementer): warm", workerSessionID),
+		implementerWarmLine,
 	} {
 		if !strings.Contains(winnerStdout, want) {
 			t.Errorf("%s stdout missing %q; got:\n%s", winnerName, want, winnerStdout)
