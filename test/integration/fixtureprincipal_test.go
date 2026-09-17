@@ -1158,3 +1158,87 @@ func TestFixtureWorkerHoldBarrier(t *testing.T) {
 		t.Error("worker-hold did not commit a change before submitting")
 	}
 }
+
+// TestFixtureWorkerHoldMissingBodyFailsLoudly proves the negative side of
+// the read-before-ack fix (Astra review pass 1, P2 "unread bodies"): a
+// delivered barrier-release answer whose body file does not exist must
+// never be acked — the worker must fail loudly (readFileOrFatal's own
+// fatalf) instead of silently releasing on an envelope it never actually
+// read.
+func TestFixtureWorkerHoldMissingBodyFailsLoudly(t *testing.T) {
+	artifacts := newArtifactDir(t)
+	worker := buildFixtureWorker(t, artifacts)
+	fakeHop := buildFakeHopStub(t, artifacts)
+	repo := newFixtureRepo(t, artifacts, nil, "repo")
+
+	stateDir := artifacts.dir(t, "state")
+	scratchDir := artifacts.dir(t, "worker-hold-missing-body-scratch")
+	const (
+		runID     = "12121212-1212-4121-8121-121212121212"
+		taskID    = "13131313-1313-4131-8131-131313131313"
+		attemptID = "14141414-1414-4141-8141-141414141414"
+		sessionID = "15151515-1515-4151-8151-151515151515"
+	)
+	assignmentPath := filepath.Join(stateDir, "runs", runID, "attempts", attemptID, "assignment.md")
+	if err := os.MkdirAll(filepath.Dir(assignmentPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(assignmentPath, []byte("# HOP Task Assignment\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	instructionsPath := filepath.Join(stateDir, "runs", runID, "tasks", taskID+".md")
+	if err := os.MkdirAll(filepath.Dir(instructionsPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(instructionsPath, []byte("FIXTURE-BEHAVIOR: worker-hold "+scratchDir+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	scriptDir := artifacts.dir(t, "worker-hold-missing-body-script")
+	// Deliberately never created: the answer envelope names a body path
+	// this fixture must attempt to read and fail on, never silently skip.
+	missingBody := filepath.Join(scriptDir, "does-not-exist.txt")
+	blocks := []string{fakeMessageBlock("msg-answer", "answer", "manager-session", "99999999-9999-4999-8999-999999999999", "", missingBody)}
+	scriptPath, indexPath := writeFakeHopMsgScript(t, scriptDir, blocks)
+	logPath := filepath.Join(scriptDir, "log.txt")
+
+	prompt := testAssignmentPrompt(assignmentPath, fakeHop)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, worker, "--session-id", sessionID, prompt) //nolint:gosec // G204: fixed test-owned binary and arguments.
+	cmd.Dir = repo.Root
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOP_STATE_DIR=" + stateDir,
+		"HOP_RUN_ID=" + runID,
+		"HOP_TASK_ID=" + taskID,
+		"HOP_ATTEMPT_ID=" + attemptID,
+		"HOP_SESSION_ID=" + sessionID,
+		"HOP_INCARNATION_ID=16161616-1616-4161-8161-161616161616",
+		"HOP_ROLE=implementer",
+		"FAKE_HOP_MSG_SCRIPT=" + scriptPath,
+		"FAKE_HOP_MSG_INDEX=" + indexPath,
+		"FAKE_HOP_LOG=" + logPath,
+	}
+	var out strings.Builder
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	cmd.Stdin = strings.NewReader("FIXTURE-QUIT\n")
+	runErr := cmd.Run()
+	if runErr == nil {
+		t.Fatalf("worker exited 0 despite an unreadable delivered body; want a fatal exit; output:\n%s", out.String())
+	}
+
+	output := out.String()
+	if !strings.Contains(output, "fixture principal: read "+missingBody) {
+		t.Errorf("worker output does not name the read failure; got:\n%s", output)
+	}
+	if strings.Contains(output, "FIXTURE-HOLD-RELEASED") {
+		t.Errorf("worker reported the barrier released despite never reading the answer's body; got:\n%s", output)
+	}
+
+	log := readFakeHopLog(t, logPath)
+	if strings.Contains(log, "msg\tack\tmsg-answer") {
+		t.Errorf("fixture acked a message whose body it never successfully read; log:\n%s", log)
+	}
+}

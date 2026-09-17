@@ -536,6 +536,11 @@ func submitOnce(hopPath, oid, summary string) {
 // half ("before hop result submit it must drain its queue"), applied
 // uniformly before every submit/verdict attempt so a message left over
 // from an earlier attempt of the same task can never block acceptance.
+// Every ack is the recipient's statement of receipt-AND-READ (design
+// section 7): this reads each message's own body file successfully
+// before acking it, even when the content is otherwise ignored, and
+// fails loudly rather than acking a message whose body it never
+// actually read.
 func drainMailbox(hopPath string) {
 	for {
 		res := runHopCLI(hopPath, "msg", "next")
@@ -543,7 +548,21 @@ func drainMailbox(hopPath string) {
 		if !ok {
 			return
 		}
-		runHopCLI(hopPath, "msg", "ack", msg.ID)
+		readFileOrFatal(msg.BodyPath)
+		ackAndRequireSuccess(hopPath, msg.ID)
+	}
+}
+
+// ackAndRequireSuccess runs hop msg ack and fails the run loudly unless
+// the response is accepted/duplicate — an ack that read back the body
+// successfully but was itself refused must never be silently ignored
+// (design section 7: an ack is the recipient's own statement of
+// receipt-and-read).
+func ackAndRequireSuccess(hopPath, messageID string) {
+	res := runHopCLI(hopPath, "msg", "ack", messageID)
+	first := res.FirstLine()
+	if !strings.HasPrefix(first, "acknowledged ") && !strings.HasPrefix(first, "duplicate ") {
+		fatalf("hop msg ack %s failed: %s", messageID, first)
 	}
 }
 
@@ -820,7 +839,8 @@ func runWorker() {
 			if !delivered {
 				continue
 			}
-			runHopCLI(hopPath, "msg", "ack", answer.ID)
+			readFileOrFatal(answer.BodyPath)
+			ackAndRequireSuccess(hopPath, answer.ID)
 			if answer.Kind == "answer" && answer.ReplyTo == question {
 				fmt.Printf("FIXTURE-HOLD-RELEASED answer=[%s]\n", answer.ID)
 				break
@@ -1193,7 +1213,7 @@ func handleManagerMessage(hopPath, cwd, runID, scratchDir string, script *manage
 			}
 		}
 	}
-	runHopCLI(hopPath, "msg", "ack", msg.ID)
+	ackAndRequireSuccess(hopPath, msg.ID)
 }
 
 // reviewSubmitOnce runs "<hopPath> review submit ...", retrying on the
