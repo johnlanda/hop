@@ -721,6 +721,15 @@ func parseDeliveredMessage(stdout string) (deliveredMessage, bool) {
 // spinning silently forever against a permanent regression.
 const fixtureFetchLoopDeadline = 2 * time.Minute
 
+// fixtureMessagingUnauthorizedText mirrors internal/app/messaging.go's
+// ErrMessagingUnauthorized.Error() exactly (retyped, never imported): design
+// section 7's Fetch prints NO protocol line on stdout for any authority
+// refusal (the pre-binding launch window's own disagreeing/absent pending
+// intent included) -- only a stderr diagnostic ("hop msg wait: app: fetch
+// message: "+this text+": <detail>"), which runHopCLI's merged capture
+// still surfaces as the line's own stable substring.
+const fixtureMessagingUnauthorizedText = "messaging session is not authorized for this request"
+
 // fetchDeliveredMessage runs "<hopPath> msg wait" in a loop until a
 // message is delivered, classifying and pacing every non-delivery outcome
 // instead of retrying unconditionally on anything -- worker-hold's and
@@ -728,12 +737,12 @@ const fixtureFetchLoopDeadline = 2 * time.Minute
 //   - "none: ..." (no message within the wait timeout) continues at once;
 //     the server-side wait itself already paced that call, so no sleep is
 //     added on top of it.
-//   - "transient: ..." -- and the pre-binding launch window's own exact
-//     "refused: unauthorized" line (a session/incarnation not yet
-//     current, matched by EXACT text, never a broader prefix, so a
-//     genuinely different unauthorized refusal still fails loudly below)
-//     -- sleeps fixtureRetryInterval within fixtureFetchLoopDeadline and
-//     prints the line.
+//   - "transient: ..." -- and the pre-binding launch window's own fetch
+//     authority refusal, recognized by fixtureMessagingUnauthorizedText's
+//     stable substring (a fetch refusal carries no fixed first-line
+//     grammar of its own to match verbatim, unlike a send/ack/submit
+//     refusal) -- sleeps fixtureRetryInterval within
+//     fixtureFetchLoopDeadline and prints the line.
 //   - anything else fatalf's immediately, naming the exact line, rather
 //     than looping silently against a permanent regression.
 func fetchDeliveredMessage(hopPath string) deliveredMessage {
@@ -746,7 +755,7 @@ func fetchDeliveredMessage(hopPath string) deliveredMessage {
 		first := out.FirstLine()
 		switch {
 		case strings.HasPrefix(first, "none:"):
-		case strings.HasPrefix(first, "transient:"), first == "refused: unauthorized":
+		case strings.HasPrefix(first, "transient:"), strings.Contains(first, fixtureMessagingUnauthorizedText):
 			if !time.Now().Before(deadline) {
 				fatalf("hop msg wait kept returning %q past the %s retry deadline", first, fixtureFetchLoopDeadline)
 			}

@@ -23,10 +23,11 @@ import (
 // place of depending on the SCRIPTED fixture manager's own timing or
 // text encoding. A call issued this way is exactly as legitimate as one
 // the live scripted manager process would make itself: the store
-// validates only the session id, its current incarnation and the run it
-// belongs to (internal/app/usecase_message.go's SendMessage,
-// internal/adapters/sqlite/messaging.go's SendMessage) -- never which OS
-// process happened to invoke the CLI. Shared by
+// validates only the session id, the run it belongs to, its current
+// incarnation and its resolved address's currency (design section 7's
+// run.CurrentAddressSession -- internal/app/usecase_message.go's
+// SendMessage, internal/adapters/sqlite/messaging.go's SendMessage) --
+// never which OS process happened to invoke the CLI. Shared by
 // injectionfreedelivery_test.go, mailboxclosurerace_test.go,
 // relayedquestion_test.go and duplicateandambiguousdelivery_test.go.
 

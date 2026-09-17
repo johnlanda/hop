@@ -1797,8 +1797,9 @@ func TestFixtureWorkerHoldBarrier(t *testing.T) {
 // path: fetchDeliveredMessage (shared by worker-hold and
 // worker-fetch-crash's own msg-wait fetch loop) must fatalf on any hop msg
 // wait outcome that is neither a delivered message, "none:", "transient:",
-// nor the pre-binding launch window's own exact "refused: unauthorized"
-// line -- never spin silently against a permanent regression.
+// nor a line carrying the pre-binding launch window's own fetch authority
+// refusal text (fixtureMessagingUnauthorizedText) -- never spin silently
+// against a permanent regression.
 func TestFixtureWorkerHoldFetchLoopFatalsOnUnexpectedRefusal(t *testing.T) {
 	artifacts := newArtifactDir(t)
 	worker := buildFixtureWorker(t, artifacts)
@@ -1829,9 +1830,9 @@ func TestFixtureWorkerHoldFetchLoopFatalsOnUnexpectedRefusal(t *testing.T) {
 
 	scriptDir := artifacts.dir(t, "worker-hold-fatal-script")
 	// A hop msg wait outcome that is none of the tolerated shapes: not a
-	// delivered message, not "none:", not "transient:", and not the
-	// pre-binding launch window's own exact "refused: unauthorized"
-	// line.
+	// delivered message, not "none:", not "transient:", and carrying none
+	// of the pre-binding launch window's own fetch authority refusal
+	// text.
 	blocks := []string{"refused: not-found\n"}
 	scriptPath, indexPath := writeFakeHopMsgScript(t, scriptDir, blocks)
 	logPath := filepath.Join(scriptDir, "log.txt")
