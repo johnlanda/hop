@@ -233,6 +233,10 @@ func runResultSubmit(args []string) {
 	requireUUID("HOP_TASK_ID", env["HOP_TASK_ID"])
 	requireUUID("HOP_ATTEMPT_ID", env["HOP_ATTEMPT_ID"])
 	requireUUID("HOP_INCARNATION_ID", env["HOP_INCARNATION_ID"])
+	if transientCallsLeft("FAKE_HOP_RESULT_SUBMIT_UNDELIVERED_COUNT", "FAKE_HOP_RESULT_SUBMIT_UNDELIVERED_COUNTER_FILE") {
+		fmt.Println("transient: undelivered messages; drain with hop msg next, ack, then resubmit")
+		os.Exit(1)
+	}
 	fmt.Println("accepted 77777777-7777-4777-8777-777777777777")
 }
 
@@ -1240,5 +1244,91 @@ func TestFixtureWorkerHoldMissingBodyFailsLoudly(t *testing.T) {
 	log := readFakeHopLog(t, logPath)
 	if strings.Contains(log, "msg\tack\tmsg-answer") {
 		t.Errorf("fixture acked a message whose body it never successfully read; log:\n%s", log)
+	}
+}
+
+// TestFixtureWorkerDrainsOnUndeliveredResultTransient proves
+// submitOnce's own mailbox-drain retry (Astra review pass 1, P2):
+// previously it only slept and resubmitted on ANY transient line, so a
+// message the section 5 mailbox rule requires draining first would sit
+// undrained on every identical retry until the two-minute budget
+// expired. Drives the SOLO submit-valid behavior deliberately — it never
+// drains before its own first submit call (unlike worker-implement/
+// worker-hold), so the scripted pending message survives untouched until
+// submitOnce's OWN post-transient drain is what has to find it, proving
+// the drain fires from the retry path itself, not some earlier one.
+func TestFixtureWorkerDrainsOnUndeliveredResultTransient(t *testing.T) {
+	artifacts := newArtifactDir(t)
+	worker := buildFixtureWorker(t, artifacts)
+	fakeHop := buildFakeHopStub(t, artifacts)
+	repo := newFixtureRepo(t, artifacts, nil, "repo")
+
+	stateDir := artifacts.dir(t, "state")
+	const runID = "17171717-1717-4171-8171-171717171717"
+	runDir := filepath.Join(stateDir, "runs", runID, "artifacts")
+	if err := os.MkdirAll(runDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	assignmentPath := filepath.Join(runDir, "assignment.md")
+	brief := fixtureWorkerBrief("submit-valid")
+	if err := os.WriteFile(assignmentPath, []byte("# HOP Assignment\n\n## Brief\n\n"+brief+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	scriptDir := artifacts.dir(t, "drain-script")
+	pendingBody := filepath.Join(scriptDir, "pending-info.txt")
+	if err := os.WriteFile(pendingBody, []byte("pending notice\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	blocks := []string{fakeMessageBlock("msg-pending", "info", "manager-session", "", "", pendingBody)}
+	scriptPath, indexPath := writeFakeHopMsgScript(t, scriptDir, blocks)
+	logPath := filepath.Join(scriptDir, "log.txt")
+	undeliveredCounterPath := filepath.Join(scriptDir, "undelivered-counter.txt")
+
+	prompt := testAssignmentPrompt(assignmentPath, fakeHop)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	const sessionID = "22222222-2222-4222-8222-222222222222"
+	cmd := exec.CommandContext(ctx, worker, "--session-id", sessionID, prompt) //nolint:gosec // G204: fixed test-owned binary and arguments.
+	cmd.Dir = repo.Root
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOP_STATE_DIR=" + stateDir,
+		"HOP_RUN_ID=" + runID,
+		"HOP_TASK_ID=23232323-2323-4232-8232-232323232323",
+		"HOP_ATTEMPT_ID=24242424-2424-4242-8242-242424242424",
+		"HOP_SESSION_ID=" + sessionID,
+		"HOP_INCARNATION_ID=25252525-2525-4252-8252-252525252525",
+		"FAKE_HOP_MSG_SCRIPT=" + scriptPath,
+		"FAKE_HOP_MSG_INDEX=" + indexPath,
+		"FAKE_HOP_LOG=" + logPath,
+		"FAKE_HOP_RESULT_SUBMIT_UNDELIVERED_COUNT=1",
+		"FAKE_HOP_RESULT_SUBMIT_UNDELIVERED_COUNTER_FILE=" + undeliveredCounterPath,
+	}
+	var out strings.Builder
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	cmd.Stdin = strings.NewReader("FIXTURE-QUIT\n")
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("run fixture worker: %v\nstdout/stderr:\n%s", err, out.String())
+	}
+
+	stdout := out.String()
+	if !strings.Contains(stdout, "FIXTURE-SUBMIT-RESULT exit=[1] first-line=[transient: undelivered messages") {
+		t.Errorf("worker stdout missing the first (transient) submit attempt; got:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "FIXTURE-SUBMIT-RESULT exit=[0] first-line=[accepted") {
+		t.Errorf("worker stdout missing the second (accepted) submit attempt; got:\n%s", stdout)
+	}
+
+	log := readFakeHopLog(t, logPath)
+	if !strings.Contains(log, "msg\tack\tmsg-pending") {
+		t.Errorf("fixture never drained (acked) the pending message between submit attempts; log:\n%s", log)
+	}
+	firstSubmit := strings.Index(log, "result\tsubmit\t")
+	ackIdx := strings.Index(log, "msg\tack\tmsg-pending")
+	secondSubmit := strings.LastIndex(log, "result\tsubmit\t")
+	if firstSubmit < 0 || ackIdx < 0 || firstSubmit >= ackIdx || ackIdx >= secondSubmit {
+		t.Errorf("the drain did not happen strictly between the two submit attempts; log:\n%s", log)
 	}
 }

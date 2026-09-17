@@ -522,11 +522,19 @@ func submitOnce(hopPath, oid, summary string) {
 	for {
 		res := runHopCLI(hopPath, "result", "submit", "--summary", summary, "--commit", oid)
 		fmt.Printf("FIXTURE-SUBMIT-RESULT exit=[%d] first-line=[%s]\n", res.ExitCode, res.FirstLine())
-		if strings.HasPrefix(res.FirstLine(), "transient") && time.Now().Before(deadline) {
-			time.Sleep(fixtureRetryInterval)
-			continue
+		if !strings.HasPrefix(res.FirstLine(), "transient") || !time.Now().Before(deadline) {
+			return
 		}
-		return
+		// Feature mode's own mailbox-drain transient (design section 5:
+		// "transient: undelivered messages; drain with hop msg next, ack,
+		// then resubmit") names a SPECIFIC required action, distinct from
+		// solo's "attempt not yet running" retry: the identical resubmit
+		// would see the SAME pending message forever without this drain.
+		// Solo never renders this line, so this never fires for it.
+		if strings.HasPrefix(res.FirstLine(), "transient: undelivered messages") {
+			drainMailbox(hopPath)
+		}
+		time.Sleep(fixtureRetryInterval)
 	}
 }
 
