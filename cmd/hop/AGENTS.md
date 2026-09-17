@@ -163,7 +163,9 @@ commands expect the built binary at `.bin/hop` (see `make build`).
   exit), hop run's refusal/failure/detach paths and flag surface, resume
   outcome routing (a resumed feature run whose child is
   launch-suppressed enters the loop and reaches failed through the
-  retirement pass, never a stop), stop's drive/observe/deadline paths, status filtering
+  retirement pass, never a stop; one whose child launch is in flight
+  renders its pending line and enters the loop, whose corroboration
+  settles it), stop's drive/observe/deadline paths, status filtering
   and detail rendering — including STATUS-1's feature-mode block: the task
   table, latest integration, guard shortfalls, per-mailbox attention lines
   (with and without a known live-session binding, with and without
