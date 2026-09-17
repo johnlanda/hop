@@ -252,7 +252,8 @@ integrator slice removes it with the `hop launch --run --attempt` flip.
 worker and the feature manager alike: the claim of the incarnation the
 session launch context resolves — the current binding's, else, while the
 `pane.open` outcome is unrecorded, the session's newest pending launch
-intent's; a binding and a pending intent that disagree surface no claim.
+intent's; a binding and any pending launch intent of the session that
+names another incarnation (not only the newest) surface no claim.
 Every reader of the detail therefore decides by claim state whether or
 not the binding was recorded (Phase 2 section 4, "claim state decides"):
 solo stop retires a live pre-binding launch by its creation label under
@@ -296,6 +297,33 @@ The manager pane itself is then opened with the Phase 2 `OpenWorkerPane`
 transport, same claim, same corroboration predicate. Recovery of a lost
 `workspace.create` response is by creation label through
 `session.snapshot`, pinned by S8 before the port freezes.
+
+`ServerInstance` names one server LIFETIME, replacing Phase 2's bare
+socket-peer-pid token, whose pid a restarted server could reuse. Herdr
+exposes no lifetime value of its own, never re-execs a running server in
+place, and starts a new process for every restart and live handoff, so
+the herdr adapter renders `herdr-server-lifetime/v1 pid=<peer pid>
+start=<sec>.<usec>`: the pid of the process that accepted the connection
+(the socket peer) and that process's OS start time. A later process
+reusing the pid is created after the earlier holder exited, so its start
+time is later, and the token never repeats (only a backwards wall-clock
+step landing on the earlier start's exact microsecond could). The token
+is implemented on darwin (a raw `kinfo_proc` read, accepted only at the
+expected record size carrying the pid) and pinned there by
+`TestSpikeLabelSurvivesRestart` under the production transport: it names
+the server leader's pid and the start second `ps -o lstart=` reports,
+stays identical within a lifetime and changes across a restart. Every
+other platform, and any failed lookup, yields "" — unknown — so each
+continuity decision there fails closed until a platform identity is added
+with its own probe. A token recorded in the Phase 2 `peer-pid:<n>` format
+never equals a v1 token, so runs placed by an older HOP compare as
+changed: their attested cold relaunch, in-flight hand-off and
+launch-ended settlement stay fail-closed. `InspectPane` stamps its result
+(`PaneProcess.ServerInstance`) with the lifetime of the server that
+answered that very request: Herdr serves one request per API connection,
+and the adapter reads the peer pid on that connection and the pid's
+lifetime before the request and after the response, stamping only when
+both agree.
 
 ### ConfigurationSource (extended RunPolicy)
 
@@ -476,8 +504,8 @@ New operation kinds and their decision-table rows (Phase 2 rows unchanged):
 | `integration.reset` (combined-check failure rollback, section 8; also the stop path's retirement of a published-but-unsettled candidate) | The act is two steps with the identity persisted BETWEEN them: (i) create the ROLLBACK COMMIT R (`git commit-tree <premerge>^{tree} -p <M>` — R carries the pre-merge content and keeps the rejected M reachable as its parent) and record R's object ID in `act_evidence` — a plain store write — BEFORE any ref move; (ii) `git update-ref … <R> <M>`. Recovery is decidable in every window: R recorded and ref == R → adopt; R recorded and ref == M → re-act step (ii) only (idempotent CAS); no R recorded and ref == M → re-act from step (i) (a prior orphaned commit-tree object is unreferenced and harmless); anything else → `reconciling` | same | same |
 | `worktree.create` (now per attempt) | Phase 2 row verbatim; provenance = repository common-directory equality plus the recorded base commit (now the integration head frozen into the intent). Feature mode resolves an unresolved one on every scheduling pass, on resume, and before stop's and the terminal failure's terminal reports — adopted with its attempt link and the workspace its creation label (the operation ID) names, or settled failed after the bounded wait, the attempt then settling as a terminal launch failure with the budgeted task consequence | same | same |
 | `pane.open` (manager, worker, reviewer) | Phase 2 row verbatim — one predicate, one close rule, all roles | same | same |
-| `pane.open` whose `exec_pending` claim outlived its placed pane (the launch ended before corroboration) | Phase 2's claim-state logic keeps an `exec_pending` claim ambiguous until it is corroborated or retired; the retirement can also be OBSERVED. The claim settles `exec_failed` — with the fixed reason "launch ended before corroboration: pane absent by id and label; claimed process gone", and the pane id and claimed pid as evidence — only when all three hold: the claim's own binding is current and not superseded; its pane is positively absent under the one absence rule (`pane_not_found` by id AND a successful creation-label lookup that finds nothing); and the claimed process is gone (a successful listing of the claimed pid's own process group shows no member with that pid — the launcher is a session leader, so a living claimed process is always listed there). From then on the `exec_failed` row decides: a child's attempt fails with the section 5 budgeted task consequence and the manager notice, and the manager lineage's failure cause fails the run. Anything short of that pair stays ambiguous and settles nothing: any other inspection or lookup error, a pane still answering by label, a failed listing, a pid still listed (a zombie or a recycled pid fails closed), no inspector, an uninspectable pid. The shapes and the process relation are pinned by `TestSpikeVanishedPaneShapes` (`test/integration/spike_panevanish_test.go`) | same — the scheduling pass's launch corroboration applies it on every round | same — resume's session reconciliation applies it; stop and the terminal-failure shutdown retire an `exec_pending` session only on the same pair, and a vanished pane whose claimed process still runs stays outstanding with the human action named |
-| `pane.open` whose `exec_pending` claim outlived a pane whose placement was never recorded (the launch ended before its `pane.open` outcome) — the label-only variant of the row above | With no committed binding there is no pane id to inspect, so absence rests on the creation label: the claim settles `exec_failed` — with the DISTINCT fixed reason "launch ended before its placement was recorded: no pane answers for the creation label; claimed process gone", and the claimed pid as evidence — only when all of these hold: the session has no committed binding; exactly one unresolved, decodable, labeled `pane.open` intent names the session, and no unresolved launch row with unusable identity might; the claim is that intent's own incarnation and `exec_pending`; a successful creation-label lookup finds nothing; and the claimed process is gone (the same group listing as above). The same transaction, which re-reads all of it, resolves that `pane.open` `failed` with a typed outcome saying it was DISPATCHED (its pane's own process wrote the claim) and the pane is gone — never "refused before dispatch" — so nothing stays unresolved; the session's claim keeps resolving through that resolved intent, so the `exec_failed` row decides everywhere afterwards, exactly as above. The label conjunct is sound because a claim exists only after the pane's own process ran `hop launch`, so the pane existed at claim time, and Herdr attaches a pane's creation label in the very request that creates it, keeps it for the pane's whole life — a graceful restart restores it before the server serves any request — and drops it with the pane; a label that stops answering therefore means the pane is gone. Both are pinned by executed probes under the production transport (`TestSpikeVanishedPaneShapes`: the first lookup after the create, back-to-back lookups while the pane lives, nothing after exit or close; `TestSpikeLabelSurvivesRestart`). The one live relabelling (a human's `pane.rename`) leaves the pane's process running, which the process conjunct still observes. Anything short of the whole set stays ambiguous and settles nothing: a failed lookup, a pane answering for the label (it is adopted by label instead), more than one unresolved launch, an unusable row, a live, still-listed or unobservable claimed process | same — the scheduling pass's launch corroboration applies it after its label recovery finds nothing | same — resume adopts an unresolved `pane.open` by its label first and applies it otherwise; stop and every retirement boundary apply it before reporting the launch outstanding. Solo is unchanged: its unbound-launch rule (`retireUnboundLaunch`) keeps failing closed on a claim whose pane answers nothing |
+| `pane.open` whose `exec_pending` claim outlived its placed pane (the launch ended before corroboration) | Phase 2's claim-state logic keeps an `exec_pending` claim ambiguous until it is corroborated or retired; the retirement can also be OBSERVED. The claim settles `exec_failed` — with the fixed reason "launch ended before corroboration: pane absent by id and label; claimed process gone", and the pane id and claimed pid as evidence — only when all of these hold: the claim's own binding is current and not superseded; its pane is positively absent under the one absence rule (`pane_not_found` by id AND a successful creation-label lookup that finds nothing); the claimed process is gone (a successful listing of the claimed pid's own process group shows no member with that pid — the launcher is a session leader, so a living claimed process is always listed there); and server continuity since the placement holds on both sides of those observations (the binding's recorded `ServerInstance` equals a fresh, non-empty read taken immediately before and again after them — server lifetimes are contiguous and a socket path is served by one server at a time, so the observations between were served by that lifetime). The continuity conjunct is what makes the pair conclusive: under one lifetime a pane has a runtime from its creation and keeps its process for its whole life, while after a restart Herdr answers `pane_not_found` for a restored pane whose deferred native restore has not fired, and restores a pane a human renamed under its NEW name, so absence by id and label proves nothing there (`TestSpikeRenamedLabelSurvivesRestart`). From then on the `exec_failed` row decides: a child's attempt fails with the section 5 budgeted task consequence and the manager notice, and the manager lineage's failure cause fails the run. Anything short of the whole set stays ambiguous and settles nothing: any other inspection or lookup error, a pane still answering by label, a failed listing, a pid still listed (a zombie or a recycled pid fails closed), no inspector, an uninspectable pid, and a changed, unknown or older-format server identity — the last reported with the value-free human action: rename a renamed pane back to its launch label, otherwise stop the run once no pane of it remains (stop's own absence observation, which does not read continuity, then finishes it; follow-up STOP-1 records that stop, retirement and feature stop can read a renamed-and-restored pane as absent after a restart). The shapes and the process relation are pinned by `TestSpikeVanishedPaneShapes` (`test/integration/spike_panevanish_test.go`) | same — the scheduling pass's launch corroboration applies it on every round | same — resume's session reconciliation applies it; stop and the terminal-failure shutdown retire an `exec_pending` session only on the same pair, and a vanished pane whose claimed process still runs stays outstanding with the human action named |
+| `pane.open` whose `exec_pending` claim outlived a pane whose placement was never recorded (the launch ended before its `pane.open` outcome) — the label-only variant of the row above | With no committed binding there is no pane id to inspect, so absence rests on the creation label: the claim settles `exec_failed` — with the DISTINCT fixed reason "launch ended before its placement was recorded: no pane answers for the creation label; claimed process gone", and the claimed pid as evidence — only when all of these hold: the session has no committed binding; exactly one unresolved, decodable, labeled `pane.open` intent names the session, and no unresolved launch row with unusable identity might; the claim is that intent's own incarnation and `exec_pending`; a successful creation-label lookup finds nothing; the claimed process is gone (the same group listing as above); and server continuity since the launch holds on both sides of those observations (the intent's recorded `ServerInstance`, observed immediately before the pane was created, equals fresh, non-empty reads immediately before and after them — continuity from that point covers the pane's creation and its launcher's claim). The same transaction, which re-reads all of it, resolves that `pane.open` `failed` with a typed outcome saying it was DISPATCHED (its pane's own process wrote the claim) and the pane is gone — never "refused before dispatch" — so nothing stays unresolved; the session's claim keeps resolving through that resolved intent, so the `exec_failed` row decides everywhere afterwards, exactly as above. The label conjunct is sound only within one server lifetime. A claim exists only after the pane's own process ran `hop launch`, so the pane existed at claim time, and Herdr attaches a pane's creation label in the very request that creates it and drops it with the pane (`TestSpikeVanishedPaneShapes`: the first lookup after the create, back-to-back lookups while the pane lives, nothing after exit or close). The one relabelling, a human's `pane.rename`, rewrites that same label: within the lifetime the renamed pane keeps its process, which the process conjunct still observes, but Herdr persists the new name and restores the pane under it after a restart, with a fresh shell or a deferred native restore in place of the claimed process (`TestSpikeRenamedLabelSurvivesRestart`; an unrenamed pane keeps its creation label across a restart, `TestSpikeLabelSurvivesRestart`). So after a restart "no pane answers for the creation label and the claimed process is gone" does not prove the pane gone, and only the continuity conjunct excludes that. Anything short of the whole set stays ambiguous and settles nothing: a failed lookup, a pane answering for the label (it is adopted by label instead), more than one unresolved launch, an unusable row, a live, still-listed or unobservable claimed process, and a changed, unknown or older-format server identity — the last reported with the value-free human action "if a pane of this run was renamed, rename it back to <label>", after which a later round adopts it by its label (every label a detail shows renders through the one escaping boundary, `app.RenderExternal`). RESIDUAL (matches the behavior before this row existed): an unplaced launch whose pane is really gone after a restart has no automatic or attested exit yet — resume stays `resuming` and stop stays `stopping` naming that action; `hop resume --confirm-absent` does not reach an unplaced launch, and extending it would amend Phase 2 section 5 item 5 (follow-up ATTEST-1) | same — the scheduling pass's launch corroboration applies it after its label recovery finds nothing | same — resume adopts an unresolved `pane.open` by its label first and applies it otherwise; stop and every retirement boundary apply it before reporting the launch outstanding. Solo is unchanged: its unbound-launch rule (`retireUnboundLaunch`) keeps failing closed on a claim whose pane answers nothing |
 | `session.close` (completion retirement, section 8) | Phase 2 `pane.close` row verbatim | same | same |
 
 There is no standing integration checkout: each integration operation
@@ -615,11 +643,21 @@ session, before its disposition is decided:
   failed closed to `reconciling` — a forking wrapper — stays that way);
   its binding is committed, current and not superseded; its claim is
   absent or that placement's own `exec_pending` claim; the `pane.open`
-  that recorded the placement is not `failed`; server continuity holds
-  between the placement and now (the recorded `ServerInstance` equals a
-  fresh, non-empty observation); and the recorded pane answers by id
-  with a foreground occupant whose process, when a claim exists, is the
-  claimed process. The run then resumes and the loop's corroboration
+  that recorded the placement is not `failed`; the recorded pane answers
+  by id, and THAT inspection was answered by the server lifetime the
+  placement recorded (the inspection's own `ServerInstance` stamp equals
+  the binding's, non-empty — so a restart between an earlier identity
+  read and the inspection cannot pass a restored pane off); and the pane
+  has a foreground occupant whose own process is the launch's: with a
+  claim, the claimed process; with none yet, HOP's own launcher for
+  exactly this session — the member at the pane's shell pid reporting
+  argv exactly equal to the placement's frozen `hop launch --run <run>
+  --session <session>` command, itself a launcher invocation naming this
+  run and session. Under one lifetime a pane id names one pane and a
+  command pane keeps its process for its whole life, so that process is
+  the one the placement spawned with this incarnation's environment
+  (`TestSpikeVanishedPaneShapes` pins that the pane's own process reports
+  exactly the argv `layout.apply` ran it with). The run then resumes and the loop's corroboration
   finishes the launch — settlement, the forking-wrapper reconcile, the
   launch-ended row, or the pre-claim launch deadline — exactly as a live
   controller would. Server continuity is a conjunct because a graceful
@@ -628,10 +666,11 @@ session, before its disposition is decided:
   token changing across the restart): after a restart the recorded id
   answers again, with a fresh shell or a restored harness in it, so "the
   pane still answers" is evidence of the original launch only under an
-  unchanged server identity. Unknown continuity, a pane gone by id (even
-  with its label answering), another process in the pane, an empty
-  foreground or a failed placement keep the run `resuming` with the reason
-  named, as before.
+  unchanged server lifetime, observed on the inspection itself. Unknown
+  or changed continuity, a pane gone by id (even with its label
+  answering), another process in the pane, any occupant but this
+  session's launcher before a claim, an empty foreground or a failed
+  placement keep the run `resuming` with the reason named.
 - The existing guards stand: the run never goes to `running` while the
   manager's own launch is unsettled (the bootstrap continuation returns it
   to `launching`, and only the manager's settlement moves it on — never a
@@ -889,9 +928,10 @@ failed and closed its pane, still fails the run rather than leaving it
 `launching`. A launch that ended before corroboration — its placed pane
 and claimed process both observed gone, or, with its placement never
 recorded, its creation label answering nothing and its claimed process
-gone — is an exec failure too, for every role: the section 4
-launch-ended row or its label-only variant settles the claim
-`exec_failed`, and the same consequences follow. The fixture principals deliberately stay
+gone, each under unbroken server continuity since the launch — is an
+exec failure too, for every role: the section 4 launch-ended row or its
+label-only variant settles the claim `exec_failed`, and the same
+consequences follow. The fixture principals deliberately stay
 alive at a composer-like idle loop after submitting, so the suite proves
 retirement actually terminates them rather than relying on process exit.
 
@@ -1208,12 +1248,14 @@ alike; a result submission resolves the attempt's non-terminated session
 first). The claimed incarnation is current for the session iff:
 
 - the session's committed, non-superseded binding carries it, and no
-  pending launch intent of the session names a different incarnation (a
-  binding and a pending intent that disagree fail closed, exactly as the
-  launch context does); or
+  pending launch intent of the session — ANY of them, not only the newest
+  — names a different incarnation or none usable (a binding and a pending
+  intent that disagree fail closed, exactly as the launch context and the
+  status claim do, even when a newer pending intent agrees); or
 - the session has no binding row at all (a superseded row without a
   successor retires its incarnation and disables this fallback), and the
-  session's newest pending `pane.open`/`launch.send` intent names it.
+  session's newest pending `pane.open`/`launch.send` intent names it
+  (this fallback alone selects the newest).
 
 The second branch is the claim's own pre-binding rule: the launcher is
 the pane's own command and can claim before the controller records the

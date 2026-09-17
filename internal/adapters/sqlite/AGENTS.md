@@ -37,9 +37,9 @@ this package never resolves environment variables or defaults.
 | [messages.go](messages.go) | `parseAddress`, `scanMessage`, `getMessage`, `messagesByAddress`, `nextEnqueueSeq`, `insertMessage`, `messageDeliveries`, `messageAck`, `resolveSessionAddress` | Shared message row mapping: Message.State reconstructed from the delivery/ack rows in the same snapshot (never a persisted column), the per-(run, recipient) FIFO sequence, lineage-based address resolution |
 | [statestore.go](statestore.go) | `InitializeRun`, `AcquireLease`, `Heartbeat`, `ReleaseLease`, `Begin`, `validateLease` | The controller authority: run bootstrap in one transaction (the snapshot's workflow JSON round-tripped, NULL for solo; a feature spec inserts the run, snapshot, manager session and lease only, refusing `app.ErrFeatureRunSpecInvalid` before the transaction and `app.ErrRunSequenceMismatch` inside it), lease CAS with monotonic generations, fenced unit-of-work begin |
 | [uow.go](uow.go) | `unitOfWork` and the typed repositories (`Runs`…`CheckExecClaims`), `OperationRepository.Pending`/`ByKind`, `Commit`, `Rollback` | One immediate transaction per unit of work; optimistic-concurrency saves; append-only bindings and transitions; journal payloads persisted as uninterpreted JSON; controller-side launch-claim settlement |
-| [entities.go](entities.go) | `getRun`, `getTask`, `getAttempt`, `getSession`, `currentSession`, `currentBinding`, `getWorktree`, `scanWorktree`, `selectWorktreeColumns`, `getLaunchClaim`, `acceptedResult`, `incarnationCurrent`, `sessionIncarnationCurrent`, `pendingLaunchIntentOfSession` | Row ↔ domain-value mapping shared by all three authorities through the `querier` interface; `sessionIncarnationCurrent` is the one principal-incarnation rule every caller-incarnation check decides through (see Invariants) (`getWorktree` and the listing's `scanWorktree` map NULL `attempt_id`/`base_commit` to the solo row's empty links; a worktree's `state` column is read verbatim, including the retirement states `removed`/`absent`/`released`) |
+| [entities.go](entities.go) | `getRun`, `getTask`, `getAttempt`, `getSession`, `currentSession`, `currentBinding`, `getWorktree`, `scanWorktree`, `selectWorktreeColumns`, `getLaunchClaim`, `acceptedResult`, `incarnationCurrent`, `sessionIncarnationCurrent`, `pendingLaunchIntentDisagrees`, `pendingLaunchIntentOfSession` | Row ↔ domain-value mapping shared by all three authorities through the `querier` interface; `sessionIncarnationCurrent` is the one principal-incarnation rule every caller-incarnation check decides through (see Invariants) (`getWorktree` and the listing's `scanWorktree` map NULL `attempt_id`/`base_commit` to the solo row's empty links; a worktree's `state` column is read verbatim, including the retirement states `removed`/`absent`/`released`) |
 | [submission.go](submission.go) | `SubmitResult`, `RecordMalformed`, `ClaimLaunch`, `SettleLaunchFailure`, `ClaimCheckExec`, `RequestStop`, `insertReceipt` | The worker authority: the section 7 validation order with the domain's `AcceptResult` inside one transaction, receipts for every outcome, the pre-exec claim contracts, the monotonic stop request |
-| [readstore.go](readstore.go) | `ListRuns`, `LoadRunStatus`, `attachSessionBinding`, `LoadFrozenRun`, `LoadCheckExecutionContext`, `lastCheckSummary`, `retirementIntentExecution` | Lease-free reads, each inside one deferred read transaction for a consistent WAL snapshot; `LoadRunStatus` names the solo worker's (or feature manager's) session, its current binding and the claim of the incarnation `sessionLaunchIncarnation` resolves (`attachSessionBinding`: the binding's, else the session's newest pending launch intent's, none on a disagreement), and carries the snapshot's frozen `TargetBranch` and the run's `worktrees_retired_at` fact, and for a feature run `featureWorktreeDetail` adds every worktree row (oldest first, non-nil) and the run's `worktree.retire` operations (newest first, through the shared `operationsByKind`) |
+| [readstore.go](readstore.go) | `ListRuns`, `LoadRunStatus`, `attachSessionBinding`, `LoadFrozenRun`, `LoadCheckExecutionContext`, `lastCheckSummary`, `retirementIntentExecution` | Lease-free reads, each inside one deferred read transaction for a consistent WAL snapshot; `LoadRunStatus` names the solo worker's (or feature manager's) session, its current binding and the claim of the incarnation `sessionLaunchIncarnation` resolves (`attachSessionBinding`: the binding's, else the session's newest pending launch intent's, none when any pending launch intent of the session disagrees with the binding), and carries the snapshot's frozen `TargetBranch` and the run's `worktrees_retired_at` fact, and for a feature run `featureWorktreeDetail` adds every worktree row (oldest first, non-nil) and the run's `worktree.retire` operations (newest first, through the shared `operationsByKind`) |
 | [worktreeretirement_read.go](worktreeretirement_read.go) | `Store` as `app.RetirementReadStore`: `ListRetirementCandidates`, `terminalUnretiredRuns`, `retirementCandidateRecord`, `collectIntegrations` | The worktree-retirement triage read, in one read transaction. It returns the repository's completed, failed and stopped runs whose fact is unset, whose frozen workflow is feature mode with a target, and that integrated at least one row adding content, in sequence order. Each record carries its integrated rows (oldest first), its `retirement.check` operations (newest first) and whether any `retirement.check` or `worktree.retire` is pending or reconciling. An unknown root has no candidates |
 | [worktreeretirement.go](worktreeretirement.go) | `unitOfWork` as `app.WorktreeRetirementRepositories`: `WorktreesForRetirement`, `WorktreesRetiredAt`, `MarkWorktreesRetired`; `runWorktrees`, `runWorktreesRetiredAt` | `WorktreesForRetirement` lists every worktree row of the leased run (another run is `ErrFenced`) in insertion order (`created_at, rowid`), any state, with its revision; row state saves go through `Worktrees().Save`. `WorktreesRetiredAt` reads the leased run's fact inside the transaction (another run is `ErrFenced`). Migration 004's worktrees-retired run fact: written once inside the fenced unit of work (the leased run only; the UPDATE applies only while NULL, so a repeat keeps the first value; a set-once housekeeping column that does not move `runs.revision`), read back as nil for NULL or the canonical time (anything else fails closed) |
 
@@ -108,8 +108,8 @@ this package never resolves environment variables or defaults.
   only seed_evidence to the retry's outcome; all invocation identity
   fields remain unchanged, and settled claims refuse retries. Currency is
   the principal-incarnation rule below: the session's current binding
-  decides when one exists (a pending intent naming another incarnation
-  fails it closed); before ANY binding row exists for that session (the
+  decides when one exists (ANY pending intent of the session naming
+  another incarnation, or none usable, fails it closed); before ANY binding row exists for that session (the
   launcher is the pane's own command and can claim before the controller
   records the pane.open outcome), the authority is the session's newest
   pending launch operation (kind pane.open or launch.send), whose intent
@@ -158,9 +158,16 @@ this package never resolves environment variables or defaults.
   `AckMessage`, `SubmitReview` and `SubmitResult` (through
   `incarnationCurrent`, which resolves the attempt's non-terminated session
   first — solo included). Current means: the session's current binding
-  carries the incarnation and no pending launch intent of the session names
-  another one (a disagreement fails closed); or no binding row exists at
-  all and the session's newest PENDING launch intent names it. A principal
+  carries the incarnation and no pending launch intent of the session —
+  any of them, not only the newest (`pendingLaunchIntentDisagrees`: an
+  `EXISTS` over the session's pending pane.open/launch.send rows whose
+  `incarnation_id` is not a string equal to the binding's, so an absent,
+  null or non-string one counts too) — names another one (a disagreement
+  fails closed even when a newer intent agrees); or no binding row exists
+  at all and the session's newest PENDING launch intent names it (this
+  fallback alone selects the newest). `sessionLaunchIncarnation`, which
+  the launch context and the status claim share, resolves the bound case
+  through the same `pendingLaunchIntentDisagrees`. A principal
   whose pane.open outcome was never recorded therefore proceeds normally
   (the run-state rule still applies); a superseded binding without a
   successor stays stale. The intent source is `pending` only, so a
@@ -297,12 +304,18 @@ this package never resolves environment variables or defaults.
   principal-incarnation rule (`TestPrincipalIncarnationRule` — task
   create, task retry, plan close, message send, fetch and ack, the launch
   claim, review and result submission, each against a committed binding,
-  a pending intent only, a disagreeing binding and intent, and a
-  superseded binding — `TestPrincipalIncarnationPendingIntentKeepsRunStateRule`
+  a pending intent only, a disagreeing binding and intent, a superseded
+  binding, an OLDER pending intent disagreeing while the newest agrees,
+  and a pending intent with no usable incarnation —
+  `TestPrincipalIncarnationOlderConflictingIntent` (the review's
+  reproduction through `ClosePlan`),
+  `TestPrincipalIncarnationPendingIntentKeepsRunStateRule`
   and the solo `TestPrincipalIncarnationSoloResult`), the status read
   model's claim (`TestLoadRunStatusResolvesTheLaunchContextClaim`: a
   claim written before the binding surfaces for the solo worker and the
-  feature manager, none on a binding/intent disagreement) and its relaunch
+  feature manager, none on a binding/intent disagreement, including an
+  older disagreeing intent behind an agreeing newest one, for which the
+  launch context resolves nothing either) and its relaunch
   safety (`TestFeatureColdRelaunchSuccessorIsCurrent` for an implementer,
   a reviewer and the manager, `TestSoloColdRelaunchSuccessorIsCurrent`
   after an attestation and after a restored occupant's retirement: each
