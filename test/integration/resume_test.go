@@ -110,6 +110,14 @@ func endWithSelfKill(t *testing.T, fx *fixtureRun, scratchDir, paneID, attemptID
 	if !waitUntil(func() bool { return !fx.server.paneExists(t, paneID) }) {
 		t.Fatalf("pane %s still exists after attempt %s's self-kill control file was written", paneID, attemptID)
 	}
+	// Remove this test's own control file now that the pane is gone and
+	// before any relaunch: a relaunched incarnation of the SAME attempt
+	// runs the identical frozen "idle-self-kill" brief, so a control file
+	// still on disk from this kill would make it SIGKILL itself the
+	// instant it starts, before it ever becomes observable.
+	if err := os.Remove(controlPath); err != nil {
+		t.Fatalf("remove self-kill control file for attempt %s: %v", attemptID, err)
+	}
 }
 
 // coldRelaunchAfterCrash builds a self-killable fixture run, settles its
@@ -152,6 +160,30 @@ func coldRelaunchAfterCrash(t *testing.T, fx *fixtureRun, scratchDir string) (ol
 		t.Fatalf("incarnation after cold relaunch = %s, want a new incarnation distinct from %s", newIncarnationID, oldIncarnationID)
 	}
 	return oldIncarnationID, newIncarnationID, taskID, attemptID
+}
+
+// waitForWorkerObservation polls the scratch-dir observation dump at path
+// until it carries env:HOP_INCARNATION_ID=incarnationID, bounded. The dump
+// name is keyed by attempt id, not incarnation id (fixtureworker_test.go's
+// runWorker), so a cold relaunch's worker overwrites the SAME file its
+// predecessor already wrote; reading it without this wait could observe
+// the retired incarnation's own stale content instead of the relaunched
+// worker's.
+func waitForWorkerObservation(t *testing.T, path, incarnationID string) workerObservation {
+	t.Helper()
+	want := "env:HOP_INCARNATION_ID=" + incarnationID
+	var obs workerObservation
+	if !waitUntil(func() bool {
+		raw, err := os.ReadFile(path) //nolint:gosec // G304: a path this test constructed itself, under its own scratch directory.
+		if err != nil || !strings.Contains(string(raw), want) {
+			return false
+		}
+		obs = readWorkerObservation(t, path)
+		return true
+	}) {
+		t.Fatalf("worker observation %s never carried %s", path, want)
+	}
+	return obs
 }
 
 // TestRealProcessConfirmAbsentColdRelaunchNonRestart proves design section 5
@@ -197,7 +229,7 @@ func TestRealProcessConfirmAbsentColdRelaunchNonRestart(t *testing.T) {
 		t.Fatalf("attempt %s does not carry one shared native session reference; got %q", attemptID, nativeRef)
 	}
 	assignmentPath := filepath.Join(fx.stateDir, "runs", fx.runID, "artifacts", "assignment.md")
-	obs := readWorkerObservation(t, filepath.Join(fx.stateDir, "runs", fx.runID, "artifacts", "worker-observed.txt"))
+	obs := waitForWorkerObservation(t, filepath.Join(scratchDir, "worker-observed-"+attemptID+".txt"), newIncarnationID)
 	hopPath := obs.Fields["hop_path"]
 	if hopPath == "" {
 		t.Fatalf("the relaunched worker's observation dump records no hop_path (parsed from the continuation prompt)")
@@ -238,10 +270,22 @@ func TestRealProcessStaleSubmissionFromRetiredIncarnation(t *testing.T) {
 	}
 
 	// The retired incarnation's stale receipt must never touch the still-open
-	// attempt the new (current) incarnation owns.
-	state := querySQLite(t, fx.dbPath(), fmt.Sprintf("SELECT state FROM attempts WHERE id = '%s';", attemptID))
-	if state == "failed" || state == "interrupted" {
-		t.Errorf("attempt state after the stale submission = %q, want the current incarnation's attempt left unaffected", state)
+	// attempt the new (current) incarnation owns. A single snapshot read
+	// here would be a race, not a proof: the controller's own next
+	// scheduling pass could still settle the attempt failed after this
+	// read happened to land first. The wait for "running" independently
+	// confirms the current incarnation is genuinely healthy, and the
+	// transitions journal (append-only, so a later pass can only ADD to
+	// it) is checked directly for the one outcome that must never appear.
+	if !waitUntil(func() bool {
+		return querySQLite(t, fx.dbPath(), fmt.Sprintf("SELECT state FROM attempts WHERE id = '%s';", attemptID)) == "running"
+	}) {
+		t.Fatalf("attempt %s never confirmed running after the stale submission", attemptID)
+	}
+	if n := querySQLite(t, fx.dbPath(), fmt.Sprintf(
+		"SELECT count(*) FROM transitions WHERE entity_kind = 'attempt' AND entity_id = '%s' AND to_state IN ('failed', 'interrupted');",
+		attemptID)); n != "0" {
+		t.Errorf("attempt %s recorded %s failed/interrupted transition(s), want none: a stale submission from a retired incarnation must never affect it", attemptID, n)
 	}
 }
 
