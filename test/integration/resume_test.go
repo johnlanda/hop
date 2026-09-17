@@ -4,9 +4,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
 )
 
@@ -70,20 +70,63 @@ func TestRealProcessControllerKillResumeWarmReattach(t *testing.T) {
 	}
 }
 
-// coldRelaunchAfterCrash builds a fixture run, settles its first
-// incarnation, then crash-simulates total loss of both the worker and the
-// controller: it SIGKILLs the worker's own foreground process (a
-// layout.apply command pane has no shell, so the pane closes itself once
-// its command exits, S6 — giving hop resume's absence observation both
-// required conjuncts: gone by id, gone by creation label, no ambiguity) and
-// SIGKILLs the hop run controller (never released its lease). Once the
-// abandoned lease has expired, it drives `hop resume --confirm-absent` to a
-// cold relaunch (design section 5 resume case 3/5: absence conclusively
-// established by positive observation, continuity established because the
-// herdr server itself never restarted) and waits for the new incarnation to
-// itself settle, returning both incarnation ids and the shared task/attempt
-// ids for the caller's own assertions.
-func coldRelaunchAfterCrash(t *testing.T, fx *fixtureRun) (oldIncarnationID, newIncarnationID, taskID, attemptID string) {
+// startSelfKillableFixtureRun starts a solo fixture run whose worker is
+// reachable through the fixture self-kill channel: "idle-self-kill" is
+// registered in scratchDirRequiringBehaviors (fixtureworker_test.go), but
+// fixtureWorkerBrief's solo directive line carries no separate scratch-dir
+// argument of its own, so the scratch directory is appended directly into
+// the behavior string it renders verbatim ("FIXTURE-BEHAVIOR: <behavior>
+// <scratchDir>\n") — parseBehavior then splits it out as behaviorArgs[0],
+// exactly the shape requireScratchDir expects. Returns the run plus the
+// scratch directory endWithSelfKill needs to address this worker's control
+// file.
+func startSelfKillableFixtureRun(t *testing.T) (fx *fixtureRun, scratchDir string) {
+	t.Helper()
+	artifacts, server := newFixtureRunEnv(t)
+	repo := newFixtureRepo(t, artifacts, server, "repo")
+	scratchDir = artifacts.dir(t, "fixture-scratch")
+	fx = startRun(t, artifacts, server, repo, "idle-self-kill "+scratchDir)
+	return fx, scratchDir
+}
+
+// endWithSelfKill asks attemptID's own worker to end itself via the
+// fixture's self-kill control file — never a raw OS signal to a pid this
+// harness only OBSERVED via pane inspection (Astra review finding P1: the
+// OS could recycle that pid between observation and signal, since this
+// harness never owns the worker's Wait/reap lifecycle; only Herdr does).
+// Waits for the pane to close itself (a layout.apply command pane has no
+// shell, S6), giving hop resume's absence observation both required
+// conjuncts.
+func endWithSelfKill(t *testing.T, fx *fixtureRun, scratchDir, paneID, attemptID string) {
+	t.Helper()
+	controlPath := filepath.Join(scratchDir, "self-kill-"+attemptID)
+	tmp := controlPath + ".tmp"
+	if err := os.WriteFile(tmp, []byte("FIXTURE-SELF-KILL\n"), 0o600); err != nil {
+		t.Fatalf("write self-kill control file for attempt %s: %v", attemptID, err)
+	}
+	if err := os.Rename(tmp, controlPath); err != nil {
+		t.Fatalf("rename self-kill control file into place for attempt %s: %v", attemptID, err)
+	}
+	if !waitUntil(func() bool { return !fx.server.paneExists(t, paneID) }) {
+		t.Fatalf("pane %s still exists after attempt %s's self-kill control file was written", paneID, attemptID)
+	}
+}
+
+// coldRelaunchAfterCrash builds a self-killable fixture run, settles its
+// first incarnation, then crash-simulates total loss of both the worker
+// and the controller: it asks the worker to end ITSELF via the fixture
+// self-kill channel (a layout.apply command pane has no shell, so the pane
+// closes itself once its command exits, S6 — giving hop resume's absence
+// observation both required conjuncts: gone by id, gone by creation label,
+// no ambiguity) and SIGKILLs the hop run controller through its own owned
+// process handle (never released its lease). Once the abandoned lease has
+// expired, it drives `hop resume --confirm-absent` to a cold relaunch
+// (design section 5 resume case 3/5: absence conclusively established by
+// positive observation, continuity established because the herdr server
+// itself never restarted) and waits for the new incarnation to itself
+// settle, returning both incarnation ids and the shared task/attempt ids
+// for the caller's own assertions.
+func coldRelaunchAfterCrash(t *testing.T, fx *fixtureRun, scratchDir string) (oldIncarnationID, newIncarnationID, taskID, attemptID string) {
 	t.Helper()
 	fields := fx.requireRunState(t, "running")
 	paneID := paneIDFromBinding(fields["binding"])
@@ -91,16 +134,7 @@ func coldRelaunchAfterCrash(t *testing.T, fx *fixtureRun) (oldIncarnationID, new
 	taskID, attemptID = fx.taskAndAttemptIDs(t)
 	oldIncarnationID = fx.currentIncarnationID(t, attemptID)
 
-	// SIGKILL the WORKER itself, located by the claim's pid — never
-	// ForegroundProcesses[0], which is ordinarily the worker's MCP stand-in
-	// child, and killing that would leave the worker (and the pane) alive.
-	workerPID := fx.workerForegroundPID(t, paneID)
-	if err := syscall.Kill(workerPID, syscall.SIGKILL); err != nil {
-		t.Fatalf("kill fixture worker pid %d: %v", workerPID, err)
-	}
-	if !waitUntil(func() bool { return !fx.server.paneExists(t, paneID) }) {
-		t.Fatalf("pane %s still exists after its foreground worker was killed; a layout.apply command pane must close itself (S6)", paneID)
-	}
+	endWithSelfKill(t, fx, scratchDir, paneID, attemptID)
 
 	killControllerLeader(t, fx.controller)
 	waitForLeaseExpiry(t, fx.dbPath(), fx.runID)
@@ -127,8 +161,8 @@ func coldRelaunchAfterCrash(t *testing.T, fx *fixtureRun) (oldIncarnationID, new
 // journals the human attestation, and binds a fresh session and incarnation
 // to the same attempt.
 func TestRealProcessConfirmAbsentColdRelaunchNonRestart(t *testing.T) {
-	fx := startFixtureRun(t, "")
-	oldIncarnationID, newIncarnationID, _, attemptID := coldRelaunchAfterCrash(t, fx)
+	fx, scratchDir := startSelfKillableFixtureRun(t)
+	oldIncarnationID, newIncarnationID, _, attemptID := coldRelaunchAfterCrash(t, fx, scratchDir)
 
 	if oldIncarnationID == newIncarnationID {
 		t.Fatal("cold relaunch did not mint a new incarnation")
@@ -181,8 +215,8 @@ func TestRealProcessConfirmAbsentColdRelaunchNonRestart(t *testing.T) {
 // eligibility check is a pure store read of the attempt's current binding —
 // is rejected `stale`, never accepted or treated as a duplicate.
 func TestRealProcessStaleSubmissionFromRetiredIncarnation(t *testing.T) {
-	fx := startFixtureRun(t, "")
-	oldIncarnationID, _, taskID, attemptID := coldRelaunchAfterCrash(t, fx)
+	fx, scratchDir := startSelfKillableFixtureRun(t)
+	oldIncarnationID, _, taskID, attemptID := coldRelaunchAfterCrash(t, fx, scratchDir)
 
 	env := append(append([]string{}, fx.env...), "HOP_INCARNATION_ID="+oldIncarnationID)
 	result := runHop(t, env, fx.stateDir, "result", "submit",
@@ -222,21 +256,13 @@ func TestRealProcessStaleSubmissionFromRetiredIncarnation(t *testing.T) {
 // never relaunching, distinct from the non-restart case this task also
 // proves.
 func TestRealProcessConfirmAbsentRefusedAfterServerRestart(t *testing.T) {
-	fx := startFixtureRun(t, "")
+	fx, scratchDir := startSelfKillableFixtureRun(t)
 	fields := fx.requireRunState(t, "running")
 	paneID := paneIDFromBinding(fields["binding"])
 	_, attemptID := fx.taskAndAttemptIDs(t)
 	oldIncarnationID := fx.currentIncarnationID(t, attemptID)
 
-	// Located by the claim's pid — never ForegroundProcesses[0], which is
-	// ordinarily the worker's MCP stand-in child.
-	workerPID := fx.workerForegroundPID(t, paneID)
-	if err := syscall.Kill(workerPID, syscall.SIGKILL); err != nil {
-		t.Fatalf("kill fixture worker pid %d: %v", workerPID, err)
-	}
-	if !waitUntil(func() bool { return !fx.server.paneExists(t, paneID) }) {
-		t.Fatalf("pane %s still exists after its foreground worker was killed; a layout.apply command pane must close itself (S6)", paneID)
-	}
+	endWithSelfKill(t, fx, scratchDir, paneID, attemptID)
 	killControllerLeader(t, fx.controller)
 	waitForLeaseExpiry(t, fx.dbPath(), fx.runID)
 

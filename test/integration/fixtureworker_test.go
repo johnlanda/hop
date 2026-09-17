@@ -885,6 +885,14 @@ func runWorker() {
 		}
 		drainMailbox(hopPath)
 		submitOnce(hopPath, oid, "fixture implementer result (released)")
+	case "idle-self-kill":
+		// Exactly the unnamed default's own behavior (submit nothing, stay
+		// alive) but named and scratch-dir-registered solely so the self-
+		// kill watcher above gets wired: a solo crash-recovery scenario
+		// (resume_test.go's coldRelaunchAfterCrash and its callers) needs a
+		// safe way to end THIS worker's own process without signaling a pid
+		// it only observed via pane inspection (Astra review finding P1,
+		// the same reasoning scratchDirRequiringBehaviors documents above).
 	default:
 		// Unknown or empty directive: submit nothing, just stay alive, so a
 		// scenario that only needs a settled, idle worker still gets one.
@@ -911,6 +919,7 @@ var scratchDirRequiringBehaviors = map[string]bool{
 	"worker-implement":     true,
 	"worker-hold":          true,
 	"worker-conflict":      true,
+	"idle-self-kill":       true,
 	"manager-feature":      true,
 	"reviewer-approve":     true,
 	"reviewer-reject-once": true,
@@ -2097,6 +2106,108 @@ func TestFixtureWorkerSelfKillOnControlFile(t *testing.T) {
 
 	if !waitUntil(func() bool { return strings.Contains(out.snapshot(), "FIXTURE-HOLD-SENT") }) {
 		t.Fatalf("worker never reported sending its barrier question; output so far:\n%s", out.snapshot())
+	}
+
+	controlPath := filepath.Join(scratchDir, "self-kill-"+attemptID)
+	tmp := controlPath + ".tmp"
+	if err := os.WriteFile(tmp, []byte("FIXTURE-SELF-KILL\n"), 0o600); err != nil {
+		t.Fatalf("write self-kill control file: %v", err)
+	}
+	if err := os.Rename(tmp, controlPath); err != nil {
+		t.Fatalf("rename self-kill control file into place: %v", err)
+	}
+
+	if err := wait(); err == nil {
+		t.Fatalf("worker exited 0 after the self-kill control file was written; want it SIGKILLed; output:\n%s", out.snapshot())
+	}
+	exitErr, ok := waitErr.(*exec.ExitError) //nolint:errorlint // a direct type assertion suffices for this test's own exec of a single known binary.
+	if !ok {
+		t.Fatalf("worker wait error = %v (%T), want *exec.ExitError", waitErr, waitErr)
+	}
+	ws, ok := exitErr.Sys().(syscall.WaitStatus)
+	if !ok {
+		t.Fatalf("worker exit status %#v is not a syscall.WaitStatus", exitErr.Sys())
+	}
+	if !ws.Signaled() || ws.Signal() != syscall.SIGKILL {
+		t.Fatalf("worker exit status = %+v, want signaled by SIGKILL", ws)
+	}
+}
+
+// TestFixtureWorkerIdleSelfKillOnControlFile proves the "idle-self-kill"
+// solo behavior TEST-1 added: unlike worker-hold, it reaches the shared
+// idle() composer loop immediately (nothing to do first), so this test
+// gives the child an open, never-closed stdin pipe (idle() blocks
+// scanning it; a nil Stdin would give it an already-EOF /dev/null and let
+// it exit 0 on its own before the self-kill control file could ever be
+// written) and waits for FIXTURE-WORKER-IDLE before triggering the kill,
+// mirroring TestFixtureWorkerSelfKillOnControlFile's own assertions
+// otherwise: the process must die by SIGKILL of its own doing, never a
+// signal this test aimed at an externally observed pid.
+func TestFixtureWorkerIdleSelfKillOnControlFile(t *testing.T) {
+	artifacts := newArtifactDir(t)
+	worker := buildFixtureWorker(t, artifacts)
+	repo := newFixtureRepo(t, artifacts, nil, "repo")
+
+	stateDir := artifacts.dir(t, "state")
+	scratchDir := artifacts.dir(t, "scratch")
+	const (
+		runID     = "66666666-6666-4666-8666-666666666666"
+		attemptID = "77777777-7777-4777-8777-777777777777"
+	)
+	runDir := filepath.Join(stateDir, "runs", runID, "artifacts")
+	if err := os.MkdirAll(runDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	assignmentPath := filepath.Join(runDir, "assignment.md")
+	brief := fixtureWorkerBrief("idle-self-kill " + scratchDir)
+	assignmentContent := "# HOP Assignment\n\n## Brief\n\n" + brief + "\n## Instructions\n"
+	if err := os.WriteFile(assignmentPath, []byte(assignmentContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	prompt := testAssignmentPrompt(assignmentPath, filepath.Join(artifacts.path, "hop"))
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, worker, "--session-id", "88888888-8888-4888-8888-888888888888", prompt) //nolint:gosec // G204: fixed test-owned binary and arguments.
+	cmd.Dir = repo.Root
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOP_STATE_DIR=" + stateDir,
+		"HOP_RUN_ID=" + runID,
+		"HOP_TASK_ID=99999999-9999-4999-8999-999999999999",
+		"HOP_ATTEMPT_ID=" + attemptID,
+		"HOP_INCARNATION_ID=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+	}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatalf("open fixture worker stdin pipe: %v", err)
+	}
+	var out syncOutput
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start fixture worker: %v", err)
+	}
+	var (
+		waitOnce sync.Once
+		waitErr  error
+	)
+	wait := func() error {
+		waitOnce.Do(func() { waitErr = cmd.Wait() })
+		return waitErr
+	}
+	t.Cleanup(func() {
+		_ = stdin.Close()
+		if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			t.Logf("cleanup: kill fixture worker: %v", err)
+		}
+		if err := wait(); err != nil {
+			t.Logf("cleanup: reap fixture worker: %v", err)
+		}
+	})
+
+	if !waitUntil(func() bool { return strings.Contains(out.snapshot(), "FIXTURE-WORKER-IDLE") }) {
+		t.Fatalf("worker never reported reaching idle; output so far:\n%s", out.snapshot())
 	}
 
 	controlPath := filepath.Join(scratchDir, "self-kill-"+attemptID)
