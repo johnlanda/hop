@@ -37,17 +37,6 @@ func readSubmitObservationLines(t *testing.T, path string) []string {
 // section 5's drain-then-submit contract).
 const grammarTransientUndeliveredLine = "transient: undelivered messages; drain with hop msg next, ack, then resubmit"
 
-// grammarTransientNotRunningLine mirrors
-// internal/app/grammar.go's GrammarTransientNotRunningLine: hop result
-// submit's Phase 2 early-submission line, rendered when the attempt's own
-// launch claim has not yet settled. Design section 5's one acceptance
-// order (AcceptResult) checks incarnation currency and launch-claim
-// settlement BEFORE the mailbox, so t1's own release-gated first submit
-// attempts can legitimately observe this line -- never the mailbox drain
-// line -- for as long as the controller has not yet corroborated the
-// claim, regardless of the race message already sitting in the mailbox.
-const grammarTransientNotRunningLine = "transient: attempt not yet running; retry"
-
 // grammarRefusalMailboxClosed mirrors GrammarRefusalLine(GrammarReasonMailboxClosed):
 // a send addressed to a task whose mailbox is closed.
 const grammarRefusalMailboxClosed = "refused: mailbox-closed"
@@ -134,9 +123,29 @@ func testRealProcessMailboxClosureRaceOrdering(t *testing.T) {
 	}
 	sendFirstMessageID := parseSentID(t, sendFirstResult.Stdout)
 
+	// Deterministic, not merely favored: block the release until the
+	// store itself shows attempt 1's own launch settled -- running, with
+	// its launch claim execed -- so design section 5's one acceptance
+	// order (AcceptResult: incarnation currency, then run/attempt
+	// eligibility, THEN the mailbox) can never observe an unsettled claim
+	// once the worker's own first submit call unblocks. Without this, that
+	// first attempt could legitimately race the controller's own
+	// corroboration pass and observe the early-submission
+	// "transient: attempt not yet running; retry" line instead of the
+	// mailbox's own drain line -- this precondition makes the drain line
+	// the ONLY transient shape a well-behaved run can ever produce here,
+	// so the strict sequence check below is a real guarantee, not a race
+	// this test happened to win.
+	if !waitUntilDeadline(featureRunTimeout, func() bool {
+		return fx.attemptState(t, attempt1ID) == "running" && fx.claimState(t, session1ID) == "execed"
+	}) {
+		t.Fatalf("attempt %s never reached running with an execed launch claim within %s (state=%s claim=%s)",
+			attempt1ID, featureRunTimeout, fx.attemptState(t, attempt1ID), fx.claimState(t, session1ID))
+	}
+
 	// NOW release the gate: t1's worker reaches its first submit only
 	// after this file exists, well after the race message above already
-	// landed.
+	// landed and the attempt's own launch has settled.
 	submitHeldReleasePath := filepath.Join(scratchDir, "submit-held-release-"+attempt1ID)
 	submitHeldTmp := submitHeldReleasePath + ".tmp"
 	if err := os.WriteFile(submitHeldTmp, []byte("FIXTURE-RELEASE\n"), 0o600); err != nil {
@@ -171,41 +180,28 @@ func testRealProcessMailboxClosureRaceOrdering(t *testing.T) {
 		t.Errorf("accepted result_submissions receipt count for attempt %s = %s, want exactly 1", attempt1ID, n)
 	}
 
-	// The exact sequence of first lines the real CLI rendered across every
-	// submit attempt, dumped by the fixture to its own observation file --
-	// EXACTLY "accepted <id>" last, never inferred from the outcome rows
-	// alone (which prove acceptance but say nothing about the CLI's own
-	// rendered text). Every attempt before that is one of exactly two
-	// transient shapes, never anything else: design section 5's one
-	// acceptance order (AcceptResult) checks the attempt's own launch-claim
-	// settlement BEFORE the mailbox, so a submit attempt this early can
-	// legitimately observe the not-running line for as long as the
-	// controller has not yet corroborated t1's claim, regardless of the
-	// race message already sitting in its mailbox -- but the exact drain
-	// line must appear at least once, proving the mailbox-not-clear
-	// condition this order (send lands first) exists to prove was actually
-	// reached and correctly drained, not merely that every attempt happened
-	// to retry for an unrelated reason.
+	// The exact sequence of first lines the real CLI rendered across
+	// every submit attempt, dumped by the fixture to its own observation
+	// file -- the retyped drain line at least once, then EXACTLY
+	// "accepted <id>", never inferred from the outcome rows alone (which
+	// prove acceptance but say nothing about the CLI's own rendered
+	// text). The precondition above rules out the early-submission
+	// "attempt not yet running" line entirely (the attempt was already
+	// running, with its own claim execed, before release), so any line
+	// other than the exact drain line here is a real regression, not a
+	// race this test happened to lose.
 	acceptedResultID := fx.scalar(t, fmt.Sprintf("SELECT id FROM results WHERE attempt_id = '%s' AND accepted = 1;", attempt1ID))
 	if acceptedResultID == "" {
 		t.Fatalf("no accepted results row for attempt %s", attempt1ID)
 	}
 	observedLines := readSubmitObservationLines(t, filepath.Join(scratchDir, "submit-observed-"+attempt1ID+".txt"))
 	if len(observedLines) < 2 {
-		t.Fatalf("submit observation for attempt %s has %d line(s), want at least 2 (>=1 transient line, then accepted); got: %v", attempt1ID, len(observedLines), observedLines)
+		t.Fatalf("submit observation for attempt %s has %d line(s), want at least 2 (>=1 drain line, then accepted); got: %v", attempt1ID, len(observedLines), observedLines)
 	}
-	sawDrainLine := false
 	for _, line := range observedLines[:len(observedLines)-1] {
-		switch line {
-		case grammarTransientUndeliveredLine:
-			sawDrainLine = true
-		case grammarTransientNotRunningLine:
-		default:
-			t.Errorf("submit observation line %q before the final line, want either the exact drain line %q or the exact not-running line %q", line, grammarTransientUndeliveredLine, grammarTransientNotRunningLine)
+		if line != grammarTransientUndeliveredLine {
+			t.Errorf("submit observation line %q before the final line, want the EXACT drain line %q", line, grammarTransientUndeliveredLine)
 		}
-	}
-	if !sawDrainLine {
-		t.Errorf("submit observation for attempt %s never observed the exact drain line %q before its final line; got: %v", attempt1ID, grammarTransientUndeliveredLine, observedLines)
 	}
 	if want, got := "accepted "+acceptedResultID, observedLines[len(observedLines)-1]; got != want {
 		t.Errorf("submit observation's final line = %q, want %q", got, want)
