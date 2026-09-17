@@ -1318,6 +1318,14 @@ func TestFixtureManagerNeedsReworkNoticeShapes(t *testing.T) {
 		if retried {
 			t.Errorf("manager retried t1 for a task line at an unrecognized position; want no retry; stdout:\n%s", stdout)
 		}
+		// A crashed, hung or otherwise notice-dropping manager would ALSO
+		// never print FIXTURE-RETRIED, so the absence above alone proves
+		// nothing: this requires positive evidence the notice was actually
+		// classified and handled as a non-needs-rework notice (the status-
+		// check branch ran and correctly found no match).
+		if !strings.Contains(stdout, "FIXTURE-STATUS-CHECKED matched=[false]") {
+			t.Errorf("manager did not process the notice through the status-check branch; want \"FIXTURE-STATUS-CHECKED matched=[false]\"; stdout:\n%s", stdout)
+		}
 	})
 
 	t.Run("reason line merely naming needs-rework never retries", func(t *testing.T) {
@@ -1331,6 +1339,10 @@ func TestFixtureManagerNeedsReworkNoticeShapes(t *testing.T) {
 		retried, stdout := runNeedsReworkCase(t, artifacts, noticePath)
 		if retried {
 			t.Errorf("manager retried t1 for a reason line merely mentioning needs-rework; want no retry (anchored match only); stdout:\n%s", stdout)
+		}
+		// Same positive-evidence requirement as the sibling subtest above.
+		if !strings.Contains(stdout, "FIXTURE-STATUS-CHECKED matched=[false]") {
+			t.Errorf("manager did not process the notice through the status-check branch; want \"FIXTURE-STATUS-CHECKED matched=[false]\"; stdout:\n%s", stdout)
 		}
 	})
 }
