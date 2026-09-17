@@ -330,6 +330,9 @@ func featureDetailLines(detail *app.RunDetailView) []string {
 			taskLabel = taskLabelFor(s.TaskID, labels)
 		}
 		lines = append(lines, "  "+app.GrammarSessionLine(s.SessionID, s.Role, s.State, taskLabel, s.AttemptNumber, safeRenderExternal(orUnset(s.BindingSummary))))
+		if s.LaunchCorroborationPending {
+			lines = append(lines, "    "+app.GrammarActionPrefix+"      "+app.GrammarSessionLaunchCorroborationAction)
+		}
 	}
 
 	return lines

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/johnlanda/hop/internal/domain/identity"
@@ -84,6 +85,10 @@ func (h *RunHandle) RunID() string { return h.runID.String() }
 type dispatchState struct {
 	ctx    context.Context
 	cancel context.CancelFunc
+	// integration is held for the whole of one DriveIntegration or
+	// DriveIntegrationCheck call, so the serial integration step has one
+	// owner at a time within the process.
+	integration sync.Mutex
 }
 
 // newRunHandle builds a handle with a fresh dispatch scope.
@@ -97,6 +102,21 @@ func (h *RunHandle) cancelDispatch() {
 	if h.dispatch != nil {
 		h.dispatch.cancel()
 	}
+}
+
+// claimIntegrationStep takes the handle's integration-step exclusion
+// without blocking: ok is false while another DriveIntegration or
+// DriveIntegrationCheck call of the same dispatch scope holds it. release
+// must be called once the call ends. A handle with no dispatch scope has
+// no exclusion to take.
+func (h *RunHandle) claimIntegrationStep() (release func(), ok bool) {
+	if h.dispatch == nil {
+		return func() {}, true
+	}
+	if !h.dispatch.integration.TryLock() {
+		return nil, false
+	}
+	return h.dispatch.integration.Unlock, true
 }
 
 // actContext derives the context an external act runs under: the caller's
@@ -118,10 +138,16 @@ func (h *RunHandle) actContext(ctx context.Context) (context.Context, context.Ca
 // the design's 10s interval so a long check or wait never outlives the 30s
 // TTL. A failed heartbeat cancels the handle's dispatch scope — in-flight
 // external calls are canceled — and the caller must stop acting
-// (docs/plan/phase-2-design.md section 4).
+// (docs/plan/phase-2-design.md section 4). A heartbeat that failed
+// because the caller's own ctx ended says nothing about the lease, so it
+// leaves the scope live: an interrupted round's revalidation never ends
+// the dispatch of the acts that follow it (a stop's among them), and the
+// periodic heartbeat still detects a real loss.
 func (c *Controller) Heartbeat(ctx context.Context, handle RunHandle) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; heartbeat runs on a 10s interval, never a hot loop.
 	if err := c.Store.Heartbeat(ctx, handle.lease); err != nil {
-		handle.cancelDispatch()
+		if ctx.Err() == nil {
+			handle.cancelDispatch()
+		}
 		return fmt.Errorf("app: heartbeat: %w", err)
 	}
 	return nil
@@ -154,7 +180,9 @@ func (c *Controller) Detach(ctx context.Context, handle RunHandle) error { //nol
 // and — unless the act is itself part of stopping — the stop flag re-read
 // under a fenced unit of work. Any failure means the act must not be
 // dispatched; an already-committed intent stays pending for recovery per
-// the operation decision table.
+// the operation decision table, unless its caller knows nothing was
+// dispatched for it and settles it so (a feature child's worktree or
+// pane, and a check execution refused before its spawn).
 func (c *Controller) revalidateForDispatch(ctx context.Context, handle RunHandle, actIsStopping bool) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per external act.
 	if err := c.Heartbeat(ctx, handle); err != nil {
 		return err

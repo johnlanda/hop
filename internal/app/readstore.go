@@ -117,6 +117,13 @@ type SessionSummary struct {
 	TaskID        identity.TaskID // "" for the manager
 	AttemptNumber int             // 0 for the manager
 	Binding       *run.RuntimeBinding
+	// LaunchCorroborationPending is the structural fact that this session
+	// is reconciling with a current unsuperseded placed binding whose own
+	// incarnation's launch claim is still exec_pending: the one reconciling
+	// state the controller's launch corroboration re-inspects every pass,
+	// reached when a foreground group holds another process carrying the
+	// launch identity. False for every other session, reconciling or not.
+	LaunchCorroborationPending bool
 }
 
 // RunDetail is the full detail block `hop status -run` renders, and the

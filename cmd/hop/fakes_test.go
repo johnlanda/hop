@@ -48,6 +48,7 @@ type fakeController struct {
 	retireSettledSessions  func() (app.RetirementReport, error)
 	recomputeReleases      func() (app.ReleaseReport, error)
 	driveIntegration       func(ctx context.Context, hopPath string, spawnEnv []string) (app.IntegrationReport, error)
+	driveIntegrationCheck  func(ctx context.Context, hopPath string, spawnEnv []string) (app.IntegrationReport, error)
 	ensureReviewTask       func() (bool, error)
 	assignReadyTasks       func(opts app.AssignmentOptions) (app.AssignmentReport, error)
 	assignmentDefaults     func() (app.AssignmentOptions, error)
@@ -81,6 +82,11 @@ type fakeController struct {
 	retireWorktrees      func(ctx context.Context, runID string, opts app.RetireWorktreesOptions) (app.WorktreeRetirementReport, error)
 	releaseRetirement    func(runID string) error
 	retirementHeld       string
+
+	// integrationStep is the real Controller's integration-step
+	// exclusion, held for the whole of one DriveIntegration or
+	// DriveIntegrationCheck call.
+	integrationStep sync.Mutex
 
 	// frozenRepositoryRoot and frozenStateRoot are the scripted run's
 	// frozen roots: the unscripted AssignmentDefaults serves them, and
@@ -343,12 +349,31 @@ func (f *fakeController) RecomputeReleases(_ context.Context, _ app.RunHandle) (
 	return f.recomputeReleases()
 }
 
+// DriveIntegration and DriveIntegrationCheck share the real Controller's
+// per-handle exclusion: a call made while the other is still running does
+// nothing and reports InFlight.
 func (f *fakeController) DriveIntegration(ctx context.Context, _ app.RunHandle, hopPath string, spawnEnv []string) (app.IntegrationReport, error) { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.
 	f.record("DriveIntegration")
+	if !f.integrationStep.TryLock() {
+		return app.IntegrationReport{InFlight: true}, nil
+	}
+	defer f.integrationStep.Unlock()
 	if f.driveIntegration == nil {
 		return app.IntegrationReport{}, nil
 	}
 	return f.driveIntegration(ctx, hopPath, spawnEnv)
+}
+
+func (f *fakeController) DriveIntegrationCheck(ctx context.Context, _ app.RunHandle, hopPath string, spawnEnv []string) (app.IntegrationReport, error) { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.
+	f.record("DriveIntegrationCheck")
+	if !f.integrationStep.TryLock() {
+		return app.IntegrationReport{InFlight: true}, nil
+	}
+	defer f.integrationStep.Unlock()
+	if f.driveIntegrationCheck == nil {
+		return app.IntegrationReport{}, errors.New("unexpected DriveIntegrationCheck")
+	}
+	return f.driveIntegrationCheck(ctx, hopPath, spawnEnv)
 }
 
 func (f *fakeController) EnsureReviewTask(_ context.Context, _ app.RunHandle) (bool, error) { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.

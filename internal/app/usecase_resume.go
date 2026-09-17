@@ -935,6 +935,7 @@ func (c *Controller) completePendingRetirement(ctx context.Context, handle RunHa
 			PaneID: intent.PaneID, Label: intent.Label,
 			SessionID: intent.SessionID, IncarnationID: intent.IncarnationID,
 			PID: intent.PID, Markers: intent.ArgvMarkers, Reason: intent.Reason,
+			ServerInstance: intent.ServerInstance,
 		}
 		retired, _, err := c.closePaneOperation(ctx, handle, detail, &target)
 		return retired, err
@@ -1196,13 +1197,16 @@ func (c *Controller) retireAndRelaunch(ctx context.Context, handle RunHandle, de
 		if !found {
 			return fmt.Errorf("app: no current binding to supersede for session %s", detail.SessionID)
 		}
+		// The retirement's absence is decided against the lifetime that
+		// identified the restored occupant, never the placement's own.
 		target = paneCloseTarget{
 			PaneID: binding.PaneID, Label: binding.CreationLabel,
 			SessionID: detail.SessionID, IncarnationID: binding.IncarnationID,
 			PID: occupant.PID, Markers: []string{nativeRef},
-			Reason: closeReasonRetirement,
+			Reason: closeReasonRetirement, ServerInstance: observedInstance,
 		}
 		if binding.LaunchKind == run.LaunchRestoredObserved {
+			target.ServerInstance = binding.ServerInstance
 			return nil
 		}
 		nextBinding, supersedeErr := binding.Supersede(evidence, now)

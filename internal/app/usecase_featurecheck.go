@@ -67,25 +67,36 @@ func (c *Controller) DriveFeatureChecks(ctx context.Context, handle RunHandle, h
 	report.Ran = true
 
 	checkoutPath := checkExecutionCheckoutPath(frozen.Snapshot.StateRoot, handle.runID, opID)
+	// Settlements outlive a canceled round: an execution interrupted before
+	// or during its spawn is still journaled, never left for recovery to
+	// guess at.
+	persistCtx, persistCancel := context.WithTimeout(context.WithoutCancel(ctx), checkPersistenceTimeout)
+	defer persistCancel()
 	actCtx, release := handle.actContext(ctx)
 	defer release()
 	if err := c.revalidateForDispatch(ctx, handle, false); err != nil {
-		return report, fmt.Errorf("app: revalidate before feature-check checkout: %w", err)
+		return report, c.requeueUnspawnedFeatureCheck(persistCtx, handle, opID, result.ID, fmt.Errorf("app: revalidate before feature-check checkout: %w", err))
 	}
 	if rejectDetail, rejectErr := c.rejectSubmoduleCandidate(actCtx, frozen.RepositoryRoot, result.CommitOID); rejectErr != nil {
-		return report, c.settleFeatureCheckOutcome(ctx, handle, &frozen, opID, &task, &attempt, result.ID, checkRunOutcome{Unknown: true, Detail: rejectErr.Error()}, nil)
+		if actCtx.Err() != nil {
+			return report, c.requeueUnspawnedFeatureCheck(persistCtx, handle, opID, result.ID, fmt.Errorf("app: inspect feature-check candidate: %w", rejectErr))
+		}
+		return report, c.settleFeatureCheckOutcome(persistCtx, handle, &frozen, opID, &task, &attempt, result.ID, checkRunOutcome{Unknown: true, Detail: rejectErr.Error()}, nil)
 	} else if rejectDetail != "" {
-		return report, c.settleFeatureCheckOutcome(ctx, handle, &frozen, opID, &task, &attempt, result.ID, checkRunOutcome{ExitCode: 1, Detail: rejectDetail}, nil)
+		return report, c.settleFeatureCheckOutcome(persistCtx, handle, &frozen, opID, &task, &attempt, result.ID, checkRunOutcome{ExitCode: 1, Detail: rejectDetail}, nil)
 	}
 	if err := c.revalidateForDispatch(ctx, handle, false); err != nil {
-		return report, fmt.Errorf("app: revalidate before feature-check materialization: %w", err)
+		return report, c.requeueUnspawnedFeatureCheck(persistCtx, handle, opID, result.ID, fmt.Errorf("app: revalidate before feature-check materialization: %w", err))
 	}
 	if err := c.materializeCheckout(actCtx, frozen.RepositoryRoot, checkoutPath, result.CommitOID); err != nil {
-		return report, c.settleFeatureCheckOutcome(ctx, handle, &frozen, opID, &task, &attempt, result.ID, checkRunOutcome{Unknown: true, Detail: err.Error()}, nil)
+		if actCtx.Err() != nil {
+			return report, c.requeueUnspawnedFeatureCheck(persistCtx, handle, opID, result.ID, fmt.Errorf("app: materialize feature-check checkout: %w", err))
+		}
+		return report, c.settleFeatureCheckOutcome(persistCtx, handle, &frozen, opID, &task, &attempt, result.ID, checkRunOutcome{Unknown: true, Detail: err.Error()}, nil)
 	}
 
 	if err := c.revalidateForDispatch(ctx, handle, false); err != nil {
-		return report, fmt.Errorf("app: revalidate before feature-check spawn: %w", err)
+		return report, c.requeueUnspawnedFeatureCheck(persistCtx, handle, opID, result.ID, fmt.Errorf("app: revalidate before feature-check spawn: %w", err))
 	}
 	timeout := frozen.Snapshot.CheckTimeout
 	if timeout <= 0 {
@@ -94,9 +105,6 @@ func (c *Controller) DriveFeatureChecks(ctx context.Context, handle RunHandle, h
 	boundedCtx, cancel := context.WithTimeout(actCtx, timeout)
 	cmdResult, runErr := c.Commands.Run(boundedCtx, Command{Argv: checkSpawnArgv(hopPath, opID, frozen.Snapshot.CheckArgv), Dir: checkoutPath, Env: withHOPStateDir(spawnEnv, frozen.Snapshot.StateRoot)})
 	cancel()
-
-	persistCtx, persistCancel := context.WithTimeout(context.WithoutCancel(ctx), checkPersistenceTimeout)
-	defer persistCancel()
 
 	evidence, captureErr := c.captureCheckOutputs(persistCtx, handle, &frozen, opID, result.ID, cmdResult)
 	if runErr != nil {
@@ -248,6 +256,46 @@ func (c *Controller) claimFeatureCheck(ctx context.Context, handle RunHandle, fr
 		return false, "", fmt.Errorf("app: claim feature check: %w", err)
 	}
 	return claimed, opID, nil
+}
+
+// requeueUnspawnedFeatureCheck settles a result-subject check execution
+// whose round ended before its spawn was dispatched — no process can have
+// claimed it — failed as never spawned, and returns its claimed request to
+// requested so a later round runs a fresh execution; the attempt and task
+// are untouched. It returns cause joined with any write failure: a
+// settlement the store refuses (a lost lease) leaves the intent pending
+// for its recovery row.
+func (c *Controller) requeueUnspawnedFeatureCheck(ctx context.Context, handle RunHandle, opID identity.OperationID, resultID identity.ResultID, cause error) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per unspawned execution.
+	now := c.Clock.Now()
+	err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		op, getErr := uow.Operations().Get(ctx, opID)
+		if getErr != nil {
+			return getErr
+		}
+		if op.State != OperationPending && op.State != OperationReconciling {
+			return nil
+		}
+		op.State = OperationFailed
+		op.Outcome = fmt.Sprintf("never spawned: %v", cause)
+		op.UpdatedAt = now
+		if saveErr := uow.Operations().Save(ctx, op); saveErr != nil {
+			return saveErr
+		}
+		request, getErr := uow.CheckRequests().Get(ctx, resultID)
+		if getErr != nil {
+			return getErr
+		}
+		if request.State != CheckRequestClaimed {
+			return nil
+		}
+		request.State = CheckRequestRequested
+		request.ClaimedGeneration = nil
+		return uow.CheckRequests().Save(ctx, request)
+	})
+	if err != nil {
+		return errors.Join(cause, err)
+	}
+	return cause
 }
 
 // settleFeatureCheckFailure settles an execution whose OUTCOME is

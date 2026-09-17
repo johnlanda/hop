@@ -308,7 +308,7 @@ func (c *Controller) observeWorkerExit(ctx context.Context, handle RunHandle, fr
 	if !bindingFound || binding.PaneID == "" || !claimFound || claim.State != LaunchClaimExeced {
 		return false, nil // pre-claim launches stay the launch machinery's.
 	}
-	_, absent, ambiguous := c.observePaneAbsence(ctx, binding.PaneID, binding.CreationLabel)
+	_, absent, ambiguous := c.observePlacedPaneAbsence(ctx, binding.ServerInstance, binding.PaneID, binding.CreationLabel)
 	if ambiguous != "" || !absent {
 		return false, nil
 	}
@@ -687,7 +687,7 @@ func (c *Controller) retireChildSession(ctx context.Context, handle RunHandle, d
 	if !claimFound {
 		// No recorded occupant identity to close against: only observed
 		// absence clears it.
-		_, absent, ambiguous := c.observePaneAbsence(ctx, binding.PaneID, binding.CreationLabel)
+		_, absent, ambiguous := c.observePlacedPaneAbsence(ctx, binding.ServerInstance, binding.PaneID, binding.CreationLabel)
 		if ambiguous == "" && absent {
 			return true, "", c.terminateRetiredSession(ctx, handle, session.ID, reason+" (pane observed absent)")
 		}
@@ -698,13 +698,14 @@ func (c *Controller) retireChildSession(ctx context.Context, handle RunHandle, d
 	}
 
 	target := paneCloseTarget{
-		PaneID:        binding.PaneID,
-		Label:         binding.CreationLabel,
-		SessionID:     session.ID,
-		IncarnationID: binding.IncarnationID,
-		PID:           claim.PID,
-		Markers:       markers,
-		Reason:        reason,
+		PaneID:         binding.PaneID,
+		Label:          binding.CreationLabel,
+		SessionID:      session.ID,
+		IncarnationID:  binding.IncarnationID,
+		PID:            claim.PID,
+		Markers:        markers,
+		Reason:         reason,
+		ServerInstance: binding.ServerInstance,
 		// An unsettled launch is observed terminated only as the
 		// corroborated-absence pair: pane absent and claimed process gone.
 		requireProcessGone: claim.State == LaunchClaimExecPending,

@@ -18,11 +18,26 @@ type SessionLaunchProgress struct {
 	Progress  LaunchProgress
 }
 
+// TransitionReasonLaunchCorroboration is the reason the LIVE launch
+// corroboration records when it fails closed on a foreground group that
+// holds another process carrying the launch identity. It is value-free,
+// and it is deliberately not the resume reason: this reconciliation is
+// re-inspected by every later round, and a later clean observation of the
+// same pane settles it.
+//
+// Exported because the transition journal is read outside this package:
+// a fixture that reproduces this state has to write the SAME reason the
+// live path writes, and a guard over reconciling transitions tells this
+// one from every other by it.
+const TransitionReasonLaunchCorroboration = "launch corroboration: another process on the pane carries the launch identity; re-inspected every pass"
+
 // CorroborateSessionLaunches performs one inspection round for every
 // non-terminal session of a feature-mode run currently in SessionLaunching
 // state — manager, implementers and reviewer alike
 // (docs/plan/phase-3-design.md section 6, "corroborate launches" in the
-// extended scheduling pass, L796-798). It is the per-session sibling of
+// extended scheduling pass, L796-798) — and for the one reconciliation
+// this step itself produces, identified structurally by
+// wrapperReconciliation. It is the per-session sibling of
 // Phase 2's CorroborateLaunch: orchestration only, every occupant decision
 // reuses CorroborateSettlement verbatim, and Phase 2's CorroborateLaunch
 // and its RunDetail-bound helpers (driveLaunchDeadline,
@@ -49,7 +64,11 @@ func (c *Controller) CorroborateSessionLaunches(ctx context.Context, handle RunH
 	var reports []SessionLaunchProgress
 	for i := range sessions {
 		session := sessions[i]
-		if session.State != run.SessionLaunching {
+		inspect, inspectErr := c.sessionUnderLaunchCorroboration(ctx, handle, &session)
+		if inspectErr != nil {
+			return reports, inspectErr
+		}
+		if !inspect {
 			continue
 		}
 		progress, corrErr := c.corroborateSessionLaunch(ctx, handle, &frozen, &session)
@@ -62,6 +81,55 @@ func (c *Controller) CorroborateSessionLaunches(ctx context.Context, handle RunH
 		return reports, err
 	}
 	return reports, nil
+}
+
+// sessionUnderLaunchCorroboration reports whether one session is this
+// step's to inspect: every launching session, plus the live wrapper
+// reconciliation this step itself produces (wrapperReconciliation). A
+// reconciling session in any other shape — every resume-marked one, whose
+// claim is settled — is left exactly as it was.
+func (c *Controller) sessionUnderLaunchCorroboration(ctx context.Context, handle RunHandle, session *run.Session) (bool, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per session per scheduling pass.
+	switch session.State {
+	case run.SessionLaunching:
+		return true, nil
+	case run.SessionReconciling:
+		binding, _, claim, claimFound, _, err := c.sessionCloseEvidence(ctx, handle, session)
+		if err != nil {
+			return false, err
+		}
+		return wrapperReconciliation(&binding, claimFound, &claim), nil
+	default:
+		return false, nil
+	}
+}
+
+// wrapperReconciliation is the STRUCTURAL identification of the live
+// wrapper reconciliation, used wherever that state has to be told apart
+// from every other reconciling session: a current, unsuperseded, placed
+// binding whose own incarnation's launch claim is still exec_pending. The
+// caller has already established that the session is reconciling. A
+// binding that was not found is the zero value, whose empty pane id fails
+// the first conjunct.
+//
+// It needs no recorded reason or marker of its own because
+// markSessionReconciling's invariant makes the shape exclusive: every
+// resume path marks a session reconciling only after reading its claim as
+// settled, so an exec_pending claim under a live placement can only be a
+// launch this step is still corroborating.
+//
+// Two of the four conjuncts are defensive rather than discriminating as
+// this is called today: every caller sources binding and claim from
+// sessionCloseEvidence, which reads Bindings().Current — already
+// unsuperseded, since the store selects on it — and then keys the claim by
+// that binding's own incarnation. So !Superseded and the incarnation
+// equality cannot be false through any current path, and no test can make
+// them false without a caller that sources the pair some other way. They
+// are kept because this predicate states the whole shape it identifies,
+// and the sqlite read model's twin (launchCorroborationPending) rests on
+// the same currentBinding property rather than re-deriving it.
+func wrapperReconciliation(binding *run.RuntimeBinding, claimFound bool, claim *LaunchClaim) bool {
+	return binding.PaneID != "" && !binding.Superseded &&
+		claimFound && claim.State == LaunchClaimExecPending && claim.IncarnationID == binding.IncarnationID
 }
 
 // driveLaunchingRunFailure drives the feature terminal failure of a
@@ -196,7 +264,7 @@ func (c *Controller) corroborateSessionLaunch(ctx context.Context, handle RunHan
 		}
 		return LaunchSettled, nil
 	case SettlementForkingWrapper:
-		if err := c.markSessionReconciling(ctx, handle, session.ID); err != nil {
+		if err := c.markSessionReconciling(ctx, handle, session.ID, TransitionReasonLaunchCorroboration); err != nil {
 			return "", err
 		}
 		return LaunchNeedsInteraction, nil
@@ -507,6 +575,7 @@ func (c *Controller) driveSessionLaunchDeadline(ctx context.Context, handle RunH
 		}
 	}
 	now := c.Clock.Now()
+	claimed := false
 	err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 		op, getErr := uow.Operations().Get(ctx, newest.ID)
 		if getErr != nil {
@@ -514,6 +583,10 @@ func (c *Controller) driveSessionLaunchDeadline(ctx context.Context, handle RunH
 		}
 		if op.State == OperationReconciling {
 			return nil
+		}
+		var claimErr error
+		if claimed, claimErr = launchClaimedLocked(ctx, uow, &op); claimErr != nil || claimed {
+			return claimErr
 		}
 		op.State = OperationReconciling
 		op.Outcome = "no launch claim appeared within the launch-claim deadline; reconciling, never re-sent"
@@ -526,5 +599,5 @@ func (c *Controller) driveSessionLaunchDeadline(ctx context.Context, handle RunH
 	if err != nil {
 		return false, fmt.Errorf("app: record session launch deadline: %w", err)
 	}
-	return true, nil
+	return !claimed, nil
 }

@@ -81,13 +81,29 @@ func newIntegrationFixture(t *testing.T, srcIsAncestor bool) *integrationFixture
 	return &integrationFixture{tc: tc, fr: fr, git: git, base: base, src: src, taskID: taskID, attemptID: attemptID, resultID: resultID}
 }
 
+// drive runs one integration-step round as the controller loop drives
+// it (driveIntegrationStep).
 func (f *integrationFixture) drive(t *testing.T) app.IntegrationReport {
 	t.Helper()
-	report, err := f.tc.Controller.DriveIntegration(context.Background(), f.fr.Handle, integrationHopPath, []string{"PATH=/usr/bin"})
+	report, err := driveIntegrationStep(context.Background(), f.tc.Controller, f.fr.Handle)
 	if err != nil {
-		t.Fatalf("DriveIntegration() error = %v", err)
+		t.Fatalf("integration step error = %v", err)
 	}
 	return report
+}
+
+// driveIntegrationStep runs one integration-step round as the controller
+// loop drives it: DriveIntegration, then, when it reports a combined-check
+// execution due, the DriveIntegrationCheck round the loop runs
+// asynchronously before its next DriveIntegration. The report is the last
+// call's.
+func driveIntegrationStep(ctx context.Context, ctrl *app.Controller, handle app.RunHandle) (app.IntegrationReport, error) { //nolint:gocritic // hugeParam: RunHandle is passed by value as every Controller method takes it.
+	env := []string{"PATH=/usr/bin"}
+	report, err := ctrl.DriveIntegration(ctx, handle, integrationHopPath, env)
+	if err != nil || !report.CheckDue {
+		return report, err
+	}
+	return ctrl.DriveIntegrationCheck(ctx, handle, integrationHopPath, env)
 }
 
 // driveUntil loops DriveIntegration until the integration reports
@@ -1093,9 +1109,9 @@ func TestIntegrationBarrierZombieAfterTakeover(t *testing.T) {
 	handleB := app.NewRunHandleForTest(f.fr.RunID, leaseB)
 
 	driveB := func() app.IntegrationReport {
-		report, driveErr := f.tc.Controller.DriveIntegration(context.Background(), handleB, integrationHopPath, nil)
+		report, driveErr := driveIntegrationStep(context.Background(), f.tc.Controller, handleB)
 		if driveErr != nil {
-			t.Fatalf("DriveIntegration(B) error = %v", driveErr)
+			t.Fatalf("integration step (B) error = %v", driveErr)
 		}
 		return report
 	}

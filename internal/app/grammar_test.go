@@ -202,6 +202,17 @@ func TestGoldenGrammar(t *testing.T) {
 			app.GrammarSessionLine(msgID, "manager", "active", "(none)", 0, "ws/tab/pane"),
 			"session " + msgID + ": role=manager state=active task=(none) attempt=0 binding=ws/tab/pane",
 		},
+		{
+			"launch-corroboration transition reason",
+			app.TransitionReasonLaunchCorroboration,
+			"launch corroboration: another process on the pane carries the launch identity; re-inspected every pass",
+		},
+		{
+			"session launch-corroboration action",
+			app.GrammarSessionLaunchCorroborationAction,
+			"another process on this session's pane carries the launch identity, so the launch is not corroborated yet; " +
+				"the controller re-inspects it every pass and needs nothing, and if this state persists, open that pane and check whether the harness was started through a process that forks it",
+		},
 	}
 	for _, tc := range golden {
 		t.Run(tc.name, func(t *testing.T) {

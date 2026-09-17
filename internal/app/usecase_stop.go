@@ -58,6 +58,11 @@ type paneCloseIntent struct {
 	PID           int                    `json:"pid"`
 	ArgvMarkers   []string               `json:"argv_markers"`
 	Reason        string                 `json:"reason"`
+	// ServerInstance is the server lifetime the target's absence is
+	// decided against (observePlacedPaneAbsence). A close journaled
+	// without it is decided against its caller's target, which names the
+	// same pane and incarnation.
+	ServerInstance string `json:"server_instance"`
 }
 
 // paneCloseOutcome is the OpPaneClose operation's outcome payload.
@@ -88,6 +93,11 @@ type paneCloseTarget struct {
 	PID           int
 	Markers       []string
 	Reason        string
+	// ServerInstance is the server lifetime recorded for the target: the
+	// placement's for a session's own worker, the identifying lifetime for
+	// a positive-evidence retirement. Its absence is concluded only while
+	// that lifetime serves the socket.
+	ServerInstance string
 	// requireProcessGone is set by a caller whose target is an unsettled
 	// (exec_pending) launch claim, from the claim's CURRENT state and never
 	// persisted: the pane's observed absence retires the target only
@@ -331,7 +341,7 @@ func (c *Controller) retireWorker(ctx context.Context, handle RunHandle, detail 
 		// A binding with no claim: the pane may hold a pre-claim launcher.
 		// There is no recorded identity to close against, so nothing is
 		// acted on; only observed absence clears it.
-		_, absent, ambiguous := c.observePaneAbsence(ctx, detail.Binding.PaneID, detail.Binding.CreationLabel)
+		_, absent, ambiguous := c.observePlacedPaneAbsence(ctx, detail.Binding.ServerInstance, detail.Binding.PaneID, detail.Binding.CreationLabel)
 		if ambiguous == "" && absent {
 			return "", nil
 		}
@@ -354,13 +364,14 @@ func (c *Controller) retireWorker(ctx context.Context, handle RunHandle, detail 
 		markers = append(markers, detail.Binding.Occupant.ArgvMarker)
 	}
 	target := paneCloseTarget{
-		PaneID:        detail.Binding.PaneID,
-		Label:         detail.Binding.CreationLabel,
-		SessionID:     detail.SessionID,
-		IncarnationID: detail.Binding.IncarnationID,
-		PID:           detail.Claim.PID,
-		Markers:       markers,
-		Reason:        closeReasonStop,
+		PaneID:         detail.Binding.PaneID,
+		Label:          detail.Binding.CreationLabel,
+		SessionID:      detail.SessionID,
+		IncarnationID:  detail.Binding.IncarnationID,
+		PID:            detail.Claim.PID,
+		Markers:        markers,
+		Reason:         closeReasonStop,
+		ServerInstance: detail.Binding.ServerInstance,
 	}
 	retired, outstanding, err := c.closePaneOperation(ctx, handle, detail, &target)
 	if err != nil {
@@ -451,6 +462,7 @@ func (c *Controller) retireUnboundLaunch(ctx context.Context, handle RunHandle, 
 			PaneID: persisted.PaneID, Label: persisted.Label,
 			SessionID: persisted.SessionID, IncarnationID: persisted.IncarnationID,
 			PID: persisted.PID, Markers: persisted.ArgvMarkers, Reason: persisted.Reason,
+			ServerInstance: persisted.ServerInstance,
 		}
 		retired, outstanding, closeErr := c.closePaneOperation(ctx, handle, detail, &target)
 		if closeErr != nil {
@@ -477,6 +489,7 @@ func (c *Controller) retireUnboundLaunch(ctx context.Context, handle RunHandle, 
 		PaneID: ref.PaneID, Label: intent.Label,
 		SessionID: intent.SessionID, IncarnationID: intent.IncarnationID,
 		PID: detail.Claim.PID, Markers: markers, Reason: closeReasonStop,
+		ServerInstance: intent.ServerInstance,
 	}
 	retired, outstanding, err := c.closePaneOperation(ctx, handle, detail, &target)
 	if err != nil {
@@ -522,14 +535,21 @@ func (c *Controller) closePaneOperation(ctx context.Context, handle RunHandle, d
 	// The process requirement is the caller's current claim state, never
 	// part of the persisted intent.
 	requireProcessGone := target.requireProcessGone
+	callerInstance := target.ServerInstance
 	target = effective
 	target.requireProcessGone = requireProcessGone
+	if target.ServerInstance == "" {
+		// A close journaled before its intent recorded a lifetime is for
+		// the same pane and incarnation as the caller's target, whose
+		// recorded lifetime it therefore shares.
+		target.ServerInstance = callerInstance
+	}
 
 	if err := c.revalidateForDispatch(ctx, handle, true); err != nil {
 		return false, "", err
 	}
 
-	pane, absent, ambiguous := c.observePaneAbsence(ctx, target.PaneID, target.Label)
+	pane, absent, ambiguous := c.observePlacedPaneAbsence(ctx, target.ServerInstance, target.PaneID, target.Label)
 	if ambiguous != "" {
 		return false, ambiguous, nil
 	}
@@ -591,7 +611,7 @@ func (c *Controller) closePaneOperation(ctx context.Context, handle RunHandle, d
 	// One immediate re-observation: the pane may already be gone. The same
 	// absence rule applies — anything short of established absence stays
 	// dispatched-but-unobserved.
-	if _, absentAfter, ambiguousAfter := c.observePaneAbsence(ctx, target.PaneID, target.Label); ambiguousAfter == "" && absentAfter {
+	if _, absentAfter, ambiguousAfter := c.observePlacedPaneAbsence(ctx, target.ServerInstance, target.PaneID, target.Label); ambiguousAfter == "" && absentAfter {
 		if still := c.closeTargetProcessStillLive(ctx, target); still != "" {
 			return false, awaiting + ": " + still, nil
 		}
@@ -654,6 +674,7 @@ func (c *Controller) findOrCreateCloseOperation(ctx context.Context, handle RunH
 			PaneID: intent.PaneID, Label: intent.Label,
 			SessionID: intent.SessionID, IncarnationID: intent.IncarnationID,
 			PID: intent.PID, Markers: intent.ArgvMarkers, Reason: intent.Reason,
+			ServerInstance: intent.ServerInstance,
 		}
 		return op.ID, persisted, "", nil
 	}
@@ -667,6 +688,7 @@ func (c *Controller) findOrCreateCloseOperation(ctx context.Context, handle RunH
 		PaneID: target.PaneID, Label: target.Label,
 		SessionID: target.SessionID, IncarnationID: target.IncarnationID,
 		PID: target.PID, ArgvMarkers: target.Markers, Reason: target.Reason,
+		ServerInstance: target.ServerInstance,
 	}
 	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 		return uow.Operations().Create(ctx, Operation{

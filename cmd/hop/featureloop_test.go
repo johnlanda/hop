@@ -238,7 +238,7 @@ func TestRunFeatureSchedulingPassPopulatesAssignmentOptions(t *testing.T) {
 		return app.AssignmentReport{}, nil
 	}
 
-	pass, err := runFeatureSchedulingPass(context.Background(), ctrl, app.RunHandle{}, "running", "/opt/hop/bin/hop", []string{"KEY=value"})
+	pass, err := runFeatureSchedulingPass(context.Background(), ctrl, app.RunHandle{}, "running", "/opt/hop/bin/hop", []string{"KEY=value"}, false)
 	if err != nil {
 		t.Fatalf("runFeatureSchedulingPass() error = %v", err)
 	}

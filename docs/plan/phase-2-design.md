@@ -983,7 +983,11 @@ the documented alternative.
 The launch-claim deadline (default 120s from pane creation) bounds
 mechanical launcher start: if no claim row appears, the operation is never
 re-created or re-sent; it goes `reconciling` with a pane snapshot as
-evidence, per the decision table. Human-interaction time after the claim is
+evidence, per the decision table. The bound applies only while no claim
+exists, and the transaction that records it re-reads the claim: a
+launcher that claimed after the round's own earlier read keeps its
+intent, which is the pre-binding principal authority its own verbs are
+validated against. Human-interaction time after the claim is
 unbounded: a claimed-and-corroborated harness waiting at a trust or
 permission dialog is reported as `blocked, needs interaction` for as long
 as it takes, with no resend and no timeout failure. Detection that arrives

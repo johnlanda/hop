@@ -25,13 +25,8 @@ func (c *Controller) recoverIntegrationOperations(ctx context.Context, handle Ru
 			return opErr
 		}
 		for i := range ops {
-			switch ops[i].Kind {
-			case OpIntegrationMerge, OpIntegrationPublish, OpIntegrationReset, OpIntegrationFence:
+			if isIntegrationStepOperation(&ops[i]) {
 				unresolved = append(unresolved, ops[i])
-			case OpCheckRun:
-				if intent, ok := decodeOperationPayload[integrationCheckIntent](ops[i].Intent); ok && intent.IntegrationID != "" {
-					unresolved = append(unresolved, ops[i])
-				}
 			}
 		}
 		return nil

@@ -88,7 +88,7 @@ func TestResumeFeatureChildLaunchInFlight(t *testing.T) {
 		}
 	})
 
-	t.Run("a forking-wrapper occupant: resumed, the loop fails it closed, and a later resume stays reconciling", func(t *testing.T) {
+	t.Run("a forking-wrapper occupant: the loop fails it closed, a later resume hands it back, and it never settles", func(t *testing.T) {
 		f := newResumeFixture(t)
 		binding := resumeChildClaim(t, f, app.LaunchClaimExecPending)
 		wrapped := corroboratingChild(binding.IncarnationID)
@@ -108,22 +108,42 @@ func TestResumeFeatureChildLaunchInFlight(t *testing.T) {
 			t.Fatalf("child session state = %s, want reconciling", got)
 		}
 
-		// The loop's controller dies too; the next resume fails closed.
+		// The loop's controller dies too. The launch the loop left
+		// reconciling is one it still re-inspects, so the next resume hands
+		// it back to the loop rather than holding the run in
+		// reconciliation.
 		f.tc.Clock.Advance(leaseTTL + 1)
-		again, _, err := f.tc.Controller.ResumeFeature(context.Background(), app.ResumeFeatureRequest{
+		again, handle, err := f.tc.Controller.ResumeFeature(context.Background(), app.ResumeFeatureRequest{
 			RunID: f.fr.RunID.String(), ControllerID: "controller-3", HOPPath: "/usr/local/bin/hop", StateRoot: "/state",
 		})
 		if err != nil {
 			t.Fatalf("second ResumeFeature() error = %v", err)
 		}
-		if again.Outcome != "reconciling" {
-			t.Fatalf("second resume = %+v, want reconciling", again)
+		if again.Outcome != "resumed" {
+			t.Fatalf("second resume = %+v, want resumed: the loop still corroborates this launch", again)
 		}
 		report := sessionReport(t, &again, f.ChildID.String())
-		if report.Disposition != app.SessionPending || !strings.Contains(report.Detail, "the session is reconciling, not launching") {
-			t.Fatalf("child report = %+v, want pending, not in flight", report)
+		if report.Disposition != app.SessionPending || report.Detail != inFlightDetail {
+			t.Fatalf("child report = %+v, want pending in flight", report)
 		}
-		requireRunState(t, f, run.RunResuming)
+		requireRunState(t, f, run.RunRunning)
+
+		// Handing it back is not settling it: while the other process is
+		// still there, every pass keeps failing closed and the claim never
+		// settles. The human action this state renders is asserted by
+		// TestStatusRendersTheLaunchCorroborationAction.
+		for pass := range 3 {
+			reports, err = f.tc.Controller.CorroborateSessionLaunches(context.Background(), handle)
+			if err != nil || len(reports) != 1 || reports[0].Progress != app.LaunchNeedsInteraction {
+				t.Fatalf("pass %d: CorroborateSessionLaunches() = %+v, %v; want needs-interaction again", pass, reports, err)
+			}
+			if got := f.tc.Store.Sessions[f.ChildID].value.State; got != run.SessionReconciling {
+				t.Fatalf("pass %d: child session state = %s, want reconciling", pass, got)
+			}
+			if got := f.tc.Store.LaunchClaims[binding.IncarnationID].State; got != app.LaunchClaimExecPending {
+				t.Fatalf("pass %d: claim state = %s, want exec_pending: a persistent wrapper never settles", pass, got)
+			}
+		}
 	})
 
 	t.Run("no claim yet with the launcher in its pane: resumed, and the loop settles the later claim", func(t *testing.T) {
@@ -151,6 +171,41 @@ func TestResumeFeatureChildLaunchInFlight(t *testing.T) {
 		if err != nil || len(reports) != 1 || reports[0].Progress != app.LaunchSettled {
 			t.Fatalf("CorroborateSessionLaunches() = %+v, %v; want settled", reports, err)
 		}
+	})
+
+	t.Run("a reconciling session that is not the loop's own reconciliation is never in flight", func(t *testing.T) {
+		f := newResumeFixture(t)
+		binding, _ := f.tc.Store.currentBindingLocked(f.ChildID)
+		// Reconciling with NO claim: not the live wrapper reconciliation,
+		// which always carries the placement's own exec_pending claim. The
+		// loop's corroboration skips this session for exactly that reason
+		// (sessionUnderLaunchCorroboration asks wrapperReconciliation
+		// too), so reporting it in flight would hand a launch to a step
+		// that will never look at it — the wedge, through another door.
+		//
+		// The state is not reachable through any path today; the conjunct
+		// is what keeps it unreachable from the in-flight rule if one ever
+		// produced it, and this pins the rule rather than a live bug.
+		row := f.tc.Store.Sessions[f.ChildID]
+		reconciling, err := row.value.Reconcile(f.tc.Clock.Now())
+		if err != nil {
+			t.Fatalf("Reconcile() error = %v", err)
+		}
+		row.value = reconciling
+		row.revision++
+		// Its pane holds this session's own hop launch invocation — every
+		// positive observation the pre-claim leg of the rule requires.
+		f.tc.Runtime.InspectPaneFn = withChildPane(f, binding.PaneID, childPaneWith(childLaunchPID, childLauncher(f)))
+
+		result, _ := f.resume(t, "")
+		report := sessionReport(t, &result, f.ChildID.String())
+		if report.Detail == inFlightDetail {
+			t.Fatalf("child report = %+v, want NOT in flight: nothing re-inspects this session", report)
+		}
+		if !strings.Contains(report.Detail, "not a launch the controller loop still corroborates") {
+			t.Fatalf("child report = %+v, want the detail naming why it is not in flight", report)
+		}
+		requireRunState(t, f, run.RunResuming)
 	})
 
 	t.Run("the manager's own launch is unsettled: the run returns to launching, never running", func(t *testing.T) {

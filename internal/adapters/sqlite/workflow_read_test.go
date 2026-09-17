@@ -643,3 +643,149 @@ func TestLoadCheckExecutionContextByKind(t *testing.T) {
 		t.Fatal("a pane.open operation loaded as an execution context; want refused")
 	}
 }
+
+// TestSessionSummaryLaunchCorroborationPending pins the read model's
+// structural fact behind `hop status`'s per-session action line:
+// SessionSummary.LaunchCorroborationPending holds for exactly one shape —
+// a reconciling session with a current unsuperseded placed binding whose
+// own incarnation's launch claim is still exec_pending. Every neighboring
+// shape reports false, which is what makes the fact identify the live
+// launch corroboration's own reconciliation rather than any reconciling
+// session.
+func TestSessionSummaryLaunchCorroborationPending(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		// arrange runs after the worker session exists, active and bound.
+		arrange func(t *testing.T, f *featureFixture, sessionID identity.SessionID, incarnation identity.IncarnationID)
+		want    bool
+	}{
+		{
+			name: "reconciling with the placement's own exec_pending claim",
+			arrange: func(t *testing.T, f *featureFixture, sessionID identity.SessionID, incarnation identity.IncarnationID) {
+				claimWorkerLaunch(t, f, sessionID, incarnation)
+				reconcileWorkerSession(t, f, sessionID)
+			},
+			want: true,
+		},
+		{
+			name: "active with an exec_pending claim",
+			arrange: func(t *testing.T, f *featureFixture, sessionID identity.SessionID, incarnation identity.IncarnationID) {
+				claimWorkerLaunch(t, f, sessionID, incarnation)
+			},
+			want: false,
+		},
+		{
+			name: "reconciling with a settled claim",
+			arrange: func(t *testing.T, f *featureFixture, sessionID identity.SessionID, incarnation identity.IncarnationID) {
+				claimWorkerLaunch(t, f, sessionID, incarnation)
+				settleWorkerClaim(t, f, incarnation, app.LaunchClaimExeced)
+				reconcileWorkerSession(t, f, sessionID)
+			},
+			want: false,
+		},
+		{
+			name: "reconciling with an exec_failed claim",
+			arrange: func(t *testing.T, f *featureFixture, sessionID identity.SessionID, incarnation identity.IncarnationID) {
+				claimWorkerLaunch(t, f, sessionID, incarnation)
+				settleWorkerClaim(t, f, incarnation, app.LaunchClaimExecFailed)
+				reconcileWorkerSession(t, f, sessionID)
+			},
+			want: false,
+		},
+		{
+			name: "reconciling with no claim recorded at all",
+			arrange: func(t *testing.T, f *featureFixture, sessionID identity.SessionID, _ identity.IncarnationID) {
+				reconcileWorkerSession(t, f, sessionID)
+			},
+			want: false,
+		},
+		{
+			name: "reconciling with the placement superseded",
+			arrange: func(t *testing.T, f *featureFixture, sessionID identity.SessionID, incarnation identity.IncarnationID) {
+				claimWorkerLaunch(t, f, sessionID, incarnation)
+				reconcileWorkerSession(t, f, sessionID)
+				supersedeWorkerBinding(t, f, sessionID)
+			},
+			want: false,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFeatureFixture(t)
+			task := f.createFeatureTask(t, 8301, 2, run.TaskActive)
+			sessionID, incarnation := f.createWorkerSession(t, task, run.RoleImplementer, 8302)
+			tt.arrange(t, f, sessionID, incarnation)
+
+			detail, err := f.store.LoadRunStatus(t.Context(), f.spec.RunID)
+			if err != nil {
+				t.Fatalf("LoadRunStatus() = %v", err)
+			}
+			var worker *app.SessionSummary
+			for i := range detail.Sessions {
+				if detail.Sessions[i].SessionID == sessionID {
+					worker = &detail.Sessions[i]
+				}
+			}
+			if worker == nil {
+				t.Fatalf("session %s is not in the summaries %+v", sessionID, detail.Sessions)
+			}
+			if worker.LaunchCorroborationPending != tt.want {
+				t.Fatalf("LaunchCorroborationPending = %t, want %t for summary %+v", worker.LaunchCorroborationPending, tt.want, worker)
+			}
+		})
+	}
+}
+
+// claimWorkerLaunch records the worker's launcher claim through the
+// production writer, leaving it exec_pending.
+func claimWorkerLaunch(t *testing.T, f *featureFixture, sessionID identity.SessionID, incarnation identity.IncarnationID) {
+	t.Helper()
+	claim := app.LaunchClaim{
+		IncarnationID: incarnation, RunID: f.spec.RunID, SessionID: sessionID,
+		Executable: "/opt/harness/claude", ArgvDigest: "argv-digest", PID: 8311,
+	}
+	if err := f.store.ClaimLaunch(t.Context(), claim); err != nil {
+		t.Fatalf("ClaimLaunch() = %v", err)
+	}
+}
+
+// settleWorkerClaim settles the worker's claim to state.
+func settleWorkerClaim(t *testing.T, f *featureFixture, incarnation identity.IncarnationID, state app.LaunchClaimState) {
+	t.Helper()
+	f.inUOW(t, func(uow app.UnitOfWork) {
+		if err := uow.LaunchClaims().Settle(t.Context(), incarnation, app.LaunchClaimSettlement{
+			State: state, PaneID: "pane-w", PID: 8311, Executable: "/opt/harness/claude",
+			ArgvMarker: incarnation.String(), Reason: "fixture settlement", At: f.clock.Now(),
+		}); err != nil {
+			t.Fatalf("Settle(%s) = %v", state, err)
+		}
+	})
+}
+
+// reconcileWorkerSession moves the worker session to reconciling.
+func reconcileWorkerSession(t *testing.T, f *featureFixture, sessionID identity.SessionID) {
+	t.Helper()
+	now := f.clock.Now()
+	f.inUOW(t, func(uow app.UnitOfWork) {
+		saveSession(t, uow, sessionID, func(v run.Session) (run.Session, error) { return v.Reconcile(now) })
+	})
+}
+
+// supersedeWorkerBinding supersedes the worker's current placement with no
+// successor.
+func supersedeWorkerBinding(t *testing.T, f *featureFixture, sessionID identity.SessionID) {
+	t.Helper()
+	now := f.clock.Now()
+	f.inUOW(t, func(uow app.UnitOfWork) {
+		binding, found, err := uow.Bindings().Current(t.Context(), sessionID)
+		if err != nil || !found {
+			t.Fatalf("current binding of %s: found=%t err=%v", sessionID, found, err)
+		}
+		superseded, supErr := binding.Supersede("fixture supersession", now)
+		if supErr != nil {
+			t.Fatalf("supersede binding: %v", supErr)
+		}
+		if err := uow.Bindings().Save(t.Context(), superseded); err != nil {
+			t.Fatalf("save superseded binding: %v", err)
+		}
+	})
+}

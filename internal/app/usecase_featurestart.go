@@ -787,7 +787,10 @@ type bootstrapJournal struct {
 // after its frozen artifacts are verified. A launching manager — the
 // bootstrap's, or a relaunched successor — with no binding goes through
 // the session-keyed label recovery, and with no settled claim returns the
-// run to launching for the loop's corroboration. Any other manager state
+// run to launching for the loop's corroboration. A manager in the live
+// launch corroboration's own reconciliation returns the run to launching
+// too, under the positive observations resume's in-flight rule requires.
+// Any other manager state
 // means the bootstrap is complete. Recorded outcomes that stop the bootstrap (a collision,
 // an unresolved act) are reported as Blocked; only failures to read or
 // record anything are errors.
@@ -840,6 +843,28 @@ func (c *Controller) continueFeatureBootstrap(ctx context.Context, handle RunHan
 			}
 		}
 		if claimFound && claim.State != LaunchClaimExecPending {
+			return progress, nil
+		}
+		progress.ManagerLaunching = true
+		if err := c.returnRunToLaunching(ctx, handle); err != nil {
+			return progress, err
+		}
+	case run.SessionReconciling:
+		// The live launch corroboration's own reconciliation is a manager
+		// launch the loop still finishes, exactly as a launching manager's
+		// is — accepted here only under the same positive observations
+		// resume's in-flight rule requires of a child's placed launch
+		// (placedLaunchProcessObserved). The launcher-identity conjunct
+		// cannot apply: this state always has the placement's own claim.
+		manager := journal.manager
+		binding, _, claim, claimFound, _, evidenceErr := c.sessionCloseEvidence(ctx, handle, &manager)
+		if evidenceErr != nil {
+			return progress, evidenceErr
+		}
+		if !wrapperReconciliation(&binding, claimFound, &claim) {
+			return progress, nil
+		}
+		if observed, _ := c.placedLaunchProcessObserved(ctx, &binding, claimFound, &claim, nil, handle.runID, manager.ID); !observed {
 			return progress, nil
 		}
 		progress.ManagerLaunching = true

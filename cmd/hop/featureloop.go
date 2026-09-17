@@ -9,72 +9,86 @@ import (
 	"github.com/johnlanda/hop/internal/app"
 )
 
-// featureCheckOutcome carries one asynchronous DriveFeatureChecks
-// completion, mirroring checkOutcome for the feature-mode report shape.
-type featureCheckOutcome struct {
-	report app.FeatureCheckReport
+// roundOutcome carries one asynchronous round's completion.
+type roundOutcome[R any] struct {
+	report R
 	err    error
 }
 
-// featureCheckDriver runs at most one DriveFeatureChecks round at a time
-// in its own goroutine under a cancelable context derived from the loop's,
-// mirroring checkDriver exactly (solo's own async check driver, untouched)
-// so a long-running feature-mode check does not block the rest of the
-// scheduling pass — the loop keeps observing a stop request and
-// heartbeating while a check executes, and a stop interrupts the check
-// through the app's own stop precedence instead of waiting it out.
-type featureCheckDriver struct {
+// asyncRound runs at most one controller round at a time in its own
+// goroutine under a cancelable context derived from the loop's, mirroring
+// checkDriver (solo's own async check driver, untouched), so a
+// long-running round does not block the rest of the scheduling pass: the
+// loop keeps observing a stop request and heartbeating while the round
+// executes, and a stop interrupts it — the runner kills the check's
+// process group — instead of waiting it out. The feature loop runs two:
+// the per-task check round (DriveFeatureChecks) and the integration
+// step's combined-check round (DriveIntegrationCheck).
+type asyncRound[R any] struct {
 	cancel context.CancelFunc
-	done   chan featureCheckOutcome
+	done   chan roundOutcome[R]
 }
 
-// start begins one asynchronous feature-check round; the driver must be
-// idle. posted, when non-nil, is called after the outcome is in the
-// channel, exactly like checkDriver.start's barrier for deterministic test
-// pacing; production wiring leaves it nil.
-func (c *featureCheckDriver) start(ctx context.Context, ctrl controllerAPI, handle app.RunHandle, hopPath string, spawnEnv []string, posted func()) { //nolint:gocritic // hugeParam: RunHandle is the app-defined opaque token, passed by value as every Controller method takes it.
-	checkCtx, cancel := context.WithCancel(ctx)
-	done := make(chan featureCheckOutcome, 1)
+// start begins one asynchronous round; the driver must be idle. posted,
+// when non-nil, is called after the outcome is in the channel, exactly
+// like checkDriver.start's barrier for deterministic test pacing;
+// production wiring leaves it nil.
+func (c *asyncRound[R]) start(ctx context.Context, round func(context.Context) (R, error), posted func()) {
+	roundCtx, cancel := context.WithCancel(ctx)
+	done := make(chan roundOutcome[R], 1)
 	c.cancel = cancel
 	c.done = done
 	go func() {
 		defer cancel()
-		report, err := ctrl.DriveFeatureChecks(checkCtx, handle, hopPath, spawnEnv)
-		done <- featureCheckOutcome{report: report, err: err}
+		report, err := round(roundCtx)
+		done <- roundOutcome[R]{report: report, err: err}
 		if posted != nil {
 			posted()
 		}
 	}()
 }
 
-// running reports whether a check round is in flight.
-func (c *featureCheckDriver) running() bool { return c.done != nil }
+// running reports whether a round is in flight.
+func (c *asyncRound[R]) running() bool { return c.done != nil }
 
 // poll consumes a finished round without blocking; ok is false while the
 // round is still running.
-func (c *featureCheckDriver) poll() (featureCheckOutcome, bool) {
+func (c *asyncRound[R]) poll() (roundOutcome[R], bool) {
 	if c.done == nil {
-		return featureCheckOutcome{}, false
+		return roundOutcome[R]{}, false
 	}
 	select {
 	case outcome := <-c.done:
 		c.done = nil
 		return outcome, true
 	default:
-		return featureCheckOutcome{}, false
+		return roundOutcome[R]{}, false
 	}
 }
 
 // interrupt cancels the in-flight round, if any, and waits for it to
 // return.
-func (c *featureCheckDriver) interrupt() (featureCheckOutcome, bool) {
+func (c *asyncRound[R]) interrupt() (roundOutcome[R], bool) {
 	if c.done == nil {
-		return featureCheckOutcome{}, false
+		return roundOutcome[R]{}, false
 	}
 	c.cancel()
 	outcome := <-c.done
 	c.done = nil
 	return outcome, true
+}
+
+// roundError is the part of an asynchronous round's error the loop
+// reports: a stop refusal and a cancellation are the loop's own doing and
+// are not.
+func roundError(what string, err error) error {
+	if err == nil || errors.Is(err, app.ErrStopRequested) {
+		return nil
+	}
+	if reportable := nonCancellationCauses(err); reportable != nil {
+		return fmt.Errorf("%s: %w", what, reportable)
+	}
+	return nil
 }
 
 // runFeatureControllerLoop drives one held feature-mode run in the
@@ -126,19 +140,14 @@ func (c *featureCheckDriver) interrupt() (featureCheckOutcome, bool) {
 func runFeatureControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, handle app.RunHandle, runID, label, hopPath string, stdout io.Writer) (loopResult, error) { //nolint:gocritic // hugeParam: RunHandle is the app-defined opaque token, passed by value as every Controller method takes it.
 	heartbeatFailed := runHeartbeats(ctx, d, ctrl, handle)
 	var (
-		lastState string
-		spawnEnv  []string
-		checks    featureCheckDriver
+		lastState         string
+		spawnEnv          []string
+		checks            asyncRound[app.FeatureCheckReport]
+		integrationChecks asyncRound[app.IntegrationReport]
 	)
-	reportOutcome := func(outcome featureCheckOutcome) error {
+	reportOutcome := func(outcome roundOutcome[app.FeatureCheckReport]) error {
 		if outcome.err != nil {
-			if errors.Is(outcome.err, app.ErrStopRequested) {
-				return nil
-			}
-			if reportable := nonCancellationCauses(outcome.err); reportable != nil {
-				return fmt.Errorf("run feature checks: %w", reportable)
-			}
-			return nil
+			return roundError("run feature checks", outcome.err)
 		}
 		if outcome.report.Ran {
 			if _, werr := fmt.Fprintf(stdout, "check %s %s\n", outcome.report.TaskID, describeFeatureCheckReport(&outcome.report)); werr != nil {
@@ -147,11 +156,21 @@ func runFeatureControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, 
 		}
 		return nil
 	}
+	reportIntegrationOutcome := func(outcome roundOutcome[app.IntegrationReport]) error {
+		return roundError("run the combined integration check", outcome.err)
+	}
+	// drainChecks interrupts both asynchronous rounds and waits for them,
+	// so nothing the loop started still acts once it returns or drives a
+	// stop.
 	drainChecks := func() error {
+		var errs []error
 		if outcome, ok := checks.interrupt(); ok {
-			return reportOutcome(outcome)
+			errs = append(errs, reportOutcome(outcome))
 		}
-		return nil
+		if outcome, ok := integrationChecks.interrupt(); ok {
+			errs = append(errs, reportIntegrationOutcome(outcome))
+		}
+		return errors.Join(errs...)
 	}
 
 	for {
@@ -185,10 +204,11 @@ func runFeatureControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, 
 		}
 
 		if detail.StopRequested || detail.State == runStateStopping {
-			if outcome, ok := checks.interrupt(); ok {
-				if repErr := reportOutcome(outcome); repErr != nil {
-					return loopResult{}, repErr
-				}
+			// Both asynchronous rounds are interrupted and awaited first:
+			// stop retires what they spawned by claim, and nothing of theirs
+			// may still be acting while it does.
+			if drainErr := drainChecks(); drainErr != nil {
+				return loopResult{}, drainErr
 			}
 			report, stopErr := ctrl.DriveFeatureStop(ctx, handle)
 			if stopErr != nil {
@@ -207,7 +227,16 @@ func runFeatureControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, 
 					return loopResult{}, errors.Join(fmt.Errorf("compose check spawn environment: %w", err), drainChecks())
 				}
 			}
-			pass, err := runFeatureSchedulingPass(ctx, ctrl, handle, detail.State, hopPath, spawnEnv)
+			// A finished combined-check round is consumed before the pass,
+			// so the pass's integration step handles its aftermath this
+			// tick; while one is still running the pass leaves the step
+			// alone.
+			if outcome, ok := integrationChecks.poll(); ok {
+				if repErr := reportIntegrationOutcome(outcome); repErr != nil {
+					return loopResult{}, errors.Join(repErr, drainChecks())
+				}
+			}
+			pass, err := runFeatureSchedulingPass(ctx, ctrl, handle, detail.State, hopPath, spawnEnv, integrationChecks.running())
 			for _, line := range pass.lines {
 				if _, werr := fmt.Fprintln(stdout, line); werr != nil {
 					return loopResult{}, errors.Join(werr, err, drainChecks())
@@ -218,11 +247,18 @@ func runFeatureControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, 
 			}
 			if outcome, ok := checks.poll(); ok {
 				if repErr := reportOutcome(outcome); repErr != nil {
-					return loopResult{}, repErr
+					return loopResult{}, errors.Join(repErr, drainChecks())
 				}
 			}
 			if !pass.halted && !checks.running() {
-				checks.start(ctx, ctrl, handle, hopPath, spawnEnv, d.checkOutcomePosted)
+				checks.start(ctx, func(roundCtx context.Context) (app.FeatureCheckReport, error) {
+					return ctrl.DriveFeatureChecks(roundCtx, handle, hopPath, spawnEnv)
+				}, d.checkOutcomePosted)
+			}
+			if !pass.halted && pass.integrationCheckDue && !integrationChecks.running() {
+				integrationChecks.start(ctx, func(roundCtx context.Context) (app.IntegrationReport, error) {
+					return ctrl.DriveIntegrationCheck(roundCtx, handle, hopPath, spawnEnv)
+				}, d.checkOutcomePosted)
 			}
 		}
 
@@ -242,6 +278,10 @@ type featurePassResult struct {
 	// lines are the transition lines the pass observed, for the loop to
 	// print: the solo loop's launch line for a failed manager launch.
 	lines []string
+	// integrationCheckDue is true when the pass's integration step
+	// reported a combined-check execution due; the loop starts it as an
+	// asynchronous round.
+	integrationCheckDue bool
 }
 
 // roleManager is the manager session's role as SessionLaunchProgress
@@ -283,11 +323,17 @@ func attemptLaunchLines(report *app.AssignmentReport) []string {
 
 // runFeatureSchedulingPass runs one deterministic scheduling-pass round
 // (design section 6) up to, but not including, check-driving — which the
-// caller runs asynchronously through featureCheckDriver, mirroring the
-// solo loop's own separation of the synchronous pass from the async check
-// round. spawnEnv is the same sanitized environment the check driver
-// spawns hop check-exec with (computed once by the caller and cached
-// across ticks), reused here for the integration merge's own spawn.
+// caller runs asynchronously (asyncRound), mirroring the solo loop's own
+// separation of the synchronous pass from the async check round. The
+// integration step's combined-check execution is such a round too: the
+// pass reports it due (integrationCheckDue) for the caller to start, and
+// skips the integration step entirely while integrationBusy says one is
+// still running, since that round owns the step until it returns. A stop
+// that refuses one of the step's own dispatches ends the pass, leaving the
+// stop to the loop's next tick. spawnEnv is the same sanitized
+// environment the check rounds spawn hop check-exec with (computed once
+// by the caller and cached across ticks), reused here for the
+// integration merge's own spawn.
 // Every run-fixed AssignReadyTasks field — the frozen repository and
 // state roots included — comes from AssignmentDefaults: a known run
 // operates on its frozen repository, never on the directory hop was
@@ -304,7 +350,7 @@ func attemptLaunchLines(report *app.AssignmentReport) []string {
 // RetireSettledSessions' RunFailed or RunFailing, or DriveCompletion's
 // RunState other than running. AssignReadyTasks accepts only a running
 // run, so it must never be reached past either report.
-func runFeatureSchedulingPass(ctx context.Context, ctrl controllerAPI, handle app.RunHandle, runState, hopPath string, spawnEnv []string) (featurePassResult, error) { //nolint:gocritic // hugeParam: RunHandle is the app-defined opaque token, passed by value as every Controller method takes it.
+func runFeatureSchedulingPass(ctx context.Context, ctrl controllerAPI, handle app.RunHandle, runState, hopPath string, spawnEnv []string, integrationBusy bool) (featurePassResult, error) { //nolint:gocritic // hugeParam: RunHandle is the app-defined opaque token, passed by value as every Controller method takes it.
 	halted := featurePassResult{halted: true}
 	switch runState {
 	case runStateLaunching:
@@ -330,8 +376,15 @@ func runFeatureSchedulingPass(ctx context.Context, ctrl controllerAPI, handle ap
 	if _, err = ctrl.RecomputeReleases(ctx, handle); err != nil {
 		return featurePassResult{}, fmt.Errorf("recompute releases: %w", err)
 	}
-	if _, err = ctrl.DriveIntegration(ctx, handle, hopPath, spawnEnv); err != nil {
-		return featurePassResult{}, fmt.Errorf("drive integration: %w", err)
+	var integration app.IntegrationReport
+	if !integrationBusy {
+		integration, err = ctrl.DriveIntegration(ctx, handle, hopPath, spawnEnv)
+		if errors.Is(err, app.ErrStopRequested) {
+			return halted, nil
+		}
+		if err != nil {
+			return featurePassResult{}, fmt.Errorf("drive integration: %w", err)
+		}
 	}
 	if _, err = ctrl.EnsureReviewTask(ctx, handle); err != nil {
 		return featurePassResult{}, fmt.Errorf("ensure review task: %w", err)
@@ -360,7 +413,10 @@ func runFeatureSchedulingPass(ctx context.Context, ctrl controllerAPI, handle ap
 	if err != nil {
 		return featurePassResult{lines: attemptLaunchLines(&assignment)}, fmt.Errorf("corroborate session launches: %w", err)
 	}
-	result := featurePassResult{lines: append(attemptLaunchLines(&assignment), managerLaunchLines(launches)...)}
+	result := featurePassResult{
+		lines:               append(attemptLaunchLines(&assignment), managerLaunchLines(launches)...),
+		integrationCheckDue: integration.CheckDue,
+	}
 	if _, err = ctrl.PublishRunPresentation(ctx, handle); err != nil {
 		return result, fmt.Errorf("publish run presentation: %w", err)
 	}

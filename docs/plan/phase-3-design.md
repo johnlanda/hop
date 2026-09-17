@@ -506,8 +506,8 @@ New operation kinds and their decision-table rows (Phase 2 rows unchanged):
 | `integration.reset` (combined-check failure rollback, section 8; also the stop path's retirement of a published-but-unsettled candidate) | The act is two steps with the identity persisted BETWEEN them: (i) create the ROLLBACK COMMIT R (`git commit-tree <premerge>^{tree} -p <M>` — R carries the pre-merge content and keeps the rejected M reachable as its parent) and record R's object ID in `act_evidence` — a plain store write — BEFORE any ref move; (ii) `git update-ref … <R> <M>`. Recovery is decidable in every window: R recorded and ref == R → adopt; R recorded and ref == M → re-act step (ii) only (idempotent CAS); no R recorded and ref == M → re-act from step (i) (a prior orphaned commit-tree object is unreferenced and harmless); anything else → `reconciling` | same | same |
 | `worktree.create` (now per attempt) | Phase 2 row verbatim; provenance = repository common-directory equality plus the recorded base commit (now the integration head frozen into the intent). Feature mode resolves an unresolved one on every scheduling pass, on resume, and before stop's and the terminal failure's terminal reports — adopted with its attempt link and the workspace its creation label (the operation ID) names, or settled failed after the bounded wait, the attempt then settling as a terminal launch failure with the budgeted task consequence | same | same |
 | `pane.open` (manager, worker, reviewer) | Phase 2 row verbatim — one predicate, one close rule, all roles | same | same |
-| `pane.open` whose `exec_pending` claim outlived its placed pane (the launch ended before corroboration) | Phase 2's claim-state logic keeps an `exec_pending` claim ambiguous until it is corroborated or retired; the retirement can also be OBSERVED. The claim settles `exec_failed` — with the fixed reason "launch ended before corroboration: pane absent by id and label; claimed process gone", and the pane id and claimed pid as evidence — only when all of these hold: the claim's own binding is current and not superseded; its pane is positively absent under the one absence rule (`pane_not_found` by id AND a successful creation-label lookup that finds nothing); the claimed process is gone (a successful listing of the claimed pid's own process group shows no member with that pid — the launcher is a session leader, so a living claimed process is always listed there); and server continuity since the placement holds on both sides of those observations (the binding's recorded `ServerInstance` equals a fresh, non-empty read taken immediately before and again after them — server lifetimes are contiguous and a socket path is served by one server at a time, so the observations between were served by that lifetime). The continuity conjunct is what makes the pair conclusive: under one lifetime a pane has a runtime from its creation and keeps its process for its whole life, while after a restart Herdr answers `pane_not_found` for a restored pane whose deferred native restore has not fired, and restores a pane a human renamed under its NEW name, so absence by id and label proves nothing there (`TestSpikeRenamedLabelSurvivesRestart`). From then on the `exec_failed` row decides: a child's attempt fails with the section 5 budgeted task consequence and the manager notice, and the manager lineage's failure cause fails the run. Anything short of the whole set stays ambiguous and settles nothing: any other inspection or lookup error, a pane still answering by label, a failed listing, a pid still listed (a zombie or a recycled pid fails closed), no inspector, an uninspectable pid, and a changed, unknown or older-format server identity — the last reported with the value-free human action: rename a renamed pane back to its launch label, otherwise stop the run once no pane of it remains (stop's own absence observation, which does not read continuity, then finishes it; follow-up STOP-1 records that stop, retirement and feature stop can read a renamed-and-restored pane as absent after a restart). The shapes and the process relation are pinned by `TestSpikeVanishedPaneShapes` (`test/integration/spike_panevanish_test.go`) | same — the scheduling pass's launch corroboration applies it on every round | same — resume's session reconciliation applies it; stop and the terminal-failure shutdown retire an `exec_pending` session only on the same pair, and a vanished pane whose claimed process still runs stays outstanding with the human action named |
-| `pane.open` whose `exec_pending` claim outlived a pane whose placement was never recorded (the launch ended before its `pane.open` outcome) — the label-only variant of the row above | With no committed binding there is no pane id to inspect, so absence rests on the creation label: the claim settles `exec_failed` — with the DISTINCT fixed reason "launch ended before its placement was recorded: no pane answers for the creation label; claimed process gone", and the claimed pid as evidence — only when all of these hold: the session has no committed binding; exactly one unresolved, decodable, labeled `pane.open` intent names the session, and no unresolved launch row with unusable identity might; the claim is that intent's own incarnation and `exec_pending`; a successful creation-label lookup finds nothing; the claimed process is gone (the same group listing as above); and server continuity since the launch holds on both sides of those observations (the intent's recorded `ServerInstance`, observed immediately before the pane was created, equals fresh, non-empty reads immediately before and after them — continuity from that point covers the pane's creation and its launcher's claim). The same transaction, which re-reads all of it, resolves that `pane.open` `failed` with a typed outcome saying it was DISPATCHED (its pane's own process wrote the claim) and the pane is gone — never "refused before dispatch" — so nothing stays unresolved; the session's claim keeps resolving through that resolved intent, so the `exec_failed` row decides everywhere afterwards, exactly as above. The label conjunct is sound only within one server lifetime. A claim exists only after the pane's own process ran `hop launch`, so the pane existed at claim time, and Herdr attaches a pane's creation label in the very request that creates it and drops it with the pane (`TestSpikeVanishedPaneShapes`: the first lookup after the create, back-to-back lookups while the pane lives, nothing after exit or close). The one relabelling, a human's `pane.rename`, rewrites that same label: within the lifetime the renamed pane keeps its process, which the process conjunct still observes, but Herdr persists the new name and restores the pane under it after a restart, with a fresh shell or a deferred native restore in place of the claimed process (`TestSpikeRenamedLabelSurvivesRestart`; an unrenamed pane keeps its creation label across a restart, `TestSpikeLabelSurvivesRestart`). So after a restart "no pane answers for the creation label and the claimed process is gone" does not prove the pane gone, and only the continuity conjunct excludes that. Anything short of the whole set stays ambiguous and settles nothing: a failed lookup, a pane answering for the label (it is adopted by label instead), more than one unresolved launch, an unusable row, a live, still-listed or unobservable claimed process, and a changed, unknown or older-format server identity — the last reported with the value-free human action "if a pane of this run was renamed, rename it back to <label>", after which a later round adopts it by its label (every label a detail shows renders through the one escaping boundary, `app.RenderExternal`). RESIDUAL (matches the behavior before this row existed): an unplaced launch whose pane is really gone after a restart has no automatic or attested exit yet — resume stays `resuming` and stop stays `stopping` naming that action; `hop resume --confirm-absent` does not reach an unplaced launch, and extending it would amend Phase 2 section 5 item 5 (follow-up ATTEST-1) | same — the scheduling pass's launch corroboration applies it after its label recovery finds nothing | same — resume adopts an unresolved `pane.open` by its label first and applies it otherwise; stop and every retirement boundary apply it before reporting the launch outstanding. Solo is unchanged: its unbound-launch rule (`retireUnboundLaunch`) keeps failing closed on a claim whose pane answers nothing |
+| `pane.open` whose `exec_pending` claim outlived its placed pane (the launch ended before corroboration) | Phase 2's claim-state logic keeps an `exec_pending` claim ambiguous until it is corroborated or retired; the retirement can also be OBSERVED. The claim settles `exec_failed` — with the fixed reason "launch ended before corroboration: pane absent by id and label; claimed process gone", and the pane id and claimed pid as evidence — only when all of these hold: the claim's own binding is current and not superseded; its pane is positively absent under the one absence rule (`pane_not_found` by id AND a successful creation-label lookup that finds nothing); the claimed process is gone (a successful listing of the claimed pid's own process group shows no member with that pid — the launcher is a session leader, so a living claimed process is always listed there); and server continuity since the placement holds on both sides of those observations (the binding's recorded `ServerInstance` equals a fresh, non-empty read taken immediately before and again after them — server lifetimes are contiguous and a socket path is served by one server at a time, so the observations between were served by that lifetime). The continuity conjunct is what makes the pair conclusive: under one lifetime a pane has a runtime from its creation and keeps its process for its whole life, while after a restart Herdr answers `pane_not_found` for a restored pane whose deferred native restore has not fired, and restores a pane a human renamed under its NEW name, so absence by id and label proves nothing there (`TestSpikeRenamedLabelSurvivesRestart`). From then on the `exec_failed` row decides: a child's attempt fails with the section 5 budgeted task consequence and the manager notice, and the manager lineage's failure cause fails the run. Anything short of the whole set stays ambiguous and settles nothing: any other inspection or lookup error, a pane still answering by label, a failed listing, a pid still listed (a zombie or a recycled pid fails closed), no inspector, an uninspectable pid, and a changed, unknown or older-format server identity — each reported with a value-free human action, and WHICH action depends on how continuity failed: a recorded identity that no longer matches is the restart case, whose action is to rename a renamed pane back to its launch label, while an identity that was NEVER recorded has no restart to undo and gets its own action instead (section 6's second residual, which also notes that off darwin every placement has that shape). Stop, feature stop and the per-attempt retirement decide a placed session's absence under the same continuity conjunct (section 6), so after a restart none of them concludes it either. The shapes and the process relation are pinned by `TestSpikeVanishedPaneShapes` (`test/integration/spike_panevanish_test.go`) | same — the scheduling pass's launch corroboration applies it on every round | same — resume's session reconciliation applies it; stop and the terminal-failure shutdown retire an `exec_pending` session only on the same pair, and a vanished pane whose claimed process still runs stays outstanding with the human action named |
+| `pane.open` whose `exec_pending` claim outlived a pane whose placement was never recorded (the launch ended before its `pane.open` outcome) — the label-only variant of the row above | With no committed binding there is no pane id to inspect, so absence rests on the creation label: the claim settles `exec_failed` — with the DISTINCT fixed reason "launch ended before its placement was recorded: no pane answers for the creation label; claimed process gone", and the claimed pid as evidence — only when all of these hold: the session has no committed binding; exactly one unresolved, decodable, labeled `pane.open` intent names the session, and no unresolved launch row with unusable identity might; the claim is that intent's own incarnation and `exec_pending`; a successful creation-label lookup finds nothing; the claimed process is gone (the same group listing as above); and server continuity since the launch holds on both sides of those observations (the intent's recorded `ServerInstance`, observed immediately before the pane was created, equals fresh, non-empty reads immediately before and after them — continuity from that point covers the pane's creation and its launcher's claim). The same transaction, which re-reads all of it, resolves that `pane.open` `failed` with a typed outcome saying it was DISPATCHED (its pane's own process wrote the claim) and the pane is gone — never "refused before dispatch" — so nothing stays unresolved; the session's claim keeps resolving through that resolved intent, so the `exec_failed` row decides everywhere afterwards, exactly as above. The label conjunct is sound only within one server lifetime. A claim exists only after the pane's own process ran `hop launch`, so the pane existed at claim time, and Herdr attaches a pane's creation label in the very request that creates it and drops it with the pane (`TestSpikeVanishedPaneShapes`: the first lookup after the create, back-to-back lookups while the pane lives, nothing after exit or close). The one relabelling, a human's `pane.rename`, rewrites that same label: within the lifetime the renamed pane keeps its process, which the process conjunct still observes, but Herdr persists the new name and restores the pane under it after a restart, with a fresh shell or a deferred native restore in place of the claimed process (`TestSpikeRenamedLabelSurvivesRestart`; an unrenamed pane keeps its creation label across a restart, `TestSpikeLabelSurvivesRestart`). So after a restart "no pane answers for the creation label and the claimed process is gone" does not prove the pane gone, and only the continuity conjunct excludes that. Anything short of the whole set stays ambiguous and settles nothing: a failed lookup, a pane answering for the label (it is adopted by label instead), more than one unresolved launch, an unusable row, a live, still-listed or unobservable claimed process, and a changed, unknown or older-format server identity — each reported with a value-free human action: a recorded identity that no longer matches gets "if a pane of this run was renamed, rename it back to <label>", after which a later round adopts it by its label, while an identity that was never recorded gets its own action instead, since there is no rename to undo (section 6's second residual) (every label a detail shows renders through the one escaping boundary, `app.RenderExternal`). RESIDUAL (matches the behavior before this row existed): an unplaced launch whose pane is really gone after a restart has no automatic or attested exit yet — resume stays `resuming` and stop stays `stopping` naming that action; `hop resume --confirm-absent` does not reach an unplaced launch, and extending it would amend Phase 2 section 5 item 5 (follow-up ATTEST-1) | same — the scheduling pass's launch corroboration applies it after its label recovery finds nothing | same — resume adopts an unresolved `pane.open` by its label first and applies it otherwise; stop and every retirement boundary apply it before reporting the launch outstanding. Solo is unchanged: its unbound-launch rule (`retireUnboundLaunch`) keeps failing closed on a claim whose pane answers nothing |
 | `session.close` (completion retirement, section 8) | Phase 2 `pane.close` row verbatim | same | same |
 
 There is no standing integration checkout: each integration operation
@@ -640,10 +640,15 @@ session, before its disposition is decided:
   label-only launch-ended row (section 4).
 - A child's placed launch left unsettled is IN FLIGHT, and does not hold
   the run in `reconciling`, when every one of these is a positive
-  observation: the session is an implementer or reviewer and is
-  `launching` (the loop corroborates nothing else, so a session already
-  failed closed to `reconciling` — a forking wrapper — stays that way);
-  its binding is committed, current and not superseded; its claim is
+  observation: the session is an implementer or reviewer and is in one of
+  the two states the loop's corroboration re-inspects — `launching`, or
+  the live launch corroboration's OWN reconciliation (section 6: a current
+  unsuperseded placed binding whose incarnation's claim is still
+  `exec_pending`). Every OTHER `reconciling` session stays that way,
+  because nothing revisits it: a resume path marks a session `reconciling`
+  only after reading its claim as SETTLED, which is what makes that shape
+  identify the live reconciliation alone.
+  Its binding is committed, current and not superseded; its claim is
   absent or that placement's own `exec_pending` claim; the `pane.open`
   that recorded the placement is not `failed`; the recorded pane answers
   by id, and THAT inspection was answered by the server lifetime the
@@ -673,6 +678,15 @@ session, before its disposition is decided:
   answering), another process in the pane, any occupant but this
   session's launcher before a claim, an empty foreground or a failed
   placement keep the run `resuming` with the reason named.
+- The manager's own launch is the bootstrap continuation's, and it reads
+  the same two states for the same reason: a `launching` manager, and a
+  manager in the live launch corroboration's own reconciliation, both
+  return the run to `launching` for the loop — the reconciliation only
+  under the same positive observations the child's in-flight rule
+  requires (the inspection's own `ServerInstance` stamp equal to the
+  binding's, and the pane's own process being the claimed one). The
+  launcher-identity conjunct cannot apply there: that state always has
+  the placement's own claim.
 - The existing guards stand: the run never goes to `running` while the
   manager's own launch is unsettled (the bootstrap continuation returns it
   to `launching`, and only the manager's settlement moves it on — never a
@@ -929,6 +943,67 @@ task for the current head) → assign released tasks into free slots (task
 `seq` order) → corroborate launches → drive checks. Every dispatch
 revalidates (heartbeat CAS + stop re-read) exactly as Phase 2 requires.
 
+The long executions run off the pass, as asynchronous rounds under a
+context the loop cancels. The per-task check is one such round. The
+integration step's combined-check execution is the other (section 8).
+- **Starting a round.** The integration step reports the combined check
+  due instead of running it. The loop starts that round after a pass
+  that did not halt.
+- **While a round runs.** The integration step has one owner at a time:
+  the pass leaves the step alone until the loop has consumed the round.
+  Meanwhile every other step keeps its cadence, including heartbeats and
+  the stop check.
+- **Stop.** The stop branch interrupts both rounds and waits for them
+  before stop handling. The runner kills a canceled check's process
+  group, and stop retires what is left by its claim.
+- **A stop refusal mid-pass.** When a held stop refuses one of the
+  integration step's own dispatches, that pass ends. The next tick
+  drives the stop.
+
+### Launch corroboration, revisited
+
+The corroboration step reuses the Phase 2 predicate verbatim, wrapper
+precedence included: any foreground member matching the claim's
+executable identity and marker under a DIFFERENT pid fails the launch
+closed, even when the claim's own pid also matches. That precedence is
+kept, because the observables cannot tell the two topologies apart. S12
+holds a legitimate same-image child in its fork-before-exec window and
+finds it reporting the parent's `argv`, `argv0`, `name` and `cmdline`
+verbatim under a pid of its own, in the same foreground group, with the
+claimed process itself satisfying every conjunct — the exact shape a live
+forking wrapper presents. A settled-first reading would therefore adopt
+the refused topology whenever a wrapper is what is actually there.
+
+What DOES follow from S12 is that such an observation is a fact about one
+SAMPLE, not about the launch: releasing the held child execs it, in the
+same pid, into something carrying neither the identity nor a marker, and
+the very next observation of the same pane settles. So the step's
+fail-closed outcome is a REVISITABLE reconciliation, not a terminal one.
+The step inspects every `launching` session and, in addition, that
+reconciliation — identified structurally, with no reason or marker of its
+own: state `reconciling`, a current unsuperseded placed binding, and that
+binding's own incarnation's claim still `exec_pending`. The shape is
+exclusive because every RESUME path marks a session `reconciling` only
+after reading its claim as settled (section 5). The branches are the
+unchanged ones: a clean observation settles the claim and activates the
+session; another matching process still there writes nothing at all; a
+pane gone takes the launch-ended row (section 4), whose `exec_failed`
+settlement then takes the ordinary exec-failure row. The transition the
+live path records is its own value-free reason, never resume's, and
+`hop status` renders a value-free action under that session's line: the
+controller re-inspects it every pass and needs nothing, and a human looks
+at the pane only if the state persists.
+
+RESIDUAL: one clean observation settles the launch, exactly as a first
+corroboration does. A wrapper that forks the harness and then exits — so
+that a later sample shows only the harness under the claim's pid — is
+settled rather than refused. This is the same trade every first
+corroboration makes (a single sample is the evidence), and the narrower
+alternative, requiring the clean observation to persist across N samples,
+buys nothing against it: the wrapper is gone by then either way. What
+wrapper precedence still protects, unchanged, is the case that matters —
+a wrapper ALIVE alongside the harness is never adopted.
+
 ### Per-attempt session retirement
 
 An interactive harness does not exit when its model turn ends: the landed
@@ -964,6 +1039,56 @@ label-only variant settles the claim `exec_failed`, and the same
 consequences follow. The fixture principals deliberately stay
 alive at a composer-like idle loop after submitting, so the suite proves
 retirement actually terminates them rather than relying on process exit.
+
+A placed session's absence is concluded only under server continuity.
+This applies to stop, feature stop, the per-attempt retirement (its
+close, and a claimless session's observation) and the live controller's
+self-exit observation. The pane must be positively absent by id and by
+creation label, and the server lifetime the placement recorded must serve
+the socket both before and after those observations. A positive-evidence
+retirement uses the lifetime that identified the restored occupant
+instead, and the pane.close intent freezes whichever lifetime applies.
+
+Continuity is required because of what a restart does:
+- a pane renamed before a restart is restored under its new name;
+- a pane whose deferred native restore has not fired answers no
+  inspection.
+
+Either can resume a harness later, so an absence observed across a
+restart is ambiguous. Such a session stays outstanding with the
+value-free action "if a pane of this run was renamed, rename it back to
+<label>". A later round then finds a renamed-back pane by its label.
+
+RESIDUAL: a stop or retirement of a session placed before a restart has
+no exit HOP can take on its own. The session stays outstanding and the run
+stays `stopping`, or the slot stays occupied. Once a restart has
+happened, continuity against the placement's lifetime can never hold
+again, and after a restart the close rule cannot match a restored
+occupant to the recorded process. The candidate human exits (an
+attestation accepted as stop evidence, or a positively identified close
+decided within the observing lifetime) are pending decisions.
+
+RESIDUAL, the second one, and wider: continuity compares the lifetime a
+placement RECORDED against the one observed, so a placement that recorded
+NO lifetime can never establish it — for any observation, at any later
+time. Such a session is never concluded absent by stop, feature stop, the
+per-attempt retirement or the live self-exit observation: the run stays
+`stopping`, or the slot stays occupied, exactly as above but with no
+restart involved. Two things reach this state. A lifetime read that fails
+while the pane create that follows it succeeds records `""` — narrow, but
+permanent once it happens. And `Runtime.ServerInstance` is implemented on
+darwin alone, yielding `""` everywhere else, so on every other platform
+this is not an edge case but the shape of EVERY placement.
+
+It is stated here rather than closed because the obvious fix is worse
+than the defect: refusing a placement that recorded no lifetime would
+mean HOP cannot launch anything at all off darwin. What this slice does
+instead is tell the two failures apart in what the human is told — the
+restart case keeps the rename-back action, and an unrecorded lifetime
+gets its own, since nothing was renamed and renaming nothing back
+resolves nothing. The exit itself is the same pending human decision the
+residual above names; it is deliberately NOT covered by that residual's
+wording, which is scoped to a session placed before a restart.
 
 ### Bounded concurrency
 
@@ -1801,6 +1926,39 @@ rollback commit, section 4) and `needs-rework`; passing per-task checks
 on separate branches never substitute — this is the exit criterion's
 revalidation, mechanically.
 
+The combined-check execution is the step's one long act. It runs as its
+own round, which the controller loop can cancel (section 6). The rest of
+the step is recovery, the claim, the merge, the publish, the reset and
+the adoption of a settled receipt; it reports a checking candidate with
+no receipt as due and never executes the check itself. The two calls
+exclude each other within the controller process: whichever call arrives
+second does nothing.
+
+A round acts only when all of these hold:
+- the integration is still checking;
+- no integration-step operation is unresolved;
+- its intent transaction finds no stop request and no terminal-failure
+  cause. Unstarted work is never started into a stopping or failing run.
+  The published candidate belongs to that shutdown's reset.
+
+A canceled round's journal:
+- **Cancelled before its spawn.** No process can have claimed the
+  execution. The round settles it failed as never spawned, under a
+  context that outlives the cancellation. A later round runs a fresh
+  execution, or the stop resets the candidate.
+- **Cancelled after its spawn.** The execution is journaled reconciling.
+  Stop retires it by its claim.
+
+The outcome, its evidence and the integration's consequence (integrated,
+or `check-failed`) commit in one transaction. That transaction still
+reads stop first. It writes nothing unless the execution is still
+unresolved. A terminal-failure shutdown can run while the round runs, and
+it settles a running execution by its claim before it resets the
+candidate. A round that finds its execution already settled therefore
+backs off. It never marks integrated a candidate whose ref that shutdown
+is resetting. The per-task check follows the same never-spawned rule: its
+request returns to requested for a fresh execution.
+
 ### Review as a task
 
 When every implement task is `integrated` and no review task for the
@@ -1892,6 +2050,16 @@ the manager conversation (warm reattach) or cold-relaunches it
 (`claude --resume <manager-native-ref>`) without ever minting a second
 manager lineage. A second concurrent `hop resume` loses the lease CAS and
 exits reporting the holder — the exit-criterion scenario.
+
+Lease loss and a caller's own cancellation are different facts. A failed
+heartbeat cancels the controller's dispatch scope, and with it every
+in-flight external act, because the lease may have moved. A heartbeat
+that failed only because its caller's context had already ended says
+nothing about the lease, so it leaves the scope live. An asynchronous
+round that stop or shutdown interrupts at its pre-dispatch revalidation
+therefore never ends the dispatch of the acts after it, the stop's own
+acts included. The periodic heartbeat, under the loop's own context,
+still detects a real loss.
 
 Detach (SIGINT/SIGTERM) remains distinct from stop and leaves the manager
 and workers running; `hop stop` remains the only stop, and now drives
@@ -2016,6 +2184,8 @@ contracts; the exit scenarios are real-process.
 | G2 merge outcome matrix (local git, no herdr) | Under the frozen argv `git -c user.name=... -c user.email=... -c commit.gpgsign=false -c merge.verifysignatures=false merge --no-ff --no-edit <source>` (env: `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM=/dev/null`, `GIT_TERMINAL_PROMPT=0`), in a DETACHED scratch checkout throughout (the ref stays untouched in every case): two-parent merge (parents == {base, source}); conflict (non-zero exit, `UU` index entries, clean `merge --abort`); already-up-to-date no-op (nothing created, HEAD unchanged); `--no-ff` forces a genuine merge commit on an otherwise fast-forwardable head; `git commit-tree` with pinned tree/parent/identity/dates/message is byte-stable across two invocations (the G3 rollback's precondition). A repository with `commit.gpgsign=true` set LOCALLY does not block the merge — the frozen argv's own `-c commit.gpgsign=false` wins over every config file, local included (testing GLOBAL config is moot: the frozen env already redirects it to `/dev/null`). A non-conflict failure (an unwritable shared object database) is distinguished from a conflict by OUTPUT TEXT and INDEX STATE, never by abortability — `merge --abort` still succeeds after this failure too. HOOKS FIRE under a hooksPath-less argv (no `--no-verify`); suppression options verified: `--no-verify` skips only `pre-merge-commit`; `-c core.hooksPath=<dir>` (an empty existing directory, or one that does not exist at all — both behave identically) suppresses BOTH `pre-merge-commit` and `post-merge`. Adopted (human decision, 2026-09-15): the frozen argv carries `-c core.hooksPath=<empty existing dir under the operation's artifact dir>` (section 8); honoring local hooks again would be a configuration decision, deferred | The `integration.merge` adoption predicate including the no-op row, the noninteractive argv/env with configuration suppression, and the failure classification |
 | G3 fenced publish/reset (local git, no herdr) | `update-ref <ref> <new> <old>` succeeds and moves the ref only when `<old>` matches its actual current value; a stale `<old>` is refused, ref left exactly where it was. `""` as `<old>` is create-only (see G1). The rollback construction — `git commit-tree <pre-merge-tree> -p <rejected-merge> -m <message>`, CAS-published in turn — keeps the rejected merge REACHABLE (`git merge-base --is-ancestor <rejected> <ref>` holds; `git log <ref>` lists it) rather than orphaning it via a destructive reset+force | The `integration.publish`/`integration.reset` CAS rows and the never-revisit rule's mechanics |
 | S11 request-log observability (herdr) | Location: `<the server's own socket directory>/herdr-server.log`. Format: plain text (`tracing_subscriber`'s default formatter, no JSON/ANSI), one line per event, e.g. `... DEBUG herdr::logging: api request received event="api.request.start" ... request_id="hop-1" method="ping" changes_ui=false`. LEVEL splits exactly by method: `pane.send_text`/`pane.send_keys`/`pane.send_input` log their start/complete pair at DEBUG ONLY when they succeed (invisible at the default `herdr=info` filter) — a FAILED or erroring call among these still completes via the SAME `event="api.request.complete"` record, never a distinct fail event, but at INFO, since the server forces INFO whenever `outcome != "ok"`; `agent.prompt`/`agent.send_keys`/`agent.start` log both their start AND completion records at INFO regardless of outcome — confirmed for all six methods on a SEPARATE client connection, none needing to succeed or need a live/matching agent to reach the log. `event="api.request.fail"` (WARN) is a SEPARATE event reserved for a failure WRITING the response back to the client socket itself (e.g. a disconnect mid-write) — it never fires for an ordinary business-logic refusal, and no Phase 3 scenario relies on it. Every line carries `method` and `request_id` but NEVER the pane/agent target or any request parameter (confirmed: neither a sent marker string nor a target pane id ever appears) — the injection-free claim is therefore honestly method-level, never per-pane. `request_id` is a CLIENT-chosen label the server only echoes, NOT a server-assigned global sequence: two independent client connections to the same server both start counting from `"hop-1"`, and that exact value was observed logged against two unrelated methods in one capture — correlation must locate a call's own line by something unique to it (method name, confirmed) and read the id back from there. A capture window is bracketed by two otherwise-unused methods' own log lines (`pane.list`/`tab.list` in the probe) — never by a chosen label, which the log never carries at all | The `InjectionFreeDelivery` scenario's evidence channel: what a forbidden request WOULD look like in the log, so a zero count over the whole capture is meaningful |
+
+| S12 fork window, same-image child (herdr) | A command pane runs `/bin/bash` exec'd under the launch claim's own recorded executable name (`exec -a`, argv[0] control) carrying the launch marker in its prompt argument, and forks ONE same-image child held unexec'd in the `open()` of a test-owned gate FIFO. While it is held, `pane.process_info` reports that child under a PID OF ITS OWN with the parent's `argv` (all five elements), `argv0` ("claude", the basename of the spoofed argv[0]), `name` ("bash", the real image's `comm`, inherited across fork), `cmdline` and `cwd` all identical to the parent's; the pane's `shell_pid` equals its `foreground_group`, and the platform process table lists EXACTLY the two members in that group. `ClaimProcessMatches` confirms the claimed process itself satisfies executable identity, marker and pid, and `CorroborateSettlement` still classifies `forking-wrapper` — naming the held child as the occupant — on every one of 20 back-to-back samples. Opening the gate execs that child IN THE SAME PID into a marker-free stand-in (`argv0` "mcp-stand-in", `name` "sleep"), and the next observation of the same pane, under the same server lifetime, classifies `settled` against the claim's own pid | That a `forking-wrapper` classification of a LIVE launch is not evidence about the launch: the observables cannot separate a fork window from a wrapper, so wrapper-first stays (section 6), and the reconciliation it produces must be revisitable rather than terminal |
 
 Deliberately not probed for BUSINESS BEHAVIOR, since no Phase 3 decision
 rule consumes them (section 7) and probing their actual EFFECT would imply

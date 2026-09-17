@@ -87,13 +87,62 @@ func (c *Controller) serverContinuityHolds(ctx context.Context, recorded string)
 }
 
 // placedContinuityDetail is the value-free outstanding detail, with the
-// human action, for a placed launch observed absent without established
+// human action, for a placed pane observed absent without established
 // server continuity. After a restart a renamed pane keeps its new name and
 // a pane awaiting a deferred native restore answers no inspection, so
-// absence by id and label proves nothing; stop's own absence observation
-// is the finite exit once no pane of the run remains.
+// absence by id and label proves nothing. Renaming a renamed pane back
+// lets a later round find it by its label; a pane really gone after a
+// restart has no exit HOP can take on its own.
 func placedContinuityDetail(label string) string {
-	return fmt.Sprintf("the pane is absent by id and by launch label %s, but server continuity since the placement is not established (the Herdr server may have restarted, and a pane renamed before a restart, or one awaiting a deferred restore, stays hidden from both), so nothing is settled; if a pane of this run was renamed, rename it back to %s, otherwise hop stop the run once no pane of it remains", RenderExternal(label), RenderExternal(label))
+	return fmt.Sprintf("the pane is absent by id and by launch label %s, but server continuity since the placement is not established (the Herdr server may have restarted, and a pane renamed before a restart, or one awaiting a deferred restore, stays hidden from both), so no absence is concluded; if a pane of this run was renamed, rename it back to %s", RenderExternal(label), RenderExternal(label))
+}
+
+// placedUnrecordedLifetimeDetail is the value-free outstanding detail, with
+// the human action, for the OTHER way continuity fails: the placement
+// recorded no server identity at all, so continuity with it can never be
+// established for any observation, now or later. Nothing was renamed and
+// no restart is implied, so the rename-back action would send the operator
+// after a pane that was never renamed; this case has its own action
+// instead. A platform with no server-lifetime identity records nothing for
+// every placement, so this is that platform's ordinary shape, not a rare
+// failure.
+func placedUnrecordedLifetimeDetail(label string) string {
+	return fmt.Sprintf("the pane is absent by id and by launch label %s, but this session's placement recorded no server identity, so continuity with it can never be established and no absence is ever concluded here; nothing was renamed, so renaming a pane back cannot resolve it — confirm no agent of this session is still running before reusing this run's workspace", RenderExternal(label))
+}
+
+// placedAbsenceDetail picks the outstanding detail for a placed pane
+// observed absent without established continuity: the rename-back action
+// when a lifetime was recorded and no longer matches, and the
+// unrecorded-lifetime action when the placement recorded none.
+func placedAbsenceDetail(recorded, label string) string {
+	if recorded == "" {
+		return placedUnrecordedLifetimeDetail(label)
+	}
+	return placedContinuityDetail(label)
+}
+
+// observePlacedPaneAbsence applies the one absence rule to a placed pane
+// with server continuity bracketed around it: absent only when the pane is
+// positively absent by id and by creation label (observePaneAbsence) AND
+// the server lifetime recorded (the placement's, or the lifetime that
+// answered a positive identification) serves the socket on both sides of
+// that observation. An absence observed without continuity is ambiguous,
+// with placedAbsenceDetail's action for whichever way continuity failed: a
+// renamed pane restored after a restart, or one whose deferred native
+// restore has not fired, answers neither lookup and may still resume a
+// harness later; a placement that recorded no lifetime at all can never
+// establish continuity and gets its own action. Stop, the pane.close
+// procedure and the per-attempt retirement decide absence through it.
+func (c *Controller) observePlacedPaneAbsence(ctx context.Context, recorded, paneID, label string) (pane PaneProcess, absent bool, ambiguous string) {
+	continuousBefore := c.serverContinuityHolds(ctx, recorded)
+	pane, absent, ambiguous = c.observePaneAbsence(ctx, paneID, label)
+	if ambiguous != "" || !absent {
+		return pane, absent, ambiguous
+	}
+	if !continuousBefore || !c.serverContinuityHolds(ctx, recorded) {
+		return PaneProcess{}, false, placedAbsenceDetail(recorded, label)
+	}
+	return pane, true, ""
 }
 
 // observeLaunchEnded applies the corroborated-absence predicate to an
@@ -130,12 +179,12 @@ func (c *Controller) observeLaunchEnded(ctx context.Context, binding *run.Runtim
 	case !absent:
 		return false, ""
 	case !continuous:
-		return false, placedContinuityDetail(binding.CreationLabel)
+		return false, placedAbsenceDetail(binding.ServerInstance, binding.CreationLabel)
 	}
 	gone, ambiguous := c.observeClaimedProcessGone(ctx, claim.PID)
 	switch {
 	case !c.serverContinuityHolds(ctx, binding.ServerInstance):
-		return false, placedContinuityDetail(binding.CreationLabel)
+		return false, placedAbsenceDetail(binding.ServerInstance, binding.CreationLabel)
 	case ambiguous != "":
 		return false, "the pane is absent, but " + ambiguous
 	case !gone:
@@ -266,6 +315,23 @@ func unplacedContinuityDetail(label string) string {
 	return fmt.Sprintf("no pane answers for launch label %s, but server continuity since the launch is not established (the Herdr server may have restarted, and a pane renamed before a restart keeps its new name), so the launch may still run; if a pane of this run was renamed, rename it back to %s and a later round adopts it by its label", RenderExternal(label), RenderExternal(label))
 }
 
+// unplacedUnrecordedLifetimeDetail is placedUnrecordedLifetimeDetail's
+// label-only sibling: the launch recorded no server identity, so
+// continuity with it can never be established and the launch is never
+// concluded ended. The rename-back action does not apply for the same
+// reason — nothing was renamed.
+func unplacedUnrecordedLifetimeDetail(label string) string {
+	return fmt.Sprintf("no pane answers for launch label %s, but this launch recorded no server identity, so continuity with it can never be established and the launch is never concluded ended; nothing was renamed, so renaming a pane back cannot resolve it — confirm no agent of this session is still running before reusing this run's workspace", RenderExternal(label))
+}
+
+// unplacedAbsenceDetail is placedAbsenceDetail's label-only sibling.
+func unplacedAbsenceDetail(recorded, label string) string {
+	if recorded == "" {
+		return unplacedUnrecordedLifetimeDetail(label)
+	}
+	return unplacedContinuityDetail(label)
+}
+
 // observeUnplacedLaunchEnded applies the label-only variant of the
 // corroborated-absence predicate to one session's unplaced launch facts:
 // no committed binding, exactly one unresolved, decodable, labeled
@@ -316,12 +382,12 @@ func (c *Controller) observeUnplacedLaunchEnded(ctx context.Context, facts *unpl
 	case found:
 		return false, ""
 	case !continuous:
-		return false, unplacedContinuityDetail(label)
+		return false, unplacedAbsenceDetail(facts.intent.ServerInstance, label)
 	}
 	gone, ambiguous := c.observeClaimedProcessGone(ctx, facts.claim.PID)
 	switch {
 	case !c.serverContinuityHolds(ctx, facts.intent.ServerInstance):
-		return false, unplacedContinuityDetail(label)
+		return false, unplacedAbsenceDetail(facts.intent.ServerInstance, label)
 	case ambiguous != "":
 		return false, fmt.Sprintf("no pane answers for launch label %s, but %s", RenderExternal(label), ambiguous)
 	case !gone:
