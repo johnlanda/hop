@@ -1,0 +1,321 @@
+package integration
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/johnlanda/hop/internal/adapters/herdr"
+)
+
+// hostilePayload is seeded into every artifact-delivery channel this
+// scenario proves byte-exact (the brief, a task's instructions, and a
+// manager answer): ANSI escapes, a bracketed-paste open/close pair, the
+// classic "y" + newline confirm-dialog payload, and control characters
+// -- design section 11 scenario 7's exact hostile-content list. It
+// carries no NUL byte: the brief travels as a single argv element to the
+// real hop binary (execve, no shell), and a NUL cannot appear in one, so
+// the SAME payload is reused unchanged for the other two channels
+// (file content, where a NUL would in fact be safe) for one shared,
+// simpler proof.
+const hostilePayload = "\x1b[31mANSI-ESCAPE\x1b[0m" +
+	"\x1b[200~BRACKETED-PASTE-BLOCK\x1b[201~" +
+	"y\n" +
+	"\x07\x08\x1bCONTROL-CHARS"
+
+// terminalInputMethods is Herdr 0.9.0's complete real terminal-input
+// surface (design section 7/11, S11-confirmed against
+// repos/herdr/src/api/schema.rs): the only methods that could ever type
+// into a live pane.
+func terminalInputMethods() []string {
+	return []string{
+		"pane.send_text", "pane.send_keys", "pane.send_input",
+		"agent.prompt", "agent.send_keys", "agent.start",
+	}
+}
+
+// extractBriefSection extracts the exact text internal/app/templates.go's
+// renderManagerAssignment interpolates for the brief -- between its fixed
+// "## Brief\n\n" and "\n\n## Instructions" markers -- failing the test
+// loudly if either marker is absent. Retyped from that renderer's own
+// literal template text (never derived), so a drift in the template fails
+// here rather than silently degrading this scenario's assertion to a
+// loose substring check.
+func extractBriefSection(t *testing.T, assignmentContent string) string {
+	t.Helper()
+	const startMarker = "## Brief\n\n"
+	const endMarker = "\n\n## Instructions"
+	i := strings.Index(assignmentContent, startMarker)
+	if i < 0 {
+		t.Fatalf("manager assignment does not contain the %q section marker; content:\n%s", startMarker, assignmentContent)
+	}
+	rest := assignmentContent[i+len(startMarker):]
+	j := strings.Index(rest, endMarker)
+	if j < 0 {
+		t.Fatalf("manager assignment does not contain the %q section marker after Brief; content:\n%s", endMarker, assignmentContent)
+	}
+	return rest[:j]
+}
+
+// sha256HexOf returns the lowercase-hex SHA-256 digest of content,
+// mirroring internal/app/usecase_run.go's sha256Hex exactly (retyped,
+// never imported) -- cryptographic corroboration of byte-exactness on
+// top of a direct content comparison, cross-checked against the
+// messages.body_digest column the production write path itself computed.
+func sha256HexOf(content string) string {
+	sum := sha256.Sum256([]byte(content))
+	return hex.EncodeToString(sum[:])
+}
+
+// TestRealProcessInjectionFreeDelivery is design section 11 scenario 7:
+// the brief, a task's instructions and a manager answer are seeded with
+// hostile bytes (ANSI escapes, a bracketed-paste open/close pair, "y"
+// plus newline, and control characters); every fixture principal that
+// receives one validates byte-exact delivery (this test's own read of
+// the durable artifact file, cross-checked against the RECEIVING
+// process's own independent os.ReadFile, captured in its observation
+// dump); and the disposable server's own request log, captured at the
+// S11-pinned elevated level for the whole run, proves zero requests to
+// any of Herdr's six real terminal-input methods other than one
+// identified positive control.
+//
+// The manager session here is deliberately UNSCRIPTED (its
+// FIXTURE-BEHAVIOR directive is absent -- the entire brief IS the
+// hostile payload, so nothing else may parse it): every manager verb
+// this scenario needs (task create, plan close, the barrier answer) is
+// driven directly, authenticated as this same live manager session --
+// exactly as legitimate as the scripted fixture manager issuing them
+// itself (messagingscenarios_helpers_test.go's managerEnv), and never
+// typed pane input. This also sidesteps the scripted manager-feature
+// grammar's own whitespace-delimited, underscore-substituted TASK/ANSWER
+// encoding, which cannot carry genuinely hostile bytes losslessly.
+func TestRealProcessInjectionFreeDelivery(t *testing.T) {
+	start := time.Now()
+	defer func() { t.Logf("TestRealProcessInjectionFreeDelivery wall time: %s", time.Since(start)) }()
+
+	artifacts := newArtifactDir(t)
+	server := prepareServer(t, artifacts)
+	// The S11-pinned elevated capture level, set BEFORE the server ever
+	// starts -- so the capture window's start precedes the first HOP
+	// process by construction, never by luck: at the default level a
+	// successful pane.* call is invisible, so a zero count there would
+	// prove nothing.
+	server.extraEnv = append(server.extraEnv, "HERDR_LOG=herdr=debug")
+	worker := buildFixtureWorker(t, artifacts)
+	installFixtureWorkerAsClaudeStub(t, server, worker)
+	server.start(t)
+
+	// A dedicated, test-owned pane for the positive control, created now
+	// (on the test's own shared connection -- setup, not itself part of
+	// the six forbidden methods) so it exists throughout the run and is
+	// available once the run has finished.
+	var controlWorkspace workspaceCreatedResponse
+	server.call(t, "workspace.create", map[string]any{"cwd": server.workDir(), "focus": false}, &controlWorkspace)
+	controlPane := controlWorkspace.RootPane.PaneID
+
+	// Window-start bracket (S11's own bracketing technique): a distinct,
+	// otherwise-unused method's own log line, issued before any HOP
+	// process (hop run, and every fixture principal it launches) exists.
+	server.call(t, "pane.list", nil, &struct{}{})
+
+	scratchDir := artifacts.dir(t, "fixture-scratch")
+	repo := newFeatureFixtureRepo(t, artifacts, server, "injection-repo", featureFixtureOptions{
+		ScratchDir: scratchDir, ReviewerBehavior: "reviewer-approve",
+		MaxWorkers: 1, RetryLimit: 3, MessageWaitTimeout: "3s", MessageAttentionAfter: "30s",
+	})
+
+	// Channel 1: the brief -- seeded ENTIRELY with hostile bytes, and
+	// otherwise unscripted (no FIXTURE-BEHAVIOR directive at all: the
+	// manager just dumps it byte-exact to its own observation file and
+	// idles at the composer-like loop).
+	brief := hostilePayload
+	fx := startFeatureRun(t, artifacts, server, repo, scratchDir, brief)
+
+	briefPath := filepath.Join(fx.stateDir, "runs", fx.runID, "artifacts", "assignment.md")
+	rawAssignment, err := os.ReadFile(briefPath) //nolint:gosec // G304: a path this test computed itself from its own run state.
+	if err != nil {
+		t.Fatalf("read manager assignment %s: %v", briefPath, err)
+	}
+	if got := extractBriefSection(t, string(rawAssignment)); got != brief {
+		t.Fatalf("delivered brief section is not byte-exact: got %q, want %q", got, brief)
+	}
+	managerObservationPath := filepath.Join(fx.stateDir, "runs", fx.runID, "artifacts", "manager-observed.txt")
+	managerObs := waitForObservation(t, managerObservationPath)
+	if managerObs.AssignmentContent != string(rawAssignment) {
+		t.Errorf("the manager fixture's OWN read of its assignment (its observation dump) does not byte-exactly match the file this test independently read:\nprincipal observed: %q\nfile content:       %q", managerObs.AssignmentContent, string(rawAssignment))
+	}
+
+	managerEnv := fx.managerEnv(t)
+
+	// Channel 2: a task's instructions -- a valid directive line
+	// (worker-hold, so the worker sends a barrier question this scenario
+	// answers directly, exercising channel 3 too) followed immediately by
+	// the hostile payload. Created directly as the manager (never through
+	// the scripted grammar, whose own TASK-line fields cannot carry it).
+	instructionsPath := filepath.Join(scratchDir, "hostile-instructions.md")
+	instructionsContent := "FIXTURE-BEHAVIOR: worker-hold " + scratchDir + "\n" + hostilePayload
+	if err := os.WriteFile(instructionsPath, []byte(instructionsContent), 0o600); err != nil {
+		t.Fatalf("write hostile instructions file: %v", err)
+	}
+	createResult := runHop(t, managerEnv, repo.Root, "task", "create", "--title", "hostile task", "--file", instructionsPath, "--request-id", newSpikeUUID(t))
+	if createResult.ExitCode != 0 {
+		t.Fatalf("hop task create (hostile instructions): exit=%d stdout=%q stderr=%q", createResult.ExitCode, createResult.Stdout, createResult.Stderr)
+	}
+	taskID := parseTaskID(t, createResult.Stdout)
+
+	closeResult := runHop(t, managerEnv, repo.Root, "plan", "close", "--request-id", newSpikeUUID(t))
+	if closeResult.ExitCode != 0 && !strings.HasPrefix(closeResult.FirstStdoutLine(), "duplicate") {
+		t.Fatalf("hop plan close: exit=%d stdout=%q stderr=%q", closeResult.ExitCode, closeResult.Stdout, closeResult.Stderr)
+	}
+
+	fx.requireTaskState(t, taskID, "active")
+	attemptID, _ := fx.currentAttempt(t, taskID)
+	sessionID := fx.sessionForAttempt(t, attemptID)
+
+	instructionsArtifactPath := fx.scalar(t, fmt.Sprintf("SELECT instructions_path FROM tasks WHERE id = '%s';", taskID))
+	if instructionsArtifactPath == "" {
+		t.Fatalf("task %s has no recorded instructions_path", taskID)
+	}
+	requireByteExactFile(t, instructionsArtifactPath, instructionsContent)
+	workerObservationPath := filepath.Join(scratchDir, "worker-observed-"+attemptID+".txt")
+	workerObs := waitForObservation(t, workerObservationPath)
+	if workerObs.AssignmentContent != instructionsContent {
+		t.Errorf("the worker fixture's OWN read of its task instructions (its observation dump) does not byte-exactly match what was delivered:\nprincipal observed: %q\nwant:               %q", workerObs.AssignmentContent, instructionsContent)
+	}
+
+	// Channel 3: a manager answer -- seeded entirely with hostile bytes,
+	// answering the worker-hold barrier question directly (never relayed
+	// to a human here: this scenario is proving delivery bytes, not the
+	// relay chain).
+	questionID := fx.sessionQuestionTo(t, sessionID, "manager")
+	answerPath := filepath.Join(scratchDir, "hostile-answer.md")
+	if err := os.WriteFile(answerPath, []byte(hostilePayload), 0o600); err != nil {
+		t.Fatalf("write hostile answer file: %v", err)
+	}
+	answerResult := runHop(t, managerEnv, repo.Root, "msg", "send", "--kind", "answer", "--reply-to", questionID, "--file", answerPath, "--request-id", newSpikeUUID(t))
+	if answerResult.ExitCode != 0 {
+		t.Fatalf("hop msg send --kind answer (hostile body): exit=%d stdout=%q stderr=%q", answerResult.ExitCode, answerResult.Stdout, answerResult.Stderr)
+	}
+	answerID := parseSentID(t, answerResult.Stdout)
+
+	answerBodyPath, answerBodyDigest := "", ""
+	row := fx.scalar(t, fmt.Sprintf("SELECT body_path || '|' || body_digest FROM messages WHERE id = '%s';", answerID))
+	if parts := strings.SplitN(row, "|", 2); len(parts) == 2 {
+		answerBodyPath, answerBodyDigest = parts[0], parts[1]
+	}
+	if answerBodyPath == "" {
+		t.Fatalf("no message row found for the accepted answer %s", answerID)
+	}
+	requireByteExactFile(t, answerBodyPath, hostilePayload)
+	if want := sha256HexOf(hostilePayload); answerBodyDigest != want {
+		t.Errorf("stored body_digest for answer %s = %s, want %s (sha256 of the exact hostile bytes)", answerID, answerBodyDigest, want)
+	}
+	// The worker (holding no messaging content dump of its own once
+	// acked) proved it actually READ this body without choking by
+	// continuing on to drain and submit normally below; delivery and ack
+	// against the worker's OWN session close the loop directly.
+	if !waitUntilDeadline(featureRunTimeout, func() bool {
+		return messageDeliveredToSession(t, fx, answerID, sessionID)
+	}) {
+		t.Fatalf("answer %s was never delivered to session %s", answerID, sessionID)
+	}
+	if !waitUntilDeadline(featureRunTimeout, func() bool { return fx.messageAcked(t, answerID) }) {
+		t.Fatalf("answer %s was never acknowledged", answerID)
+	}
+
+	// The run completes normally, proving nothing about the hostile
+	// content broke the pipeline.
+	fx.requireTaskState(t, taskID, "integrated")
+	fx.requireRunState(t, "completed")
+	waitForControllerExit(t, fx.controller, 30*time.Second)
+
+	// The positive control: pane.send_text through a SEPARATE connection
+	// (exactly as a production subprocess connects), located by method
+	// name, asserted present -- proving the elevated capture level and
+	// the log's own correlation mechanics actually work, so a zero count
+	// below is meaningful and not an artifact of a broken capture.
+	controlMarker := "hop-injection-free-control-" + newSpikeUUID(t)
+	controlClient := herdr.NewClient(server.socketPath)
+	if err := controlClient.Call(testContext(t), "pane.send_text", map[string]any{"pane_id": controlPane, "text": controlMarker + "\n"}, nil); err != nil {
+		t.Fatalf("positive control pane.send_text: %v", err)
+	}
+
+	// Window-end bracket.
+	server.call(t, "tab.list", nil, &struct{}{})
+
+	logPath := filepath.Join(filepath.Dir(server.socketPath), "herdr-server.log")
+	var content string
+	if !waitUntil(func() bool {
+		data, readErr := os.ReadFile(logPath) //nolint:gosec // G304: fixed path derived from this test's own isolated socket directory.
+		if readErr != nil {
+			return false
+		}
+		content = string(data)
+		return strings.Contains(content, `method="tab.list"`)
+	}) {
+		t.Fatalf("herdr-server.log at %s never recorded the window-end marker (tab.list); last content:\n%s", logPath, content)
+	}
+	artifacts.save(t, "herdr-server-log.txt", content)
+
+	lines := strings.Split(content, "\n")
+	startIdx, ok := firstLineIndex(lines, `method="pane.list"`)
+	if !ok {
+		t.Fatalf("herdr-server.log never recorded the window-start marker (pane.list)")
+	}
+	endIdx, ok := firstLineIndex(lines, `method="tab.list"`)
+	if !ok {
+		t.Fatalf("herdr-server.log never recorded the window-end marker (tab.list)")
+	}
+	if endIdx <= startIdx {
+		t.Fatalf("window-end line %d is not after window-start line %d; the bracket is not usable for scoping a scan", endIdx, startIdx)
+	}
+
+	// S11's own finding: a request-log line never carries the pane/agent
+	// target or any request parameter, so the control is located by
+	// method + outcome alone -- unique here since production never calls
+	// pane.send_text at all and this test issues it exactly once.
+	controlLine := requireLine(t, lines, startIdx, endIdx, `method="pane.send_text"`, `event="api.request.complete"`)
+	t.Logf("positive control located: %s", controlLine)
+
+	requireNoUnexpectedTerminalInputRequests(t, lines, startIdx, endIdx, controlLine)
+}
+
+// messageDeliveredToSession reports whether a delivery row exists for
+// message messageID addressed to sessionID specifically (never merely to
+// its lineage), the same authority hop msg ack itself requires.
+func messageDeliveredToSession(t *testing.T, fx *featureRun, messageID, sessionID string) bool {
+	t.Helper()
+	return fx.scalar(t, fmt.Sprintf("SELECT count(*) FROM message_deliveries WHERE message_id = '%s' AND session_id = '%s';", messageID, sessionID)) != "0"
+}
+
+// requireNoUnexpectedTerminalInputRequests asserts that within
+// lines[startIdx+1:endIdx] no api.request.complete or api.request.fail
+// entry exists for any of injectionTerminalInputMethods, other than
+// controlLine itself.
+func requireNoUnexpectedTerminalInputRequests(t *testing.T, lines []string, startIdx, endIdx int, controlLine string) {
+	t.Helper()
+	var violations []string
+	for i := startIdx + 1; i < endIdx; i++ {
+		line := lines[i]
+		if line == controlLine {
+			continue
+		}
+		if !strings.Contains(line, `event="api.request.complete"`) && !strings.Contains(line, `event="api.request.fail"`) {
+			continue
+		}
+		for _, m := range terminalInputMethods() {
+			if strings.Contains(line, `method="`+m+`"`) {
+				violations = append(violations, line)
+			}
+		}
+	}
+	if len(violations) > 0 {
+		t.Fatalf("herdr-server.log records %d unexpected terminal-input request completion(s)/failure(s) other than the identified positive control:\n%s",
+			len(violations), strings.Join(violations, "\n"))
+	}
+}
