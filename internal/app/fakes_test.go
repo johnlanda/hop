@@ -749,13 +749,13 @@ func (s *fakeStore) currentSessionOfAttemptLocked(attemptID identity.AttemptID) 
 // ClaimLaunch, the plan verbs, message send, fetch and ack, review
 // submission and result submission all decide through: the session's
 // current binding must carry exactly incarnation, with no pending launch
-// intent of the session naming a different one; with no binding row at
+// intent of the session — any of them — naming a different one or none
+// usable (pendingSessionIntentDisagreesLocked); with no binding row at
 // all, the session's newest PENDING pane.open/launch.send intent must name
 // it; any binding row (a superseded one included) disables that fallback.
 func (s *fakeStore) sessionIncarnationCurrentLocked(sessionID identity.SessionID, incarnation identity.IncarnationID) bool {
-	intent, hasIntent := s.pendingSessionIntentLocked(sessionID)
 	if binding, ok := s.currentBindingLocked(sessionID); ok {
-		if hasIntent && intent != binding.IncarnationID {
+		if s.pendingSessionIntentDisagreesLocked(sessionID, binding.IncarnationID) {
 			return false
 		}
 		return binding.IncarnationID == incarnation
@@ -763,7 +763,37 @@ func (s *fakeStore) sessionIncarnationCurrentLocked(sessionID identity.SessionID
 	if len(s.Bindings[sessionID]) > 0 {
 		return false
 	}
+	intent, hasIntent := s.pendingSessionIntentLocked(sessionID)
 	return hasIntent && intent == incarnation
+}
+
+// pendingSessionIntentDisagreesLocked mirrors the real store's
+// pendingLaunchIntentDisagrees: whether ANY pending pane.open/launch.send
+// operation whose intent's session_id is the session fails to carry
+// exactly incarnation as a string incarnation_id — a different one, or an
+// absent, null or non-string one. The intent is read as generic JSON so an
+// unusable incarnation_id is seen, never skipped by a typed decode.
+func (s *fakeStore) pendingSessionIntentDisagreesLocked(sessionID identity.SessionID, incarnation identity.IncarnationID) bool {
+	for _, op := range s.Operations { //nolint:gocritic // rangeValCopy: test fake; the journal is small and read-only here.
+		if op.State != app.OperationPending || (op.Kind != app.OpPaneOpen && op.Kind != app.OpLaunchSend) {
+			continue
+		}
+		raw, err := json.Marshal(op.Intent)
+		if err != nil {
+			continue
+		}
+		var fields map[string]any
+		if json.Unmarshal(raw, &fields) != nil {
+			continue
+		}
+		if session, ok := fields["session_id"].(string); !ok || session != sessionID.String() {
+			continue
+		}
+		if named, ok := fields["incarnation_id"].(string); !ok || named != incarnation.String() {
+			return true
+		}
+	}
+	return false
 }
 
 // pendingSessionIntentLocked resolves the incarnation named by the
@@ -796,26 +826,24 @@ func (s *fakeStore) pendingSessionIntentLocked(sessionID identity.SessionID) (id
 // sessionLaunchIncarnationLocked mirrors the real store's one
 // launch-identity resolution (sqlite sessionLaunchIncarnation), which the
 // launch context and the status read model share: the session's current
-// binding's incarnation, else its newest pending launch intent's; a
-// binding and a pending intent that disagree, or a malformed intent
-// identity, resolve nothing.
+// binding's incarnation, unless any pending launch intent of the session
+// names another or none usable; else its newest pending launch intent's; a
+// disagreement or a malformed intent identity resolves nothing.
 func (s *fakeStore) sessionLaunchIncarnationLocked(sessionID identity.SessionID) (identity.IncarnationID, bool) {
-	intent, hasIntent := s.pendingSessionIntentLocked(sessionID)
-	if hasIntent {
-		if _, err := identity.ParseIncarnationID(intent.String()); err != nil {
+	if binding, hasBinding := s.currentBindingLocked(sessionID); hasBinding {
+		if s.pendingSessionIntentDisagreesLocked(sessionID, binding.IncarnationID) {
 			return "", false
 		}
-	}
-	binding, hasBinding := s.currentBindingLocked(sessionID)
-	switch {
-	case hasBinding && hasIntent && intent != binding.IncarnationID:
-		return "", false
-	case hasBinding:
 		return binding.IncarnationID, true
-	case hasIntent:
-		return intent, true
 	}
-	return "", false
+	intent, hasIntent := s.pendingSessionIntentLocked(sessionID)
+	if !hasIntent {
+		return "", false
+	}
+	if _, err := identity.ParseIncarnationID(intent.String()); err != nil {
+		return "", false
+	}
+	return intent, true
 }
 
 // checkOutcomeFields are the check outcome JSON keys the fake's status

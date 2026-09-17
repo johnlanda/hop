@@ -524,9 +524,10 @@ func incarnationCurrent(ctx context.Context, q querier, attemptID identity.Attem
 // incarnation is current for sessionID iff
 //
 //   - the session's current (non-superseded) binding carries exactly this
-//     incarnation, and no pending launch intent of the session names a
-//     different one — a binding and a pending intent that disagree fail
-//     closed, as the launch context does; or
+//     incarnation, and no pending launch intent of the session — ANY of
+//     them, not only the newest (pendingLaunchIntentDisagrees) — names a
+//     different one or none usable: a binding and a pending intent that
+//     disagree fail closed, as the launch context does; or
 //   - no binding row exists for the session at all — a superseded row
 //     without a successor retires the incarnation, so any row disables the
 //     fallback — and the SESSION's newest pending launch operation (kind
@@ -540,25 +541,27 @@ func incarnationCurrent(ctx context.Context, q querier, attemptID identity.Attem
 // another session's later intent can no longer invalidate this session's
 // own (B2).
 //
-// The intent source is state pending only (pendingLaunchIntentOfSession).
-// A pane.open the controller recorded reconciling — its act returned an
-// error after the launcher had already claimed — is not read, so its
-// principal is stale until label recovery commits the binding (LAUNCH-6,
-// an accepted residual; widening it would widen ClaimLaunch too).
+// The intent source is state pending only (pendingLaunchIntentDisagrees,
+// pendingLaunchIntentOfSession). A pane.open the controller recorded
+// reconciling — its act returned an error after the launcher had already
+// claimed — is not read, so its principal is stale until label recovery
+// commits the binding (LAUNCH-6, an accepted residual; widening it would
+// widen ClaimLaunch too).
 func sessionIncarnationCurrent(ctx context.Context, q querier, sessionID identity.SessionID, incarnationID identity.IncarnationID) (bool, error) {
 	binding, hasBinding, err := currentBinding(ctx, q, sessionID)
 	if err != nil {
 		return false, err
 	}
+	if hasBinding {
+		disagrees, disagreeErr := pendingLaunchIntentDisagrees(ctx, q, sessionID, binding.IncarnationID)
+		if disagreeErr != nil || disagrees {
+			return false, disagreeErr
+		}
+		return binding.IncarnationID == incarnationID, nil
+	}
 	intentIncarnation, hasIntent, err := pendingLaunchIntentOfSession(ctx, q, sessionID)
 	if err != nil {
 		return false, err
-	}
-	if hasBinding {
-		if hasIntent && intentIncarnation != binding.IncarnationID.String() {
-			return false, nil
-		}
-		return binding.IncarnationID == incarnationID, nil
 	}
 	var bindingRows int64
 	if countErr := q.QueryRowContext(ctx,
@@ -572,10 +575,34 @@ func sessionIncarnationCurrent(ctx context.Context, q querier, sessionID identit
 	return hasIntent && intentIncarnation == incarnationID.String(), nil
 }
 
+// pendingLaunchIntentDisagrees reports whether ANY pending launch operation
+// of the session (kind pane.open or launch.send, matched on the intent
+// JSON's "session_id" key) fails to name exactly incarnationID under its
+// "incarnation_id" key: one naming a different incarnation, and one whose
+// incarnation is unusable — absent, null or not a string — alike. It is the
+// bound half of the one principal-incarnation rule and of the launch
+// identity resolution: with a binding, an older pending intent naming
+// another incarnation fails closed even when the newest one agrees.
+func pendingLaunchIntentDisagrees(ctx context.Context, q querier, sessionID identity.SessionID, incarnationID identity.IncarnationID) (bool, error) {
+	var disagrees int64
+	err := q.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM operations
+		  WHERE state = ? AND kind IN (?, ?) AND json_extract(intent, '$.session_id') = ?
+		    AND (json_type(intent, '$.incarnation_id') IS NOT 'text' OR json_extract(intent, '$.incarnation_id') != ?))`,
+		string(app.OperationPending), string(app.OpPaneOpen), string(app.OpLaunchSend), sessionID.String(), incarnationID.String(),
+	).Scan(&disagrees)
+	if err != nil {
+		return false, fmt.Errorf("sqlite: read pending launch intents of session %s: %w", sessionID, err)
+	}
+	return disagrees != 0, nil
+}
+
 // pendingLaunchIntentOfSession reads the SESSION's newest pending launch
 // operation (kind pane.open or launch.send, matched on the intent JSON's
 // "session_id" key) and returns its intent's "incarnation_id"; ok is false
-// when the session has no pending launch operation.
+// when the session has no pending launch operation. It is the source of
+// the no-binding fallback only: with a binding, every pending intent
+// decides (pendingLaunchIntentDisagrees).
 func pendingLaunchIntentOfSession(ctx context.Context, q querier, sessionID identity.SessionID) (incarnationID string, ok bool, err error) {
 	var intentIncarnation sql.NullString
 	err = q.QueryRowContext(ctx,

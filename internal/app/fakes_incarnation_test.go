@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/johnlanda/hop/internal/app"
 	"github.com/johnlanda/hop/internal/domain/identity"
@@ -84,6 +85,40 @@ func incarnationShapes() []incarnationShape {
 				return nil, []identity.IncarnationID{p.bound, unbound}
 			},
 		},
+		{
+			// Every pending intent decides once a binding exists, not only the
+			// newest: an older one naming another incarnation fails closed.
+			name: "an older pending intent disagrees while the newest agrees",
+			arrange: func(t *testing.T, tc *testController, p incarnationPrincipal, unbound identity.IncarnationID) ([]identity.IncarnationID, []identity.IncarnationID) {
+				seedPendingLaunchIntent(t, tc, p.fr.RunID, p.session, unbound)
+				tc.Clock.Advance(time.Second)
+				seedPendingLaunchIntent(t, tc, p.fr.RunID, p.session, p.bound)
+				return nil, []identity.IncarnationID{p.bound, unbound}
+			},
+		},
+		{
+			name: "a pending intent of the session names no usable incarnation",
+			arrange: func(t *testing.T, tc *testController, p incarnationPrincipal, unbound identity.IncarnationID) ([]identity.IncarnationID, []identity.IncarnationID) {
+				seedPendingLaunchIntentPayload(t, tc, p.fr.RunID, map[string]any{"session_id": p.session.String(), "incarnation_id": 42})
+				return nil, []identity.IncarnationID{p.bound, unbound}
+			},
+		},
+	}
+}
+
+// seedPendingLaunchIntentPayload journals a pending pane.open whose intent
+// is exactly payload, for shapes no well-formed controller intent has.
+func seedPendingLaunchIntentPayload(t *testing.T, tc *testController, runID identity.RunID, payload map[string]any) {
+	t.Helper()
+	opID, err := identity.ParseOperationID(tc.IDs.NewID())
+	if err != nil {
+		t.Fatalf("parse operation id: %v", err)
+	}
+	now := tc.Clock.Now()
+	payload["label"] = opID.String()
+	tc.Store.Operations[opID] = app.Operation{
+		ID: opID, RunID: runID, Generation: 1, Kind: app.OpPaneOpen, State: app.OperationPending,
+		Intent: payload, CreatedAt: now, UpdatedAt: now,
 	}
 }
 

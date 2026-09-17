@@ -1169,12 +1169,20 @@ func (s *fakeStore) LoadSessionLaunchContext(_ context.Context, runID identity.R
 }
 
 // sessionLaunchIdentityLocked mirrors the real store's
-// sessionLaunchIdentity: the session's current binding, else its newest
-// pending pane.open/launch.send intent naming it, agreement required when
-// both exist; a disagreement, a malformed intent incarnation or neither
-// source fails closed with ErrNotFound. Callers hold s.mu.
+// sessionLaunchIdentity: the session's current binding, provided no
+// pending pane.open/launch.send intent of the session names another
+// incarnation or none usable (pendingSessionIntentDisagreesLocked), else
+// its newest pending intent naming it; a disagreement, a malformed intent
+// incarnation or neither source fails closed with ErrNotFound. Callers
+// hold s.mu.
 func (s *fakeStore) sessionLaunchIdentityLocked(session identity.SessionID) (identity.IncarnationID, error) {
 	binding, hasBinding := s.currentBindingLocked(session)
+	if hasBinding {
+		if s.pendingSessionIntentDisagreesLocked(session, binding.IncarnationID) {
+			return "", fmt.Errorf("%w: binding and pending intent incarnations disagree for session %s", app.ErrNotFound, session)
+		}
+		return binding.IncarnationID, nil
+	}
 	var (
 		newest    app.Operation
 		hasIntent bool
@@ -1192,27 +1200,14 @@ func (s *fakeStore) sessionLaunchIdentityLocked(session identity.SessionID) (ide
 			newest, hasIntent, rawIntent = op, true, intent.IncarnationID
 		}
 	}
-	var intentIncarnation identity.IncarnationID
-	if hasIntent {
-		parsed, err := identity.ParseIncarnationID(rawIntent)
-		if err != nil {
-			return "", fmt.Errorf("%w: pending launch intent of session %s carries a malformed incarnation id", app.ErrNotFound, session)
-		}
-		intentIncarnation = parsed
-	}
-	switch {
-	case hasBinding && hasIntent:
-		if binding.IncarnationID != intentIncarnation {
-			return "", fmt.Errorf("%w: binding and pending intent incarnations disagree for session %s", app.ErrNotFound, session)
-		}
-		return binding.IncarnationID, nil
-	case hasBinding:
-		return binding.IncarnationID, nil
-	case hasIntent:
-		return intentIncarnation, nil
-	default:
+	if !hasIntent {
 		return "", fmt.Errorf("%w: no binding and no pending launch intent for session %s", app.ErrNotFound, session)
 	}
+	intentIncarnation, err := identity.ParseIncarnationID(rawIntent)
+	if err != nil {
+		return "", fmt.Errorf("%w: pending launch intent of session %s carries a malformed incarnation id", app.ErrNotFound, session)
+	}
+	return intentIncarnation, nil
 }
 
 // sessionIsSuccessorLocked mirrors the real store's sessionIsSuccessor:

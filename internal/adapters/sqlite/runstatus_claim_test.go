@@ -1,6 +1,7 @@
 package sqlite_test
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/johnlanda/hop/internal/app"
@@ -91,5 +92,18 @@ func TestLoadRunStatusResolvesTheLaunchContextClaim(t *testing.T) {
 		requireDetailClaim(t, f.fixture, f.ManagerID, true, f.ManagerIncarnation)
 		createLaunchIntentFor(t, f, 8422, f.ManagerID, identity.IncarnationID(uid(8424)))
 		requireDetailClaim(t, f.fixture, f.ManagerID, true, "")
+	})
+
+	t.Run("feature manager: an older differing pending intent surfaces no claim though the newest agrees", func(t *testing.T) {
+		f := newFeatureFixture(t)
+		if err := f.store.ClaimLaunch(t.Context(), claimFor(f, f.ManagerIncarnation, f.ManagerID, "", 8431)); err != nil {
+			t.Fatalf("ClaimLaunch(bound manager): %v", err)
+		}
+		createLaunchIntentFor(t, f, 8432, f.ManagerID, identity.IncarnationID(uid(8434)))
+		createLaunchIntentFor(t, f, 8435, f.ManagerID, f.ManagerIncarnation)
+		requireDetailClaim(t, f.fixture, f.ManagerID, true, "")
+		if _, err := f.store.LoadSessionLaunchContext(t.Context(), f.spec.RunID, f.ManagerID); !errors.Is(err, app.ErrNotFound) {
+			t.Errorf("LoadSessionLaunchContext() error = %v, want ErrNotFound: the launch context resolves nothing either", err)
+		}
 	})
 }

@@ -77,6 +77,58 @@ func principalShapes() []principalShape {
 				return nil, []identity.IncarnationID{p.bound, unbound}
 			},
 		},
+		{
+			// Every pending intent of the session decides once a binding
+			// exists, not only the newest: an older one naming another
+			// incarnation fails closed although the newest agrees.
+			name: "an older pending intent disagrees while the newest agrees",
+			arrange: func(t *testing.T, f *featureFixture, p principal, unbound identity.IncarnationID, opN int) ([]identity.IncarnationID, []identity.IncarnationID) {
+				createLaunchIntentFor(t, f, opN, p.session, unbound)
+				createLaunchIntentFor(t, f, opN+2, p.session, p.bound)
+				return nil, []identity.IncarnationID{p.bound, unbound}
+			},
+		},
+		{
+			name: "a pending intent of the session names no usable incarnation",
+			arrange: func(t *testing.T, f *featureFixture, p principal, unbound identity.IncarnationID, opN int) ([]identity.IncarnationID, []identity.IncarnationID) {
+				createLaunchIntentPayload(t, f, opN, map[string]any{"session_id": p.session.String(), "incarnation_id": 42})
+				return nil, []identity.IncarnationID{p.bound, unbound}
+			},
+		},
+	}
+}
+
+// createLaunchIntentPayload journals, through the fenced repository, a
+// pending pane.open whose intent is exactly payload — a shape no
+// well-formed controller intent has.
+func createLaunchIntentPayload(t *testing.T, f *featureFixture, opN int, payload map[string]any) {
+	t.Helper()
+	f.inUOW(t, func(uow app.UnitOfWork) {
+		err := uow.Operations().Create(t.Context(), app.Operation{
+			ID: identity.OperationID(uid(opN)), RunID: f.spec.RunID, Generation: f.lease.Generation,
+			Kind: app.OpPaneOpen, State: app.OperationPending, Intent: payload,
+			CreatedAt: f.clock.Now(), UpdatedAt: f.clock.Now(),
+		})
+		if err != nil {
+			t.Fatalf("create launch intent: %v", err)
+		}
+	})
+}
+
+// TestPrincipalIncarnationOlderConflictingIntent is the real-store
+// reproduction of a bound manager whose newest pending launch intent names
+// its own incarnation while an older pending one names another: the
+// principal is stale, never accepted.
+func TestPrincipalIncarnationOlderConflictingIntent(t *testing.T) {
+	f := newFeatureFixture(t)
+	createLaunchIntentFor(t, f, 99801, f.ManagerID, identity.IncarnationID(uid(99802)))
+	createLaunchIntentFor(t, f, 99803, f.ManagerID, f.ManagerIncarnation)
+	outcome, err := f.store.ClosePlan(t.Context(), app.PlanClose{RunID: f.spec.RunID, Session: f.ManagerID, IncarnationID: f.ManagerIncarnation})
+	if err != nil {
+		t.Fatalf("ClosePlan() error = %v", err)
+	}
+	if outcome.Outcome != app.WorkflowRefused || outcome.Reason != app.GrammarReasonStale {
+		t.Fatalf("ClosePlan() = %+v, want a stale refusal: an older pending intent names another incarnation", outcome)
 	}
 }
 

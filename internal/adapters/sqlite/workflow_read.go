@@ -104,39 +104,38 @@ type launchIncarnation struct {
 
 // sessionLaunchIncarnation is the one launch-identity resolution the
 // launch context and the status read model share: the session's current
-// binding's incarnation when one exists, else its newest pending launch
-// intent's, and when both exist they must agree. A disagreement, a
-// malformed intent identity or neither source resolves nothing.
+// binding's incarnation when one exists, provided no pending launch intent
+// of the session — any of them, not only the newest — names another
+// incarnation or none usable (pendingLaunchIntentDisagrees); else the
+// session's newest pending launch intent's. A disagreement, a malformed
+// intent identity or neither source resolves nothing.
 func sessionLaunchIncarnation(ctx context.Context, q querier, sessionID identity.SessionID) (launchIncarnation, error) {
 	binding, hasBinding, err := currentBinding(ctx, q, sessionID)
 	if err != nil {
 		return launchIncarnation{}, err
 	}
+	if hasBinding {
+		disagrees, disagreeErr := pendingLaunchIntentDisagrees(ctx, q, sessionID, binding.IncarnationID)
+		switch {
+		case disagreeErr != nil:
+			return launchIncarnation{}, disagreeErr
+		case disagrees:
+			return launchIncarnation{unresolved: fmt.Sprintf("binding incarnation %s and a pending launch intent of the session disagree", binding.IncarnationID)}, nil
+		}
+		return launchIncarnation{incarnation: binding.IncarnationID}, nil
+	}
 	rawIntent, hasIntent, err := pendingLaunchIntentOfSession(ctx, q, sessionID)
 	if err != nil {
 		return launchIncarnation{}, err
 	}
-	var intentIncarnation identity.IncarnationID
-	if hasIntent {
-		parsed, parseErr := identity.ParseIncarnationID(rawIntent)
-		if parseErr != nil {
-			return launchIncarnation{unresolved: "the pending launch intent carries a malformed incarnation id"}, nil
-		}
-		intentIncarnation = parsed
-	}
-	switch {
-	case hasBinding && hasIntent:
-		if binding.IncarnationID != intentIncarnation {
-			return launchIncarnation{unresolved: fmt.Sprintf("binding incarnation %s and pending intent incarnation %s disagree", binding.IncarnationID, intentIncarnation)}, nil
-		}
-		return launchIncarnation{incarnation: binding.IncarnationID}, nil
-	case hasBinding:
-		return launchIncarnation{incarnation: binding.IncarnationID}, nil
-	case hasIntent:
-		return launchIncarnation{incarnation: intentIncarnation}, nil
-	default:
+	if !hasIntent {
 		return launchIncarnation{unresolved: "no binding and no pending launch intent"}, nil
 	}
+	intentIncarnation, err := identity.ParseIncarnationID(rawIntent)
+	if err != nil {
+		return launchIncarnation{unresolved: "the pending launch intent carries a malformed incarnation id"}, nil
+	}
+	return launchIncarnation{incarnation: intentIncarnation}, nil
 }
 
 // worktreePathForAttempt resolves the recorded worktree path the launch

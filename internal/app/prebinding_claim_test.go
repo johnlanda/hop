@@ -2,6 +2,7 @@ package app_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -98,6 +99,22 @@ func TestFakeRunStatusResolvesTheLaunchContextClaim(t *testing.T) {
 		requireFakeDetailClaim(t, tc, fr.RunID, fr.ManagerID, true, fr.ManagerIncarnation)
 		seedPendingLaunchIntent(t, tc, fr.RunID, fr.ManagerID, identity.IncarnationID(tc.IDs.NewID()))
 		requireFakeDetailClaim(t, tc, fr.RunID, fr.ManagerID, true, "")
+	})
+
+	t.Run("feature manager: an older differing pending intent surfaces no claim though the newest agrees", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		fr := seedFeatureRun(t, tc, 2)
+		tc.Store.LaunchClaims[fr.ManagerIncarnation] = app.LaunchClaim{
+			IncarnationID: fr.ManagerIncarnation, RunID: fr.RunID, SessionID: fr.ManagerID,
+			Executable: "/usr/local/bin/claude", PID: 900, State: app.LaunchClaimExeced, ClaimedAt: tc.Clock.Now(),
+		}
+		seedPendingLaunchIntent(t, tc, fr.RunID, fr.ManagerID, identity.IncarnationID(tc.IDs.NewID()))
+		tc.Clock.Advance(time.Second)
+		seedPendingLaunchIntent(t, tc, fr.RunID, fr.ManagerID, fr.ManagerIncarnation)
+		requireFakeDetailClaim(t, tc, fr.RunID, fr.ManagerID, true, "")
+		if _, err := tc.Store.LoadSessionLaunchContext(context.Background(), fr.RunID, fr.ManagerID); !errors.Is(err, app.ErrNotFound) {
+			t.Errorf("LoadSessionLaunchContext() error = %v, want ErrNotFound: the launch context resolves nothing either", err)
+		}
 	})
 
 	t.Run("feature: each run names its own manager", func(t *testing.T) {
