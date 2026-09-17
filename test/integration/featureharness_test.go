@@ -335,6 +335,14 @@ func evaluateReconcilingGuard(entries, exits []reconcileTransition, now time.Tim
 			if parseErr != nil {
 				return "", false, fmt.Errorf("parse session %s reconciling exit timestamp %q: %w", entry.SessionID, candidates[i], parseErr)
 			}
+			// Defensive: production's markSessionReconciling is idempotent
+			// while a session stays reconciling, so entries and exits for
+			// one session strictly alternate and an exit can never precede
+			// its own entry — this comparison holds on every real exit the
+			// journal can produce. Kept as a guard against clock skew
+			// rather than assumed: if it ever failed, treating the entry
+			// as still open (never matched) is the safe direction, a false
+			// failure rather than a false pass.
 			if !exitTime.Before(enteredAt) {
 				leftAt, leftTime, found = candidates[i], exitTime, true
 				break
@@ -386,20 +394,29 @@ func (f *featureRun) reconcilingGuard(t *testing.T) (violation string, pending b
 // want while such an episode is open does NOT end the wait, since letting
 // the task's own state decide it would pass a run that completes while a
 // session is still silently wedged — the exact failure mode this guard
-// exists to catch.
+// exists to catch. sawWant LATCHES the instant want is observed rather
+// than re-testing taskState only once no episode is pending: want may be
+// a state the task only passes through (never rests in), and a pending
+// episode can span exactly the polls that would have observed it, so
+// re-deriving "reached want" from a LATER poll's state would silently
+// miss it — the wait would then burn the full featureRunTimeout and fail
+// naming whatever state the task moved on to, not the reconciliation that
+// actually caused the miss.
 func (f *featureRun) requireTaskStateNeverReconciling(t *testing.T, taskID string, want ...string) {
 	t.Helper()
 	var state, violation string
+	sawWant := false
 	reached := waitUntilDeadline(featureRunTimeout, func() bool {
 		var pending bool
 		if violation, pending = f.reconcilingGuard(t); violation != "" {
 			return true
 		}
 		state = f.taskState(t, taskID)
+		sawWant = sawWant || slices.Contains(want, state)
 		if pending {
 			return false
 		}
-		return slices.Contains(want, state)
+		return sawWant
 	})
 	if violation != "" {
 		t.Fatalf("task %s: %s", taskID, violation)

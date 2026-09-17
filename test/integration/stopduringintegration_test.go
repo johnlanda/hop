@@ -187,9 +187,9 @@ func TestRealProcessStopDuringFeatureRun(t *testing.T) {
 	// rests on: `hop stop` itself polls until it observes "stopped" (or
 	// its own deadline), so the CLI's own return is the observed
 	// consequence, and the gap between the two wall-clock reads is the
-	// interrupt latency STOP-2 exists to bound — never the test's own
-	// total wall time, most of which is the run reaching "checking" in
-	// the first place.
+	// stop-request-to-consequence interval this scenario bounds — never
+	// the test's own total wall time, most of which is the run reaching
+	// "checking" in the first place.
 	stopRequestedAt := time.Now()
 	result := runHop(t, fx.env, fx.repo.Root, "stop", "-C", fx.repo.Root, fx.runID)
 	stopInterval := time.Since(stopRequestedAt)
@@ -236,6 +236,13 @@ func TestRealProcessStopDuringFeatureRun(t *testing.T) {
 	}
 	if got := fx.repo.git(t, "rev-parse", "--verify", rollbackOID+"^"); got != rejectedMergeOID {
 		t.Errorf("rollback commit %s's parent = %s, want the rejected merge commit %s (kept reachable, never orphaned)", rollbackOID, got, rejectedMergeOID)
+	}
+	// Positive control: the merge candidate's own tree must actually
+	// differ from its pre-merge (first-parent) tree, or the rollback-tree
+	// comparison below would hold vacuously even for a rollback built from
+	// the WRONG (post-merge) tree.
+	if mergeTree, premergeTree := fx.repo.git(t, "rev-parse", rejectedMergeOID+"^{tree}"), fx.repo.git(t, "rev-parse", rejectedMergeOID+"^1^{tree}"); mergeTree == premergeTree {
+		t.Fatalf("rejected merge %s's tree equals its own pre-merge tree %s; the rollback-tree check below cannot distinguish rollback source", rejectedMergeOID, premergeTree)
 	}
 	// The rollback commit's own TREE, not merely its parent linkage, must
 	// be the pre-merge content (design section 4): the rejected merge's
@@ -298,10 +305,19 @@ func TestRealProcessStopDuringFeatureRun(t *testing.T) {
 	stoppedAt := fx.requireTransitionAt(t, "run", fx.runID, "stopped")
 	managerTerminatedAt := fx.requireTransitionAt(t, "session", managerSessionID, "terminated")
 	implementerTerminatedAt := fx.requireTransitionAt(t, "session", implementerSessionID, "terminated")
-	checkUpdatedAt := fx.scalar(t, fmt.Sprintf(
-		"SELECT updated_at FROM operations WHERE run_id = '%s' AND kind = 'check.run' ORDER BY created_at DESC LIMIT 1;", fx.runID))
+	checkUpdatedAt, checkState := fx.scalar(t, fmt.Sprintf(
+		"SELECT updated_at FROM operations WHERE run_id = '%s' AND kind = 'check.run' ORDER BY created_at DESC LIMIT 1;", fx.runID)),
+		fx.scalar(t, fmt.Sprintf(
+			"SELECT state FROM operations WHERE run_id = '%s' AND kind = 'check.run' ORDER BY created_at DESC LIMIT 1;", fx.runID))
 	if checkUpdatedAt == "" {
 		t.Fatalf("no check.run operation found for run %s", fx.runID)
+	}
+	// The check operation must have actually SETTLED, or the "stopped
+	// after the check's last update" comparison below would hold
+	// vacuously against updated_at still at its creation time (an
+	// operation that was created but never touched again).
+	if checkState == "pending" || checkState == "reconciling" {
+		t.Errorf("combined check operation state after stop = %q, want settled (not pending/reconciling), or the ordering check below proves nothing", checkState)
 	}
 	if stoppedAt < managerTerminatedAt {
 		t.Errorf("run reported stopped at %s before the manager session terminated at %s", stoppedAt, managerTerminatedAt)
