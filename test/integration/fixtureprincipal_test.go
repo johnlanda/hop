@@ -31,20 +31,38 @@ import (
 // recognizes.
 const fixtureHoldMarker = "FIXTURE-HOLD-BARRIER"
 
-// fakeHopSource is a minimal, scriptable stand-in for the real hop binary:
-// every worker-plumbing verb except msg wait/next returns a fixed,
-// deterministic success line (task create's own line increments a
-// caller-provided counter file so dependency ids are distinguishable), and
-// every invocation's argv is appended to a log file the test reads back —
-// sufficient to prove the fixture manager's/reviewer's/worker's own
-// decisions (what it called, with what arguments, in what order) without
-// needing a real store. msg wait/next instead serves the next block of a
-// test-authored script (blocks separated by a line reading exactly "---"),
-// advancing a persistent index file, so a test can hand the principal
-// exactly the message sequence a scenario would.
+// fakeHopSource is a minimal, scriptable stand-in for the real hop binary
+// — the handwritten-fake law (design's review brief): it validates each
+// supported verb's real argv/context contract before ever returning a
+// scripted outcome, exactly as cmd/hop's own flag parsing and HOP_* env
+// resolution do (required/forbidden flags, positional argument counts,
+// UUID-shaped caller identities, readable body files), rejecting a
+// missing, unknown or extra argument the same way the real CLI's own
+// usage errors would rather than silently accepting it. It is NOT a
+// store: dependency graphs, run/task state and workflow legality are
+// never modeled — only the CLI-level contract every scripted outcome
+// sits behind. A successful, syntactically-legible call still returns a
+// fixed, deterministic line (task create's own line increments a
+// caller-provided counter file so dependency ids are distinguishable),
+// and every invocation's argv is appended to a log file the test reads
+// back. msg wait/next instead serve the next block of a test-authored
+// script (blocks separated by a line reading exactly "---"), advancing a
+// persistent index file, so a test can hand the principal exactly the
+// message sequence a scenario would; next and wait render DISTINCT
+// empty-queue lines, per design section 7's grammar, once the script is
+// exhausted or absent. Message ids used inside test-authored fakeMessageBlock
+// scripts are deliberately test-owned LABELS (e.g. "msg-hold-question"),
+// not UUIDs, so this fake's own UUID validation is scoped to the caller
+// IDENTITIES (HOP_RUN_ID/HOP_SESSION_ID/HOP_TASK_ID/HOP_ATTEMPT_ID/
+// HOP_INCARNATION_ID) and to task ids this fake itself mints
+// (task create's own id, --depends-on, task retry's positional
+// argument) — never to a message's own reply-to/relay-of/ack target,
+// which real production code never requires to be UUID-shaped either
+// (an opaque message id is still just an id).
 const fakeHopSource = `package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 	"strconv"
@@ -62,54 +80,380 @@ func main() {
 		}
 	}
 	if len(args) > 0 && args[0] == "status" {
-		if os.Getenv("FAKE_HOP_STATUS_REJECTED") == "1" {
-			fmt.Println("run r1 aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\n  state:         running\n  guard shortfall: verdict-rejected")
-		} else {
-			fmt.Println("run r1 aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\n  state:         running")
-		}
+		runStatus(args[1:])
 		return
 	}
-	verb := ""
+	verb, rest := "", args
 	switch {
 	case len(args) >= 2:
-		verb = args[0] + " " + args[1]
+		verb, rest = args[0]+" "+args[1], args[2:]
 	case len(args) == 1:
-		verb = args[0]
+		verb, rest = args[0], args[1:]
 	}
 	switch verb {
 	case "result submit":
-		fmt.Println("accepted 77777777-7777-4777-8777-777777777777")
+		runResultSubmit(rest)
 	case "task create":
-		if os.Getenv("FAKE_HOP_TASK_CREATE_REFUSED") == "1" {
-			fmt.Println("refused: dependency-cycle")
-			os.Exit(1)
-		}
-		if transientCallsLeft("FAKE_HOP_TASK_CREATE_TRANSIENT_COUNT", "FAKE_HOP_TASK_CREATE_TRANSIENT_COUNTER_FILE") {
-			fmt.Println("transient: run is launching; retry")
-			os.Exit(1)
-		}
-		n := nextCounter(os.Getenv("FAKE_HOP_TASK_COUNTER_FILE"))
-		fmt.Printf("task 00000000-0000-4000-8000-%012d t%d created\n", n, n)
+		runTaskCreate(rest)
 	case "task retry":
-		fmt.Println("retry accepted t0 attempt 2")
+		runTaskRetry(rest)
 	case "plan close":
-		fmt.Println("plan closed")
+		runPlanClose(rest)
 	case "msg send":
-		fmt.Println("sent 99999999-9999-4999-8999-999999999999")
+		runMsgSend(rest)
+	case "msg next":
+		runMsgFetch(rest, false)
+	case "msg wait":
+		runMsgFetch(rest, true)
 	case "msg ack":
-		id := ""
-		if len(args) >= 3 {
-			id = args[2]
-		}
-		fmt.Println("acknowledged " + id)
+		runMsgAck(rest)
 	case "review submit":
-		fmt.Println("verdict accepted 88888888-8888-4888-8888-888888888888")
-	case "msg wait", "msg next":
-		printScripted()
+		runReviewSubmit(rest)
 	default:
-		fmt.Println("refused: not-found")
+		refuse("not-found")
+	}
+}
+
+// refuse renders the grammar's refusal line and exits 1 — a rejected but
+// syntactically legible request, distinct from a usage error.
+func refuse(token string) {
+	fmt.Println("refused: " + token)
+	os.Exit(1)
+}
+
+// usageFail renders a usage complaint to stderr and exits 2, mirroring
+// the real CLI's own flag/argument-count convention: a malformed
+// invocation (missing, unknown or extra argument, or missing/invalid
+// required context) is a caller bug, never a scripted store outcome.
+func usageFail(format string, a ...any) {
+	fmt.Fprintf(os.Stderr, "fake hop: "+format+"\n", a...)
+	os.Exit(2)
+}
+
+// parseFlags parses args against fs, exiting 2 on any parse error
+// (unknown flag, malformed value) exactly like the real CLI's own
+// flag.ContinueOnError + explicit exit convention, and returns the
+// remaining positional arguments.
+func parseFlags(fs *flag.FlagSet, args []string) []string {
+	fs.SetOutput(os.Stderr)
+	if err := fs.Parse(args); err != nil {
+		os.Exit(2)
+	}
+	return fs.Args()
+}
+
+// requireEnv fails the invocation (usage, exit 2) if any of names is
+// empty, returning every value for convenience.
+func requireEnv(names ...string) map[string]string {
+	values := map[string]string{}
+	for _, n := range names {
+		v := os.Getenv(n)
+		if v == "" {
+			usageFail("required %s is not set", n)
+		}
+		values[n] = v
+	}
+	return values
+}
+
+// requireCallerContext validates the caller-identity contract every
+// manager and message verb shares (HOP_RUN_ID/HOP_SESSION_ID/
+// HOP_INCARNATION_ID, every one UUID-shaped) — task create/retry, plan
+// close and msg send/next/wait/ack all resolve their caller this same
+// way, regardless of role (manager, worker or reviewer).
+func requireCallerContext() {
+	env := requireEnv("HOP_RUN_ID", "HOP_SESSION_ID", "HOP_INCARNATION_ID")
+	requireUUID("HOP_RUN_ID", env["HOP_RUN_ID"])
+	requireUUID("HOP_SESSION_ID", env["HOP_SESSION_ID"])
+	requireUUID("HOP_INCARNATION_ID", env["HOP_INCARNATION_ID"])
+}
+
+func requireUUID(label, value string) string {
+	if !isUUIDShape(value) {
+		usageFail("%s = %q is not UUID-shaped", label, value)
+	}
+	return value
+}
+
+func isUUIDShape(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if c != '-' {
+				return false
+			}
+			continue
+		}
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// requireReadableFile fails the invocation if path is empty or cannot be
+// read — the fake's own counterpart of the real CLI's file-first
+// protocol (task create's --file, msg send's --file, review submit's
+// --reasons-file all read their body before any scripted outcome).
+func requireReadableFile(label, path string) []byte {
+	if path == "" {
+		usageFail("%s is required", label)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		usageFail("%s %q is not readable: %v", label, path, err)
+	}
+	return body
+}
+
+// runResultSubmit validates hop result submit's real contract:
+// --summary/--commit required, no positional arguments, a worker context
+// (HOP_RUN_ID/HOP_TASK_ID/HOP_ATTEMPT_ID/HOP_INCARNATION_ID, every one
+// UUID-shaped — no HOP_SESSION_ID, matching cmd/hop's own SubmitResult
+// call).
+func runResultSubmit(args []string) {
+	fs := flag.NewFlagSet("result submit", flag.ContinueOnError)
+	summary := fs.String("summary", "", "")
+	commit := fs.String("commit", "", "")
+	rest := parseFlags(fs, args)
+	if len(rest) > 0 {
+		usageFail("result submit: unexpected argument %q", rest[0])
+	}
+	if *summary == "" {
+		usageFail("result submit: --summary is required")
+	}
+	if *commit == "" {
+		usageFail("result submit: --commit is required")
+	}
+	env := requireEnv("HOP_RUN_ID", "HOP_TASK_ID", "HOP_ATTEMPT_ID", "HOP_INCARNATION_ID")
+	requireUUID("HOP_RUN_ID", env["HOP_RUN_ID"])
+	requireUUID("HOP_TASK_ID", env["HOP_TASK_ID"])
+	requireUUID("HOP_ATTEMPT_ID", env["HOP_ATTEMPT_ID"])
+	requireUUID("HOP_INCARNATION_ID", env["HOP_INCARNATION_ID"])
+	fmt.Println("accepted 77777777-7777-4777-8777-777777777777")
+}
+
+// runTaskCreate validates hop task create's real contract:
+// --title/--file required, --depends-on repeatable (each value
+// UUID-shaped — every dependency this fake itself ever mints is), no
+// positional arguments, manager context. Validation runs BEFORE any
+// scripted refused/transient outcome, matching the real CLI's own
+// usage-before-business-logic order.
+func runTaskCreate(args []string) {
+	fs := flag.NewFlagSet("task create", flag.ContinueOnError)
+	title := fs.String("title", "", "")
+	file := fs.String("file", "", "")
+	var deps stringListFlag
+	fs.Var(&deps, "depends-on", "")
+	fs.String("request-id", "", "")
+	rest := parseFlags(fs, args)
+	if len(rest) > 0 {
+		usageFail("task create: unexpected argument %q", rest[0])
+	}
+	if *title == "" {
+		usageFail("task create: --title is required")
+	}
+	requireReadableFile("--file", *file)
+	for _, dep := range deps {
+		requireUUID("--depends-on", dep)
+	}
+	requireCallerContext()
+
+	if os.Getenv("FAKE_HOP_TASK_CREATE_REFUSED") == "1" {
+		refuse("dependency-cycle")
+	}
+	if transientCallsLeft("FAKE_HOP_TASK_CREATE_TRANSIENT_COUNT", "FAKE_HOP_TASK_CREATE_TRANSIENT_COUNTER_FILE") {
+		fmt.Println("transient: run not yet running; retry")
 		os.Exit(1)
 	}
+	n := nextCounter(os.Getenv("FAKE_HOP_TASK_COUNTER_FILE"))
+	fmt.Printf("task 00000000-0000-4000-8000-%012d t%d created\n", n, n)
+}
+
+// runTaskRetry validates hop task retry's real contract: --reason
+// required, exactly one positional task-id (UUID-shaped), manager
+// context.
+func runTaskRetry(args []string) {
+	fs := flag.NewFlagSet("task retry", flag.ContinueOnError)
+	reason := fs.String("reason", "", "")
+	fs.String("request-id", "", "")
+	rest := parseFlags(fs, args)
+	if len(rest) != 1 {
+		usageFail("task retry: exactly one task-id argument is required")
+	}
+	if *reason == "" {
+		usageFail("task retry: --reason is required")
+	}
+	requireUUID("task-id", rest[0])
+	requireCallerContext()
+	fmt.Println("retry accepted t0 attempt 2")
+}
+
+// runPlanClose validates hop plan close's real contract: no positional
+// arguments, manager context.
+func runPlanClose(args []string) {
+	fs := flag.NewFlagSet("plan close", flag.ContinueOnError)
+	fs.String("request-id", "", "")
+	rest := parseFlags(fs, args)
+	if len(rest) > 0 {
+		usageFail("plan close: unexpected argument %q", rest[0])
+	}
+	requireCallerContext()
+	fmt.Println("plan closed")
+}
+
+// runMsgSend validates hop msg send's real contract: --kind required;
+// --to required unless --kind answer (forbidden then); --reply-to
+// required for --kind answer (forbidden otherwise); exactly one of
+// --file/--body, the file readable; no positional arguments; a session
+// context (every sender role — manager, worker, reviewer — resolves the
+// same way).
+func runMsgSend(args []string) {
+	fs := flag.NewFlagSet("msg send", flag.ContinueOnError)
+	to := fs.String("to", "", "")
+	kind := fs.String("kind", "", "")
+	replyTo := fs.String("reply-to", "", "")
+	fs.String("relay-of", "", "")
+	file := fs.String("file", "", "")
+	fs.String("body", "", "")
+	fs.String("request-id", "", "")
+	rest := parseFlags(fs, args)
+	supplied := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { supplied[f.Name] = true })
+	if len(rest) > 0 {
+		usageFail("msg send: unexpected argument %q", rest[0])
+	}
+	if *kind == "" {
+		usageFail("msg send: --kind is required")
+	}
+	if *kind == "answer" {
+		if supplied["to"] {
+			usageFail("msg send: --to is forbidden for --kind answer")
+		}
+		if *replyTo == "" {
+			usageFail("msg send: --reply-to is required for --kind answer")
+		}
+	} else {
+		if *to == "" {
+			usageFail("msg send: --to is required")
+		}
+		if supplied["reply-to"] {
+			usageFail("msg send: --reply-to is only valid for --kind answer")
+		}
+	}
+	if supplied["file"] == supplied["body"] {
+		usageFail("msg send: exactly one of --file and --body is required")
+	}
+	if supplied["file"] {
+		requireReadableFile("--file", *file)
+	}
+	requireCallerContext()
+	fmt.Println("sent 99999999-9999-4999-8999-999999999999")
+}
+
+// runMsgFetch validates hop msg next/wait's real contract: no positional
+// arguments, a session context. waitVerb selects between the two verbs'
+// DISTINCT empty-queue lines (design section 7's grammar: next's is the
+// fixed "none: no queued message"; wait's names its own timeout) once
+// the scripted message sequence is exhausted or absent.
+func runMsgFetch(args []string, waitVerb bool) {
+	fs := flag.NewFlagSet("msg fetch", flag.ContinueOnError)
+	var timeout *string
+	if waitVerb {
+		timeout = fs.String("timeout", "3s", "")
+	}
+	rest := parseFlags(fs, args)
+	if len(rest) > 0 {
+		usageFail("msg next/wait: unexpected argument %q", rest[0])
+	}
+	requireCallerContext()
+	if printScripted() {
+		return
+	}
+	if waitVerb {
+		time.Sleep(50 * time.Millisecond)
+		fmt.Println("none: no message within " + *timeout + "; run hop msg wait again")
+		return
+	}
+	fmt.Println("none: no queued message")
+}
+
+// runMsgAck validates hop msg ack's real contract: exactly one
+// positional message-id, a session context. The message id itself is
+// NEVER validated as UUID-shaped: fakeMessageBlock's own scripted ids
+// are test-owned labels, matching how real message ids are opaque too.
+func runMsgAck(args []string) {
+	fs := flag.NewFlagSet("msg ack", flag.ContinueOnError)
+	rest := parseFlags(fs, args)
+	if len(rest) != 1 {
+		usageFail("msg ack: exactly one message-id argument is required")
+	}
+	requireCallerContext()
+	fmt.Println("acknowledged " + rest[0])
+}
+
+// runReviewSubmit validates hop review submit's real contract:
+// --verdict (approve|reject)/--subject/--reasons-file all required (the
+// reasons file readable), no positional arguments, the reviewer context
+// (HOP_RUN_ID/HOP_TASK_ID/HOP_ATTEMPT_ID/HOP_SESSION_ID/
+// HOP_INCARNATION_ID, every one UUID-shaped).
+func runReviewSubmit(args []string) {
+	fs := flag.NewFlagSet("review submit", flag.ContinueOnError)
+	verdict := fs.String("verdict", "", "")
+	subject := fs.String("subject", "", "")
+	reasonsFile := fs.String("reasons-file", "", "")
+	rest := parseFlags(fs, args)
+	if len(rest) > 0 {
+		usageFail("review submit: unexpected argument %q", rest[0])
+	}
+	if *verdict != "approve" && *verdict != "reject" {
+		usageFail("review submit: --verdict must be approve or reject")
+	}
+	if *subject == "" {
+		usageFail("review submit: --subject is required")
+	}
+	requireReadableFile("--reasons-file", *reasonsFile)
+	env := requireEnv("HOP_RUN_ID", "HOP_TASK_ID", "HOP_ATTEMPT_ID", "HOP_SESSION_ID", "HOP_INCARNATION_ID")
+	for label, v := range env {
+		requireUUID(label, v)
+	}
+	fmt.Println("verdict accepted 88888888-8888-4888-8888-888888888888")
+}
+
+// runStatus validates hop status's own minimal contract as this fake's
+// only non-worker-plumbing verb: -C and -run required.
+func runStatus(args []string) {
+	fs := flag.NewFlagSet("status", flag.ContinueOnError)
+	repoDir := fs.String("C", "", "")
+	runArg := fs.String("run", "", "")
+	rest := parseFlags(fs, args)
+	if len(rest) > 0 {
+		usageFail("status: unexpected argument %q", rest[0])
+	}
+	if *repoDir == "" {
+		usageFail("status: -C is required")
+	}
+	if *runArg == "" {
+		usageFail("status: -run is required")
+	}
+	if os.Getenv("FAKE_HOP_STATUS_REJECTED") == "1" {
+		fmt.Println("run r1 aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\n  state:         running\n  guard shortfall: verdict-rejected")
+	} else {
+		fmt.Println("run r1 aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\n  state:         running")
+	}
+}
+
+// stringListFlag is a repeatable string flag (--depends-on), mirroring
+// cmd/hop's own stringList.
+type stringListFlag []string
+
+func (s *stringListFlag) String() string { return strings.Join(*s, ",") }
+func (s *stringListFlag) Set(v string) error {
+	*s = append(*s, v)
+	return nil
 }
 
 func nextCounter(path string) int {
@@ -146,25 +490,26 @@ func transientCallsLeft(countEnv, counterFileEnv string) bool {
 	return true
 }
 
-func printScripted() {
+// printScripted serves the next block of the test-authored msg script,
+// if one is configured and has a block left; false when there is nothing
+// to deliver (no script configured, or the script is exhausted), leaving
+// the caller to render its own verb-specific empty-queue line.
+func printScripted() bool {
 	scriptPath := os.Getenv("FAKE_HOP_MSG_SCRIPT")
 	idxPath := os.Getenv("FAKE_HOP_MSG_INDEX")
 	content, err := os.ReadFile(scriptPath)
 	if err != nil {
-		time.Sleep(50 * time.Millisecond)
-		fmt.Println("none: no message within 3s; run hop msg wait again")
-		return
+		return false
 	}
 	blocks := strings.Split(string(content), "\n---\n")
 	idxData, _ := os.ReadFile(idxPath)
 	idx, _ := strconv.Atoi(strings.TrimSpace(string(idxData)))
 	if idx >= len(blocks) {
-		time.Sleep(50 * time.Millisecond)
-		fmt.Println("none: no message within 3s; run hop msg wait again")
-		return
+		return false
 	}
 	fmt.Print(blocks[idx])
 	_ = os.WriteFile(idxPath, []byte(strconv.Itoa(idx+1)), 0o600)
+	return true
 }
 `
 
@@ -770,6 +1115,7 @@ func TestFixtureWorkerHoldBarrier(t *testing.T) {
 		"HOP_RUN_ID=" + runID,
 		"HOP_TASK_ID=" + taskID,
 		"HOP_ATTEMPT_ID=" + attemptID,
+		"HOP_SESSION_ID=99999999-8888-4777-8666-555555555555",
 		"HOP_INCARNATION_ID=cccccccc-cccc-4ccc-8ccc-cccccccccccc",
 		"HOP_ROLE=implementer",
 		"FAKE_HOP_MSG_SCRIPT=" + scriptPath,
