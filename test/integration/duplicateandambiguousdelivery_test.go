@@ -113,7 +113,8 @@ func TestRealProcessDuplicateAndAmbiguousDelivery(t *testing.T) {
 	// (design section 7's in-flight age is computed from the delivery
 	// row's own timestamp), used below as an upper bound on the parsed
 	// in-flight age.
-	obs := waitForObservation(t, filepath.Join(scratchDir, "fetch-crash-observed-"+attempt1ID+".txt"))
+	observationPath := filepath.Join(scratchDir, "fetch-crash-observed-"+attempt1ID+".txt")
+	obs := waitForObservation(t, observationPath)
 	deliveredApprox := time.Now()
 	if obs.Fields["id"] != m1 {
 		t.Fatalf("worker's fetch-crash observation names id=%s, want m1=%s", obs.Fields["id"], m1)
@@ -121,8 +122,33 @@ func TestRealProcessDuplicateAndAmbiguousDelivery(t *testing.T) {
 	if fx.messageAcked(t, m1) {
 		t.Fatalf("m1 was acked before the self-kill; the deterministic kill point did not hold")
 	}
+	// The resumed incarnation writes to this SAME fixed path (keyed by
+	// attempt id, shared across incarnations of one attempt, like the
+	// self-kill control file). Removed here so the later wait for the
+	// resumed incarnation's own observation cannot spuriously succeed
+	// against this already-consumed file.
+	if err := os.Remove(observationPath); err != nil {
+		t.Fatalf("remove fetch-crash observation file before relaunch: %v", err)
+	}
 
 	fx.killSession(t, session1ID, attempt1ID)
+
+	// killSession's own self-kill control file is keyed by ATTEMPT id
+	// (fixtureworker_test.go's watchForSelfKill call in runWorker), never
+	// removed by killSession itself -- harmless for every EXISTING
+	// scenario, whose next attempt (a RETRY) always gets a fresh attempt
+	// id of its own, but this scenario's cold relaunch deliberately
+	// reuses the SAME attempt id. Left in place, the resumed incarnation's
+	// own background watchForSelfKill goroutine would find this file
+	// already present the instant it starts and self-kill itself again
+	// before ever reaching its own fetch -- removed here, exactly the
+	// "remove its own control file before hop resume" one-shot discipline
+	// RelayedQuestion's manager barrier documents (there, a brand-new
+	// session id makes this unnecessary; here, the session changes but
+	// the attempt id, which this file is keyed by, does not).
+	if err := os.Remove(filepath.Join(scratchDir, "self-kill-"+attempt1ID)); err != nil {
+		t.Fatalf("remove self-kill control file before relaunch: %v", err)
+	}
 
 	// Both the worker and the controller are killed before any
 	// reconciliation: a live controller would otherwise reconcile the
@@ -218,7 +244,7 @@ func TestRealProcessDuplicateAndAmbiguousDelivery(t *testing.T) {
 	// NEW session -- proven directly from the journal, and via the
 	// resumed worker's own observation of the exact fetched id, before
 	// releasing it to ack.
-	resumedObs := waitForObservation(t, filepath.Join(scratchDir, "fetch-crash-observed-"+attempt1ID+".txt"))
+	resumedObs := waitForObservation(t, observationPath)
 	if resumedObs.Fields["id"] != m1 {
 		t.Fatalf("resumed worker's fetch-crash observation names id=%s, want the re-served m1=%s", resumedObs.Fields["id"], m1)
 	}
