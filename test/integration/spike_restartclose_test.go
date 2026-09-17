@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	goruntime "runtime"
 	"slices"
@@ -37,28 +38,69 @@ const standInAgentName = "droid"
 // for a resume plan to be built at all.
 const standInAgentSource = "herdr:droid"
 
-// standInRecorderScript is the stand-in agent, rendered with this test's
+// standInRecorderSource is the stand-in agent, rendered with this test's
 // own absolute paths (marker, records directory, gate): it records one line
 // per invocation into a single append-only marker file, dumps its complete
 // environment to a pid-named file, and then holds until its gate file
 // appears — so a fired restore is durable positive evidence AND stays the
 // restored pane's live foreground occupant for inspection. The paths are
 // baked in rather than read from the environment, because the environment a
-// restored pane's shell carries is itself one of this probe's findings.
-// The gate is the same release discipline openGatedPane uses for a pane
-// command.
-const standInRecorderScript = `#!/bin/sh
-marker='%s'
-records='%s'
-gate='%s'
-{
-  printf 'invocation pid=%%s ppid=%%s argv:' "$$" "$PPID"
-  for arg in "$@"; do printf ' [%%s]' "$arg"; done
-  printf '\n'
-} >> "$marker"
-env | sort > "$records/env-$$.txt.tmp"
-mv "$records/env-$$.txt.tmp" "$records/env-$$.txt"
-while [ ! -e "$gate" ]; do sleep 0.1; done
+// restored pane's shell carries is itself one of this probe's findings. The
+// gate is the same release discipline openGatedPane uses for a pane command.
+//
+// It is COMPILED rather than written as a shell script, and that is the
+// whole point of the extra build: a script's argv[0] is the interpreter, so
+// a restored script reports argv ["/bin/sh" "<path>" "--resume" "<ref>"] and
+// MatchRestoredHarness — which reads filepath.Base(argv[0]) — would not
+// recognize it. Production's harness is an executable, not a script (the
+// installed claude is a Mach-O binary), so a bare name typed by Herdr's
+// restore yields argv ["<name>" "--resume" "<ref>"]. Compiling the stand-in
+// is what makes this probe's observed argv carry production's shape, so the
+// predicate the close rule depends on is exercised here rather than
+// inferred from another test.
+const standInRecorderSource = `package main
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+)
+
+const (
+	marker  = %q
+	records = %q
+	gate    = %q
+)
+
+func main() {
+	var line strings.Builder
+	fmt.Fprintf(&line, "invocation pid=%%d ppid=%%d argv:", os.Getpid(), os.Getppid())
+	for _, arg := range os.Args[1:] {
+		fmt.Fprintf(&line, " [%%s]", arg)
+	}
+	line.WriteString("\n")
+	// One O_APPEND write, so concurrent invocations cannot interleave.
+	if file, err := os.OpenFile(marker, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o600); err == nil {
+		fmt.Fprint(file, line.String())
+		file.Close()
+	}
+	environ := os.Environ()
+	sort.Strings(environ)
+	dump := []byte(strings.Join(environ, "\n") + "\n")
+	path := filepath.Join(records, fmt.Sprintf("env-%%d.txt", os.Getpid()))
+	if err := os.WriteFile(path+".tmp", dump, 0o600); err == nil {
+		os.Rename(path+".tmp", path)
+	}
+	for {
+		if _, err := os.Stat(gate); err == nil {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
 `
 
 // standInRecorder is the installed stand-in agent and the evidence it
@@ -127,11 +169,7 @@ func installStandInAgent(t *testing.T, server *testServer, artifacts *artifactDi
 		Records: artifacts.dir(t, "records"),
 		Gate:    filepath.Join(artifacts.dir(t, "gates"), "stand-in-release"),
 	}
-	path := filepath.Join(recorder.Dir, standInAgentName)
-	script := fmt.Sprintf(standInRecorderScript, recorder.Marker, recorder.Records, recorder.Gate)
-	if err := os.WriteFile(path, []byte(script), 0o755); err != nil { //nolint:gosec // G306: a stand-in agent must be executable; it lives in this test's private roots.
-		t.Fatal(err)
-	}
+	buildStandInAgent(t, filepath.Join(recorder.Dir, standInAgentName), &recorder)
 	if err := os.WriteFile(recorder.Marker, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -147,6 +185,40 @@ func installStandInAgent(t *testing.T, server *testServer, artifacts *artifactDi
 		}
 	})
 	return recorder
+}
+
+// buildStandInAgent compiles standInRecorderSource, with this test's own
+// paths baked in, to an executable at path — the stand-in agent's name on
+// the pane shell's PATH.
+func buildStandInAgent(t *testing.T, path string, recorder *standInRecorder) {
+	t.Helper()
+	src, err := os.MkdirTemp("", "hop-spike-standin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if removeErr := os.RemoveAll(src); removeErr != nil {
+			t.Logf("remove the stand-in source: %v", removeErr)
+		}
+	})
+	source := fmt.Sprintf(standInRecorderSource, recorder.Marker, recorder.Records, recorder.Gate)
+	if err = os.WriteFile(filepath.Join(src, "go.mod"), []byte("module standinagent\n\ngo 1.21\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(filepath.Join(src, "main.go"), []byte(source), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Fatalf("the go tool is required to build the stand-in agent: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+	defer cancel()
+	build := exec.CommandContext(ctx, goBin, "build", "-o", path, ".") //nolint:gosec // G204: the go tool builds this test's own generated module into this test's own roots.
+	build.Dir = src
+	if out, buildErr := build.CombinedOutput(); buildErr != nil {
+		t.Fatalf("go build the stand-in agent: %v\n%s", buildErr, out)
+	}
 }
 
 // invocations reads every line the recorder has written so far.
@@ -675,10 +747,27 @@ func TestSpikeRestoredPaneCloseDiscardsResume(t *testing.T) {
 	if fired.Process.ShellPID == control.ShellPID {
 		t.Errorf("the control pane's process is still the pre-restart pid %d; want the restored agent's own process", control.ShellPID)
 	}
-	if !slices.ContainsFunc(fired.Process.Foreground, func(p app.ProcessInfo) bool {
-		return slices.Contains(p.Argv, "--resume") && slices.Contains(p.Argv, control.SessionRef)
-	}) {
-		t.Errorf("the control pane's foreground = %v, want a member running the restore plan's own --resume %s", fired.Foreground, control.SessionRef)
+	// The three properties the close rule's restored-harness conjunct reads
+	// (internal/app's MatchRestoredHarness, retyped here rather than
+	// derived): argv[0]'s BASENAME is the agent's own name, an argv element
+	// equal to the resume flag is IMMEDIATELY followed by one EXACTLY equal
+	// to the native reference, and EXACTLY ONE foreground member satisfies
+	// both — the last is what makes that predicate's ambiguous outcome a
+	// real case rather than a theoretical one.
+	var matched []app.ProcessInfo
+	for _, fg := range fired.Process.Foreground {
+		if len(fg.Argv) == 0 || filepath.Base(fg.Argv[0]) != standInAgentName {
+			continue
+		}
+		for i := 1; i+1 < len(fg.Argv); i++ {
+			if fg.Argv[i] == "--resume" && fg.Argv[i+1] == control.SessionRef {
+				matched = append(matched, fg)
+				break
+			}
+		}
+	}
+	if len(matched) != 1 {
+		t.Errorf("the control pane's foreground holds %d members running the restore plan for %s, want exactly 1; foreground = %v", len(matched), control.SessionRef, fired.Foreground)
 	}
 	artifacts.save(t, "control-after-resume.txt", strings.Join(fired.Foreground, "\n")+"\n")
 	t.Logf("the already-resumed control pane holds: %s", strings.Join(fired.Foreground, "; "))
@@ -710,4 +799,84 @@ func TestSpikeRestoredPaneCloseDiscardsResume(t *testing.T) {
 	if got := len(recorder.lines(t)); got != 2 {
 		t.Errorf("the stand-in recorded %d invocations over the run, want exactly the control's two (one per restart it survived):\n%s", got, recorder.invocations(t))
 	}
+}
+
+// TestSpikeRecordedPaneIDCanAddressADifferentPane is the executed probe
+// behind the restart-close rule's IDENTIFICATION requirement
+// (docs/plan/phase-3-design.md sections 4 and 6): a recorded pane id is not
+// a durable address across a restart, so closing one on a changed server
+// lifetime must first identify the pane as the session's own.
+//
+// The mechanism is not pane renumbering — a workspace's pane counter never
+// regresses, within a lifetime (repos/herdr/src/workspace.rs,
+// register_new_pane_with_number advances the counter and unregister_pane
+// does not lower it) or across a restore (repos/herdr/src/persist/restore.rs
+// re-seeds it to the saved high-water mark). It is that a pane id is
+// `<workspace id>:p<n>` and WORKSPACE ids are reissued: the id counter is
+// re-seeded from the highest RESTORED workspace, so a workspace closed
+// before the restart leaves its id free for the next new one
+// (TestSpikeWorkspaceIDReissuedAfterRestart pins that half). The pane id
+// composed from a reissued workspace id therefore answers for a pane that
+// belongs to somebody else.
+//
+// What makes the observation decisive is the pair: the recorded pane id
+// ANSWERS, and the recorded creation label — a UUID this run minted —
+// answers nothing. The durable identity is the label; the pane id is a
+// lookup key that is only trustworthy once something else has vouched for
+// it.
+func TestSpikeRecordedPaneIDCanAddressADifferentPane(t *testing.T) {
+	artifacts := newArtifactDir(t)
+	server := prepareServer(t, artifacts)
+	server.start(t)
+	runtime := herdr.NewRuntime(server.socketPath)
+
+	create := func(name string) app.WorkspaceHandle {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(t.Context(), callTimeout)
+		defer cancel()
+		handle, err := runtime.CreateWorkspace(ctx, app.WorkspaceRequest{
+			Cwd:   server.workDir(),
+			Label: "hop-spike-idreuse-" + name + "-" + newSpikeUUID(t),
+		})
+		if err != nil {
+			t.Fatalf("CreateWorkspace(%s): %v", name, err)
+		}
+		return handle
+	}
+
+	// kept survives the restart and seeds the restored counter; closed is
+	// the one whose id falls free.
+	kept := create("kept")
+	closed := create("closed")
+	closedLabel := "hop-spike-idreuse-closed-label-" + newSpikeUUID(t)
+	renamePane(t, server, closed.PaneID, closedLabel)
+	requireLabelResolves(t, runtime, &vanishingPane{Label: closedLabel, PaneID: closed.PaneID}, "before the workspace is closed")
+	t.Logf("before the restart: kept workspace %s (pane %s), closed workspace %s (pane %s)", kept.WorkspaceID, kept.PaneID, closed.WorkspaceID, closed.PaneID)
+
+	server.call(t, "workspace.close", map[string]any{"workspace_id": closed.WorkspaceID}, nil)
+	if !waitUntil(func() bool { return observePane(t, runtime, closed.PaneID).NotFound }) {
+		t.Fatalf("pane %s still answers after its workspace was closed", closed.PaneID)
+	}
+
+	server.restart(t)
+
+	// A fresh workspace after the restart takes the closed workspace's id
+	// back, and with it the whole pane-id namespace underneath it.
+	fresh := create("fresh")
+	t.Logf("after the restart: fresh workspace %s (pane %s); the closed workspace was %s (pane %s)", fresh.WorkspaceID, fresh.PaneID, closed.WorkspaceID, closed.PaneID)
+	if fresh.WorkspaceID != closed.WorkspaceID {
+		t.Skipf("the restarted server issued %s to the new workspace rather than reusing the closed %s; this run cannot pin the reuse", fresh.WorkspaceID, closed.WorkspaceID)
+	}
+	if fresh.PaneID != closed.PaneID {
+		t.Fatalf("the new workspace's root pane is %s, not the closed workspace's recorded %s; the collision this probe is about did not occur", fresh.PaneID, closed.PaneID)
+	}
+
+	// The decisive pair: the recorded id answers, and it is NOT ours.
+	answering := observePane(t, runtime, closed.PaneID)
+	if !answering.Answered {
+		t.Fatalf("the recorded pane id %s does not answer after the restart (err=%v); the collision this probe is about did not occur", closed.PaneID, answering.Err)
+	}
+	requireLabelAnswersNothing(t, runtime, closedLabel, "after the restart reissued the pane id to another workspace")
+	t.Logf("the recorded pane id %s now answers for the new workspace's own pane (foreground %v) while the recorded label %s answers nothing: a close by recorded id alone would have destroyed a pane this run never owned", closed.PaneID, answering.Foreground, closedLabel)
+	artifacts.save(t, "reissued-pane-id.txt", fmt.Sprintf("recorded pane id %s, recorded label %s\nafter the restart it answers: %v\n", closed.PaneID, closedLabel, answering.Foreground))
 }
