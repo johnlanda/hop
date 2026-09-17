@@ -488,8 +488,7 @@ func (s *fakeStore) SendMessage(_ context.Context, send app.MessageSend) (app.Me
 	if !ok || senderRow.value.RunID != send.RunID {
 		return app.MessageOutcome{Kind: app.MessageRefused, Reason: app.GrammarReasonUnauthorized, Detail: "session does not belong to this run"}, nil
 	}
-	binding, hasBinding := s.currentBindingLocked(send.Sender.SessionID)
-	if !hasBinding || binding.IncarnationID != send.IncarnationID || binding.Superseded {
+	if !s.sessionIncarnationCurrentLocked(send.Sender.SessionID, send.IncarnationID) {
 		return app.MessageOutcome{Kind: app.MessageRefused, Reason: app.GrammarReasonStale, Detail: "incarnation is not current"}, nil
 	}
 
@@ -628,8 +627,7 @@ func (s *fakeStore) FetchNextMessage(_ context.Context, fetch app.MessageFetch) 
 	if !ok || sessionRow.value.RunID != fetch.RunID {
 		return app.MessageDelivery{}, false, fmt.Errorf("%w: session %s does not belong to run %s", app.ErrMessagingUnauthorized, fetch.SessionID, fetch.RunID)
 	}
-	binding, hasBinding := s.currentBindingLocked(fetch.SessionID)
-	if !hasBinding || binding.IncarnationID != fetch.IncarnationID || binding.Superseded {
+	if !s.sessionIncarnationCurrentLocked(fetch.SessionID, fetch.IncarnationID) {
 		return app.MessageDelivery{}, false, fmt.Errorf("%w: session %s incarnation %s is not current", app.ErrMessagingUnauthorized, fetch.SessionID, fetch.IncarnationID)
 	}
 	resolvedAddress, ok := s.resolveSessionAddressLocked(fetch.SessionID)
@@ -701,8 +699,7 @@ func (s *fakeStore) AckMessage(_ context.Context, ack app.MessageAck) (app.Messa
 			break
 		}
 	}
-	binding, hasBinding := s.currentBindingLocked(ack.SessionID)
-	incarnationCurrent := hasBinding && binding.IncarnationID == ack.IncarnationID && !binding.Superseded
+	incarnationCurrent := s.sessionIncarnationCurrentLocked(ack.SessionID, ack.IncarnationID)
 
 	outcomeVal, err := run.AcceptAck(msg, priorAck, run.AckContext{DeliveredToSession: deliveredToSession, IncarnationCurrent: incarnationCurrent}, run.Ack{SessionID: ack.SessionID, IncarnationID: ack.IncarnationID}, now)
 	switch {
@@ -836,8 +833,7 @@ func (s *fakeStore) CreateTask(_ context.Context, req app.TaskCreate) (app.TaskC
 	if !ok || sRow.value.Role != run.RoleManager || sRow.value.RunID != req.RunID {
 		return app.TaskCreated{Outcome: app.WorkflowRefused, Reason: app.GrammarReasonNotManager, Detail: "caller is not the run's manager"}, nil
 	}
-	binding, hasBinding := s.currentBindingLocked(req.Session)
-	if !hasBinding || binding.IncarnationID != req.IncarnationID || binding.Superseded {
+	if !s.sessionIncarnationCurrentLocked(req.Session, req.IncarnationID) {
 		return app.TaskCreated{Outcome: app.WorkflowRefused, Reason: app.GrammarReasonStale, Detail: "incarnation is not current"}, nil
 	}
 	rRow, ok := s.Runs[req.RunID]
@@ -909,8 +905,7 @@ func (s *fakeStore) RequestRetry(_ context.Context, req app.RetryRequest) (app.R
 	if !ok || sRow.value.Role != run.RoleManager || sRow.value.RunID != req.RunID {
 		return app.RetryAccepted{Outcome: app.WorkflowRefused, Reason: app.GrammarReasonNotManager, Detail: "caller is not the run's manager"}, nil
 	}
-	binding, hasBinding := s.currentBindingLocked(req.Session)
-	if !hasBinding || binding.IncarnationID != req.IncarnationID || binding.Superseded {
+	if !s.sessionIncarnationCurrentLocked(req.Session, req.IncarnationID) {
 		return app.RetryAccepted{Outcome: app.WorkflowRefused, Reason: app.GrammarReasonStale, Detail: "incarnation is not current"}, nil
 	}
 	rRow, ok := s.Runs[req.RunID]
@@ -1011,8 +1006,7 @@ func (s *fakeStore) ClosePlan(_ context.Context, req app.PlanClose) (app.PlanClo
 	if !ok || sRow.value.Role != run.RoleManager || sRow.value.RunID != req.RunID {
 		return app.PlanCloseResult{Outcome: app.WorkflowRefused, Reason: app.GrammarReasonNotManager, Detail: "caller is not the run's manager"}, nil
 	}
-	binding, hasBinding := s.currentBindingLocked(req.Session)
-	if !hasBinding || binding.IncarnationID != req.IncarnationID || binding.Superseded {
+	if !s.sessionIncarnationCurrentLocked(req.Session, req.IncarnationID) {
 		return app.PlanCloseResult{Outcome: app.WorkflowRefused, Reason: app.GrammarReasonStale, Detail: "incarnation is not current"}, nil
 	}
 	rRow, ok := s.Runs[req.RunID]
@@ -1083,8 +1077,7 @@ func (s *fakeStore) SubmitReview(_ context.Context, submission app.ReviewSubmiss
 		}
 	}
 
-	binding, hasBinding := s.currentBindingLocked(submission.Session)
-	incarnationCurrent := hasBinding && binding.IncarnationID == submission.IncarnationID && !binding.Superseded
+	incarnationCurrent := s.sessionIncarnationCurrentLocked(submission.Session, submission.IncarnationID)
 	claim, hasClaim := s.LaunchClaims[submission.IncarnationID]
 	launchClaimSettled := hasClaim && claim.State == app.LaunchClaimExeced
 	mailboxClear := s.mailboxClearLocked(submission.TaskID)
