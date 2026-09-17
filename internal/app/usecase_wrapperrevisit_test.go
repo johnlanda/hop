@@ -12,7 +12,7 @@ import (
 
 // The two transition reasons a reconciling feature session can carry,
 // retyped from internal/app's own constants (sessionReconcileResumeAmbiguous
-// and sessionReconcileLaunchCorroboration) rather than derived from them, so
+// and TransitionReasonLaunchCorroboration) rather than derived from them, so
 // either side drifting fails here.
 const (
 	liveCorroborationReason = "launch corroboration: another process on the pane carries the launch identity; re-inspected every pass"

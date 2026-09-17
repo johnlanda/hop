@@ -18,13 +18,18 @@ type SessionLaunchProgress struct {
 	Progress  LaunchProgress
 }
 
-// sessionReconcileLaunchCorroboration is the reason the LIVE launch
+// TransitionReasonLaunchCorroboration is the reason the LIVE launch
 // corroboration records when it fails closed on a foreground group that
 // holds another process carrying the launch identity. It is value-free,
 // and it is deliberately not the resume reason: this reconciliation is
 // re-inspected by every later round, and a later clean observation of the
 // same pane settles it.
-const sessionReconcileLaunchCorroboration = "launch corroboration: another process on the pane carries the launch identity; re-inspected every pass"
+//
+// Exported because the transition journal is read outside this package:
+// a fixture that reproduces this state has to write the SAME reason the
+// live path writes, and a guard over reconciling transitions tells this
+// one from every other by it.
+const TransitionReasonLaunchCorroboration = "launch corroboration: another process on the pane carries the launch identity; re-inspected every pass"
 
 // CorroborateSessionLaunches performs one inspection round for every
 // non-terminal session of a feature-mode run currently in SessionLaunching
@@ -248,7 +253,7 @@ func (c *Controller) corroborateSessionLaunch(ctx context.Context, handle RunHan
 		}
 		return LaunchSettled, nil
 	case SettlementForkingWrapper:
-		if err := c.markSessionReconciling(ctx, handle, session.ID, sessionReconcileLaunchCorroboration); err != nil {
+		if err := c.markSessionReconciling(ctx, handle, session.ID, TransitionReasonLaunchCorroboration); err != nil {
 			return "", err
 		}
 		return LaunchNeedsInteraction, nil

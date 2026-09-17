@@ -71,6 +71,35 @@ func (f *launchingFeature) reconcile(t *testing.T) {
 	}
 }
 
+// managerTransition reads the newest transition row recorded for the
+// manager session, rendered "<from>-><to>: <reason>", or "" when none.
+// The fixture that moves a session to reconciling must journal what the
+// live controller journals, or a reconciling session is indistinguishable
+// from any other in the record.
+func (f *launchingFeature) managerTransition(t *testing.T) string {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(f.StateRoot, "hop.db")+"?mode=ro&_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open raw db for a read: %v", err)
+	}
+	defer func() {
+		if closeErr := db.Close(); closeErr != nil {
+			t.Errorf("close raw db after a read: %v", closeErr)
+		}
+	}()
+	var rendered string
+	err = db.QueryRowContext(context.Background(), `
+		SELECT COALESCE((SELECT from_state || '->' || to_state || ': ' || reason
+		                 FROM transitions
+		                 WHERE entity_kind = 'session' AND entity_id = ?1
+		                 ORDER BY at DESC, rowid DESC LIMIT 1), '')`,
+		f.base.ManagerID).Scan(&rendered)
+	if err != nil {
+		t.Fatalf("read the manager's transition rows: %v", err)
+	}
+	return rendered
+}
+
 // statusDetail renders `hop status -run` for this run through the built
 // binary.
 func (f *launchingFeature) statusDetail(t *testing.T) string {

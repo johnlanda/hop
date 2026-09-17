@@ -43,6 +43,11 @@ func TestGrammarContractStatusLaunchCorroborationAction(t *testing.T) {
 	t.Run("reconciling with an unsettled claim renders the action under its session line", func(t *testing.T) {
 		f := newLaunchingFeature(t, 9310)
 		f.reconcile(t)
+		// The fixture journals what the live path journals: the row AND
+		// the transition, under the live reason (law 06FD1A61).
+		if got, want := f.managerTransition(t), "launching->reconciling: "+app.TransitionReasonLaunchCorroboration; got != want {
+			t.Fatalf("manager transition = %q, want %q", got, want)
+		}
 		out := f.statusDetail(t)
 		requireSessionState(t, out, f.base.ManagerID, "reconciling")
 		if want := launchCorroborationActionLine(); !strings.Contains(out, want) {
