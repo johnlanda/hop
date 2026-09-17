@@ -277,6 +277,64 @@ func TestStoreVectors(t *testing.T) {
 		})
 	})
 
+	t.Run("MessageSendClaimedAddressReplay", func(t *testing.T) {
+		f := newMessagingFixture(t)
+		taskC := f.createFeatureTask(t, 8100, 3, run.TaskActive)
+		workerC, workerCIncarnation := f.createWorkerSession(t, taskC, run.RoleImplementer, 8101)
+		question := f.workerSend(8105, run.MessageQuestion, "q-1")
+		requireSendOutcome(t, f.store, "task B question", question, app.MessageAccepted, "")
+		requireSendOutcome(t, f.store, "manager answer", f.managerAnswer(8106, question.ID, "fwd-1", "secret-body"), app.MessageAccepted, "")
+		info := app.MessageSend{
+			ID: identity.MessageID(uid(8107)), RunID: f.spec.RunID,
+			Sender: run.SessionPrincipal(f.ManagerID), SenderAddress: run.ManagerAddress(),
+			IncarnationID: f.ManagerIncarnation, Recipient: run.TaskAddress(f.TaskB), Kind: run.MessageInfo,
+			RequestID: "info-1", BodyPath: "/state/info.md", BodyDigest: "info-body", BodyBytes: 4,
+		}
+		requireSendOutcome(t, f.store, "manager info to task B", info, app.MessageAccepted, "")
+
+		cases := []struct {
+			name      string
+			n         int
+			claimed   run.Address
+			kind      run.MessageKind
+			to        run.Address
+			replyTo   *identity.MessageID
+			requestID string
+			digest    string
+		}{
+			{"the manager's answer, same body", 8110, run.ManagerAddress(), run.MessageAnswer, run.Address{}, &question.ID, "fwd-1", "secret-body"},
+			{"the manager's answer, another body", 8111, run.ManagerAddress(), run.MessageAnswer, run.Address{}, &question.ID, "fwd-1", "guess-body"},
+			{"the manager's info, same body", 8112, run.ManagerAddress(), run.MessageInfo, run.TaskAddress(f.TaskB), nil, "info-1", "info-body"},
+			{"the manager's info, another body", 8113, run.ManagerAddress(), run.MessageInfo, run.TaskAddress(f.TaskB), nil, "info-1", "guess-body"},
+			{"task B's question, same body", 8114, run.TaskAddress(f.TaskB), run.MessageQuestion, run.ManagerAddress(), nil, "q-1", question.BodyDigest},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				messageID := identity.MessageID(uid(tc.n))
+				before := messageReceiptCount(t, f.store, f.spec.RunID)
+				got, err := f.store.SendMessage(t.Context(), storevectors.MessageSendClaimedAddressReplay(
+					f.spec.RunID, workerC, tc.claimed, workerCIncarnation, messageID, tc.kind, tc.to, tc.replyTo, tc.requestID, "/state/body.md", tc.digest, 3,
+				))
+				if err != nil {
+					t.Fatalf("SendMessage() error = %v", err)
+				}
+				if got.Kind != app.MessageRefused || got.Reason != storevectors.MessageSendClaimedAddressReplayReason ||
+					got.Detail != storevectors.MessageSendClaimedAddressReplayDetail || got.MessageID != "" {
+					t.Fatalf("SendMessage(claimed-address replay) = %+v, want refused/%s %q naming no message", got, storevectors.MessageSendClaimedAddressReplayReason, storevectors.MessageSendClaimedAddressReplayDetail)
+				}
+				if n := countRows(t, f.store, `SELECT COUNT(*) FROM messages WHERE id = ?`, messageID.String()); n != 0 {
+					t.Fatal("the refused replay created an envelope; want none")
+				}
+				if after := messageReceiptCount(t, f.store, f.spec.RunID); after != before+1 {
+					t.Fatalf("the refusal left %d receipts, want exactly one more than %d", after, before)
+				}
+			})
+		}
+		if n := countRows(t, f.store, `SELECT COUNT(*) FROM messages WHERE reply_to = ? OR recipient_address = ?`, question.ID.String(), app.AddressString(run.TaskAddress(f.TaskB))); n != 2 {
+			t.Errorf("envelopes answering task B's question or addressed to task B = %d; want the manager's answer and info only", n)
+		}
+	})
+
 	t.Run("MessageSendCrossRun", func(t *testing.T) {
 		clock := newFakeClock()
 		store := openStoreAt(t, t.TempDir(), clock)

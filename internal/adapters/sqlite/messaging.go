@@ -97,13 +97,14 @@ func sendRequestDigest(send *app.MessageSend) string {
 }
 
 // SendMessage applies the section 7 send/answer validation order inside
-// one worker-authority transaction: the request-ID receipt first (an
-// identical retry returns the original acceptance as duplicate; a reused
-// ID with different content is refused), then the caller session's OWN
-// run (send.RunID is caller-supplied and never trusted alone), the
-// current incarnation, the sender's logical address re-derived from its
-// session row (unresolvable, or different from send.SenderAddress, is
-// refused unauthorized — only the derived address decides), and — for an
+// one worker-authority transaction: the run, the caller session's OWN run
+// (send.RunID is caller-supplied and never trusted alone) and the sender's
+// logical address re-derived from its session row (unresolvable, or
+// different from send.SenderAddress, is refused unauthorized — only the
+// derived address decides); then the request-ID receipt (an identical
+// retry returns the original acceptance as duplicate; a reused ID with
+// different content is refused), so only a caller at the claimed address
+// reads it; then the current incarnation, and — for an
 // ordinary send — addressing legality, the run's acceptance
 // (run.Run.CanAcceptManagerVerb: transient while the run can still reach
 // running, refused once it never will) and the recipient mailbox; an
@@ -135,6 +136,36 @@ func (s *Store) SendMessage(ctx context.Context, send app.MessageSend) (app.Mess
 			return insertMessageReceipt(ctx, tx, receipt, now)
 		}
 
+		runV, _, err := getRun(ctx, tx, send.RunID)
+		if errors.Is(err, app.ErrNotFound) {
+			return record(app.MessageMalformed, "", app.GrammarReasonMalformed, "unknown run")
+		}
+		if err != nil {
+			return err
+		}
+		// The sender session's OWN run is the only authoritative source for
+		// which run it may act in.
+		sender, _, err := getSession(ctx, tx, send.Sender.SessionID)
+		if errors.Is(err, app.ErrNotFound) || (err == nil && sender.RunID != send.RunID) {
+			return record(app.MessageRefused, "", app.GrammarReasonUnauthorized, "session does not belong to this run")
+		}
+		if err != nil {
+			return err
+		}
+		// The sender's logical address is re-derived from its own session
+		// row before the request-ID receipt is read: send.SenderAddress
+		// feeds the request digest and must agree, so a session claiming
+		// another address never reads a duplicate or conflicting verdict
+		// about that address's requests, and only the derived address is
+		// used to decide.
+		senderAddress, resolvable, err := resolveSessionAddress(ctx, tx, &sender)
+		if err != nil {
+			return err
+		}
+		if !resolvable || !senderAddress.Equal(send.SenderAddress) {
+			return record(app.MessageRefused, "", app.GrammarReasonUnauthorized, "session does not resolve to the claimed address")
+		}
+
 		if send.RequestID != "" {
 			priorDigest, createdEntity, ok, err := acceptedMessageReceipt(ctx, tx, send.RunID.String(), msgSendVerb, send.RequestID)
 			if err != nil {
@@ -155,38 +186,12 @@ func (s *Store) SendMessage(ctx context.Context, send app.MessageSend) (app.Mess
 			}
 		}
 
-		runV, _, err := getRun(ctx, tx, send.RunID)
-		if errors.Is(err, app.ErrNotFound) {
-			return record(app.MessageMalformed, "", app.GrammarReasonMalformed, "unknown run")
-		}
-		if err != nil {
-			return err
-		}
-		// The sender session's OWN run is the only authoritative source for
-		// which run it may act in.
-		sender, _, err := getSession(ctx, tx, send.Sender.SessionID)
-		if errors.Is(err, app.ErrNotFound) || (err == nil && sender.RunID != send.RunID) {
-			return record(app.MessageRefused, "", app.GrammarReasonUnauthorized, "session does not belong to this run")
-		}
-		if err != nil {
-			return err
-		}
 		current, err := sessionIncarnationCurrent(ctx, tx, send.Sender.SessionID, send.IncarnationID)
 		if err != nil {
 			return err
 		}
 		if !current {
 			return record(app.MessageRefused, "", app.GrammarReasonStale, "incarnation is not current")
-		}
-		// The sender's logical address is re-derived from its own session
-		// row: send.SenderAddress feeds the request digest and must agree,
-		// but only the derived address is used to decide.
-		senderAddress, resolvable, err := resolveSessionAddress(ctx, tx, &sender)
-		if err != nil {
-			return err
-		}
-		if !resolvable || !senderAddress.Equal(send.SenderAddress) {
-			return record(app.MessageRefused, "", app.GrammarReasonUnauthorized, "session does not resolve to the claimed address")
 		}
 
 		if send.Kind == run.MessageAnswer {

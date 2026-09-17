@@ -192,8 +192,8 @@ func TestFakeAnswerRecipientAuthority(t *testing.T) {
 }
 
 // TestFakeAnswerRetryPrecedence mirrors TestAnswerRetryPrecedence: the
-// request-ID receipt first, then recipient authority, then the prior
-// answer's content.
+// sender's re-derived address first, then the request-ID receipt, then
+// recipient authority, then the prior answer's content.
 func TestFakeAnswerRetryPrecedence(t *testing.T) {
 	tc := newTestController(defaultPolicy())
 	fr, workerB, workerC := seedTwoWorkers(t, tc)
@@ -201,6 +201,7 @@ func TestFakeAnswerRetryPrecedence(t *testing.T) {
 	question := workerB.question(t, tc, fr.RunID, run.ManagerAddress(), nil)
 	requireFakeSend(t, tc, "task B question", question, app.MessageAccepted, "")
 	accepted := requireFakeSend(t, tc, "manager answer", manager.answer(t, tc, fr.RunID, question.ID, "fwd-1", "digest-fwd"), app.MessageAccepted, "")
+	liar := answerSender{session: workerC.session, address: run.ManagerAddress(), incarnation: workerC.incarnation}
 
 	steps := []struct {
 		name   string
@@ -214,6 +215,9 @@ func TestFakeAnswerRetryPrecedence(t *testing.T) {
 		{"no request id with the same body", manager.answer(t, tc, fr.RunID, question.ID, "", "digest-fwd"), app.MessageDuplicate, ""},
 		{"a fresh request id with another body", manager.answer(t, tc, fr.RunID, question.ID, "fwd-3", "digest-other"), app.MessageConflicting, app.GrammarReasonConflicting},
 		{"a non-recipient reusing the recipient's request id", workerC.answer(t, tc, fr.RunID, question.ID, "fwd-1", "digest-fwd"), app.MessageRefused, app.GrammarReasonConflicting},
+		{"a non-recipient reusing the recipient's request id with another body", workerC.answer(t, tc, fr.RunID, question.ID, "fwd-1", "digest-other"), app.MessageRefused, app.GrammarReasonConflicting},
+		{"a non-recipient claiming the recipient's address, replaying its request id and body", liar.answer(t, tc, fr.RunID, question.ID, "fwd-1", "digest-fwd"), app.MessageRefused, app.GrammarReasonUnauthorized},
+		{"a non-recipient claiming the recipient's address, replaying its request id with another body", liar.answer(t, tc, fr.RunID, question.ID, "fwd-1", "digest-other"), app.MessageRefused, app.GrammarReasonUnauthorized},
 		{"a non-recipient with a fresh request id and the accepted body", workerC.answer(t, tc, fr.RunID, question.ID, "c-1", "digest-fwd"), app.MessageRefused, app.GrammarReasonUnauthorized},
 		{"a non-recipient with no request id and the accepted body", workerC.answer(t, tc, fr.RunID, question.ID, "", "digest-fwd"), app.MessageRefused, app.GrammarReasonUnauthorized},
 		{"a non-recipient with another body", workerC.answer(t, tc, fr.RunID, question.ID, "c-2", "digest-other"), app.MessageRefused, app.GrammarReasonUnauthorized},
@@ -230,6 +234,32 @@ func TestFakeAnswerRetryPrecedence(t *testing.T) {
 	}
 	if n := fakeAnswersTo(tc, question.ID); n != 1 {
 		t.Fatalf("answer envelopes = %d, want the one accepted answer", n)
+	}
+}
+
+// TestFakeAnswerReplayByMisclaimedAddress mirrors
+// TestAnswerReplayByMisclaimedAddress: a session claiming the recipient's
+// address is refused unauthorized whatever it replays, naming no message.
+func TestFakeAnswerReplayByMisclaimedAddress(t *testing.T) {
+	tc := newTestController(defaultPolicy())
+	fr, workerB, workerC := seedTwoWorkers(t, tc)
+	question := workerB.question(t, tc, fr.RunID, run.ManagerAddress(), nil)
+	requireFakeSend(t, tc, "task B question", question, app.MessageAccepted, "")
+	requireFakeSend(t, tc, "manager answer", managerSender(fr).answer(t, tc, fr.RunID, question.ID, "fwd-1", "secret-body"), app.MessageAccepted, "")
+	liar := answerSender{session: workerC.session, address: run.ManagerAddress(), incarnation: workerC.incarnation}
+
+	for _, probe := range []struct{ name, requestID, body string }{
+		{"right guess, reused request id", "fwd-1", "secret-body"},
+		{"wrong guess, reused request id", "fwd-1", "guess-body"},
+		{"right guess, fresh request id", "c-fresh", "secret-body"},
+	} {
+		got := requireFakeSend(t, tc, probe.name, liar.answer(t, tc, fr.RunID, question.ID, probe.requestID, probe.body), app.MessageRefused, app.GrammarReasonUnauthorized)
+		if got.Detail != "session does not resolve to the claimed address" || got.MessageID != "" {
+			t.Fatalf("%s: SendMessage() = %+v, want the claimed-address refusal naming no message", probe.name, got)
+		}
+	}
+	if n := fakeAnswersTo(tc, question.ID); n != 1 {
+		t.Fatalf("answer envelopes = %d, want the manager's only", n)
 	}
 }
 

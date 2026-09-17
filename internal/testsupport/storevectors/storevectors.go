@@ -279,6 +279,34 @@ func MessageSendClaimedAddressMismatch(runID identity.RunID, session identity.Se
 	return send
 }
 
+// MessageSendClaimedAddressReplayReason and
+// MessageSendClaimedAddressReplayDetail are
+// MessageSendClaimedAddressReplay's expected refusal reason token and
+// detail: the claimed-address refusal itself.
+const (
+	MessageSendClaimedAddressReplayReason = MessageSendClaimedAddressMismatchReason
+	MessageSendClaimedAddressReplayDetail = MessageSendClaimedAddressMismatchDetail
+)
+
+// MessageSendClaimedAddressReplay returns MessageSendClaimedAddressMismatch's
+// request carrying requestID: a current session of the run claims
+// claimedAddress, another principal's address, and replays that
+// principal's request ID. The consuming fixture has already accepted a
+// request with requestID from the session truly at claimedAddress; with
+// the same kind, recipient, replyTo and body digest the replay's request
+// digest equals the accepted one, and with another body digest it differs.
+// Either way it is refused app.MessageRefused (reason
+// MessageSendClaimedAddressReplayReason), detail
+// MessageSendClaimedAddressReplayDetail, with no envelope created — never
+// duplicate (which would name the accepted message) and never conflicting
+// (which would tell the caller its body differs): the sender's address is
+// re-derived and compared before the request-ID receipt is read.
+func MessageSendClaimedAddressReplay(runID identity.RunID, session identity.SessionID, claimedAddress run.Address, incarnation identity.IncarnationID, messageID identity.MessageID, kind run.MessageKind, recipient run.Address, replyTo *identity.MessageID, requestID, bodyPath, bodyDigest string, bodyBytes int64) app.MessageSend {
+	send := MessageSendClaimedAddressMismatch(runID, session, claimedAddress, incarnation, messageID, kind, recipient, replyTo, bodyPath, bodyDigest, bodyBytes)
+	send.RequestID = requestID
+	return send
+}
+
 // MessageSendCrossRunReason is MessageSendCrossRun's expected refusal
 // reason token.
 const MessageSendCrossRunReason = app.GrammarReasonUnauthorized

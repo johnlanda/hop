@@ -205,7 +205,10 @@ type HumanAnswer struct {
 // disagree with the request's stated RunID/SenderAddress/Address — a
 // session belongs to exactly
 // one run, and only the session row itself is authoritative for which
-// one. This holds even when a driving use case already performed the
+// one. SendMessage makes both checks BEFORE reading the request-ID
+// receipt, so a session claiming another address never learns whether
+// that address's request was accepted or what its content was. This
+// holds even when a driving use case already performed the
 // identical check (SendMessage/FetchMessage/AckMessage,
 // usecase_message.go, via WorkflowReadStore.LoadMessagingContext): a
 // direct caller of this port must be refused exactly like one that went

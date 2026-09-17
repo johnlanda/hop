@@ -345,6 +345,59 @@ func TestStoreVectors(t *testing.T) {
 		})
 	})
 
+	t.Run("MessageSendClaimedAddressReplay", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		fr, workerB, workerC := seedTwoWorkers(t, tc)
+		manager := managerSender(fr)
+		question := workerB.question(t, tc, fr.RunID, run.ManagerAddress(), nil)
+		question.RequestID = "q-1"
+		requireFakeSend(t, tc, "task B question", question, app.MessageAccepted, "")
+		requireFakeSend(t, tc, "manager answer", manager.answer(t, tc, fr.RunID, question.ID, "fwd-1", "secret-body"), app.MessageAccepted, "")
+		info := manager.question(t, tc, fr.RunID, workerB.address, nil)
+		info.Kind, info.RequestID, info.BodyDigest = run.MessageInfo, "info-1", "info-body"
+		requireFakeSend(t, tc, "manager info to task B", info, app.MessageAccepted, "")
+
+		cases := []struct {
+			name      string
+			claimed   run.Address
+			kind      run.MessageKind
+			to        run.Address
+			replyTo   *identity.MessageID
+			requestID string
+			digest    string
+		}{
+			{"the manager's answer, same body", run.ManagerAddress(), run.MessageAnswer, run.Address{}, &question.ID, "fwd-1", "secret-body"},
+			{"the manager's answer, another body", run.ManagerAddress(), run.MessageAnswer, run.Address{}, &question.ID, "fwd-1", "guess-body"},
+			{"the manager's info, same body", run.ManagerAddress(), run.MessageInfo, workerB.address, nil, "info-1", "info-body"},
+			{"the manager's info, another body", run.ManagerAddress(), run.MessageInfo, workerB.address, nil, "info-1", "guess-body"},
+			{"task B's question, same body", workerB.address, run.MessageQuestion, run.ManagerAddress(), nil, "q-1", question.BodyDigest},
+		}
+		for _, c := range cases {
+			t.Run(c.name, func(t *testing.T) {
+				messageID := mintMessageID(t, tc)
+				got, err := tc.Controller.Messages.SendMessage(context.Background(), storevectors.MessageSendClaimedAddressReplay(
+					fr.RunID, workerC.session, c.claimed, workerC.incarnation, messageID, c.kind, c.to, c.replyTo, c.requestID, "/state/body.md", c.digest, 3,
+				))
+				if err != nil {
+					t.Fatalf("SendMessage() error = %v", err)
+				}
+				if got.Kind != app.MessageRefused || got.Reason != storevectors.MessageSendClaimedAddressReplayReason ||
+					got.Detail != storevectors.MessageSendClaimedAddressReplayDetail || got.MessageID != "" {
+					t.Fatalf("SendMessage(claimed-address replay) = %+v, want refused/%s %q naming no message", got, storevectors.MessageSendClaimedAddressReplayReason, storevectors.MessageSendClaimedAddressReplayDetail)
+				}
+				if _, exists := tc.Store.Messages[messageID]; exists {
+					t.Fatal("the refused replay created an envelope; want none")
+				}
+			})
+		}
+		if n := fakeAnswersTo(tc, question.ID); n != 1 {
+			t.Errorf("answers to task B's question = %d; want the manager's only", n)
+		}
+		if n := fakeEnvelopesFor(tc, workerB.address); n != 2 {
+			t.Errorf("envelopes addressed to task B = %d; want the manager's answer and info only", n)
+		}
+	})
+
 	t.Run("MessageSendCrossRun", func(t *testing.T) {
 		tc := newTestController(defaultPolicy())
 		fr1 := seedFeatureRun(t, tc, 2)

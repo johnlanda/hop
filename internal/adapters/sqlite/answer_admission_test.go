@@ -198,13 +198,17 @@ func TestAnswerToAnotherAddressRefused(t *testing.T) {
 }
 
 // TestAnswerRetryPrecedence pins the order a retried or competing answer is
-// decided in: the (run, verb, request ID) receipt first — so the
+// decided in: the sender's re-derived address first — so a session claiming
+// the recipient's address is refused unauthorized whatever request id and
+// body it replays, and never learns the accepted answer's id or whether its
+// body matches — then the (run, verb, request ID) receipt — so the
 // recipient's identical retry is duplicate and a reused id with other
-// content (including a non-recipient's, whose digest names a different
-// sender address) is refused conflicting — then recipient authority, so a
-// non-recipient never reads a duplicate or conflicting verdict about the
-// accepted answer, then the prior answer's content. Every decision leaves
-// one receipt, and one answer envelope exists throughout.
+// content is refused conflicting, including a non-recipient's at its own
+// address, whose digest names a different sender and so is conflicting
+// whatever its body — then recipient authority, so a non-recipient never
+// reads a duplicate or conflicting verdict about the accepted answer, then
+// the prior answer's content. Every decision leaves one receipt, and one
+// answer envelope exists throughout.
 func TestAnswerRetryPrecedence(t *testing.T) {
 	f := newMessagingFixture(t)
 	taskC := f.createFeatureTask(t, 9745, 3, run.TaskActive)
@@ -228,6 +232,9 @@ func TestAnswerRetryPrecedence(t *testing.T) {
 		{"no request id with the same body", f.managerAnswer(9755, question.ID, "", "digest-fwd"), app.MessageDuplicate, ""},
 		{"a fresh request id with another body", f.managerAnswer(9756, question.ID, "fwd-3", "digest-other"), app.MessageConflicting, app.GrammarReasonConflicting},
 		{"a non-recipient reusing the recipient's request id", byC(9757, question.ID, "fwd-1", "digest-fwd"), app.MessageRefused, app.GrammarReasonConflicting},
+		{"a non-recipient reusing the recipient's request id with another body", byC(9762, question.ID, "fwd-1", "digest-other"), app.MessageRefused, app.GrammarReasonConflicting},
+		{"a non-recipient claiming the recipient's address, replaying its request id and body", sessionAnswer(f.spec.RunID, 9763, workerC, run.ManagerAddress(), workerCIncarnation, question.ID, "fwd-1", "digest-fwd"), app.MessageRefused, app.GrammarReasonUnauthorized},
+		{"a non-recipient claiming the recipient's address, replaying its request id with another body", sessionAnswer(f.spec.RunID, 9764, workerC, run.ManagerAddress(), workerCIncarnation, question.ID, "fwd-1", "digest-other"), app.MessageRefused, app.GrammarReasonUnauthorized},
 		{"a non-recipient with a fresh request id and the accepted body", byC(9758, question.ID, "c-1", "digest-fwd"), app.MessageRefused, app.GrammarReasonUnauthorized},
 		{"a non-recipient with no request id and the accepted body", byC(9759, question.ID, "", "digest-fwd"), app.MessageRefused, app.GrammarReasonUnauthorized},
 		{"a non-recipient with another body", byC(9760, question.ID, "c-2", "digest-other"), app.MessageRefused, app.GrammarReasonUnauthorized},
@@ -251,6 +258,45 @@ func TestAnswerRetryPrecedence(t *testing.T) {
 	}
 	if n := countRows(t, f.store, `SELECT COUNT(*) FROM message_receipts WHERE op = 'msg-send' AND outcome = 'accepted' AND claimed_message_id = ?`, question.ID.String()); n != 1 {
 		t.Fatalf("accepted answer receipts = %d, want 1", n)
+	}
+}
+
+// TestAnswerReplayByMisclaimedAddress drives the receipt probe of a session
+// that claims the recipient's address: a right body guess, a wrong one and
+// a fresh request id are each refused unauthorized with the claimed-address
+// detail and a receipt, naming no message, so the prober learns neither the
+// accepted answer's id nor whether its guess matches.
+func TestAnswerReplayByMisclaimedAddress(t *testing.T) {
+	f := newMessagingFixture(t)
+	taskC := f.createFeatureTask(t, 9765, 3, run.TaskActive)
+	workerC, workerCIncarnation := f.createWorkerSession(t, taskC, run.RoleImplementer, 9766)
+	question := f.workerSend(9770, run.MessageQuestion, "")
+	requireSendOutcome(t, f.store, "task B question", question, app.MessageAccepted, "")
+	requireSendOutcome(t, f.store, "manager answer", f.managerAnswer(9771, question.ID, "fwd-1", "secret-body"), app.MessageAccepted, "")
+
+	for _, probe := range []struct {
+		name      string
+		n         int
+		requestID string
+		body      string
+	}{
+		{"right guess, reused request id", 9772, "fwd-1", "secret-body"},
+		{"wrong guess, reused request id", 9773, "fwd-1", "guess-body"},
+		{"right guess, fresh request id", 9774, "c-fresh", "secret-body"},
+	} {
+		before := messageReceiptCount(t, f.store, f.spec.RunID)
+		got := requireSendOutcome(t, f.store, probe.name,
+			sessionAnswer(f.spec.RunID, probe.n, workerC, run.ManagerAddress(), workerCIncarnation, question.ID, probe.requestID, probe.body),
+			app.MessageRefused, app.GrammarReasonUnauthorized)
+		if got.Detail != "session does not resolve to the claimed address" || got.MessageID != "" {
+			t.Fatalf("%s: SendMessage() = %+v, want the claimed-address refusal naming no message", probe.name, got)
+		}
+		if after := messageReceiptCount(t, f.store, f.spec.RunID); after != before+1 {
+			t.Fatalf("%s: %d receipts, want exactly one more than %d", probe.name, after, before)
+		}
+	}
+	if n := countRows(t, f.store, `SELECT COUNT(*) FROM messages WHERE kind = 'answer' AND reply_to = ?`, question.ID.String()); n != 1 {
+		t.Fatalf("answer envelopes = %d, want the manager's only", n)
 	}
 }
 

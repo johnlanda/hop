@@ -494,6 +494,28 @@ func (s *fakeStore) SendMessage(_ context.Context, send app.MessageSend) (app.Me
 	const verb = "msg-send"
 
 	digest := sendRequestDigest(send)
+	rRow, ok := s.Runs[send.RunID]
+	if !ok {
+		return app.MessageOutcome{Kind: app.MessageMalformed, Reason: app.GrammarReasonMalformed, Detail: "unknown run"}, nil
+	}
+	// The sender session's OWN run is the only authoritative source for
+	// which run it may act in — send.RunID is a caller-supplied field,
+	// never trusted on its own (a current session for run A must not be
+	// able to supply run B and act against B's messages).
+	senderRow, ok := s.Sessions[send.Sender.SessionID]
+	if !ok || senderRow.value.RunID != send.RunID {
+		return app.MessageOutcome{Kind: app.MessageRefused, Reason: app.GrammarReasonUnauthorized, Detail: "session does not belong to this run"}, nil
+	}
+	// The sender's logical address is re-derived from its own session
+	// row before the request-ID receipt is read, exactly as the SQLite
+	// adapter does: send.SenderAddress feeds the request digest and must
+	// agree, so a session claiming another address never reads a verdict
+	// about that address's requests, and only the derived address
+	// decides.
+	senderAddress, ok := s.resolveSessionAddressLocked(send.Sender.SessionID)
+	if !ok || !senderAddress.Equal(send.SenderAddress) {
+		return app.MessageOutcome{Kind: app.MessageRefused, Reason: app.GrammarReasonUnauthorized, Detail: "session does not resolve to the claimed address"}, nil
+	}
 	if send.RequestID != "" {
 		key := requestReceiptKey{run: send.RunID, verb: verb, requestID: send.RequestID}
 		if prior, ok := s.RequestReceipts[key]; ok {
@@ -511,29 +533,8 @@ func (s *fakeStore) SendMessage(_ context.Context, send app.MessageSend) (app.Me
 			return app.MessageOutcome{Kind: app.MessageRefused, Reason: app.GrammarReasonConflicting, Detail: "request id reused with different content"}, nil
 		}
 	}
-
-	rRow, ok := s.Runs[send.RunID]
-	if !ok {
-		return app.MessageOutcome{Kind: app.MessageMalformed, Reason: app.GrammarReasonMalformed, Detail: "unknown run"}, nil
-	}
-	// The sender session's OWN run is the only authoritative source for
-	// which run it may act in — send.RunID is a caller-supplied field,
-	// never trusted on its own (a current session for run A must not be
-	// able to supply run B and act against B's messages).
-	senderRow, ok := s.Sessions[send.Sender.SessionID]
-	if !ok || senderRow.value.RunID != send.RunID {
-		return app.MessageOutcome{Kind: app.MessageRefused, Reason: app.GrammarReasonUnauthorized, Detail: "session does not belong to this run"}, nil
-	}
 	if !s.sessionIncarnationCurrentLocked(send.Sender.SessionID, send.IncarnationID) {
 		return app.MessageOutcome{Kind: app.MessageRefused, Reason: app.GrammarReasonStale, Detail: "incarnation is not current"}, nil
-	}
-	// The sender's logical address is re-derived from its own session
-	// row, exactly as the SQLite adapter does: send.SenderAddress feeds
-	// the request digest and must agree, but only the derived address
-	// decides.
-	senderAddress, ok := s.resolveSessionAddressLocked(send.Sender.SessionID)
-	if !ok || !senderAddress.Equal(send.SenderAddress) {
-		return app.MessageOutcome{Kind: app.MessageRefused, Reason: app.GrammarReasonUnauthorized, Detail: "session does not resolve to the claimed address"}, nil
 	}
 
 	var outcome app.MessageOutcome

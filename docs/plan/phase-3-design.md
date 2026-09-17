@@ -1343,7 +1343,12 @@ response; the request ID covers a lost MUTATION response, which
 re-running would otherwise duplicate. The flag is optional at the CLI
 (omitted → server-minted, retry then not idempotent) but the templates
 and fixtures ALWAYS pass it; the duplicate lookup by request key runs
-before any other validation (receipt-before-eligibility, as everywhere).
+before any eligibility check (receipt-before-eligibility, as everywhere).
+A session's `msg send` first establishes only who is asking — the
+session's own run and its re-derived logical address, which must equal
+the address the request digest covers (Send, below) — so a session that
+claims another principal's address never reads a duplicate or
+conflicting verdict about that principal's requests.
 
 Run-state acceptance follows the Phase 2 result-submission precedent
 ([phase-2-design.md](phase-2-design.md) section 7, step 4: a submission
@@ -1386,11 +1391,17 @@ the retryable nor the final line applies to them.
   [--relay-of <id>] --file <path>`, or `--kind answer --reply-to <id>
   --file <path>` with NO `--to`): parse and bound. The sender's logical
   address is re-derived from its own session row inside the accepting
-  transaction for every kind, after the request-ID receipt lookup and the
-  incarnation check; a sender whose row resolves to no address, or to a
-  different one than the request claims (the address the request digest
-  covers), is `refused: unauthorized` with a receipt, and every decision
-  below uses only the derived address. Kind/address legality
+  transaction for every kind, after the session's own run and BEFORE the
+  request-ID receipt lookup and the incarnation check; a sender whose row
+  resolves to no address, or to a different one than the request claims
+  (the address the request digest covers), is `refused: unauthorized`
+  with a receipt whatever request ID and body it carries, and every
+  decision below uses only the derived address. A session at its OWN
+  address that reuses another principal's request ID is `refused:
+  conflicting`: the request key is run-wide and the digest names the
+  sender's address, so the digest never matches and the outcome is the
+  same whatever the body — the caller learns only that the ID is taken,
+  never whether its content matches. Kind/address legality
   by role: workers and reviewers → `question`/`info` to `manager` only;
   the manager → `question` to `human` or `question`/`info` to `task:<id>`;
   an `answer` is legal only from the session answering a question
@@ -1406,8 +1417,10 @@ the retryable nor the final line applies to them.
   request-ID receipt lookup (a same-request-ID retry still resolves as
   duplicate or conflicting first) and precedes the prior-answer
   comparison below, so a non-recipient never reads a duplicate or
-  conflicting verdict about someone else's answer; a recipient's address
-  is lineage-stable, so its own retries are decided exactly as before.
+  conflicting verdict about someone else's answer — one claiming the
+  recipient's address is refused before the receipt, above; a
+  recipient's address is lineage-stable, so its own retries are decided
+  exactly as before.
   `info` to `human` is refused at send — humans have no fetch or ack verb,
   so a human-addressed info could never settle (the only human-addressed
   kind is `question`, settled by its answer). An `answer`'s destination is
