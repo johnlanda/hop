@@ -408,6 +408,10 @@ func (c *fakeCommands) run(ctx context.Context, cmd app.Command) (app.CommandRes
 	if !filepath.IsAbs(cmd.Argv[0]) {
 		return app.CommandResult{}, fmt.Errorf("app_test: CommandRunner.Run called with executable %q, which is not an absolute path; the real Runner refuses this", cmd.Argv[0])
 	}
+	// The real Runner starts nothing under a context already canceled.
+	if err := ctx.Err(); err != nil {
+		return app.CommandResult{}, fmt.Errorf("app_test: CommandRunner.Run: context already canceled, nothing started: %w", err)
+	}
 	if err := c.store.refuseInsideTransaction("CommandRunner.Run"); err != nil {
 		return app.CommandResult{}, err
 	}

@@ -409,7 +409,7 @@ func TestReviewFixRetentionFailure(t *testing.T) {
 		merged := f.git.ref(integrationRefName)
 
 		f.tc.Artifacts.WriteErr = errors.New("injected output retention failure")
-		if _, err := f.tc.Controller.DriveIntegration(context.Background(), f.fr.Handle, integrationHopPath, nil); err == nil {
+		if _, err := driveIntegrationStep(context.Background(), f.tc.Controller, f.fr.Handle); err == nil {
 			t.Fatalf("retention failure did not surface as an error")
 		}
 		f.tc.Artifacts.WriteErr = nil

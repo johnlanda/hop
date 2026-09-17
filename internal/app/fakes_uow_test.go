@@ -114,6 +114,10 @@ func stageSave[K comparable, T any](staged map[K]stagedRow[T], base map[K]*entit
 type fakeUnitOfWork struct {
 	store *fakeStore
 	lease app.Lease
+	// ctx is the context the unit of work was begun under; its
+	// cancellation before Commit fails the commit, as the real
+	// transaction's does.
+	ctx context.Context //nolint:containedctx // mirrors database/sql's Tx, which is bound to its BeginTx context until it ends.
 
 	runs      map[identity.RunID]stagedRow[run.Run]
 	tasks     map[identity.TaskID]stagedRow[run.Task]
@@ -199,6 +203,9 @@ func (u *fakeUnitOfWork) Commit() error {
 	defer s.mu.Unlock()
 	s.openUnitsOfWork--
 
+	if u.ctx != nil && u.ctx.Err() != nil {
+		return fmt.Errorf("app_test: commit unit of work: %w", u.ctx.Err())
+	}
 	if !s.matchesHeldLease(u.lease) {
 		return app.ErrFenced
 	}

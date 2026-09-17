@@ -50,6 +50,16 @@ type fakeGitRepo struct {
 	// OnCheckExec, when set, runs for every simulated check-exec spawn
 	// with the operation id parsed from the argv and the inner argv.
 	OnCheckExec func(opID string, inner []string)
+	// CheckExecGate, when set, runs for every simulated check-exec spawn
+	// after OnCheckExec (the child's claim write), with the act context,
+	// and answers the spawn itself when handled: a test holds a running
+	// check open until its context ends, the way the real Runner holds a
+	// child, or injects state at that exact point.
+	CheckExecGate func(ctx context.Context, opID string) (result app.CommandResult, handled bool, err error)
+	// GitGate, when set, runs for every direct git invocation with the act
+	// context before the fake answers it, and answers it itself when
+	// handled.
+	GitGate func(ctx context.Context, args []string) (result app.CommandResult, handled bool, err error)
 	// UpdateRefCalls records every update-ref invocation as
 	// "ref new old" strings, oldest first.
 	UpdateRefCalls []string
@@ -152,20 +162,26 @@ func (g *fakeGitRepo) parentsOf(oid string) []string {
 }
 
 // Hook adapts the fake repo to fakeCommands.RunHook.
-func (g *fakeGitRepo) Hook(_ context.Context, cmd app.Command) (app.CommandResult, bool, error) {
+func (g *fakeGitRepo) Hook(ctx context.Context, cmd app.Command) (app.CommandResult, bool, error) {
 	argv := cmd.Argv
 	if len(argv) >= 2 && argv[0] == g.hop && argv[1] == "check-exec" {
-		return g.runCheckExec(argv), true, nil
+		result, err := g.runCheckExec(ctx, argv)
+		return result, true, err
 	}
 	if len(argv) >= 1 && argv[0] == g.git {
+		if g.GitGate != nil {
+			if result, handled, err := g.GitGate(ctx, argv[1:]); handled {
+				return result, true, err
+			}
+		}
 		return g.runGitArgv(argv[1:]), true, nil
 	}
 	return app.CommandResult{}, false, nil
 }
 
 // runCheckExec simulates the exec boundary: parse the operation id, hand
-// it to the test's claim hook, then run the inner argv.
-func (g *fakeGitRepo) runCheckExec(argv []string) app.CommandResult {
+// it to the test's claim hook and gate, then run the inner argv.
+func (g *fakeGitRepo) runCheckExec(ctx context.Context, argv []string) (app.CommandResult, error) {
 	g.mu.Lock()
 	g.CheckExecCalls++
 	g.mu.Unlock()
@@ -183,13 +199,27 @@ func (g *fakeGitRepo) runCheckExec(argv []string) app.CommandResult {
 	if g.OnCheckExec != nil {
 		g.OnCheckExec(opID, inner)
 	}
+	if g.CheckExecGate != nil {
+		if result, handled, err := g.CheckExecGate(ctx, opID); handled {
+			return result, err
+		}
+	}
 	if len(inner) == 0 {
-		return app.CommandResult{ExitCode: 2, Stderr: []byte("check-exec: no inner argv")}
+		return app.CommandResult{ExitCode: 2, Stderr: []byte("check-exec: no inner argv")}, nil
 	}
 	if inner[0] == g.git {
-		return g.runGitArgv(inner[1:])
+		return g.runGitArgv(inner[1:]), nil
 	}
-	return app.CommandResult{ExitCode: g.CheckExitCode}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return app.CommandResult{ExitCode: g.CheckExitCode}, nil
+}
+
+// canceledCommand answers a command held open until ctx ended the way the
+// real Runner answers it: the group killed, the context's cause wrapped.
+func canceledCommand(ctx context.Context) (app.CommandResult, bool, error) {
+	<-ctx.Done()
+	return app.CommandResult{ExitCode: -1}, true, fmt.Errorf("command canceled and its process group killed (group emptied: true): %w", context.Cause(ctx))
 }
 
 // runGitArgv interprets one git invocation.

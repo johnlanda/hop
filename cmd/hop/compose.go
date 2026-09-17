@@ -58,6 +58,10 @@ type controllerAPI interface {
 	RetireSettledSessions(ctx context.Context, handle app.RunHandle) (app.RetirementReport, error)
 	RecomputeReleases(ctx context.Context, handle app.RunHandle) (app.ReleaseReport, error)
 	DriveIntegration(ctx context.Context, handle app.RunHandle, hopPath string, spawnEnv []string) (app.IntegrationReport, error)
+	// DriveIntegrationCheck is the integration step's combined-check
+	// round, which the loop runs asynchronously once DriveIntegration
+	// reports it due.
+	DriveIntegrationCheck(ctx context.Context, handle app.RunHandle, hopPath string, spawnEnv []string) (app.IntegrationReport, error)
 	EnsureReviewTask(ctx context.Context, handle app.RunHandle) (bool, error)
 	AssignReadyTasks(ctx context.Context, handle app.RunHandle, opts app.AssignmentOptions) (app.AssignmentReport, error)
 	// AssignmentDefaults returns the frozen MaxWorkers/Harness/

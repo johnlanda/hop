@@ -150,8 +150,17 @@ type IntegrationReport struct {
 	// Blocked names an unresolved integration operation that refuses new
 	// integration work (the decision table's unresolved-intent rule).
 	Blocked string
-	// Interrupted is true when a stop request prevented new work.
+	// Interrupted is true when a stop request or a terminal-failure cause
+	// prevented new work, or a shutdown settled the round's own execution.
 	Interrupted bool
+	// CheckDue is true when the current integration is checking and no
+	// settled receipt decides its candidate: a combined-check execution is
+	// due, which DriveIntegration never runs itself and
+	// DriveIntegrationCheck runs.
+	CheckDue bool
+	// InFlight is true when the call did nothing because another
+	// integration-step call of the same handle was still running.
+	InFlight bool
 }
 
 // integrationRef renders the integration branch's full ref name.
@@ -243,12 +252,21 @@ func (c *Controller) ResolveIntegrationHead(ctx context.Context, handle RunHandl
 // DriveIntegration performs one round of the serial-integration step:
 // recover any unresolved integration operation first (nothing new starts
 // while one stands), then advance the run's current integration one
-// journaled operation — merge, publish, combined check or reset — or
-// claim the next completed implement task into the serial slot. Callers
-// (the controller loop's scheduling pass) invoke it repeatedly; every
-// external act is record-intent → act → record-outcome with pre-dispatch
-// revalidation.
+// journaled operation — merge, publish or reset, or the adoption of a
+// settled combined-check receipt — or claim the next completed implement
+// task into the serial slot. A checking integration with no settled
+// receipt is reported CheckDue and left to DriveIntegrationCheck, the
+// one long act of the step, which a caller runs under a context it can
+// cancel. Callers (the controller loop's scheduling pass) invoke it
+// repeatedly; every external act is record-intent → act → record-outcome
+// with pre-dispatch revalidation. It does nothing, reporting InFlight,
+// while a DriveIntegrationCheck call of the same handle is running.
 func (c *Controller) DriveIntegration(ctx context.Context, handle RunHandle, hopPath string, spawnEnv []string) (IntegrationReport, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per scheduling pass.
+	release, owned := handle.claimIntegrationStep()
+	if !owned {
+		return IntegrationReport{InFlight: true}, nil
+	}
+	defer release()
 	frozen, err := c.Read.LoadFrozenRun(ctx, handle.runID)
 	if err != nil {
 		return IntegrationReport{}, fmt.Errorf("app: load frozen run: %w", err)
@@ -278,7 +296,7 @@ func (c *Controller) DriveIntegration(ctx context.Context, handle RunHandle, hop
 	case run.IntegrationMerging:
 		return c.advanceMerging(ctx, handle, &frozen, hopPath, spawnEnv, &integ)
 	case run.IntegrationChecking:
-		return c.advanceChecking(ctx, handle, &frozen, hopPath, spawnEnv, &integ)
+		return c.advanceChecking(ctx, handle, &frozen, hopPath, spawnEnv, &integ, false)
 	case run.IntegrationCheckFailed:
 		still, resetErr := c.driveIntegrationReset(ctx, handle, &frozen, &integ, "combined check failed")
 		if resetErr != nil {
@@ -851,9 +869,10 @@ func (c *Controller) actAndSettlePublish(ctx context.Context, handle RunHandle, 
 }
 
 // advanceChecking advances an integration in checking: adopt an existing
-// settled passing receipt for exactly this candidate, or run a fresh
-// combined-check execution.
-func (c *Controller) advanceChecking(ctx context.Context, handle RunHandle, frozen *FrozenRun, hopPath string, spawnEnv []string, integ *run.Integration) (IntegrationReport, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
+// settled receipt for exactly this candidate, or, with no receipt, run a
+// fresh combined-check execution when execute is set and report it due
+// otherwise.
+func (c *Controller) advanceChecking(ctx context.Context, handle RunHandle, frozen *FrozenRun, hopPath string, spawnEnv []string, integ *run.Integration, execute bool) (IntegrationReport, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
 	report := IntegrationReport{IntegrationID: integ.ID.String(), State: string(integ.State)}
 	subjectTree, err := c.runGit(ctx, frozen.RepositoryRoot, "rev-parse", integ.MergeCommitOID+"^{tree}")
 	if err != nil {
@@ -878,6 +897,10 @@ func (c *Controller) advanceChecking(ctx context.Context, handle RunHandle, froz
 			return report, failErr
 		}
 		return c.reportCurrentIntegrationState(ctx, handle, integ.ID)
+	}
+	if !execute {
+		report.CheckDue = true
+		return report, nil
 	}
 	interrupted, err := c.runIntegrationCheck(ctx, handle, frozen, integ, subjectTree, hopPath, spawnEnv)
 	if err != nil {
@@ -1059,8 +1082,7 @@ func (c *Controller) actAndSettleReset(ctx context.Context, handle RunHandle, fr
 // controller info message to the manager — one transaction (the
 // reference trace 1 commit).
 func (c *Controller) settleIntegrationIntegrated(ctx context.Context, handle RunHandle, frozen *FrozenRun, integ *run.Integration, evidence string) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per integration.
-	noticeBody := fmt.Sprintf("integration %s integrated\ncandidate %s\n%s\n", integ.ID, integ.MergeCommitOID, evidence)
-	notice, err := c.prepareControllerNotice(ctx, handle, frozen.Snapshot.StateRoot, noticeBody)
+	notice, err := c.prepareIntegratedNotice(ctx, handle, frozen, integ, evidence)
 	if err != nil {
 		return err
 	}
@@ -1082,39 +1104,54 @@ func (c *Controller) settleIntegrationIntegrated(ctx context.Context, handle Run
 			// path's reset.
 			return fmt.Errorf("%w: run %s", ErrStopRequested, handle.runID)
 		}
-		latest, rev, getErr := wf.Integrations().Get(ctx, integ.ID)
-		if getErr != nil {
-			return getErr
-		}
-		integrated, trErr := latest.Integrate(now)
-		if trErr != nil {
-			return trErr
-		}
-		if _, saveErr := wf.Integrations().Save(ctx, integrated, rev); saveErr != nil {
-			return saveErr
-		}
-		task, taskRev, getErr := uow.Tasks().Get(ctx, integ.TaskID)
-		if getErr != nil {
-			return getErr
-		}
-		taskFrom := task.State
-		taskIntegrated, trErr := task.Integrate(now)
-		if trErr != nil {
-			return trErr
-		}
-		if _, saveErr := uow.Tasks().Save(ctx, taskIntegrated, taskRev); saveErr != nil {
-			return saveErr
-		}
-		generation := gen(handle.lease.Generation)
-		if err := recordTransition(ctx, uow, EntityTask, integ.TaskID.String(), string(taskFrom), string(taskIntegrated.State), "combined candidate integrated", generation, now); err != nil {
-			return err
-		}
-		// Dependents release in the same transaction.
-		if err := releaseEligibleTasks(ctx, uow, wf, handle.runID, generation, now); err != nil {
-			return err
-		}
-		return commitControllerNotice(ctx, wf, handle.runID, notice, now)
+		return integrateLocked(ctx, uow, wf, handle, integ, notice, now)
 	})
+}
+
+// prepareIntegratedNotice writes the manager notice an integrated
+// settlement commits, before its transaction opens.
+func (c *Controller) prepareIntegratedNotice(ctx context.Context, handle RunHandle, frozen *FrozenRun, integ *run.Integration, evidence string) (controllerNotice, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per integration.
+	noticeBody := fmt.Sprintf("integration %s integrated\ncandidate %s\n%s\n", integ.ID, integ.MergeCommitOID, evidence)
+	return c.prepareControllerNotice(ctx, handle, frozen.Snapshot.StateRoot, noticeBody)
+}
+
+// integrateLocked applies a passing combined candidate inside the
+// caller's transaction, whose stop read the caller owns: integration and
+// task integrated, dependents released, the prepared manager notice
+// committed.
+func integrateLocked(ctx context.Context, uow UnitOfWork, wf WorkflowRepositories, handle RunHandle, integ *run.Integration, notice controllerNotice, now time.Time) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per integration.
+	latest, rev, err := wf.Integrations().Get(ctx, integ.ID)
+	if err != nil {
+		return err
+	}
+	integrated, err := latest.Integrate(now)
+	if err != nil {
+		return err
+	}
+	if _, saveErr := wf.Integrations().Save(ctx, integrated, rev); saveErr != nil {
+		return saveErr
+	}
+	task, taskRev, err := uow.Tasks().Get(ctx, integ.TaskID)
+	if err != nil {
+		return err
+	}
+	taskFrom := task.State
+	taskIntegrated, err := task.Integrate(now)
+	if err != nil {
+		return err
+	}
+	if _, saveErr := uow.Tasks().Save(ctx, taskIntegrated, taskRev); saveErr != nil {
+		return saveErr
+	}
+	generation := gen(handle.lease.Generation)
+	if transErr := recordTransition(ctx, uow, EntityTask, integ.TaskID.String(), string(taskFrom), string(taskIntegrated.State), "combined candidate integrated", generation, now); transErr != nil {
+		return transErr
+	}
+	// Dependents release in the same transaction.
+	if releaseErr := releaseEligibleTasks(ctx, uow, wf, handle.runID, generation, now); releaseErr != nil {
+		return releaseErr
+	}
+	return commitControllerNotice(ctx, wf, handle.runID, notice, now)
 }
 
 // releaseEligibleTasks releases every pending dependent task whose

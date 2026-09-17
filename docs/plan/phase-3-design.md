@@ -929,6 +929,23 @@ task for the current head) → assign released tasks into free slots (task
 `seq` order) → corroborate launches → drive checks. Every dispatch
 revalidates (heartbeat CAS + stop re-read) exactly as Phase 2 requires.
 
+The long executions run off the pass, as asynchronous rounds under a
+context the loop cancels. The per-task check is one such round. The
+integration step's combined-check execution is the other (section 8).
+- **Starting a round.** The integration step reports the combined check
+  due instead of running it. The loop starts that round after a pass
+  that did not halt.
+- **While a round runs.** The integration step has one owner at a time:
+  the pass leaves the step alone until the loop has consumed the round.
+  Meanwhile every other step keeps its cadence, including heartbeats and
+  the stop check.
+- **Stop.** The stop branch interrupts both rounds and waits for them
+  before stop handling. The runner kills a canceled check's process
+  group, and stop retires what is left by its claim.
+- **A stop refusal mid-pass.** When a held stop refuses one of the
+  integration step's own dispatches, that pass ends. The next tick
+  drives the stop.
+
 ### Per-attempt session retirement
 
 An interactive harness does not exit when its model turn ends: the landed
@@ -1800,6 +1817,39 @@ combined check triggers the journaled compare-and-swap reset (a fresh
 rollback commit, section 4) and `needs-rework`; passing per-task checks
 on separate branches never substitute — this is the exit criterion's
 revalidation, mechanically.
+
+The combined-check execution is the step's one long act. It runs as its
+own round, which the controller loop can cancel (section 6). The rest of
+the step is recovery, the claim, the merge, the publish, the reset and
+the adoption of a settled receipt; it reports a checking candidate with
+no receipt as due and never executes the check itself. The two calls
+exclude each other within the controller process: whichever call arrives
+second does nothing.
+
+A round acts only when all of these hold:
+- the integration is still checking;
+- no integration-step operation is unresolved;
+- its intent transaction finds no stop request and no terminal-failure
+  cause. Unstarted work is never started into a stopping or failing run.
+  The published candidate belongs to that shutdown's reset.
+
+A canceled round's journal:
+- **Cancelled before its spawn.** No process can have claimed the
+  execution. The round settles it failed as never spawned, under a
+  context that outlives the cancellation. A later round runs a fresh
+  execution, or the stop resets the candidate.
+- **Cancelled after its spawn.** The execution is journaled reconciling.
+  Stop retires it by its claim.
+
+The outcome, its evidence and the integration's consequence (integrated,
+or `check-failed`) commit in one transaction. That transaction still
+reads stop first. It writes nothing unless the execution is still
+unresolved. A terminal-failure shutdown can run while the round runs, and
+it settles a running execution by its claim before it resets the
+candidate. A round that finds its execution already settled therefore
+backs off. It never marks integrated a candidate whose ref that shutdown
+is resetting. The per-task check follows the same never-spawned rule: its
+request returns to requested for a fresh execution.
 
 ### Review as a task
 

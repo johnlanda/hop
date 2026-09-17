@@ -401,11 +401,18 @@ func (s *fakeStore) ReleaseLease(_ context.Context, lease app.Lease) error {
 	return nil
 }
 
-func (s *fakeStore) Begin(_ context.Context, lease app.Lease) (app.UnitOfWork, error) {
+// Begin opens a unit of work bound to ctx, as the real store's BeginTx
+// binds its transaction: a context already canceled refuses the unit of
+// work before anything opens, and one canceled before Commit fails the
+// commit.
+func (s *fakeStore) Begin(ctx context.Context, lease app.Lease) (app.UnitOfWork, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("app_test: begin unit of work: %w", err)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.openUnitsOfWork++
-	return &fakeUnitOfWork{store: s, lease: lease}, nil
+	return &fakeUnitOfWork{store: s, lease: lease, ctx: ctx}, nil
 }
 
 // refuseInsideTransaction fails a port call made while any unit of work is
