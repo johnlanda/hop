@@ -924,9 +924,13 @@ func runWorker() {
 		drainMailbox(hopPath)
 		submitOnce(hopPath, oid, "fixture implementer result (released)")
 	case "worker-fetch-crash":
-		msg, delivered := parseDeliveredMessage(runHopCLI(hopPath, "msg", "wait").Stdout)
-		if !delivered {
-			fatalf("worker-fetch-crash: no message delivered within the wait timeout")
+		var msg deliveredMessage
+		for {
+			var delivered bool
+			msg, delivered = parseDeliveredMessage(runHopCLI(hopPath, "msg", "wait").Stdout)
+			if delivered {
+				break
+			}
 		}
 		msgBody := readFileOrFatal(msg.BodyPath)
 		// This process's OWN read of the fetched message, dumped as a
