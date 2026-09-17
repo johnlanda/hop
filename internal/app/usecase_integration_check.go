@@ -350,7 +350,15 @@ func (c *Controller) settleCombinedCheck(ctx context.Context, handle RunHandle, 
 		if runErr != nil {
 			return runErr
 		}
-		if r.StopRequested {
+		// The stop read above is the authority, and a notice exists only
+		// when the read-only look before the body was written agreed with
+		// it. A prepared notice missing here would mean the two disagreed
+		// held-then-not-held, which the monotonic stop flag cannot do
+		// today; integrating on it anyway would commit a zero-valued
+		// message row — empty id, empty body path, undeliverable. Treat it
+		// as the stop the earlier read saw, so the stop path owns the
+		// candidate exactly as it would have.
+		if r.StopRequested || (passed && notice.ID == "") {
 			settled = combinedCheckStopHeld
 			return nil
 		}
