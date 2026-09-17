@@ -340,6 +340,9 @@ type processInfoParams struct {
 // schema-optional (no foreground job at all is a legitimate pane state),
 // so their absence is the port's documented zero value, not a decode
 // error; there is no process start time anywhere in this surface.
+// answeredBy is not wire data: Client.Call records in it the lifetime of
+// the server that answered, observed on the request's own connection
+// (lifetimeObserver).
 type processInfoResult struct {
 	Type        string `json:"type"`
 	ProcessInfo *struct {
@@ -347,6 +350,12 @@ type processInfoResult struct {
 		ForegroundProcessGroupID int                  `json:"foreground_process_group_id"`
 		ForegroundProcesses      []processInfoProcess `json:"foreground_processes"`
 	} `json:"process_info"`
+	answeredBy string
+}
+
+// observeServerLifetime implements lifetimeObserver.
+func (r *processInfoResult) observeServerLifetime(token string) {
+	r.answeredBy = token
 }
 
 // processInfoProcess is one foreground process record. PID and Name are
@@ -367,7 +376,10 @@ type processInfoProcess struct {
 // the returned error wraps both app.ErrPaneNotFound (the port's "positively
 // does not exist" absence contract) and this adapter's own ErrPaneNotFound
 // in that case, and only that case — every other failure (transport,
-// protocol, a wrong-typed response) satisfies neither.
+// protocol, a wrong-typed response) satisfies neither. The returned
+// PaneProcess's ServerInstance is the lifetime of the server that answered
+// this very request (serverLifetime, read on the request's own connection
+// before and after it), "" when that could not be established.
 func (r *Runtime) InspectPane(ctx context.Context, paneID string) (app.PaneProcess, error) {
 	var result processInfoResult
 	if err := r.client.Call(ctx, "pane.process_info", processInfoParams{PaneID: paneID}, &result); err != nil {
@@ -402,6 +414,7 @@ func (r *Runtime) InspectPane(ctx context.Context, paneID string) (app.PaneProce
 		ShellPID:          result.ProcessInfo.ShellPID,
 		ForegroundGroupID: result.ProcessInfo.ForegroundProcessGroupID,
 		Foreground:        foreground,
+		ServerInstance:    result.answeredBy,
 	}, nil
 }
 
@@ -471,24 +484,20 @@ func isPaneNotFound(err error) bool {
 	return errors.As(err, &apiErr) && apiErr.Code == "pane_not_found"
 }
 
-// ServerInstance identifies the server process behind the configured
-// socket: the peer pid of the process that accepted the dialed
-// connection, rendered as "peer-pid:<n>". A non-empty token identifies
-// both the configured socket and the server process behind it, so equal
-// tokens imply the same socket and the same server process; peer-pid
-// recycling is not detected. An empty string, with a nil error, means the
-// identity could not be established (an unsupported platform, or the
-// platform lookup failing) — never a fabricated value. Only a failure to
-// connect at all is an error.
+// ServerInstance identifies the server lifetime behind the configured
+// socket: a bare connect (no request is sent) whose accepting process is
+// the server, rendered by serverLifetime as that process's pid and OS start
+// time. Equal non-empty tokens therefore imply the same socket and the same
+// server process lifetime, and a pid reused by a later server never
+// repeats a token. An empty string, with a nil error, means the identity
+// could not be established (every platform but darwin, or a lookup
+// failing) — never a fabricated value. Only a failure to connect at all is
+// an error.
 func (r *Runtime) ServerInstance(ctx context.Context) (string, error) {
 	conn, err := r.client.dial(ctx)
 	if err != nil {
 		return "", fmt.Errorf("determine server instance: %w", err)
 	}
 	defer closeConn(conn)
-	pid, ok := peerPID(conn)
-	if !ok {
-		return "", nil
-	}
-	return fmt.Sprintf("peer-pid:%d", pid), nil
+	return serverLifetime(conn), nil
 }

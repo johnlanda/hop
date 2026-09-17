@@ -661,7 +661,7 @@ func seedForeignReviewer(t *testing.T, tc *testController, fr featureRun, seq in
 	if err != nil {
 		t.Fatalf("parse incarnation id: %v", err)
 	}
-	binding := run.NewRuntimeBinding(sessionID, incarnationID, "", "peer-pid:2", "ws-f", "tab-f", "pane-f", "label-f", run.LaunchInitial, now)
+	binding := run.NewRuntimeBinding(sessionID, incarnationID, "", fakeServerToken(2), "ws-f", "tab-f", "pane-f", "label-f", run.LaunchInitial, now)
 	tc.Store.Bindings[sessionID] = append(tc.Store.Bindings[sessionID], binding)
 	tc.Store.LaunchClaims[incarnationID] = app.LaunchClaim{
 		IncarnationID: incarnationID, RunID: fr.RunID, SessionID: sessionID, AttemptID: attemptID,

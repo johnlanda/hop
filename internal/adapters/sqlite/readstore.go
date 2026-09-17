@@ -239,18 +239,27 @@ func featureWorktreeDetail(ctx context.Context, q querier, detail *app.RunDetail
 	return err
 }
 
-// attachSessionBinding surfaces the session's current binding and its
-// incarnation's claim on the detail block, when a binding exists.
+// attachSessionBinding surfaces the session's current binding, when one
+// exists, and the launch claim of the incarnation the session launch
+// context resolves (sessionLaunchIncarnation): the binding's, else — while
+// the pane.open outcome is unrecorded — the session's newest pending
+// launch intent's, so a claim written before the binding is visible to
+// every reader of the detail (docs/plan/phase-2-design.md section 4:
+// claim state decides). A binding and a pending intent that disagree
+// surface no claim.
 func attachSessionBinding(ctx context.Context, q querier, detail *app.RunDetail, sessionID identity.SessionID) error {
 	binding, hasBinding, err := currentBinding(ctx, q, sessionID)
 	if err != nil {
 		return err
 	}
-	if !hasBinding {
-		return nil
+	if hasBinding {
+		detail.Binding = &binding
 	}
-	detail.Binding = &binding
-	if detail.Claim, err = getLaunchClaim(ctx, q, binding.IncarnationID); err != nil {
+	resolved, err := sessionLaunchIncarnation(ctx, q, sessionID)
+	if err != nil || resolved.unresolved != "" {
+		return err
+	}
+	if detail.Claim, err = getLaunchClaim(ctx, q, resolved.incarnation); err != nil {
 		return err
 	}
 	return nil

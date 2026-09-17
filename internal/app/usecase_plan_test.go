@@ -624,7 +624,7 @@ func TestPlanRefusalReasonsAlwaysSet(t *testing.T) {
 			t.Fatalf("parse incarnation id: %v", err)
 		}
 		tc.Store.Bindings[managerID] = append(tc.Store.Bindings[managerID],
-			run.NewRuntimeBinding(managerID, incarnationID, "", "peer-pid:9", "ws", "tab", "pane", "label", run.LaunchInitial, now))
+			run.NewRuntimeBinding(managerID, incarnationID, "", fakeServerToken(9), "ws", "tab", "pane", "label", run.LaunchInitial, now))
 
 		got, err := tc.Store.CreateTask(context.Background(), app.TaskCreate{
 			ID: taskID, RunID: unknownRunID, Session: managerID, IncarnationID: incarnationID,

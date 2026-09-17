@@ -8,7 +8,7 @@ import (
 )
 
 func newBinding() run.RuntimeBinding {
-	return run.NewRuntimeBinding(testSessionID, testIncarnation, "/tmp/herdr.sock", "peer-pid:1", "workspace-1", "tab-1", "pane-1", "label-1", run.LaunchInitial, epoch())
+	return run.NewRuntimeBinding(testSessionID, testIncarnation, "/tmp/herdr.sock", "herdr-server-lifetime/v1 pid=41001 start=1789000000.000001", "workspace-1", "tab-1", "pane-1", "label-1", run.LaunchInitial, epoch())
 }
 
 func TestNewRuntimeBinding(t *testing.T) {

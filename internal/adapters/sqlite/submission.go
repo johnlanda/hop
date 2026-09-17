@@ -305,12 +305,14 @@ func persistAcceptance(ctx context.Context, tx *sql.Tx, acceptance run.Acceptanc
 // session's current identity, or a claim for this incarnation already
 // exists with a different run, session, attempt or pid; a rewrite by the
 // same pid on the same tuple is idempotent. Currency follows
-// sessionIncarnationCurrent: the session's current binding decides when
-// one exists, and before any binding row the authority is the SESSION's
-// newest pending launch operation's intent JSON ("incarnation_id"), so a
-// launcher racing the controller's pane.open outcome write is admitted, a
-// retired incarnation's launcher never is, and two concurrently pending
-// launches validate independently. The INSERT records the resolved
+// sessionIncarnationCurrent, the one principal-incarnation rule: the
+// session's current binding decides when one exists (a pending launch
+// intent disagreeing with it fails closed), and before any binding row the
+// authority is the SESSION's newest pending launch operation's intent JSON
+// ("incarnation_id"), so a launcher racing the controller's pane.open
+// outcome write is admitted, a retired incarnation's launcher never is,
+// and two concurrently pending launches validate independently. The
+// INSERT records the resolved
 // session_id (NOT NULL after migration 003) with attempt_id NULL for an
 // attempt-less session's claim.
 func (s *Store) ClaimLaunch(ctx context.Context, claim app.LaunchClaim) error { //nolint:gocritic // hugeParam: the port passes the claim value; the adapter mirrors its signature.

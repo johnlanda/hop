@@ -33,13 +33,13 @@ this package never resolves environment variables or defaults.
 | [messaging.go](messaging.go) | `SendMessage`, `FetchNextMessage`, `AckMessage`, `AnswerQuestion`, `insertMessageReceipt`, `acceptedMessageReceipt`, `sendRequestDigest`, `decideAnswer`, `recordAnswerOutcome`, `answerDestinationClosed` | The section 7 worker-authority messaging port: request-ID receipts first, the caller session's OWN run and current incarnation re-derived per verb, every sender's logical address re-derived from its session row before any addressing decision (unresolvable or different from the claimed `SenderAddress`: `unauthorized`), answer recipient authority (that derived address required to equal the question's recipient, via `run.AcceptAnswer`'s `AnswerContext`, so no session answers a human question), derived answer destinations admitted only into an open task mailbox (`decideAnswer`, `recordAnswerOutcome`, `answerDestinationClosed`, shared by both answer paths), the bundled human-question ack, receipts for every outcome except the deliberately receipt-free empty fetch. Only an ordinary send checks the run state (`Run.CanAcceptManagerVerb`: a `transient` receipt while the run can still reach running, `refused-run-not-accepting` once it never will); fetch, ack and both answer paths have no run-state gate |
 | [plan.go](plan.go) | `CreateTask`, `RequestRetry`, `ClosePlan`, `insertWorkflowReceipt`, `acceptedWorkflowReceipt`, `requireManagerCaller`, `runAcceptanceReason` | The section 8 worker-authority plan port: manager-only verbs, run-state-gated after the caller checks (`Run.CanAcceptManagerVerb`: a `transient` receipt and nothing else while the run can still reach running, `refused` with `run-not-accepting` once it never will), the retry's successor attempt reserved in the accepting transaction (its outcome carries the task's seq and the attempt number, re-read on a receipt replay), the plan flag set/cleared on runs.plan_closed_at, one authoritative acceptance per (run, verb, request ID) |
 | [review.go](review.go) | `SubmitReview`, `persistVerdictAcceptance`, `reviewerSessionEligible` | The section 8 worker-authority verdict write: SubmitResult's order mirrored (a transient verdict carries `app.TransientReasonOf` its `AcceptVerdict` error), acceptance persisting the review, completing attempt and task, closing the mailbox and committing the controller's reasons-bearing manager notice atomically |
-| [workflow_read.go](workflow_read.go) | `LoadSessionLaunchContext`, `LoadMessagingContext`, `LoadMessageDetail`, `worktreePathForAttempt`, `attemptWorktreePath`, `featureRunDetail`, `runNeedsAttentionLocked`, `mailboxStatuses`, `guardShortfalls`, `recordedSubjects`, `pendingQuestions`, `sessionSummaries` | The Phase 3 lease-free reads (`app.WorkflowReadStore`): session-addressed launch context (binding else the SESSION-keyed pending intent, fail closed; the attempt row, worktree path and Relaunch successor fact), the messaging context, hop msg show's detail, and RunDetail's feature extensions. The launch context's worktree comes from the newest row linked to the attempt, else the run's only row while that row is unlinked, else ""; a row linked to another attempt is never served, and several rows are never guessed among. The status task table uses the linked row alone. `sessionSummaries` (STATUS-1) lists every session of the run, oldest first (`ORDER BY rowid`), each with `getAttempt`'s task/number for a delegated child and `currentBinding`'s current (non-superseded) binding whatever the session's own state — a terminated session's last binding is still reported, as evidence of where it ran. `runNeedsAttentionLocked` (Astra F4, called from `readstore.go`'s `ListRuns`) is false for a solo run, else the OR-reduction of the SAME `mailboxStatuses` call `featureRunDetail`'s own `Mailboxes` population makes — one implementation of the attention threshold rule, so the bare listing and the `-run` detail can never disagree about one run. `guardShortfalls` evaluates through `app.StatusGuardShortfalls`: the head commit is the newest integrated row's merge commit, and `recordedSubjects` lists the subjects recorded for exactly that commit (review tasks' `subject_commit_oid`/`subject_tree_oid` and reviews' subject columns) that supply its tree — the integration row records no tree, and the merge commit id is never used as one |
+| [workflow_read.go](workflow_read.go) | `LoadSessionLaunchContext`, `sessionLaunchIdentity`, `sessionLaunchIncarnation`, `LoadMessagingContext`, `LoadMessageDetail`, `worktreePathForAttempt`, `attemptWorktreePath`, `featureRunDetail`, `runNeedsAttentionLocked`, `mailboxStatuses`, `guardShortfalls`, `recordedSubjects`, `pendingQuestions`, `sessionSummaries` | The Phase 3 lease-free reads (`app.WorkflowReadStore`): session-addressed launch context (binding else the SESSION-keyed pending intent, fail closed — `sessionLaunchIncarnation`, the resolution the status read model shares; the attempt row, worktree path and Relaunch successor fact), the messaging context, hop msg show's detail, and RunDetail's feature extensions. The launch context's worktree comes from the newest row linked to the attempt, else the run's only row while that row is unlinked, else ""; a row linked to another attempt is never served, and several rows are never guessed among. The status task table uses the linked row alone. `sessionSummaries` (STATUS-1) lists every session of the run, oldest first (`ORDER BY rowid`), each with `getAttempt`'s task/number for a delegated child and `currentBinding`'s current (non-superseded) binding whatever the session's own state — a terminated session's last binding is still reported, as evidence of where it ran. `runNeedsAttentionLocked` (Astra F4, called from `readstore.go`'s `ListRuns`) is false for a solo run, else the OR-reduction of the SAME `mailboxStatuses` call `featureRunDetail`'s own `Mailboxes` population makes — one implementation of the attention threshold rule, so the bare listing and the `-run` detail can never disagree about one run. `guardShortfalls` evaluates through `app.StatusGuardShortfalls`: the head commit is the newest integrated row's merge commit, and `recordedSubjects` lists the subjects recorded for exactly that commit (review tasks' `subject_commit_oid`/`subject_tree_oid` and reviews' subject columns) that supply its tree — the integration row records no tree, and the merge commit id is never used as one |
 | [messages.go](messages.go) | `parseAddress`, `scanMessage`, `getMessage`, `messagesByAddress`, `nextEnqueueSeq`, `insertMessage`, `messageDeliveries`, `messageAck`, `resolveSessionAddress` | Shared message row mapping: Message.State reconstructed from the delivery/ack rows in the same snapshot (never a persisted column), the per-(run, recipient) FIFO sequence, lineage-based address resolution |
 | [statestore.go](statestore.go) | `InitializeRun`, `AcquireLease`, `Heartbeat`, `ReleaseLease`, `Begin`, `validateLease` | The controller authority: run bootstrap in one transaction (the snapshot's workflow JSON round-tripped, NULL for solo; a feature spec inserts the run, snapshot, manager session and lease only, refusing `app.ErrFeatureRunSpecInvalid` before the transaction and `app.ErrRunSequenceMismatch` inside it), lease CAS with monotonic generations, fenced unit-of-work begin |
 | [uow.go](uow.go) | `unitOfWork` and the typed repositories (`Runs`…`CheckExecClaims`), `OperationRepository.Pending`/`ByKind`, `Commit`, `Rollback` | One immediate transaction per unit of work; optimistic-concurrency saves; append-only bindings and transitions; journal payloads persisted as uninterpreted JSON; controller-side launch-claim settlement |
-| [entities.go](entities.go) | `getRun`, `getTask`, `getAttempt`, `getSession`, `currentSession`, `currentBinding`, `getWorktree`, `scanWorktree`, `selectWorktreeColumns`, `getLaunchClaim`, `acceptedResult`, `incarnationCurrent`, `launchIncarnationCurrent`, `pendingLaunchIntent` | Row ↔ domain-value mapping shared by all three authorities through the `querier` interface (`getWorktree` and the listing's `scanWorktree` map NULL `attempt_id`/`base_commit` to the solo row's empty links; a worktree's `state` column is read verbatim, including the retirement states `removed`/`absent`/`released`) |
+| [entities.go](entities.go) | `getRun`, `getTask`, `getAttempt`, `getSession`, `currentSession`, `currentBinding`, `getWorktree`, `scanWorktree`, `selectWorktreeColumns`, `getLaunchClaim`, `acceptedResult`, `incarnationCurrent`, `sessionIncarnationCurrent`, `pendingLaunchIntentDisagrees`, `pendingLaunchIntentOfSession` | Row ↔ domain-value mapping shared by all three authorities through the `querier` interface; `sessionIncarnationCurrent` is the one principal-incarnation rule every caller-incarnation check decides through (see Invariants) (`getWorktree` and the listing's `scanWorktree` map NULL `attempt_id`/`base_commit` to the solo row's empty links; a worktree's `state` column is read verbatim, including the retirement states `removed`/`absent`/`released`) |
 | [submission.go](submission.go) | `SubmitResult`, `RecordMalformed`, `ClaimLaunch`, `SettleLaunchFailure`, `ClaimCheckExec`, `RequestStop`, `insertReceipt` | The worker authority: the section 7 validation order with the domain's `AcceptResult` inside one transaction, receipts for every outcome (a transient result carries its typed reason: undelivered-messages from the mailbox check that precedes `AcceptResult`, attempt-not-running from its `ErrTransientNotRunning`), the pre-exec claim contracts, the monotonic stop request |
-| [readstore.go](readstore.go) | `ListRuns`, `LoadRunStatus`, `LoadFrozenRun`, `LoadCheckExecutionContext`, `lastCheckSummary`, `retirementIntentExecution` | Lease-free reads, each inside one deferred read transaction for a consistent WAL snapshot; `LoadRunStatus` carries the snapshot's frozen `TargetBranch` and the run's `worktrees_retired_at` fact, and for a feature run `featureWorktreeDetail` adds every worktree row (oldest first, non-nil) and the run's `worktree.retire` operations (newest first, through the shared `operationsByKind`) |
+| [readstore.go](readstore.go) | `ListRuns`, `LoadRunStatus`, `attachSessionBinding`, `LoadFrozenRun`, `LoadCheckExecutionContext`, `lastCheckSummary`, `retirementIntentExecution` | Lease-free reads, each inside one deferred read transaction for a consistent WAL snapshot; `LoadRunStatus` names the solo worker's (or feature manager's) session, its current binding and the claim of the incarnation `sessionLaunchIncarnation` resolves (`attachSessionBinding`: the binding's, else the session's newest pending launch intent's, none when any pending launch intent of the session disagrees with the binding), and carries the snapshot's frozen `TargetBranch` and the run's `worktrees_retired_at` fact, and for a feature run `featureWorktreeDetail` adds every worktree row (oldest first, non-nil) and the run's `worktree.retire` operations (newest first, through the shared `operationsByKind`) |
 | [worktreeretirement_read.go](worktreeretirement_read.go) | `Store` as `app.RetirementReadStore`: `ListRetirementCandidates`, `terminalUnretiredRuns`, `retirementCandidateRecord`, `collectIntegrations` | The worktree-retirement triage read, in one read transaction. It returns the repository's completed, failed and stopped runs whose fact is unset, whose frozen workflow is feature mode with a target, and that integrated at least one row adding content, in sequence order. Each record carries its integrated rows (oldest first), its `retirement.check` operations (newest first) and whether any `retirement.check` or `worktree.retire` is pending or reconciling. An unknown root has no candidates |
 | [worktreeretirement.go](worktreeretirement.go) | `unitOfWork` as `app.WorktreeRetirementRepositories`: `WorktreesForRetirement`, `WorktreesRetiredAt`, `MarkWorktreesRetired`; `runWorktrees`, `runWorktreesRetiredAt` | `WorktreesForRetirement` lists every worktree row of the leased run (another run is `ErrFenced`) in insertion order (`created_at, rowid`), any state, with its revision; row state saves go through `Worktrees().Save`. `WorktreesRetiredAt` reads the leased run's fact inside the transaction (another run is `ErrFenced`). Migration 004's worktrees-retired run fact: written once inside the fenced unit of work (the leased run only; the UPDATE applies only while NULL, so a repeat keeps the first value; a set-once housekeeping column that does not move `runs.revision`), read back as nil for NULL or the canonical time (anything else fails closed) |
 
@@ -106,21 +106,21 @@ this package never resolves environment variables or defaults.
   same-pid retry on the same tuple is accepted only while the claim is
   exec_pending and its executable and argv digest match. It refreshes
   only seed_evidence to the retry's outcome; all invocation identity
-  fields remain unchanged, and settled claims refuse retries. Currency:
-  the
-  attempt's current session's current binding decides when one exists;
-  before ANY binding row exists for that session (the launcher is the
-  pane's own command and can claim before the controller records the
-  pane.open outcome), the authority is the run's newest pending launch
-  operation (kind pane.open or launch.send), whose intent JSON must carry
-  BOTH the claim's incarnation and the current session's id under the keys
+  fields remain unchanged, and settled claims refuse retries. Currency is
+  the principal-incarnation rule below: the session's current binding
+  decides when one exists (ANY pending intent of the session naming
+  another incarnation, or none usable, fails it closed); before ANY binding row exists for that session (the
+  launcher is the pane's own command and can claim before the controller
+  records the pane.open outcome), the authority is the session's newest
+  pending launch operation (kind pane.open or launch.send), whose intent
+  JSON carries the claim's incarnation and the session's id under the keys
   `incarnation_id` and `session_id` — a documented contract between the
   application (which commits the intent before dispatching the pane
-  request) and this store (which reads them with `json_extract`). The
-  session conjunct keeps a retired incarnation's still-pending old intent
-  from authorizing a claim after a cold relaunch replaces the session, and
-  a superseded binding without a successor retires the incarnation: any
-  existing binding row disables the intent fallback.
+  request) and this store (which reads them with `json_extract`). Keying
+  the intent to the session keeps a retired incarnation's still-pending old
+  intent from authorizing a claim after a cold relaunch replaces the
+  session, and a superseded binding without a successor retires the
+  incarnation: any existing binding row disables the intent fallback.
   `LaunchClaims().Settle` moves exec_pending to execed or exec_failed only,
   idempotent per target state. `ClaimCheckExec` requires a pending
   operation whose kind `app.OperationKind.ExecClaimable` accepts
@@ -151,6 +151,28 @@ this package never resolves environment variables or defaults.
   fails closed with `app.ErrNotFound`; slice 6 deleted the Phase 2
   run-keyed `LoadLaunchContext`, so this is the only launch-context read
   now — every role, the permanent solo shim included.
+- One principal-incarnation rule (`sessionIncarnationCurrent`,
+  docs/plan/phase-3-design.md section 7) decides every caller-incarnation
+  check: `ClaimLaunch`, `CreateTask`/`RequestRetry`/`ClosePlan`
+  (`requireManagerCaller`), `SendMessage`, `FetchNextMessage`,
+  `AckMessage`, `SubmitReview` and `SubmitResult` (through
+  `incarnationCurrent`, which resolves the attempt's non-terminated session
+  first — solo included). Current means: the session's current binding
+  carries the incarnation and no pending launch intent of the session —
+  any of them, not only the newest (`pendingLaunchIntentDisagrees`: an
+  `EXISTS` over the session's pending pane.open/launch.send rows whose
+  `incarnation_id` is not a string equal to the binding's, so an absent,
+  null or non-string one counts too) — names another one (a disagreement
+  fails closed even when a newer intent agrees); or no binding row exists
+  at all and the session's newest PENDING launch intent names it (this
+  fallback alone selects the newest). `sessionLaunchIncarnation`, which
+  the launch context and the status claim share, resolves the bound case
+  through the same `pendingLaunchIntentDisagrees`. A principal
+  whose pane.open outcome was never recorded therefore proceeds normally
+  (the run-state rule still applies); a superseded binding without a
+  successor stays stale. The intent source is `pending` only, so a
+  pane.open recorded reconciling after its launcher claimed leaves the
+  principal stale until label recovery binds it (LAUNCH-6, accepted).
 - Worker-authority request idempotency is receipt-first: every mutating
   messaging/plan verb resolves the (run, verb, request ID) acceptance key
   before anything else — an identical retry returns the original outcome
@@ -231,8 +253,9 @@ this package never resolves environment variables or defaults.
   two receipts and one check request; `ClaimLaunch` idempotence,
   different-pid rejection (raced), run/attempt agreement (mixed tuples
   refused before and after the owner stops), the pre-binding intent
-  fallback (matching intent accepted, stale incarnation refused, binding
-  precedence, supersession retirement, replacement-session refusal);
+  fallback (matching intent accepted, stale incarnation refused, a binding
+  and a differing intent failing closed, supersession retirement,
+  replacement-session refusal);
   `SettleLaunchFailure` and controller settlement transitions;
   `ClaimCheckExec` generation/kind/state matrix; monotonic `RequestStop`;
   the read-store loads (`LoadFrozenRun`; the session-keyed launch-context
@@ -291,7 +314,29 @@ this package never resolves environment variables or defaults.
   (`TestClaimLaunchSessionKeyedIntents` — B2 —
   `TestClaimLaunchByAttemptResolvesSession`,
   `TestClaimLaunchManagerSession`,
-  `TestClaimCheckExecAcceptsMergeOperations`); the Phase 3 reads
+  `TestClaimCheckExecAcceptsMergeOperations`); the one
+  principal-incarnation rule (`TestPrincipalIncarnationRule` — task
+  create, task retry, plan close, message send, fetch and ack, the launch
+  claim, review and result submission, each against a committed binding,
+  a pending intent only, a disagreeing binding and intent, a superseded
+  binding, an OLDER pending intent disagreeing while the newest agrees,
+  and a pending intent with no usable incarnation —
+  `TestPrincipalIncarnationOlderConflictingIntent` (the review's
+  reproduction through `ClosePlan`),
+  `TestPrincipalIncarnationPendingIntentKeepsRunStateRule`
+  and the solo `TestPrincipalIncarnationSoloResult`), the status read
+  model's claim (`TestLoadRunStatusResolvesTheLaunchContextClaim`: a
+  claim written before the binding surfaces for the solo worker and the
+  feature manager, none on a binding/intent disagreement, including an
+  older disagreeing intent behind an agreeing newest one, for which the
+  launch context resolves nothing either) and its relaunch
+  safety (`TestFeatureColdRelaunchSuccessorIsCurrent` for an implementer,
+  a reviewer and the manager, `TestSoloColdRelaunchSuccessorIsCurrent`
+  after an attestation and after a restored occupant's retirement: each
+  path's transactions replayed in the application's order — every
+  relaunch mints a new session, so the successor's claim and first verb
+  are current before and after its pane.open outcome while the prior
+  incarnation stays stale); the Phase 3 reads
   (`TestLoadSessionLaunchContext` — worktree rows written through the
   production repository, including the one-unlinked-row fallback and the
   several-unlinked-rows refusal — `TestLoadMessagingContext`,

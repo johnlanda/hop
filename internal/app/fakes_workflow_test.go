@@ -488,8 +488,7 @@ func (s *fakeStore) SendMessage(_ context.Context, send app.MessageSend) (app.Me
 	if !ok || senderRow.value.RunID != send.RunID {
 		return app.MessageOutcome{Kind: app.MessageRefused, Reason: app.GrammarReasonUnauthorized, Detail: "session does not belong to this run"}, nil
 	}
-	binding, hasBinding := s.currentBindingLocked(send.Sender.SessionID)
-	if !hasBinding || binding.IncarnationID != send.IncarnationID || binding.Superseded {
+	if !s.sessionIncarnationCurrentLocked(send.Sender.SessionID, send.IncarnationID) {
 		return app.MessageOutcome{Kind: app.MessageRefused, Reason: app.GrammarReasonStale, Detail: "incarnation is not current"}, nil
 	}
 	// The sender's logical address is re-derived from its own session
@@ -664,8 +663,7 @@ func (s *fakeStore) FetchNextMessage(_ context.Context, fetch app.MessageFetch) 
 	if !ok || sessionRow.value.RunID != fetch.RunID {
 		return app.MessageDelivery{}, false, fmt.Errorf("%w: session %s does not belong to run %s", app.ErrMessagingUnauthorized, fetch.SessionID, fetch.RunID)
 	}
-	binding, hasBinding := s.currentBindingLocked(fetch.SessionID)
-	if !hasBinding || binding.IncarnationID != fetch.IncarnationID || binding.Superseded {
+	if !s.sessionIncarnationCurrentLocked(fetch.SessionID, fetch.IncarnationID) {
 		return app.MessageDelivery{}, false, fmt.Errorf("%w: session %s incarnation %s is not current", app.ErrMessagingUnauthorized, fetch.SessionID, fetch.IncarnationID)
 	}
 	resolvedAddress, ok := s.resolveSessionAddressLocked(fetch.SessionID)
@@ -737,8 +735,7 @@ func (s *fakeStore) AckMessage(_ context.Context, ack app.MessageAck) (app.Messa
 			break
 		}
 	}
-	binding, hasBinding := s.currentBindingLocked(ack.SessionID)
-	incarnationCurrent := hasBinding && binding.IncarnationID == ack.IncarnationID && !binding.Superseded
+	incarnationCurrent := s.sessionIncarnationCurrentLocked(ack.SessionID, ack.IncarnationID)
 
 	outcomeVal, err := run.AcceptAck(msg, priorAck, run.AckContext{DeliveredToSession: deliveredToSession, IncarnationCurrent: incarnationCurrent}, run.Ack{SessionID: ack.SessionID, IncarnationID: ack.IncarnationID}, now)
 	switch {
@@ -839,8 +836,7 @@ func (s *fakeStore) CreateTask(_ context.Context, req app.TaskCreate) (app.TaskC
 	if !ok || sRow.value.Role != run.RoleManager || sRow.value.RunID != req.RunID {
 		return app.TaskCreated{Outcome: app.WorkflowRefused, Reason: app.GrammarReasonNotManager, Detail: "caller is not the run's manager"}, nil
 	}
-	binding, hasBinding := s.currentBindingLocked(req.Session)
-	if !hasBinding || binding.IncarnationID != req.IncarnationID || binding.Superseded {
+	if !s.sessionIncarnationCurrentLocked(req.Session, req.IncarnationID) {
 		return app.TaskCreated{Outcome: app.WorkflowRefused, Reason: app.GrammarReasonStale, Detail: "incarnation is not current"}, nil
 	}
 	rRow, ok := s.Runs[req.RunID]
@@ -912,8 +908,7 @@ func (s *fakeStore) RequestRetry(_ context.Context, req app.RetryRequest) (app.R
 	if !ok || sRow.value.Role != run.RoleManager || sRow.value.RunID != req.RunID {
 		return app.RetryAccepted{Outcome: app.WorkflowRefused, Reason: app.GrammarReasonNotManager, Detail: "caller is not the run's manager"}, nil
 	}
-	binding, hasBinding := s.currentBindingLocked(req.Session)
-	if !hasBinding || binding.IncarnationID != req.IncarnationID || binding.Superseded {
+	if !s.sessionIncarnationCurrentLocked(req.Session, req.IncarnationID) {
 		return app.RetryAccepted{Outcome: app.WorkflowRefused, Reason: app.GrammarReasonStale, Detail: "incarnation is not current"}, nil
 	}
 	rRow, ok := s.Runs[req.RunID]
@@ -1014,8 +1009,7 @@ func (s *fakeStore) ClosePlan(_ context.Context, req app.PlanClose) (app.PlanClo
 	if !ok || sRow.value.Role != run.RoleManager || sRow.value.RunID != req.RunID {
 		return app.PlanCloseResult{Outcome: app.WorkflowRefused, Reason: app.GrammarReasonNotManager, Detail: "caller is not the run's manager"}, nil
 	}
-	binding, hasBinding := s.currentBindingLocked(req.Session)
-	if !hasBinding || binding.IncarnationID != req.IncarnationID || binding.Superseded {
+	if !s.sessionIncarnationCurrentLocked(req.Session, req.IncarnationID) {
 		return app.PlanCloseResult{Outcome: app.WorkflowRefused, Reason: app.GrammarReasonStale, Detail: "incarnation is not current"}, nil
 	}
 	rRow, ok := s.Runs[req.RunID]
@@ -1086,8 +1080,7 @@ func (s *fakeStore) SubmitReview(_ context.Context, submission app.ReviewSubmiss
 		}
 	}
 
-	binding, hasBinding := s.currentBindingLocked(submission.Session)
-	incarnationCurrent := hasBinding && binding.IncarnationID == submission.IncarnationID && !binding.Superseded
+	incarnationCurrent := s.sessionIncarnationCurrentLocked(submission.Session, submission.IncarnationID)
 	claim, hasClaim := s.LaunchClaims[submission.IncarnationID]
 	launchClaimSettled := hasClaim && claim.State == app.LaunchClaimExeced
 	mailboxClear := s.mailboxClearLocked(submission.TaskID)
@@ -1180,12 +1173,20 @@ func (s *fakeStore) LoadSessionLaunchContext(_ context.Context, runID identity.R
 }
 
 // sessionLaunchIdentityLocked mirrors the real store's
-// sessionLaunchIdentity: the session's current binding, else its newest
-// pending pane.open/launch.send intent naming it, agreement required when
-// both exist; a disagreement, a malformed intent incarnation or neither
-// source fails closed with ErrNotFound. Callers hold s.mu.
+// sessionLaunchIdentity: the session's current binding, provided no
+// pending pane.open/launch.send intent of the session names another
+// incarnation or none usable (pendingSessionIntentDisagreesLocked), else
+// its newest pending intent naming it; a disagreement, a malformed intent
+// incarnation or neither source fails closed with ErrNotFound. Callers
+// hold s.mu.
 func (s *fakeStore) sessionLaunchIdentityLocked(session identity.SessionID) (identity.IncarnationID, error) {
 	binding, hasBinding := s.currentBindingLocked(session)
+	if hasBinding {
+		if s.pendingSessionIntentDisagreesLocked(session, binding.IncarnationID) {
+			return "", fmt.Errorf("%w: binding and pending intent incarnations disagree for session %s", app.ErrNotFound, session)
+		}
+		return binding.IncarnationID, nil
+	}
 	var (
 		newest    app.Operation
 		hasIntent bool
@@ -1203,27 +1204,14 @@ func (s *fakeStore) sessionLaunchIdentityLocked(session identity.SessionID) (ide
 			newest, hasIntent, rawIntent = op, true, intent.IncarnationID
 		}
 	}
-	var intentIncarnation identity.IncarnationID
-	if hasIntent {
-		parsed, err := identity.ParseIncarnationID(rawIntent)
-		if err != nil {
-			return "", fmt.Errorf("%w: pending launch intent of session %s carries a malformed incarnation id", app.ErrNotFound, session)
-		}
-		intentIncarnation = parsed
-	}
-	switch {
-	case hasBinding && hasIntent:
-		if binding.IncarnationID != intentIncarnation {
-			return "", fmt.Errorf("%w: binding and pending intent incarnations disagree for session %s", app.ErrNotFound, session)
-		}
-		return binding.IncarnationID, nil
-	case hasBinding:
-		return binding.IncarnationID, nil
-	case hasIntent:
-		return intentIncarnation, nil
-	default:
+	if !hasIntent {
 		return "", fmt.Errorf("%w: no binding and no pending launch intent for session %s", app.ErrNotFound, session)
 	}
+	intentIncarnation, err := identity.ParseIncarnationID(rawIntent)
+	if err != nil {
+		return "", fmt.Errorf("%w: pending launch intent of session %s carries a malformed incarnation id", app.ErrNotFound, session)
+	}
+	return intentIncarnation, nil
 }
 
 // sessionIsSuccessorLocked mirrors the real store's sessionIsSuccessor:

@@ -106,9 +106,10 @@ func sendRequestDigest(send *app.MessageSend) string {
 // refused unauthorized — only the derived address decides), and — for an
 // ordinary send — addressing legality, the run's acceptance
 // (run.Run.CanAcceptManagerVerb: transient while the run can still reach
-// running, refused once it never will) and the recipient mailbox; an answer is accepted only from the session whose
-// re-derived logical address is the question's recipient (so no session
-// ever answers a human question), its destination is derived from the
+// running, refused once it never will) and the recipient mailbox; an
+// answer is accepted only from the session whose re-derived logical
+// address is the question's recipient (so no session ever answers a
+// human question), its destination is derived from the
 // referenced question's sender, never caller-chosen, a closed destination
 // task mailbox refuses it once any prior answer is resolved, and it has no
 // run-state gate. Every outcome leaves a receipt; only an acceptance
@@ -170,11 +171,11 @@ func (s *Store) SendMessage(ctx context.Context, send app.MessageSend) (app.Mess
 		if err != nil {
 			return err
 		}
-		binding, hasBinding, err := currentBinding(ctx, tx, send.Sender.SessionID)
+		current, err := sessionIncarnationCurrent(ctx, tx, send.Sender.SessionID, send.IncarnationID)
 		if err != nil {
 			return err
 		}
-		if !hasBinding || binding.IncarnationID != send.IncarnationID || binding.Superseded {
+		if !current {
 			return record(app.MessageRefused, "", app.GrammarReasonStale, "incarnation is not current")
 		}
 		// The sender's logical address is re-derived from its own session
@@ -404,8 +405,9 @@ func persistBundledQuestionAck(ctx context.Context, q querier, question *run.Mes
 // for the caller's address if one exists, else the lowest-enqueue-sequence
 // queued message. Before touching the queue it independently re-derives
 // every caller-supplied identity from the session row itself — the
-// session's own run, its current non-superseded binding's incarnation and
-// its resolved logical address — and any disagreement is
+// session's own run, the claimed incarnation's currency
+// (sessionIncarnationCurrent) and its resolved logical address — and any
+// disagreement is
 // app.ErrMessagingUnauthorized with a refusal receipt committed (the one
 // evidence a refused fetch leaves). An EMPTY fetch commits neither a
 // delivery row nor a receipt, so a 1s poll loop cannot grow the store; a
@@ -436,11 +438,11 @@ func (s *Store) FetchNextMessage(ctx context.Context, fetch app.MessageFetch) (a
 		if err != nil {
 			return err
 		}
-		binding, hasBinding, err := currentBinding(ctx, tx, fetch.SessionID)
+		current, err := sessionIncarnationCurrent(ctx, tx, fetch.SessionID, fetch.IncarnationID)
 		if err != nil {
 			return err
 		}
-		if !hasBinding || binding.IncarnationID != fetch.IncarnationID || binding.Superseded {
+		if !current {
 			return refuse("incarnation is not current",
 				fmt.Errorf("%w: session %s incarnation %s is not current", app.ErrMessagingUnauthorized, fetch.SessionID, fetch.IncarnationID))
 		}
@@ -542,11 +544,10 @@ func (s *Store) AckMessage(ctx context.Context, ack app.MessageAck) (app.Message
 		).Scan(&deliveredToSession); scanErr != nil {
 			return fmt.Errorf("sqlite: read deliveries of message %s: %w", ack.MessageID, scanErr)
 		}
-		binding, hasBinding, err := currentBinding(ctx, tx, ack.SessionID)
+		incarnationIsCurrent, err := sessionIncarnationCurrent(ctx, tx, ack.SessionID, ack.IncarnationID)
 		if err != nil {
 			return err
 		}
-		incarnationIsCurrent := hasBinding && binding.IncarnationID == ack.IncarnationID && !binding.Superseded
 
 		outcomeVal, err := run.AcceptAck(message, priorAck,
 			run.AckContext{DeliveredToSession: deliveredToSession, IncarnationCurrent: incarnationIsCurrent},

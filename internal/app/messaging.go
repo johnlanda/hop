@@ -217,8 +217,11 @@ type MessagingStore interface {
 	// sequence queued message. ok is false for an empty fetch, which
 	// commits neither a delivery row nor a receipt. Validates, before
 	// touching the queue: fetch.SessionID exists and belongs to
-	// fetch.RunID; its current, non-superseded binding's incarnation
-	// equals fetch.IncarnationID; and its resolved logical address equals
+	// fetch.RunID; fetch.IncarnationID is current under the one
+	// principal-incarnation rule (docs/plan/phase-3-design.md section 7:
+	// the committed binding's incarnation, else — before any binding row —
+	// the session's pending launch intent's, a disagreement failing
+	// closed); and its resolved logical address equals
 	// fetch.Address — any disagreement is ErrMessagingUnauthorized, never
 	// silently treated as an empty fetch.
 	FetchNextMessage(ctx context.Context, fetch MessageFetch) (MessageDelivery, bool, error)

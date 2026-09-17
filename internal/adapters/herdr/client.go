@@ -64,15 +64,35 @@ type wireError struct {
 	Message string `json:"message"`
 }
 
+// lifetimeObserver is implemented by a Call result that records which
+// server lifetime answered it. Herdr serves exactly one request per API
+// connection, so the process that accepted the connection is the one that
+// produced the response; Call reads that process's pid from the call's own
+// connection once, right after connecting, and its lifetime
+// (processLifetime) immediately before the request and again after the
+// response, reporting it only when both reads agree (stableLifetime).
+type lifetimeObserver interface {
+	observeServerLifetime(token string)
+}
+
 // Call sends one request and decodes the matching response's result into
 // result when it is non-nil. A response with a different ID, or a frame that
 // is not a response, is a ProtocolError; an error response is an APIError.
+// A result implementing lifetimeObserver is additionally told which server
+// lifetime answered it, or "" when that could not be established.
 func (c *Client) Call(ctx context.Context, method string, params, result any) error {
 	conn, err := c.dial(ctx)
 	if err != nil {
 		return err
 	}
 	defer stopOnDone(ctx, conn)()
+	observer, observes := result.(lifetimeObserver)
+	peer, before := 0, ""
+	if observes {
+		if pid, ok := peerPID(conn); ok {
+			peer, before = pid, processLifetime(pid)
+		}
+	}
 	id := fmt.Sprintf("hop-%d", c.nextID.Add(1))
 	if writeErr := writeRequest(conn, id, method, params); writeErr != nil {
 		return fmt.Errorf("herdr socket %s: write %s: %w", c.socketPath, method, coalesceContextError(ctx, writeErr))
@@ -89,6 +109,13 @@ func (c *Client) Call(ctx context.Context, method string, params, result any) er
 	}
 	if err := json.Unmarshal(resp.Result, result); err != nil {
 		return &ProtocolError{Reason: fmt.Sprintf("decode %s result: %v", method, err)}
+	}
+	if observes {
+		after := ""
+		if peer != 0 {
+			after = processLifetime(peer)
+		}
+		observer.observeServerLifetime(stableLifetime(before, after))
 	}
 	return nil
 }

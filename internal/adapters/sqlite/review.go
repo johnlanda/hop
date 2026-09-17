@@ -117,11 +117,10 @@ func (s *Store) SubmitReview(ctx context.Context, submission app.ReviewSubmissio
 			}
 		}
 
-		binding, hasBinding, err := currentBinding(ctx, tx, submission.Session)
+		incarnationIsCurrent, err := sessionIncarnationCurrent(ctx, tx, submission.Session, submission.IncarnationID)
 		if err != nil {
 			return err
 		}
-		incarnationIsCurrent := hasBinding && binding.IncarnationID == submission.IncarnationID && !binding.Superseded
 		claim, err := getLaunchClaim(ctx, tx, submission.IncarnationID)
 		if err != nil {
 			return err
