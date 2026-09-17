@@ -109,6 +109,10 @@ func TestRealProcessCombinedCheckFailure(t *testing.T) {
 	if !ok || integrationState != "rolled-back" {
 		t.Errorf("integration state after the combined check failed = %q (found=%v), want \"rolled-back\"", integrationState, ok)
 	}
+	// Direct evidence the combined check itself failed on the rejected
+	// candidate — never merely inferred from states and the counter
+	// script.
+	fx.requireCombinedCheckFailed(t, rejectedMergeOID, 1)
 
 	// The reset construction, verified both by object id and by the
 	// persisted rollback-commit OID.
@@ -156,6 +160,12 @@ func TestRealProcessCombinedCheckFailure(t *testing.T) {
 	// (executions 3 and 4 — the script's sole failure was execution 2 —
 	// so the run completes.
 	fx.requireTaskState(t, t1, "integrated")
+	finalMergeOID := fx.scalar(t, fmt.Sprintf(
+		"SELECT merge_commit_oid FROM integrations WHERE run_id = '%s' AND task_id = '%s' ORDER BY rowid DESC LIMIT 1;", fx.runID, t1))
+	if finalMergeOID == "" {
+		t.Fatalf("task %s's final integration has no recorded merge_commit_oid", t1)
+	}
+	fx.requireCombinedCheckPassed(t, finalMergeOID)
 	reviewTaskID := fx.requireReviewTask(t)
 	fx.requireTaskState(t, reviewTaskID, "completed")
 	if verdict, ok := fx.reviewVerdict(t, reviewTaskID); !ok || verdict != "approve" {

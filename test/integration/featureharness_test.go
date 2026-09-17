@@ -579,6 +579,26 @@ func (f *featureRun) requireCombinedCheckPassed(t *testing.T, candidateCommit st
 	}
 }
 
+// requireCombinedCheckFailed is requireCombinedCheckPassed's negative
+// sibling: asserts a PERSISTED, failed combined check (kind=check.run,
+// state=failed) whose subject commit is exactly candidateCommit and
+// whose outcome records exitCode — the actual guard evidence a scenario
+// proving a combined-check failure needs, rather than inferring the
+// failure from task/integration states and the check script alone.
+func (f *featureRun) requireCombinedCheckFailed(t *testing.T, candidateCommit string, exitCode int) {
+	t.Helper()
+	row := f.scalar(t, fmt.Sprintf(
+		`SELECT count(*) FROM operations WHERE run_id = '%s' AND kind = 'check.run' AND state = 'failed' AND intent LIKE '%%"subject_commit_oid":%q%%' AND outcome LIKE '%%"exit_code":%d%%';`,
+		f.runID, candidateCommit, exitCode))
+	n, err := strconv.Atoi(row)
+	if err != nil {
+		t.Fatalf("combined-check failure evidence count %q for candidate %s does not parse: %v", row, candidateCommit, err)
+	}
+	if n == 0 {
+		t.Errorf("no persisted failed combined-check operation (kind=check.run, state=failed, exit_code=%d) found for candidate commit %s (run %s)", exitCode, candidateCommit, f.runID)
+	}
+}
+
 // reviewVerdict reads reviewTaskID's accepted verdict, if any.
 func (f *featureRun) reviewVerdict(t *testing.T, reviewTaskID string) (verdict string, ok bool) {
 	t.Helper()
