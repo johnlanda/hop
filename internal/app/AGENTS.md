@@ -1019,7 +1019,10 @@ sides together. `cmd/hop` never imports domain or identity types: every
   causes, the snapshot-equality forced retry); `TestGuardEnforcement`
   (a scripted manager calling every verb cannot complete a run without
   real receipts), `TestEnsureReviewTask`, `TestDriveCompletion`
-  (retirement observed, re-validation fallback, stop precedence);
+  (retirement observed, re-validation fallback, stop precedence, and an
+  approve of the integrated head — its git tree distinct from its
+  commit — reading ready to the completion guard and verdict-clear to
+  the status read);
   `TestResumeFeature` (warm reattach, per-session attestation with
   continuity evidence, manager lineage/succession with historical
   parents preserved and stale-manager verb refusal, changed/unknown

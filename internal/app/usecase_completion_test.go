@@ -254,6 +254,24 @@ func TestDriveCompletion(t *testing.T) {
 		}
 	})
 
+	t.Run("an approved head reads ready to the guard and verdict-clear to status", func(t *testing.T) {
+		f, rf := integratedFixture(t)
+		head := f.git.ref(integrationRefName)
+		if tree := f.git.treeOf(head); tree == "" || tree == head || rf.SubjectCommit != head {
+			t.Fatalf("head %s tree %q reviewed subject %s; want an approve of the head, its tree distinct from its commit", head, tree, rf.SubjectCommit)
+		}
+		ready, missing, err := f.tc.Controller.EvaluateRunReadiness(context.Background(), f.fr.Handle)
+		if err != nil || !ready || len(missing) != 0 {
+			t.Fatalf("EvaluateRunReadiness() = %v %v err=%v, want ready with nothing missing", ready, missing, err)
+		}
+		// The status read holds no check receipt, so check-missing is its
+		// one shortfall; the approve of the head clears every verdict one.
+		view := mustStatusDetail(t, f.tc, f.fr.RunID)
+		if len(view.GuardShortfalls) != 1 || !containsShortfall(view.GuardShortfalls, string(run.ShortfallCheckMissing)) {
+			t.Fatalf("status GuardShortfalls = %+v, want exactly check-missing", view.GuardShortfalls)
+		}
+	})
+
 	t.Run("completion retirement is observed, never declared", func(t *testing.T) {
 		f, _ := integratedFixture(t)
 		// The manager still idles at its composer: retirement dispatches
