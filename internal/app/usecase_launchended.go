@@ -87,13 +87,36 @@ func (c *Controller) serverContinuityHolds(ctx context.Context, recorded string)
 }
 
 // placedContinuityDetail is the value-free outstanding detail, with the
-// human action, for a placed launch observed absent without established
+// human action, for a placed pane observed absent without established
 // server continuity. After a restart a renamed pane keeps its new name and
 // a pane awaiting a deferred native restore answers no inspection, so
-// absence by id and label proves nothing; stop's own absence observation
-// is the finite exit once no pane of the run remains.
+// absence by id and label proves nothing. Renaming a renamed pane back
+// lets a later round find it by its label; a pane really gone after a
+// restart has no exit HOP can take on its own.
 func placedContinuityDetail(label string) string {
-	return fmt.Sprintf("the pane is absent by id and by launch label %s, but server continuity since the placement is not established (the Herdr server may have restarted, and a pane renamed before a restart, or one awaiting a deferred restore, stays hidden from both), so nothing is settled; if a pane of this run was renamed, rename it back to %s, otherwise hop stop the run once no pane of it remains", RenderExternal(label), RenderExternal(label))
+	return fmt.Sprintf("the pane is absent by id and by launch label %s, but server continuity since the placement is not established (the Herdr server may have restarted, and a pane renamed before a restart, or one awaiting a deferred restore, stays hidden from both), so no absence is concluded; if a pane of this run was renamed, rename it back to %s", RenderExternal(label), RenderExternal(label))
+}
+
+// observePlacedPaneAbsence applies the one absence rule to a placed pane
+// with server continuity bracketed around it: absent only when the pane is
+// positively absent by id and by creation label (observePaneAbsence) AND
+// the server lifetime recorded (the placement's, or the lifetime that
+// answered a positive identification) serves the socket on both sides of
+// that observation. An absence observed without continuity is ambiguous,
+// with placedContinuityDetail's action: a renamed pane restored after a
+// restart, or one whose deferred native restore has not fired, answers
+// neither lookup and may still resume a harness later. Stop, the pane.close
+// procedure and the per-attempt retirement decide absence through it.
+func (c *Controller) observePlacedPaneAbsence(ctx context.Context, recorded, paneID, label string) (pane PaneProcess, absent bool, ambiguous string) {
+	continuousBefore := c.serverContinuityHolds(ctx, recorded)
+	pane, absent, ambiguous = c.observePaneAbsence(ctx, paneID, label)
+	if ambiguous != "" || !absent {
+		return pane, absent, ambiguous
+	}
+	if !continuousBefore || !c.serverContinuityHolds(ctx, recorded) {
+		return PaneProcess{}, false, placedContinuityDetail(label)
+	}
+	return pane, true, ""
 }
 
 // observeLaunchEnded applies the corroborated-absence predicate to an

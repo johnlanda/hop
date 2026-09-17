@@ -661,12 +661,13 @@ func TestLaunchEndedPredicateGovernsStopAndFailure(t *testing.T) {
 	})
 }
 
-// TestLaunchEndedRowAfterRestartLeavesStopAsTheExit pins what the
+// TestLaunchEndedRowAfterRestartHasNoAutomaticExit pins what the
 // continuity conjunct leaves for a placed launch after a server restart:
-// resume never settles it and names the rename-back action, while stop's
-// own absence observation still finishes the run once no pane of it
-// remains.
-func TestLaunchEndedRowAfterRestartLeavesStopAsTheExit(t *testing.T) {
+// resume never settles it and names the rename-back action, and stop
+// concludes no absence either and stays stopping with the same action,
+// while the same observations under the placement's lifetime finish the
+// stop.
+func TestLaunchEndedRowAfterRestartHasNoAutomaticExit(t *testing.T) {
 	t.Run("resume stays resuming with the rename-back action", func(t *testing.T) {
 		f := newResumeFixture(t)
 		binding := resumeChildClaim(t, f, app.LaunchClaimExecPending)
@@ -679,8 +680,8 @@ func TestLaunchEndedRowAfterRestartLeavesStopAsTheExit(t *testing.T) {
 		}
 		report := sessionReport(t, &result, f.ChildID.String())
 		want := "launch claim not settled; corroboration continues (the pane is absent by id and by launch label " + binding.CreationLabel +
-			", but server continuity since the placement is not established (the Herdr server may have restarted, and a pane renamed before a restart, or one awaiting a deferred restore, stays hidden from both), so nothing is settled; if a pane of this run was renamed, rename it back to " +
-			binding.CreationLabel + ", otherwise hop stop the run once no pane of it remains)"
+			", but server continuity since the placement is not established (the Herdr server may have restarted, and a pane renamed before a restart, or one awaiting a deferred restore, stays hidden from both), so no absence is concluded; if a pane of this run was renamed, rename it back to " +
+			binding.CreationLabel + ")"
 		if report.Disposition != app.SessionPending || report.Detail != want {
 			t.Fatalf("child report = %+v, want pending with %q", report, want)
 		}
@@ -693,7 +694,8 @@ func TestLaunchEndedRowAfterRestartLeavesStopAsTheExit(t *testing.T) {
 		requireRunState(t, f, run.RunResuming)
 	})
 
-	t.Run("stop with the pane really gone still finishes", func(t *testing.T) {
+	stopWithChildPaneGone := func(t *testing.T, instance string) (app.StopReport, *testController, launchingChild) {
+		t.Helper()
 		tc := newTestController(defaultPolicy())
 		fr := seedFeatureRun(t, tc, 2)
 		taskID := seedImplementTask(t, tc, fr.RunID, 1, "A", false, run.TaskReady)
@@ -702,19 +704,45 @@ func TestLaunchEndedRowAfterRestartLeavesStopAsTheExit(t *testing.T) {
 		rRow.value = rRow.value.RequestStop(tc.Clock.Now())
 		rRow.revision++
 		tc.Runtime.InspectPaneFn = vanishedPane(child.PaneID, nil)
-		tc.Runtime.ServerInstanceValue = fakeServerToken(2)
+		tc.Runtime.ServerInstanceValue = instance
 
 		report, err := tc.Controller.DriveFeatureStop(context.Background(), fr.Handle)
 		if err != nil {
 			t.Fatalf("DriveFeatureStop() error = %v", err)
 		}
-		if !report.Terminated || report.RunState != string(run.RunStopped) {
-			t.Fatalf("stop report = %+v, want stopped", report)
-		}
 		if got := tc.Store.LaunchClaims[child.IncarnationID]; got.State != app.LaunchClaimExecPending {
 			t.Errorf("claim = %s (%q), want exec_pending: stop settles no launch-ended claim", got.State, got.Error)
 		}
+		return report, tc, child
+	}
+
+	t.Run("stop after a restart stays stopping with the rename-back action", func(t *testing.T) {
+		report, tc, child := stopWithChildPaneGone(t, fakeServerToken(2))
+		if report.Terminated || report.RunState != string(run.RunStopping) {
+			t.Fatalf("stop report = %+v, want stopping: no absence is concluded without continuity", report)
+		}
+		binding, ok := tc.Store.currentBindingLocked(child.SessionID)
+		if !ok {
+			t.Fatalf("no binding for session %s", child.SessionID)
+		}
+		want := "session " + child.SessionID.String() + ": " + placedContinuityText(binding.CreationLabel)
+		if !slices.Contains(report.Outstanding, want) {
+			t.Fatalf("outstanding = %q, want %q", report.Outstanding, want)
+		}
 	})
+
+	t.Run("stop with the pane really gone under one lifetime finishes", func(t *testing.T) {
+		report, _, _ := stopWithChildPaneGone(t, fakeServerToken(1))
+		if !report.Terminated || report.RunState != string(run.RunStopped) {
+			t.Fatalf("stop report = %+v, want stopped", report)
+		}
+	})
+}
+
+// placedContinuityText is placedContinuityDetail's rendering for label.
+func placedContinuityText(label string) string {
+	return "the pane is absent by id and by launch label " + label +
+		", but server continuity since the placement is not established (the Herdr server may have restarted, and a pane renamed before a restart, or one awaiting a deferred restore, stays hidden from both), so no absence is concluded; if a pane of this run was renamed, rename it back to " + label
 }
 
 // allPanesAbsentPinned answers every pane with the adapter's pinned

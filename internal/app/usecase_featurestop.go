@@ -266,24 +266,29 @@ func (c *Controller) stopFeatureSessions(ctx context.Context, handle RunHandle, 
 			}
 		}
 		if !claimFound {
-			_, absent, ambiguous := c.observePaneAbsence(ctx, binding.PaneID, binding.CreationLabel)
+			_, absent, ambiguous := c.observePlacedPaneAbsence(ctx, binding.ServerInstance, binding.PaneID, binding.CreationLabel)
 			if ambiguous == "" && absent {
 				if termErr := c.terminateRetiredSession(ctx, handle, session.ID, "stop: pane observed absent with no claim"); termErr != nil {
 					return nil, termErr
 				}
 				continue
 			}
+			if ambiguous != "" {
+				outstanding = append(outstanding, fmt.Sprintf("session %s has no launch claim to retire against; %s", session.ID, ambiguous))
+				continue
+			}
 			outstanding = append(outstanding, fmt.Sprintf("session %s has no launch claim to retire against; failing closed", session.ID))
 			continue
 		}
 		target := paneCloseTarget{
-			PaneID:        binding.PaneID,
-			Label:         binding.CreationLabel,
-			SessionID:     session.ID,
-			IncarnationID: binding.IncarnationID,
-			PID:           claim.PID,
-			Markers:       markers,
-			Reason:        closeReasonStop,
+			PaneID:         binding.PaneID,
+			Label:          binding.CreationLabel,
+			SessionID:      session.ID,
+			IncarnationID:  binding.IncarnationID,
+			PID:            claim.PID,
+			Markers:        markers,
+			Reason:         closeReasonStop,
+			ServerInstance: binding.ServerInstance,
 			// An unsettled launch is observed terminated only as the
 			// corroborated-absence pair: pane absent and claimed process gone.
 			requireProcessGone: claim.State == LaunchClaimExecPending,

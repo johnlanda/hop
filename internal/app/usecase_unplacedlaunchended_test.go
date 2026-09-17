@@ -491,13 +491,14 @@ func TestUnplacedLaunchAfterRestartHasNoAutomaticExit(t *testing.T) {
 		pendingIntentPayload(t, u)["label"] = hostile
 		u.tc.Runtime.ServerInstanceValue = fakeServerToken(2)
 		report := u.driveStop(t, 1)
-		joined := strings.Join(report.Outstanding, "\n")
 		want := "session " + u.sessionID.String() + ": " + unplacedContinuityText(strconv.Quote(hostile)) + "; failing closed"
 		if !slices.Contains(report.Outstanding, want) {
 			t.Fatalf("outstanding = %q, want %q", report.Outstanding, want)
 		}
-		if strings.ContainsAny(joined, "\x1b\n") {
-			t.Fatalf("outstanding = %q carries a raw control byte or line break", joined)
+		for _, entry := range report.Outstanding {
+			if strings.ContainsAny(entry, "\x1b\n") {
+				t.Fatalf("outstanding entry %q carries a raw control byte or line break", entry)
+			}
 		}
 	})
 
