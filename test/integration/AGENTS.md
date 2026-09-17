@@ -467,6 +467,13 @@ The address/session-currency and result/verdict acceptance-order rules (design s
   artifact directory as every other evidence this suite produces. The suite
   never removes the shared `$TMPDIR/hop-integration` root by hand — only its
   own per-test directories.
+- The package's own total wall time (every `TestRealProcess*`/`TestSpike*`
+  case run together, as `make test`'s `./...` sweep does) is now about 10
+  minutes — past `go test`'s own 10m per-package default, which is why
+  `make test` passes an explicit `-timeout 30m`. Every new real-process
+  scenario adds directly to this total: keep each one lean (the minimum
+  kill points, waits and assertions its own trace actually needs, `-run` a
+  narrow pattern while iterating) rather than growing it further.
 
 ## Related guides
 
