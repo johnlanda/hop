@@ -322,6 +322,18 @@ func TestRealProcessInjectionFreeDelivery(t *testing.T) {
 	if endIdx <= startIdx {
 		t.Fatalf("window-end line %d is not after window-start line %d; the bracket is not usable for scoping a scan", endIdx, startIdx)
 	}
+	// P3-4: production never calls pane.list/tab.list today (verified by
+	// grep), which is what makes firstLineIndex's FIRST-occurrence bracket
+	// safe -- but that safety is silent and would change meaning without
+	// warning if production ever did call either method. Asserting each
+	// marker occurs EXACTLY ONCE across the whole capture makes that
+	// assumption an executed check, not just a cited fact.
+	if n := countLinesContaining(lines, `method="pane.list"`); n != 1 {
+		t.Fatalf("herdr-server.log contains %d line(s) naming method=\"pane.list\" (the window-start marker), want exactly 1", n)
+	}
+	if n := countLinesContaining(lines, `method="tab.list"`); n != 1 {
+		t.Fatalf("herdr-server.log contains %d line(s) naming method=\"tab.list\" (the window-end marker), want exactly 1", n)
+	}
 
 	// S11's own finding: a request-log line never carries the pane/agent
 	// target or any request parameter, so the control is located by

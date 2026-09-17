@@ -10,6 +10,25 @@ import (
 	"time"
 )
 
+// readSubmitObservationLines reads a submit-valid-held worker's own
+// observation file (each hop result submit attempt's exact first line, one
+// per line, dumped by submitOnce/fixtureworker_test.go's own
+// observationPath parameter) and returns its non-empty lines in order.
+func readSubmitObservationLines(t *testing.T, path string) []string {
+	t.Helper()
+	content, err := os.ReadFile(path) //nolint:gosec // G304: a path this test constructed itself under its own scratch directory.
+	if err != nil {
+		t.Fatalf("read submit observation %s: %v", path, err)
+	}
+	var lines []string
+	for _, line := range strings.Split(string(content), "\n") {
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
 // grammarTransientUndeliveredLine mirrors
 // internal/app/grammar.go's GrammarTransientUndeliveredLine (retyped,
 // never imported, per this suite's own convention for cross-boundary
@@ -72,7 +91,7 @@ func testRealProcessMailboxClosureRaceOrdering(t *testing.T) {
 
 	brief := fixtureManagerBrief(scratchDir,
 		[]fixtureManagerTask{
-			{Label: "t1", Title: "Implement t1 (send lands first)", Behavior: "submit-valid"},
+			{Label: "t1", Title: "Implement t1 (send lands first)", Behavior: "submit-valid-held"},
 			{Label: "t2", Title: "Implement t2 (closure lands first)", Behavior: "worker-implement"},
 		},
 		nil, "",
@@ -84,12 +103,16 @@ func testRealProcessMailboxClosureRaceOrdering(t *testing.T) {
 	managerEnv := fx.managerEnv(t)
 
 	// --- Order A: the send lands first. ---
-	// Addressed to t1's mailbox the INSTANT the task row exists (before
-	// the controller has even run one scheduling pass, let alone before
-	// the real worker process has launched, committed a change and
-	// called hop result submit itself) -- a structural guarantee, not a
-	// timed race: the message is unconditionally queued long before
-	// submit-valid's worker can possibly reach its own submission.
+	// P2-3: STRUCTURAL, not a timed race. t1 (submit-valid-held) blocks
+	// immediately before its OWN first hop result submit call until this
+	// test writes its release gate -- so the worker cannot possibly
+	// complete a submit attempt before the race message below is already
+	// durably committed, regardless of how fast the real worker process
+	// happens to launch and reach it.
+	fx.requireTaskState(t, t1, "active")
+	attempt1ID, _ := fx.currentAttempt(t, t1)
+	session1ID := fx.sessionForAttempt(t, attempt1ID)
+
 	sendFirstPath := filepath.Join(scratchDir, "race-send-first-t1.md")
 	if err := os.WriteFile(sendFirstPath, []byte("manager info racing t1's own first submission attempt\n"), 0o600); err != nil {
 		t.Fatalf("write race message body: %v", err)
@@ -100,13 +123,21 @@ func testRealProcessMailboxClosureRaceOrdering(t *testing.T) {
 	}
 	sendFirstMessageID := parseSentID(t, sendFirstResult.Stdout)
 
-	fx.requireTaskState(t, t1, "active", "checking", "completed", "integrating", "integrated")
-	attempt1ID, _ := fx.currentAttempt(t, t1)
-	session1ID := fx.sessionForAttempt(t, attempt1ID)
+	// NOW release the gate: t1's worker reaches its first submit only
+	// after this file exists, well after the race message above already
+	// landed.
+	submitHeldReleasePath := filepath.Join(scratchDir, "submit-held-release-"+attempt1ID)
+	submitHeldTmp := submitHeldReleasePath + ".tmp"
+	if err := os.WriteFile(submitHeldTmp, []byte("FIXTURE-RELEASE\n"), 0o600); err != nil {
+		t.Fatalf("write submit-held release control file: %v", err)
+	}
+	if err := os.Rename(submitHeldTmp, submitHeldReleasePath); err != nil {
+		t.Fatalf("rename submit-held release control file into place: %v", err)
+	}
 
-	// The submission is refused transient at least once: submit-valid's
-	// FIRST hop result submit call runs against a mailbox that is not
-	// yet clear, by construction.
+	// The submission is refused transient at least once: t1's FIRST hop
+	// result submit call runs against a mailbox that is not yet clear, by
+	// construction.
 	if !waitUntilDeadline(featureRunTimeout, func() bool {
 		return fx.scalar(t, fmt.Sprintf(
 			"SELECT count(*) FROM result_submissions WHERE claimed_attempt_id = '%s' AND outcome = 'transient' AND detail = '%s';",
@@ -127,6 +158,29 @@ func testRealProcessMailboxClosureRaceOrdering(t *testing.T) {
 	}
 	if n := fx.scalar(t, fmt.Sprintf("SELECT count(*) FROM result_submissions WHERE claimed_attempt_id = '%s' AND outcome = 'accepted';", attempt1ID)); n != "1" {
 		t.Errorf("accepted result_submissions receipt count for attempt %s = %s, want exactly 1", attempt1ID, n)
+	}
+
+	// P2-3: the exact sequence of first lines the real CLI rendered
+	// across every submit attempt, dumped by the fixture to its own
+	// observation file -- the retyped drain line at least once, then
+	// EXACTLY "accepted <id>", never inferred from the outcome rows
+	// alone (which prove acceptance but say nothing about the CLI's own
+	// rendered text -- RESULT-1's own gap, before its fix landed).
+	acceptedResultID := fx.scalar(t, fmt.Sprintf("SELECT id FROM results WHERE attempt_id = '%s' AND accepted = 1;", attempt1ID))
+	if acceptedResultID == "" {
+		t.Fatalf("no accepted results row for attempt %s", attempt1ID)
+	}
+	observedLines := readSubmitObservationLines(t, filepath.Join(scratchDir, "submit-observed-"+attempt1ID+".txt"))
+	if len(observedLines) < 2 {
+		t.Fatalf("submit observation for attempt %s has %d line(s), want at least 2 (>=1 drain line, then accepted); got: %v", attempt1ID, len(observedLines), observedLines)
+	}
+	for _, line := range observedLines[:len(observedLines)-1] {
+		if line != grammarTransientUndeliveredLine {
+			t.Errorf("submit observation line %q before the final line, want the EXACT drain line %q", line, grammarTransientUndeliveredLine)
+		}
+	}
+	if want, got := "accepted "+acceptedResultID, observedLines[len(observedLines)-1]; got != want {
+		t.Errorf("submit observation's final line = %q, want %q", got, want)
 	}
 
 	// --- Order B: the closure lands first. ---
@@ -195,9 +249,8 @@ func testRealProcessMailboxClosureRaceFailure(t *testing.T) {
 	})
 
 	brief := fixtureManagerBrief(scratchDir,
-		[]fixtureManagerTask{{Label: "t1", Title: "Implement t1", Behavior: "worker-hold"}},
-		[]fixtureManagerAnswer{{Match: fixtureHoldMarker, Action: "relay"}},
-		"",
+		[]fixtureManagerTask{{Label: "t1", Title: "Implement t1", Behavior: "worker-block"}},
+		nil, "",
 	)
 	fx := startFeatureRun(t, artifacts, server, repo, scratchDir, brief)
 
@@ -217,19 +270,14 @@ func testRealProcessMailboxClosureRaceFailure(t *testing.T) {
 	// identity does not depend on anything this test does to the worker.
 	managerEnv := fx.managerEnv(t)
 
-	// Kill the worker before its barrier is ever answered: mailbox still
-	// open, no accepted result, its own launch already settled (execed,
-	// asserted above) -- design section 11 scenario 4's own precondition,
-	// generalized here to the exhaustion variant by RetryLimit=1.
-	fx.killSession(t, session1ID, attempt1ID)
-
-	// Immediately -- a single near-instant hop CLI call issued the
-	// moment killSession's own bounded wait confirms the pane is gone,
-	// comfortably ahead of the live controller's own multi-second
-	// scheduling-pass cadence -- address an info message to the
-	// STILL-OPEN mailbox: this is the orphaned obligation the failing
-	// settlement's snapshot-equality contract (design section 5) must
-	// capture in its notice.
+	// P2-2 (option A): the order is now STRUCTURAL, not timed. worker-block
+	// never calls hop msg wait (never drains, never submits, never asks a
+	// question) -- its ONLY liveness signal is existing until self-killed
+	// -- so this send against t1's mailbox is addressed WHILE the worker
+	// is provably alive (asserted above: active, execed), with nothing on
+	// the worker side that could possibly race it. This is the orphaned
+	// obligation the failing settlement's snapshot-equality contract
+	// (design section 5) must capture in its notice.
 	orphanPath := filepath.Join(scratchDir, "orphan-info-t1.md")
 	if err := os.WriteFile(orphanPath, []byte("manager info addressed to t1 while its worker is dead and its mailbox still open\n"), 0o600); err != nil {
 		t.Fatalf("write orphan message body: %v", err)
@@ -239,10 +287,19 @@ func testRealProcessMailboxClosureRaceFailure(t *testing.T) {
 		t.Fatalf("hop msg send (orphan info) exit=%d stdout=%q stderr=%q", orphanResult.ExitCode, orphanResult.Stdout, orphanResult.Stderr)
 	}
 	orphanMessageID := parseSentID(t, orphanResult.Stdout)
+	// worker-block never calls hop msg wait at all, so this message stays
+	// QUEUED (never delivered) right up to the kill -- still a pending
+	// obligation the failing settlement's notice must name.
+	if fx.messageAcked(t, orphanMessageID) {
+		t.Fatalf("orphan message %s is already acked before the worker was ever killed", orphanMessageID)
+	}
 
-	// The live controller reconciles on its own next scheduling pass:
-	// the retry budget is already exhausted (one attempt, RetryLimit=1),
-	// so the task fails directly, never parking at needs-rework.
+	// NOW self-kill the still-unresponsive worker, then let the live
+	// controller settle the failure on its own next scheduling pass: the
+	// retry budget is already exhausted (one attempt, RetryLimit=1), so
+	// the task fails directly, never parking at needs-rework.
+	fx.killSession(t, session1ID, attempt1ID)
+
 	fx.requireTaskState(t, t1, "failed")
 	fx.requireSessionState(t, session1ID, "terminated")
 

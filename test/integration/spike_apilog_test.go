@@ -298,6 +298,21 @@ func firstLineIndex(lines []string, substr string) (int, bool) {
 	return -1, false
 }
 
+// countLinesContaining returns how many lines in lines contain substr --
+// used to assert a marker line is UNIQUE across a whole capture, never
+// merely "at least one" (firstLineIndex's own first-occurrence bracket is
+// only safe when the marker is unique; this makes that assumption an
+// executed check).
+func countLinesContaining(lines []string, substr string) int {
+	n := 0
+	for _, line := range lines {
+		if strings.Contains(line, substr) {
+			n++
+		}
+	}
+	return n
+}
+
 // requireLine returns the line within lines[startIdx+1:endIdx] containing
 // every one of substrs, failing the test unless exactly one such line
 // exists.

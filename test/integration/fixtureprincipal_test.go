@@ -1796,6 +1796,88 @@ func TestFixtureWorkerHoldBarrier(t *testing.T) {
 	}
 }
 
+// TestFixtureWorkerHoldFetchLoopFatalsOnUnexpectedRefusal proves P2-7's
+// fatal path: fetchDeliveredMessage (shared by worker-hold and
+// worker-fetch-crash's own msg-wait fetch loop) must fatalf on any hop msg
+// wait outcome that is neither a delivered message, "none:", "transient:",
+// nor the LAUNCH-7 pre-binding window's own exact "refused: unauthorized"
+// line -- never spin silently against a permanent regression.
+func TestFixtureWorkerHoldFetchLoopFatalsOnUnexpectedRefusal(t *testing.T) {
+	artifacts := newArtifactDir(t)
+	worker := buildFixtureWorker(t, artifacts)
+	fakeHop := buildFakeHopStub(t, artifacts)
+	repo := newFixtureRepo(t, artifacts, nil, "repo")
+
+	stateDir := artifacts.dir(t, "state")
+	scratchDir := artifacts.dir(t, "worker-hold-fatal-scratch")
+	const (
+		runID     = "12121212-1212-4212-8212-121212121212"
+		taskID    = "13131313-1313-4313-8313-131313131313"
+		attemptID = "14141414-1414-4414-8414-141414141414"
+	)
+	assignmentPath := filepath.Join(stateDir, "runs", runID, "attempts", attemptID, "assignment.md")
+	if err := os.MkdirAll(filepath.Dir(assignmentPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(assignmentPath, []byte("# HOP Task Assignment\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	instructionsPath := filepath.Join(stateDir, "runs", runID, "tasks", taskID+".md")
+	if err := os.MkdirAll(filepath.Dir(instructionsPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(instructionsPath, []byte("FIXTURE-BEHAVIOR: worker-hold "+scratchDir+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	scriptDir := artifacts.dir(t, "worker-hold-fatal-script")
+	// A hop msg wait outcome that is none of the tolerated shapes: not a
+	// delivered message, not "none:", not "transient:", and not the
+	// LAUNCH-7 pre-binding window's own exact "refused: unauthorized"
+	// line.
+	blocks := []string{"refused: not-found\n"}
+	scriptPath, indexPath := writeFakeHopMsgScript(t, scriptDir, blocks)
+	logPath := filepath.Join(scriptDir, "log.txt")
+
+	prompt := testAssignmentPrompt(assignmentPath, fakeHop)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, worker, "--session-id", "15151515-1515-4515-8515-151515151515", prompt) //nolint:gosec // G204: fixed test-owned binary and arguments.
+	cmd.Dir = repo.Root
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOP_STATE_DIR=" + stateDir,
+		"HOP_RUN_ID=" + runID,
+		"HOP_TASK_ID=" + taskID,
+		"HOP_ATTEMPT_ID=" + attemptID,
+		"HOP_SESSION_ID=15151515-1515-4515-8515-151515151515",
+		"HOP_INCARNATION_ID=16161616-1616-4616-8616-161616161616",
+		"HOP_ROLE=implementer",
+		"FAKE_HOP_MSG_SCRIPT=" + scriptPath,
+		"FAKE_HOP_MSG_INDEX=" + indexPath,
+		"FAKE_HOP_LOG=" + logPath,
+	}
+	var out strings.Builder
+	cmd.Stdout, cmd.Stderr = &out, &out
+	err := cmd.Run()
+	if err == nil {
+		t.Fatalf("worker-hold exited 0 despite an unexpected hop msg wait refusal; output:\n%s", out.String())
+	}
+	exitErr, ok := err.(*exec.ExitError) //nolint:errorlint // a direct type assertion suffices for this test's own exec of a single known binary.
+	if !ok {
+		t.Fatalf("run error = %v (%T), want *exec.ExitError", err, err)
+	}
+	if exitErr.ExitCode() != 1 {
+		t.Fatalf("exit code = %d, want 1 (fatalf); output:\n%s", exitErr.ExitCode(), out.String())
+	}
+	if !strings.Contains(out.String(), `fixture principal: hop msg wait returned an unexpected line: "refused: not-found"`) {
+		t.Errorf("output missing the expected fatalf message; got:\n%s", out.String())
+	}
+	if strings.Contains(out.String(), "FIXTURE-HOLD-RELEASED") || strings.Contains(out.String(), "FIXTURE-WORKER-IDLE") {
+		t.Errorf("worker-hold proceeded past the unexpected refusal instead of fatal-ing; output:\n%s", out.String())
+	}
+}
+
 // TestFixtureWorkerFetchCrash proves DuplicateAndAmbiguousDelivery's
 // worker-fetch-crash behavior (design section 11 scenario 3) in
 // isolation, for both incarnations: the first fetches one message, dumps
@@ -1907,9 +1989,10 @@ func testFixtureWorkerFetchCrashBlocksBeforeAck(t *testing.T) {
 	if err := os.Rename(tmp, controlPath); err != nil {
 		t.Fatalf("rename self-kill control file into place: %v", err)
 	}
-	if err := wait(); err == nil {
-		t.Fatalf("worker exited 0 after the self-kill control file was written; want it SIGKILLed; output:\n%s", out.snapshot())
-	}
+	// P3-1 (the finding's own executed case, m1): ctx.Err() == nil proves
+	// this SIGKILL is the fixture's own self-kill channel firing, never
+	// the context's 30s deadline masking a self-kill that never happened.
+	requireSelfKilled(t, ctx.Err(), wait())
 
 	log := readFakeHopLog(t, logPath)
 	if strings.Contains(log, "msg\tack\t"+msgID) {
@@ -2019,11 +2102,23 @@ func testFixtureWorkerFetchCrashResumedWaitsForReleaseThenAcks(t *testing.T) {
 	if !waitUntil(func() bool { return strings.Contains(out.snapshot(), wantObserved) }) {
 		t.Fatalf("resumed worker never reported observing the re-served message; output so far:\n%s", out.snapshot())
 	}
-	if strings.Contains(out.snapshot(), "FIXTURE-FETCH-CRASH-ACKED") {
-		t.Fatalf("resumed worker acked before the release gate was created; output:\n%s", out.snapshot())
-	}
-	if log := readFakeHopLog(t, logPath); strings.Contains(log, "msg\tack\t"+msgID) {
-		t.Fatalf("fake hop invocation log shows the message acked before the release gate was created; got:\n%s", log)
+	// P3-2: a single snapshot taken right after OBSERVED cannot reliably
+	// detect a release gate that returns instantly instead of actually
+	// holding (the reviewer's own mutation m2: waitForControlFile
+	// no-ops) -- there is still a real race window between the OBSERVED
+	// print and a now-immediate ack, so a lucky snapshot can still catch
+	// "not yet acked" even under the bug (2 of 5 runs passed against m2).
+	// Polling repeatedly across a bounded, generous NEGATIVE window
+	// proves the gate actually held, deterministically, not by luck.
+	const fetchCrashReleaseNegativeWindow = 2 * time.Second
+	const fetchCrashReleaseNegativePoll = 50 * time.Millisecond
+	for deadline := time.Now().Add(fetchCrashReleaseNegativeWindow); time.Now().Before(deadline); time.Sleep(fetchCrashReleaseNegativePoll) {
+		if strings.Contains(out.snapshot(), "FIXTURE-FETCH-CRASH-ACKED") {
+			t.Fatalf("resumed worker acked before the release gate was ever created; output:\n%s", out.snapshot())
+		}
+		if log := readFakeHopLog(t, logPath); strings.Contains(log, "msg\tack\t"+msgID) {
+			t.Fatalf("fake hop invocation log shows the message acked before the release gate was ever created; got:\n%s", log)
+		}
 	}
 
 	releasePath := filepath.Join(scratchDir, "fetch-crash-release-"+attemptID)

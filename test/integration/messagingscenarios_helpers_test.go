@@ -9,6 +9,27 @@ import (
 	"time"
 )
 
+// This file adds the one capability slice 7a's harness does not itself
+// provide: driving a manager verb (hop task create/plan close/msg send)
+// as a direct, test-issued one-shot process authenticated with the run's
+// OWN live manager session identity -- exactly the technique
+// featureharness_test.go's answerHuman already uses for "human" (a
+// separate real hop process, never typed pane input), generalized to the
+// manager's own HOP_SESSION_ID/HOP_INCARNATION_ID so a scenario can
+// construct an exact send/submission ordering deterministically (never
+// with a sleep), or seed an artifact-delivery channel with content the
+// scripted manager-feature grammar cannot carry losslessly (its
+// whitespace-delimited, underscore-substituted TASK/ANSWER fields), in
+// place of depending on the SCRIPTED fixture manager's own timing or
+// text encoding. A call issued this way is exactly as legitimate as one
+// the live scripted manager process would make itself: the store
+// validates only the session id, its current incarnation and the run it
+// belongs to (internal/app/usecase_message.go's SendMessage,
+// internal/adapters/sqlite/messaging.go's SendMessage) -- never which OS
+// process happened to invoke the CLI. Shared by
+// injectionfreedelivery_test.go, mailboxclosurerace_test.go,
+// relayedquestion_test.go and duplicateandambiguousdelivery_test.go.
+
 // managerVerbRetryInterval paces runManagerVerb's retry-on-transient
 // loop, mirroring the embedded fixture's own fixtureRetryInterval.
 const managerVerbRetryInterval = 200 * time.Millisecond
@@ -36,26 +57,6 @@ func runManagerVerb(t *testing.T, env []string, dir string, args ...string) hopR
 		time.Sleep(managerVerbRetryInterval)
 	}
 }
-
-// This file adds the one capability slice 7a's harness does not itself
-// provide: driving a manager verb (hop task create/plan close/msg send)
-// as a direct, test-issued one-shot process authenticated with the run's
-// OWN live manager session identity -- exactly the technique
-// featureharness_test.go's answerHuman already uses for "human" (a
-// separate real hop process, never typed pane input), generalized to the
-// manager's own HOP_SESSION_ID/HOP_INCARNATION_ID so a scenario can
-// construct an exact send/submission ordering deterministically (never
-// with a sleep), or seed an artifact-delivery channel with content the
-// scripted manager-feature grammar cannot carry losslessly (its
-// whitespace-delimited, underscore-substituted TASK/ANSWER fields), in
-// place of depending on the SCRIPTED fixture manager's own timing or
-// text encoding. A call issued this way is exactly as legitimate as one
-// the live scripted manager process would make itself: the store
-// validates only the session id, its current incarnation and the run it
-// belongs to (internal/app/usecase_message.go's SendMessage,
-// internal/adapters/sqlite/messaging.go's SendMessage) -- never which OS
-// process happened to invoke the CLI. Shared by
-// injectionfreedelivery_test.go and mailboxclosurerace_test.go.
 
 // managerEnv returns the environment for a one-shot hop CLI invocation
 // authenticated as this run's own manager session.
@@ -201,11 +202,14 @@ func waitForObservation(t *testing.T, path string) workerObservation {
 // CLI subprocess (opening the sqlite store) on every iteration, rather
 // than the suite's default 25ms pollInterval: hammering the store that
 // frequently, right after a SIGKILL of its own writer (killControllerLeader),
-// risks transient SQLite WAL lock contention ("database is locked") with no
-// retry tolerance further up the stack (querySQLite fails the test
-// immediately). A condition that only needs to observe crossing a
-// multi-second attention threshold does not need millisecond polling
-// granularity.
+// risks transient SQLite WAL lock contention. querySQLite tolerates this via
+// sqlite3's own busy-timeout (`-cmd ".timeout 5000"`, matching production's
+// busy_timeout(5000)), not the string-matching Go-level retry loop it
+// replaced (17533e0) -- but that is a per-call busy-WAIT inside one sqlite3
+// invocation, not a retry of the whole command: a lock still held after 5s
+// still fails the test immediately. A condition that only needs to observe
+// crossing a multi-second attention threshold does not need millisecond
+// polling granularity regardless.
 const attentionPollInterval = 500 * time.Millisecond
 
 // waitUntilDeadlineWithInterval polls condition like waitUntilDeadline, but
