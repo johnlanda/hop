@@ -58,8 +58,8 @@ const fixtureEvidenceInconsistentQuestionBody = "HOP's recorded evidence about t
 // message sequence a scenario would; next and wait render DISTINCT
 // empty-queue lines, per design section 7's grammar, once the script is
 // exhausted or absent. Message ids used inside test-authored
-// fakeMessageBlock scripts are canonical lowercase UUIDs (Astra pass 2 F5:
-// real AckMessage/SendMessage call identity.ParseMessageID on ack targets
+// fakeMessageBlock scripts are canonical lowercase UUIDs (real
+// AckMessage/SendMessage call identity.ParseMessageID on ack targets
 // and on --reply-to/--relay-of, so a label like "msg-hold-question" would
 // succeed against this fake but never against the real binary), validated
 // here the same way as the caller identities (HOP_RUN_ID/HOP_SESSION_ID/
@@ -1262,13 +1262,12 @@ func runNeedsReworkCase(t *testing.T, artifacts *artifactDir, noticeBodyPath str
 }
 
 // TestFixtureManagerNeedsReworkNoticeShapes proves parseNeedsReworkLabel
-// recognizes BOTH production notice renderers' shapes (manager review
-// finding: the fixture's own earlier "first line only" rule was an
-// over-specification neither renderer nor design section 7 actually
-// promises) with an ANCHORED, exact-line match — never a substring
-// search, so a reason or evidence line merely naming "needs-rework", or
-// the task line appearing at any position other than the one each shape
-// allows, can never trigger a retry.
+// recognizes BOTH production notice renderers' shapes (an earlier "first
+// line only" rule was an over-specification: neither renderer nor design
+// section 7 actually promises one) with an ANCHORED, exact-line match —
+// never a substring search, so a reason or evidence line merely naming
+// "needs-rework", or the task line appearing at any position other than
+// the one each shape allows, can never trigger a retry.
 func TestFixtureManagerNeedsReworkNoticeShapes(t *testing.T) {
 	t.Run("task line first (renderTaskNotice: worker interruption, per-task check failure)", func(t *testing.T) {
 		artifacts := newArtifactDir(t)
@@ -1522,11 +1521,10 @@ func TestFixtureWorkerHoldBarrier(t *testing.T) {
 }
 
 // TestFixtureWorkerHoldMissingBodyFailsLoudly proves the negative side of
-// the read-before-ack fix (Astra review pass 1, P2 "unread bodies"): a
-// delivered barrier-release answer whose body file does not exist must
-// never be acked — the worker must fail loudly (readFileOrFatal's own
-// fatalf) instead of silently releasing on an envelope it never actually
-// read.
+// the read-before-ack rule: a delivered barrier-release answer whose
+// body file does not exist must never be acked — the worker must fail
+// loudly (readFileOrFatal's own fatalf) instead of silently releasing on
+// an envelope it never actually read.
 func TestFixtureWorkerHoldMissingBodyFailsLoudly(t *testing.T) {
 	artifacts := newArtifactDir(t)
 	worker := buildFixtureWorker(t, artifacts)
@@ -1607,11 +1605,11 @@ func TestFixtureWorkerHoldMissingBodyFailsLoudly(t *testing.T) {
 }
 
 // TestFixtureWorkerDrainsOnUndeliveredResultTransient proves
-// submitOnce's own mailbox-drain retry (Astra review pass 1, P2):
-// previously it only slept and resubmitted on ANY transient line, so a
-// message the section 5 mailbox rule requires draining first would sit
-// undrained on every identical retry until the two-minute budget
-// expired. Drives the SOLO submit-valid behavior deliberately — it never
+// submitOnce's own mailbox-drain retry: sleeping and resubmitting on ANY
+// transient line, without draining first, would leave a message the
+// section 5 mailbox rule requires draining sitting undrained on every
+// identical retry until the two-minute budget expired. Drives the SOLO
+// submit-valid behavior deliberately — it never
 // drains before its own first submit call (unlike worker-implement/
 // worker-hold), so the scripted pending message survives untouched until
 // submitOnce's OWN post-transient drain is what has to find it, proving
@@ -1717,8 +1715,8 @@ func fakeHopValidEnv(t *testing.T, artifacts *artifactDir, overrides map[string]
 }
 
 // TestFakeHopRejectsInvalidInvocations proves the fake hop stub's
-// argv/context contract (Astra pass 2 finding F5): every invocation below
-// is exactly the shape the real binary refuses before any store logic
+// argv/context contract: every invocation below is exactly the shape
+// the real binary refuses before any store logic
 // ever runs (identity.ParseMessageID's canonical-lowercase-UUID contract
 // on ack/reply-to/relay-of, parseMessageKind's question/info/answer set,
 // parseAddress's manager/human/task:<uuid> set, SendMessage's non-empty-

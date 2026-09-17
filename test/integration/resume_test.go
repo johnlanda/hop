@@ -91,9 +91,9 @@ func startSelfKillableFixtureRun(t *testing.T) (fx *fixtureRun, scratchDir strin
 
 // endWithSelfKill asks attemptID's own worker to end itself via the
 // fixture's self-kill control file — never a raw OS signal to a pid this
-// harness only OBSERVED via pane inspection (Astra review finding P1: the
-// OS could recycle that pid between observation and signal, since this
-// harness never owns the worker's Wait/reap lifecycle; only Herdr does).
+// harness only OBSERVED via pane inspection: the OS could recycle that
+// pid between observation and signal, since this harness never owns the
+// worker's Wait/reap lifecycle; only Herdr does.
 // Waits for the pane to close itself (a layout.apply command pane has no
 // shell, S6), giving hop resume's absence observation both required
 // conjuncts.

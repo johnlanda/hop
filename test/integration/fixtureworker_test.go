@@ -215,7 +215,7 @@ const selfKillPollInterval = 100 * time.Millisecond
 // races the OS's own pid-reuse window between observation and signal —
 // Herdr could reap this process and the kernel could recycle its pid
 // before the test's own signal call executes, killing an unrelated
-// process instead (Astra review finding P1). Asking the verified process
+// process instead. Asking the verified process
 // to kill itself closes that window: no other process is ever named by
 // the pid the test's signal ultimately targets. Runs forever in its own
 // goroutine; the process exits from this or on its own, whichever is
@@ -541,8 +541,8 @@ func newRequestID() string {
 // retry convention (submitOnce), generalized here to every OTHER mutating
 // verb a validated manager/worker principal calls (design section 7/8): a
 // run still launching or resuming legitimately refuses a manager/message
-// verb with a retryable transient line rather than a hard refusal
-// (defect LAUNCH-1). It NEVER retries a "refused:" line — only a literal
+// verb with a retryable transient line rather than a hard refusal. It
+// NEVER retries a "refused:" line — only a literal
 // "transient:" prefix is retryable — and reuses the identical args
 // (therefore the same --request-id, when the caller included one)
 // unchanged on every attempt, so a retry is idempotent. Bounded exactly
@@ -857,8 +857,8 @@ func runWorker() {
 		// A real-process scenario that ends this attempt mid-flight (design
 		// section 11 scenario 4) must never signal a pid it only OBSERVED
 		// via pane.process_info: Herdr could reap and the OS could recycle
-		// that pid before the signal lands (Astra review finding P1). This
-		// watcher is the ONLY safe channel — the test asks this verified
+		// that pid before the signal lands. This watcher is the ONLY safe
+		// channel — the test asks this verified
 		// process to kill ITSELF (os.Getpid()) by writing a control file
 		// under the run's own scratch directory, never HOP_STATE_DIR and
 		// never a pane/typed-input path.
@@ -935,8 +935,8 @@ func runWorker() {
 		// kill watcher above gets wired: a solo crash-recovery scenario
 		// (resume_test.go's coldRelaunchAfterCrash and its callers) needs a
 		// safe way to end THIS worker's own process without signaling a pid
-		// it only observed via pane inspection (Astra review finding P1,
-		// the same reasoning scratchDirRequiringBehaviors documents above).
+		// it only observed via pane inspection, the same reasoning
+		// scratchDirRequiringBehaviors documents above.
 	default:
 		// Unknown or empty directive: submit nothing, just stay alive, so a
 		// scenario that only needs a settled, idle worker still gets one.
@@ -1169,10 +1169,9 @@ func matchIntegrationLine(line string) bool {
 // parseNeedsReworkLabel extracts the task label from a manager notice
 // body naming a needs-rework consequence, recognizing BOTH production
 // renderers' shapes byte for byte — neither mirrors the other's line
-// order, and nothing pins one as canonical (manager review finding: this
-// fixture's own earlier "first line only" rule was an over-specification,
-// since design section 7 only promises "a needs-rework notice", never a
-// fixed line position):
+// order, and nothing pins one as canonical, since design section 7 only
+// promises "a needs-rework notice", never a fixed line position (an
+// earlier "first line only" rule was an over-specification):
 //   - renderTaskNotice (internal/app/usecase_featurecheck.go, worker
 //     interruption and per-task check failure): the task consequence
 //     line is LINE 1.
@@ -2120,9 +2119,9 @@ func (o *syncOutput) snapshot() string {
 }
 
 // TestFixtureWorkerSelfKillOnControlFile proves the fixture principal's
-// self-kill watcher (Astra review finding P1: a real-process scenario
-// must never signal a pid it only OBSERVED via pane.process_info — the
-// OS could recycle it between observation and signal). Drives a
+// self-kill watcher: a real-process scenario must never signal a pid it
+// only OBSERVED via pane.process_info — the OS could recycle it between
+// observation and signal. Drives a
 // worker-hold implementer directly (no herdr, no pane) until it has sent
 // its own barrier question — genuinely blocked in its own hop msg wait
 // loop, exactly the state a real scenario kills it in — then writes the
@@ -2225,9 +2224,9 @@ func TestFixtureWorkerSelfKillOnControlFile(t *testing.T) {
 	// never be mistaken for the self-kill watcher's own doing: both
 	// produce a SIGKILL exit, so ruling out ctx.Err() here is what makes
 	// this assertion mean "the watcher fired", not merely "the process is
-	// dead" (Astra/manager review finding: a missing scratchDirRequiring
-	// Behaviors entry once let exactly this false pass through, caught
-	// only by a suspiciously round pass duration matching the deadline).
+	// dead" — a missing scratchDirRequiringBehaviors entry would otherwise
+	// leave this watcher never wired, and the process would still die by
+	// SIGKILL on the deadline alone, a false pass this check rules out.
 	if err := ctx.Err(); err != nil {
 		t.Fatalf("test context ended (%v) before the self-kill watcher could act; the exit below cannot be attributed to it", err)
 	}
@@ -2342,7 +2341,7 @@ func vanishOnceMarkerPathForTest(scratchDir, taskID string) string {
 }
 
 // TestFixtureWorkerIdleSelfKillOnControlFile proves the "idle-self-kill"
-// solo behavior TEST-1 added: unlike worker-hold, it reaches the shared
+// solo behavior: unlike worker-hold, it reaches the shared
 // idle() composer loop immediately (nothing to do first), so this test
 // gives the child an open, never-closed stdin pipe (idle() blocks
 // scanning it; a nil Stdin would give it an already-EOF /dev/null and let
@@ -2436,9 +2435,9 @@ func TestFixtureWorkerIdleSelfKillOnControlFile(t *testing.T) {
 	// never be mistaken for the self-kill watcher's own doing: both
 	// produce a SIGKILL exit, so ruling out ctx.Err() here is what makes
 	// this assertion mean "the watcher fired", not merely "the process is
-	// dead" (Astra/manager review finding: a missing scratchDirRequiring
-	// Behaviors entry once let exactly this false pass through, caught
-	// only by a suspiciously round pass duration matching the deadline).
+	// dead" — a missing scratchDirRequiringBehaviors entry would otherwise
+	// leave this watcher never wired, and the process would still die by
+	// SIGKILL on the deadline alone, a false pass this check rules out.
 	if err := ctx.Err(); err != nil {
 		t.Fatalf("test context ended (%v) before the self-kill watcher could act; the exit below cannot be attributed to it", err)
 	}

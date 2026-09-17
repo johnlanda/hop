@@ -291,11 +291,11 @@ func TestLiveClaudeDefaultProfileRun(t *testing.T) {
 	}
 	// End the pane through Herdr's own pane.close (this test's own server
 	// client, an owned action against the server it is already connected
-	// to) rather than a raw OS signal to workerPID: TEST-1 (test-safety),
-	// since that pid was only OBSERVED via pane.process_info above, never
-	// one this harness owns the Wait/reap lifecycle of — the OS could
-	// recycle it between observation and signal (Astra review finding P1,
-	// fixtureworker_test.go's watchForSelfKill doc comment). A real Claude
+	// to) rather than a raw OS signal to workerPID, since that pid was
+	// only OBSERVED via pane.process_info above, never one this harness
+	// owns the Wait/reap lifecycle of — the OS could recycle it between
+	// observation and signal (see fixtureworker_test.go's watchForSelfKill
+	// doc comment for the same reasoning). A real Claude
 	// process cannot be asked to self-kill via a control file the way the
 	// fixture can, so pane.close is the safe substitute here: a
 	// layout.apply command pane has no shell, its process IS the launched
