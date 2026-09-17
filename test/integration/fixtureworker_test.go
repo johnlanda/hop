@@ -1162,10 +1162,41 @@ const verdictRejectedShortfallToken = "verdict-rejected"
 // app.GrammarShortfallEvidenceInconsistent: the status read model's own
 // value-free shortfall kind, reported in place of the check and verdict
 // guards when the recorded evidence about the current head contradicts
-// itself. Named here only for documentation — parseVerdictRejectedLines
-// already skips it (and every other shortfall shape) by construction, so
-// the manager never mistakes it for a rejection.
+// itself. parseVerdictRejectedLines already skips it (and every other
+// shortfall shape) by construction, so the manager never mistakes it for
+// a rejection; statusHasEvidenceInconsistentShortfall below is the
+// distinct positive detection the verdict-channel instruction's own
+// human-escalation rule needs.
 const evidenceInconsistentShortfallToken = "evidence-inconsistent"
+
+// evidenceInconsistentShortfallLine mirrors the fixed line
+// app.GrammarShortfallLine renders for evidence-inconsistent: value-free,
+// carrying no task label (grammar.go: taskLabel is "" for every shortfall
+// but task-not-integrated), so it is exactly this text with no
+// variation.
+const evidenceInconsistentShortfallLine = "shortfall: " + evidenceInconsistentShortfallToken
+
+// statusHasEvidenceInconsistentShortfall reports whether one hop status
+// rendering carries the evidence-inconsistent shortfall line. The
+// manager's verdict-channel instruction treats it as never a rejection,
+// but — distinctly from an ordinary non-match — still escalates it: HOP's
+// own recorded evidence about the current head disagrees, so a human
+// needs to look, not just wait.
+func statusHasEvidenceInconsistentShortfall(statusOutput string) bool {
+	for _, line := range strings.Split(statusOutput, "\n") {
+		if strings.TrimSpace(line) == evidenceInconsistentShortfallLine {
+			return true
+		}
+	}
+	return false
+}
+
+// fixtureEvidenceInconsistentQuestionBody is the fixed body of the
+// question the manager sends to human when hop status names the
+// evidence-inconsistent shortfall on a notice it does not otherwise
+// recognize (design section 7/8's verdict-channel instruction: "ask the
+// human to inspect the run").
+const fixtureEvidenceInconsistentQuestionBody = "HOP's recorded evidence about this run's current head is inconsistent; please inspect the run."
 
 // verdictRejectedLinePrefix mirrors the fixed text
 // app.GrammarVerdictRejectedLine renders before its review= field
@@ -1226,22 +1257,24 @@ func parseVerdictRejectedLines(statusOutput string) []verdictRejection {
 	return out
 }
 
-// verdictRejectionMatchingNotice runs "hop status -C <repoDir> -run
-// <runID>" and reports the verdict-rejected shortfall, if any, whose
-// reasons path equals noticeBodyPath — the manager's own verdict-channel
-// correlation rule (internal/app/templates.go's renderManagerAssignment):
-// EQUAL means this notice IS that review's rejection; DIFFERENT (or no
-// verdict-rejected line at all) means it is not, and the notice is acted
-// on as itself instead (a needs-rework notice already has its own path,
-// handled before this is ever called).
-func verdictRejectionMatchingNotice(hopPath, repoDir, runID, noticeBodyPath string) (rejection verdictRejection, matched bool) {
+// statusOutcomeForNotice runs "hop status -C <repoDir> -run <runID>"
+// ONCE and reports everything the manager's verdict-channel instruction
+// needs to act on a non-task-consequence info notice: the
+// verdict-rejected shortfall, if any, whose reasons path equals
+// noticeBodyPath — the correlation rule (internal/app/templates.go's
+// renderManagerAssignment): EQUAL means this notice IS that review's
+// rejection; DIFFERENT (or no verdict-rejected line at all) means it is
+// not — and, only when no rejection matched, whether the SAME rendering
+// also carries the evidence-inconsistent shortfall (escalated to the
+// human, but still never treated as a rejection).
+func statusOutcomeForNotice(hopPath, repoDir, runID, noticeBodyPath string) (rejection verdictRejection, matched, evidenceInconsistent bool) {
 	res := runHopCLI(hopPath, "status", "-C", repoDir, "-run", runID)
 	for _, r := range parseVerdictRejectedLines(res.Stdout) {
 		if r.reasonsPath == noticeBodyPath {
-			return r, true
+			return r, true, false
 		}
 	}
-	return verdictRejection{}, false
+	return verdictRejection{}, false, statusHasEvidenceInconsistentShortfall(res.Stdout)
 }
 
 // handleManagerMessage dispatches one delivered message per the section 7
@@ -1289,12 +1322,11 @@ func handleManagerMessage(hopPath, cwd, runID, scratchDir string, script *manage
 		// against THIS notice's own body path — the ONLY way to know WHICH
 		// review a reject verdict's notice reports, since the notice's body
 		// is only the reviewer's raw reasons text with no distinguishing
-		// marker. An evidence-inconsistent shortfall, or no matching line
-		// at all, is never a rejection: plan no fix, act on the notice
-		// itself (already done above for needs-rework), and just ack.
-		rejection, matched := verdictRejectionMatchingNotice(hopPath, cwd, runID, msg.BodyPath)
-		fmt.Printf("FIXTURE-STATUS-CHECKED matched=[%t]\n", matched)
-		if matched && !plannedFixReviews[rejection.reviewID] {
+		// marker.
+		rejection, matched, evidenceInconsistent := statusOutcomeForNotice(hopPath, cwd, runID, msg.BodyPath)
+		fmt.Printf("FIXTURE-STATUS-CHECKED matched=[%t] evidence-inconsistent=[%t]\n", matched, evidenceInconsistent)
+		switch {
+		case matched && !plannedFixReviews[rejection.reviewID]:
 			plannedFixReviews[rejection.reviewID] = true
 			*fixCounter++
 			label := "fix" + strconv.Itoa(*fixCounter)
@@ -1309,6 +1341,13 @@ func handleManagerMessage(hopPath, cwd, runID, scratchDir string, script *manage
 			if closeRes := runHopCLIRetryable(hopPath, "plan", "close", "--request-id", newRequestID()); closeRes.ExitCode != 0 && !strings.HasPrefix(closeRes.FirstLine(), "duplicate") {
 				fatalf("manager script: hop plan close after the fix task was refused: %s", closeRes.FirstLine())
 			}
+		case evidenceInconsistent:
+			// Never a rejection: plan no fix. The verdict-channel
+			// instruction's remaining two-thirds — act on the notice itself
+			// (nothing further to do for a generic info notice) and ask the
+			// human to inspect the run — apply here.
+			res := runHopCLIRetryable(hopPath, "msg", "send", "--to", "human", "--kind", "question", "--body", fixtureEvidenceInconsistentQuestionBody, "--request-id", newRequestID())
+			fmt.Printf("FIXTURE-EVIDENCE-INCONSISTENT-ESCALATED result=[%s]\n", res.FirstLine())
 		}
 	}
 	ackAndRequireSuccess(hopPath, msg.ID)
