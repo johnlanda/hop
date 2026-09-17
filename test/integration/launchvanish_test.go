@@ -22,10 +22,14 @@ const vanishingClaudeStub = "#!/bin/sh\nexit 0\n"
 // reason for a launch whose pane and claimed process were observed gone.
 const launchEndedClaimReason = "launch ended before corroboration: pane absent by id and label; claimed process gone"
 
-// featureConfigTOML extends fixtureConfigTOML with feature mode and the
-// three role instruction files the feature policy requires, resolved
-// against .herdr-orchestrator.
-func featureConfigTOML(checkCommand []string) string {
+// vanishFeatureConfigTOML extends fixtureConfigTOML with feature mode and
+// the three role instruction files the feature policy requires, resolved
+// against .herdr-orchestrator. Named distinctly from featureharness_test.
+// go's own richer featureConfigTOML (MaxWorkers/RetryLimit/message
+// timeouts, built independently on a different branch for the fuller
+// scenario suite): this scenario needs none of those knobs, only the
+// minimal feature-mode config a vanished manager launch can fail against.
+func vanishFeatureConfigTOML(checkCommand []string) string {
 	return fixtureConfigTOML(checkCommand) +
 		"\n[workflow]\nmode = \"feature\"\n" +
 		"\n[roles.manager]\ninstructions = \"roles/manager.md\"\n" +
@@ -33,14 +37,16 @@ func featureConfigTOML(checkCommand []string) string {
 		"\n[roles.reviewer]\ninstructions = \"roles/reviewer.md\"\n"
 }
 
-// newFeatureFixtureRepo is newFixtureRepo configured for feature mode.
-func newFeatureFixtureRepo(t *testing.T, artifacts *artifactDir, server *testServer) *fixtureRepo {
+// newVanishFeatureFixtureRepo is newFixtureRepo configured for feature
+// mode, named distinctly from featureharness_test.go's own richer
+// newFeatureFixtureRepo (see vanishFeatureConfigTOML).
+func newVanishFeatureFixtureRepo(t *testing.T, artifacts *artifactDir, server *testServer) *fixtureRepo {
 	t.Helper()
 	repo := initFixtureRepo(t, artifacts, "repo")
 	repo.writeFile(t, "hello.go", trivialSourceFile, 0o644)
 	repo.writeFile(t, checkScriptName, checkScriptSource, 0o755)
 	repo.writeFile(t, checkResultFile, "pass\n", 0o644)
-	repo.writeFile(t, configRelPath, featureConfigTOML([]string{"sh", checkScriptName}), 0o644)
+	repo.writeFile(t, configRelPath, vanishFeatureConfigTOML([]string{"sh", checkScriptName}), 0o644)
 	for _, role := range []string{"manager", "implementer", "reviewer"} {
 		repo.writeFile(t, filepath.Join(".herdr-orchestrator", "roles", role+".md"), "# "+role+" role\n\nFixture role instructions.\n", 0o644)
 	}
@@ -67,7 +73,7 @@ func TestRealProcessManagerLaunchVanishesBeforeCorroboration(t *testing.T) {
 		t.Fatalf("install vanishing claude stub: %v", err)
 	}
 	server.start(t)
-	repo := newFeatureFixtureRepo(t, artifacts, server)
+	repo := newVanishFeatureFixtureRepo(t, artifacts, server)
 
 	stateDir := artifacts.dir(t, "state")
 	fx := &fixtureRun{artifacts: artifacts, server: server, repo: repo, stateDir: stateDir, env: server.hopEnviron(stateDir), controllerName: "run"}

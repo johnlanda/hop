@@ -1,7 +1,9 @@
 package integration
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -9,75 +11,82 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
 
-// The fixture worker stands in for the launched harness end to end: it is
-// installed under the recognized name "claude" so hop launch's PATH
-// resolution (section 6) finds it, reads the HOP_* environment and locates
-// the assignment artifact exactly the way section 6 delivers it, validates
-// its delivered content, and submits through the real `hop result submit`
-// at the hop path its own prompt argv names. Its behavior is scriptable
-// through a "FIXTURE-BEHAVIOR: <name> [args...]" directive line the test
-// embeds in hop run's brief — delivered to the worker through the very same
-// brief -> assignment.md channel a real brief travels through, so no
-// separate plumbing is needed through the controller's fixed HOP_* env
-// keys. fixtureWorkerBrief renders that line.
+// The fixture worker generalizes into the fixture PRINCIPAL (design section
+// 11): one deterministic Go program installed under the recognized name
+// "claude" so hop launch's PATH resolution (section 6) finds it, dispatching
+// on its session's role (HOP_ROLE, absent for a solo run) into one of three
+// entry points — runWorker (solo and feature-mode implementer, which share
+// the Phase 2 prompt/result-submission shapes byte for byte), runManager
+// (manager-feature: creates a scripted plan through the real hop task/plan
+// verbs, then spends its remaining lifetime in the section 7 idle-poll
+// loop), and runReviewer (reviewer-approve / reviewer-reject-once). Every
+// role reads the HOP_* environment and locates its own assignment artifact
+// exactly the way section 6 delivers it, validates its delivered content,
+// and (worker/reviewer) submits through the real `hop result submit` /
+// `hop review submit` at the hop path its own prompt argv names. A worker's
+// or the manager's behavior is scriptable through a
+// "FIXTURE-BEHAVIOR: <name> [args...]" directive line delivered through the
+// existing brief -> assignment.md channel (solo and the manager) or the
+// manager-authored task-instructions artifact (a feature-mode implementer,
+// an independently computable path — see runWorker); a reviewer's behavior
+// comes from the run's frozen reviewer role artifact instead, since a review
+// task's assignment carries no manager-authored free text at all.
+// fixtureWorkerBrief renders the simple one-line directive every worker
+// behavior and an unscripted manager use; fixtureManagerBrief renders the
+// manager-feature script DSL (TASK/ANSWER/FIX lines) parseManagerScript
+// parses.
 //
-// Locating the assignment file: usecase_run.go computes its path as
+// Locating a solo/manager assignment file: usecase_run.go and
+// templates.go's renderManagerAssignment agree on
 // filepath.Join(StateRoot, "runs", <run-uuid>, "artifacts", "assignment.md")
-// — a stable convention independent of the prompt's exact wording — so the
-// worker computes it the same way from HOP_STATE_DIR and HOP_RUN_ID rather
-// than parsing it out of the prompt.
+// — a stable convention independent of the prompt's exact wording. A
+// feature-mode implementer's or reviewer's assignment is instead
+// per-attempt: filepath.Join(StateRoot, "runs", <run-uuid>, "attempts",
+// <attempt-uuid>, "assignment.md") (usecase_sessionlaunch.go's
+// attemptAssignmentPath) — every role computes its own path independently
+// from HOP_* env rather than parsing it out of the prompt, then
+// cross-validates against the prompt's own marker (below), so a mismatch or
+// an absent marker fails the run loudly rather than silently preferring one
+// source.
 //
-// The hop path has no such independent source: it reaches the worker only
-// through the prompt argv, by design. internal/app/usecase_execboundary.go's
-// renderInitialPrompt (the ACTUAL landed prompt renderer hop launch uses,
-// distinct from internal/app/assignment.go's renderAssignment, which renders
-// the separate assignment.md FILE content) renders exactly:
-//
-//	Read your assignment at %s and complete it. When your work is
-//	committed, submit it by running: %s result submit --summary
-//	"<one-line summary>" --commit <commit-oid>. If the first output line
-//	begins with "transient", wait briefly and run the exact same command
-//	again.
-//
-// — a single-line string with no separate "submit" line to isolate, so the
-// worker extracts both paths from this exact wording: the assignment path
-// between "Read your assignment at " and " and complete it." — cross-
-// validated against the independently computed path above, and a mismatch
-// or an absent marker fails the run loudly rather than silently preferring
-// one source — and the hop path between "submit it by running: " and
-// " result submit --summary" (its only source: this worker never falls back
-// to a PATH lookup or a guessed location for the hop binary).
-//
-// A cold relaunch ("--resume <native-ref> <continuation prompt>") carries
-// the same information through renderContinuationPrompt's fixed template
-// (same file; interactive Claude Code never re-runs a pending user turn on
-// --resume, so HOP appends the continuation prompt as the positional
-// argument):
-//
-//	You were relaunched after an interruption; your restored session may
-//	show earlier, unfinished work. Re-read your assignment at %s and
-//	continue it. When your work is committed, submit it by running: %s
-//	result submit --summary "<one-line summary>" --commit <commit-oid>.
-//	If the first output line begins with "transient", wait briefly and
-//	run the exact same command again.
-//
-// The worker extracts the assignment path between "Re-read your assignment
-// at " and " and continue it." there, and the hop path with the same
-// submit marker as the initial prompt.
+// The hop path has no such independent source for any role: it reaches
+// this principal only through the prompt argv, by design. Every role's
+// initial/continuation prompt is rendered by internal/app (worker/
+// implementer: usecase_execboundary.go's renderInitialPrompt/
+// renderContinuationPrompt; reviewer and manager:
+// usecase_sessionlaunch.go's renderReviewerInitialPrompt/
+// renderReviewerContinuationPrompt and renderManagerInitialPrompt/
+// renderManagerContinuationPrompt, byte-for-byte mirrored by
+// roleprompts_test.go and pinned there against internal/app's own golden
+// literals) with a fixed pair of markers surrounding the assignment path
+// and the hop path; extractFromPrompt (embedded source, promptMarkers)
+// applies the role/shape-appropriate pair — workerPromptMarkers,
+// reviewerPromptMarkers or managerPromptMarkers — retyped here from those
+// same pinned renderers, so a drift in either place fails a test before
+// the two can desynchronize silently. A resume-shaped invocation
+// (`--resume <native-ref> <continuation prompt>`) is identical across
+// every role (internal/app's composeSessionArgvTail composes the same
+// four-element tail regardless of role) and is detected and strictly
+// validated (requireResumeShape) before any element is ever treated as a
+// first-launch prompt, exactly as the original solo worker already did.
 const fixtureWorkerSource = `package main
 
 import (
 	"bufio"
+	"crypto/rand"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -102,12 +111,22 @@ var (
 	mcpStandInStdin io.WriteCloser
 )
 
-// fixtureRetryInterval is this worker's own back-off between hop result
-// submit retries, mandated by the section 7 transient protocol the launch
-// prompt itself states ("wait briefly and run the exact same command
-// again") — worker behavior this fixture reproduces, never a test-side
-// wait.
+// fixtureRetryInterval is this principal's own back-off between hop result
+// submit / hop review submit retries, mandated by the section 7 transient
+// protocol the launch prompt itself states ("wait briefly and run the exact
+// same command again") — behavior this fixture reproduces, never a
+// test-side wait.
 const fixtureRetryInterval = 200 * time.Millisecond
+
+// fixtureHoldMarker is worker-hold's barrier question body: a fixed,
+// recognizable token the manager script's ANSWER table matches on to decide
+// whether to relay it to a human (a test-controlled release) or answer it
+// directly.
+const fixtureHoldMarker = "FIXTURE-HOLD-BARRIER"
+
+// fixtureAckGenericBody is the manager's default direct-answer body for a
+// question that matches no scripted ANSWER rule.
+const fixtureAckGenericBody = "acknowledged"
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == mcpStandInArg {
@@ -115,12 +134,12 @@ func main() {
 		return
 	}
 	// Reproduce the pinned real-harness process-group shape BEFORE anything
-	// about this worker is observable as ready: Claude Code 2.1.270 spawns
-	// its configured MCP servers as children in its own process group
-	// immediately after the trust check, so every settlement, stop and
-	// adoption decision in production runs against a multi-member
-	// foreground group whose raw listing order gives the worker no
-	// particular index.
+	// about this principal is observable as ready: Claude Code 2.1.270
+	// spawns its configured MCP servers as children in its own process
+	// group immediately after the trust check, so every settlement, stop
+	// and adoption decision in production runs against a multi-member
+	// foreground group whose raw listing order gives this principal no
+	// particular index — for every role, not only a worker.
 	spawnMCPStandIn()
 
 	if os.Getenv(reexecMarkerEnv) != "" {
@@ -129,79 +148,20 @@ func main() {
 		return
 	}
 
-	env := requireEnv("HOP_STATE_DIR", "HOP_RUN_ID", "HOP_TASK_ID", "HOP_ATTEMPT_ID", "HOP_INCARNATION_ID")
-	assignmentPath := filepath.Join(env["HOP_STATE_DIR"], "runs", env["HOP_RUN_ID"], "artifacts", "assignment.md")
-
-	// Both invocation shapes carry a prompt as their final argv element and
-	// this worker parses it, with per-shape markers: a first launch's fixed
-	// initial prompt ("Read your assignment at <path> and complete it."), or
-	// a cold relaunch's fixed continuation prompt ("Re-read your assignment
-	// at <path> and continue it.") after "--resume <native-ref>" — HOP's
-	// relaunch argv always carries the continuation prompt (internal/app's
-	// composeHarnessArgvTail). A resume-shaped invocation is validated
-	// against that EXACT four-element shape before any element is treated
-	// as the prompt (requireResumeShape): the real CLI's "--resume [value]"
-	// takes an optional value, so a lax fixture that grabbed the final
-	// element would happily accept "--resume <prompt>" with no reference at
-	// all, masking a malformed launch. Any other shape fails loudly.
-	prompt := ""
-	assignmentStart, assignmentEnd := "Read your assignment at ", " and complete it."
-	if isResumeInvocation(os.Args) {
-		prompt = requireResumeShape(os.Args)
-		assignmentStart, assignmentEnd = "Re-read your assignment at ", " and continue it."
-	} else if len(os.Args) > 0 {
-		prompt = os.Args[len(os.Args)-1]
-	}
-	promptAssignmentPath := extractMarked(prompt, assignmentStart, assignmentEnd)
-	hopPath := extractMarked(prompt, "submit it by running: ", " result submit --summary")
-	if hopPath == "" {
-		fatalf("prompt does not carry the %q marker naming the hop path", "submit it by running: ")
-	}
-	if promptAssignmentPath == "" {
-		fatalf("prompt does not carry the %q marker naming the assignment path", assignmentStart)
-	}
-	// The StateRoot-derived path is what this worker actually reads, but
-	// the prompt's own path is cross-validated against it rather than
-	// merely logged: a mismatch means the launch delivered a different
-	// assignment than the one this run's own state root computes, which
-	// must fail the scenario loudly, never silently prefer one source
-	// over the other.
-	if promptAssignmentPath != assignmentPath {
-		fatalf("prompt's assignment path (%s) does not match the path computed from HOP_STATE_DIR/HOP_RUN_ID (%s)", promptAssignmentPath, assignmentPath)
-	}
-
-	assignmentContent, err := os.ReadFile(assignmentPath)
-	if err != nil {
-		fatalf("read assignment %s: %v", assignmentPath, err)
-	}
-	behavior, behaviorArgs := parseBehavior(string(assignmentContent))
-
-	writeObservation(filepath.Join(filepath.Dir(assignmentPath), "worker-observed.txt"), assignmentPath, promptAssignmentPath, hopPath, string(assignmentContent), behavior, behaviorArgs)
-	fmt.Println("FIXTURE-WORKER-READY")
-
-	switch behavior {
-	case "submit-valid":
-		oid := commitChange("fixture worker change")
-		submitOnce(hopPath, oid, "fixture worker result")
-	case "submit-stale":
-		waitForGo()
-		oid := commitChange("fixture worker stale change")
-		submitOnce(hopPath, oid, "fixture worker stale result")
-	case "submit-twice":
-		oid := commitChange("fixture worker change")
-		submitOnce(hopPath, oid, "fixture worker result")
-		submitOnce(hopPath, oid, "fixture worker result")
-	case "exit-without-submitting":
-		waitForGo()
-		return
-	case "exec-keep-pid":
-		waitForGo()
-		reexecSelf()
+	// HOP_ROLE is present for every feature-mode session (manager,
+	// implementer, reviewer) and absent for a solo run's pane. An
+	// implementer shares the solo worker's prompt shapes and
+	// behavior-directive channel byte for byte, so both dispatch through
+	// runWorker; only the per-role assignment-path formula and behavior
+	// source differ inside it.
+	switch os.Getenv("HOP_ROLE") {
+	case "manager":
+		runManager()
+	case "reviewer":
+		runReviewer()
 	default:
-		// Unknown or empty directive: submit nothing, just stay alive, so a
-		// scenario that only needs a settled, idle worker still gets one.
+		runWorker()
 	}
-	idle()
 }
 
 // spawnMCPStandIn starts one long-lived child in this process's OWN
@@ -242,12 +202,41 @@ func mcpStandIn() {
 	_, _ = io.Copy(io.Discard, os.Stdin)
 }
 
+// selfKillPollInterval paces watchForSelfKill's poll for the test's
+// self-kill control file.
+const selfKillPollInterval = 100 * time.Millisecond
+
+// watchForSelfKill polls for controlPath — a test-owned file under the
+// run's scratch directory, never HOP_STATE_DIR, never pane input — and
+// SIGKILLs this process's OWN pid (os.Getpid()) the instant it appears.
+// This is the only safe way a test ends a launched principal's process
+// from outside: a test may OBSERVE this process's pid (via
+// pane.process_info), but signaling an externally observed pid directly
+// races the OS's own pid-reuse window between observation and signal —
+// Herdr could reap this process and the kernel could recycle its pid
+// before the test's own signal call executes, killing an unrelated
+// process instead (Astra review finding P1). Asking the verified process
+// to kill itself closes that window: no other process is ever named by
+// the pid the test's signal ultimately targets. Runs forever in its own
+// goroutine; the process exits from this or on its own, whichever is
+// first.
+func watchForSelfKill(controlPath string) {
+	for {
+		if _, err := os.Stat(controlPath); err == nil {
+			_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
+			return
+		}
+		time.Sleep(selfKillPollInterval)
+	}
+}
+
 // isResumeInvocation reports whether argv is a resume-SHAPED invocation:
 // any element equals the exact "--resume". Detection only — it routes the
 // invocation to requireResumeShape's strict validation, so a malformed
 // resume argv can never fall through to first-launch prompt parsing, and
 // the trailing continuation prompt every HOP relaunch carries never
-// disturbs it.
+// disturbs it. Shared by every role: composeSessionArgvTail composes the
+// identical [--resume <ref> <continuation prompt>] tail regardless of role.
 func isResumeInvocation(argv []string) bool {
 	for _, a := range argv {
 		if a == "--resume" {
@@ -259,10 +248,10 @@ func isResumeInvocation(argv []string) bool {
 
 // requireResumeShape validates HOP's one supported cold-relaunch argv,
 // exactly [<exe> --resume <native-ref> <continuation prompt>]
-// (internal/app's composeHarnessArgvTail, design section 6 item 3):
-// four elements, "--resume" at index 1 immediately followed by a
-// UUID-shaped native reference, the continuation prompt as the final
-// element. The reference check matters because the real CLI's
+// (internal/app's composeHarnessArgvTail / composeSessionArgvTail, design
+// section 6 item 3): four elements, "--resume" at index 1 immediately
+// followed by a UUID-shaped native reference, the continuation prompt as
+// the final element. The reference check matters because the real CLI's
 // "--resume [value]" takes an OPTIONAL value: without it, an argv like
 // [worker --resume <prompt>] — no reference at all — would be consumed by
 // the real CLI as a resume value, so this fixture must reject it rather
@@ -314,7 +303,7 @@ func requireEnv(keys ...string) map[string]string {
 }
 
 func fatalf(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, "fixture worker: "+format+"\n", args...)
+	fmt.Fprintf(os.Stderr, "fixture principal: "+format+"\n", args...)
 	os.Exit(1)
 }
 
@@ -334,12 +323,14 @@ func extractMarked(s, start, end string) string {
 }
 
 // parseBehavior finds the "FIXTURE-BEHAVIOR: <name> [args...]" directive
-// line the test embedded in hop run's brief text and returns the behavior
-// name and its extra arguments. An assignment carrying no directive returns
-// an empty behavior, which idles without submitting anything.
-func parseBehavior(assignment string) (behavior string, args []string) {
+// line in content and returns the behavior name and its extra arguments.
+// Content carrying no directive returns an empty behavior. Shared by every
+// role: a worker/implementer's assignment (solo) or task instructions
+// (feature), a reviewer's frozen role artifact, and a manager's brief all
+// carry this same directive line as their first line.
+func parseBehavior(content string) (behavior string, args []string) {
 	const prefix = "FIXTURE-BEHAVIOR: "
-	for _, line := range strings.Split(assignment, "\n") {
+	for _, line := range strings.Split(content, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if !strings.HasPrefix(trimmed, prefix) {
 			continue
@@ -353,20 +344,16 @@ func parseBehavior(assignment string) (behavior string, args []string) {
 	return "", nil
 }
 
-// writeObservation dumps everything this worker observed to path,
+// writeObservation dumps everything this principal observed to path,
 // atomically (write-temp-then-rename), so the test can read it back after
-// the fact rather than trusting this process's own judgment of correctness
-// — the same philosophy the Phase 1 spike fixture uses for its environment
-// dump. promptAssignmentPath is the prompt's own marker extraction, already
-// verified equal to assignmentPath (the path actually read) by the time this
-// is called — main fails closed before reaching here on any mismatch. The
-// dump carries the worker's COMPLETE inherited environment (os.Environ()),
-// not just the required HOP_* subset, so a scenario can assert the full
-// sanitized-exec contract directly: every strip-matrix and policy-strip
-// variable absent even when seeded into the server's own environment,
-// HERDR_*/HOP_* present, and passthrough/profile entries exactly as
-// configured (docs/plan/phase-2-design.md section 6).
-func writeObservation(path string, assignmentPath, promptAssignmentPath, hopPath, assignmentContent, behavior string, behaviorArgs []string) {
+// the fact rather than trusting this process's own judgment of correctness.
+// The dump carries the principal's COMPLETE inherited environment
+// (os.Environ()), not just the required HOP_* subset, so a scenario can
+// assert the full sanitized-exec contract directly: every strip-matrix and
+// policy-strip variable absent even when seeded into the server's own
+// environment, HERDR_*/HOP_* present, and passthrough/profile entries
+// exactly as configured (docs/plan/phase-2-design.md section 6).
+func writeObservation(path, role, assignmentPath, promptAssignmentPath, hopPath, assignmentContent, behavior string, behaviorArgs []string) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "pid=%d\n", os.Getpid())
 	// os.Executable() is this process's own resolved image path — the
@@ -379,6 +366,7 @@ func writeObservation(path string, assignmentPath, promptAssignmentPath, hopPath
 		fmt.Fprintf(&b, "executable_error=%v\n", execErr)
 	}
 	fmt.Fprintf(&b, "mcp_stand_in_pid=%d\n", mcpStandInPID)
+	fmt.Fprintf(&b, "role=%s\n", role)
 	fmt.Fprintf(&b, "assignment_path=%s\n", assignmentPath)
 	fmt.Fprintf(&b, "prompt_assignment_path=%s\n", promptAssignmentPath)
 	fmt.Fprintf(&b, "hop_path=%s\n", hopPath)
@@ -390,13 +378,32 @@ func writeObservation(path string, assignmentPath, promptAssignmentPath, hopPath
 		fmt.Fprintf(&b, "env:%s\n", entry)
 	}
 	fmt.Fprintf(&b, "assignment_content_begin\n%s\nassignment_content_end\n", assignmentContent)
+	atomicWriteFile(path, b.String())
+}
+
+// atomicWriteFile writes content to path, temp-file-then-rename, so a
+// reader (the test, or this same principal recovering after a relaunch)
+// never observes a partial write.
+func atomicWriteFile(path, content string) {
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(b.String()), 0o600); err != nil {
-		fatalf("write observation: %v", err)
+	if err := os.WriteFile(tmp, []byte(content), 0o600); err != nil {
+		fatalf("write %s: %v", path, err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
-		fatalf("rename observation into place: %v", err)
+		fatalf("rename %s into place: %v", path, err)
 	}
+}
+
+// readFileOrFatal reads path, failing the run loudly on any error — every
+// path this fixture reads is either independently computed from HOP_* env
+// (a HOP-owned artifact convention) or extracted from a pinned prompt/role
+// marker, so a read failure is always a defect worth stopping for.
+func readFileOrFatal(path string) string {
+	content, err := os.ReadFile(path) //nolint:gosec // G304: a path this fixture computed itself from its own environment or a pinned marker.
+	if err != nil {
+		fatalf("read %s: %v", path, err)
+	}
+	return string(content)
 }
 
 // commitChange writes a small, unique change to the working tree (its own
@@ -424,12 +431,87 @@ func runGit(args ...string) string {
 	return string(out)
 }
 
+// hopResult captures one bounded hop CLI invocation's outcome.
+type hopResult struct {
+	Stdout   string
+	ExitCode int
+}
+
+// FirstLine returns Stdout's first line without its terminator.
+func (r hopResult) FirstLine() string {
+	line, _, _ := strings.Cut(r.Stdout, "\n")
+	return line
+}
+
+// runHopCLI runs "<hopPath> <args...>", inheriting this process's own
+// environment (the sanitized launch environment hop launch composed —
+// exactly as the existing solo worker's submitOnce already relied on Go's
+// nil-Env-means-inherit default) and blocking until it exits, exactly as
+// every real worker-plumbing verb invocation is a short, bounded store
+// round trip. It never fails the run itself on a non-zero exit — refusals
+// are data the caller decides how to act on, exactly like a real harness
+// would read them; only a failure to even start or run the process is
+// fatal.
+func runHopCLI(hopPath string, args ...string) hopResult {
+	cmd := exec.Command(hopPath, args...)
+	var out strings.Builder
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	runErr := cmd.Run()
+	code := 0
+	if runErr != nil {
+		if exitErr, ok := runErr.(*exec.ExitError); ok { //nolint:errorlint // a direct type assertion suffices for this fixture's own exec of a single known binary.
+			code = exitErr.ExitCode()
+		} else {
+			fatalf("run %s %s: %v", hopPath, strings.Join(args, " "), runErr)
+		}
+	}
+	return hopResult{Stdout: out.String(), ExitCode: code}
+}
+
+// newRequestID mints a fresh lowercase-hex UUIDv4-shaped request id for one
+// logical mutating-verb call (design section 7: "the templates and
+// fixtures ALWAYS pass it"), reused UNCHANGED across every retry of that
+// SAME call — never regenerated per attempt — so a transient retry is
+// idempotent rather than minting a fresh, unrelated request each time.
+func newRequestID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		fatalf("generate request id: %v", err)
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// runHopCLIRetryable runs hopPath with args, retrying while the response's
+// first line begins with "transient:" — Phase 2's own hop result submit
+// retry convention (submitOnce), generalized here to every OTHER mutating
+// verb a validated manager/worker principal calls (design section 7/8): a
+// run still launching or resuming legitimately refuses a manager/message
+// verb with a retryable transient line rather than a hard refusal
+// (defect LAUNCH-1). It NEVER retries a "refused:" line — only a literal
+// "transient:" prefix is retryable — and reuses the identical args
+// (therefore the same --request-id, when the caller included one)
+// unchanged on every attempt, so a retry is idempotent. Bounded exactly
+// like submitOnce/reviewSubmitOnce so a persistently broken run does not
+// hang forever.
+func runHopCLIRetryable(hopPath string, args ...string) hopResult {
+	deadline := time.Now().Add(2 * time.Minute)
+	for {
+		res := runHopCLI(hopPath, args...)
+		if strings.HasPrefix(res.FirstLine(), "transient:") && time.Now().Before(deadline) {
+			time.Sleep(fixtureRetryInterval)
+			continue
+		}
+		return res
+	}
+}
+
 // submitOnce runs "<hopPath> result submit --summary <summary> --commit
 // <oid>", retrying while the first stdout line begins with "transient" (the
 // assignment template's own retry instruction), bounded so a persistent
-// rejection does not hang the worker forever. It prints the final outcome
-// so the test can read it from the pane/log evidence in addition to the
-// observation dump.
+// rejection does not hang the worker forever.
 func submitOnce(hopPath, oid, summary string) {
 	// The retry budget must comfortably outlast the controller's own
 	// corroboration polling: launch claim settlement depends on real pane
@@ -440,27 +522,122 @@ func submitOnce(hopPath, oid, summary string) {
 	// bounds it only so a persistently broken run does not hang forever.
 	deadline := time.Now().Add(2 * time.Minute)
 	for {
-		cmd := exec.Command(hopPath, "result", "submit", "--summary", summary, "--commit", oid)
-		var out strings.Builder
-		cmd.Stdout = &out
-		cmd.Stderr = &out
-		runErr := cmd.Run()
-		first, _, _ := strings.Cut(out.String(), "\n")
-		fmt.Printf("FIXTURE-SUBMIT-RESULT err=[%v] first-line=[%s]\n", runErr, first)
-		if strings.HasPrefix(first, "transient") && time.Now().Before(deadline) {
-			time.Sleep(fixtureRetryInterval)
-			continue
+		res := runHopCLI(hopPath, "result", "submit", "--summary", summary, "--commit", oid)
+		fmt.Printf("FIXTURE-SUBMIT-RESULT exit=[%d] first-line=[%s]\n", res.ExitCode, res.FirstLine())
+		if !strings.HasPrefix(res.FirstLine(), "transient") || !time.Now().Before(deadline) {
+			return
 		}
-		return
+		// Feature mode's own mailbox-drain transient (design section 5:
+		// "transient: undelivered messages; drain with hop msg next, ack,
+		// then resubmit") names a SPECIFIC required action, distinct from
+		// solo's "attempt not yet running" retry: the identical resubmit
+		// would see the SAME pending message forever without this drain.
+		// Solo never renders this line, so this never fires for it.
+		if strings.HasPrefix(res.FirstLine(), "transient: undelivered messages") {
+			drainMailbox(hopPath)
+		}
+		time.Sleep(fixtureRetryInterval)
 	}
 }
 
+// drainMailbox drains this session's task-address mailbox with hop msg
+// next until "none: no queued message", acknowledging every delivered
+// message regardless of kind — the section 5 mailbox rule's worker-side
+// half ("before hop result submit it must drain its queue"), applied
+// uniformly before every submit/verdict attempt so a message left over
+// from an earlier attempt of the same task can never block acceptance.
+// Every ack is the recipient's statement of receipt-AND-READ (design
+// section 7): this reads each message's own body file successfully
+// before acking it, even when the content is otherwise ignored, and
+// fails loudly rather than acking a message whose body it never
+// actually read.
+func drainMailbox(hopPath string) {
+	for {
+		res := runHopCLI(hopPath, "msg", "next")
+		msg, ok := parseDeliveredMessage(res.Stdout)
+		if !ok {
+			return
+		}
+		readFileOrFatal(msg.BodyPath)
+		ackAndRequireSuccess(hopPath, msg.ID)
+	}
+}
+
+// ackAndRequireSuccess runs hop msg ack and fails the run loudly unless
+// the response is accepted/duplicate — an ack that read back the body
+// successfully but was itself refused must never be silently ignored
+// (design section 7: an ack is the recipient's own statement of
+// receipt-and-read).
+func ackAndRequireSuccess(hopPath, messageID string) {
+	res := runHopCLI(hopPath, "msg", "ack", messageID)
+	first := res.FirstLine()
+	if !strings.HasPrefix(first, "acknowledged ") && !strings.HasPrefix(first, "duplicate ") {
+		fatalf("hop msg ack %s failed: %s", messageID, first)
+	}
+}
+
+// deliveredMessage is one hop msg next/wait response, parsed from its
+// fixed three-line shape (design section 7's grammar,
+// internal/app/grammar.go's GrammarMessageLine/GrammarBodyLine).
+type deliveredMessage struct {
+	ID, Kind, From, ReplyTo, RelayOf, Origin string
+	BodyPath                                 string
+}
+
+// parseDeliveredMessage parses one hop msg next/wait stdout, returning
+// ok=false for the empty-queue/timeout line ("none: ..."). It never
+// assumes field order or presence beyond kind/from, which the grammar
+// renders unconditionally.
+func parseDeliveredMessage(stdout string) (deliveredMessage, bool) {
+	lines := strings.Split(stdout, "\n")
+	if len(lines) == 0 || !strings.HasPrefix(lines[0], "message ") {
+		return deliveredMessage{}, false
+	}
+	fields := strings.Fields(lines[0])
+	if len(fields) < 2 {
+		fatalf("malformed delivered-message first line %q", lines[0])
+	}
+	msg := deliveredMessage{ID: fields[1]}
+	for _, field := range fields[2:] {
+		key, value, ok := strings.Cut(field, "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "kind":
+			msg.Kind = value
+		case "from":
+			msg.From = value
+		case "reply-to":
+			msg.ReplyTo = value
+		case "relay-of":
+			msg.RelayOf = value
+		case "origin":
+			msg.Origin = value
+		}
+	}
+	for _, line := range lines[1:] {
+		if path, ok := strings.CutPrefix(line, "body: "); ok {
+			msg.BodyPath = path
+			break
+		}
+	}
+	if msg.BodyPath == "" {
+		fatalf("delivered message %s carries no body: line", msg.ID)
+	}
+	return msg, true
+}
+
 // waitForGo blocks on stdin for a line reading exactly "FIXTURE-GO",
-// letting the test control this worker's timing precisely (e.g. drive a
-// relaunch that retires this incarnation before releasing a submit-stale
-// worker). Stdin reaching EOF before that line is treated as an immediate
-// go-ahead, so a test that does not care about precise timing can just
-// close stdin.
+// letting a direct (non-pane) test drive this process's timing precisely
+// (e.g. drive a relaunch that retires this incarnation before releasing a
+// submit-stale worker). Stdin reaching EOF before that line is treated as
+// an immediate go-ahead, so a test that does not care about precise timing
+// can just close stdin. Real pane scenarios never write to a launched
+// principal's stdin (that would be typed pane input, forbidden by design);
+// they control timing through the messaging barrier (fixtureHoldMarker)
+// instead, so this remains a direct-invocation-only mechanism, exactly as
+// it always was.
 func waitForGo() {
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
@@ -485,11 +662,13 @@ func reexecSelf() {
 	}
 }
 
-// idle keeps this process alive as the pane's foreground process (worker
-// success and failure are both observed only through the result protocol
+// idle keeps this process alive as the pane's foreground process (success
+// and failure are both observed only through the result/verdict protocol
 // and check, never through pane exit — section 5) until told to stop:
 // FIXTURE-QUIT exits 0, FIXTURE-QUIT-FAIL exits 3, and stdin EOF exits 0
-// like a worker that was simply closed.
+// like a process that was simply closed. Every role idles the same way
+// after acting: the composer-like survivor per-attempt retirement (section
+// 6) must actually terminate, never a self-exit standing in for it.
 func idle() {
 	fmt.Println("FIXTURE-WORKER-IDLE")
 	scanner := bufio.NewScanner(os.Stdin)
@@ -502,17 +681,819 @@ func idle() {
 		}
 	}
 }
+
+// promptMarkers names one role/shape's fixed extraction markers: the
+// substrings immediately surrounding the assignment path and the hop path
+// in that role's pinned prompt (internal/app/usecase_execboundary.go's
+// renderInitialPrompt/renderContinuationPrompt for a solo/implementer
+// worker, usecase_sessionlaunch.go's renderReviewerInitialPrompt/
+// renderReviewerContinuationPrompt and renderManagerInitialPrompt/
+// renderManagerContinuationPrompt — test/integration/roleprompts_test.go
+// and fixtureworker_test.go's testAssignmentPrompt/testContinuationPrompt
+// mirror and pin the exact same literals on the test side).
+type promptMarkers struct {
+	assignmentStart, assignmentEnd string
+	hopStart, hopEnd               string
+}
+
+// workerPromptMarkers are the solo/implementer worker's markers: identical
+// for both roles (design section 6 — "worker and implementer share the
+// Phase 2 prompt shapes byte for byte").
+var workerPromptMarkers = map[bool]promptMarkers{
+	false: {"Read your assignment at ", " and complete it.", "submit it by running: ", " result submit --summary"},
+	true:  {"Re-read your assignment at ", " and continue it.", "submit it by running: ", " result submit --summary"},
+}
+
+// reviewerPromptMarkers are the reviewer's markers.
+var reviewerPromptMarkers = map[bool]promptMarkers{
+	false: {"Read your review assignment at ", " and evaluate the frozen subject it names.", "submit your verdict by running: ", " review submit --verdict"},
+	true:  {"Re-read your review assignment at ", " and continue it.", "submit your verdict by running: ", " review submit --verdict"},
+}
+
+// managerPromptMarkers are the manager's markers: the hop-path marker
+// text is identical on both shapes ("poll for messages by running: " is
+// lowercased differently only by sentence position — see the capital-P
+// continuation variant below); the assignment marker's end text is shared
+// too.
+var managerPromptMarkers = map[bool]promptMarkers{
+	false: {"Read your assignment at ", ", your role instructions at", "poll for messages by running: ", " msg wait."},
+	true:  {"Re-read your assignment at ", ", your role instructions at", "Poll for messages by running: ", " msg wait."},
+}
+
+// extractFromPrompt applies markers to prompt, failing the run loudly if
+// either path is absent — a malformed launch must never silently proceed
+// on a guessed value.
+func extractFromPrompt(markers promptMarkers, prompt string) (assignmentPath, hopPath string) {
+	assignmentPath = extractMarked(prompt, markers.assignmentStart, markers.assignmentEnd)
+	hopPath = extractMarked(prompt, markers.hopStart, markers.hopEnd)
+	if assignmentPath == "" {
+		fatalf("prompt does not carry the %q marker naming the assignment path", markers.assignmentStart)
+	}
+	if hopPath == "" {
+		fatalf("prompt does not carry the %q marker naming the hop path", markers.hopStart)
+	}
+	return assignmentPath, hopPath
+}
+
+// resolvePrompt extracts the trailing prompt from argv per HOP's two
+// invocation shapes, detecting and strictly validating a resume-shaped
+// argv before ever treating any element as a first-launch prompt.
+func resolvePrompt(argv []string) (prompt string, resumed bool) {
+	if isResumeInvocation(argv) {
+		return requireResumeShape(argv), true
+	}
+	if len(argv) > 0 {
+		return argv[len(argv)-1], false
+	}
+	return "", false
+}
+
+// runWorker is the solo-worker and feature-implementer entry point: they
+// share the Phase 2 prompt shapes and the result-submission protocol byte
+// for byte, differing only in the assignment-path formula (solo: the
+// run's own artifacts/assignment.md; implementer: this attempt's own
+// attempts/<id>/assignment.md, computed exactly as
+// internal/app/usecase_sessionlaunch.go's attemptAssignmentPath does) and
+// in where the FIXTURE-BEHAVIOR directive lives (solo: inlined in the
+// brief, so it is already part of assignment.md's own content; feature:
+// the manager-authored task instructions file, an independently
+// computable path this worker never needs to extract from anything —
+// filepath.Join(<state>, "runs", <run>, "tasks", <task>+".md"), exactly
+// internal/app/usecase_plan.go's taskInstructionsPath).
+func runWorker() {
+	env := requireEnv("HOP_STATE_DIR", "HOP_RUN_ID", "HOP_TASK_ID", "HOP_ATTEMPT_ID", "HOP_INCARNATION_ID")
+	role := os.Getenv("HOP_ROLE") // "" for solo, "implementer" for feature mode.
+	feature := role == "implementer"
+
+	var assignmentPath string
+	if feature {
+		assignmentPath = filepath.Join(env["HOP_STATE_DIR"], "runs", env["HOP_RUN_ID"], "attempts", env["HOP_ATTEMPT_ID"], "assignment.md")
+	} else {
+		assignmentPath = filepath.Join(env["HOP_STATE_DIR"], "runs", env["HOP_RUN_ID"], "artifacts", "assignment.md")
+	}
+
+	prompt, resumed := resolvePrompt(os.Args)
+	promptAssignmentPath, hopPath := extractFromPrompt(workerPromptMarkers[resumed], prompt)
+	if promptAssignmentPath != assignmentPath {
+		fatalf("prompt's assignment path (%s) does not match the independently computed path (%s)", promptAssignmentPath, assignmentPath)
+	}
+
+	assignmentContent := readFileOrFatal(assignmentPath)
+	behavior, behaviorArgs := parseBehavior(assignmentContent)
+	if feature {
+		// The manager-authored task instructions carry the directive for a
+		// feature-mode implementer; assignment.md itself is fully computed
+		// (no manager-authored free text), so parseBehavior would find
+		// nothing there.
+		instructionsPath := filepath.Join(env["HOP_STATE_DIR"], "runs", env["HOP_RUN_ID"], "tasks", env["HOP_TASK_ID"]+".md")
+		behavior, behaviorArgs = parseBehavior(readFileOrFatal(instructionsPath))
+	}
+
+	// Every Phase 3 behavior's directive carries a test-owned scratch
+	// directory as its first argument: HOP_STATE_DIR's tree is HOP's own,
+	// never a place this fixture writes into, so its observation dump and
+	// any message body it authors (worker-hold's barrier question) land
+	// there instead. Phase 2 behaviors are unchanged: they keep writing
+	// beside the assignment file, exactly as they always have.
+	scratchDir := requireScratchDir(behavior, behaviorArgs)
+	observationPath := filepath.Join(filepath.Dir(assignmentPath), "worker-observed.txt")
+	if scratchDir != "" {
+		observationPath = filepath.Join(scratchDir, "worker-observed-"+env["HOP_ATTEMPT_ID"]+".txt")
+		// A real-process scenario that ends this attempt mid-flight (design
+		// section 11 scenario 4) must never signal a pid it only OBSERVED
+		// via pane.process_info: Herdr could reap and the OS could recycle
+		// that pid before the signal lands (Astra review finding P1). This
+		// watcher is the ONLY safe channel — the test asks this verified
+		// process to kill ITSELF (os.Getpid()) by writing a control file
+		// under the run's own scratch directory, never HOP_STATE_DIR and
+		// never a pane/typed-input path.
+		go watchForSelfKill(filepath.Join(scratchDir, "self-kill-"+env["HOP_ATTEMPT_ID"]))
+	}
+	writeObservation(observationPath, cmp(role, "solo"), assignmentPath, promptAssignmentPath, hopPath, assignmentContent, behavior, behaviorArgs)
+	fmt.Println("FIXTURE-WORKER-READY")
+
+	switch behavior {
+	case "submit-valid":
+		oid := commitChange("fixture worker change")
+		submitOnce(hopPath, oid, "fixture worker result")
+	case "submit-stale":
+		waitForGo()
+		oid := commitChange("fixture worker stale change")
+		submitOnce(hopPath, oid, "fixture worker stale result")
+	case "submit-twice":
+		oid := commitChange("fixture worker change")
+		submitOnce(hopPath, oid, "fixture worker result")
+		submitOnce(hopPath, oid, "fixture worker result")
+	case "exit-without-submitting":
+		waitForGo()
+		return
+	case "exec-keep-pid":
+		waitForGo()
+		reexecSelf()
+	case "worker-implement":
+		oid := commitChange("fixture implementer change")
+		drainMailbox(hopPath)
+		submitOnce(hopPath, oid, "fixture implementer result")
+	case "worker-hold":
+		oid := commitChange("fixture implementer change (held)")
+		questionPath := filepath.Join(scratchDir, "hold-question-"+env["HOP_ATTEMPT_ID"]+".txt")
+		atomicWriteFile(questionPath, fixtureHoldMarker+"\n")
+		res := runHopCLIRetryable(hopPath, "msg", "send", "--to", "manager", "--kind", "question", "--file", questionPath, "--request-id", newRequestID())
+		question, ok := parseSentMessageID(res.Stdout)
+		if !ok {
+			fatalf("worker-hold: hop msg send did not accept the barrier question: %s", res.FirstLine())
+		}
+		fmt.Printf("FIXTURE-HOLD-SENT question=[%s]\n", question)
+		for {
+			answer, delivered := parseDeliveredMessage(runHopCLI(hopPath, "msg", "wait").Stdout)
+			if !delivered {
+				continue
+			}
+			readFileOrFatal(answer.BodyPath)
+			ackAndRequireSuccess(hopPath, answer.ID)
+			if answer.Kind == "answer" && answer.ReplyTo == question {
+				fmt.Printf("FIXTURE-HOLD-RELEASED answer=[%s]\n", answer.ID)
+				break
+			}
+		}
+		drainMailbox(hopPath)
+		submitOnce(hopPath, oid, "fixture implementer result (released)")
+	default:
+		// Unknown or empty directive: submit nothing, just stay alive, so a
+		// scenario that only needs a settled, idle worker still gets one.
+	}
+	idle()
+}
+
+// cmp returns a for a non-empty role, else fallback — used only to render
+// a readable "solo" label in the observation dump when HOP_ROLE is unset.
+func cmp(role, fallback string) string {
+	if role == "" {
+		return fallback
+	}
+	return role
+}
+
+// scratchDirRequiringBehaviors names every Phase 3 behavior whose
+// FIXTURE-BEHAVIOR directive's first argument is a test-owned scratch
+// directory: HOP_STATE_DIR's tree is HOP's own, never a place this
+// fixture writes into, so observation dumps, message bodies it authors
+// and one-shot markers all land in a directory the test itself supplied
+// instead. Phase 2 behaviors carry no such argument and are unaffected.
+var scratchDirRequiringBehaviors = map[string]bool{
+	"worker-implement":     true,
+	"worker-hold":          true,
+	"manager-feature":      true,
+	"reviewer-approve":     true,
+	"reviewer-reject-once": true,
+}
+
+// requireScratchDir returns behaviorArgs[0] for a behavior that requires
+// a test-owned scratch directory, failing the run loudly if it is absent
+// or empty; "" for every other (Phase 2) behavior.
+func requireScratchDir(behavior string, behaviorArgs []string) string {
+	if !scratchDirRequiringBehaviors[behavior] {
+		return ""
+	}
+	if len(behaviorArgs) == 0 || behaviorArgs[0] == "" {
+		fatalf("FIXTURE-BEHAVIOR %s requires a test-owned scratch directory as its first argument", behavior)
+	}
+	return behaviorArgs[0]
+}
+
+// parseSentMessageID parses hop msg send's accepted/duplicate first line
+// ("sent <uuid>" / "duplicate <uuid>") and returns the message id.
+func parseSentMessageID(stdout string) (string, bool) {
+	first, _, _ := strings.Cut(stdout, "\n")
+	for _, prefix := range []string{"sent ", "duplicate "} {
+		if id, ok := strings.CutPrefix(first, prefix); ok {
+			return strings.TrimSpace(id), true
+		}
+	}
+	return "", false
+}
+
+// parseCreatedTaskID parses hop task create's accepted/duplicate first
+// line ("task <uuid> t<seq> created" / "duplicate <uuid> t<seq>") and
+// returns the task id.
+func parseCreatedTaskID(stdout string) (string, bool) {
+	first, _, _ := strings.Cut(stdout, "\n")
+	fields := strings.Fields(first)
+	if len(fields) >= 2 && (fields[0] == "task" || fields[0] == "duplicate") {
+		return fields[1], true
+	}
+	return "", false
+}
+
+// managerTask is one scripted task the manager creates.
+type managerTask struct {
+	Label     string
+	Title     string
+	Behavior  string
+	DependsOn []string
+}
+
+// managerAnswerRule is one scripted ANSWER table entry: when a question's
+// body contains Match, either relay it to the human (Action=="relay") or
+// answer it directly with Body.
+type managerAnswerRule struct {
+	Match  string
+	Action string // "answer" | "relay"
+	Body   string
+}
+
+// managerScript is the manager-feature behavior's complete scripted plan,
+// parsed from the run's brief (the same brief -> assignment.md channel
+// every solo FIXTURE-BEHAVIOR directive already travels through — no side
+// channel through the controller's environment). Line grammar, one
+// directive per line after the leading "FIXTURE-BEHAVIOR: manager-feature"
+// line:
+//
+//	TASK <label> title=<title, underscores for spaces> behavior=<name> [depends=<label>[,<label>...]]
+//	ANSWER match=<substring, underscores for spaces> action=answer body=<body, underscores for spaces>
+//	ANSWER match=<substring, underscores for spaces> action=relay
+//	FIX behavior=<name>
+//
+// FIX names the behavior a reject-triggered fix task uses; absent, it
+// defaults to "worker-implement".
+type managerScript struct {
+	Tasks       []managerTask
+	Answers     []managerAnswerRule
+	FixBehavior string
+}
+
+// parseManagerScript parses every script line in content (every line
+// after the FIXTURE-BEHAVIOR directive; parseBehavior already located
+// that line and is not re-run here).
+func parseManagerScript(content string) *managerScript {
+	script := &managerScript{FixBehavior: "worker-implement"}
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		fields := strings.Fields(trimmed)
+		if len(fields) == 0 {
+			continue
+		}
+		switch fields[0] {
+		case "TASK":
+			if len(fields) < 2 {
+				fatalf("manager script: TASK line %q names no label", trimmed)
+			}
+			task := managerTask{Label: fields[1]}
+			for _, kv := range fields[2:] {
+				key, value, ok := strings.Cut(kv, "=")
+				if !ok {
+					continue
+				}
+				switch key {
+				case "title":
+					task.Title = strings.ReplaceAll(value, "_", " ")
+				case "behavior":
+					task.Behavior = value
+				case "depends":
+					task.DependsOn = strings.Split(value, ",")
+				}
+			}
+			script.Tasks = append(script.Tasks, task)
+		case "ANSWER":
+			rule := managerAnswerRule{}
+			for _, kv := range fields[1:] {
+				key, value, ok := strings.Cut(kv, "=")
+				if !ok {
+					continue
+				}
+				switch key {
+				case "match":
+					rule.Match = strings.ReplaceAll(value, "_", " ")
+				case "action":
+					rule.Action = value
+				case "body":
+					rule.Body = strings.ReplaceAll(value, "_", " ")
+				}
+			}
+			script.Answers = append(script.Answers, rule)
+		case "FIX":
+			for _, kv := range fields[1:] {
+				key, value, ok := strings.Cut(kv, "=")
+				if ok && key == "behavior" {
+					script.FixBehavior = value
+				}
+			}
+		}
+	}
+	return script
+}
+
+// matchAnswer returns the first scripted rule whose Match is a substring
+// of body, or nil when none matches.
+func (s *managerScript) matchAnswer(body string) *managerAnswerRule {
+	for i := range s.Answers {
+		if strings.Contains(body, s.Answers[i].Match) {
+			return &s.Answers[i]
+		}
+	}
+	return nil
+}
+
+// writeTempInstructions writes a temporary instructions file whose sole
+// content is the FIXTURE-BEHAVIOR directive for one task, in the
+// manager's own cwd (the run's repository root — a real, writable git
+// checkout the manager never commits from) — the artifact channel hop
+// task create durably copies from before this file is ever read again.
+// scratchDir is threaded through as the child worker's own directive
+// argument (requireScratchDir), so a worker-implement/worker-hold
+// attempt this task spawns writes its own observation dump and any
+// message body it authors into the SAME test-owned directory the
+// manager itself was given, never under HOP_STATE_DIR.
+func writeTempInstructions(dir, behavior, scratchDir string) string {
+	path := filepath.Join(dir, fmt.Sprintf("fixture-instructions-%d.md", time.Now().UnixNano()))
+	atomicWriteFile(path, "FIXTURE-BEHAVIOR: "+behavior+" "+scratchDir+"\n\nImplement the assigned change and commit it.\n")
+	return path
+}
+
+// parseNeedsReworkLabel extracts the task label from a renderTaskNotice
+// body's first line ("task t<seq> needs-rework\n...",
+// internal/app/usecase_featurecheck.go's renderTaskNotice) when its
+// consequence is needs-rework; ok is false for any other notice shape
+// (an integrated/dependents-released notice, a failed notice, etc.),
+// which the manager acks without acting on.
+func parseNeedsReworkLabel(body string) (label string, ok bool) {
+	first, _, _ := strings.Cut(body, "\n")
+	fields := strings.Fields(first)
+	if len(fields) == 3 && fields[0] == "task" && fields[2] == "needs-rework" {
+		return fields[1], true
+	}
+	return "", false
+}
+
+// runManager is the manager-feature behavior's entry point: a scripted
+// manager that creates its plan through the real hop task/plan verbs,
+// closes the plan, then spends its entire remaining lifetime in the
+// section 7 idle-poll loop (hop msg wait), answering questions from its
+// scripted table, relaying a barrier question to the human when scripted,
+// forwarding a human's answer back through the relay chain using only the
+// envelope's own origin field, retrying a task on its needs-rework notice,
+// and — the ONLY channel section 8/STATUS-1 actually name for a reject
+// verdict, since the acceptance notice's own body is just the reviewer's
+// raw reasons text with no distinguishing marker — checking hop status
+// for the rendered guard shortfall on any other info notice
+// (statusReportsVerdictRejected) and planning a fix task when it names
+// one. It never exits on its own: per-attempt retirement (section 6) is
+// what a scenario proves actually terminates it.
+func runManager() {
+	env := requireEnv("HOP_STATE_DIR", "HOP_RUN_ID", "HOP_SESSION_ID", "HOP_INCARNATION_ID")
+	assignmentPath := filepath.Join(env["HOP_STATE_DIR"], "runs", env["HOP_RUN_ID"], "artifacts", "assignment.md")
+
+	prompt, resumed := resolvePrompt(os.Args)
+	promptAssignmentPath, hopPath := extractFromPrompt(managerPromptMarkers[resumed], prompt)
+	if promptAssignmentPath != assignmentPath {
+		fatalf("prompt's assignment path (%s) does not match the independently computed path (%s)", promptAssignmentPath, assignmentPath)
+	}
+
+	assignmentContent := readFileOrFatal(assignmentPath)
+	behavior, behaviorArgs := parseBehavior(assignmentContent)
+	scratchDir := requireScratchDir(behavior, behaviorArgs)
+	observationPath := filepath.Join(filepath.Dir(assignmentPath), "manager-observed.txt")
+	if scratchDir != "" {
+		observationPath = filepath.Join(scratchDir, "manager-observed.txt")
+	}
+	writeObservation(observationPath, "manager", assignmentPath, promptAssignmentPath, hopPath, assignmentContent, behavior, nil)
+	fmt.Println("FIXTURE-MANAGER-READY")
+
+	if behavior != "manager-feature" {
+		// An unscripted manager: nothing to plan. Still idle at the
+		// composer-like loop so retirement has something to terminate.
+		idle()
+		return
+	}
+	script := parseManagerScript(assignmentContent)
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		fatalf("resolve manager working directory: %v", err)
+	}
+	labelToID := map[string]string{}
+	for _, task := range script.Tasks {
+		instructionsPath := writeTempInstructions(cwd, task.Behavior, scratchDir)
+		args := []string{"task", "create", "--title", task.Title, "--file", instructionsPath, "--request-id", newRequestID()}
+		for _, dep := range task.DependsOn {
+			depID, known := labelToID[dep]
+			if !known {
+				fatalf("manager script: TASK %s depends on unknown label %s (declare it earlier)", task.Label, dep)
+			}
+			args = append(args, "--depends-on", depID)
+		}
+		res := runHopCLIRetryable(hopPath, args...)
+		taskID, ok := parseCreatedTaskID(res.Stdout)
+		if !ok {
+			fatalf("manager script: hop task create for %s was refused: %s", task.Label, res.FirstLine())
+		}
+		labelToID[task.Label] = taskID
+		fmt.Printf("FIXTURE-TASK-CREATED label=[%s] id=[%s]\n", task.Label, taskID)
+	}
+	if res := runHopCLIRetryable(hopPath, "plan", "close", "--request-id", newRequestID()); res.ExitCode != 0 && !strings.HasPrefix(res.FirstLine(), "duplicate") {
+		fatalf("manager script: hop plan close was refused: %s", res.FirstLine())
+	}
+	fmt.Println("FIXTURE-PLAN-CLOSED")
+
+	fixCounter := len(script.Tasks)
+	plannedFixReviews := map[string]bool{}
+	for {
+		msg, delivered := parseDeliveredMessage(runHopCLI(hopPath, "msg", "wait").Stdout)
+		if !delivered {
+			continue
+		}
+		handleManagerMessage(hopPath, cwd, env["HOP_RUN_ID"], scratchDir, script, labelToID, &fixCounter, plannedFixReviews, &msg)
+	}
+}
+
+// verdictRejectedShortfallToken mirrors app.GrammarShortfallVerdictRejected
+// (internal/app/grammar.go, itself mirroring run.ShortfallVerdictRejected):
+// EvaluateReadiness's reject-verdict guard-shortfall kind token,
+// "verdict-rejected". The manager's standing instruction (design section
+// 7/8, STATUS-1's manager verdict channel, internal/app/templates.go's
+// renderManagerAssignment) is to run hop status after any controller info
+// notice it does not otherwise recognize and read its shortfall lines —
+// the ONLY channel that names a reject verdict at all, since the
+// acceptance notice's own body is just the reviewer's raw reasons text
+// (sqlite/review.go's persistVerdictAcceptance), never a marker.
+const verdictRejectedShortfallToken = "verdict-rejected"
+
+// evidenceInconsistentShortfallToken mirrors
+// app.GrammarShortfallEvidenceInconsistent: the status read model's own
+// value-free shortfall kind, reported in place of the check and verdict
+// guards when the recorded evidence about the current head contradicts
+// itself. parseVerdictRejectedLines already skips it (and every other
+// shortfall shape) by construction, so the manager never mistakes it for
+// a rejection; statusHasEvidenceInconsistentShortfall below is the
+// distinct positive detection the verdict-channel instruction's own
+// human-escalation rule needs.
+const evidenceInconsistentShortfallToken = "evidence-inconsistent"
+
+// evidenceInconsistentShortfallLine mirrors the fixed line
+// app.GrammarShortfallLine renders for evidence-inconsistent: value-free,
+// carrying no task label (grammar.go: taskLabel is "" for every shortfall
+// but task-not-integrated), so it is exactly this text with no
+// variation.
+const evidenceInconsistentShortfallLine = "shortfall: " + evidenceInconsistentShortfallToken
+
+// statusHasEvidenceInconsistentShortfall reports whether one hop status
+// rendering carries the evidence-inconsistent shortfall line. The
+// manager's verdict-channel instruction treats it as never a rejection,
+// but — distinctly from an ordinary non-match — still escalates it: HOP's
+// own recorded evidence about the current head disagrees, so a human
+// needs to look, not just wait.
+func statusHasEvidenceInconsistentShortfall(statusOutput string) bool {
+	for _, line := range strings.Split(statusOutput, "\n") {
+		if strings.TrimSpace(line) == evidenceInconsistentShortfallLine {
+			return true
+		}
+	}
+	return false
+}
+
+// fixtureEvidenceInconsistentQuestionBody is the fixed body of the
+// question the manager sends to human when hop status names the
+// evidence-inconsistent shortfall on a notice it does not otherwise
+// recognize (design section 7/8's verdict-channel instruction: "ask the
+// human to inspect the run").
+const fixtureEvidenceInconsistentQuestionBody = "HOP's recorded evidence about this run's current head is inconsistent; please inspect the run."
+
+// verdictRejectedLinePrefix mirrors the fixed text
+// app.GrammarVerdictRejectedLine renders before its review= field
+// (grammar.go's GrammarVerdictRejectedLine: "shortfall: " plus the
+// verdict-rejected token plus " review="), so parsing fails loudly on any
+// drift rather than matching a bare substring anywhere in the output.
+const verdictRejectedLinePrefix = "shortfall: " + verdictRejectedShortfallToken + " review="
+
+// verdictRejection is one parsed "shortfall: verdict-rejected
+// review=<id> subject=<oid> reasons=<path>" line
+// (app.GrammarVerdictRejectedLine, STATUS-1): the specific review's
+// identity, its subject commit and its reasons artifact path — the three
+// fields the manager's own verdict-channel instruction says a
+// verdict-rejected shortfall carries so a manager can tell WHICH review
+// is being reported, never just "the latest one".
+type verdictRejection struct {
+	reviewID, subjectCommitOID, reasonsPath string
+}
+
+// parseVerdictRejectedLines extracts every verdict-rejected shortfall
+// line from one "hop status -run" rendering. A reasons path
+// cmd/hop's safeRenderExternal rendered through strconv.Quote (rather
+// than raw) is unquoted here: safeRenderExternal's own contract is that a
+// raw field never begins with a double quote — that shape is reserved for
+// the quoted form, which always starts with one — so a leading '"'
+// unambiguously means the field must be unquoted, never a literal
+// character of the real path. Any other line shape, including a
+// value-free "shortfall: evidence-inconsistent" line (which names no
+// review at all), is not this shape and is silently skipped: the
+// manager's standing instruction treats evidence-inconsistent, and every
+// notice or shortfall it does not otherwise recognize, as never a
+// rejection.
+func parseVerdictRejectedLines(statusOutput string) []verdictRejection {
+	var out []verdictRejection
+	for _, line := range strings.Split(statusOutput, "\n") {
+		rest, ok := strings.CutPrefix(strings.TrimSpace(line), verdictRejectedLinePrefix)
+		if !ok {
+			continue
+		}
+		reviewID, rest, ok := strings.Cut(rest, " subject=")
+		if !ok || reviewID == "" {
+			fatalf("manager: malformed verdict-rejected shortfall line: %q", line)
+		}
+		subjectCommitOID, rawReasons, ok := strings.Cut(rest, " reasons=")
+		if !ok || subjectCommitOID == "" {
+			fatalf("manager: malformed verdict-rejected shortfall line: %q", line)
+		}
+		reasonsPath := rawReasons
+		if strings.HasPrefix(reasonsPath, "\"") {
+			unquoted, err := strconv.Unquote(reasonsPath)
+			if err != nil {
+				fatalf("manager: could not unquote status reasons path %q: %v", reasonsPath, err)
+			}
+			reasonsPath = unquoted
+		}
+		out = append(out, verdictRejection{reviewID: reviewID, subjectCommitOID: subjectCommitOID, reasonsPath: reasonsPath})
+	}
+	return out
+}
+
+// statusOutcomeForNotice runs "hop status -C <repoDir> -run <runID>"
+// ONCE and reports everything the manager's verdict-channel instruction
+// needs to act on a non-task-consequence info notice: the
+// verdict-rejected shortfall, if any, whose reasons path equals
+// noticeBodyPath — the correlation rule (internal/app/templates.go's
+// renderManagerAssignment): EQUAL means this notice IS that review's
+// rejection; DIFFERENT (or no verdict-rejected line at all) means it is
+// not — and, only when no rejection matched, whether the SAME rendering
+// also carries the evidence-inconsistent shortfall (escalated to the
+// human, but still never treated as a rejection).
+func statusOutcomeForNotice(hopPath, repoDir, runID, noticeBodyPath string) (rejection verdictRejection, matched, evidenceInconsistent bool) {
+	res := runHopCLI(hopPath, "status", "-C", repoDir, "-run", runID)
+	for _, r := range parseVerdictRejectedLines(res.Stdout) {
+		if r.reasonsPath == noticeBodyPath {
+			return r, true, false
+		}
+	}
+	return verdictRejection{}, false, statusHasEvidenceInconsistentShortfall(res.Stdout)
+}
+
+// handleManagerMessage dispatches one delivered message per the section 7
+// manager operating contract, acknowledging it before the next wait in
+// every case. plannedFixReviews tracks every review id this manager has
+// already planned a fix task for, keyed by the review's own id, so a
+// re-served or redelivered rejection notice for a review already acted on
+// never plans a second fix (the verdict-channel instruction's own rule:
+// "never plan a second fix from the same shortfall once its path has
+// already matched a notice you acted on").
+func handleManagerMessage(hopPath, cwd, runID, scratchDir string, script *managerScript, labelToID map[string]string, fixCounter *int, plannedFixReviews map[string]bool, msg *deliveredMessage) {
+	body := readFileOrFatal(msg.BodyPath)
+	switch msg.Kind {
+	case "question":
+		rule := script.matchAnswer(body)
+		if rule != nil && rule.Action == "relay" {
+			res := runHopCLIRetryable(hopPath, "msg", "send", "--to", "human", "--kind", "question", "--relay-of", msg.ID, "--file", msg.BodyPath, "--request-id", newRequestID())
+			fmt.Printf("FIXTURE-RELAYED question=[%s] relay=[%s]\n", msg.ID, res.FirstLine())
+		} else {
+			answerBody := fixtureAckGenericBody
+			if rule != nil {
+				answerBody = rule.Body
+			}
+			runHopCLIRetryable(hopPath, "msg", "send", "--kind", "answer", "--reply-to", msg.ID, "--body", answerBody, "--request-id", newRequestID())
+		}
+	case "answer":
+		if msg.From != "human" || msg.Origin == "" {
+			fatalf("manager received an answer it did not expect (from=%s origin=%s); the fixture manager only ever asks the human via a relay", msg.From, msg.Origin)
+		}
+		runHopCLIRetryable(hopPath, "msg", "send", "--kind", "answer", "--reply-to", msg.Origin, "--file", msg.BodyPath, "--request-id", newRequestID())
+		fmt.Printf("FIXTURE-FORWARDED origin=[%s]\n", msg.Origin)
+	case "info":
+		if label, ok := parseNeedsReworkLabel(body); ok {
+			taskID, known := labelToID[label]
+			if !known {
+				fatalf("manager received a needs-rework notice for unknown label %s", label)
+			}
+			res := runHopCLIRetryable(hopPath, "task", "retry", "--reason", "fixture retry after interruption", "--request-id", newRequestID(), taskID)
+			fmt.Printf("FIXTURE-RETRIED label=[%s] result=[%s]\n", label, res.FirstLine())
+			break
+		}
+		// Not a task-consequence notice: per the manager's own
+		// verdict-channel instruction (design section 7/8, STATUS-1), run
+		// hop status and correlate its verdict-rejected shortfall lines
+		// against THIS notice's own body path — the ONLY way to know WHICH
+		// review a reject verdict's notice reports, since the notice's body
+		// is only the reviewer's raw reasons text with no distinguishing
+		// marker.
+		rejection, matched, evidenceInconsistent := statusOutcomeForNotice(hopPath, cwd, runID, msg.BodyPath)
+		fmt.Printf("FIXTURE-STATUS-CHECKED matched=[%t] evidence-inconsistent=[%t]\n", matched, evidenceInconsistent)
+		switch {
+		case matched && !plannedFixReviews[rejection.reviewID]:
+			plannedFixReviews[rejection.reviewID] = true
+			*fixCounter++
+			label := "fix" + strconv.Itoa(*fixCounter)
+			instructionsPath := writeTempInstructions(cwd, script.FixBehavior, scratchDir)
+			res := runHopCLIRetryable(hopPath, "task", "create", "--title", "fix from reject", "--file", instructionsPath, "--request-id", newRequestID())
+			taskID, ok := parseCreatedTaskID(res.Stdout)
+			if !ok {
+				fatalf("manager script: fix task creation was refused: %s", res.FirstLine())
+			}
+			labelToID[label] = taskID
+			fmt.Printf("FIXTURE-FIX-TASK-CREATED label=[%s] id=[%s] review=[%s]\n", label, taskID, rejection.reviewID)
+			if closeRes := runHopCLIRetryable(hopPath, "plan", "close", "--request-id", newRequestID()); closeRes.ExitCode != 0 && !strings.HasPrefix(closeRes.FirstLine(), "duplicate") {
+				fatalf("manager script: hop plan close after the fix task was refused: %s", closeRes.FirstLine())
+			}
+		case evidenceInconsistent:
+			// Never a rejection: plan no fix. The verdict-channel
+			// instruction's remaining two-thirds — act on the notice itself
+			// (nothing further to do for a generic info notice) and ask the
+			// human to inspect the run — apply here.
+			res := runHopCLIRetryable(hopPath, "msg", "send", "--to", "human", "--kind", "question", "--body", fixtureEvidenceInconsistentQuestionBody, "--request-id", newRequestID())
+			fmt.Printf("FIXTURE-EVIDENCE-INCONSISTENT-ESCALATED result=[%s]\n", res.FirstLine())
+		}
+	}
+	ackAndRequireSuccess(hopPath, msg.ID)
+}
+
+// reviewSubmitOnce runs "<hopPath> review submit ...", retrying on the
+// section 5 mailbox-drain transient line exactly as submitOnce retries
+// hop result submit's own transient line, draining before each retry.
+func reviewSubmitOnce(hopPath, verdict, subjectCommit, reasonsPath string) hopResult {
+	deadline := time.Now().Add(2 * time.Minute)
+	for {
+		res := runHopCLI(hopPath, "review", "submit", "--verdict", verdict, "--subject", subjectCommit, "--reasons-file", reasonsPath)
+		fmt.Printf("FIXTURE-REVIEW-RESULT exit=[%d] first-line=[%s]\n", res.ExitCode, res.FirstLine())
+		if strings.Contains(res.FirstLine(), "transient") && time.Now().Before(deadline) {
+			drainMailbox(hopPath)
+			time.Sleep(fixtureRetryInterval)
+			continue
+		}
+		return res
+	}
+}
+
+// runReviewer is the reviewer-approve / reviewer-reject-once behaviors'
+// entry point. The reviewer's behavior directive lives in the run's
+// frozen reviewer role artifact (a review task's assignment carries no
+// manager-authored free text at all — internal/app/templates.go's
+// renderReviewAssignment is fully computed from frozen run facts), an
+// independently computable path exactly like the run-level artifacts
+// this fixture already locates without parsing anything out of a prompt:
+// internal/app/templates.go's roleArtifactPath(stateRoot, runID,
+// "reviewer"), carrying its own test-owned scratch-directory argument
+// exactly like every other Phase 3 directive (requireScratchDir).
+// reviewer-reject-once tracks its own one-shot state with a durable
+// marker file under THAT scratch directory — never under HOP_STATE_DIR,
+// which is HOP's own tree — and it persists there across every review
+// task's own separate reviewer process/pane in this run, since the
+// frozen role artifact (and the scratch directory it names) is identical
+// for every one of them.
+func runReviewer() {
+	env := requireEnv("HOP_STATE_DIR", "HOP_RUN_ID", "HOP_SESSION_ID", "HOP_INCARNATION_ID", "HOP_TASK_ID", "HOP_ATTEMPT_ID")
+	assignmentPath := filepath.Join(env["HOP_STATE_DIR"], "runs", env["HOP_RUN_ID"], "attempts", env["HOP_ATTEMPT_ID"], "assignment.md")
+
+	prompt, resumed := resolvePrompt(os.Args)
+	promptAssignmentPath, hopPath := extractFromPrompt(reviewerPromptMarkers[resumed], prompt)
+	if promptAssignmentPath != assignmentPath {
+		fatalf("prompt's assignment path (%s) does not match the independently computed path (%s)", promptAssignmentPath, assignmentPath)
+	}
+
+	assignmentContent := readFileOrFatal(assignmentPath)
+	subjectCommit := extractMarked(assignmentContent, "Commit: ", "\n")
+	if subjectCommit == "" {
+		fatalf("review assignment %s does not carry a %q line", assignmentPath, "Commit: ")
+	}
+
+	rolePath := filepath.Join(env["HOP_STATE_DIR"], "runs", env["HOP_RUN_ID"], "artifacts", "roles", "reviewer.md")
+	roleContent := readFileOrFatal(rolePath)
+	behavior, behaviorArgs := parseBehavior(roleContent)
+	scratchDir := requireScratchDir(behavior, behaviorArgs)
+
+	writeObservation(filepath.Join(scratchDir, "reviewer-observed-"+env["HOP_ATTEMPT_ID"]+".txt"), "reviewer", assignmentPath, promptAssignmentPath, hopPath, assignmentContent, behavior, nil)
+	fmt.Println("FIXTURE-REVIEWER-READY")
+
+	verdict, reasons := "approve", "fixture reviewer reasons: approve\n"
+	if behavior == "reviewer-reject-once" {
+		markerPath := filepath.Join(scratchDir, "reviewer-rejected-once")
+		if _, statErr := os.Stat(markerPath); statErr != nil {
+			verdict, reasons = "reject", "fixture reviewer reasons: reject\n"
+			atomicWriteFile(markerPath, "rejected once\n")
+		}
+	}
+
+	drainMailbox(hopPath)
+	reasonsPath := filepath.Join(scratchDir, "reviewer-reasons-"+env["HOP_ATTEMPT_ID"]+".txt")
+	atomicWriteFile(reasonsPath, reasons)
+	reviewSubmitOnce(hopPath, verdict, subjectCommit, reasonsPath)
+	idle()
+}
 `
 
 // fixtureWorkerBrief renders a hop run brief whose text embeds the fixture
 // worker's scripted behavior directive, so the brief -> assignment.md
 // delivery path (section 6) is what carries the script to the worker — no
 // separate plumbing through the controller's fixed HOP_* env keys. Known
-// behavior names: "submit-valid", "submit-stale", "submit-twice",
-// "exit-without-submitting", "exec-keep-pid"; an empty or unrecognized
-// behavior makes the worker idle without ever submitting.
+// solo/implementer behavior names: "submit-valid", "submit-stale",
+// "submit-twice", "exit-without-submitting", "exec-keep-pid",
+// "worker-implement", "worker-hold"; an empty or unrecognized behavior
+// makes the worker idle without ever submitting. A feature-mode
+// implementer's behavior travels through its task's own manager-authored
+// instructions file instead (fixtureManagerScript's TASK lines), never the
+// run's top-level brief.
 func fixtureWorkerBrief(behavior string) string {
 	return "FIXTURE-BEHAVIOR: " + behavior + "\n"
+}
+
+// fixtureManagerTask/fixtureManagerAnswer describe one scripted manager
+// plan, rendered by fixtureManagerBrief into the run's brief text the
+// manager-feature behavior's embedded parseManagerScript parses (see the
+// grammar documented on the embedded managerScript type above). Label is
+// the manager's own local bookkeeping name for a task, referenced by
+// later DependsOn entries — it is never sent to the store directly, but
+// tasks are created in declaration order with no gaps, so it equals the
+// real t<seq> label the store reports for a scenario that never mutates
+// the plan out of order.
+type fixtureManagerTask struct {
+	Label, Title, Behavior string
+	DependsOn              []string
+}
+
+// fixtureManagerAnswer is one scripted ANSWER rule: Action is "answer"
+// (direct reply with Body) or "relay" (forwarded to the human, a
+// test-controlled release — see fixtureHoldMarker).
+type fixtureManagerAnswer struct {
+	Match, Action, Body string
+}
+
+// fixtureManagerBrief renders the manager-feature behavior's complete
+// scripted brief: the FIXTURE-BEHAVIOR directive (carrying scratchDir, the
+// test-owned directory the manager's own observation dump and every task
+// it plans use instead of anything under HOP_STATE_DIR — HOP's own tree),
+// one TASK line per task (with its dependencies), one ANSWER line per
+// scripted rule, and a FIX line naming the behavior a reject-triggered fix
+// task uses. Spaces in Title/Match/Body are rendered as underscores (the
+// embedded parser's simple whitespace-delimited field grammar); fixBehavior
+// may be "" to accept parseManagerScript's own default ("worker-implement").
+func fixtureManagerBrief(scratchDir string, tasks []fixtureManagerTask, answers []fixtureManagerAnswer, fixBehavior string) string {
+	underscored := func(s string) string { return strings.ReplaceAll(s, " ", "_") }
+	var b strings.Builder
+	b.WriteString("FIXTURE-BEHAVIOR: manager-feature " + scratchDir + "\n")
+	for _, task := range tasks {
+		fmt.Fprintf(&b, "TASK %s title=%s behavior=%s", task.Label, underscored(task.Title), task.Behavior)
+		if len(task.DependsOn) > 0 {
+			fmt.Fprintf(&b, " depends=%s", strings.Join(task.DependsOn, ","))
+		}
+		b.WriteString("\n")
+	}
+	for _, answer := range answers {
+		if answer.Action == "relay" {
+			fmt.Fprintf(&b, "ANSWER match=%s action=relay\n", underscored(answer.Match))
+			continue
+		}
+		fmt.Fprintf(&b, "ANSWER match=%s action=answer body=%s\n", underscored(answer.Match), underscored(answer.Body))
+	}
+	if fixBehavior != "" {
+		fmt.Fprintf(&b, "FIX behavior=%s\n", fixBehavior)
+	}
+	return b.String()
 }
 
 // buildFixtureWorker compiles fixtureWorkerSource once for the calling test
@@ -968,4 +1949,149 @@ func (o workerObservation) HasEnvName(name string) bool {
 		}
 	}
 	return false
+}
+
+// syncOutput is a mutex-protected byte buffer safe as an exec.Cmd's
+// Stdout/Stderr target while a live poll reads its accumulated content
+// concurrently — os/exec copies a child's output into that writer from
+// its own goroutine the moment Start returns, and a bare
+// strings.Builder/bytes.Buffer provides no synchronization against a
+// concurrent read of its internal slice header (a real data race, caught
+// by `go test -race`, distinct from the writes themselves being
+// serialized by os/exec since Stdout and Stderr share this same
+// target). Mirrors ptyClient's own mu+buffer+snapshot shape (pty_test.go).
+type syncOutput struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (o *syncOutput) Write(p []byte) (int, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.buf.Write(p)
+}
+
+// snapshot returns the bytes captured so far. Safe to call at any time,
+// including while the child is still running and writing concurrently;
+// contrast with reading the raw buffer only after Wait, which this test
+// also still does for its final failure-message content.
+func (o *syncOutput) snapshot() string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.buf.String()
+}
+
+// TestFixtureWorkerSelfKillOnControlFile proves the fixture principal's
+// self-kill watcher (Astra review finding P1: a real-process scenario
+// must never signal a pid it only OBSERVED via pane.process_info — the
+// OS could recycle it between observation and signal). Drives a
+// worker-hold implementer directly (no herdr, no pane) until it has sent
+// its own barrier question — genuinely blocked in its own hop msg wait
+// loop, exactly the state a real scenario kills it in — then writes the
+// self-kill control file the SAME way featureharness_test.go's
+// killSession does, and asserts the process terminates by SIGKILL of its
+// OWN doing, never a signal this test aimed at an externally observed pid.
+func TestFixtureWorkerSelfKillOnControlFile(t *testing.T) {
+	artifacts := newArtifactDir(t)
+	worker := buildFixtureWorker(t, artifacts)
+	fakeHop := buildFakeHopStub(t, artifacts)
+	repo := newFixtureRepo(t, artifacts, nil, "repo")
+
+	stateDir := artifacts.dir(t, "state")
+	scratchDir := artifacts.dir(t, "scratch")
+	const (
+		runID     = "d3d3d3d3-d3d3-4d3d-8d3d-d3d3d3d3d3d3"
+		taskID    = "e4e4e4e4-e4e4-4e4e-8e4e-e4e4e4e4e4e4"
+		attemptID = "f5f5f5f5-f5f5-4f5f-8f5f-f5f5f5f5f5f5"
+		sessionID = "a6a6a6a6-a6a6-4a6a-8a6a-a6a6a6a6a6a6"
+	)
+	assignmentPath := filepath.Join(stateDir, "runs", runID, "attempts", attemptID, "assignment.md")
+	if err := os.MkdirAll(filepath.Dir(assignmentPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(assignmentPath, []byte("# HOP Task Assignment\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	instructionsPath := filepath.Join(stateDir, "runs", runID, "tasks", taskID+".md")
+	if err := os.MkdirAll(filepath.Dir(instructionsPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(instructionsPath, []byte("FIXTURE-BEHAVIOR: worker-hold "+scratchDir+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(artifacts.dir(t, "log"), "log.txt")
+
+	prompt := testAssignmentPrompt(assignmentPath, fakeHop)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, worker, "--session-id", sessionID, prompt) //nolint:gosec // G204: fixed test-owned binary and arguments.
+	cmd.Dir = repo.Root
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOP_STATE_DIR=" + stateDir,
+		"HOP_RUN_ID=" + runID,
+		"HOP_TASK_ID=" + taskID,
+		"HOP_ATTEMPT_ID=" + attemptID,
+		"HOP_SESSION_ID=" + sessionID,
+		"HOP_INCARNATION_ID=b7b7b7b7-b7b7-4b7b-8b7b-b7b7b7b7b7b7",
+		"HOP_ROLE=implementer",
+		"FAKE_HOP_LOG=" + logPath,
+	}
+	var out syncOutput
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start fixture worker: %v", err)
+	}
+	// Exactly one goroutine ever calls cmd.Wait, on every path: the happy
+	// path below calls it directly, and cleanup calls it too (a no-op via
+	// sync.Once if the happy path already did) so an early t.Fatalf before
+	// that point — the readiness poll failing, say — still reaps this
+	// directly-started child and lets its output-copy goroutine finish,
+	// rather than leaving both dangling. Never signals or waits on any pid
+	// other than this cmd's own Process handle.
+	var (
+		waitOnce sync.Once
+		waitErr  error
+	)
+	wait := func() error {
+		waitOnce.Do(func() { waitErr = cmd.Wait() })
+		return waitErr
+	}
+	t.Cleanup(func() {
+		if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			t.Logf("cleanup: kill fixture worker: %v", err)
+		}
+		if err := wait(); err != nil {
+			t.Logf("cleanup: reap fixture worker: %v", err)
+		}
+	})
+
+	if !waitUntil(func() bool { return strings.Contains(out.snapshot(), "FIXTURE-HOLD-SENT") }) {
+		t.Fatalf("worker never reported sending its barrier question; output so far:\n%s", out.snapshot())
+	}
+
+	controlPath := filepath.Join(scratchDir, "self-kill-"+attemptID)
+	tmp := controlPath + ".tmp"
+	if err := os.WriteFile(tmp, []byte("FIXTURE-SELF-KILL\n"), 0o600); err != nil {
+		t.Fatalf("write self-kill control file: %v", err)
+	}
+	if err := os.Rename(tmp, controlPath); err != nil {
+		t.Fatalf("rename self-kill control file into place: %v", err)
+	}
+
+	if err := wait(); err == nil {
+		t.Fatalf("worker exited 0 after the self-kill control file was written; want it SIGKILLed; output:\n%s", out.snapshot())
+	}
+	exitErr, ok := waitErr.(*exec.ExitError) //nolint:errorlint // a direct type assertion suffices for this test's own exec of a single known binary.
+	if !ok {
+		t.Fatalf("worker wait error = %v (%T), want *exec.ExitError", waitErr, waitErr)
+	}
+	ws, ok := exitErr.Sys().(syscall.WaitStatus)
+	if !ok {
+		t.Fatalf("worker exit status %#v is not a syscall.WaitStatus", exitErr.Sys())
+	}
+	if !ws.Signaled() || ws.Signal() != syscall.SIGKILL {
+		t.Fatalf("worker exit status = %+v, want signaled by SIGKILL", ws)
+	}
 }
