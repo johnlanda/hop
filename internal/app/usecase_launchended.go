@@ -72,17 +72,47 @@ func claimedProcessLiveDetail(pid int) string {
 	return fmt.Sprintf("the pane is gone but the claimed launch process (pid %d) still runs; end that process, and a later round observes its exit", pid)
 }
 
+// serverContinuityHolds reports whether the server lifetime a launch
+// recorded at its placement (recorded, frozen into the pane.open intent and
+// the creation binding) is the one serving the configured socket right now
+// (ServerContinuityEstablished against a fresh Runtime.ServerInstance
+// read). The launch-ended rows read it once before and once after their
+// observations: server lifetimes are contiguous and a socket path is served
+// by one server at a time, so two reads naming the recorded lifetime prove
+// every observation between them — each on its own connection — was served
+// by that lifetime, and that no restart or live handoff happened since the
+// placement.
+func (c *Controller) serverContinuityHolds(ctx context.Context, recorded string) bool {
+	return ServerContinuityEstablished(recorded, c.observeServerInstance(ctx))
+}
+
+// placedContinuityDetail is the value-free outstanding detail, with the
+// human action, for a placed launch observed absent without established
+// server continuity. After a restart a renamed pane keeps its new name and
+// a pane awaiting a deferred native restore answers no inspection, so
+// absence by id and label proves nothing; stop's own absence observation
+// is the finite exit once no pane of the run remains.
+func placedContinuityDetail(label string) string {
+	return fmt.Sprintf("the pane is absent by id and by launch label %s, but server continuity since the placement is not established (the Herdr server may have restarted, and a pane renamed before a restart, or one awaiting a deferred restore, stays hidden from both), so nothing is settled; if a pane of this run was renamed, rename it back to %s, otherwise hop stop the run once no pane of it remains", RenderExternal(label), RenderExternal(label))
+}
+
 // observeLaunchEnded applies the corroborated-absence predicate to an
 // unsettled launch: binding is the claim's own current incarnation and
 // not superseded, the pane is positively absent under the one absence
 // rule (observePaneAbsence: absent by id AND by creation label, each a
-// successful observation) and the claimed process is gone
-// (observeClaimedProcessGone). docs/plan/phase-2-design.md section 5
-// defines a worker's exit as exactly this pair: pane absence together
-// with the launch claim's process being gone. ended is false whenever any
-// conjunct fails, and no conjunct's failure is ever absence; detail names
-// what is still unestablished, and is empty for the ordinary launch in
-// flight — a pane that still has a foreground occupant.
+// successful observation), the claimed process is gone
+// (observeClaimedProcessGone), and server continuity since the placement
+// holds on both sides of those observations (serverContinuityHolds against
+// the binding's recorded ServerInstance). docs/plan/phase-2-design.md
+// section 5 defines a worker's exit as exactly the pane-and-process pair;
+// the continuity conjunct is what makes that pair conclusive: under one
+// server lifetime a pane keeps its process for its whole life and has a
+// runtime from its creation, while after a restart Herdr answers
+// pane_not_found for a restored pane whose deferred native restore has not
+// fired and restores a renamed pane under its new name. ended is false
+// whenever any conjunct fails, and no conjunct's failure is ever absence;
+// detail names what is still unestablished, and is empty for the ordinary
+// launch in flight — a pane that still has a foreground occupant.
 func (c *Controller) observeLaunchEnded(ctx context.Context, binding *run.RuntimeBinding, claim *LaunchClaim) (ended bool, detail string) {
 	switch {
 	case claim.State != LaunchClaimExecPending:
@@ -92,15 +122,20 @@ func (c *Controller) observeLaunchEnded(ctx context.Context, binding *run.Runtim
 	case binding.Superseded:
 		return false, "the claim's binding is superseded; its observations are ignored"
 	}
+	continuous := c.serverContinuityHolds(ctx, binding.ServerInstance)
 	_, absent, ambiguous := c.observePaneAbsence(ctx, binding.PaneID, binding.CreationLabel)
 	switch {
 	case ambiguous != "":
 		return false, ambiguous
 	case !absent:
 		return false, ""
+	case !continuous:
+		return false, placedContinuityDetail(binding.CreationLabel)
 	}
 	gone, ambiguous := c.observeClaimedProcessGone(ctx, claim.PID)
 	switch {
+	case !c.serverContinuityHolds(ctx, binding.ServerInstance):
+		return false, placedContinuityDetail(binding.CreationLabel)
 	case ambiguous != "":
 		return false, "the pane is absent, but " + ambiguous
 	case !gone:
@@ -218,7 +253,17 @@ func launchEndedIntentLocked(ctx context.Context, uow UnitOfWork, runID identity
 // human action, for an unplaced launch whose creation label answers
 // nothing while its claimed process still runs.
 func unplacedLaunchLiveDetail(label string, pid int) string {
-	return fmt.Sprintf("no pane answers for launch label %s but the claimed launch process (pid %d) still runs; end that process, and a later round observes its exit", label, pid)
+	return fmt.Sprintf("no pane answers for launch label %s but the claimed launch process (pid %d) still runs; end that process, and a later round observes its exit", RenderExternal(label), pid)
+}
+
+// unplacedContinuityDetail is the value-free outstanding detail, with the
+// human action, for an unplaced launch whose creation label answers
+// nothing without established server continuity: a pane renamed before a
+// restart is restored under its new name, so the label's silence proves
+// nothing. Renaming the pane back lets a later round adopt it by its label;
+// a pane really gone after a restart has no automatic or attested exit.
+func unplacedContinuityDetail(label string) string {
+	return fmt.Sprintf("no pane answers for launch label %s, but server continuity since the launch is not established (the Herdr server may have restarted, and a pane renamed before a restart keeps its new name), so the launch may still run; if a pane of this run was renamed, rename it back to %s and a later round adopts it by its label", RenderExternal(label), RenderExternal(label))
 }
 
 // observeUnplacedLaunchEnded applies the label-only variant of the
@@ -226,18 +271,25 @@ func unplacedLaunchLiveDetail(label string, pid int) string {
 // no committed binding, exactly one unresolved, decodable, labeled
 // pane.open intent naming the session and nothing unusable that might,
 // that intent's own exec_pending claim, a successful creation-label lookup
-// that finds nothing, and the claimed process gone
-// (observeClaimedProcessGone). The label conjunct stands in for the
-// missing pane id: a claim exists only once the pane's own process ran
-// hop launch, so the pane existed at claim time, and Herdr attaches a
-// pane's creation label in the very request that creates it, keeps it for
-// the pane's whole life — across a graceful restart too — and drops it
-// with the pane (pinned by test/integration/spike_panevanish_test.go:
-// TestSpikeVanishedPaneShapes and TestSpikeLabelSurvivesRestart). A pane a
-// human relabels while it lives keeps its process, which the process
-// conjunct still observes. ended is false whenever any conjunct fails;
-// detail names what is still unestablished ("" when the predicate simply
-// does not apply, or a pane answers for the label).
+// that finds nothing, the claimed process gone
+// (observeClaimedProcessGone), and server continuity since the launch on
+// both sides of those observations (serverContinuityHolds against the
+// intent's recorded ServerInstance, observed immediately before the pane
+// was created, so continuity from then covers the pane's creation and its
+// launcher's claim). The label conjunct stands in for the missing pane id:
+// a claim exists only once the pane's own process ran hop launch, so the
+// pane existed at claim time, and within one server lifetime Herdr
+// attaches a pane's creation label in the very request that creates it and
+// drops it with the pane (pinned by
+// test/integration/spike_panevanish_test.go: TestSpikeVanishedPaneShapes).
+// The one relabelling, a human's pane.rename, changes that same label; a
+// pane renamed within the lifetime keeps its process, which the process
+// conjunct still observes, but a renamed pane survives a restart under its
+// new name with a fresh or deferred occupant
+// (TestSpikeRenamedLabelSurvivesRestart), which only the continuity
+// conjunct excludes. ended is false whenever any conjunct fails; detail
+// names what is still unestablished ("" when the predicate simply does not
+// apply, or a pane answers for the label).
 func (c *Controller) observeUnplacedLaunchEnded(ctx context.Context, facts *unplacedLaunchFacts) (ended bool, detail string) {
 	switch {
 	case facts.bound:
@@ -255,19 +307,25 @@ func (c *Controller) observeUnplacedLaunchEnded(ctx context.Context, facts *unpl
 	case facts.claim.IncarnationID != facts.intent.IncarnationID:
 		return false, "the launch claim is not the unresolved intent's own incarnation"
 	}
-	_, found, err := c.Runtime.FindPaneByLabel(ctx, facts.intent.Label)
+	label := facts.intent.Label
+	continuous := c.serverContinuityHolds(ctx, facts.intent.ServerInstance)
+	_, found, err := c.Runtime.FindPaneByLabel(ctx, label)
 	switch {
 	case err != nil:
 		return false, "the pane label lookup failed; absence is never assumed from a lookup error"
 	case found:
 		return false, ""
+	case !continuous:
+		return false, unplacedContinuityDetail(label)
 	}
 	gone, ambiguous := c.observeClaimedProcessGone(ctx, facts.claim.PID)
 	switch {
+	case !c.serverContinuityHolds(ctx, facts.intent.ServerInstance):
+		return false, unplacedContinuityDetail(label)
 	case ambiguous != "":
-		return false, fmt.Sprintf("no pane answers for launch label %s, but %s", facts.intent.Label, ambiguous)
+		return false, fmt.Sprintf("no pane answers for launch label %s, but %s", RenderExternal(label), ambiguous)
 	case !gone:
-		return false, unplacedLaunchLiveDetail(facts.intent.Label, facts.claim.PID)
+		return false, unplacedLaunchLiveDetail(label, facts.claim.PID)
 	}
 	return true, ""
 }

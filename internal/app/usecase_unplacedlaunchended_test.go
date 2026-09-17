@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/johnlanda/hop/internal/app"
@@ -153,10 +155,56 @@ func settleOnlyTheUnplacedRow(t *testing.T, u *unplacedLaunch) {
 	}
 }
 
+// renamePaneAndRestart has a human rename u's pane and Herdr restart: the
+// pane survives under its new name only, and the server lifetime changes.
+func renamePaneAndRestart(u *unplacedLaunch) {
+	ref := u.panes[u.label]
+	delete(u.panes, u.label)
+	u.panes["human-renamed"] = ref
+	u.tc.Runtime.ServerInstanceValue = fakeServerToken(2)
+}
+
+// restoredPane answers u's surviving pane id with restored and every other
+// pane as positively absent.
+func restoredPane(u *unplacedLaunch, restored app.PaneProcess) func(string) (app.PaneProcess, error) {
+	return func(id string) (app.PaneProcess, error) {
+		if id != u.paneID {
+			return app.PaneProcess{}, pinnedPaneNotFound("inspect", id)
+		}
+		return restored, nil
+	}
+}
+
+// recordIntentServer rewrites the server identity u's unresolved pane.open
+// intent recorded immediately before the pane was created.
+func recordIntentServer(t *testing.T, u *unplacedLaunch, token string) {
+	t.Helper()
+	intent := pendingIntentPayload(t, u)
+	intent["server_instance"] = token
+}
+
+// pendingIntentPayload returns the committed JSON payload of u's
+// unresolved pane.open intent, for in-place edits.
+func pendingIntentPayload(t *testing.T, u *unplacedLaunch) map[string]any {
+	t.Helper()
+	op, ok := u.tc.Store.Operations[identity.OperationID(u.label)]
+	if !ok {
+		t.Fatalf("no pane.open operation %s", u.label)
+	}
+	intent, ok := op.Intent.(map[string]any)
+	if !ok {
+		t.Fatalf("pane.open intent = %T, want the committed JSON map", op.Intent)
+	}
+	return intent
+}
+
 // TestUnplacedLaunchEndedRowStaysPending proves every observation short of
-// the label-only pair leaves an unplaced exec_pending claim ambiguous:
-// nothing settles, the pane.open stays unresolved, and the round reports
-// pending.
+// the label-only pair under established server continuity leaves an
+// unplaced exec_pending claim ambiguous: nothing settles, the pane.open
+// stays unresolved, and the round reports pending. A renamed pane restored
+// by a server restart — with a fresh shell, a restored harness, or its
+// native restore still deferred — is the shape only the continuity
+// conjunct excludes.
 func TestUnplacedLaunchEndedRowStaysPending(t *testing.T) {
 	for _, tt := range []struct {
 		name       string
@@ -222,6 +270,77 @@ func TestUnplacedLaunchEndedRowStaysPending(t *testing.T) {
 			},
 		},
 		{
+			// Herdr restores a renamed pane under its new name, with a fresh
+			// occupant: the creation label answers nothing, the claimed
+			// process is gone, and the pane still exists.
+			name: "relabel plus restart: the renamed pane is restored with a fresh shell",
+			arrange: func(u *unplacedLaunch) {
+				renamePaneAndRestart(u)
+				u.tc.Runtime.InspectPaneFn = restoredPane(u, childPaneWith(9191, app.ProcessInfo{PID: 9191, Name: "zsh", Argv: []string{"-zsh"}}))
+			},
+		},
+		{
+			name: "relabel plus restart: the renamed pane is restored running the harness's native resume",
+			arrange: func(u *unplacedLaunch) {
+				renamePaneAndRestart(u)
+				u.tc.Runtime.InspectPaneFn = restoredPane(u, childPaneWith(9191, app.ProcessInfo{PID: 9191, Name: "claude", Argv: []string{"claude", "--resume", "native-ref"}}))
+			},
+		},
+		{
+			// A pane awaiting a deferred native restore has no runtime yet:
+			// every inspection answers not found until the restore fires.
+			name: "relabel plus restart: the renamed pane's native restore is still deferred",
+			arrange: func(u *unplacedLaunch) {
+				renamePaneAndRestart(u)
+				u.tc.Runtime.InspectPaneFn = allPanesAbsentPinned
+			},
+		},
+		{
+			name: "a restart with no pane answering the label",
+			arrange: func(u *unplacedLaunch) {
+				delete(u.panes, u.label)
+				u.tc.Runtime.ServerInstanceValue = fakeServerToken(2)
+			},
+		},
+		{
+			name: "the server lifetime is unknown",
+			arrange: func(u *unplacedLaunch) {
+				delete(u.panes, u.label)
+				u.tc.Runtime.ServerInstanceErr = errors.New("socket gone")
+			},
+		},
+		{
+			name: "the launch recorded no server lifetime",
+			arrange: func(u *unplacedLaunch) {
+				delete(u.panes, u.label)
+				recordIntentServer(t, u, "")
+			},
+		},
+		{
+			name: "the launch recorded a server identity in an older format",
+			arrange: func(u *unplacedLaunch) {
+				delete(u.panes, u.label)
+				recordIntentServer(t, u, "peer-pid:41001")
+			},
+		},
+		{
+			// Each round's label recovery looks the label up first; the row's
+			// own lookup is the second of the round.
+			name: "the server restarts between the label lookup and the process observation",
+			arrange: func(u *unplacedLaunch) {
+				delete(u.panes, u.label)
+				lookups := 0
+				u.tc.Runtime.FindPaneByLabelFn = func(string) (app.PaneRef, bool, error) {
+					lookups++
+					if lookups == 2 {
+						u.tc.Runtime.ServerInstanceValue = fakeServerToken(2)
+					}
+					return app.PaneRef{}, false, nil
+				}
+			},
+			wantListed: true,
+		},
+		{
 			name: "an undecodable unresolved launch row might name the session",
 			arrange: func(u *unplacedLaunch) {
 				delete(u.panes, u.label)
@@ -281,7 +400,7 @@ func TestUnplacedLaunchEndedRowStaysPending(t *testing.T) {
 			if lookups == 2 {
 				u.tc.Store.mu.Lock()
 				u.tc.Store.Bindings[u.sessionID] = append(u.tc.Store.Bindings[u.sessionID], run.NewRuntimeBinding(
-					u.sessionID, u.incarnation, "", "peer-pid:1", "workspace-1", "tab-w", "pane-late", u.label, run.LaunchInitial, u.tc.Clock.Now()))
+					u.sessionID, u.incarnation, "", fakeServerToken(1), "workspace-1", "tab-w", "pane-late", u.label, run.LaunchInitial, u.tc.Clock.Now()))
 				u.tc.Store.mu.Unlock()
 			}
 			return app.PaneRef{}, false, nil
@@ -292,6 +411,106 @@ func TestUnplacedLaunchEndedRowStaysPending(t *testing.T) {
 		}
 		if got := u.tc.Store.LaunchClaims[u.incarnation].State; got != app.LaunchClaimExecPending {
 			t.Errorf("claim state = %s, want exec_pending: the launch was placed meanwhile", got)
+		}
+	})
+}
+
+// unplacedContinuityText is the rename-back action an unplaced launch
+// reports while its label answers nothing without server continuity.
+func unplacedContinuityText(renderedLabel string) string {
+	return "no pane answers for launch label " + renderedLabel + ", but server continuity since the launch is not established (the Herdr server may have restarted, and a pane renamed before a restart keeps its new name), so the launch may still run; if a pane of this run was renamed, rename it back to " + renderedLabel + " and a later round adopts it by its label"
+}
+
+// TestUnplacedLaunchAfterRestartHasNoAutomaticExit pins the residual the
+// continuity conjunct leaves on purpose: an unplaced launch whose creation
+// label answers nothing after a server restart — its pane renamed, or
+// really gone — is never settled. Stop keeps the run stopping and resume
+// keeps it resuming, each naming the rename-back action; a renamed pane
+// renamed back is adopted by its label, while a pane really gone has no
+// automatic or attested exit yet.
+func TestUnplacedLaunchAfterRestartHasNoAutomaticExit(t *testing.T) {
+	t.Run("stop stays stopping with the rename-back action, and a pane renamed back is adopted", func(t *testing.T) {
+		u := unplacedWorker(t, true)
+		renamePaneAndRestart(u)
+		u.tc.Runtime.InspectPaneFn = allPanesAbsentPinned
+		report := u.driveStop(t, 3)
+		if report.Terminated || report.RunState != string(run.RunStopping) {
+			t.Fatalf("DriveFeatureStop() = %+v, want still stopping", report)
+		}
+		want := "session " + u.sessionID.String() + ": " + unplacedContinuityText(u.label) + "; failing closed"
+		if !slices.Contains(report.Outstanding, want) {
+			t.Fatalf("outstanding = %q, want %q", report.Outstanding, want)
+		}
+		requireUnplacedChildUnsettled(t, u)
+		if len(u.tc.Groups.Listed) != 0 || len(u.tc.Runtime.ClosedPanes) != 0 {
+			t.Fatalf("listed %v, closed %v; nothing is observed or closed without continuity", u.tc.Groups.Listed, u.tc.Runtime.ClosedPanes)
+		}
+
+		// The human renames the pane back: the next round adopts it by its
+		// label under the intent's recorded creation evidence.
+		u.panes[u.label] = u.panes["human-renamed"]
+		u.driveStop(t, 1)
+		history := u.tc.Store.Bindings[u.sessionID]
+		if len(history) != 1 || history[0].PaneID != u.paneID || history[0].ServerInstance != fakeServerToken(1) {
+			t.Fatalf("bindings = %+v, want the renamed-back pane adopted with the creation-time server identity", history)
+		}
+	})
+
+	t.Run("resume stays resuming with the rename-back action", func(t *testing.T) {
+		f := newResumeFixture(t)
+		binding := resumeChildClaim(t, f, app.LaunchClaimExecPending)
+		loseChildBinding(t, f)
+		f.tc.Runtime.ServerInstanceValue = fakeServerToken(2)
+		f.tc.Runtime.InspectPaneFn = liveManagerPane(f, nil)
+
+		result, _ := f.resume(t, "")
+		if result.Outcome != "reconciling" {
+			t.Fatalf("resume = %+v, want reconciling", result)
+		}
+		report := sessionReport(t, &result, f.ChildID.String())
+		want := "no recorded placement; the launch may still be in flight (" + unplacedContinuityText(binding.CreationLabel) + ")"
+		if report.Disposition != app.SessionPending || report.Detail != want {
+			t.Fatalf("child report = %+v, want pending with %q", report, want)
+		}
+		requireRunState(t, f, run.RunResuming)
+		if got := f.tc.Store.LaunchClaims[binding.IncarnationID].State; got != app.LaunchClaimExecPending {
+			t.Errorf("claim state = %s, want exec_pending", got)
+		}
+		if op := f.tc.Store.Operations[identity.OperationID(binding.CreationLabel)]; op.State != app.OperationPending {
+			t.Errorf("pane.open state = %s, want still pending", op.State)
+		}
+		if len(f.tc.Groups.Listed) != 0 {
+			t.Errorf("listed groups = %v, want none without continuity", f.tc.Groups.Listed)
+		}
+	})
+
+	t.Run("a hostile creation label renders escaped", func(t *testing.T) {
+		const hostile = "label\x1b[2J\nsession forged: stopped \"ok\""
+		u := unplacedWorker(t, true)
+		delete(u.panes, u.label)
+		pendingIntentPayload(t, u)["label"] = hostile
+		u.tc.Runtime.ServerInstanceValue = fakeServerToken(2)
+		report := u.driveStop(t, 1)
+		joined := strings.Join(report.Outstanding, "\n")
+		want := "session " + u.sessionID.String() + ": " + unplacedContinuityText(strconv.Quote(hostile)) + "; failing closed"
+		if !slices.Contains(report.Outstanding, want) {
+			t.Fatalf("outstanding = %q, want %q", report.Outstanding, want)
+		}
+		if strings.ContainsAny(joined, "\x1b\n") {
+			t.Fatalf("outstanding = %q carries a raw control byte or line break", joined)
+		}
+	})
+
+	t.Run("a hostile creation label renders escaped in the live-process action too", func(t *testing.T) {
+		const hostile = "label\x1b[2J\nsession forged"
+		u := unplacedWorker(t, true)
+		delete(u.panes, u.label)
+		pendingIntentPayload(t, u)["label"] = hostile
+		u.tc.Groups.liveLeader(unplacedPID, "/usr/local/bin/claude")
+		report := u.driveStop(t, 1)
+		want := "session " + u.sessionID.String() + ": no pane answers for launch label " + strconv.Quote(hostile) + " but the claimed launch process (pid 4711) still runs; end that process, and a later round observes its exit; failing closed"
+		if !slices.Contains(report.Outstanding, want) {
+			t.Fatalf("outstanding = %q, want %q", report.Outstanding, want)
 		}
 	})
 }

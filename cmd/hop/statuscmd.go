@@ -5,10 +5,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/johnlanda/hop/internal/app"
 )
@@ -17,17 +15,13 @@ import (
 const defaultStatusTimeout = 10 * time.Second
 
 // safeRenderExternal renders a path or an opaque Herdr-assigned
-// identifier for a status line: raw when it is valid UTF-8 with no
-// control character (C0, DEL, C1), no double quote and no backslash —
-// the shapes that could otherwise forge a line boundary (a newline
-// inserting a fake protocol line), emit a terminal control sequence, or
-// make the two rendering forms ambiguous. Otherwise it renders as Go's
-// quoted-string form (strconv.Quote), which escapes exactly those bytes
-// and always starts with a double quote — so a raw rendering never
-// starts with one, and a reader can always tell which form a field
-// took. Ordinary paths and identifiers are untouched, so every existing
-// render table stays byte-identical. Applied to every externally sourced
-// string hop status prints, each as one whole field:
+// identifier for a status line through app.RenderExternal, the one
+// rendering boundary: raw when it is valid UTF-8 with no control
+// character (C0, DEL, C1), no double quote and no backslash, else Go's
+// quoted-string form (strconv.Quote). Ordinary paths and identifiers are
+// untouched, so every existing render table stays byte-identical. Applied
+// to every externally sourced string hop status prints, each as one whole
+// field:
 //   - paths: the solo worktree, each feature worktree row, the task
 //     table's worktree, artifacts, check evidence, a question's body and
 //     a rejected review's reasons;
@@ -51,29 +45,7 @@ const defaultStatusTimeout = 10 * time.Second
 // HOP-generated token (a parsed uuid, a typed state or kind, a count, an
 // age, a time) or fixed text, and renders raw.
 func safeRenderExternal(s string) string {
-	if isSafeExternalString(s) {
-		return s
-	}
-	return strconv.Quote(s)
-}
-
-// isSafeExternalString reports whether s can render raw per
-// safeRenderExternal's contract.
-func isSafeExternalString(s string) bool {
-	if !utf8.ValidString(s) {
-		return false
-	}
-	for _, r := range s {
-		switch {
-		case r == '"' || r == '\\':
-			return false
-		case r < 0x20 || r == 0x7f: // C0 controls and DEL
-			return false
-		case r >= 0x80 && r <= 0x9f: // C1 controls
-			return false
-		}
-	}
-	return true
+	return app.RenderExternal(s)
 }
 
 // runStatus implements `hop status`: without -run one line per run of the

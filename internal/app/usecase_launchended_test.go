@@ -362,6 +362,50 @@ func TestLaunchEndedRowStaysPending(t *testing.T) {
 			},
 		},
 		{
+			// After a restart a renamed pane is restored under its new name, and
+			// until its deferred native restore fires it has no runtime: it
+			// answers not found by id and nothing by its creation label.
+			name: "relabel plus restart: the renamed pane's native restore is still deferred",
+			arrange: func(tc *testController, fr featureRun, child *launchingChild) {
+				tc.Runtime.InspectPaneFn = vanishedPane(child.PaneID, liveManagerOnly(fr, 900))
+				tc.Runtime.ServerInstanceValue = fakeServerToken(2)
+			},
+		},
+		{
+			name: "pane absent, the server lifetime is unknown",
+			arrange: func(tc *testController, fr featureRun, child *launchingChild) {
+				tc.Runtime.InspectPaneFn = vanishedPane(child.PaneID, liveManagerOnly(fr, 900))
+				tc.Runtime.ServerInstanceErr = errors.New("socket gone")
+			},
+		},
+		{
+			name: "pane absent, the placement recorded no server lifetime",
+			arrange: func(tc *testController, fr featureRun, child *launchingChild) {
+				tc.Runtime.InspectPaneFn = vanishedPane(child.PaneID, liveManagerOnly(fr, 900))
+				history := tc.Store.Bindings[child.SessionID]
+				history[len(history)-1].ServerInstance = ""
+			},
+		},
+		{
+			name: "pane absent, the placement recorded a server identity in an older format",
+			arrange: func(tc *testController, fr featureRun, child *launchingChild) {
+				tc.Runtime.InspectPaneFn = vanishedPane(child.PaneID, liveManagerOnly(fr, 900))
+				history := tc.Store.Bindings[child.SessionID]
+				history[len(history)-1].ServerInstance = "peer-pid:41001"
+			},
+		},
+		{
+			name: "pane absent, the server restarts between the absence and the process observations",
+			arrange: func(tc *testController, fr featureRun, child *launchingChild) {
+				tc.Runtime.InspectPaneFn = vanishedPane(child.PaneID, liveManagerOnly(fr, 900))
+				tc.Runtime.FindPaneByLabelFn = func(string) (app.PaneRef, bool, error) {
+					tc.Runtime.ServerInstanceValue = fakeServerToken(2)
+					return app.PaneRef{}, false, nil
+				}
+			},
+			wantListed: true,
+		},
+		{
 			name: "a pane inspection error other than not found",
 			arrange: func(tc *testController, fr featureRun, child *launchingChild) {
 				tc.Runtime.InspectPaneFn = func(id string) (app.PaneProcess, error) {
@@ -613,6 +657,62 @@ func TestLaunchEndedPredicateGovernsStopAndFailure(t *testing.T) {
 		}
 		if got := tc.Store.Sessions[child.SessionID].value.State; got != run.SessionTerminated {
 			t.Errorf("session state = %s, want terminated", got)
+		}
+	})
+}
+
+// TestLaunchEndedRowAfterRestartLeavesStopAsTheExit pins what the
+// continuity conjunct leaves for a placed launch after a server restart:
+// resume never settles it and names the rename-back action, while stop's
+// own absence observation still finishes the run once no pane of it
+// remains.
+func TestLaunchEndedRowAfterRestartLeavesStopAsTheExit(t *testing.T) {
+	t.Run("resume stays resuming with the rename-back action", func(t *testing.T) {
+		f := newResumeFixture(t)
+		binding := resumeChildClaim(t, f, app.LaunchClaimExecPending)
+		f.tc.Runtime.InspectPaneFn = liveManagerOnly(f.fr, f.ManagerPID)
+		f.tc.Runtime.ServerInstanceValue = fakeServerToken(2)
+
+		result, _ := f.resume(t, "")
+		if result.Outcome != "reconciling" {
+			t.Fatalf("resume = %+v, want reconciling", result)
+		}
+		report := sessionReport(t, &result, f.ChildID.String())
+		want := "launch claim not settled; corroboration continues (the pane is absent by id and by launch label " + binding.CreationLabel +
+			", but server continuity since the placement is not established (the Herdr server may have restarted, and a pane renamed before a restart, or one awaiting a deferred restore, stays hidden from both), so nothing is settled; if a pane of this run was renamed, rename it back to " +
+			binding.CreationLabel + ", otherwise hop stop the run once no pane of it remains)"
+		if report.Disposition != app.SessionPending || report.Detail != want {
+			t.Fatalf("child report = %+v, want pending with %q", report, want)
+		}
+		if got := f.tc.Store.LaunchClaims[binding.IncarnationID].State; got != app.LaunchClaimExecPending {
+			t.Errorf("claim state = %s, want exec_pending", got)
+		}
+		if len(f.tc.Groups.Listed) != 0 {
+			t.Errorf("listed groups = %v, want none without continuity", f.tc.Groups.Listed)
+		}
+		requireRunState(t, f, run.RunResuming)
+	})
+
+	t.Run("stop with the pane really gone still finishes", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		fr := seedFeatureRun(t, tc, 2)
+		taskID := seedImplementTask(t, tc, fr.RunID, 1, "A", false, run.TaskReady)
+		child := seedLaunchingChild(t, tc, fr, taskID, app.LaunchClaimExecPending)
+		rRow := tc.Store.Runs[fr.RunID]
+		rRow.value = rRow.value.RequestStop(tc.Clock.Now())
+		rRow.revision++
+		tc.Runtime.InspectPaneFn = vanishedPane(child.PaneID, nil)
+		tc.Runtime.ServerInstanceValue = fakeServerToken(2)
+
+		report, err := tc.Controller.DriveFeatureStop(context.Background(), fr.Handle)
+		if err != nil {
+			t.Fatalf("DriveFeatureStop() error = %v", err)
+		}
+		if !report.Terminated || report.RunState != string(run.RunStopped) {
+			t.Fatalf("stop report = %+v, want stopped", report)
+		}
+		if got := tc.Store.LaunchClaims[child.IncarnationID]; got.State != app.LaunchClaimExecPending {
+			t.Errorf("claim = %s (%q), want exec_pending: stop settles no launch-ended claim", got.State, got.Error)
 		}
 	})
 }

@@ -95,8 +95,9 @@ func readUnplacedLaunchLocked(ctx context.Context, uow UnitOfWork, runID identit
 // absence. A successful lookup that finds nothing hands an exec_pending
 // claim to the label-only launch-ended row (settleIfUnplacedLaunchEnded):
 // settled, the launch has nothing live; otherwise — the claimed process
-// still runs, or its observation is ambiguous — it stays outstanding with
-// the reason named.
+// still runs, its observation is ambiguous, or server continuity since the
+// launch is not established — it stays outstanding with the reason and
+// the human action named.
 func (c *Controller) resolveUnplacedLaunch(ctx context.Context, handle RunHandle, session *run.Session) (unplacedLaunch, string, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per unplaced session per round.
 	var facts unplacedLaunchFacts
 	err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
@@ -133,7 +134,7 @@ func (c *Controller) resolveUnplacedLaunch(ctx context.Context, handle RunHandle
 			return unplacedNothingLive, "", nil
 		}
 		if still == "" {
-			still = fmt.Sprintf("no pane answers for launch label %s while claim pid %d is unobserved", facts.intent.Label, facts.claim.PID)
+			still = fmt.Sprintf("no pane answers for launch label %s while claim pid %d is unobserved", RenderExternal(facts.intent.Label), facts.claim.PID)
 		}
 		return unplacedOutstanding, still + "; failing closed", nil
 	}
@@ -149,7 +150,7 @@ func (c *Controller) resolveUnplacedLaunch(ctx context.Context, handle RunHandle
 		return unplacedOutstanding, "", err
 	}
 	if !bound {
-		return unplacedOutstanding, fmt.Sprintf("the pane for launch label %s could not be bound; failing closed", facts.intent.Label), nil
+		return unplacedOutstanding, fmt.Sprintf("the pane for launch label %s could not be bound; failing closed", RenderExternal(facts.intent.Label)), nil
 	}
 	return unplacedBound, "", nil
 }
