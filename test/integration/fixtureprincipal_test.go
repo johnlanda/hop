@@ -67,10 +67,13 @@ const (
 // the identically named constants inside fixtureWorkerSource: the opt-in
 // gate file a test creates under a worker-hold attempt's own scratch
 // directory before starting the run, held until the file is removed, and
-// the fixed name of the observation the gate dumps before blocking.
+// the fixed PREFIX of the observation the gate dumps before blocking
+// (suffixed "-<attempt id>.txt" like every sibling dump, since the
+// control file itself gates every worker-hold attempt in the run
+// uniformly while each attempt's own observation must not collide).
 const (
 	workerHoldSendGateControlFile  = "worker-hold-send-gate"
-	workerHoldSendGateObservedFile = "worker-hold-send-gate-observed.txt"
+	workerHoldSendGateObservedFile = "worker-hold-send-gate-observed"
 )
 
 // fakeHopSource is a minimal, scriptable stand-in for the real hop binary
@@ -2147,9 +2150,9 @@ func TestFixtureWorkerHoldBarrier(t *testing.T) {
 // ready to drive the compiled fixture worker directly (no herdr) against
 // a fake hop stub.
 type workerHoldSendGateFixture struct {
-	worker, cwd, scratchDir, logPath string
-	prompt                           string
-	env                              []string
+	worker, cwd, scratchDir, logPath, attemptID string
+	prompt                                      string
+	env                                         []string
 }
 
 func buildWorkerHoldSendGateFixture(t *testing.T, artifacts *artifactDir) workerHoldSendGateFixture {
@@ -2191,7 +2194,7 @@ func buildWorkerHoldSendGateFixture(t *testing.T, artifacts *artifactDir) worker
 	logPath := filepath.Join(scriptDir, "log.txt")
 
 	return workerHoldSendGateFixture{
-		worker: worker, cwd: repo.Root, scratchDir: scratchDir, logPath: logPath,
+		worker: worker, cwd: repo.Root, scratchDir: scratchDir, logPath: logPath, attemptID: attemptID,
 		prompt: testAssignmentPrompt(assignmentPath, fakeHop),
 		env: []string{
 			"PATH=" + os.Getenv("PATH"),
@@ -2240,8 +2243,8 @@ func testFixtureWorkerHoldSendGateDisabled(t *testing.T) {
 	if !strings.Contains(out.String(), "FIXTURE-HOLD-SENT") {
 		t.Errorf("worker-hold stdout missing FIXTURE-HOLD-SENT with the gate file absent; got:\n%s", out.String())
 	}
-	if _, err := os.Stat(filepath.Join(fx.scratchDir, workerHoldSendGateObservedFile)); err == nil {
-		t.Error("worker-hold-send-gate-observed.txt exists with the gate file never created; the gate must never engage when disabled")
+	if _, err := os.Stat(filepath.Join(fx.scratchDir, workerHoldSendGateObservedFile+"-"+fx.attemptID+".txt")); err == nil {
+		t.Error("the send-gate observation file exists with the gate file never created; the gate must never engage when disabled")
 	}
 }
 
@@ -2283,7 +2286,7 @@ func testFixtureWorkerHoldSendGateEnabled(t *testing.T) {
 	})
 
 	if !waitUntil(func() bool {
-		_, err := os.Stat(filepath.Join(fx.scratchDir, workerHoldSendGateObservedFile))
+		_, err := os.Stat(filepath.Join(fx.scratchDir, workerHoldSendGateObservedFile+"-"+fx.attemptID+".txt"))
 		return err == nil
 	}) {
 		t.Fatalf("worker-hold never observed the send gate; output so far:\n%s", out.snapshot())

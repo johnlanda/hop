@@ -2186,16 +2186,18 @@ life, as `launchvanish_test.go`'s own vanishing stub shows for the
 manager's launch), but not safely here: the one `claude` stub serves
 EVERY role in this suite, so gating it would force the manager and
 reviewer sessions through the same exec-chain topology that exposes
-WEDGE-1 (a forking-wrapper false classification a scenario's own worker
-launch tripped by accident, fixed in this branch by removing the exec
-chain rather than by gating it). An IN-fixture gate avoids that
-topology, but corroborates within the SAME scheduling pass that placed
-it regardless (`runFeatureSchedulingPass`: `AssignReadyTasks` then
+WEDGE-1, a forking-wrapper false classification a worker launch can trip
+by accident — unfixed in production, owned by a separate slice.
+`workerlaunchvanish_test.go`'s own scenario avoids tripping it by
+installing the fixture worker directly as `claude` with no exec chain,
+never by gating it. An IN-fixture gate avoids that topology, but
+corroborates within the SAME scheduling pass that placed it regardless
+(`runFeatureSchedulingPass`: `AssignReadyTasks` then
 `CorroborateSessionLaunches`), closing the window before an external
 observer could react — for a reason unrelated to WEDGE-1. This scenario
-stays deferred until WEDGE-1 is fixed; a controller-fix slice may then
-make a gated `claude` stub usable for the second window. The rule is
-covered by the app tables for resume's in-flight rule
+stays deferred until WEDGE-1 is fixed in production; a controller-fix
+slice may then make a gated `claude` stub usable for the second window.
+The rule is covered by the app tables for resume's in-flight rule
 (`TestResumeFeatureChildLaunchInFlight` and its siblings).
 
 ## 12. Work breakdown

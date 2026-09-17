@@ -133,12 +133,16 @@ func TestRealProcessManagerColdRelaunch(t *testing.T) {
 	// control channel — never a raw signal to an observed pid — exactly
 	// resume_test.go's endWithSelfKill pattern, keyed by the manager's own
 	// session id (the manager has no attempt id; fixtureworker_test.go's
-	// runManager names its control file self-kill-<HOP_SESSION_ID>).
-	// Waits for the pane to close itself (a layout.apply command pane has
-	// no shell, S6), giving hop resume's absence observation the by-id
-	// conjunct, then removes the control file: a relaunched incarnation
-	// reads the identical frozen assignment and would SIGKILL itself the
-	// instant it started if the file were still in place.
+	// runManager names its control file self-kill-<HOP_SESSION_ID>, so a
+	// cold-relaunched successor's own watcher is keyed to its OWN, new
+	// session id and never collides with its predecessor's already-
+	// consumed one — unlike a worker's relaunch, which keeps the same
+	// attempt id and therefore the same control-file name across the
+	// kill). Waits for the pane to close itself (a layout.apply command
+	// pane has no shell, S6), giving hop resume's absence observation the
+	// by-id conjunct, then removes the control file: harmless to the
+	// relaunch either way, but removed regardless as the same hygiene
+	// every self-kill caller in this package practices.
 	managerSelfKillControlPath := filepath.Join(scratchDir, "self-kill-"+managerSessionID)
 	tmp := managerSelfKillControlPath + ".tmp"
 	if err := os.WriteFile(tmp, []byte("FIXTURE-SELF-KILL\n"), 0o600); err != nil {

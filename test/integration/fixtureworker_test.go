@@ -1073,7 +1073,7 @@ func runWorker() {
 		drainMailbox(hopPath)
 		submitOnce(hopPath, oid, "fixture implementer result (conflict "+env["HOP_TASK_ID"]+")", "")
 	case "worker-hold":
-		waitForWorkerHoldSendGateCleared(scratchDir)
+		waitForWorkerHoldSendGateCleared(scratchDir, env["HOP_ATTEMPT_ID"])
 		oid := commitChange("fixture implementer change (held)")
 		questionPath := filepath.Join(scratchDir, "hold-question-"+env["HOP_ATTEMPT_ID"]+".txt")
 		atomicWriteFile(questionPath, fixtureHoldMarker+"\n")
@@ -1747,22 +1747,25 @@ func postForwardBarrierEnabled(scratchDir string) bool {
 // racing it.
 const workerHoldSendGateControlFile = "worker-hold-send-gate"
 
-// workerHoldSendGateObservedFile is where the gate dumps its own
-// observation the instant it starts blocking (empty when the gate was
-// never enabled, since the check below returns before writing it), so a
-// test can wait for this file rather than guessing when the block took
-// effect.
-const workerHoldSendGateObservedFile = "worker-hold-send-gate-observed.txt"
+// workerHoldSendGateObservedFile is the fixed PREFIX of where the gate
+// dumps its own observation the instant it starts blocking (empty when
+// the gate was never enabled, since the check below returns before
+// writing it), keyed by attempt id like every sibling dump — the control
+// file itself stays fixed-named, since it gates every worker-hold attempt
+// in the run uniformly, but two concurrent attempts writing the SAME
+// observed-file path would share atomicWriteFile's one fixed ".tmp"
+// sibling, and a rename that lands second would find it already moved.
+const workerHoldSendGateObservedFile = "worker-hold-send-gate-observed"
 
 // waitForWorkerHoldSendGateCleared blocks until workerHoldSendGateControlFile
 // no longer exists under scratchDir, returning immediately if it was
 // never created.
-func waitForWorkerHoldSendGateCleared(scratchDir string) {
+func waitForWorkerHoldSendGateCleared(scratchDir, attemptID string) {
 	path := filepath.Join(scratchDir, workerHoldSendGateControlFile)
 	if _, err := os.Stat(path); err != nil {
 		return
 	}
-	writeContentDigest(filepath.Join(scratchDir, workerHoldSendGateObservedFile), "worker-hold-send-gate", "blocked")
+	writeContentDigest(filepath.Join(scratchDir, workerHoldSendGateObservedFile+"-"+attemptID+".txt"), attemptID, "blocked")
 	for {
 		if _, err := os.Stat(path); os.IsNotExist(err) {
 			return
@@ -2761,6 +2764,16 @@ func TestFixtureWorkerVanishOnce(t *testing.T) {
 		if !strings.Contains(secondOut, want) {
 			t.Errorf("second attempt output missing %q; got:\n%s", want, secondOut)
 		}
+	}
+	// The positive control for the first attempt's empty-log assertion
+	// above: an empty firstLogPath means nothing IFF the log-capture
+	// channel itself is known to be live for this same worker binary and
+	// env shape. The second attempt's own call proves that — it must
+	// actually call hop, so a broken or unwired FAKE_HOP_LOG (which would
+	// also leave firstLogPath looking empty for the wrong reason) fails
+	// here instead of passing silently.
+	if log := readFakeHopLog(t, secondLogPath); !strings.Contains(log, "result\tsubmit\t") {
+		t.Errorf("second attempt's fake hop log missing the result submit call; got:\n%s", log)
 	}
 }
 
