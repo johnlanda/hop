@@ -1893,6 +1893,16 @@ the manager conversation (warm reattach) or cold-relaunches it
 manager lineage. A second concurrent `hop resume` loses the lease CAS and
 exits reporting the holder — the exit-criterion scenario.
 
+Lease loss and a caller's own cancellation are different facts. A failed
+heartbeat cancels the controller's dispatch scope, and with it every
+in-flight external act, because the lease may have moved. A heartbeat
+that failed only because its caller's context had already ended says
+nothing about the lease, so it leaves the scope live. An asynchronous
+round that stop or shutdown interrupts at its pre-dispatch revalidation
+therefore never ends the dispatch of the acts after it, the stop's own
+acts included. The periodic heartbeat, under the loop's own context,
+still detects a real loss.
+
 Detach (SIGINT/SIGTERM) remains distinct from stop and leaves the manager
 and workers running; `hop stop` remains the only stop, and now drives
 termination of every owned session (manager, workers, reviewer) and every

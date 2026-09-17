@@ -373,9 +373,13 @@ func (s *fakeStore) matchesHeldLease(lease app.Lease) bool {
 	return row.lease.ControllerID == lease.ControllerID && row.lease.Generation == lease.Generation
 }
 
-func (s *fakeStore) Heartbeat(_ context.Context, lease app.Lease) error {
+func (s *fakeStore) Heartbeat(ctx context.Context, lease app.Lease) error {
 	if s.HeartbeatHook != nil {
 		s.HeartbeatHook()
+	}
+	// The real heartbeat is a write transaction bound to ctx.
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("app_test: heartbeat: %w", err)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()

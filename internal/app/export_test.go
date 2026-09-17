@@ -14,6 +14,12 @@ func NewRunHandleForTest(runID identity.RunID, lease Lease) RunHandle {
 	return newRunHandle(runID, lease)
 }
 
+// DispatchLiveForTest reports whether handle's dispatch scope is still
+// live: no failed heartbeat or detach has canceled it.
+func DispatchLiveForTest(handle RunHandle) bool { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; test bridge.
+	return handle.dispatch != nil && handle.dispatch.ctx.Err() == nil
+}
+
 // RenderContinuationPromptForTest exposes renderContinuationPrompt to
 // app_test, so scenarios scripting the argv of HOP's own cold-relaunched
 // worker reproduce the pinned relaunch shape

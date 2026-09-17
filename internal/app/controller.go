@@ -118,10 +118,16 @@ func (h *RunHandle) actContext(ctx context.Context) (context.Context, context.Ca
 // the design's 10s interval so a long check or wait never outlives the 30s
 // TTL. A failed heartbeat cancels the handle's dispatch scope — in-flight
 // external calls are canceled — and the caller must stop acting
-// (docs/plan/phase-2-design.md section 4).
+// (docs/plan/phase-2-design.md section 4). A heartbeat that failed
+// because the caller's own ctx ended says nothing about the lease, so it
+// leaves the scope live: an interrupted round's revalidation never ends
+// the dispatch of the acts that follow it (a stop's among them), and the
+// periodic heartbeat still detects a real loss.
 func (c *Controller) Heartbeat(ctx context.Context, handle RunHandle) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; heartbeat runs on a 10s interval, never a hot loop.
 	if err := c.Store.Heartbeat(ctx, handle.lease); err != nil {
-		handle.cancelDispatch()
+		if ctx.Err() == nil {
+			handle.cancelDispatch()
+		}
 		return fmt.Errorf("app: heartbeat: %w", err)
 	}
 	return nil
