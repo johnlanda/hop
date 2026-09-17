@@ -63,6 +63,16 @@ const (
 	postForwardBarrierObservedFile = "manager-post-forward-observed.txt"
 )
 
+// workerHoldSendGateControlFile and workerHoldSendGateObservedFile mirror
+// the identically named constants inside fixtureWorkerSource: the opt-in
+// gate file a test creates under a worker-hold attempt's own scratch
+// directory before starting the run, held until the file is removed, and
+// the fixed name of the observation the gate dumps before blocking.
+const (
+	workerHoldSendGateControlFile  = "worker-hold-send-gate"
+	workerHoldSendGateObservedFile = "worker-hold-send-gate-observed.txt"
+)
+
 // fakeHopSource is a minimal, scriptable stand-in for the real hop binary
 // — the handwritten-fake law (design's review brief): it validates each
 // supported verb's real argv/context contract before ever returning a
@@ -2128,6 +2138,177 @@ func TestFixtureWorkerHoldBarrier(t *testing.T) {
 	}
 	if want := fmt.Sprintf("%d", len(answerContent)); answerObs.Fields["bytes"] != want {
 		t.Errorf("answer observation bytes = %q, want %q", answerObs.Fields["bytes"], want)
+	}
+}
+
+// workerHoldSendGateFixture is the shared setup for
+// TestFixtureWorkerHoldSendGate's disabled/enabled subtests: a
+// worker-hold implementer whose barrier release is already scripted,
+// ready to drive the compiled fixture worker directly (no herdr) against
+// a fake hop stub.
+type workerHoldSendGateFixture struct {
+	worker, cwd, scratchDir, logPath string
+	prompt                           string
+	env                              []string
+}
+
+func buildWorkerHoldSendGateFixture(t *testing.T, artifacts *artifactDir) workerHoldSendGateFixture {
+	t.Helper()
+	worker := buildFixtureWorker(t, artifacts)
+	fakeHop := buildFakeHopStub(t, artifacts)
+	repo := newFixtureRepo(t, artifacts, nil, "repo")
+
+	stateDir := artifacts.dir(t, "state")
+	scratchDir := artifacts.dir(t, "worker-hold-send-gate-scratch")
+	const (
+		runID     = "c8c8c8c8-c8c8-4c8c-8c8c-c8c8c8c8c8c8"
+		taskID    = "d9d9d9d9-d9d9-4d9d-8d9d-d9d9d9d9d9d9"
+		attemptID = "eaeaeaea-eaea-4aea-8aea-eaeaeaeaeaea"
+	)
+	assignmentPath := filepath.Join(stateDir, "runs", runID, "attempts", attemptID, "assignment.md")
+	if err := os.MkdirAll(filepath.Dir(assignmentPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(assignmentPath, []byte("# HOP Task Assignment\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	instructionsPath := filepath.Join(stateDir, "runs", runID, "tasks", taskID+".md")
+	if err := os.MkdirAll(filepath.Dir(instructionsPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(instructionsPath, []byte("FIXTURE-BEHAVIOR: worker-hold "+scratchDir+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	scriptDir := artifacts.dir(t, "worker-hold-send-gate-script")
+	answerBody := filepath.Join(scriptDir, "answer-body.txt")
+	if err := os.WriteFile(answerBody, []byte("released\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const msgAnswerID = "fbfbfbfb-2222-4fbf-8222-222222222222"
+	blocks := []string{fakeMessageBlock(msgAnswerID, "answer", "manager-session", "99999999-9999-4999-8999-999999999999", "", answerBody)}
+	scriptPath, indexPath := writeFakeHopMsgScript(t, scriptDir, blocks)
+	logPath := filepath.Join(scriptDir, "log.txt")
+
+	return workerHoldSendGateFixture{
+		worker: worker, cwd: repo.Root, scratchDir: scratchDir, logPath: logPath,
+		prompt: testAssignmentPrompt(assignmentPath, fakeHop),
+		env: []string{
+			"PATH=" + os.Getenv("PATH"),
+			"HOP_STATE_DIR=" + stateDir,
+			"HOP_RUN_ID=" + runID,
+			"HOP_TASK_ID=" + taskID,
+			"HOP_ATTEMPT_ID=" + attemptID,
+			"HOP_SESSION_ID=fcfcfcfc-8888-4fcf-8666-555555555555",
+			"HOP_INCARNATION_ID=fdfdfdfd-cccc-4fdf-8ccc-cccccccccccc",
+			"HOP_ROLE=implementer",
+			"FAKE_HOP_MSG_SCRIPT=" + scriptPath,
+			"FAKE_HOP_MSG_INDEX=" + indexPath,
+			"FAKE_HOP_LOG=" + logPath,
+		},
+	}
+}
+
+// TestFixtureWorkerHoldSendGate proves the worker-hold send gate
+// (fixtureworker_test.go's workerHoldSendGateControlFile) in isolation:
+// disabled (the gate file absent — every existing scenario's own shape)
+// sends the barrier question immediately and never engages the gate at
+// all, while enabled (the gate file present) blocks until it is removed,
+// proven across a bounded negative window rather than a single snapshot,
+// since a gate that returns instantly instead of actually holding still
+// leaves a real race window a lucky snapshot could win.
+func TestFixtureWorkerHoldSendGate(t *testing.T) {
+	t.Run("Disabled", testFixtureWorkerHoldSendGateDisabled)
+	t.Run("Enabled", testFixtureWorkerHoldSendGateEnabled)
+}
+
+func testFixtureWorkerHoldSendGateDisabled(t *testing.T) {
+	artifacts := newArtifactDir(t)
+	fx := buildWorkerHoldSendGateFixture(t, artifacts)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, fx.worker, "--session-id", "fcfcfcfc-8888-4fcf-8666-555555555555", fx.prompt) //nolint:gosec // G204: fixed test-owned binary and arguments.
+	cmd.Dir = fx.cwd
+	cmd.Env = fx.env
+	var out strings.Builder
+	cmd.Stdout, cmd.Stderr = &out, &out
+	cmd.Stdin = strings.NewReader("FIXTURE-QUIT\n")
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("run fixture worker-hold: %v\nstdout/stderr:\n%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "FIXTURE-HOLD-SENT") {
+		t.Errorf("worker-hold stdout missing FIXTURE-HOLD-SENT with the gate file absent; got:\n%s", out.String())
+	}
+	if _, err := os.Stat(filepath.Join(fx.scratchDir, workerHoldSendGateObservedFile)); err == nil {
+		t.Error("worker-hold-send-gate-observed.txt exists with the gate file never created; the gate must never engage when disabled")
+	}
+}
+
+func testFixtureWorkerHoldSendGateEnabled(t *testing.T) {
+	artifacts := newArtifactDir(t)
+	fx := buildWorkerHoldSendGateFixture(t, artifacts)
+
+	gatePath := filepath.Join(fx.scratchDir, workerHoldSendGateControlFile)
+	if err := os.WriteFile(gatePath, []byte("FIXTURE-GATE\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, fx.worker, "--session-id", "fcfcfcfc-8888-4fcf-8666-555555555555", fx.prompt) //nolint:gosec // G204: fixed test-owned binary and arguments.
+	cmd.Dir = fx.cwd
+	cmd.Env = fx.env
+	var out syncOutput
+	cmd.Stdout, cmd.Stderr = &out, &out
+	cmd.Stdin = strings.NewReader("FIXTURE-QUIT\n")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start fixture worker-hold: %v", err)
+	}
+	var (
+		waitOnce sync.Once
+		waitErr  error
+	)
+	wait := func() error {
+		waitOnce.Do(func() { waitErr = cmd.Wait() })
+		return waitErr
+	}
+	t.Cleanup(func() {
+		if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			t.Logf("cleanup: kill fixture worker: %v", err)
+		}
+		if err := wait(); err != nil {
+			t.Logf("cleanup: reap fixture worker: %v", err)
+		}
+	})
+
+	if !waitUntil(func() bool {
+		_, err := os.Stat(filepath.Join(fx.scratchDir, workerHoldSendGateObservedFile))
+		return err == nil
+	}) {
+		t.Fatalf("worker-hold never observed the send gate; output so far:\n%s", out.snapshot())
+	}
+	// A single snapshot taken right after the observed marker cannot
+	// reliably detect a gate that returns instantly instead of actually
+	// holding -- there is still a real race window before an
+	// already-in-flight send. Polling repeatedly across a bounded,
+	// generous negative window proves the gate actually held.
+	const negativeWindow = 2 * time.Second
+	const negativePoll = 50 * time.Millisecond
+	for deadline := time.Now().Add(negativeWindow); time.Now().Before(deadline); time.Sleep(negativePoll) {
+		if strings.Contains(out.snapshot(), "FIXTURE-HOLD-SENT") {
+			t.Fatalf("worker-hold sent its barrier question before the gate file was ever removed; output:\n%s", out.snapshot())
+		}
+	}
+
+	if err := os.Remove(gatePath); err != nil {
+		t.Fatalf("remove send gate control file: %v", err)
+	}
+	if !waitUntil(func() bool { return strings.Contains(out.snapshot(), "FIXTURE-HOLD-SENT") }) {
+		t.Fatalf("worker-hold never sent its barrier question after the gate file was removed; output so far:\n%s", out.snapshot())
+	}
+	if err := wait(); err != nil {
+		t.Fatalf("worker-hold did not exit cleanly after FIXTURE-QUIT: %v; output:\n%s", err, out.snapshot())
 	}
 }
 

@@ -43,15 +43,16 @@ func waitForManagerObservation(t *testing.T, path, incarnationID string) workerO
 // guard — never a raw signal to an observed pid.
 //
 // A single worker-hold task keeps its worker blocked at a barrier for the
-// whole window. Task t1 reaching "active" only proves the controller
-// assigned it, not that the worker has since implemented and sent its
-// barrier question — a race a fast worker could in principle win — so the
-// scenario ENFORCES the ordering it depends on with a bounded, immediate
-// check right before the kill (no question from this worker has been
-// relayed yet) rather than assuming it, and attributes both the relay and
-// the answer forward to the relaunched manager's own session id directly
-// from the message rows: "a manager did its job" is not the claim here,
-// "the RELAUNCHED manager did its job" is.
+// whole window, held back from sending its own barrier question at all
+// until this scenario removes the fixture's worker-hold send gate — a
+// file created before the run ever starts, so the worker cannot reach the
+// send ahead of it. The ordering the "one live duty" proof below depends
+// on is therefore structural, not a race against how fast the worker
+// happens to run: the gate comes down only after both kills and the
+// manager's own cold relaunch, and both the relay and the answer forward
+// are attributed to the relaunched manager's own session id directly from
+// the message rows — "a manager did its job" is not the claim here, "the
+// RELAUNCHED manager did its job" is.
 func TestRealProcessManagerColdRelaunch(t *testing.T) {
 	artifacts := newArtifactDir(t)
 	server := prepareServer(t, artifacts)
@@ -60,6 +61,16 @@ func TestRealProcessManagerColdRelaunch(t *testing.T) {
 	server.start(t)
 
 	scratchDir := artifacts.dir(t, "fixture-scratch")
+	// Holds t1's worker back from sending its own barrier question until
+	// this file is removed (fixtureworker_test.go's worker-hold send
+	// gate), created before the run even starts so the worker can never
+	// reach the send ahead of it: the ordering this scenario's own
+	// live-duty proof depends on is therefore structural, not a race
+	// against how fast the worker happens to run.
+	sendGatePath := filepath.Join(scratchDir, workerHoldSendGateControlFile)
+	if err := os.WriteFile(sendGatePath, []byte("FIXTURE-GATE\n"), 0o600); err != nil {
+		t.Fatalf("write worker-hold send gate control file: %v", err)
+	}
 	repo := newFeatureFixtureRepo(t, artifacts, server, "repo", featureFixtureOptions{
 		ScratchDir: scratchDir, ReviewerBehavior: "reviewer-approve",
 		MaxWorkers: 1, RetryLimit: 3, MessageWaitTimeout: "3s", MessageAttentionAfter: "30s",
@@ -106,14 +117,12 @@ func TestRealProcessManagerColdRelaunch(t *testing.T) {
 		t.Fatalf("plan_closed_at is empty before the kill; the manager never closed its plan")
 	}
 
-	// t1 reaching "active" only proves the controller assigned it; it says
-	// nothing about whether the worker has since implemented and sent its
-	// own barrier question. Enforce the ordering the "one live duty" proof
-	// below depends on, rather than assuming it: a bounded, immediate check
-	// that no question from this worker has been relayed to the human yet.
-	// If the worker ever wins that race, this fails loudly, naming exactly
-	// what happened, instead of silently letting the ORIGINAL manager
-	// perform the relay and proving nothing about the relaunched one.
+	// The send gate above already makes it structurally impossible for the
+	// worker to have sent its own barrier question yet; this is the cheap
+	// invariant check confirming that, naming exactly what happened if it
+	// were ever otherwise rather than silently letting the ORIGINAL
+	// manager perform the relay and proving nothing about the relaunched
+	// one.
 	if got := fx.scalar(t, fmt.Sprintf(
 		"SELECT count(*) FROM messages h JOIN messages orig ON h.relayed_from = orig.id WHERE h.run_id = '%s' AND h.recipient_address = 'human' AND orig.sender_session_id = '%s';",
 		fx.runID, worker1SessionID)); got != "0" {
@@ -253,18 +262,26 @@ func TestRealProcessManagerColdRelaunch(t *testing.T) {
 		t.Errorf("relaunched manager claim argv digest = %s, want %s for %q — the claim's argv must be exactly `<claude> --resume <native-ref> <continuation prompt>`", newClaimDigest, got, wantArgv)
 	}
 
+	// Only now — after both kills and the manager's own cold relaunch —
+	// does the worker's send gate come down, so its barrier question is
+	// sent into a world where the relaunched manager is the only live
+	// one.
+	if err := os.Remove(sendGatePath); err != nil {
+		t.Fatalf("remove worker-hold send gate control file: %v", err)
+	}
+
 	// The relaunched manager resumes its section 7 duties: it relays the
-	// worker's own barrier question — proven still pending at kill time by
-	// the precondition check above, since the manager was killed before
-	// the worker ever reached its barrier — to the human, and, once
-	// answered, forwards the answer back so the worker releases and
-	// submits. Both acts are attributed to newManagerSessionID directly
-	// from the message rows, not merely inferred from the run completing:
-	// a manager that comes back mute would leave the relayed question,
-	// and therefore the whole run, stuck here forever, failing this wait
-	// rather than any later one, and a run that somehow completed without
-	// the relaunched manager's own hand in it would fail these two
-	// identity checks instead of passing for the wrong reason.
+	// worker's own barrier question — sent only after the gate above came
+	// down, so the ORIGINAL manager never had a chance to see it — to the
+	// human, and, once answered, forwards the answer back so the worker
+	// releases and submits. Both acts are attributed to newManagerSessionID
+	// directly from the message rows, not merely inferred from the run
+	// completing: a manager that comes back mute would leave the relayed
+	// question, and therefore the whole run, stuck here forever, failing
+	// this wait rather than any later one, and a run that somehow
+	// completed without the relaunched manager's own hand in it would
+	// fail these two identity checks instead of passing for the wrong
+	// reason.
 	fx.requireTaskStateNeverReconciling(t, t1, "active", "checking", "completed", "integrating", "integrated")
 	question := fx.relayedQuestionFor(t, worker1SessionID)
 	if got := fx.messageBodyContent(t, question); got != fixtureHoldMarker+"\n" {

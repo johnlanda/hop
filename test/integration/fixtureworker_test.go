@@ -1073,6 +1073,7 @@ func runWorker() {
 		drainMailbox(hopPath)
 		submitOnce(hopPath, oid, "fixture implementer result (conflict "+env["HOP_TASK_ID"]+")", "")
 	case "worker-hold":
+		waitForWorkerHoldSendGateCleared(scratchDir)
 		oid := commitChange("fixture implementer change (held)")
 		questionPath := filepath.Join(scratchDir, "hold-question-"+env["HOP_ATTEMPT_ID"]+".txt")
 		atomicWriteFile(questionPath, fixtureHoldMarker+"\n")
@@ -1734,6 +1735,40 @@ func postForwardBarrierEnabled(scratchDir string) bool {
 	}
 	_, err := os.Stat(filepath.Join(scratchDir, postForwardBarrierControlFile))
 	return err == nil
+}
+
+// workerHoldSendGateControlFile is the fixed name of the opt-in gate file
+// a test creates under a worker-hold attempt's own scratch directory
+// BEFORE starting the run: absent (every existing scenario), worker-hold
+// sends its barrier question immediately, exactly as it always has;
+// present, it blocks until the file is REMOVED, then proceeds — a
+// structural way to hold a worker-hold attempt back from sending its own
+// question until some other event has already happened, rather than
+// racing it.
+const workerHoldSendGateControlFile = "worker-hold-send-gate"
+
+// workerHoldSendGateObservedFile is where the gate dumps its own
+// observation the instant it starts blocking (empty when the gate was
+// never enabled, since the check below returns before writing it), so a
+// test can wait for this file rather than guessing when the block took
+// effect.
+const workerHoldSendGateObservedFile = "worker-hold-send-gate-observed.txt"
+
+// waitForWorkerHoldSendGateCleared blocks until workerHoldSendGateControlFile
+// no longer exists under scratchDir, returning immediately if it was
+// never created.
+func waitForWorkerHoldSendGateCleared(scratchDir string) {
+	path := filepath.Join(scratchDir, workerHoldSendGateControlFile)
+	if _, err := os.Stat(path); err != nil {
+		return
+	}
+	writeContentDigest(filepath.Join(scratchDir, workerHoldSendGateObservedFile), "worker-hold-send-gate", "blocked")
+	for {
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			return
+		}
+		time.Sleep(selfKillPollInterval)
+	}
 }
 
 // handleManagerMessage dispatches one delivered message per the section 7
