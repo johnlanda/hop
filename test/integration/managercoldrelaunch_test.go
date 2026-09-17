@@ -43,12 +43,15 @@ func waitForManagerObservation(t *testing.T, path, incarnationID string) workerO
 // guard — never a raw signal to an observed pid.
 //
 // A single worker-hold task keeps its worker blocked at a barrier for the
-// whole window: task t1 reaches "active" (and therefore its attempt,
-// session and worktree intent are already committed) before the worker
-// process itself has done anything else, so killing the manager at that
-// point guarantees the worker's own barrier question is still unsent —
-// the relaunched manager, not the killed one, is what relays it and later
-// forwards the human's answer back.
+// whole window. Task t1 reaching "active" only proves the controller
+// assigned it, not that the worker has since implemented and sent its
+// barrier question — a race a fast worker could in principle win — so the
+// scenario ENFORCES the ordering it depends on with a bounded, immediate
+// check right before the kill (no question from this worker has been
+// relayed yet) rather than assuming it, and attributes both the relay and
+// the answer forward to the relaunched manager's own session id directly
+// from the message rows: "a manager did its job" is not the claim here,
+// "the RELAUNCHED manager did its job" is.
 func TestRealProcessManagerColdRelaunch(t *testing.T) {
 	artifacts := newArtifactDir(t)
 	server := prepareServer(t, artifacts)
@@ -93,6 +96,20 @@ func TestRealProcessManagerColdRelaunch(t *testing.T) {
 	beforePlanClosedAt := fx.scalar(t, fmt.Sprintf("SELECT plan_closed_at FROM runs WHERE id = '%s';", fx.runID))
 	if beforePlanClosedAt == "" {
 		t.Fatalf("plan_closed_at is empty before the kill; the manager never closed its plan")
+	}
+
+	// t1 reaching "active" only proves the controller assigned it; it says
+	// nothing about whether the worker has since implemented and sent its
+	// own barrier question. Enforce the ordering the "one live duty" proof
+	// below depends on, rather than assuming it: a bounded, immediate check
+	// that no question from this worker has been relayed to the human yet.
+	// If the worker ever wins that race, this fails loudly, naming exactly
+	// what happened, instead of silently letting the ORIGINAL manager
+	// perform the relay and proving nothing about the relaunched one.
+	if got := fx.scalar(t, fmt.Sprintf(
+		"SELECT count(*) FROM messages h JOIN messages orig ON h.relayed_from = orig.id WHERE h.run_id = '%s' AND h.recipient_address = 'human' AND orig.sender_session_id = '%s';",
+		fx.runID, worker1SessionID)); got != "0" {
+		t.Fatalf("worker session %s already had its barrier question relayed (%s relayed rows) before the manager was killed; the kill landed too late for this scenario's own live-duty proof to mean anything — tighten the timing rather than relaxing the assertion", worker1SessionID, got)
 	}
 
 	// The manager dies by its own hand through the fixture's self-kill
@@ -229,18 +246,41 @@ func TestRealProcessManagerColdRelaunch(t *testing.T) {
 	}
 
 	// The relaunched manager resumes its section 7 duties: it relays the
-	// worker's own barrier question — still pending, since the manager
-	// was killed before the worker ever reached its barrier — to the
-	// human, and, once answered, forwards the answer back so the worker
-	// releases and submits. A manager that comes back mute would leave
-	// the relayed question, and therefore the whole run, stuck here
-	// forever, failing this wait rather than any later one.
+	// worker's own barrier question — proven still pending at kill time by
+	// the precondition check above, since the manager was killed before
+	// the worker ever reached its barrier — to the human, and, once
+	// answered, forwards the answer back so the worker releases and
+	// submits. Both acts are attributed to newManagerSessionID directly
+	// from the message rows, not merely inferred from the run completing:
+	// a manager that comes back mute would leave the relayed question,
+	// and therefore the whole run, stuck here forever, failing this wait
+	// rather than any later one, and a run that somehow completed without
+	// the relaunched manager's own hand in it would fail these two
+	// identity checks instead of passing for the wrong reason.
 	fx.requireTaskStateNeverReconciling(t, t1, "active", "checking", "completed", "integrating", "integrated")
 	question := fx.relayedQuestionFor(t, worker1SessionID)
 	if got := fx.messageBodyContent(t, question); got != fixtureHoldMarker+"\n" {
 		t.Errorf("relayed question %s body = %q, want the barrier marker unchanged", question, got)
 	}
+	if got := fx.scalar(t, fmt.Sprintf("SELECT sender_session_id FROM messages WHERE id = '%s';", question)); got != newManagerSessionID {
+		t.Errorf("relayed question %s sender_session_id = %s, want the relaunched manager session %s (the ORIGINAL manager was already dead by the precondition check above)", question, got, newManagerSessionID)
+	}
+	workerQuestionID := fx.scalar(t, fmt.Sprintf("SELECT relayed_from FROM messages WHERE id = '%s';", question))
+	if workerQuestionID == "" {
+		t.Fatalf("relayed question %s carries no relayed_from back to the worker's own original question", question)
+	}
 	fx.answerHuman(t, question, "released")
+
+	var forwardID string
+	if !waitUntil(func() bool {
+		forwardID = fx.scalar(t, fmt.Sprintf("SELECT id FROM messages WHERE kind = 'answer' AND reply_to = '%s';", workerQuestionID))
+		return forwardID != ""
+	}) {
+		t.Fatalf("no answer ever forwarded to the worker's own barrier question %s", workerQuestionID)
+	}
+	if got := fx.scalar(t, fmt.Sprintf("SELECT sender_session_id FROM messages WHERE id = '%s';", forwardID)); got != newManagerSessionID {
+		t.Errorf("forwarded answer %s sender_session_id = %s, want the relaunched manager session %s", forwardID, got, newManagerSessionID)
+	}
 
 	fx.requireTaskStateNeverReconciling(t, t1, "completed", "integrating", "integrated")
 	fx.requireIntegrationState(t, t1, "integrated")
