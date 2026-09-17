@@ -2462,6 +2462,10 @@ func TestFixtureWorkerSelfKillOnControlFile(t *testing.T) {
 	// 30s deadline masking a self-kill that never happened (a bare
 	// non-zero-exit or even a confirmed-SIGKILL check alone cannot tell
 	// the two apart, since exec.CommandContext kills the process the
-	// identical way once its context is done).
-	requireSelfKilled(t, ctx.Err(), wait())
+	// identical way once its context is done). wait() is called FIRST, on
+	// its own line: Go evaluates call arguments left to right, so
+	// inlining ctx.Err() as an argument would read it BEFORE wait() ever
+	// blocks, defeating the entire check.
+	finalWaitErr := wait()
+	requireSelfKilled(t, ctx.Err(), finalWaitErr)
 }

@@ -1992,7 +1992,11 @@ func testFixtureWorkerFetchCrashBlocksBeforeAck(t *testing.T) {
 	// P3-1 (the finding's own executed case, m1): ctx.Err() == nil proves
 	// this SIGKILL is the fixture's own self-kill channel firing, never
 	// the context's 30s deadline masking a self-kill that never happened.
-	requireSelfKilled(t, ctx.Err(), wait())
+	// wait() is called FIRST, on its own line: Go evaluates call
+	// arguments left to right, so inlining ctx.Err() as an argument would
+	// read it BEFORE wait() ever blocks, defeating the entire check.
+	finalWaitErr := wait()
+	requireSelfKilled(t, ctx.Err(), finalWaitErr)
 
 	log := readFakeHopLog(t, logPath)
 	if strings.Contains(log, "msg\tack\t"+msgID) {
