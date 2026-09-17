@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -265,16 +266,23 @@ func TestRealProcessControllerReconnectNoSecondClaimant(t *testing.T) {
 	// internal/adapters/sqlite/statestore.go's AcquireLease wraps
 	// app.ErrLeaseHeld with the run id, the CURRENT holder's controller id
 	// and the lease's expiry timestamp before cmd/hop's runResumeFeature
-	// prints it verbatim; the holder id and expiry are dynamic (a fresh
-	// controller id per invocation, a computed TTL), so the exact grammar
-	// is pinned by its stable prefix (naming this run) and its wrapped-
-	// error suffix around them.
-	wantLoserPrefix := "hop resume: app: acquire lease: sqlite: run " + fx.runID + " lease is held by "
-	if !strings.Contains(loserStderr, wantLoserPrefix) {
-		t.Errorf("%s stderr = %q, want it to contain %q", loserName, loserStderr, wantLoserPrefix)
+	// prints it verbatim. The holder id is a fresh UUID d.newID() mints
+	// inside the WINNER's own process, invisible to this test until read
+	// back — so read run_leases.controller_id now (the winner holds it
+	// continuously since its own successful acquire, never reassigned
+	// while it stays alive) and require the loser's line to name EXACTLY
+	// that id: proof the loser actually observed the winner's own lease,
+	// not merely a shape that happens to look right. The expiry timestamp
+	// alone stays a wildcard.
+	winnerControllerID := fx.scalar(t, fmt.Sprintf("SELECT controller_id FROM run_leases WHERE run_id = '%s';", fx.runID))
+	if winnerControllerID == "" {
+		t.Fatalf("no run_leases row found for run %s after the race", fx.runID)
 	}
-	if !strings.Contains(loserStderr, ": app: lease is held") {
-		t.Errorf("%s stderr = %q, want it to end its wrapped chain with %q", loserName, loserStderr, ": app: lease is held")
+	wantLoserPattern := regexp.MustCompile(
+		`^hop resume: app: acquire lease: sqlite: run ` + regexp.QuoteMeta(fx.runID) +
+			` lease is held by "` + regexp.QuoteMeta(winnerControllerID) + `" until \S+: app: lease is held\n$`)
+	if !wantLoserPattern.MatchString(loserStderr) {
+		t.Errorf("%s stderr = %q, want it to match %s (the winner's own held-lease controller id %s)", loserName, loserStderr, wantLoserPattern, winnerControllerID)
 	}
 
 	// The winner warm-reattaches the manager and the held worker under the
