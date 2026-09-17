@@ -50,8 +50,8 @@ func TestRealProcessReviewerRejection(t *testing.T) {
 
 	brief := fixtureManagerBrief(scratchDir,
 		[]fixtureManagerTask{{Label: "t1", Title: "Implement t1", Behavior: "worker-implement"}},
-		nil,
-		"worker-implement",
+		[]fixtureManagerAnswer{{Match: fixtureHoldMarker, Action: "relay"}},
+		"worker-hold",
 	)
 	fx := startFeatureRun(t, artifacts, server, repo, scratchDir, brief)
 
@@ -85,9 +85,32 @@ func TestRealProcessReviewerRejection(t *testing.T) {
 		t.Errorf("hop status -run %s does not name the %q guard shortfall; stdout:\n%s", fx.runID, verdictRejectedShortfallToken, result.Stdout)
 	}
 
-	// The manager plans a fix task (seq 2, this run's second and only
-	// other implement task); its integration produces a new head.
-	fixTaskID := fx.requireTaskBySeq(t, 2)
+	// The manager plans a fix task. Task seq numbers are shared with
+	// review tasks (EnsureReviewTask mints maxSeq+1), so R1 itself is
+	// seq 2 — requireTaskBySeq(t, 2) would select R1, not the fix task.
+	// Select the fix task by KIND (implement) and identity: created
+	// after R1, and distinct from it.
+	fixTaskID := fx.requireImplementTaskAfter(t, r1)
+	if fixTaskID == r1 {
+		t.Fatalf("selected fix task %s is R1 itself", fixTaskID)
+	}
+	fx.requireTaskState(t, fixTaskID, "active")
+	fixAttemptID, _ := fx.currentAttempt(t, fixTaskID)
+	fixSessionID := fx.sessionForAttempt(t, fixAttemptID)
+
+	// Hold the fix worker at its own barrier while re-asserting the
+	// rejection/head facts — proving the guard genuinely still blocks
+	// completion at this exact point (the fix task not yet integrated),
+	// not merely "eventually" once everything has already settled.
+	fixQuestionID := fx.relayedQuestionFor(t, fixSessionID, featureRunTimeout)
+	if state := fx.runState(t); state == "completed" {
+		t.Fatal("run completed while the fix task's own worker is still held at its barrier")
+	}
+	if headNow := fx.integrationHead(t); headNow != headAfterT1 {
+		t.Errorf("integration head = %s before the fix task integrated, want it still %s", headNow, headAfterT1)
+	}
+	fx.answerHuman(t, fixQuestionID, "release the fix worker")
+
 	fx.requireTaskState(t, fixTaskID, "integrated")
 	headAfterFix := fx.integrationHead(t)
 	if headAfterFix == headAfterT1 {

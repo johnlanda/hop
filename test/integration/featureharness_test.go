@@ -575,6 +575,36 @@ func (f *featureRun) requireReviewTaskOtherThan(t *testing.T, excludeTaskID stri
 	return taskID
 }
 
+// requireImplementTaskAfter polls for an implement-kind task created
+// after afterTaskID's own row (by rowid, the store's own monotonic
+// insertion order), bounded by featureRunTimeout. Task seq numbers are
+// shared with review tasks (EnsureReviewTask mints maxSeq+1), so "the
+// next seq after a review task" can select a LATER review task instead
+// of the fix task a rejected verdict causes the manager to plan — this
+// selects by KIND and creation order instead, never by seq alone.
+func (f *featureRun) requireImplementTaskAfter(t *testing.T, afterTaskID string) string {
+	t.Helper()
+	afterRowID := f.scalar(t, fmt.Sprintf("SELECT rowid FROM tasks WHERE id = '%s';", afterTaskID))
+	if afterRowID == "" {
+		t.Fatalf("no task %s found to select a later implement task after", afterTaskID)
+	}
+	var taskID string
+	reached := waitUntilDeadline(featureRunTimeout, func() bool {
+		id := f.scalar(t, fmt.Sprintf(
+			"SELECT id FROM tasks WHERE run_id = '%s' AND kind = 'implement' AND rowid > %s ORDER BY rowid LIMIT 1;",
+			f.runID, afterRowID))
+		if id == "" {
+			return false
+		}
+		taskID = id
+		return true
+	})
+	if !reached {
+		t.Fatalf("no implement task created after task %s observed for run %s after %s", afterTaskID, f.runID, featureRunTimeout)
+	}
+	return taskID
+}
+
 // transitionCount counts recorded transitions for one entity between two
 // states, used to assert a guard row exists without over-specifying its
 // exact timestamp or generation.
