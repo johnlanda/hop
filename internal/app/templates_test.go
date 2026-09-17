@@ -185,6 +185,22 @@ func TestTemplatesQuoteGrammar(t *testing.T) {
 	if !strings.Contains(task, GrammarRefusalLine("<reason-token>")) {
 		t.Errorf("task assignment does not quote the refusal shape")
 	}
+	// The worker's exits, compared across the template's line wrapping:
+	// done after an accepted or duplicate result, stop on a stale line,
+	// and the result verb's own refusal lines.
+	for _, sentence := range []string{
+		"A first line of " + GrammarResultAcceptedLine("<result-uuid>") + " or " + GrammarResultDuplicateLine("<result-uuid>") +
+			" means your work is done: end your turn without polling for messages.",
+		"A first line of " + GrammarResultRefusalLine(GrammarReasonStale, "<detail>") + " (or " + GrammarRefusalLine(GrammarReasonStale) +
+			" from any hop verb) means this session is no longer current: stop, and do not retry.",
+		"Any other refusal prints " + GrammarResultRefusalLine(GrammarReasonConflicting, "<detail>") + " or " +
+			GrammarResultRefusalLine(GrammarReasonMalformed, "<detail>") + " as its first line, or " + GrammarRefusalLine("<reason-token>") +
+			" from the other hop verbs; read the detail before acting.",
+	} {
+		if !strings.Contains(oneLine(task), sentence) {
+			t.Errorf("task assignment does not state %q", sentence)
+		}
+	}
 
 	review := string(renderReviewAssignment(&reviewAssignmentFields{
 		RunID: "r", TaskID: "t", AttemptID: "a", TaskSeq: 2, AttemptNumber: 1,
@@ -193,13 +209,31 @@ func TestTemplatesQuoteGrammar(t *testing.T) {
 	}))
 	for _, quote := range []string{
 		"/hop " + GrammarVerbReviewSubmit + " --verdict <approve|reject> --subject headoid",
-		GrammarRefusalLine(GrammarReasonSubjectMismatch) + ". On that first line,\nresubmit with the subject commit this assignment names.",
+		GrammarRefusalLine(GrammarReasonSubjectMismatch),
 		"Diff scope: baseoid..headoid",
 	} {
 		if !strings.Contains(review, quote) {
 			t.Errorf("review assignment does not quote %q", quote)
 		}
 	}
+	for _, sentence := range []string{
+		"refused with " + GrammarRefusalLine(GrammarReasonSubjectMismatch) +
+			". On that first line, resubmit with the subject commit this assignment names.",
+		"A first line of " + GrammarVerdictAcceptedLine("<review-uuid>") + " or " + GrammarVerdictDuplicateLine("<review-uuid>") +
+			" means your review is done: end your turn without polling for messages.",
+		"A first line of " + GrammarRefusalLine(GrammarReasonStale) + " or " + GrammarRefusalLine(GrammarReasonNotReviewer) +
+			" means this session is no longer this review's current session: stop, and do not retry.",
+	} {
+		if !strings.Contains(oneLine(review), sentence) {
+			t.Errorf("review assignment does not state %q", sentence)
+		}
+	}
+}
+
+// oneLine joins text's whitespace-separated words with single spaces, so a
+// sentence can be compared across a template's line wrapping.
+func oneLine(text string) string {
+	return strings.Join(strings.Fields(text), " ")
 }
 
 // TestPosixShellQuoteRoundTrips proves posixShellQuote's output, fed back

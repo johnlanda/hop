@@ -174,6 +174,18 @@ func GrammarResultAcceptedLine(resultID string) string { return "accepted " + re
 // GrammarResultDuplicateLine is the idempotent-resubmission line.
 func GrammarResultDuplicateLine(resultID string) string { return "duplicate " + resultID }
 
+// GrammarResultRefusalLine renders hop result submit's final non-success
+// first line: the outcome kind ("stale", "conflicting" or "malformed", each
+// spelled as its GrammarReason token), then ": " and the detail when there
+// is one. Unlike the other verbs' `refused: <token>` lines, the detail is
+// part of the first line.
+func GrammarResultRefusalLine(kind, detail string) string {
+	if detail == "" {
+		return kind
+	}
+	return kind + ": " + detail
+}
+
 // GrammarMessageLine renders hop msg next/wait's first line. replyTo,
 // relayOf and origin are optional ("" omits the field); origin appears on
 // an answer whose reply-to question carries relay provenance — the

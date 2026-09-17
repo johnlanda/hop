@@ -76,6 +76,8 @@ func TestGoldenGrammar(t *testing.T) {
 
 		{"result accepted", app.GrammarResultAcceptedLine(msgID), "accepted " + msgID},
 		{"result duplicate", app.GrammarResultDuplicateLine(msgID), "duplicate " + msgID},
+		{"result stale", app.GrammarResultRefusalLine(app.GrammarReasonStale, "incarnation is not current"), "stale: incarnation is not current"},
+		{"result refusal without detail", app.GrammarResultRefusalLine(app.GrammarReasonMalformed, ""), "malformed"},
 
 		{
 			"message line minimal",

@@ -289,12 +289,21 @@ here. When your work is complete and committed, submit it by running:
     %s result submit --summary "<one-line summary>" --commit <commit-oid>
 
 If that command prints a first line beginning with "transient", follow
-its instruction and run the exact same command again. Any other refusal
-prints refused: <reason-token> as its first line; read the detail lines
-before retrying.
+its instruction and run the exact same command again. A first line of
+%s or %s means your work is
+done: end your turn without polling for messages. A first line of
+%s (or %s from any hop verb) means this session
+is no longer current: stop, and do not retry. Any other refusal prints
+%s or %s as its first line, or
+%s from the other hop verbs; read the detail before
+acting.
 `,
 		f.RunID, f.TaskID, f.TaskSeq, f.AttemptID, f.AttemptNumber, f.Title,
-		f.AssignmentPath, f.InstructionsPath, f.RolePath, f.HOPPath)
+		f.AssignmentPath, f.InstructionsPath, f.RolePath, f.HOPPath,
+		GrammarResultAcceptedLine("<result-uuid>"), GrammarResultDuplicateLine("<result-uuid>"),
+		GrammarResultRefusalLine(GrammarReasonStale, "<detail>"), GrammarRefusalLine(GrammarReasonStale),
+		GrammarResultRefusalLine(GrammarReasonConflicting, "<detail>"), GrammarResultRefusalLine(GrammarReasonMalformed, "<detail>"),
+		GrammarRefusalLine("<reason-token>"))
 	if f.Prior != nil {
 		fmt.Fprintf(&b, "\n## Prior attempt %d (retry feedback)\n\n", f.Prior.Number)
 		if f.Prior.ResultCommitOID != "" {
@@ -348,8 +357,8 @@ Diff scope: %s..%s
 
 Your worktree is checked out at the subject commit. Review exactly this
 candidate: the completion guard compares object IDs, and a verdict for
-any other commit is refused with refused: %s. On that first line,
-resubmit with the subject commit this assignment names.
+any other commit is refused with refused: %s. On that
+first line, resubmit with the subject commit this assignment names.
 
 ## Instructions
 
@@ -363,12 +372,19 @@ Write your reasons to a file, then submit your verdict by running:
     %s review submit --verdict <approve|reject> --subject %s --reasons-file <absolute path>
 
 If that command prints a first line beginning with "transient", follow
-its instruction and run the exact same command again.
+its instruction and run the exact same command again. A first line of
+%s or %s means your
+review is done: end your turn without polling for messages. A first
+line of %s or %s means this
+session is no longer this review's current session: stop, and do not
+retry.
 `,
 		f.RunID, f.TaskID, f.TaskSeq, f.AttemptID, f.AttemptNumber,
 		f.SubjectCommitOID, f.SubjectTreeOID, f.DiffBaseOID, f.SubjectCommitOID,
 		GrammarReasonSubjectMismatch,
-		f.AssignmentPath, f.RolePath, f.HOPPath, f.SubjectCommitOID)
+		f.AssignmentPath, f.RolePath, f.HOPPath, f.SubjectCommitOID,
+		GrammarVerdictAcceptedLine("<review-uuid>"), GrammarVerdictDuplicateLine("<review-uuid>"),
+		GrammarRefusalLine(GrammarReasonStale), GrammarRefusalLine(GrammarReasonNotReviewer))
 }
 
 // WorkflowFreezeRequest is FreezeWorkflowArtifacts's input: the loaded

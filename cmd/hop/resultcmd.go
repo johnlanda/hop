@@ -136,7 +136,7 @@ func runResultSubmit(args []string, stdout, stderr io.Writer, d *deps) (int, err
 // store's own Detail, which is diagnostic evidence the caller prints
 // separately to stderr; ok is false for a transient outcome with no known
 // reason. Accepted and duplicate name the result id; every other outcome
-// embeds its own Detail directly in the line.
+// is app.GrammarResultRefusalLine, its own Detail embedded in the line.
 func submissionLine(result *app.SubmitResultResult) (line string, ok bool) {
 	switch result.Kind {
 	case string(app.SubmissionTransient):
@@ -144,9 +144,6 @@ func submissionLine(result *app.SubmitResultResult) (line string, ok bool) {
 	case string(app.SubmissionAccepted), string(app.SubmissionDuplicate):
 		return result.Kind + " " + result.ResultID, true
 	default:
-		if result.Detail != "" {
-			return result.Kind + ": " + result.Detail, true
-		}
-		return result.Kind, true
+		return app.GrammarResultRefusalLine(result.Kind, result.Detail), true
 	}
 }
