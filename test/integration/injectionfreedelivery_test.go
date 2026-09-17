@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -324,12 +325,18 @@ func TestRealProcessInjectionFreeDelivery(t *testing.T) {
 
 	// S11's own finding: a request-log line never carries the pane/agent
 	// target or any request parameter, so the control is located by
-	// method + outcome alone -- unique here since production never calls
-	// pane.send_text at all and this test issues it exactly once.
-	controlLine := requireLine(t, lines, startIdx, endIdx, `method="pane.send_text"`, `event="api.request.complete"`)
-	t.Logf("positive control located: %s", controlLine)
+	// method + event alone -- unique here since production never calls
+	// pane.send_text at all and this test issues it exactly once. Both its
+	// start and complete records are located and excluded from the scan
+	// below BY INDEX, never by string equality (two distinct lines in the
+	// window can be byte-identical, e.g. two requests logged in the same
+	// millisecond against the same method).
+	controlStartIdx := requireLineIndex(t, lines, startIdx, endIdx, `method="pane.send_text"`, `event="api.request.start"`)
+	controlCompleteIdx := requireLineIndex(t, lines, startIdx, endIdx, `method="pane.send_text"`, `event="api.request.complete"`)
+	t.Logf("positive control located: start=%s complete=%s", lines[controlStartIdx], lines[controlCompleteIdx])
 
-	requireNoUnexpectedTerminalInputRequests(t, lines, startIdx, endIdx, controlLine)
+	requireNoUnexpectedTerminalInputRequests(t, lines, startIdx, endIdx, controlStartIdx, controlCompleteIdx)
+	requireEveryRequestPaired(t, lines, startIdx, endIdx)
 }
 
 // messageDeliveredToSession reports whether a delivery row exists for
@@ -341,18 +348,26 @@ func messageDeliveredToSession(t *testing.T, fx *featureRun, messageID, sessionI
 }
 
 // requireNoUnexpectedTerminalInputRequests asserts that within
-// lines[startIdx+1:endIdx] no api.request.complete or api.request.fail
-// entry exists for any of injectionTerminalInputMethods, other than
-// controlLine itself.
-func requireNoUnexpectedTerminalInputRequests(t *testing.T, lines []string, startIdx, endIdx int, controlLine string) {
+// lines[startIdx+1:endIdx] no api.request.start, api.request.complete or
+// api.request.fail entry exists for any of terminalInputMethods, other than
+// the two identified positive-control lines (excluded BY INDEX, never by
+// string equality). Scanning "start" as well as "complete"/"fail" is load
+// bearing (P1-1): a forbidden wait-mode agent.prompt call can leave only a
+// start record in the window (its completion lands only when the wait
+// resolves, possibly long after the window closes, or never on some error
+// paths) -- a completion-only scan would miss exactly that regression.
+func requireNoUnexpectedTerminalInputRequests(t *testing.T, lines []string, startIdx, endIdx, controlStartIdx, controlCompleteIdx int) {
 	t.Helper()
 	var violations []string
 	for i := startIdx + 1; i < endIdx; i++ {
-		line := lines[i]
-		if line == controlLine {
+		if i == controlStartIdx || i == controlCompleteIdx {
 			continue
 		}
-		if !strings.Contains(line, `event="api.request.complete"`) && !strings.Contains(line, `event="api.request.fail"`) {
+		line := lines[i]
+		isRequestEvent := strings.Contains(line, `event="api.request.start"`) ||
+			strings.Contains(line, `event="api.request.complete"`) ||
+			strings.Contains(line, `event="api.request.fail"`)
+		if !isRequestEvent {
 			continue
 		}
 		for _, m := range terminalInputMethods() {
@@ -362,7 +377,68 @@ func requireNoUnexpectedTerminalInputRequests(t *testing.T, lines []string, star
 		}
 	}
 	if len(violations) > 0 {
-		t.Fatalf("herdr-server.log records %d unexpected terminal-input request completion(s)/failure(s) other than the identified positive control:\n%s",
+		t.Fatalf("herdr-server.log records %d unexpected terminal-input request start/completion/failure(s) other than the identified positive control:\n%s",
 			len(violations), strings.Join(violations, "\n"))
+	}
+}
+
+// apiLogEventPattern, apiLogMethodPattern and apiLogRequestIDPattern extract
+// one herdr-server.log request-log line's event/method/request_id fields
+// (S11's plain-text format: space-separated key="value" fields, order not
+// guaranteed).
+var (
+	apiLogEventPattern     = regexp.MustCompile(`event="([^"]*)"`)
+	apiLogMethodPattern    = regexp.MustCompile(`method="([^"]*)"`)
+	apiLogRequestIDPattern = regexp.MustCompile(`request_id="([^"]*)"`)
+)
+
+// apiLogLineFields returns one request-log line's event, method and
+// request_id fields, and false if any of the three is absent (a line this
+// scenario does not need to correlate, e.g. a non-request log line).
+func apiLogLineFields(line string) (event, method, requestID string, ok bool) {
+	em := apiLogEventPattern.FindStringSubmatch(line)
+	mm := apiLogMethodPattern.FindStringSubmatch(line)
+	rm := apiLogRequestIDPattern.FindStringSubmatch(line)
+	if em == nil || mm == nil || rm == nil {
+		return "", "", "", false
+	}
+	return em[1], mm[1], rm[1], true
+}
+
+// requireEveryRequestPaired asserts that every api.request.start line
+// within lines[startIdx+1:endIdx] has a matching api.request.complete or
+// api.request.fail line (same method and request_id) later in the window.
+// This is a capture-integrity check, independent of the six-method scan
+// above: a dropped or truncated completion (a log rotation mid-run, S11's
+// 5 MiB/retained=0 limit) would otherwise leave a forbidden call's start
+// record silently unpaired without failing loudly, and would make the
+// window-scoped zero-violation count above less trustworthy. Pairing is
+// counted per (method, request_id) key rather than matched line-for-line,
+// since request_id is a per-connection counter (S11): two DIFFERENT
+// connections can log the same id for the same method, but the counts
+// still balance per key as long as every start eventually resolves.
+func requireEveryRequestPaired(t *testing.T, lines []string, startIdx, endIdx int) {
+	t.Helper()
+	type reqKey struct{ method, requestID string }
+	unpaired := map[reqKey]int{}
+	for i := startIdx + 1; i < endIdx; i++ {
+		event, method, requestID, ok := apiLogLineFields(lines[i])
+		if !ok {
+			continue
+		}
+		key := reqKey{method, requestID}
+		switch event {
+		case "api.request.start":
+			unpaired[key]++
+		case "api.request.complete", "api.request.fail":
+			if unpaired[key] > 0 {
+				unpaired[key]--
+			}
+		}
+	}
+	for key, count := range unpaired {
+		if count > 0 {
+			t.Errorf("herdr-server.log has %d api.request.start line(s) for method=%q request_id=%q with no paired completion or failure before the end bracket", count, key.method, key.requestID)
+		}
 	}
 }
