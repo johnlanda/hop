@@ -1955,6 +1955,18 @@ harness ends right after exec
 dying before settlement is proved by the app tables now and joins the
 fixture-principal scenarios later.
 
+A placed-but-uncorroborated child launch across a controller kill
+(`ChildLaunchInFlightAcrossResume`, LAUNCH-5) is deferred as a real-
+process scenario for the same reason: no fixture-only barrier holds that
+window (the pane's command is the controller's own executable, resolved
+by `os.Executable` at launch time — `cmd/hop/runcmd.go`'s
+`hopExecutablePath` — so no test-owned gated launcher can be substituted
+for it), and the controller's own corroboration step can settle the
+claim within the same scheduling pass that placed it, closing the window
+before an external observer could react. The rule is covered by the app
+tables for resume's in-flight rule (`TestResumeFeatureChildLaunchInFlight`
+and its siblings).
+
 ## 12. Work breakdown
 
 Ordered implementer tasks; each lands with its guides and tests, and each
