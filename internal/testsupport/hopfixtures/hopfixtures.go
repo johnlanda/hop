@@ -835,7 +835,7 @@ func InitializeFeature(ctx context.Context, store Store, stateRoot, repositoryRo
 // succeeded). The manager's launcher can then claim (SeedLaunchClaim,
 // with no attempt), leaving the claim exec_pending and the run launching
 // until SettleManagerLaunch.
-func LaunchManager(ctx context.Context, store Store, lease app.Lease, f FeatureBase, now time.Time) error { //nolint:gocritic // hugeParam: FeatureBase is a small fixture-identity value read once per call, never a hot loop.
+func LaunchManager(ctx context.Context, store Store, lease app.Lease, f FeatureBase, now time.Time) error {
 	opID := identity.OperationID(derivedUID(f.ManagerID + "-manager-pane-open"))
 	label := opID.String()
 	if err := withUOW(ctx, store, lease, func(uow app.UnitOfWork) error {
@@ -890,7 +890,7 @@ func LaunchManager(ctx context.Context, store Store, lease app.Lease, f FeatureB
 // the incarnation as its argv marker, that evidence observed on the
 // manager's binding, and the manager session launching -> active. Call it
 // after LaunchManager and the manager's SeedLaunchClaim with the same pid.
-func SettleManagerLaunch(ctx context.Context, store Store, lease app.Lease, f FeatureBase, pid int, now time.Time) error { //nolint:gocritic // hugeParam: FeatureBase is a small fixture-identity value read once per call, never a hot loop.
+func SettleManagerLaunch(ctx context.Context, store Store, lease app.Lease, f FeatureBase, pid int, now time.Time) error {
 	return withUOW(ctx, store, lease, func(uow app.UnitOfWork) error {
 		if err := markRunRunning(ctx, uow, f.RunID, now); err != nil {
 			return err
