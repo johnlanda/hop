@@ -137,6 +137,7 @@ func TestRealProcessReviewerRejection(t *testing.T) {
 		t.Fatalf("hop status -run %s exit=%d stdout=%q stderr=%q", fx.runID, result.ExitCode, result.Stdout, result.Stderr)
 	}
 	rejected := parseVerdictRejectedLine(t, result.Stdout)
+	t.Logf("hop status -run %s observed shortfall: verdict-rejected review=%s subject=%s reasons=%s", fx.runID, rejected.reviewID, rejected.subjectCommitOID, rejected.reasonsPath)
 	wantReviewID := fx.scalar(t, fmt.Sprintf("SELECT id FROM reviews WHERE task_id = '%s';", r1))
 	if rejected.reviewID != wantReviewID {
 		t.Errorf("verdict-rejected shortfall names review %s, want %s (R1's own accepted review row)", rejected.reviewID, wantReviewID)
