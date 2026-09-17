@@ -92,7 +92,10 @@ func openGatedPane(t *testing.T, runtime *herdr.Runtime, server *testServer, gat
 	if pgid, pgErr := syscall.Getpgid(pane.PID); pgErr != nil || pgid != pane.PID {
 		t.Errorf("getpgid(%d) = %d, %v; want the command leading its own process group", pane.PID, pgid, pgErr)
 	}
-	if sid, sidErr := syscall.Getsid(pane.PID); sidErr != nil || sid != pane.PID {
+	switch sid, readable, sidErr := processSessionID(pane.PID); {
+	case !readable:
+		t.Logf("session-leader check skipped: %s", sessionIDUnavailable)
+	case sidErr != nil || sid != pane.PID:
 		t.Errorf("getsid(%d) = %d, %v; want the command to be a session leader", pane.PID, sid, sidErr)
 	}
 	// The pane's own process reports exactly the argv layout.apply ran it
