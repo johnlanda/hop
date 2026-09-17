@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -46,6 +47,24 @@ func TestRunStatusListing(t *testing.T) {
 		}
 		if !strings.Contains(out, "r3 33333333-3333-4333-8333-333333333333 stopping (stop requested, reconciling)\n") {
 			t.Errorf("output lacks the condition markers:\n%s", out)
+		}
+	})
+
+	t.Run("a run needing attention carries the blocked marker", func(t *testing.T) {
+		attentionCtrl := &fakeController{status: func(app.StatusRequest) (app.StatusResult, error) {
+			return app.StatusResult{Runs: []app.RunSummaryView{
+				{RunID: testRunID, Sequence: 1, State: "running", NeedsAttention: true},
+			}}, nil
+		}}
+		td := newTestDeps(attentionCtrl, statusEnv(), t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		if _, err := runStatus(nil, &stdout, &stderr, td.deps); err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+
+		if !strings.Contains(stdout.String(), "r1 "+testRunID+" running (blocked, needs attention)\n") {
+			t.Errorf("output lacks the attention marker:\n%s", stdout.String())
 		}
 	})
 
@@ -314,4 +333,432 @@ func TestRunStatusDetail(t *testing.T) {
 			t.Errorf("code = %d, stderr = %q", code, stderr.String())
 		}
 	})
+}
+
+// TestRunStatusFeatureDetailBlock pins every section 10 feature-mode
+// detail line renderRunDetail renders: the task table (with dependencies,
+// attempt count and worktree), the latest integration, guard shortfalls
+// (one naming a task, one — verdict-rejected — naming a review's own id,
+// subject and reasons path instead, per Astra F3), the
+// section 7 per-mailbox attention lines (in-flight-only, queued-only, a
+// task and a human address, attention with a known live-session binding,
+// attention with a live address but no known binding, and one mailbox
+// with Attention false — no action line for it), a pending human
+// question with its exact hop answer invocation, and the per-session
+// roles/bindings listing (manager, implementer, terminated reviewer).
+func TestRunStatusFeatureDetailBlock(t *testing.T) {
+	const (
+		t1ID          = "10000000-0000-4000-8000-000000000001"
+		t2ID          = "20000000-0000-4000-8000-000000000002"
+		t3ID          = "30000000-0000-4000-8000-000000000003"
+		integID       = "40000000-0000-4000-8000-000000000004"
+		inFlightID    = "50000000-0000-4000-8000-000000000005"
+		questionID    = "60000000-0000-4000-8000-000000000006"
+		mgrSessionID  = "70000000-0000-4000-8000-000000000007"
+		implSessionID = "80000000-0000-4000-8000-000000000008"
+		revSessionID  = "90000000-0000-4000-8000-000000000009"
+		rejectedID    = "a0000000-0000-4000-8000-00000000000a"
+	)
+	detail := &app.RunDetailView{
+		RunSummaryView: app.RunSummaryView{RunID: testRunID, Sequence: 1, State: "running"},
+		Mode:           "feature",
+		Tasks: []app.TaskSummaryView{
+			{TaskID: t1ID, Seq: 1, Kind: "implement", State: "integrated", AttemptCount: 1},
+			{TaskID: t2ID, Seq: 2, Kind: "implement", State: "active", DependsOn: []string{t1ID}, AttemptCount: 1, WorktreePath: "/worktrees/r1/t2a1"},
+			{TaskID: t3ID, Seq: 3, Kind: "review", State: "completed", AttemptCount: 1, WorktreePath: "/worktrees/r1/t3a1"},
+		},
+		LatestIntegration: &app.IntegrationView{
+			ID: integID, TaskID: t1ID, SourceCommitOID: "src1", PremergeHeadOID: "pre1", MergeCommitOID: "merge1", State: "integrated",
+		},
+		GuardShortfalls: []app.GuardShortfallView{
+			{Kind: "task-not-integrated", TaskID: t2ID},
+			{Kind: "verdict-rejected", ReviewID: rejectedID, SubjectCommitOID: "rejectedhead", ReasonsPath: "/state/runs/r1/reviews/" + rejectedID},
+		},
+		Mailboxes: []app.MailboxView{
+			{Address: "task:" + t2ID, InFlightMessageID: inFlightID, InFlightAge: 5 * time.Minute, AddressLive: true, Attention: true},
+			{Address: "manager", QueuedCount: 1, OldestQueuedAge: 10 * time.Minute, AddressLive: true, Attention: true},
+			{Address: "human", QueuedCount: 2, OldestQueuedAge: 3 * time.Hour, AddressLive: true, Attention: true},
+			{Address: "task:" + t1ID, QueuedCount: 1, OldestQueuedAge: 20 * time.Minute, AddressLive: false, Attention: false},
+		},
+		PendingQuestions: []app.PendingQuestionView{
+			{MessageID: questionID, Age: 45 * time.Second, BodyPath: "/state/runs/r1/messages/q.md"},
+		},
+		Sessions: []app.SessionView{
+			{SessionID: mgrSessionID, Role: "manager", State: "active"},
+			{SessionID: implSessionID, Role: "implementer", State: "active", TaskID: t2ID, AttemptNumber: 1, BindingSummary: "ws2/tab2/pane2"},
+			{SessionID: revSessionID, Role: "reviewer", State: "terminated", TaskID: t3ID, AttemptNumber: 1},
+		},
+	}
+
+	var stdout bytes.Buffer
+	code, err := renderRunDetail(&stdout, detail)
+	if err != nil {
+		t.Fatalf("renderRunDetail() error = %v", err)
+	}
+	if code != exitOK {
+		t.Fatalf("exit code = %d", code)
+	}
+
+	// Whole-block comparison, not substring containment: a forged extra
+	// line (e.g. from an unescaped hostile path elsewhere in the detail)
+	// would slip past a Contains-only assertion but not an exact match.
+	want := strings.Join([]string{
+		"run r1 " + testRunID,
+		"  state:         running",
+		"  workflow:      feature",
+		"  target:        none (detached HEAD at freeze; worktrees are never retired automatically)",
+		"  worktrees:     kept (no target branch)",
+		"  task:          (none)",
+		"  attempt:       (none)",
+		"  binding:       (none)",
+		"  launch claim:  (none)",
+		"  trust seed:    (none)",
+		"  pending ops:   0",
+		"  last submit:   (none)",
+		"  task t1 " + t1ID + ": kind=implement state=integrated deps=(none) attempts=1 worktree=(none)",
+		"  task t2 " + t2ID + ": kind=implement state=active deps=t1 attempts=1 worktree=/worktrees/r1/t2a1",
+		"  task t3 " + t3ID + ": kind=review state=completed deps=(none) attempts=1 worktree=/worktrees/r1/t3a1",
+		"  integration " + integID + ": task=t1 state=integrated source=src1 premerge=pre1 merge=merge1",
+		"  shortfall: task-not-integrated t2 " + t2ID,
+		"  shortfall: verdict-rejected review=" + rejectedID + " subject=rejectedhead reasons=/state/runs/r1/reviews/" + rejectedID,
+		"  attention: messages pending for task:" + t2ID + " (t2): in-flight 5m0s (message " + inFlightID + ")",
+		"    action:      open ws2/tab2/pane2 and check that the agent is following its polling instructions",
+		"  attention: messages pending for manager: queued 1, oldest 10m0s",
+		"    action:      open that session's pane and check that the agent is following its polling instructions",
+		"  attention: messages pending for human: queued 2, oldest 3h0m0s",
+		"    action:      answer pending human questions with hop answer",
+		"  attention: messages pending for task:" + t1ID + " (t1): queued 1, oldest 20m0s",
+		"  question " + questionID + " age=45s body: /state/runs/r1/messages/q.md",
+		"    hop answer " + questionID + " --file <path>",
+		"  session " + mgrSessionID + ": role=manager state=active task=(none) attempt=0 binding=(none)",
+		"  session " + implSessionID + ": role=implementer state=active task=t2 attempt=1 binding=ws2/tab2/pane2",
+		"  session " + revSessionID + ": role=reviewer state=terminated task=t3 attempt=1 binding=(none)",
+		"",
+	}, "\n")
+	if out := stdout.String(); out != want {
+		t.Errorf("output =\n%s\nwant exactly\n%s", out, want)
+	}
+}
+
+// TestRunStatusFeatureDetailNeverForgesALine reproduces the Astra pass-1
+// repro exactly: a pending question is the ONLY populated field (no
+// GuardShortfalls at all), and its body path carries a raw ESC sequence
+// plus an embedded newline shaped like a fake shortfall line. Before the
+// F2 fix, this rendered the ESC byte raw and inserted a "shortfall:
+// verdict-rejected" line that GuardShortfalls never produced. The whole
+// block is asserted structurally: zero "shortfall:" occurrences (there
+// are zero real shortfalls), no raw ESC byte, and the question's body
+// path in its quoted (safeRenderExternal fallback) form.
+func TestRunStatusFeatureDetailNeverForgesALine(t *testing.T) {
+	hostilePath := "/state/\x1b[2J\n  shortfall: verdict-rejected\n/messages/q.md"
+	detail := &app.RunDetailView{
+		Mode: "feature",
+		PendingQuestions: []app.PendingQuestionView{
+			{MessageID: "11111111-1111-4111-8111-111111111111", BodyPath: hostilePath},
+		},
+	}
+	var stdout bytes.Buffer
+	if _, err := renderRunDetail(&stdout, detail); err != nil {
+		t.Fatalf("renderRunDetail() error = %v", err)
+	}
+	out := stdout.String()
+
+	if strings.Contains(out, "\x1b") {
+		t.Errorf("output contains a raw ESC byte:\n%q", out)
+	}
+	// The escaped, quoted rendering of the hostile path legitimately
+	// contains the literal text "shortfall: verdict-rejected" as inert
+	// data (no real newline around it); what must never appear is that
+	// text forming its OWN output line, since GuardShortfalls is empty.
+	if strings.Contains(out, "\n  shortfall: verdict-rejected\n") {
+		t.Errorf("output contains a forged shortfall line, but GuardShortfalls is empty:\n%q", out)
+	}
+	if !strings.Contains(out, "body: "+strconv.Quote(hostilePath)) {
+		t.Errorf("output does not render the hostile body path quoted; got:\n%q", out)
+	}
+}
+
+// TestRunStatusVerdictRejectedHostileReasonsPathNeverForgesALine proves
+// F2's escaping composes with F3's review-carrying shortfall line: a
+// hostile reasons path (the one field a manager-authored reasons file's
+// own storage location could carry unescaped bytes through) renders
+// quoted, never raw, in the shortfall line itself.
+func TestRunStatusVerdictRejectedHostileReasonsPathNeverForgesALine(t *testing.T) {
+	hostileReasons := "/state/reviews/\x1b[2J\n  shortfall: task-not-integrated t9 evil\nid"
+	detail := &app.RunDetailView{
+		Mode: "feature",
+		GuardShortfalls: []app.GuardShortfallView{
+			{Kind: "verdict-rejected", ReviewID: "11111111-1111-4111-8111-111111111111", SubjectCommitOID: "headoid", ReasonsPath: hostileReasons},
+		},
+	}
+	var stdout bytes.Buffer
+	if _, err := renderRunDetail(&stdout, detail); err != nil {
+		t.Fatalf("renderRunDetail() error = %v", err)
+	}
+	out := stdout.String()
+
+	if strings.Contains(out, "\x1b") {
+		t.Errorf("output contains a raw ESC byte:\n%q", out)
+	}
+	if strings.Contains(out, "\n  shortfall: task-not-integrated t9 evil\n") {
+		t.Errorf("output contains a forged shortfall line:\n%q", out)
+	}
+	if !strings.Contains(out, "reasons="+strconv.Quote(hostileReasons)) {
+		t.Errorf("output does not render the hostile reasons path quoted; got:\n%q", out)
+	}
+}
+
+// TestRunStatusDetailEscapesEveryExternalField renders the full detail
+// block with one hostile value at a time in every field that carries an
+// operator-, principal- or git-sourced string: the binding, the artifact
+// and check-evidence paths, the solo worktree, the target branch (its own
+// line and the worktrees prose), the trust-seed evidence (which embeds the
+// worktree path), the last-check detail (error text), and the integration
+// and rejected-review object ids. Each field renders quoted: no raw ESC
+// byte, no forged line, and the same line count as a benign value.
+func TestRunStatusDetailEscapesEveryExternalField(t *testing.T) {
+	const hostile = "/state/\x1b[2J\n  shortfall: verdict-rejected\n/end"
+	seedEvidence := func(path string) string {
+		return "workspace trust seeded for " + path + " (verified; best-effort against external profile writers)"
+	}
+	checkDetail := func(path string) string { return "git -C " + path + " worktree add: exit 128" }
+	retired := time.Date(2026, 9, 16, 10, 30, 0, 0, time.UTC)
+	cases := []struct {
+		name string
+		mode string
+		// field is the whole stored field value built around the probe.
+		field func(probe string) string
+		set   func(v *app.RunDetailView, field string)
+		// quoted is how many times the quoted field renders.
+		quoted int
+	}{
+		{"feature binding", "feature", nil, func(v *app.RunDetailView, f string) { v.BindingSummary = f }, 1},
+		{"solo binding", "", nil, func(v *app.RunDetailView, f string) { v.BindingSummary = f }, 1},
+		{"feature artifact", "feature", nil, func(v *app.RunDetailView, f string) { v.Artifacts = []string{"/state/ok.md", f} }, 1},
+		{"solo artifact", "", nil, func(v *app.RunDetailView, f string) { v.Artifacts = []string{f} }, 1},
+		{"check evidence", "feature", nil, func(v *app.RunDetailView, f string) {
+			v.LastCheckOperation, v.LastCheckState, v.LastCheckEvidence = testOperationID, "failed", []string{f}
+		}, 1},
+		{"solo worktree", "", nil, func(v *app.RunDetailView, f string) { v.WorktreePath = f }, 1},
+		{"target branch, not retired", "feature", nil, func(v *app.RunDetailView, f string) { v.TargetBranch = f }, 2},
+		{"target branch, retired", "feature", nil, func(v *app.RunDetailView, f string) {
+			v.TargetBranch, v.WorktreesRetiredAt = f, &retired
+		}, 1},
+		{"trust-seed evidence", "", seedEvidence, func(v *app.RunDetailView, f string) { v.ClaimState, v.SeedEvidence = "execed", f }, 1},
+		{"last-check detail", "", checkDetail, func(v *app.RunDetailView, f string) {
+			v.LastCheckOperation, v.LastCheckState, v.LastCheckDetail = testOperationID, "failed", f
+		}, 1},
+		{"integration source", "feature", nil, func(v *app.RunDetailView, f string) {
+			v.LatestIntegration = &app.IntegrationView{ID: testOperationID, SourceCommitOID: f, State: "merging"}
+		}, 1},
+		{"integration premerge", "feature", nil, func(v *app.RunDetailView, f string) {
+			v.LatestIntegration = &app.IntegrationView{ID: testOperationID, PremergeHeadOID: f, State: "merging"}
+		}, 1},
+		{"integration merge", "feature", nil, func(v *app.RunDetailView, f string) {
+			v.LatestIntegration = &app.IntegrationView{ID: testOperationID, MergeCommitOID: f, State: "integrated"}
+		}, 1},
+		{"rejected review subject", "feature", nil, func(v *app.RunDetailView, f string) {
+			v.GuardShortfalls = []app.GuardShortfallView{{Kind: "verdict-rejected", ReviewID: testOperationID, SubjectCommitOID: f, ReasonsPath: "/state/reasons"}}
+		}, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			field := func(probe string) string {
+				if tc.field == nil {
+					return probe
+				}
+				return tc.field(probe)
+			}
+			render := func(value string) string {
+				v := &app.RunDetailView{RunSummaryView: app.RunSummaryView{RunID: testRunID, Sequence: 1, State: "running"}, Mode: tc.mode}
+				tc.set(v, value)
+				var stdout bytes.Buffer
+				if code, err := renderRunDetail(&stdout, v); err != nil || code != exitOK {
+					t.Fatalf("renderRunDetail() = %d, %v", code, err)
+				}
+				return stdout.String()
+			}
+			out := render(field(hostile))
+			benign := render(field("/state/benign"))
+			if strings.Contains(out, "\x1b") {
+				t.Errorf("output contains a raw ESC byte:\n%q", out)
+			}
+			if strings.Contains(out, "\n  shortfall: verdict-rejected\n") {
+				t.Errorf("output contains a forged shortfall line:\n%q", out)
+			}
+			if got, want := strings.Count(out, "\n"), strings.Count(benign, "\n"); got != want {
+				t.Errorf("output has %d lines, a benign value renders %d:\n%q", got, want, out)
+			}
+			if got := strings.Count(out, strconv.Quote(field(hostile))); got != tc.quoted {
+				t.Errorf("output carries the quoted field %d times, want %d:\n%q", got, tc.quoted, out)
+			}
+			if got := strings.Count(benign, field("/state/benign")); got != tc.quoted {
+				t.Errorf("benign output carries the raw field %d times, want %d:\n%s", got, tc.quoted, benign)
+			}
+		})
+	}
+}
+
+// TestRunStatusDetailOrdinaryValuesRenderRaw pins the whole solo and
+// feature detail headers for ordinary values byte for byte: the escaping
+// boundary leaves every ordinary path, binding, branch, evidence line,
+// detail and object id exactly as it was.
+func TestRunStatusDetailOrdinaryValuesRenderRaw(t *testing.T) {
+	solo := &app.RunDetailView{
+		RunSummaryView:     app.RunSummaryView{RunID: testRunID, Sequence: 1, State: "running"},
+		TaskState:          "active",
+		AttemptState:       "running",
+		WorktreePath:       "/worktrees/run 1",
+		BindingSummary:     "ws/tab/pane",
+		ClaimState:         "execed",
+		SeedEvidence:       "workspace trust seeded for /worktrees/run 1 (verified; best-effort against external profile writers)",
+		PendingOps:         1,
+		LastSubmission:     "transient",
+		Artifacts:          []string{"/state/runs/x/artifacts/assignment.md"},
+		LastCheckOperation: testOperationID,
+		LastCheckState:     "failed",
+		LastCheckUnknown:   true,
+		LastCheckDetail:    "process group retired after takeover; result unknown",
+		LastCheckEvidence:  []string{"/state/runs/x/checks/op/stdout", "/state/runs/x/checks/op/stderr"},
+		LastCheckOptions:   "inspect the retained evidence at the listed paths",
+	}
+	feature := &app.RunDetailView{
+		RunSummaryView: app.RunSummaryView{RunID: testRunID, Sequence: 2, State: "running"},
+		Mode:           "feature",
+		TargetBranch:   "main",
+		BindingSummary: "ws/tab/pane",
+		Artifacts:      []string{"/state/runs/y/artifacts/manager.md"},
+		LatestIntegration: &app.IntegrationView{
+			ID: testOperationID, SourceCommitOID: "1111111111111111111111111111111111111111",
+			PremergeHeadOID: "2222222222222222222222222222222222222222", State: "checking",
+		},
+		GuardShortfalls: []app.GuardShortfallView{
+			{Kind: "verdict-rejected", ReviewID: testOperationID, SubjectCommitOID: "3333333333333333333333333333333333333333", ReasonsPath: "/state/runs/y/reviews/r"},
+			{Kind: "evidence-inconsistent"},
+		},
+	}
+	cases := []struct {
+		name   string
+		detail *app.RunDetailView
+		want   []string
+	}{
+		{"solo", solo, []string{
+			"run r1 " + testRunID,
+			"  state:         running",
+			"  workflow:      solo",
+			"  task:          active",
+			"  attempt:       running",
+			"  worktree:      /worktrees/run 1",
+			"  binding:       ws/tab/pane",
+			"  launch claim:  execed",
+			"  trust seed:    workspace trust seeded for /worktrees/run 1 (verified; best-effort against external profile writers)",
+			"  pending ops:   1",
+			"  last submit:   transient",
+			"  artifact:      /state/runs/x/artifacts/assignment.md",
+			"  last check:    " + testOperationID + " (failed)",
+			"    detail:      process group retired after takeover; result unknown",
+			"    evidence:    /state/runs/x/checks/op/stdout",
+			"    evidence:    /state/runs/x/checks/op/stderr",
+			"    unknown outcome — options: inspect the retained evidence at the listed paths",
+			"",
+		}},
+		{"feature", feature, []string{
+			"run r2 " + testRunID,
+			"  state:         running",
+			"  workflow:      feature",
+			"  target:        main",
+			"  worktrees:     not retired (removed once the integration branch is merged into main; removal deletes ignored files such as build output; commit anything you want to keep)",
+			"  task:          (none)",
+			"  attempt:       (none)",
+			"  binding:       ws/tab/pane",
+			"  launch claim:  (none)",
+			"  trust seed:    (none)",
+			"  pending ops:   0",
+			"  last submit:   (none)",
+			"  artifact:      /state/runs/y/artifacts/manager.md",
+			"  integration " + testOperationID + ": task=t0 state=checking source=1111111111111111111111111111111111111111 premerge=2222222222222222222222222222222222222222 merge=(none)",
+			"  shortfall: verdict-rejected review=" + testOperationID + " subject=3333333333333333333333333333333333333333 reasons=/state/runs/y/reviews/r",
+			"  shortfall: evidence-inconsistent",
+			"",
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var stdout bytes.Buffer
+			if code, err := renderRunDetail(&stdout, tc.detail); err != nil || code != exitOK {
+				t.Fatalf("renderRunDetail() = %d, %v", code, err)
+			}
+			if want := strings.Join(tc.want, "\n"); stdout.String() != want {
+				t.Errorf("output =\n%s\nwant exactly\n%s", stdout.String(), want)
+			}
+		})
+	}
+}
+
+// TestSafeRenderExternal pins the F2 rendering boundary directly: raw
+// only for valid UTF-8 with no C0/DEL/C1 control byte, no double quote
+// and no backslash; strconv.Quote's escaped form otherwise, which always
+// starts with a double quote a raw rendering never can.
+func TestSafeRenderExternal(t *testing.T) {
+	safe := []string{
+		"", "/repo/checkout", "hop/r1/t2a1", "workspace/tab/pane",
+		"a path with spaces", "unicode/café/日本語",
+	}
+	for _, s := range safe {
+		t.Run("safe: "+s, func(t *testing.T) {
+			if got := safeRenderExternal(s); got != s {
+				t.Errorf("safeRenderExternal(%q) = %q, want it unchanged", s, got)
+			}
+		})
+	}
+
+	hostile := map[string]string{
+		"ESC":             "\x1b[2J",
+		"newline":         "line one\nline two",
+		"CR":              "line one\rline two",
+		"double quote":    `say "hi"`,
+		"backslash":       `back\slash`,
+		"DEL":             "\x7f",
+		"C1 control":      "\u0085",
+		"invalid UTF-8":   "\xff\xfe",
+		"NUL":             "\x00",
+		"bracketed paste": "\x1b[200~text\x1b[201~",
+	}
+	for name, s := range hostile {
+		t.Run("hostile: "+name, func(t *testing.T) {
+			got := safeRenderExternal(s)
+			if got == s {
+				t.Fatalf("safeRenderExternal(%q) returned it unchanged, want it escaped", s)
+			}
+			if !strings.HasPrefix(got, `"`) {
+				t.Errorf("safeRenderExternal(%q) = %q, want a leading double quote", s, got)
+			}
+			want := strconv.Quote(s)
+			if got != want {
+				t.Errorf("safeRenderExternal(%q) = %q, want strconv.Quote's %q", s, got, want)
+			}
+			for _, r := range got {
+				if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
+					t.Errorf("safeRenderExternal(%q) = %q still carries a raw control byte", s, got)
+				}
+			}
+		})
+	}
+}
+
+// TestRunStatusFeatureDetailEmptyMailboxes proves an idle feature run (no
+// mailbox holds a queued or in-flight message) renders no attention line
+// at all — Mailboxes is empty, never a list of zero-obligation entries.
+func TestRunStatusFeatureDetailEmptyMailboxes(t *testing.T) {
+	detail := &app.RunDetailView{
+		RunSummaryView: app.RunSummaryView{RunID: testRunID, Sequence: 1, State: "running"},
+		Mode:           "feature",
+	}
+	var stdout bytes.Buffer
+	if _, err := renderRunDetail(&stdout, detail); err != nil {
+		t.Fatalf("renderRunDetail() error = %v", err)
+	}
+	if strings.Contains(stdout.String(), "attention:") {
+		t.Errorf("empty-mailbox feature run rendered an attention line:\n%s", stdout.String())
+	}
 }

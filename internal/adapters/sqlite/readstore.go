@@ -100,6 +100,9 @@ func (s *Store) ListRuns(ctx context.Context, repositoryRoot string) ([]app.RunS
 			if statuses[i].Reconciling, err = runReconciling(ctx, tx, statuses[i].RunID); err != nil {
 				return err
 			}
+			if statuses[i].NeedsAttention, err = runNeedsAttentionLocked(ctx, tx, statuses[i].RunID, s.now()); err != nil {
+				return err
+			}
 		}
 		return nil
 	})

@@ -158,6 +158,7 @@ func (c *Controller) StartFeatureRun(ctx context.Context, req StartRunRequest) (
 		RolePath:       roleArtifactPath(req.StateRoot, runID, "manager"),
 		CribPath:       workerProtocolCribPath(req.StateRoot, runID),
 		HOPPath:        req.HOPPath,
+		RepositoryRoot: req.RepositoryRoot,
 	})
 	assignmentDigest := sha256Hex(content)
 
@@ -1069,6 +1070,7 @@ func (c *Controller) ensureManagerArtifacts(ctx context.Context, handle RunHandl
 		RolePath:       wf.ManagerRolePath,
 		CribPath:       cribPath,
 		HOPPath:        hopPath,
+		RepositoryRoot: frozen.RepositoryRoot,
 	})
 	if sha256Hex(content) != frozen.Snapshot.AssignmentDigest {
 		return errors.New("app: the manager assignment artifact could not be recreated identically from the frozen inputs (digest mismatch; has the hop executable path changed?); failing closed")
