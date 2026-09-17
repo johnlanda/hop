@@ -1168,10 +1168,10 @@ func matchIntegrationLine(line string) bool {
 
 // parseNeedsReworkLabel extracts the task label from a manager notice
 // body naming a needs-rework consequence, recognizing BOTH production
-// renderers' shapes byte for byte — neither mirrors the other's line
-// order, and nothing pins one as canonical, since design section 7 only
-// promises "a needs-rework notice", never a fixed line position (an
-// earlier "first line only" rule was an over-specification):
+// renderers' shapes — an anchored, whitespace-normalized field match on
+// each shape's own line (strings.Fields, never a substring search), not
+// pinned to either renderer's line order, since design section 7 only
+// promises "a needs-rework notice", never a fixed line position:
 //   - renderTaskNotice (internal/app/usecase_featurecheck.go, worker
 //     interruption and per-task check failure): the task consequence
 //     line is LINE 1.
@@ -2244,10 +2244,11 @@ func TestFixtureWorkerSelfKillOnControlFile(t *testing.T) {
 }
 
 // TestFixtureWorkerVanishOnce proves the "worker-vanish-once" behavior
-// (WorkerLaunchEndsBeforeSettlement, task 7c): the first invocation for a
-// given task exits at once — before printing FIXTURE-WORKER-READY or
-// calling hop at all — through the compiled fixture binary's own
-// os.Exit, never an exec chain into a differently pathed binary, and a
+// (TestRealProcessWorkerLaunchEndsBeforeSettlement's own): the first
+// invocation for a given task exits at once — before printing
+// FIXTURE-WORKER-READY or calling hop at all — through the compiled
+// fixture binary's own os.Exit, never an exec chain into a differently
+// pathed binary, and a
 // second invocation for the SAME task (a fresh attempt, as the real
 // retried attempt always is) reaches ready, drains its mailbox and
 // submits exactly like worker-implement.

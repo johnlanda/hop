@@ -5,9 +5,9 @@ import (
 	"testing"
 )
 
-// TestRealProcessWorkerLaunchEndsBeforeSettlement is the registry's own
-// 7c addition (LAUNCH-2, design section 4's launch-ended row, section 11
-// "Layers"): a worker's harness ends right after exec — its pane closing
+// TestRealProcessWorkerLaunchEndsBeforeSettlement proves design section
+// 4's launch-ended row for a worker (section 11's "Layers" table): a
+// worker's harness ends right after exec — its pane closing
 // with it before any corroboration can settle the claim. Unlike
 // TestRealProcessManagerLaunchVanishesBeforeCorroboration's shebang stub
 // (a process that is /bin/sh for its whole life, so its argv can never
@@ -58,16 +58,27 @@ func TestRealProcessWorkerLaunchEndsBeforeSettlement(t *testing.T) {
 	session1ID := fx.sessionForAttempt(t, attempt1ID)
 
 	// The claim row's own state, not timing, proves the exec_failed path:
-	// the vanish is deterministic (the process is gone before any
-	// inspection could ever observe it), but this scenario still asserts
-	// the settled state directly rather than inferring it from how long
-	// anything took.
-	var claimState string
+	// this process is claude-identified for a few milliseconds before its
+	// own os.Exit (it spawns the MCP stand-in and reads its instructions
+	// file first), so a corroboration pass landing in that narrow window
+	// could in principle settle it execed instead — a flake, not a false
+	// pass. The same window exposes the MCP stand-in's own fork-before-
+	// exec instant, which can present the forking-wrapper topology
+	// section 6 fails closed on; the reconciling guard below catches that
+	// early rather than reporting a generic "last observed state
+	// exec_pending" after the full poll bound.
+	var claimState, reconciledSession string
 	if !waitUntil(func() bool {
+		if reconciledSession == "" {
+			reconciledSession = fx.reconciledSessionID(t)
+		}
 		claimState = fx.claimState(t, session1ID)
-		return claimState == "exec_failed"
+		return claimState == "exec_failed" || reconciledSession != ""
 	}) {
 		t.Fatalf("session %s launch claim never settled exec_failed; last observed state %q", session1ID, claimState)
+	}
+	if reconciledSession != "" {
+		t.Fatalf("session %s entered reconciling before the vanished launch could settle exec_failed; last observed claim state %q", reconciledSession, claimState)
 	}
 	claimError := fx.scalar(t, fmt.Sprintf("SELECT error FROM launch_claims WHERE session_id = '%s';", session1ID))
 	if claimError != launchEndedClaimReason {
@@ -113,7 +124,7 @@ func TestRealProcessWorkerLaunchEndsBeforeSettlement(t *testing.T) {
 	// completes — the strongest possible confirmation that the controller
 	// kept running throughout. Every wait below also fails at once, never
 	// only after the full featureRunTimeout, if any session in the run
-	// goes reconciling: the silent wedge this fix removes the cause of.
+	// goes reconciling.
 	fx.requireTaskStateNeverReconciling(t, t1, "integrated")
 	reviewTaskID := fx.requireReviewTask(t)
 	fx.requireTaskStateNeverReconciling(t, reviewTaskID, "completed")

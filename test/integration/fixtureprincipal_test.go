@@ -1262,10 +1262,10 @@ func runNeedsReworkCase(t *testing.T, artifacts *artifactDir, noticeBodyPath str
 }
 
 // TestFixtureManagerNeedsReworkNoticeShapes proves parseNeedsReworkLabel
-// recognizes BOTH production notice renderers' shapes (an earlier "first
-// line only" rule was an over-specification: neither renderer nor design
-// section 7 actually promises one) with an ANCHORED, exact-line match —
-// never a substring search, so a reason or evidence line merely naming
+// recognizes BOTH production notice renderers' shapes with an ANCHORED,
+// exact-line match, never pinned to either renderer's own line position
+// (design section 7 promises only "a needs-rework notice") and never a
+// substring search, so a reason or evidence line merely naming
 // "needs-rework", or the task line appearing at any position other than
 // the one each shape allows, can never trigger a retry.
 func TestFixtureManagerNeedsReworkNoticeShapes(t *testing.T) {
