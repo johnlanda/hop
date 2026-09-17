@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -199,6 +200,14 @@ func TestGrammarContractStatusHostileStateRootNeverForgesALine(t *testing.T) {
 	if question.ExitCode != exitOK {
 		t.Fatalf("msg send (human question): exit=%d stdout=%q stderr=%q", question.ExitCode, question.Stdout, question.Stderr)
 	}
+	// A retained check execution under the same root: its evidence path
+	// is both a run artifact and the last check's evidence, and its
+	// detail is git error text naming the root.
+	evidencePath := filepath.Join(stateRoot, "runs", base.RunID, "checks", "op", "stdout")
+	checkDetail := "git -C " + stateRoot + " worktree add: exit 128: fatal: already exists"
+	if err := hopfixtures.SeedCheckEvidence(ctx, store, lease, base.RunID, seed+50, checkDetail, evidencePath, now); err != nil {
+		t.Fatalf("seed check evidence: %v", err)
+	}
 
 	detail := execHop(t, map[string]string{"HOP_STATE_DIR": stateRoot}, repoRoot, "status", "-C", repoRoot, "-run", base.RunID)
 	if detail.ExitCode != exitOK {
@@ -212,7 +221,14 @@ func TestGrammarContractStatusHostileStateRootNeverForgesALine(t *testing.T) {
 	if strings.Contains(out, "\n  shortfall: verdict-rejected\n") {
 		t.Errorf("status -run output contains a forged shortfall line:\n%q", out)
 	}
-	if !strings.Contains(out, `body: "`) {
-		t.Errorf("status -run output does not quote the hostile body path; got:\n%q", out)
+	for _, want := range []string{
+		`body: "`,
+		"\n  artifact:      " + strconv.Quote(evidencePath) + "\n",
+		"\n    detail:      " + strconv.Quote(checkDetail) + "\n",
+		"\n    evidence:    " + strconv.Quote(evidencePath) + "\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("status -run output lacks the quoted field %q; got:\n%q", want, out)
+		}
 	}
 }

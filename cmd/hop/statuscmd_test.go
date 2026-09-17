@@ -508,6 +508,193 @@ func TestRunStatusVerdictRejectedHostileReasonsPathNeverForgesALine(t *testing.T
 	}
 }
 
+// TestRunStatusDetailEscapesEveryExternalField renders the full detail
+// block with one hostile value at a time in every field that carries an
+// operator-, principal- or git-sourced string: the binding, the artifact
+// and check-evidence paths, the solo worktree, the target branch (its own
+// line and the worktrees prose), the trust-seed evidence (which embeds the
+// worktree path), the last-check detail (error text), and the integration
+// and rejected-review object ids. Each field renders quoted: no raw ESC
+// byte, no forged line, and the same line count as a benign value.
+func TestRunStatusDetailEscapesEveryExternalField(t *testing.T) {
+	const hostile = "/state/\x1b[2J\n  shortfall: verdict-rejected\n/end"
+	seedEvidence := func(path string) string {
+		return "workspace trust seeded for " + path + " (verified; best-effort against external profile writers)"
+	}
+	checkDetail := func(path string) string { return "git -C " + path + " worktree add: exit 128" }
+	retired := time.Date(2026, 9, 16, 10, 30, 0, 0, time.UTC)
+	cases := []struct {
+		name string
+		mode string
+		// field is the whole stored field value built around the probe.
+		field func(probe string) string
+		set   func(v *app.RunDetailView, field string)
+		// quoted is how many times the quoted field renders.
+		quoted int
+	}{
+		{"feature binding", "feature", nil, func(v *app.RunDetailView, f string) { v.BindingSummary = f }, 1},
+		{"solo binding", "", nil, func(v *app.RunDetailView, f string) { v.BindingSummary = f }, 1},
+		{"feature artifact", "feature", nil, func(v *app.RunDetailView, f string) { v.Artifacts = []string{"/state/ok.md", f} }, 1},
+		{"solo artifact", "", nil, func(v *app.RunDetailView, f string) { v.Artifacts = []string{f} }, 1},
+		{"check evidence", "feature", nil, func(v *app.RunDetailView, f string) {
+			v.LastCheckOperation, v.LastCheckState, v.LastCheckEvidence = testOperationID, "failed", []string{f}
+		}, 1},
+		{"solo worktree", "", nil, func(v *app.RunDetailView, f string) { v.WorktreePath = f }, 1},
+		{"target branch, not retired", "feature", nil, func(v *app.RunDetailView, f string) { v.TargetBranch = f }, 2},
+		{"target branch, retired", "feature", nil, func(v *app.RunDetailView, f string) {
+			v.TargetBranch, v.WorktreesRetiredAt = f, &retired
+		}, 1},
+		{"trust-seed evidence", "", seedEvidence, func(v *app.RunDetailView, f string) { v.ClaimState, v.SeedEvidence = "execed", f }, 1},
+		{"last-check detail", "", checkDetail, func(v *app.RunDetailView, f string) {
+			v.LastCheckOperation, v.LastCheckState, v.LastCheckDetail = testOperationID, "failed", f
+		}, 1},
+		{"integration source", "feature", nil, func(v *app.RunDetailView, f string) {
+			v.LatestIntegration = &app.IntegrationView{ID: testOperationID, SourceCommitOID: f, State: "merging"}
+		}, 1},
+		{"integration premerge", "feature", nil, func(v *app.RunDetailView, f string) {
+			v.LatestIntegration = &app.IntegrationView{ID: testOperationID, PremergeHeadOID: f, State: "merging"}
+		}, 1},
+		{"integration merge", "feature", nil, func(v *app.RunDetailView, f string) {
+			v.LatestIntegration = &app.IntegrationView{ID: testOperationID, MergeCommitOID: f, State: "integrated"}
+		}, 1},
+		{"rejected review subject", "feature", nil, func(v *app.RunDetailView, f string) {
+			v.GuardShortfalls = []app.GuardShortfallView{{Kind: "verdict-rejected", ReviewID: testOperationID, SubjectCommitOID: f, ReasonsPath: "/state/reasons"}}
+		}, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			field := func(probe string) string {
+				if tc.field == nil {
+					return probe
+				}
+				return tc.field(probe)
+			}
+			render := func(value string) string {
+				v := &app.RunDetailView{RunSummaryView: app.RunSummaryView{RunID: testRunID, Sequence: 1, State: "running"}, Mode: tc.mode}
+				tc.set(v, value)
+				var stdout bytes.Buffer
+				if code, err := renderRunDetail(&stdout, v); err != nil || code != exitOK {
+					t.Fatalf("renderRunDetail() = %d, %v", code, err)
+				}
+				return stdout.String()
+			}
+			out := render(field(hostile))
+			benign := render(field("/state/benign"))
+			if strings.Contains(out, "\x1b") {
+				t.Errorf("output contains a raw ESC byte:\n%q", out)
+			}
+			if strings.Contains(out, "\n  shortfall: verdict-rejected\n") {
+				t.Errorf("output contains a forged shortfall line:\n%q", out)
+			}
+			if got, want := strings.Count(out, "\n"), strings.Count(benign, "\n"); got != want {
+				t.Errorf("output has %d lines, a benign value renders %d:\n%q", got, want, out)
+			}
+			if got := strings.Count(out, strconv.Quote(field(hostile))); got != tc.quoted {
+				t.Errorf("output carries the quoted field %d times, want %d:\n%q", got, tc.quoted, out)
+			}
+			if got := strings.Count(benign, field("/state/benign")); got != tc.quoted {
+				t.Errorf("benign output carries the raw field %d times, want %d:\n%s", got, tc.quoted, benign)
+			}
+		})
+	}
+}
+
+// TestRunStatusDetailOrdinaryValuesRenderRaw pins the whole solo and
+// feature detail headers for ordinary values byte for byte: the escaping
+// boundary leaves every ordinary path, binding, branch, evidence line,
+// detail and object id exactly as it was.
+func TestRunStatusDetailOrdinaryValuesRenderRaw(t *testing.T) {
+	solo := &app.RunDetailView{
+		RunSummaryView:     app.RunSummaryView{RunID: testRunID, Sequence: 1, State: "running"},
+		TaskState:          "active",
+		AttemptState:       "running",
+		WorktreePath:       "/worktrees/run 1",
+		BindingSummary:     "ws/tab/pane",
+		ClaimState:         "execed",
+		SeedEvidence:       "workspace trust seeded for /worktrees/run 1 (verified; best-effort against external profile writers)",
+		PendingOps:         1,
+		LastSubmission:     "transient",
+		Artifacts:          []string{"/state/runs/x/artifacts/assignment.md"},
+		LastCheckOperation: testOperationID,
+		LastCheckState:     "failed",
+		LastCheckUnknown:   true,
+		LastCheckDetail:    "process group retired after takeover; result unknown",
+		LastCheckEvidence:  []string{"/state/runs/x/checks/op/stdout", "/state/runs/x/checks/op/stderr"},
+		LastCheckOptions:   "inspect the retained evidence at the listed paths",
+	}
+	feature := &app.RunDetailView{
+		RunSummaryView: app.RunSummaryView{RunID: testRunID, Sequence: 2, State: "running"},
+		Mode:           "feature",
+		TargetBranch:   "main",
+		BindingSummary: "ws/tab/pane",
+		Artifacts:      []string{"/state/runs/y/artifacts/manager.md"},
+		LatestIntegration: &app.IntegrationView{
+			ID: testOperationID, SourceCommitOID: "1111111111111111111111111111111111111111",
+			PremergeHeadOID: "2222222222222222222222222222222222222222", State: "checking",
+		},
+		GuardShortfalls: []app.GuardShortfallView{
+			{Kind: "verdict-rejected", ReviewID: testOperationID, SubjectCommitOID: "3333333333333333333333333333333333333333", ReasonsPath: "/state/runs/y/reviews/r"},
+			{Kind: "evidence-inconsistent"},
+		},
+	}
+	cases := []struct {
+		name   string
+		detail *app.RunDetailView
+		want   []string
+	}{
+		{"solo", solo, []string{
+			"run r1 " + testRunID,
+			"  state:         running",
+			"  workflow:      solo",
+			"  task:          active",
+			"  attempt:       running",
+			"  worktree:      /worktrees/run 1",
+			"  binding:       ws/tab/pane",
+			"  launch claim:  execed",
+			"  trust seed:    workspace trust seeded for /worktrees/run 1 (verified; best-effort against external profile writers)",
+			"  pending ops:   1",
+			"  last submit:   transient",
+			"  artifact:      /state/runs/x/artifacts/assignment.md",
+			"  last check:    " + testOperationID + " (failed)",
+			"    detail:      process group retired after takeover; result unknown",
+			"    evidence:    /state/runs/x/checks/op/stdout",
+			"    evidence:    /state/runs/x/checks/op/stderr",
+			"    unknown outcome — options: inspect the retained evidence at the listed paths",
+			"",
+		}},
+		{"feature", feature, []string{
+			"run r2 " + testRunID,
+			"  state:         running",
+			"  workflow:      feature",
+			"  target:        main",
+			"  worktrees:     not retired (removed once the integration branch is merged into main; removal deletes ignored files such as build output; commit anything you want to keep)",
+			"  task:          (none)",
+			"  attempt:       (none)",
+			"  binding:       ws/tab/pane",
+			"  launch claim:  (none)",
+			"  trust seed:    (none)",
+			"  pending ops:   0",
+			"  last submit:   (none)",
+			"  artifact:      /state/runs/y/artifacts/manager.md",
+			"  integration " + testOperationID + ": task=t0 state=checking source=1111111111111111111111111111111111111111 premerge=2222222222222222222222222222222222222222 merge=(none)",
+			"  shortfall: verdict-rejected review=" + testOperationID + " subject=3333333333333333333333333333333333333333 reasons=/state/runs/y/reviews/r",
+			"  shortfall: evidence-inconsistent",
+			"",
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var stdout bytes.Buffer
+			if code, err := renderRunDetail(&stdout, tc.detail); err != nil || code != exitOK {
+				t.Fatalf("renderRunDetail() = %d, %v", code, err)
+			}
+			if want := strings.Join(tc.want, "\n"); stdout.String() != want {
+				t.Errorf("output =\n%s\nwant exactly\n%s", stdout.String(), want)
+			}
+		})
+	}
+}
+
 // TestSafeRenderExternal pins the F2 rendering boundary directly: raw
 // only for valid UTF-8 with no C0/DEL/C1 control byte, no double quote
 // and no backslash; strconv.Quote's escaped form otherwise, which always

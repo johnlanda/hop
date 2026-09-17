@@ -26,13 +26,30 @@ const defaultStatusTimeout = 10 * time.Second
 // and always starts with a double quote — so a raw rendering never
 // starts with one, and a reader can always tell which form a field
 // took. Ordinary paths and identifiers are untouched, so every existing
-// render table stays byte-identical. Applied to every path and every
-// Herdr binding identifier hop status prints: these are operator- or
-// principal-selected strings (a checkout location, a workspace/tab/pane
-// id), never HOP-generated, and reach rendering unvalidated by the
-// stores that accept and pass them through (design's "paths appear only
-// where the design names them" invariant is about WHICH fields carry a
-// path, not about what bytes those fields may contain).
+// render table stays byte-identical. Applied to every externally sourced
+// string hop status prints, each as one whole field:
+//   - paths: the solo worktree, each feature worktree row, the task
+//     table's worktree, artifacts, check evidence, a question's body and
+//     a rejected review's reasons;
+//   - Herdr binding identifiers: the detail's binding, each session's
+//     binding and an attention action's binding;
+//   - branch names: the target (its own line and inside the worktrees
+//     sentence), each worktree row's and each worktree operation's
+//     branch;
+//   - text that embeds such values: the trust-seed evidence, which names
+//     the seeded worktree path, and the last check's detail, which is
+//     recorded error text;
+//   - git object ids: the integration's source, pre-merge and merge
+//     commits and a rejected review's subject.
+//
+// These are operator-, principal- or git-sourced strings (a checkout
+// location, a workspace/tab/pane id, a ref name, a process's error
+// output), and they reach rendering unvalidated by the stores that
+// accept and pass them through. The design's "paths appear only where the
+// design names them" invariant is about WHICH fields carry a path, not
+// about what bytes those fields may contain. Every other field is a
+// HOP-generated token (a parsed uuid, a typed state or kind, a count, an
+// age, a time) or fixed text, and renders raw.
 func safeRenderExternal(s string) string {
 	if isSafeExternalString(s) {
 		return s
@@ -230,12 +247,13 @@ func renderRunDetail(w io.Writer, detail *app.RunDetailView) (int, error) {
 	if isFeatureMode(detail.Mode) {
 		lines = append(lines, worktreeDetailLines(detail.Worktrees)...)
 	} else {
-		lines = append(lines, "  worktree:      "+orUnset(detail.WorktreePath))
+		lines = append(lines, "  worktree:      "+safeRenderExternal(orUnset(detail.WorktreePath)))
 	}
 	lines = append(lines,
-		"  binding:       "+orUnset(detail.BindingSummary),
+		"  binding:       "+safeRenderExternal(orUnset(detail.BindingSummary)),
 		"  launch claim:  "+orUnset(detail.ClaimState),
-		"  trust seed:    "+orUnset(detail.SeedEvidence),
+		// The trust-seed evidence embeds the worktree path it seeded.
+		"  trust seed:    "+safeRenderExternal(orUnset(detail.SeedEvidence)),
 		fmt.Sprintf("  pending ops:   %d", detail.PendingOps),
 		"  last submit:   "+orUnset(detail.LastSubmission),
 	)
@@ -244,14 +262,16 @@ func renderRunDetail(w io.Writer, detail *app.RunDetailView) (int, error) {
 			"    "+app.GrammarActionPrefix+"      "+op.Action)
 	}
 	for _, artifact := range detail.Artifacts {
-		lines = append(lines, "  artifact:      "+artifact)
+		lines = append(lines, "  artifact:      "+safeRenderExternal(artifact))
 	}
 	if detail.LastCheckOperation != "" {
 		lines = append(lines,
 			"  last check:    "+detail.LastCheckOperation+" ("+detail.LastCheckState+")",
-			"    detail:      "+orUnset(detail.LastCheckDetail))
+			// The detail is recorded error text, which can carry git's
+			// multi-line stderr.
+			"    detail:      "+safeRenderExternal(orUnset(detail.LastCheckDetail)))
 		for _, path := range detail.LastCheckEvidence {
-			lines = append(lines, "    evidence:    "+path)
+			lines = append(lines, "    evidence:    "+safeRenderExternal(path))
 		}
 		if detail.LastCheckUnknown {
 			lines = append(lines, "    unknown outcome — options: "+detail.LastCheckOptions)
@@ -291,13 +311,15 @@ func featureDetailLines(detail *app.RunDetailView) []string {
 	if integ := detail.LatestIntegration; integ != nil {
 		lines = append(lines, "  "+app.GrammarIntegrationLine(
 			integ.ID, taskLabelFor(integ.TaskID, labels), integ.State,
-			orUnset(integ.SourceCommitOID), orUnset(integ.PremergeHeadOID), orUnset(integ.MergeCommitOID),
+			safeRenderExternal(orUnset(integ.SourceCommitOID)),
+			safeRenderExternal(orUnset(integ.PremergeHeadOID)),
+			safeRenderExternal(orUnset(integ.MergeCommitOID)),
 		))
 	}
 
 	for _, s := range detail.GuardShortfalls {
 		if s.Kind == app.GrammarShortfallVerdictRejected {
-			lines = append(lines, "  "+app.GrammarVerdictRejectedLine(s.ReviewID, s.SubjectCommitOID, safeRenderExternal(s.ReasonsPath)))
+			lines = append(lines, "  "+app.GrammarVerdictRejectedLine(s.ReviewID, safeRenderExternal(s.SubjectCommitOID), safeRenderExternal(s.ReasonsPath)))
 			continue
 		}
 		taskLabel := ""
@@ -392,17 +414,19 @@ func sessionBindingFor(address string, sessions []app.SessionView) string {
 }
 
 // targetBranchLabel renders a feature run's frozen worktree-retirement
-// target (docs/plan/phase-3-worktree-retirement.md section 6).
+// target (docs/plan/phase-3-worktree-retirement.md section 6), safe-rendered
+// like every branch name.
 func targetBranchLabel(target string) string {
 	if target == "" {
 		return "none (detached HEAD at freeze; worktrees are never retired automatically)"
 	}
-	return target
+	return safeRenderExternal(target)
 }
 
 // worktreeRetirementLabel renders a feature run's worktrees-retired fact,
 // and before it is set, when and how retirement will happen — including
-// the plain warning that removal deletes ignored files.
+// the plain warning that removal deletes ignored files. The target branch
+// inside that sentence is safe-rendered.
 func worktreeRetirementLabel(target string, retiredAt *time.Time) string {
 	switch {
 	case retiredAt != nil:
@@ -410,7 +434,7 @@ func worktreeRetirementLabel(target string, retiredAt *time.Time) string {
 	case target == "":
 		return "kept (no target branch)"
 	default:
-		return "not retired (removed once the integration branch is merged into " + target +
+		return "not retired (removed once the integration branch is merged into " + safeRenderExternal(target) +
 			"; removal deletes ignored files such as build output; commit anything you want to keep)"
 	}
 }

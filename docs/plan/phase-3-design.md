@@ -1616,14 +1616,19 @@ status` row) is specified as its own small grammar, in
 `internal/app/grammar.go` alongside the verb table above, since the
 fixture manager and the deterministic scenarios (section 11) parse it
 exactly as they parse the verb grammar. Every path and Herdr binding
-identifier in the table below (`cmd/hop`'s `safeRenderExternal`, applied
+identifier in the table below, and every such value in the detail's
+common header — the binding, the solo worktree, the target branch (also
+inside the `worktrees:` sentence), artifact and check-evidence paths, the
+trust-seed evidence and the last check's detail, both of which embed
+them — plus the git object ids (`cmd/hop`'s `safeRenderExternal`, applied
 consistently to worktree-retirement's own report and per-row lines too)
 renders raw only when it is valid UTF-8 with no C0/DEL/C1 control byte,
 no double quote and no backslash; otherwise it renders as Go's
 `strconv.Quote` form, which always starts with a double quote a raw
-rendering never can — these are operator- or principal-selected strings
-(a checkout location, a workspace/tab/pane id), never HOP-generated, and
-none of the stores or resolvers on their path reject control bytes:
+rendering never can — these are operator-, principal- or git-sourced
+strings (a checkout location, a workspace/tab/pane id, a ref name, a
+process's error output), never HOP-generated, and none of the stores or
+resolvers on their path reject control bytes:
 
 | Line | Shape |
 | --- | --- |
