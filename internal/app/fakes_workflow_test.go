@@ -492,13 +492,21 @@ func (s *fakeStore) SendMessage(_ context.Context, send app.MessageSend) (app.Me
 	if !hasBinding || binding.IncarnationID != send.IncarnationID || binding.Superseded {
 		return app.MessageOutcome{Kind: app.MessageRefused, Reason: app.GrammarReasonStale, Detail: "incarnation is not current"}, nil
 	}
+	// The sender's logical address is re-derived from its own session
+	// row, exactly as the SQLite adapter does: send.SenderAddress feeds
+	// the request digest and must agree, but only the derived address
+	// decides.
+	senderAddress, ok := s.resolveSessionAddressLocked(send.Sender.SessionID)
+	if !ok || !senderAddress.Equal(send.SenderAddress) {
+		return app.MessageOutcome{Kind: app.MessageRefused, Reason: app.GrammarReasonUnauthorized, Detail: "session does not resolve to the claimed address"}, nil
+	}
 
 	var outcome app.MessageOutcome
 	switch send.Kind {
 	case run.MessageAnswer:
-		outcome = s.acceptSessionAnswerLocked(send, now)
+		outcome = s.acceptSessionAnswerLocked(send, senderAddress, now)
 	default:
-		if err := run.ValidateSendAddressing(send.SenderAddress, send.Kind, send.Recipient); err != nil {
+		if err := run.ValidateSendAddressing(senderAddress, send.Kind, send.Recipient); err != nil {
 			outcome = app.MessageOutcome{Kind: app.MessageRefused, Reason: app.GrammarReasonUnauthorized, Detail: err.Error()}
 			break
 		}
@@ -541,15 +549,11 @@ func (s *fakeStore) SendMessage(_ context.Context, send app.MessageSend) (app.Me
 // acceptSessionAnswerLocked handles a session's answer to a question
 // addressed to its own logical address (e.g. the manager forwarding an
 // answer to a worker's question), via run.AcceptAnswer — the SQLite
-// adapter's acceptSessionAnswer order exactly: the answering session's
-// address is re-derived from its own session row (send.SenderAddress must
-// merely agree with it), and the destination is derived from the
-// question's own sender, never from send.Recipient. Callers hold s.mu.
-func (s *fakeStore) acceptSessionAnswerLocked(send app.MessageSend, now time.Time) app.MessageOutcome { //nolint:gocritic // hugeParam: MessageSend is a per-call DTO; mirrors the port method's own convention.
-	answerer, ok := s.resolveSessionAddressLocked(send.Sender.SessionID)
-	if !ok || !answerer.Equal(send.SenderAddress) {
-		return app.MessageOutcome{Kind: app.MessageRefused, Reason: app.GrammarReasonUnauthorized, Detail: "session does not resolve to the claimed address"}
-	}
+// adapter's acceptSessionAnswer order exactly: answerer is the address
+// SendMessage re-derived from the session row, and the destination is
+// derived from the question's own sender, never from send.Recipient.
+// Callers hold s.mu.
+func (s *fakeStore) acceptSessionAnswerLocked(send app.MessageSend, answerer run.Address, now time.Time) app.MessageOutcome { //nolint:gocritic // hugeParam: MessageSend is a per-call DTO; mirrors the port method's own convention.
 	if send.ReplyTo == nil {
 		return app.MessageOutcome{Kind: app.MessageMalformed, Reason: app.GrammarReasonMalformed, Detail: "answer requires reply-to"}
 	}

@@ -161,8 +161,8 @@ func TestStoreVectors(t *testing.T) {
 		if err != nil {
 			t.Fatalf("SendMessage() error = %v", err)
 		}
-		if got.Kind != app.MessageRefused || got.Reason != storevectors.MessageSendAnswerNotRecipientReason {
-			t.Fatalf("SendMessage(answer by a non-recipient) = %+v, want refused/%s", got, storevectors.MessageSendAnswerNotRecipientReason)
+		if got.Kind != app.MessageRefused || got.Reason != storevectors.MessageSendAnswerNotRecipientReason || got.Detail != storevectors.MessageSendAnswerNotRecipientDetail {
+			t.Fatalf("SendMessage(answer by a non-recipient) = %+v, want refused/%s %q", got, storevectors.MessageSendAnswerNotRecipientReason, storevectors.MessageSendAnswerNotRecipientDetail)
 		}
 		if n := countRows(t, f.store, `SELECT COUNT(*) FROM messages WHERE id = ? OR reply_to = ?`, answerID.String(), humanQuestion.String()); n != 0 {
 			t.Fatalf("refused answer left %d envelope(s); want none", n)
@@ -204,6 +204,77 @@ func TestStoreVectors(t *testing.T) {
 		if n := countRows(t, store, `SELECT COUNT(*) FROM messages WHERE id = ? OR recipient_address = ?`, answerID.String(), app.AddressString(run.TaskAddress(f.TaskB))); n != 0 {
 			t.Fatalf("refused answer left %d envelope(s) for the closed task; want none", n)
 		}
+	})
+
+	t.Run("MessageSendClaimedAddressMismatch", func(t *testing.T) {
+		f := newMessagingFixture(t)
+		taskC := f.createFeatureTask(t, 8070, 3, run.TaskActive)
+		workerC, workerCIncarnation := f.createWorkerSession(t, taskC, run.RoleImplementer, 8071)
+		fromC := app.MessageSend{
+			ID: identity.MessageID(uid(8075)), RunID: f.spec.RunID,
+			Sender: run.SessionPrincipal(workerC), SenderAddress: run.TaskAddress(taskC),
+			IncarnationID: workerCIncarnation, Recipient: run.ManagerAddress(), Kind: run.MessageQuestion,
+			BodyPath: "/state/q.md", BodyDigest: "digest-q", BodyBytes: 1,
+		}
+		if outcome, err := f.store.SendMessage(t.Context(), fromC); err != nil || outcome.Kind != app.MessageAccepted {
+			t.Fatalf("seed task C question: %+v, %v", outcome, err)
+		}
+		cases := []struct {
+			name    string
+			n       int
+			claimed run.Address
+			kind    run.MessageKind
+			to      run.Address
+			replyTo *identity.MessageID
+		}{
+			{"a worker claiming manager sends info to another task", 8076, run.ManagerAddress(), run.MessageInfo, run.TaskAddress(taskC), nil},
+			{"a worker claiming manager asks the human", 8077, run.ManagerAddress(), run.MessageQuestion, run.HumanAddress(), nil},
+			{"a worker claiming manager answers a manager-addressed question", 8078, run.ManagerAddress(), run.MessageAnswer, run.Address{}, &fromC.ID},
+			{"a worker claiming another task asks the manager", 8079, run.TaskAddress(taskC), run.MessageQuestion, run.ManagerAddress(), nil},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				messageID := identity.MessageID(uid(tc.n))
+				before := messageReceiptCount(t, f.store, f.spec.RunID)
+				got, err := f.store.SendMessage(t.Context(), storevectors.MessageSendClaimedAddressMismatch(
+					f.spec.RunID, f.WorkerID, tc.claimed, f.WorkerIncarnation, messageID, tc.kind, tc.to, tc.replyTo, "/state/body.md", "digest", 3,
+				))
+				if err != nil {
+					t.Fatalf("SendMessage() error = %v", err)
+				}
+				if got.Kind != app.MessageRefused || got.Reason != storevectors.MessageSendClaimedAddressMismatchReason || got.Detail != storevectors.MessageSendClaimedAddressMismatchDetail {
+					t.Fatalf("SendMessage(claimed address) = %+v, want refused/%s %q", got, storevectors.MessageSendClaimedAddressMismatchReason, storevectors.MessageSendClaimedAddressMismatchDetail)
+				}
+				if n := countRows(t, f.store, `SELECT COUNT(*) FROM messages WHERE id = ?`, messageID.String()); n != 0 {
+					t.Fatal("the refused send created an envelope; want none")
+				}
+				if after := messageReceiptCount(t, f.store, f.spec.RunID); after != before+1 {
+					t.Fatalf("the refusal left %d receipts, want exactly one more than %d", after, before)
+				}
+			})
+		}
+		if n := countRows(t, f.store, `SELECT COUNT(*) FROM messages WHERE kind = 'answer' AND reply_to = ?`, fromC.ID.String()); n != 0 {
+			t.Errorf("task C's question has %d answers after the refused claim; want none", n)
+		}
+
+		t.Run("a session with no messaging role claims a task address", func(t *testing.T) {
+			solo := newFixture(t)
+			solo.createBinding(t)
+			messageID := identity.MessageID(uid(8080))
+			got, err := solo.store.SendMessage(t.Context(), storevectors.MessageSendClaimedAddressMismatch(
+				solo.spec.RunID, solo.spec.SessionID, run.TaskAddress(solo.spec.TaskID), solo.spec.IncarnationID, messageID,
+				run.MessageQuestion, run.ManagerAddress(), nil, "/state/body.md", "digest", 3,
+			))
+			if err != nil {
+				t.Fatalf("SendMessage() error = %v", err)
+			}
+			if got.Kind != app.MessageRefused || got.Reason != storevectors.MessageSendClaimedAddressMismatchReason || got.Detail != storevectors.MessageSendClaimedAddressMismatchDetail {
+				t.Fatalf("SendMessage(solo session) = %+v, want refused/%s %q", got, storevectors.MessageSendClaimedAddressMismatchReason, storevectors.MessageSendClaimedAddressMismatchDetail)
+			}
+			if n := countRows(t, solo.store, `SELECT COUNT(*) FROM messages`); n != 0 {
+				t.Fatalf("the refused send left %d envelopes; want none", n)
+			}
+		})
 	})
 
 	t.Run("MessageSendCrossRun", func(t *testing.T) {

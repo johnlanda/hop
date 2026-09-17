@@ -1219,7 +1219,13 @@ the retryable nor the final line applies to them.
 
 - **Send** (`hop msg send --to manager|task:<id> --kind question|info
   [--relay-of <id>] --file <path>`, or `--kind answer --reply-to <id>
-  --file <path>` with NO `--to`): parse and bound. Kind/address legality
+  --file <path>` with NO `--to`): parse and bound. The sender's logical
+  address is re-derived from its own session row inside the accepting
+  transaction for every kind, after the request-ID receipt lookup and the
+  incarnation check; a sender whose row resolves to no address, or to a
+  different one than the request claims (the address the request digest
+  covers), is `refused: unauthorized` with a receipt, and every decision
+  below uses only the derived address. Kind/address legality
   by role: workers and reviewers → `question`/`info` to `manager` only;
   the manager → `question` to `human` or `question`/`info` to `task:<id>`;
   an `answer` is legal only from the session answering a question

@@ -101,10 +101,12 @@ func sendRequestDigest(send *app.MessageSend) string {
 // identical retry returns the original acceptance as duplicate; a reused
 // ID with different content is refused), then the caller session's OWN
 // run (send.RunID is caller-supplied and never trusted alone), the
-// current incarnation, and — for an ordinary send — addressing legality,
-// the run's acceptance (run.Run.CanAcceptManagerVerb: transient while the
-// run can still reach running, refused once it never will) and the
-// recipient mailbox; an answer is accepted only from the session whose
+// current incarnation, the sender's logical address re-derived from its
+// session row (unresolvable, or different from send.SenderAddress, is
+// refused unauthorized — only the derived address decides), and — for an
+// ordinary send — addressing legality, the run's acceptance
+// (run.Run.CanAcceptManagerVerb: transient while the run can still reach
+// running, refused once it never will) and the recipient mailbox; an answer is accepted only from the session whose
 // re-derived logical address is the question's recipient (so no session
 // ever answers a human question), its destination is derived from the
 // referenced question's sender, never caller-chosen, a closed destination
@@ -175,11 +177,21 @@ func (s *Store) SendMessage(ctx context.Context, send app.MessageSend) (app.Mess
 		if !hasBinding || binding.IncarnationID != send.IncarnationID || binding.Superseded {
 			return record(app.MessageRefused, "", app.GrammarReasonStale, "incarnation is not current")
 		}
+		// The sender's logical address is re-derived from its own session
+		// row: send.SenderAddress feeds the request digest and must agree,
+		// but only the derived address is used to decide.
+		senderAddress, resolvable, err := resolveSessionAddress(ctx, tx, &sender)
+		if err != nil {
+			return err
+		}
+		if !resolvable || !senderAddress.Equal(send.SenderAddress) {
+			return record(app.MessageRefused, "", app.GrammarReasonUnauthorized, "session does not resolve to the claimed address")
+		}
 
 		if send.Kind == run.MessageAnswer {
-			return acceptSessionAnswer(ctx, tx, &send, record, now)
+			return acceptSessionAnswer(ctx, tx, &send, senderAddress, record, now)
 		}
-		if addrErr := run.ValidateSendAddressing(send.SenderAddress, send.Kind, send.Recipient); addrErr != nil {
+		if addrErr := run.ValidateSendAddressing(senderAddress, send.Kind, send.Recipient); addrErr != nil {
 			return record(app.MessageRefused, "", app.GrammarReasonUnauthorized, addrErr.Error())
 		}
 		if acceptErr := runV.CanAcceptManagerVerb(); acceptErr != nil {
@@ -222,19 +234,11 @@ func (s *Store) SendMessage(ctx context.Context, send app.MessageSend) (app.Mess
 }
 
 // acceptSessionAnswer handles a session's answer to a question addressed
-// to its own logical address, via run.AcceptAnswer: the answering
-// session's address is re-derived from its own session row inside this
-// transaction (never taken from send.SenderAddress, which must merely
-// agree with it), and the destination is derived from the question's own
-// sender, never from send.Recipient.
-func acceptSessionAnswer(ctx context.Context, tx *sql.Tx, send *app.MessageSend, record func(kind app.MessageOutcomeKind, messageID identity.MessageID, reason, detail string) error, now time.Time) error {
-	answerer, resolvable, err := sessionAddress(ctx, tx, send.Sender.SessionID)
-	if err != nil {
-		return err
-	}
-	if !resolvable || !answerer.Equal(send.SenderAddress) {
-		return record(app.MessageRefused, "", app.GrammarReasonUnauthorized, "session does not resolve to the claimed address")
-	}
+// to its own logical address, via run.AcceptAnswer: answerer is the
+// answering session's address as SendMessage re-derived it from the
+// session row inside this transaction, and the destination is derived
+// from the question's own sender, never from send.Recipient.
+func acceptSessionAnswer(ctx context.Context, tx *sql.Tx, send *app.MessageSend, answerer run.Address, record func(kind app.MessageOutcomeKind, messageID identity.MessageID, reason, detail string) error, now time.Time) error {
 	if send.ReplyTo == nil {
 		return record(app.MessageMalformed, "", app.GrammarReasonMalformed, "answer requires reply-to")
 	}
@@ -322,16 +326,6 @@ func recordAnswerOutcome(ctx context.Context, tx *sql.Tx, outcomeVal *run.Answer
 		// shape failure, not an authorization one.
 		return record(app.MessageRefused, "", app.GrammarReasonMalformed, acceptErr.Error())
 	}
-}
-
-// sessionAddress re-derives sessionID's logical address from its own
-// session row; ok is false for a session with no messaging role.
-func sessionAddress(ctx context.Context, q querier, sessionID identity.SessionID) (run.Address, bool, error) {
-	session, _, err := getSession(ctx, q, sessionID)
-	if err != nil {
-		return run.Address{}, false, err
-	}
-	return resolveSessionAddress(ctx, q, &session)
 }
 
 // answerDestinationClosed reports whether an answer's derived destination

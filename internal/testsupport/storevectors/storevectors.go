@@ -192,16 +192,22 @@ func MessageSendAnswerUnknownQuestion(runID identity.RunID, session identity.Ses
 	}
 }
 
-// MessageSendAnswerNotRecipientReason is MessageSendAnswerNotRecipient's
-// expected refusal reason token.
-const MessageSendAnswerNotRecipientReason = app.GrammarReasonUnauthorized
+// MessageSendAnswerNotRecipientReason and
+// MessageSendAnswerNotRecipientDetail are MessageSendAnswerNotRecipient's
+// expected refusal reason token and detail — the detail is what separates
+// this refusal from MessageSendClaimedAddressMismatch's, which shares the
+// token.
+const (
+	MessageSendAnswerNotRecipientReason = app.GrammarReasonUnauthorized
+	MessageSendAnswerNotRecipientDetail = "session is not the question's recipient"
+)
 
 // MessageSendAnswerNotRecipient returns a MessagingStore.SendMessage request
 // (Kind answer) from a current session of the run whose logical address
 // (senderAddress, its true resolved address) is NOT the recipient of
 // questionID — refused app.MessageRefused (reason
-// MessageSendAnswerNotRecipientReason), detail "session is not the
-// question's recipient", with no answer envelope created and the question
+// MessageSendAnswerNotRecipientReason), detail
+// MessageSendAnswerNotRecipientDetail, with no answer envelope created and the question
 // left unacknowledged: only the addressed recipient may answer (section 7),
 // so no session ever answers a human-addressed question and no task answers
 // another address's question.
@@ -238,6 +244,39 @@ func answerSend(runID identity.RunID, session identity.SessionID, senderAddress 
 		IncarnationID: incarnation, Kind: run.MessageAnswer, ReplyTo: &questionID,
 		BodyPath: bodyPath, BodyDigest: bodyDigest, BodyBytes: bodyBytes,
 	}
+}
+
+// MessageSendClaimedAddressMismatchReason and
+// MessageSendClaimedAddressMismatchDetail are
+// MessageSendClaimedAddressMismatch's expected refusal reason token and
+// detail.
+const (
+	MessageSendClaimedAddressMismatchReason = app.GrammarReasonUnauthorized
+	MessageSendClaimedAddressMismatchDetail = "session does not resolve to the claimed address"
+)
+
+// MessageSendClaimedAddressMismatch returns a MessagingStore.SendMessage
+// request from a current session of the run that claims claimedAddress as
+// its logical address when its own session row resolves to a different
+// address, or to none (a session with no messaging role) — refused
+// app.MessageRefused (reason MessageSendClaimedAddressMismatchReason),
+// detail MessageSendClaimedAddressMismatchDetail, with no envelope created:
+// every send re-derives the sender's address from its session row and
+// decides only by that, whatever the kind. Callers choose kind, recipient
+// (ignored for an answer) and replyTo (answers only, nil otherwise) so the
+// request is one the store WOULD accept from a session truly at
+// claimedAddress — otherwise an addressing or authority refusal, which
+// shares the reason token, would pass the test for the wrong reason.
+func MessageSendClaimedAddressMismatch(runID identity.RunID, session identity.SessionID, claimedAddress run.Address, incarnation identity.IncarnationID, messageID identity.MessageID, kind run.MessageKind, recipient run.Address, replyTo *identity.MessageID, bodyPath, bodyDigest string, bodyBytes int64) app.MessageSend {
+	send := app.MessageSend{
+		ID: messageID, RunID: runID, Sender: run.SessionPrincipal(session), SenderAddress: claimedAddress,
+		IncarnationID: incarnation, Kind: kind, ReplyTo: replyTo,
+		BodyPath: bodyPath, BodyDigest: bodyDigest, BodyBytes: bodyBytes,
+	}
+	if kind != run.MessageAnswer {
+		send.Recipient = recipient
+	}
+	return send
 }
 
 // MessageSendCrossRunReason is MessageSendCrossRun's expected refusal

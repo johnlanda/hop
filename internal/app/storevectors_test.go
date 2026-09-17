@@ -238,8 +238,8 @@ func TestStoreVectors(t *testing.T) {
 		if err != nil {
 			t.Fatalf("SendMessage() error = %v", err)
 		}
-		if got.Kind != app.MessageRefused || got.Reason != storevectors.MessageSendAnswerNotRecipientReason {
-			t.Fatalf("SendMessage(answer by a non-recipient) = %+v, want refused/%s", got, storevectors.MessageSendAnswerNotRecipientReason)
+		if got.Kind != app.MessageRefused || got.Reason != storevectors.MessageSendAnswerNotRecipientReason || got.Detail != storevectors.MessageSendAnswerNotRecipientDetail {
+			t.Fatalf("SendMessage(answer by a non-recipient) = %+v, want refused/%s %q", got, storevectors.MessageSendAnswerNotRecipientReason, storevectors.MessageSendAnswerNotRecipientDetail)
 		}
 		if _, exists := tc.Store.Messages[answerID]; exists {
 			t.Fatal("refused answer created an envelope; want none")
@@ -283,6 +283,66 @@ func TestStoreVectors(t *testing.T) {
 				t.Fatalf("refused answer left envelope %s for the closed task; want none", id)
 			}
 		}
+	})
+
+	t.Run("MessageSendClaimedAddressMismatch", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		fr, workerB, workerC := seedTwoWorkers(t, tc)
+		fromC := workerC.question(t, tc, fr.RunID, run.ManagerAddress(), nil)
+		if outcome, err := tc.Controller.Messages.SendMessage(context.Background(), fromC); err != nil || outcome.Kind != app.MessageAccepted {
+			t.Fatalf("seed task C question: %+v, %v", outcome, err)
+		}
+		cases := []struct {
+			name    string
+			claimed run.Address
+			kind    run.MessageKind
+			to      run.Address
+			replyTo *identity.MessageID
+		}{
+			{"a worker claiming manager sends info to another task", run.ManagerAddress(), run.MessageInfo, workerC.address, nil},
+			{"a worker claiming manager asks the human", run.ManagerAddress(), run.MessageQuestion, run.HumanAddress(), nil},
+			{"a worker claiming manager answers a manager-addressed question", run.ManagerAddress(), run.MessageAnswer, run.Address{}, &fromC.ID},
+			{"a worker claiming another task asks the manager", workerC.address, run.MessageQuestion, run.ManagerAddress(), nil},
+		}
+		for _, c := range cases {
+			t.Run(c.name, func(t *testing.T) {
+				messageID := mintMessageID(t, tc)
+				got, err := tc.Controller.Messages.SendMessage(context.Background(), storevectors.MessageSendClaimedAddressMismatch(
+					fr.RunID, workerB.session, c.claimed, workerB.incarnation, messageID, c.kind, c.to, c.replyTo, "/state/body.md", "digest", 3,
+				))
+				if err != nil {
+					t.Fatalf("SendMessage() error = %v", err)
+				}
+				if got.Kind != app.MessageRefused || got.Reason != storevectors.MessageSendClaimedAddressMismatchReason || got.Detail != storevectors.MessageSendClaimedAddressMismatchDetail {
+					t.Fatalf("SendMessage(claimed address) = %+v, want refused/%s %q", got, storevectors.MessageSendClaimedAddressMismatchReason, storevectors.MessageSendClaimedAddressMismatchDetail)
+				}
+				if _, exists := tc.Store.Messages[messageID]; exists {
+					t.Fatal("the refused send created an envelope; want none")
+				}
+			})
+		}
+		if n := fakeAnswersTo(tc, fromC.ID); n != 0 {
+			t.Errorf("task C's question has %d answers after the refused claim; want none", n)
+		}
+
+		t.Run("a session with no messaging role claims a task address", func(t *testing.T) {
+			solo := newTestController(defaultPolicy())
+			_, detail := startedRun(t, solo)
+			messageID := mintMessageID(t, solo)
+			got, err := solo.Store.SendMessage(context.Background(), storevectors.MessageSendClaimedAddressMismatch(
+				detail.RunID, detail.SessionID, run.TaskAddress(detail.TaskID), detail.Binding.IncarnationID, messageID,
+				run.MessageQuestion, run.ManagerAddress(), nil, "/state/body.md", "digest", 3,
+			))
+			if err != nil {
+				t.Fatalf("SendMessage() error = %v", err)
+			}
+			if got.Kind != app.MessageRefused || got.Reason != storevectors.MessageSendClaimedAddressMismatchReason || got.Detail != storevectors.MessageSendClaimedAddressMismatchDetail {
+				t.Fatalf("SendMessage(solo session) = %+v, want refused/%s %q", got, storevectors.MessageSendClaimedAddressMismatchReason, storevectors.MessageSendClaimedAddressMismatchDetail)
+			}
+			if len(solo.Store.Messages) != 0 {
+				t.Fatalf("the refused send left %d envelopes; want none", len(solo.Store.Messages))
+			}
+		})
 	})
 
 	t.Run("MessageSendCrossRun", func(t *testing.T) {
