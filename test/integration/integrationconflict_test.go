@@ -50,6 +50,12 @@ func TestRealProcessIntegrationConflict(t *testing.T) {
 
 	t1 := fx.requireTaskBySeq(t, 1)
 	t2 := fx.requireTaskBySeq(t, 2)
+	// worker-conflict submits at once (no barrier), so t2 can already be
+	// well past "active" by the first poll; wait for the attempt ROW
+	// itself rather than racing a specific task state.
+	if !waitUntil(func() bool { return fx.attemptCount(t, t2) > 0 }) {
+		t.Fatalf("no attempt ever reserved for task %s", t2)
+	}
 
 	attempt1ID, attempt1Number := fx.currentAttempt(t, t2)
 	if attempt1Number != 1 {

@@ -75,6 +75,12 @@ func TestRealProcessCombinedCheckFailure(t *testing.T) {
 	fx := startFeatureRun(t, artifacts, server, repo, scratchDir, brief)
 
 	t1 := fx.requireTaskBySeq(t, 1)
+	// worker-implement submits at once (no barrier), so t1 can already be
+	// well past "active" by the first poll; wait for the attempt ROW
+	// itself rather than racing a specific task state.
+	if !waitUntil(func() bool { return fx.attemptCount(t, t1) > 0 }) {
+		t.Fatalf("no attempt ever reserved for task %s", t1)
+	}
 	attempt1ID, attempt1Number := fx.currentAttempt(t, t1)
 	if attempt1Number != 1 {
 		t.Fatalf("first attempt number = %d, want 1", attempt1Number)
