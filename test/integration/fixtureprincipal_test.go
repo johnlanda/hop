@@ -1793,86 +1793,108 @@ func TestFixtureWorkerHoldBarrier(t *testing.T) {
 	}
 }
 
-// TestFixtureWorkerHoldFetchLoopFatalsOnUnexpectedRefusal proves the fatal
-// path: fetchDeliveredMessage (shared by worker-hold and
-// worker-fetch-crash's own msg-wait fetch loop) must fatalf on any hop msg
-// wait outcome that is neither a delivered message, "none:", "transient:",
-// nor a line carrying the pre-binding launch window's own fetch authority
-// refusal text (fixtureMessagingUnauthorizedText) -- never spin silently
-// against a permanent regression.
+// TestFixtureWorkerHoldFetchLoopFatalsOnUnexpectedRefusal proves BOTH of
+// fetchDeliveredMessage's fatal shapes (shared by worker-hold and
+// worker-fetch-crash's own msg-wait fetch loop) -- never spin silently
+// against a permanent regression:
+//   - a hop msg wait outcome that is neither a delivered message, "none:"
+//     nor "transient:" fatalf's, naming the exact line;
+//   - a line carrying the messaging-unauthorized fetch refusal's stable
+//     substring (fixtureMessagingUnauthorizedText) ALSO fatalf's, with its
+//     own distinct message: main's own address/session-currency fix
+//     (LAUNCH-7) serves a current session's pre-binding-window fetch
+//     whenever its own pending launch intent agrees, so this outcome is
+//     an authority bug to fail loudly on, never a benign race to retry
+//     past.
 func TestFixtureWorkerHoldFetchLoopFatalsOnUnexpectedRefusal(t *testing.T) {
-	artifacts := newArtifactDir(t)
-	worker := buildFixtureWorker(t, artifacts)
-	fakeHop := buildFakeHopStub(t, artifacts)
-	repo := newFixtureRepo(t, artifacts, nil, "repo")
+	cases := []struct {
+		name          string
+		block         string
+		wantFatalText string
+	}{
+		{
+			name:          "a genuinely unexpected refusal",
+			block:         "refused: not-found\n",
+			wantFatalText: `fixture principal: hop msg wait returned an unexpected line: "refused: not-found"`,
+		},
+		{
+			name: "the messaging-unauthorized fetch refusal, fatal per LAUNCH-7",
+			block: "hop msg wait: app: fetch message: app: messaging session is not authorized for this request: " +
+				"session is not its task's current attempt session\n",
+			wantFatalText: "fixture principal: hop msg wait returned an unauthorized fetch refusal for what should be a current session",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			artifacts := newArtifactDir(t)
+			worker := buildFixtureWorker(t, artifacts)
+			fakeHop := buildFakeHopStub(t, artifacts)
+			repo := newFixtureRepo(t, artifacts, nil, "repo")
 
-	stateDir := artifacts.dir(t, "state")
-	scratchDir := artifacts.dir(t, "worker-hold-fatal-scratch")
-	const (
-		runID     = "12121212-1212-4212-8212-121212121212"
-		taskID    = "13131313-1313-4313-8313-131313131313"
-		attemptID = "14141414-1414-4414-8414-141414141414"
-	)
-	assignmentPath := filepath.Join(stateDir, "runs", runID, "attempts", attemptID, "assignment.md")
-	if err := os.MkdirAll(filepath.Dir(assignmentPath), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(assignmentPath, []byte("# HOP Task Assignment\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	instructionsPath := filepath.Join(stateDir, "runs", runID, "tasks", taskID+".md")
-	if err := os.MkdirAll(filepath.Dir(instructionsPath), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(instructionsPath, []byte("FIXTURE-BEHAVIOR: worker-hold "+scratchDir+"\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+			stateDir := artifacts.dir(t, "state")
+			scratchDir := artifacts.dir(t, "worker-hold-fatal-scratch")
+			const (
+				runID     = "12121212-1212-4212-8212-121212121212"
+				taskID    = "13131313-1313-4313-8313-131313131313"
+				attemptID = "14141414-1414-4414-8414-141414141414"
+			)
+			assignmentPath := filepath.Join(stateDir, "runs", runID, "attempts", attemptID, "assignment.md")
+			if err := os.MkdirAll(filepath.Dir(assignmentPath), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(assignmentPath, []byte("# HOP Task Assignment\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			instructionsPath := filepath.Join(stateDir, "runs", runID, "tasks", taskID+".md")
+			if err := os.MkdirAll(filepath.Dir(instructionsPath), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(instructionsPath, []byte("FIXTURE-BEHAVIOR: worker-hold "+scratchDir+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
 
-	scriptDir := artifacts.dir(t, "worker-hold-fatal-script")
-	// A hop msg wait outcome that is none of the tolerated shapes: not a
-	// delivered message, not "none:", not "transient:", and carrying none
-	// of the pre-binding launch window's own fetch authority refusal
-	// text.
-	blocks := []string{"refused: not-found\n"}
-	scriptPath, indexPath := writeFakeHopMsgScript(t, scriptDir, blocks)
-	logPath := filepath.Join(scriptDir, "log.txt")
+			scriptDir := artifacts.dir(t, "worker-hold-fatal-script")
+			scriptPath, indexPath := writeFakeHopMsgScript(t, scriptDir, []string{tc.block})
+			logPath := filepath.Join(scriptDir, "log.txt")
 
-	prompt := testAssignmentPrompt(assignmentPath, fakeHop)
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, worker, "--session-id", "15151515-1515-4515-8515-151515151515", prompt) //nolint:gosec // G204: fixed test-owned binary and arguments.
-	cmd.Dir = repo.Root
-	cmd.Env = []string{
-		"PATH=" + os.Getenv("PATH"),
-		"HOP_STATE_DIR=" + stateDir,
-		"HOP_RUN_ID=" + runID,
-		"HOP_TASK_ID=" + taskID,
-		"HOP_ATTEMPT_ID=" + attemptID,
-		"HOP_SESSION_ID=15151515-1515-4515-8515-151515151515",
-		"HOP_INCARNATION_ID=16161616-1616-4616-8616-161616161616",
-		"HOP_ROLE=implementer",
-		"FAKE_HOP_MSG_SCRIPT=" + scriptPath,
-		"FAKE_HOP_MSG_INDEX=" + indexPath,
-		"FAKE_HOP_LOG=" + logPath,
-	}
-	var out strings.Builder
-	cmd.Stdout, cmd.Stderr = &out, &out
-	err := cmd.Run()
-	if err == nil {
-		t.Fatalf("worker-hold exited 0 despite an unexpected hop msg wait refusal; output:\n%s", out.String())
-	}
-	exitErr, ok := err.(*exec.ExitError) //nolint:errorlint // a direct type assertion suffices for this test's own exec of a single known binary.
-	if !ok {
-		t.Fatalf("run error = %v (%T), want *exec.ExitError", err, err)
-	}
-	if exitErr.ExitCode() != 1 {
-		t.Fatalf("exit code = %d, want 1 (fatalf); output:\n%s", exitErr.ExitCode(), out.String())
-	}
-	if !strings.Contains(out.String(), `fixture principal: hop msg wait returned an unexpected line: "refused: not-found"`) {
-		t.Errorf("output missing the expected fatalf message; got:\n%s", out.String())
-	}
-	if strings.Contains(out.String(), "FIXTURE-HOLD-RELEASED") || strings.Contains(out.String(), "FIXTURE-WORKER-IDLE") {
-		t.Errorf("worker-hold proceeded past the unexpected refusal instead of fatal-ing; output:\n%s", out.String())
+			prompt := testAssignmentPrompt(assignmentPath, fakeHop)
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, worker, "--session-id", "15151515-1515-4515-8515-151515151515", prompt) //nolint:gosec // G204: fixed test-owned binary and arguments.
+			cmd.Dir = repo.Root
+			cmd.Env = []string{
+				"PATH=" + os.Getenv("PATH"),
+				"HOP_STATE_DIR=" + stateDir,
+				"HOP_RUN_ID=" + runID,
+				"HOP_TASK_ID=" + taskID,
+				"HOP_ATTEMPT_ID=" + attemptID,
+				"HOP_SESSION_ID=15151515-1515-4515-8515-151515151515",
+				"HOP_INCARNATION_ID=16161616-1616-4616-8616-161616161616",
+				"HOP_ROLE=implementer",
+				"FAKE_HOP_MSG_SCRIPT=" + scriptPath,
+				"FAKE_HOP_MSG_INDEX=" + indexPath,
+				"FAKE_HOP_LOG=" + logPath,
+			}
+			var out strings.Builder
+			cmd.Stdout, cmd.Stderr = &out, &out
+			err := cmd.Run()
+			if err == nil {
+				t.Fatalf("worker-hold exited 0 despite an unexpected hop msg wait refusal; output:\n%s", out.String())
+			}
+			exitErr, ok := err.(*exec.ExitError) //nolint:errorlint // a direct type assertion suffices for this test's own exec of a single known binary.
+			if !ok {
+				t.Fatalf("run error = %v (%T), want *exec.ExitError", err, err)
+			}
+			if exitErr.ExitCode() != 1 {
+				t.Fatalf("exit code = %d, want 1 (fatalf); output:\n%s", exitErr.ExitCode(), out.String())
+			}
+			if !strings.Contains(out.String(), tc.wantFatalText) {
+				t.Errorf("output missing the expected fatalf message %q; got:\n%s", tc.wantFatalText, out.String())
+			}
+			if strings.Contains(out.String(), "FIXTURE-HOLD-RELEASED") || strings.Contains(out.String(), "FIXTURE-WORKER-IDLE") {
+				t.Errorf("worker-hold proceeded past the refusal instead of fatal-ing; output:\n%s", out.String())
+			}
+		})
 	}
 }
 

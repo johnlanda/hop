@@ -717,17 +717,21 @@ func parseDeliveredMessage(stdout string) (deliveredMessage, bool) {
 }
 
 // fixtureFetchLoopDeadline bounds how long fetchDeliveredMessage tolerates
-// a transient or pre-binding refusal before giving up loudly, rather than
-// spinning silently forever against a permanent regression.
+// a transient refusal before giving up loudly, rather than spinning
+// silently forever against a permanent regression.
 const fixtureFetchLoopDeadline = 2 * time.Minute
 
 // fixtureMessagingUnauthorizedText mirrors internal/app/messaging.go's
 // ErrMessagingUnauthorized.Error() exactly (retyped, never imported): design
 // section 7's Fetch prints NO protocol line on stdout for any authority
-// refusal (the pre-binding launch window's own disagreeing/absent pending
-// intent included) -- only a stderr diagnostic ("hop msg wait: app: fetch
-// message: "+this text+": <detail>"), which runHopCLI's merged capture
-// still surfaces as the line's own stable substring.
+// refusal -- only a stderr diagnostic ("hop msg wait: app: fetch message: "
+// +this text+": <detail>"), which runHopCLI's merged capture still
+// surfaces as the line's own stable substring. Main's own address/session-
+// currency fix (LAUNCH-7) SERVES a pre-binding-window fetch whenever the
+// caller's pending launch intent agrees -- the launch intent is always
+// recorded before the pane starts, so a current fixture session's own
+// fetch is never refused this way anymore. Its appearance at all is
+// therefore an authority bug, never a benign race to retry past.
 const fixtureMessagingUnauthorizedText = "messaging session is not authorized for this request"
 
 // fetchDeliveredMessage runs "<hopPath> msg wait" in a loop until a
@@ -737,14 +741,14 @@ const fixtureMessagingUnauthorizedText = "messaging session is not authorized fo
 //   - "none: ..." (no message within the wait timeout) continues at once;
 //     the server-side wait itself already paced that call, so no sleep is
 //     added on top of it.
-//   - "transient: ..." -- and the pre-binding launch window's own fetch
-//     authority refusal, recognized by fixtureMessagingUnauthorizedText's
-//     stable substring (a fetch refusal carries no fixed first-line
-//     grammar of its own to match verbatim, unlike a send/ack/submit
-//     refusal) -- sleeps fixtureRetryInterval within
+//   - "transient: ..." sleeps fixtureRetryInterval within
 //     fixtureFetchLoopDeadline and prints the line.
-//   - anything else fatalf's immediately, naming the exact line, rather
-//     than looping silently against a permanent regression.
+//   - a line carrying fixtureMessagingUnauthorizedText's stable substring
+//     fatalf's at once, naming the line: a current fixture session is
+//     always served (LAUNCH-7), so this outcome means an authority bug,
+//     never something to retry past silently.
+//   - anything else also fatalf's immediately, naming the exact line,
+//     rather than looping silently against a permanent regression.
 func fetchDeliveredMessage(hopPath string) deliveredMessage {
 	deadline := time.Now().Add(fixtureFetchLoopDeadline)
 	for {
@@ -755,7 +759,9 @@ func fetchDeliveredMessage(hopPath string) deliveredMessage {
 		first := out.FirstLine()
 		switch {
 		case strings.HasPrefix(first, "none:"):
-		case strings.HasPrefix(first, "transient:"), strings.Contains(first, fixtureMessagingUnauthorizedText):
+		case strings.Contains(first, fixtureMessagingUnauthorizedText):
+			fatalf("hop msg wait returned an unauthorized fetch refusal for what should be a current session (main serves an agreeing pre-binding intent -- LAUNCH-7): %q", first)
+		case strings.HasPrefix(first, "transient:"):
 			if !time.Now().Before(deadline) {
 				fatalf("hop msg wait kept returning %q past the %s retry deadline", first, fixtureFetchLoopDeadline)
 			}
