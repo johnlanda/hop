@@ -213,3 +213,66 @@ func TestWorkerExitAfterRestartIsNotObserved(t *testing.T) {
 		}
 	}
 }
+
+// placedUnrecordedLifetimeText retypes placedUnrecordedLifetimeDetail's
+// rendered text — never derived from it — so a drift in either fails here.
+func placedUnrecordedLifetimeText(label string) string {
+	return "the pane is absent by id and by launch label " + label +
+		", but this session's placement recorded no server identity, so continuity with it can never be established and no absence is ever concluded here; nothing was renamed, so renaming a pane back cannot resolve it — confirm no agent of this session is still running before reusing this run's workspace"
+}
+
+// clearBindingServerInstance rewrites one session's current binding to
+// have recorded no server identity, the shape a placement takes when the
+// lifetime read failed, or on any platform that has no lifetime identity
+// at all.
+func clearBindingServerInstance(t *testing.T, tc *testController, sessionID identity.SessionID) {
+	t.Helper()
+	history := tc.Store.Bindings[sessionID]
+	if len(history) == 0 {
+		t.Fatalf("no binding history for session %s", sessionID)
+	}
+	history[len(history)-1].ServerInstance = ""
+}
+
+// TestPlacementWithNoRecordedLifetimeGetsItsOwnAction pins the OTHER way
+// the continuity conjunct fails, which is not the restart case: a
+// placement that recorded no server identity can never establish
+// continuity with any observation, so stop still concludes no absence —
+// but nothing was renamed, and telling the operator to rename a pane back
+// would send them after a pane that never existed under another name. The
+// two failures are told apart in what the human is told, and only in that:
+// neither concludes absence.
+func TestPlacementWithNoRecordedLifetimeGetsItsOwnAction(t *testing.T) {
+	tc := newTestController(defaultPolicy())
+	handle, detail := runningRun(t, tc)
+	clearBindingServerInstance(t, tc, detail.SessionID)
+	if err := tc.Controller.RequestStop(context.Background(), detail.RunID.String()); err != nil {
+		t.Fatalf("RequestStop() error = %v", err)
+	}
+	// The pane is positively absent by id and by label, and the server
+	// answers its ordinary lifetime: the ONLY thing missing is the
+	// placement's own recorded identity.
+	tc.Runtime.InspectPaneFn = allPanesAbsentPinned
+
+	report, err := tc.Controller.DriveStop(context.Background(), handle)
+	if err != nil {
+		t.Fatalf("DriveStop() error = %v", err)
+	}
+	if report.Terminated || report.RunState != string(run.RunStopping) {
+		t.Fatalf("stop of a placement with no recorded lifetime = %+v, want stopping with nothing terminated", report)
+	}
+	if len(tc.Runtime.ClosedPanes) != 0 {
+		t.Fatalf("panes closed = %v, want none: absence was never concluded", tc.Runtime.ClosedPanes)
+	}
+
+	label := detail.Binding.CreationLabel
+	want := placedUnrecordedLifetimeText(label)
+	if !slices.ContainsFunc(report.Outstanding, func(entry string) bool { return strings.Contains(entry, want) }) {
+		t.Fatalf("outstanding = %q, want an entry carrying the unrecorded-lifetime action %q", report.Outstanding, want)
+	}
+	// And NOT the restart case's action: renaming a pane back cannot
+	// resolve a placement that recorded no identity to compare against.
+	if renameBack := placedContinuityText(label); slices.ContainsFunc(report.Outstanding, func(entry string) bool { return strings.Contains(entry, renameBack) }) {
+		t.Fatalf("outstanding = %q, want no rename-back action: nothing was renamed", report.Outstanding)
+	}
+}

@@ -1068,6 +1068,28 @@ occupant to the recorded process. The candidate human exits (an
 attestation accepted as stop evidence, or a positively identified close
 decided within the observing lifetime) are pending decisions.
 
+RESIDUAL, the second one, and wider: continuity compares the lifetime a
+placement RECORDED against the one observed, so a placement that recorded
+NO lifetime can never establish it — for any observation, at any later
+time. Such a session is never concluded absent by stop, feature stop, the
+per-attempt retirement or the live self-exit observation: the run stays
+`stopping`, or the slot stays occupied, exactly as above but with no
+restart involved. Two things reach this state. A lifetime read that fails
+while the pane create that follows it succeeds records `""` — narrow, but
+permanent once it happens. And `Runtime.ServerInstance` is implemented on
+darwin alone, yielding `""` everywhere else, so on every other platform
+this is not an edge case but the shape of EVERY placement.
+
+It is stated here rather than closed because the obvious fix is worse
+than the defect: refusing a placement that recorded no lifetime would
+mean HOP cannot launch anything at all off darwin. What this slice does
+instead is tell the two failures apart in what the human is told — the
+restart case keeps the rename-back action, and an unrecorded lifetime
+gets its own, since nothing was renamed and renaming nothing back
+resolves nothing. The exit itself is the same pending human decision the
+residual above names; it is deliberately NOT covered by that residual's
+wording, which is scoped to a session placed before a restart.
+
 ### Bounded concurrency
 
 `MaxWorkers` (default 2) bounds the count of non-terminal, non-manager
