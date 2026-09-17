@@ -82,10 +82,7 @@ func TestRealProcessWorkerInterruption(t *testing.T) {
 	// accepted result, its own launch already settled) — the live
 	// controller, never a crashed one, must reconcile this on its own
 	// next scheduling pass.
-	killed := fx.killSession(t, session1ID)
-	if killed <= 0 {
-		t.Fatalf("killSession returned a non-positive pid %d", killed)
-	}
+	fx.killSession(t, session1ID, attempt1ID)
 
 	// Attempt 1 interrupts, task moves to needs-rework, session terminates
 	// — all in the settlement transaction — and the manager receives the

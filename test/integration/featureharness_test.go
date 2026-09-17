@@ -7,7 +7,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -319,43 +318,33 @@ func (f *featureRun) requireManagerFirstAgentTokens(t *testing.T, managerPaneID 
 	assertManagerFirst(t, tokens, managerPaneID)
 }
 
-// foregroundPID returns sessionID's current launch claim pid, asserting
-// it is among paneID's observed foreground members — mirrors pgroup_test.
-// go's fixtureRun.workerForegroundPID, generalized to any role: the
-// claimed pid is always the identifying evidence, never a listing index
-// (every principal, any role, spawns a same-pgid MCP stand-in child).
-func (f *featureRun) foregroundPID(t *testing.T, sessionID, paneID string) int {
-	t.Helper()
-	row := f.scalar(t, fmt.Sprintf("SELECT pid FROM launch_claims WHERE session_id = '%s' ORDER BY claimed_at DESC, rowid DESC LIMIT 1;", sessionID))
-	pid, err := strconv.Atoi(row)
-	if err != nil || pid <= 0 {
-		t.Fatalf("launch claim pid for session %s = %q, want a positive pid", sessionID, row)
-	}
-	info := f.server.processInfo(t, paneID)
-	for _, p := range info.ForegroundProcesses {
-		if int(p.PID) == pid {
-			return pid
-		}
-	}
-	t.Fatalf("claimed pid %d for session %s is not among pane %s's foreground members: %+v", pid, sessionID, paneID, info.ForegroundProcesses)
-	return 0
-}
-
-// killSession SIGKILLs sessionID's own foreground process (located by its
-// launch claim's pid, never a listing index) and waits for the pane to
-// close itself (a layout.apply command pane has no shell, S6), returning
-// the killed pid.
-func (f *featureRun) killSession(t *testing.T, sessionID string) (pid int) {
+// killSession ends attemptID's own launched process by asking it to kill
+// ITSELF, then waits for its pane to close (a layout.apply command pane
+// has no shell, S6). This is never a raw OS signal to an externally
+// OBSERVED pid: Astra review finding P1 established that the test does
+// not own that pid's wait/reap lifecycle, so nothing pins it between an
+// observation (e.g. via pane.process_info) and a signal — Herdr could
+// reap the process and the OS could recycle its pid before the test's
+// own signal call ran, killing an unrelated process instead. Writing the
+// control file watchForSelfKill polls for (fixtureWorkerSource, under
+// the run's own scratch directory — never HOP_STATE_DIR, never pane
+// input) asks the VERIFIED process to kill itself, closing that window
+// entirely: no pid the test never independently re-verifies is ever
+// signaled.
+func (f *featureRun) killSession(t *testing.T, sessionID, attemptID string) {
 	t.Helper()
 	paneID := f.requirePane(t, sessionID)
-	pid = f.foregroundPID(t, sessionID, paneID)
-	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
-		t.Fatalf("kill session %s pid %d: %v", sessionID, pid, err)
+	controlPath := filepath.Join(f.scratchDir, "self-kill-"+attemptID)
+	tmp := controlPath + ".tmp"
+	if err := os.WriteFile(tmp, []byte("FIXTURE-SELF-KILL\n"), 0o600); err != nil {
+		t.Fatalf("write self-kill control file for attempt %s: %v", attemptID, err)
+	}
+	if err := os.Rename(tmp, controlPath); err != nil {
+		t.Fatalf("rename self-kill control file into place for attempt %s: %v", attemptID, err)
 	}
 	if !waitUntil(func() bool { return !f.server.paneExists(t, paneID) }) {
-		t.Fatalf("pane %s still exists after session %s's foreground process was killed", paneID, sessionID)
+		t.Fatalf("pane %s still exists after attempt %s's self-kill control file was written", paneID, attemptID)
 	}
-	return pid
 }
 
 // relayedQuestionFor finds the human-addressed question whose relay chain
@@ -688,8 +677,8 @@ func (f *featureRun) allIntegrationWindows(t *testing.T) []integrationWindow {
 }
 
 // launchClaimPID reports one session's newest recorded launch claim pid,
-// if any — unlike foregroundPID, this needs no live pane, so it remains
-// usable for provenance assertions after a session has already retired.
+// if any — needs no live pane, so it remains usable for provenance
+// assertions after a session has already retired.
 func (f *featureRun) launchClaimPID(t *testing.T, sessionID string) (pid int, ok bool) {
 	t.Helper()
 	row := f.scalar(t, fmt.Sprintf("SELECT pid FROM launch_claims WHERE session_id = '%s' ORDER BY claimed_at DESC, rowid DESC LIMIT 1;", sessionID))

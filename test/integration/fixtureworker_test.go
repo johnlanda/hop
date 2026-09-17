@@ -2,6 +2,7 @@ package integration
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -9,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -196,6 +198,34 @@ func spawnMCPStandIn() {
 // open by the parent) reaches EOF, then exit.
 func mcpStandIn() {
 	_, _ = io.Copy(io.Discard, os.Stdin)
+}
+
+// selfKillPollInterval paces watchForSelfKill's poll for the test's
+// self-kill control file.
+const selfKillPollInterval = 100 * time.Millisecond
+
+// watchForSelfKill polls for controlPath — a test-owned file under the
+// run's scratch directory, never HOP_STATE_DIR, never pane input — and
+// SIGKILLs this process's OWN pid (os.Getpid()) the instant it appears.
+// This is the only safe way a test ends a launched principal's process
+// from outside: a test may OBSERVE this process's pid (via
+// pane.process_info), but signaling an externally observed pid directly
+// races the OS's own pid-reuse window between observation and signal —
+// Herdr could reap this process and the kernel could recycle its pid
+// before the test's own signal call executes, killing an unrelated
+// process instead (Astra review finding P1). Asking the verified process
+// to kill itself closes that window: no other process is ever named by
+// the pid the test's signal ultimately targets. Runs forever in its own
+// goroutine; the process exits from this or on its own, whichever is
+// first.
+func watchForSelfKill(controlPath string) {
+	for {
+		if _, err := os.Stat(controlPath); err == nil {
+			_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
+			return
+		}
+		time.Sleep(selfKillPollInterval)
+	}
 }
 
 // isResumeInvocation reports whether argv is a resume-SHAPED invocation:
@@ -740,6 +770,15 @@ func runWorker() {
 	observationPath := filepath.Join(filepath.Dir(assignmentPath), "worker-observed.txt")
 	if scratchDir != "" {
 		observationPath = filepath.Join(scratchDir, "worker-observed-"+env["HOP_ATTEMPT_ID"]+".txt")
+		// A real-process scenario that ends this attempt mid-flight (design
+		// section 11 scenario 4) must never signal a pid it only OBSERVED
+		// via pane.process_info: Herdr could reap and the OS could recycle
+		// that pid before the signal lands (Astra review finding P1). This
+		// watcher is the ONLY safe channel — the test asks this verified
+		// process to kill ITSELF (os.Getpid()) by writing a control file
+		// under the run's own scratch directory, never HOP_STATE_DIR and
+		// never a pane/typed-input path.
+		go watchForSelfKill(filepath.Join(scratchDir, "self-kill-"+env["HOP_ATTEMPT_ID"]))
 	}
 	writeObservation(observationPath, cmp(role, "solo"), assignmentPath, promptAssignmentPath, hopPath, assignmentContent, behavior, behaviorArgs)
 	fmt.Println("FIXTURE-WORKER-READY")
@@ -1753,4 +1792,102 @@ func (o workerObservation) HasEnvName(name string) bool {
 		}
 	}
 	return false
+}
+
+// TestFixtureWorkerSelfKillOnControlFile proves the fixture principal's
+// self-kill watcher (Astra review finding P1: a real-process scenario
+// must never signal a pid it only OBSERVED via pane.process_info — the
+// OS could recycle it between observation and signal). Drives a
+// worker-hold implementer directly (no herdr, no pane) until it has sent
+// its own barrier question — genuinely blocked in its own hop msg wait
+// loop, exactly the state a real scenario kills it in — then writes the
+// self-kill control file the SAME way featureharness_test.go's
+// killSession does, and asserts the process terminates by SIGKILL of its
+// OWN doing, never a signal this test aimed at an externally observed pid.
+func TestFixtureWorkerSelfKillOnControlFile(t *testing.T) {
+	artifacts := newArtifactDir(t)
+	worker := buildFixtureWorker(t, artifacts)
+	fakeHop := buildFakeHopStub(t, artifacts)
+	repo := newFixtureRepo(t, artifacts, nil, "repo")
+
+	stateDir := artifacts.dir(t, "state")
+	scratchDir := artifacts.dir(t, "scratch")
+	const (
+		runID     = "d3d3d3d3-d3d3-4d3d-8d3d-d3d3d3d3d3d3"
+		taskID    = "e4e4e4e4-e4e4-4e4e-8e4e-e4e4e4e4e4e4"
+		attemptID = "f5f5f5f5-f5f5-4f5f-8f5f-f5f5f5f5f5f5"
+		sessionID = "a6a6a6a6-a6a6-4a6a-8a6a-a6a6a6a6a6a6"
+	)
+	assignmentPath := filepath.Join(stateDir, "runs", runID, "attempts", attemptID, "assignment.md")
+	if err := os.MkdirAll(filepath.Dir(assignmentPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(assignmentPath, []byte("# HOP Task Assignment\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	instructionsPath := filepath.Join(stateDir, "runs", runID, "tasks", taskID+".md")
+	if err := os.MkdirAll(filepath.Dir(instructionsPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(instructionsPath, []byte("FIXTURE-BEHAVIOR: worker-hold "+scratchDir+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(artifacts.dir(t, "log"), "log.txt")
+
+	prompt := testAssignmentPrompt(assignmentPath, fakeHop)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, worker, "--session-id", sessionID, prompt) //nolint:gosec // G204: fixed test-owned binary and arguments.
+	cmd.Dir = repo.Root
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOP_STATE_DIR=" + stateDir,
+		"HOP_RUN_ID=" + runID,
+		"HOP_TASK_ID=" + taskID,
+		"HOP_ATTEMPT_ID=" + attemptID,
+		"HOP_SESSION_ID=" + sessionID,
+		"HOP_INCARNATION_ID=b7b7b7b7-b7b7-4b7b-8b7b-b7b7b7b7b7b7",
+		"HOP_ROLE=implementer",
+		"FAKE_HOP_LOG=" + logPath,
+	}
+	var out strings.Builder
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start fixture worker: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			t.Logf("cleanup: kill fixture worker: %v", err)
+		}
+	})
+
+	if !waitUntil(func() bool { return strings.Contains(out.String(), "FIXTURE-HOLD-SENT") }) {
+		t.Fatalf("worker never reported sending its barrier question; output so far:\n%s", out.String())
+	}
+
+	controlPath := filepath.Join(scratchDir, "self-kill-"+attemptID)
+	tmp := controlPath + ".tmp"
+	if err := os.WriteFile(tmp, []byte("FIXTURE-SELF-KILL\n"), 0o600); err != nil {
+		t.Fatalf("write self-kill control file: %v", err)
+	}
+	if err := os.Rename(tmp, controlPath); err != nil {
+		t.Fatalf("rename self-kill control file into place: %v", err)
+	}
+
+	waitErr := cmd.Wait()
+	if waitErr == nil {
+		t.Fatalf("worker exited 0 after the self-kill control file was written; want it SIGKILLed; output:\n%s", out.String())
+	}
+	exitErr, ok := waitErr.(*exec.ExitError) //nolint:errorlint // a direct type assertion suffices for this test's own exec of a single known binary.
+	if !ok {
+		t.Fatalf("worker wait error = %v (%T), want *exec.ExitError", waitErr, waitErr)
+	}
+	ws, ok := exitErr.Sys().(syscall.WaitStatus)
+	if !ok {
+		t.Fatalf("worker exit status %#v is not a syscall.WaitStatus", exitErr.Sys())
+	}
+	if !ws.Signaled() || ws.Signal() != syscall.SIGKILL {
+		t.Fatalf("worker exit status = %+v, want signaled by SIGKILL", ws)
+	}
 }
