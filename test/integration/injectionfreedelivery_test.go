@@ -75,14 +75,23 @@ func sha256HexOf(content string) string {
 // TestRealProcessInjectionFreeDelivery is design section 11 scenario 7:
 // the brief, a task's instructions and a manager answer are seeded with
 // hostile bytes (ANSI escapes, a bracketed-paste open/close pair, "y"
-// plus newline, and control characters); every fixture principal that
-// receives one validates byte-exact delivery (this test's own read of
-// the durable artifact file, cross-checked against the RECEIVING
-// process's own independent os.ReadFile, captured in its observation
-// dump); and the disposable server's own request log, captured at the
-// S11-pinned elevated level for the whole run, proves zero requests to
-// any of Herdr's six real terminal-input methods other than one
-// identified positive control.
+// plus newline, and control characters); byte-exact delivery is proven
+// against the durable artifact file each channel actually is (this
+// test's own read), cross-checked against the RECEIVING process's own
+// independent os.ReadFile wherever that process dumps the SAME document
+// (the brief: the manager's own assignment.md, dumped verbatim in its
+// observation file; the answer: the message's stored body_digest,
+// cryptographic corroboration in place of a dump no behavior writes) --
+// the task instructions channel is the one exception: a feature-mode
+// implementer's own per-attempt assignment.md is a separate templated
+// document that only NAMES the instructions file by path, so its
+// observation dump cannot be compared to the instructions content
+// directly (see the comment at that assertion); the worker's own
+// successful parse of the hostile first line, proven by it reaching
+// worker-hold behavior at all, stands in instead. The disposable
+// server's own request log, captured at the S11-pinned elevated level
+// for the whole run, proves zero requests to any of Herdr's six real
+// terminal-input methods other than one identified positive control.
 //
 // The manager session here is deliberately UNSCRIPTED (its
 // FIXTURE-BEHAVIOR directive is absent -- the entire brief IS the
@@ -182,10 +191,22 @@ func TestRealProcessInjectionFreeDelivery(t *testing.T) {
 		t.Fatalf("task %s has no recorded instructions_path", taskID)
 	}
 	requireByteExactFile(t, instructionsArtifactPath, instructionsContent)
+	// Unlike the manager's own assignment.md (dumped verbatim above), a
+	// feature-mode implementer's per-attempt assignment.md is a SEPARATE
+	// templated document (internal/app/templates.go's renderAssignment)
+	// that only NAMES the task instructions file by path -- it never
+	// embeds its content -- so the worker's own observation dump cannot
+	// be compared against instructionsContent directly. What it DOES
+	// prove: the worker's own readFileOrFatal of THIS EXACT path
+	// (independently computed from HOP_* env, never copied from this
+	// test) succeeded and parsed the hostile first line correctly --
+	// parseBehavior would report "" otherwise, and this task would never
+	// have reached "worker-hold" behavior (it did: the barrier
+	// question below is proof by itself).
 	workerObservationPath := filepath.Join(scratchDir, "worker-observed-"+attemptID+".txt")
 	workerObs := waitForObservation(t, workerObservationPath)
-	if workerObs.AssignmentContent != instructionsContent {
-		t.Errorf("the worker fixture's OWN read of its task instructions (its observation dump) does not byte-exactly match what was delivered:\nprincipal observed: %q\nwant:               %q", workerObs.AssignmentContent, instructionsContent)
+	if workerObs.Fields["behavior"] != "worker-hold" {
+		t.Errorf("worker observation dump behavior = %q, want %q (proves the worker's own read of the hostile instructions file parsed correctly)", workerObs.Fields["behavior"], "worker-hold")
 	}
 
 	// Channel 3: a manager answer -- seeded entirely with hostile bytes,
