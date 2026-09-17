@@ -8,7 +8,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -290,11 +289,29 @@ func TestLiveClaudeDefaultProfileRun(t *testing.T) {
 	if !found {
 		t.Fatalf("launch claim pid %d not found among pane %s's foreground processes:\n%s", workerPID, firstPaneID, renderProcessInfo(info))
 	}
-	if err := syscall.Kill(workerPID, syscall.SIGKILL); err != nil {
-		t.Fatalf("kill live claude worker pid %d: %v", workerPID, err)
-	}
+	// End the pane through Herdr's own pane.close (this test's own server
+	// client, an owned action against the server it is already connected
+	// to) rather than a raw OS signal to workerPID: TEST-1 (test-safety),
+	// since that pid was only OBSERVED via pane.process_info above, never
+	// one this harness owns the Wait/reap lifecycle of — the OS could
+	// recycle it between observation and signal (Astra review finding P1,
+	// fixtureworker_test.go's watchForSelfKill doc comment). A real Claude
+	// process cannot be asked to self-kill via a control file the way the
+	// fixture can, so pane.close is the safe substitute here: a
+	// layout.apply command pane has no shell, its process IS the launched
+	// command directly (S6), and production's own per-attempt retirement
+	// and stop paths already rely on exactly this call to end a worker
+	// (docs/plan/phase-3-design.md section 6's close rule) — so closing the
+	// pane is guaranteed to end the underlying process, not merely detach
+	// from it. This changes nothing about the resume path under test: the
+	// same postcondition (pane gone by id, confirmed below, and therefore
+	// gone by label and process too) still drives hop resume --confirm-
+	// absent through the identical corroboration/absence logic and the
+	// same "cold-relaunched" disposition asserted afterward — only the
+	// mechanism producing that postcondition changed, not what is proved.
+	server.call(t, "pane.close", map[string]any{"pane_id": firstPaneID}, nil)
 	if !waitUntil(func() bool { return !server.paneExists(t, firstPaneID) }) {
-		t.Fatalf("pane %s still exists after its foreground worker was killed", firstPaneID)
+		t.Fatalf("pane %s still exists after pane.close", firstPaneID)
 	}
 	killControllerLeader(t, sp)
 	waitForLeaseExpiry(t, dbPath, runID)
