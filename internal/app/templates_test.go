@@ -154,6 +154,7 @@ func TestTemplatesQuoteGrammar(t *testing.T) {
 		GrammarRefusalLine("<reason-token>"),
 		"'/hop' status -C '/repo' -run 'r'",
 		GrammarShortfallVerdictRejected,
+		"naming " + GrammarShortfallEvidenceInconsistent + " is never a rejection",
 	} {
 		if !strings.Contains(manager, quote) {
 			t.Errorf("manager assignment does not quote %q", quote)

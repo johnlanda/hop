@@ -349,6 +349,14 @@ func GrammarIntegrationLine(id, taskLabel, state, source, premerge, merge string
 // the domain constant is pinned by TestGoldenGrammar.
 const GrammarShortfallVerdictRejected = "verdict-rejected"
 
+// GrammarShortfallEvidenceInconsistent is the status read model's own
+// shortfall kind token (ShortfallEvidenceInconsistent): rendered through
+// GrammarShortfallLine with no task, value-free, in place of the check
+// and verdict shortfalls when the recorded evidence about the head
+// contradicts itself. The manager's standing instruction names it as
+// never a rejection.
+const GrammarShortfallEvidenceInconsistent = "evidence-inconsistent"
+
 // GrammarShortfallLine renders one EvaluateReadiness shortfall verbatim
 // (section 10): the kind token exactly as the domain defines it, plus the
 // task's label AND uuid when the shortfall names a task

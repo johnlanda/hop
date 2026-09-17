@@ -165,6 +165,13 @@ func TestGoldenGrammar(t *testing.T) {
 
 		{"shortfall verdict-rejected token", app.GrammarShortfallVerdictRejected, "verdict-rejected"},
 		{"shortfall token matches the domain", app.GrammarShortfallVerdictRejected, string(run.ShortfallVerdictRejected)},
+		{"shortfall evidence-inconsistent token", app.GrammarShortfallEvidenceInconsistent, "evidence-inconsistent"},
+		{"evidence-inconsistent token matches the read model", app.GrammarShortfallEvidenceInconsistent, string(app.ShortfallEvidenceInconsistent)},
+		{
+			"shortfall line, evidence-inconsistent",
+			app.GrammarShortfallLine(app.GrammarShortfallEvidenceInconsistent, "", ""),
+			"shortfall: evidence-inconsistent",
+		},
 		{
 			"shortfall line, no task",
 			app.GrammarShortfallLine("plan-open", "", ""),

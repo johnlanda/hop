@@ -1341,19 +1341,17 @@ func (s *fakeStore) latestIntegrationLocked(runID identity.RunID) (run.Integrati
 	return *latest, true
 }
 
-// guardShortfallsLocked assembles a GuardContext from exactly the evidence
-// this fake tracks and evaluates it against EvaluateReadiness: PlanClosed
-// and every implement task are real; the head object IDs come from the
-// most recently INTEGRATED integration row (a conflicted, checking or
-// merging one has not moved the branch) — both HeadCommitOID and
-// HeadTreeOID collapse to the same MergeCommitOID, since Integration
-// carries no separate tree object id and none of this fake's tests need
-// that distinction; LatestCheck is always nil, since no Phase "2a" port
-// tracks a combined-candidate check receipt yet — so ShortfallCheckMissing
-// is reported whenever a head exists, honestly reflecting that no such
-// evidence has been recorded rather than guessing one way or the other.
-// Returns nil for a solo run, matching RunDetail.GuardShortfalls' doc.
-// Callers hold s.mu.
+// guardShortfallsLocked mirrors the real store's guardShortfalls: it
+// assembles a GuardContext from exactly the evidence this fake tracks and
+// evaluates it through app.StatusGuardShortfalls. PlanClosed and every
+// implement task are real; the head commit is the most recently
+// INTEGRATED integration row's merge commit (a conflicted, checking or
+// merging one has not moved the branch), and the recorded subjects for
+// exactly that commit — every review task's frozen subject and every
+// accepted review's subject — supply its tree; LatestCheck is always nil,
+// as in the real read, so ShortfallCheckMissing is reported whenever the
+// check guard is evaluated. Returns nil for a solo run, matching
+// RunDetail.GuardShortfalls' doc. Callers hold s.mu.
 func (s *fakeStore) guardShortfallsLocked(runID identity.RunID) []run.GuardShortfall {
 	if !s.Snapshots[runID].Workflow.Feature() {
 		return nil
@@ -1380,9 +1378,19 @@ func (s *fakeStore) guardShortfallsLocked(runID identity.RunID) []run.GuardShort
 			latestIntegrated = &v
 		}
 	}
+	var recorded []app.RecordedSubject
 	if latestIntegrated != nil {
 		ctx.HeadCommitOID = latestIntegrated.MergeCommitOID
-		ctx.HeadTreeOID = latestIntegrated.MergeCommitOID
+		for _, row := range s.Tasks {
+			if row.value.RunID == runID && row.value.Kind == run.TaskKindReview && row.value.SubjectCommitOID == ctx.HeadCommitOID {
+				recorded = append(recorded, app.RecordedSubject{CommitOID: row.value.SubjectCommitOID, TreeOID: row.value.SubjectTreeOID})
+			}
+		}
+		for _, r := range s.Reviews { //nolint:gocritic // rangeValCopy: test fake; the domain snapshot is small and read-only here.
+			if r.RunID == runID && r.SubjectCommitOID == ctx.HeadCommitOID {
+				recorded = append(recorded, app.RecordedSubject{CommitOID: r.SubjectCommitOID, TreeOID: r.SubjectTreeOID})
+			}
+		}
 	}
 
 	var latestReview *run.Review
@@ -1397,8 +1405,7 @@ func (s *fakeStore) guardShortfallsLocked(runID identity.RunID) []run.GuardShort
 	}
 	ctx.LatestReview = latestReview
 
-	_, missing := run.EvaluateReadiness(ctx)
-	return missing
+	return app.StatusGuardShortfalls(ctx, recorded)
 }
 
 // addressLiveLocked reports whether address's own session is currently

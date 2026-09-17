@@ -444,6 +444,144 @@ func TestRunDetailSoloZeroValues(t *testing.T) {
 	}
 }
 
+// TestRunDetailVerdictAgainstRecordedHeadTree drives the status guard's
+// verdict shortfalls over real review rows whose tree id differs from
+// their commit id, as git's objects do: the head's tree is the one HOP
+// recorded for exactly the head commit (the review task's frozen subject,
+// the accepted review's subject), never the merge commit id itself.
+func TestRunDetailVerdictAgainstRecordedHeadTree(t *testing.T) {
+	t.Run("a reject of the integrated head is verdict-rejected until a fix moves the head", func(t *testing.T) {
+		f := newReviewFixture(t)
+		seedIntegratedHeadRow(t, f.featureFixture, 7620, f.spec.TaskID, f.spec.AttemptID, "commit-head", "2026-09-14T10:05:00.000000000Z")
+		reject := f.submission(7611, run.VerdictReject)
+		if outcome, err := f.store.SubmitReview(t.Context(), reject); err != nil || outcome.Kind != app.ReviewAccepted {
+			t.Fatalf("SubmitReview(reject) = %+v, %v", outcome, err)
+		}
+
+		shortfalls := loadShortfalls(t, f.featureFixture)
+		if countKind(shortfalls, run.ShortfallVerdictStaleSubject) != 0 || countKind(shortfalls, run.ShortfallVerdictRejected) != 1 {
+			t.Fatalf("guard shortfalls = %+v, want verdict-rejected and no stale subject for a reject of the head", shortfalls)
+		}
+		for _, s := range shortfalls {
+			if s.Kind == run.ShortfallVerdictRejected && (s.ReviewID != reject.ID || s.SubjectCommitOID != "commit-head") {
+				t.Fatalf("verdict-rejected shortfall = %+v, want review %s at commit-head", s, reject.ID)
+			}
+		}
+
+		fixTask := f.createFeatureTask(t, 7630, 3, run.TaskIntegrated)
+		f.createWorkerSession(t, fixTask, run.RoleImplementer, 7631)
+		seedIntegratedHeadRow(t, f.featureFixture, 7635, fixTask, identity.AttemptID(uid(7631)), "commit-fix", "2026-09-14T10:10:00.000000000Z")
+		shortfalls = loadShortfalls(t, f.featureFixture)
+		if countKind(shortfalls, run.ShortfallVerdictRejected) != 0 || countKind(shortfalls, run.ShortfallVerdictStaleSubject) != 1 {
+			t.Fatalf("guard shortfalls = %+v, want only verdict-stale-subject once a fix moved the head", shortfalls)
+		}
+	})
+
+	t.Run("an approve of the integrated head leaves no verdict shortfall", func(t *testing.T) {
+		f := newReviewFixture(t)
+		seedIntegratedHeadRow(t, f.featureFixture, 7620, f.spec.TaskID, f.spec.AttemptID, "commit-head", "2026-09-14T10:05:00.000000000Z")
+		if outcome, err := f.store.SubmitReview(t.Context(), f.submission(7611, run.VerdictApprove)); err != nil || outcome.Kind != app.ReviewAccepted {
+			t.Fatalf("SubmitReview(approve) = %+v, %v", outcome, err)
+		}
+		shortfalls := loadShortfalls(t, f.featureFixture)
+		for _, kind := range []run.ShortfallKind{run.ShortfallVerdictMissing, run.ShortfallVerdictRejected, run.ShortfallVerdictStaleSubject} {
+			if countKind(shortfalls, kind) != 0 {
+				t.Fatalf("guard shortfalls = %+v, want no %s for an approve of the head", shortfalls, kind)
+			}
+		}
+		if countKind(shortfalls, run.ShortfallCheckMissing) != 1 || countKind(shortfalls, run.ShortfallPlanOpen) != 1 {
+			t.Fatalf("guard shortfalls = %+v, want the plan and check guards still reported", shortfalls)
+		}
+	})
+
+	t.Run("a head no row records a tree for reads the latest review as stale", func(t *testing.T) {
+		f := newReviewFixture(t)
+		seedIntegratedHeadRow(t, f.featureFixture, 7620, f.spec.TaskID, f.spec.AttemptID, "commit-other", "2026-09-14T10:05:00.000000000Z")
+		if outcome, err := f.store.SubmitReview(t.Context(), f.submission(7611, run.VerdictReject)); err != nil || outcome.Kind != app.ReviewAccepted {
+			t.Fatalf("SubmitReview(reject) = %+v, %v", outcome, err)
+		}
+		shortfalls := loadShortfalls(t, f.featureFixture)
+		if countKind(shortfalls, run.ShortfallVerdictRejected) != 0 || countKind(shortfalls, run.ShortfallVerdictStaleSubject) != 1 ||
+			countKind(shortfalls, run.ShortfallCheckMissing) != 1 {
+			t.Fatalf("guard shortfalls = %+v, want check-missing and verdict-stale-subject", shortfalls)
+		}
+	})
+
+	t.Run("recorded trees that disagree about the head report evidence-inconsistent", func(t *testing.T) {
+		f := newReviewFixture(t)
+		seedIntegratedHeadRow(t, f.featureFixture, 7620, f.spec.TaskID, f.spec.AttemptID, "commit-head", "2026-09-14T10:05:00.000000000Z")
+		f.inUOW(t, func(uow app.UnitOfWork) {
+			second := run.NewReviewTask(identity.TaskID(uid(7640)), f.spec.RunID, 4, "commit-head", "tree-other", f.clock.Now())
+			if _, err := workflowRepos(t, uow).TaskIndex().Create(t.Context(), second); err != nil {
+				t.Fatalf("create second review task: %v", err)
+			}
+		})
+		if outcome, err := f.store.SubmitReview(t.Context(), f.submission(7611, run.VerdictReject)); err != nil || outcome.Kind != app.ReviewAccepted {
+			t.Fatalf("SubmitReview(reject) = %+v, %v", outcome, err)
+		}
+
+		detail, err := f.store.LoadRunStatus(t.Context(), f.spec.RunID)
+		if err != nil {
+			t.Fatalf("LoadRunStatus() = %v, want the detail read to succeed", err)
+		}
+		kinds := map[string]int{}
+		for _, s := range detail.GuardShortfalls {
+			kinds[string(s.Kind)]++
+			if s.ReviewID != "" || s.SubjectCommitOID != "" {
+				t.Fatalf("shortfall %+v names a review; an inconsistent head names none", s)
+			}
+		}
+		want := map[string]int{"plan-open": 1, "task-not-integrated": 1, "evidence-inconsistent": 1}
+		if len(kinds) != len(want) {
+			t.Fatalf("guard shortfalls = %+v, want exactly %v", detail.GuardShortfalls, want)
+		}
+		for kind, n := range want {
+			if kinds[kind] != n {
+				t.Fatalf("guard shortfalls = %+v, want exactly %v", detail.GuardShortfalls, want)
+			}
+		}
+		// The rest of the detail is untouched: the tasks, the integration
+		// and the reject notice queued for the manager.
+		if len(detail.Tasks) != 3 || detail.LatestIntegration == nil || len(detail.Mailboxes) != 1 {
+			t.Fatalf("detail = tasks %d, integration %+v, mailboxes %+v; want the ordinary block", len(detail.Tasks), detail.LatestIntegration, detail.Mailboxes)
+		}
+	})
+}
+
+// seedIntegratedHeadRow records an integrated integration row for task
+// whose merge commit is mergeOID, settled at updatedAt, over a result
+// accepted for attemptID.
+func seedIntegratedHeadRow(t *testing.T, f *featureFixture, n int, task identity.TaskID, attemptID identity.AttemptID, mergeOID, updatedAt string) {
+	t.Helper()
+	resultID := uid(n)
+	rawExec(t, f.store, `INSERT INTO results (id, attempt_id, commit_oid, summary, content_digest, accepted, submitted_at)
+		VALUES (?, ?, 'source-oid', 'done', ?, 1, '2026-09-14T10:00:00.000000000Z')`, resultID, attemptID.String(), "digest-"+resultID)
+	rawExec(t, f.store, `INSERT INTO integrations (id, run_id, task_id, result_id, source_commit_oid, premerge_head_oid, merge_commit_oid, state, operation_id, revision, created_at, updated_at)
+		VALUES (?, ?, ?, ?, 'source-oid', 'premerge-oid', ?, 'integrated', NULL, 2, '2026-09-14T10:00:00.000000000Z', ?)`,
+		uid(n+1), f.spec.RunID.String(), task.String(), resultID, mergeOID, updatedAt)
+}
+
+// loadShortfalls reads the fixture run's guard shortfalls.
+func loadShortfalls(t *testing.T, f *featureFixture) []run.GuardShortfall {
+	t.Helper()
+	detail, err := f.store.LoadRunStatus(t.Context(), f.spec.RunID)
+	if err != nil {
+		t.Fatalf("LoadRunStatus() = %v", err)
+	}
+	return detail.GuardShortfalls
+}
+
+// countKind counts shortfalls of kind.
+func countKind(shortfalls []run.GuardShortfall, kind run.ShortfallKind) int {
+	n := 0
+	for _, s := range shortfalls {
+		if s.Kind == kind {
+			n++
+		}
+	}
+	return n
+}
+
 // TestLoadCheckExecutionContextByKind proves the argv dispatch: a
 // check.run returns the frozen snapshot argv, an integration.merge the
 // intent's own merge argv and scratch tree, a malformed merge intent and

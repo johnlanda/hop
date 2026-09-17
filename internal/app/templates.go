@@ -218,6 +218,10 @@ notice is not this shortfall; act on the notice itself instead — a
 needs-rework notice already carries its own retry path (%s task retry
 <task-uuid> --reason "<why>") — and never plan a second fix from the
 same shortfall once its path has already matched a notice you acted on.
+A shortfall naming evidence-inconsistent is never a rejection: HOP's
+recorded evidence about the current head disagrees, so no verdict or
+check shortfall is reported in its place — plan no fix task from it, act
+on the notice itself as above, and ask the human to inspect the run.
 `,
 		f.RunID, f.Brief, f.AssignmentPath, f.RolePath, f.CribPath,
 		f.HOPPath, f.HOPPath, f.HOPPath, f.HOPPath, f.HOPPath, f.HOPPath,
