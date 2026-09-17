@@ -234,8 +234,13 @@ func newFixtureRepoWithCheck(t *testing.T, artifacts *artifactDir, server *testS
 // repository's [check] command, and .herdr-orchestrator/config.toml per the
 // section 3 example. It returns after the initial commit, whose object id
 // is fixtureRepo.Base — the base commit hop run resolves at StartRun. server
-// is passed to registerWorktreeCleanup; see newFixtureRepoWithCheck.
-func newFixtureRepo(t *testing.T, artifacts *artifactDir, server *testServer, name string) *fixtureRepo { //nolint:unparam // every current call site names its one repository "repo"; name exists so a scenario needing two concurrent plain fixture repositories (as newFixtureRepoWithSubmodule already needs internally for its inner/outer pair) can avoid an artifact-directory collision.
+// is passed to registerWorktreeCleanup; see newFixtureRepoWithCheck. name
+// distinguishes concurrent plain fixture repositories within one test (as
+// newFixtureRepoWithSubmodule already needs internally for its inner/outer
+// pair, and as slice 7b's worker-fetch-crash unit tests need for their own
+// artifact directories) — always pass a distinct, scenario-descriptive
+// string rather than reusing another call site's.
+func newFixtureRepo(t *testing.T, artifacts *artifactDir, server *testServer, name string) *fixtureRepo {
 	t.Helper()
 	return newFixtureRepoWithCheck(t, artifacts, server, name, checkScriptName)
 }

@@ -2,11 +2,15 @@ package integration
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -37,6 +41,16 @@ const fixtureHoldMarker = "FIXTURE-HOLD-BARRIER"
 // manager sends to human when hop status names the evidence-inconsistent
 // shortfall on a notice it does not otherwise recognize.
 const fixtureEvidenceInconsistentQuestionBody = "HOP's recorded evidence about this run's current head is inconsistent; please inspect the run."
+
+// preForwardBarrierControlFile and preForwardBarrierObservedFile mirror
+// the identically named constants inside fixtureWorkerSource: the opt-in
+// control file a test creates under the manager's own scratch directory
+// to enable RelayedQuestion's deterministic pre-forward barrier, and the
+// fixed name of the observation the barrier dumps before blocking.
+const (
+	preForwardBarrierControlFile  = "manager-pre-forward-barrier"
+	preForwardBarrierObservedFile = "manager-pre-forward-observed.txt"
+)
 
 // fakeHopSource is a minimal, scriptable stand-in for the real hop binary
 // — the handwritten-fake law (design's review brief): it validates each
@@ -987,6 +1001,187 @@ func TestFixtureManagerResumeSkipsReplanning(t *testing.T) {
 	}
 }
 
+// preForwardBarrierAnswerBody is the fixed content of the scripted human
+// answer TestFixtureManagerPreForwardBarrier's fixture delivers, reused
+// both when writing the body file and when computing the barrier
+// observation's expected digest.
+const preForwardBarrierAnswerBody = "release the barrier\n"
+
+// preForwardBarrierFixture is the shared setup for
+// TestFixtureManagerPreForwardBarrier's enabled/disabled subtests: one
+// worker-hold-shaped relay question, scripted exactly like
+// TestFixtureManagerScriptDispatch's own hold/relay pair, and one scripted
+// human answer to it — ready to drive the compiled manager principal
+// directly (no herdr).
+type preForwardBarrierFixture struct {
+	principal, cwd, scratchDir, logPath string
+	prompt                              string
+	env                                 []string
+	msgHoldQuestionID, msgHumanAnswerID string
+}
+
+func buildPreForwardBarrierFixture(t *testing.T, artifacts *artifactDir) preForwardBarrierFixture {
+	t.Helper()
+	principal := buildFixtureWorker(t, artifacts)
+	fakeHop := buildFakeHopStub(t, artifacts)
+
+	stateDir := artifacts.dir(t, "state")
+	scratchDir := artifacts.dir(t, "manager-scratch")
+	const runID = "b3b3b3b3-b3b3-4b3b-8b3b-b3b3b3b3b3b3"
+	assignmentPath := filepath.Join(stateDir, "runs", runID, "artifacts", "assignment.md")
+	if err := os.MkdirAll(filepath.Dir(assignmentPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	brief := fixtureManagerBrief(scratchDir,
+		[]fixtureManagerTask{{Label: "t1", Title: "Implement t1", Behavior: "worker-implement"}},
+		[]fixtureManagerAnswer{{Match: fixtureHoldMarker, Action: "relay"}},
+		"")
+	assignmentContent := "# HOP Manager Assignment\n\nRun: " + runID + "\n\n## Brief\n\n" + brief + "\n## Instructions\n"
+	if err := os.WriteFile(assignmentPath, []byte(assignmentContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	scriptDir := artifacts.dir(t, "manager-script")
+	bodyDir := artifacts.dir(t, "manager-bodies")
+	writeBody := func(name, content string) string {
+		path := filepath.Join(bodyDir, name)
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	holdBody := writeBody("hold-question.txt", fixtureHoldMarker+"\n")
+	humanAnswerBody := writeBody("human-answer.txt", preForwardBarrierAnswerBody)
+
+	const (
+		msgHoldQuestionID = "77777777-7777-4777-8777-777777777777"
+		msgHumanAnswerID  = "88888888-8888-4888-8888-888888888888"
+		// msgRelayedQuestionID is the fixed id the fake hop stub's own "msg
+		// send" always returns.
+		msgRelayedQuestionID = "99999999-9999-4999-8999-999999999999"
+	)
+	blocks := []string{
+		fakeMessageBlock(msgHoldQuestionID, "question", "worker-session-1", "", "", holdBody),
+		fakeMessageBlock(msgHumanAnswerID, "answer", "human", msgRelayedQuestionID, msgHoldQuestionID, humanAnswerBody),
+	}
+	scriptPath, indexPath := writeFakeHopMsgScript(t, scriptDir, blocks)
+	counterPath := newFakeHopTaskCounter(t, scriptDir)
+	logPath := filepath.Join(scriptDir, "log.txt")
+
+	cwd, err := filepath.EvalSymlinks(artifacts.dir(t, "manager-cwd"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const rolePath, cribPath = "/state/runs/r/artifacts/roles/manager.md", "/state/runs/r/artifacts/worker-protocol.md"
+	prompt := testManagerInitialPrompt(assignmentPath, rolePath, cribPath, fakeHop)
+
+	return preForwardBarrierFixture{
+		principal: principal, cwd: cwd, scratchDir: scratchDir, logPath: logPath, prompt: prompt,
+		env: []string{
+			"PATH=" + os.Getenv("PATH"),
+			"HOP_STATE_DIR=" + stateDir,
+			"HOP_RUN_ID=" + runID,
+			"HOP_SESSION_ID=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+			"HOP_INCARNATION_ID=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+			"HOP_ROLE=manager",
+			"FAKE_HOP_MSG_SCRIPT=" + scriptPath,
+			"FAKE_HOP_MSG_INDEX=" + indexPath,
+			"FAKE_HOP_TASK_COUNTER_FILE=" + counterPath,
+			"FAKE_HOP_LOG=" + logPath,
+		},
+		msgHoldQuestionID: msgHoldQuestionID, msgHumanAnswerID: msgHumanAnswerID,
+	}
+}
+
+// runPreForwardBarrierManager runs fx's compiled manager principal to
+// completion or the context deadline, whichever comes first — the manager
+// never exits on its own, exactly like TestFixtureManagerScriptDispatch's
+// own intentionally endless drive — and returns its captured stdout.
+func runPreForwardBarrierManager(t *testing.T, fx preForwardBarrierFixture) string { //nolint:gocritic // hugeParam: preForwardBarrierFixture is a one-shot per-subtest fixture struct; a pointer would only complicate the two call sites.
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, fx.principal, "--session-id", "22222222-2222-2222-2222-222222222222", fx.prompt) //nolint:gosec // G204: fixed test-owned binary and arguments.
+	cmd.Dir = fx.cwd
+	cmd.Env = fx.env
+	var out strings.Builder
+	cmd.Stdout, cmd.Stderr = &out, &out
+	_ = cmd.Run() //nolint:errcheck // the context deadline ending this intentionally endless manager is the expected outcome, asserted on its captured stdout below.
+	return out.String()
+}
+
+// TestFixtureManagerPreForwardBarrier proves RelayedQuestion's opt-in
+// pre-forward barrier (design section 11 scenario 2) in isolation, for
+// both the disabled path (every existing scenario's own shape: absent,
+// the manager forwards a fetched human answer immediately, unaffected)
+// and the enabled path (present, the manager's first incarnation blocks
+// after fetching the answer and before forwarding it, dumping an
+// observation naming what it fetched but never reaching the forward or
+// the ack).
+func TestFixtureManagerPreForwardBarrier(t *testing.T) {
+	t.Run("Disabled", testFixtureManagerPreForwardBarrierDisabled)
+	t.Run("Enabled", testFixtureManagerPreForwardBarrierEnabled)
+}
+
+func testFixtureManagerPreForwardBarrierDisabled(t *testing.T) {
+	artifacts := newArtifactDir(t)
+	fx := buildPreForwardBarrierFixture(t, artifacts)
+	// No control file created: preForwardBarrierEnabled must report false,
+	// and every existing scenario's own behavior (forward immediately)
+	// must be unchanged.
+
+	stdout := runPreForwardBarrierManager(t, fx)
+	if !strings.Contains(stdout, "FIXTURE-FORWARDED origin=["+fx.msgHoldQuestionID+"]") {
+		t.Errorf("manager stdout missing the forward with the barrier control file absent; got:\n%s", stdout)
+	}
+	if strings.Contains(stdout, "FIXTURE-PRE-FORWARD-BARRIER") {
+		t.Errorf("manager stdout shows the pre-forward barrier firing with no control file present; got:\n%s", stdout)
+	}
+	if _, err := os.Stat(filepath.Join(fx.scratchDir, preForwardBarrierObservedFile)); err == nil {
+		t.Error("pre-forward barrier observation file exists despite the barrier being disabled")
+	}
+	log := readFakeHopLog(t, fx.logPath)
+	if !strings.Contains(log, "msg\tsend\t--kind\tanswer\t--reply-to\t"+fx.msgHoldQuestionID) {
+		t.Errorf("fake hop invocation log missing the forward call; got:\n%s", log)
+	}
+}
+
+func testFixtureManagerPreForwardBarrierEnabled(t *testing.T) {
+	artifacts := newArtifactDir(t)
+	fx := buildPreForwardBarrierFixture(t, artifacts)
+	if err := os.WriteFile(filepath.Join(fx.scratchDir, preForwardBarrierControlFile), []byte("enable\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout := runPreForwardBarrierManager(t, fx)
+	if !strings.Contains(stdout, "FIXTURE-PRE-FORWARD-BARRIER answer=["+fx.msgHumanAnswerID+"]") {
+		t.Fatalf("manager stdout missing the pre-forward barrier marker; got:\n%s", stdout)
+	}
+	if strings.Contains(stdout, "FIXTURE-FORWARDED") {
+		t.Errorf("manager stdout shows a forward despite the barrier being enabled; got:\n%s", stdout)
+	}
+	log := readFakeHopLog(t, fx.logPath)
+	if strings.Contains(log, "msg\tsend\t--kind\tanswer\t--reply-to\t"+fx.msgHoldQuestionID) {
+		t.Errorf("fake hop invocation log shows the forward call despite the barrier being enabled; got:\n%s", log)
+	}
+	if strings.Contains(log, "msg\tack\t"+fx.msgHumanAnswerID) {
+		t.Errorf("fake hop invocation log shows the answer acked despite the barrier blocking before it; got:\n%s", log)
+	}
+
+	obsContent, err := os.ReadFile(filepath.Join(fx.scratchDir, preForwardBarrierObservedFile))
+	if err != nil {
+		t.Fatalf("read pre-forward barrier observation file: %v", err)
+	}
+	wantSum := sha256.Sum256([]byte(preForwardBarrierAnswerBody))
+	wantHex := hex.EncodeToString(wantSum[:])
+	if !strings.Contains(string(obsContent), "id="+fx.msgHumanAnswerID+"\n") {
+		t.Errorf("barrier observation missing id=%s; got:\n%s", fx.msgHumanAnswerID, obsContent)
+	}
+	if !strings.Contains(string(obsContent), "sha256="+wantHex+"\n") {
+		t.Errorf("barrier observation missing sha256=%s; got:\n%s", wantHex, obsContent)
+	}
+}
+
 // requestIDFromLogLine extracts the value following a "--request-id"
 // token in one fake-hop invocation log line, "" if absent.
 func requestIDFromLogLine(t *testing.T, line string) string {
@@ -1531,6 +1726,265 @@ func TestFixtureWorkerHoldBarrier(t *testing.T) {
 	}
 	if want := fmt.Sprintf("%d", len(answerContent)); answerObs.Fields["bytes"] != want {
 		t.Errorf("answer observation bytes = %q, want %q", answerObs.Fields["bytes"], want)
+	}
+}
+
+// TestFixtureWorkerFetchCrash proves DuplicateAndAmbiguousDelivery's
+// worker-fetch-crash behavior (design section 11 scenario 3) in
+// isolation, for both incarnations: the first fetches one message, dumps
+// an observation naming it, then blocks until self-killed, never acking;
+// a resumed incarnation re-fetches (the same message, re-served) and
+// waits for a SEPARATE, test-controlled release gate before acking,
+// draining and submitting — the deterministic ordering mechanism a
+// real-process scenario needs to issue a stale-incarnation late-ack
+// assertion with a guaranteed happens-before relationship against this
+// session's own ack.
+func TestFixtureWorkerFetchCrash(t *testing.T) {
+	t.Run("BlocksBeforeAck", testFixtureWorkerFetchCrashBlocksBeforeAck)
+	t.Run("ResumedWaitsForReleaseThenAcks", testFixtureWorkerFetchCrashResumedWaitsForReleaseThenAcks)
+}
+
+func testFixtureWorkerFetchCrashBlocksBeforeAck(t *testing.T) {
+	artifacts := newArtifactDir(t)
+	worker := buildFixtureWorker(t, artifacts)
+	fakeHop := buildFakeHopStub(t, artifacts)
+	repo := newFixtureRepo(t, artifacts, nil, "fetch-crash-repo")
+
+	stateDir := artifacts.dir(t, "state")
+	scratchDir := artifacts.dir(t, "fetch-crash-scratch")
+	const (
+		runID     = "c4c4c4c4-c4c4-4c4c-8c4c-c4c4c4c4c4c4"
+		taskID    = "d5d5d5d5-d5d5-4d5d-8d5d-d5d5d5d5d5d5"
+		attemptID = "e6e6e6e6-e6e6-4e6e-8e6e-e6e6e6e6e6e6"
+		sessionID = "f7f7f7f7-f7f7-4f7f-8f7f-f7f7f7f7f7f7"
+	)
+	assignmentPath := filepath.Join(stateDir, "runs", runID, "attempts", attemptID, "assignment.md")
+	if err := os.MkdirAll(filepath.Dir(assignmentPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(assignmentPath, []byte("# HOP Task Assignment\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	instructionsPath := filepath.Join(stateDir, "runs", runID, "tasks", taskID+".md")
+	if err := os.MkdirAll(filepath.Dir(instructionsPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(instructionsPath, []byte("FIXTURE-BEHAVIOR: worker-fetch-crash "+scratchDir+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	scriptDir := artifacts.dir(t, "fetch-crash-script")
+	msgBodyPath := filepath.Join(scriptDir, "m1-body.txt")
+	const msgBody = "manager info for t1\n"
+	if err := os.WriteFile(msgBodyPath, []byte(msgBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const msgID = "a8a8a8a8-a8a8-4a8a-8a8a-a8a8a8a8a8a8"
+	blocks := []string{fakeMessageBlock(msgID, "info", "manager-session", "", "", msgBodyPath)}
+	scriptPath, indexPath := writeFakeHopMsgScript(t, scriptDir, blocks)
+	logPath := filepath.Join(scriptDir, "log.txt")
+
+	prompt := testAssignmentPrompt(assignmentPath, fakeHop)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, worker, "--session-id", sessionID, prompt) //nolint:gosec // G204: fixed test-owned binary and arguments.
+	cmd.Dir = repo.Root
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOP_STATE_DIR=" + stateDir,
+		"HOP_RUN_ID=" + runID,
+		"HOP_TASK_ID=" + taskID,
+		"HOP_ATTEMPT_ID=" + attemptID,
+		"HOP_SESSION_ID=" + sessionID,
+		"HOP_INCARNATION_ID=b9b9b9b9-b9b9-4b9b-8b9b-b9b9b9b9b9b9",
+		"HOP_ROLE=implementer",
+		"FAKE_HOP_MSG_SCRIPT=" + scriptPath,
+		"FAKE_HOP_MSG_INDEX=" + indexPath,
+		"FAKE_HOP_LOG=" + logPath,
+	}
+	var out syncOutput
+	cmd.Stdout, cmd.Stderr = &out, &out
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start fixture worker: %v", err)
+	}
+	var (
+		waitOnce sync.Once
+		waitErr  error
+	)
+	wait := func() error {
+		waitOnce.Do(func() { waitErr = cmd.Wait() })
+		return waitErr
+	}
+	t.Cleanup(func() {
+		if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			t.Logf("cleanup: kill fixture worker: %v", err)
+		}
+		if err := wait(); err != nil {
+			t.Logf("cleanup: reap fixture worker: %v", err)
+		}
+	})
+
+	wantObserved := "FIXTURE-FETCH-CRASH-OBSERVED id=[" + msgID + "] resumed=[false]"
+	if !waitUntil(func() bool { return strings.Contains(out.snapshot(), wantObserved) }) {
+		t.Fatalf("worker never reported observing the fetched message before blocking; output so far:\n%s", out.snapshot())
+	}
+	if strings.Contains(out.snapshot(), "FIXTURE-FETCH-CRASH-ACKED") {
+		t.Fatalf("worker acked before being self-killed; output:\n%s", out.snapshot())
+	}
+
+	controlPath := filepath.Join(scratchDir, "self-kill-"+attemptID)
+	tmp := controlPath + ".tmp"
+	if err := os.WriteFile(tmp, []byte("FIXTURE-SELF-KILL\n"), 0o600); err != nil {
+		t.Fatalf("write self-kill control file: %v", err)
+	}
+	if err := os.Rename(tmp, controlPath); err != nil {
+		t.Fatalf("rename self-kill control file into place: %v", err)
+	}
+	if err := wait(); err == nil {
+		t.Fatalf("worker exited 0 after the self-kill control file was written; want it SIGKILLed; output:\n%s", out.snapshot())
+	}
+
+	log := readFakeHopLog(t, logPath)
+	if strings.Contains(log, "msg\tack\t"+msgID) {
+		t.Errorf("fake hop invocation log shows the message acked despite the process being killed before it ever could; got:\n%s", log)
+	}
+
+	obsContent, err := os.ReadFile(filepath.Join(scratchDir, "fetch-crash-observed-"+attemptID+".txt")) //nolint:gosec // G304: a path this test constructed itself.
+	if err != nil {
+		t.Fatalf("read fetch-crash observation file: %v", err)
+	}
+	wantSum := sha256.Sum256([]byte(msgBody))
+	wantHex := hex.EncodeToString(wantSum[:])
+	if !strings.Contains(string(obsContent), "id="+msgID+"\n") {
+		t.Errorf("fetch-crash observation missing id=%s; got:\n%s", msgID, obsContent)
+	}
+	if !strings.Contains(string(obsContent), "sha256="+wantHex+"\n") {
+		t.Errorf("fetch-crash observation missing sha256=%s; got:\n%s", wantHex, obsContent)
+	}
+}
+
+func testFixtureWorkerFetchCrashResumedWaitsForReleaseThenAcks(t *testing.T) {
+	artifacts := newArtifactDir(t)
+	worker := buildFixtureWorker(t, artifacts)
+	fakeHop := buildFakeHopStub(t, artifacts)
+	repo := newFixtureRepo(t, artifacts, nil, "fetch-crash-resumed-repo")
+
+	stateDir := artifacts.dir(t, "state")
+	scratchDir := artifacts.dir(t, "fetch-crash-resumed-scratch")
+	const (
+		runID     = "1a1a1a1a-1a1a-4a1a-8a1a-1a1a1a1a1a1a"
+		taskID    = "2b2b2b2b-2b2b-4b2b-8b2b-2b2b2b2b2b2b"
+		attemptID = "3c3c3c3c-3c3c-4c3c-8c3c-3c3c3c3c3c3c"
+		sessionID = "4d4d4d4d-4d4d-4d4d-8d4d-4d4d4d4d4d4d"
+		nativeRef = "5e5e5e5e-5e5e-4e5e-8e5e-5e5e5e5e5e5e"
+	)
+	assignmentPath := filepath.Join(stateDir, "runs", runID, "attempts", attemptID, "assignment.md")
+	if err := os.MkdirAll(filepath.Dir(assignmentPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(assignmentPath, []byte("# HOP Task Assignment\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	instructionsPath := filepath.Join(stateDir, "runs", runID, "tasks", taskID+".md")
+	if err := os.MkdirAll(filepath.Dir(instructionsPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(instructionsPath, []byte("FIXTURE-BEHAVIOR: worker-fetch-crash "+scratchDir+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	scriptDir := artifacts.dir(t, "fetch-crash-resumed-script")
+	msgBodyPath := filepath.Join(scriptDir, "m1-body.txt")
+	const msgBody = "manager info for t1, re-served\n"
+	if err := os.WriteFile(msgBodyPath, []byte(msgBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const msgID = "6f6f6f6f-6f6f-4f6f-8f6f-6f6f6f6f6f6f"
+	blocks := []string{fakeMessageBlock(msgID, "info", "manager-session", "", "", msgBodyPath)}
+	scriptPath, indexPath := writeFakeHopMsgScript(t, scriptDir, blocks)
+	logPath := filepath.Join(scriptDir, "log.txt")
+
+	continuationPrompt := testContinuationPrompt(assignmentPath, fakeHop)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, worker, "--resume", nativeRef, continuationPrompt) //nolint:gosec // G204: fixed test-owned binary and arguments.
+	cmd.Dir = repo.Root
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOP_STATE_DIR=" + stateDir,
+		"HOP_RUN_ID=" + runID,
+		"HOP_TASK_ID=" + taskID,
+		"HOP_ATTEMPT_ID=" + attemptID,
+		"HOP_SESSION_ID=" + sessionID,
+		"HOP_INCARNATION_ID=7a7a7a7a-7a7a-4a7a-8a7a-7a7a7a7a7a7a",
+		"HOP_ROLE=implementer",
+		"FAKE_HOP_MSG_SCRIPT=" + scriptPath,
+		"FAKE_HOP_MSG_INDEX=" + indexPath,
+		"FAKE_HOP_LOG=" + logPath,
+	}
+	var out syncOutput
+	cmd.Stdout, cmd.Stderr = &out, &out
+	// idle() (reached after this incarnation submits) reads a clean-exit
+	// line from stdin; ready from the start since it is only ever read
+	// once the process reaches that loop.
+	cmd.Stdin = strings.NewReader("FIXTURE-QUIT\n")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start fixture worker: %v", err)
+	}
+	var (
+		waitOnce sync.Once
+		waitErr  error
+	)
+	wait := func() error {
+		waitOnce.Do(func() { waitErr = cmd.Wait() })
+		return waitErr
+	}
+	t.Cleanup(func() {
+		if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			t.Logf("cleanup: kill fixture worker: %v", err)
+		}
+		if err := wait(); err != nil {
+			t.Logf("cleanup: reap fixture worker: %v", err)
+		}
+	})
+
+	wantObserved := "FIXTURE-FETCH-CRASH-OBSERVED id=[" + msgID + "] resumed=[true]"
+	if !waitUntil(func() bool { return strings.Contains(out.snapshot(), wantObserved) }) {
+		t.Fatalf("resumed worker never reported observing the re-served message; output so far:\n%s", out.snapshot())
+	}
+	if strings.Contains(out.snapshot(), "FIXTURE-FETCH-CRASH-ACKED") {
+		t.Fatalf("resumed worker acked before the release gate was created; output:\n%s", out.snapshot())
+	}
+	if log := readFakeHopLog(t, logPath); strings.Contains(log, "msg\tack\t"+msgID) {
+		t.Fatalf("fake hop invocation log shows the message acked before the release gate was created; got:\n%s", log)
+	}
+
+	releasePath := filepath.Join(scratchDir, "fetch-crash-release-"+attemptID)
+	tmp := releasePath + ".tmp"
+	if err := os.WriteFile(tmp, []byte("FIXTURE-RELEASE\n"), 0o600); err != nil {
+		t.Fatalf("write release control file: %v", err)
+	}
+	if err := os.Rename(tmp, releasePath); err != nil {
+		t.Fatalf("rename release control file into place: %v", err)
+	}
+
+	wantAcked := "FIXTURE-FETCH-CRASH-ACKED id=[" + msgID + "]"
+	if !waitUntil(func() bool { return strings.Contains(out.snapshot(), wantAcked) }) {
+		t.Fatalf("resumed worker never acked after the release gate was created; output so far:\n%s", out.snapshot())
+	}
+	if !waitUntil(func() bool { return strings.Contains(out.snapshot(), "FIXTURE-WORKER-IDLE") }) {
+		t.Fatalf("resumed worker never reached its post-submit idle loop; output so far:\n%s", out.snapshot())
+	}
+	if err := wait(); err != nil {
+		t.Fatalf("resumed worker did not exit cleanly after FIXTURE-QUIT: %v; output:\n%s", err, out.snapshot())
+	}
+
+	log := readFakeHopLog(t, logPath)
+	if !strings.Contains(log, "msg\tack\t"+msgID) {
+		t.Errorf("fake hop invocation log missing the ack after the release gate; got:\n%s", log)
+	}
+	if !strings.Contains(log, "result\tsubmit\t") {
+		t.Errorf("fake hop invocation log missing the post-ack result submit; got:\n%s", log)
 	}
 }
 

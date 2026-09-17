@@ -232,6 +232,21 @@ func watchForSelfKill(controlPath string) {
 	}
 }
 
+// waitForControlFile blocks until controlPath exists, polling at the same
+// low frequency watchForSelfKill uses, for a control file whose own
+// purpose is not a kill -- worker-fetch-crash's resumed-incarnation
+// release gate (design section 11 scenario 3), letting a test finish its
+// own stale-ack assertion deterministically before this session's own ack
+// call ever lands.
+func waitForControlFile(controlPath string) {
+	for {
+		if _, err := os.Stat(controlPath); err == nil {
+			return
+		}
+		time.Sleep(selfKillPollInterval)
+	}
+}
+
 // isResumeInvocation reports whether argv is a resume-SHAPED invocation:
 // any element equals the exact "--resume". Detection only — it routes the
 // invocation to requireResumeShape's strict validation, so a malformed
@@ -908,6 +923,41 @@ func runWorker() {
 		}
 		drainMailbox(hopPath)
 		submitOnce(hopPath, oid, "fixture implementer result (released)")
+	case "worker-fetch-crash":
+		msg, delivered := parseDeliveredMessage(runHopCLI(hopPath, "msg", "wait").Stdout)
+		if !delivered {
+			fatalf("worker-fetch-crash: no message delivered within the wait timeout")
+		}
+		msgBody := readFileOrFatal(msg.BodyPath)
+		// This process's OWN read of the fetched message, dumped as a
+		// digest naming its id -- the deterministic-kill-point evidence a
+		// test waits for before triggering the self-kill (design section
+		// 11 scenario 3, mirroring RelayedQuestion's manager barrier).
+		writeContentDigest(filepath.Join(scratchDir, "fetch-crash-observed-"+env["HOP_ATTEMPT_ID"]+".txt"), msg.ID, msgBody)
+		fmt.Printf("FIXTURE-FETCH-CRASH-OBSERVED id=[%s] resumed=[%t]\n", msg.ID, resumed)
+		if !resumed {
+			// Blocks here until this process's own self-kill control file
+			// appears (already watched by the background watchForSelfKill
+			// goroutine started above): the message is deliberately never
+			// acked on this incarnation.
+			watchForSelfKill(filepath.Join(scratchDir, "self-kill-"+env["HOP_ATTEMPT_ID"]))
+		}
+		// Resumed: the SAME message is re-served to this new incarnation
+		// (design trace 3's "second delivery row"). Before acking, wait
+		// for a SEPARATE, test-controlled release gate -- distinct from
+		// the self-kill control file above -- so a scenario can issue a
+		// stale-incarnation late-ack assertion with a guaranteed
+		// happens-before relationship against this session's own ack,
+		// rather than racing how quickly this relaunched process happens
+		// to reach its own ack call (AcceptAck checks "already
+		// acknowledged" before incarnation currency, so ordering decides
+		// whether a late ack observes "stale" or "duplicate").
+		waitForControlFile(filepath.Join(scratchDir, "fetch-crash-release-"+env["HOP_ATTEMPT_ID"]))
+		ackAndRequireSuccess(hopPath, msg.ID)
+		fmt.Printf("FIXTURE-FETCH-CRASH-ACKED id=[%s]\n", msg.ID)
+		oid := commitChange("fixture implementer change (fetch-crash resumed)")
+		drainMailbox(hopPath)
+		submitOnce(hopPath, oid, "fixture implementer result (fetch-crash resumed)")
 	default:
 		// Unknown or empty directive: submit nothing, just stay alive, so a
 		// scenario that only needs a settled, idle worker still gets one.
@@ -933,6 +983,7 @@ func cmp(role, fallback string) string {
 var scratchDirRequiringBehaviors = map[string]bool{
 	"worker-implement":     true,
 	"worker-hold":          true,
+	"worker-fetch-crash":   true,
 	"manager-feature":      true,
 	"reviewer-approve":     true,
 	"reviewer-reject-once": true,
@@ -1143,6 +1194,7 @@ func runManager() {
 	behavior, behaviorArgs := parseBehavior(assignmentContent)
 	scratchDir := requireScratchDir(behavior, behaviorArgs)
 	observationPath := filepath.Join(filepath.Dir(assignmentPath), "manager-observed.txt")
+	var selfKillControlPath string
 	if scratchDir != "" {
 		observationPath = filepath.Join(scratchDir, "manager-observed.txt")
 		// The same safe self-kill channel runWorker's own attempts use
@@ -1151,7 +1203,8 @@ func runManager() {
 		// only observed. Named by this session's own id (the manager has
 		// no attempt id) so a cold-relaunched successor's watcher never
 		// collides with its predecessor's already-consumed control file.
-		go watchForSelfKill(filepath.Join(scratchDir, "self-kill-"+env["HOP_SESSION_ID"]))
+		selfKillControlPath = filepath.Join(scratchDir, "self-kill-"+env["HOP_SESSION_ID"])
+		go watchForSelfKill(selfKillControlPath)
 	}
 	writeObservation(observationPath, "manager", assignmentPath, promptAssignmentPath, hopPath, assignmentContent, behavior, nil, "", "")
 	fmt.Println("FIXTURE-MANAGER-READY")
@@ -1213,7 +1266,7 @@ func runManager() {
 		if !delivered {
 			continue
 		}
-		handleManagerMessage(hopPath, cwd, env["HOP_RUN_ID"], scratchDir, script, labelToID, &fixCounter, plannedFixReviews, &msg)
+		handleManagerMessage(hopPath, cwd, env["HOP_RUN_ID"], scratchDir, script, labelToID, &fixCounter, plannedFixReviews, &msg, resumed, selfKillControlPath)
 	}
 }
 
@@ -1348,6 +1401,34 @@ func statusOutcomeForNotice(hopPath, repoDir, runID, noticeBodyPath string) (rej
 	return verdictRejection{}, false, statusHasEvidenceInconsistentShortfall(res.Stdout)
 }
 
+// preForwardBarrierControlFile is the fixed name of the opt-in control
+// file a test creates under the manager's own scratch directory BEFORE
+// starting the run, to enable RelayedQuestion's deterministic pre-forward
+// barrier (design section 11 scenario 2): absent (every existing
+// scenario), the manager forwards a fetched human answer immediately,
+// exactly as it always has; present, the manager's FIRST incarnation
+// (never a resumed one -- the barrier is one-shot, keyed to the
+// incarnation via runManager's own resumed flag, since a cold-relaunched
+// manager's argv is always --resume-shaped) blocks after fetching the
+// answer and before forwarding it, until self-killed.
+const preForwardBarrierControlFile = "manager-pre-forward-barrier"
+
+// preForwardBarrierObservedFile is where the barrier dumps its own digest
+// of the fetched answer id/body (writeContentDigest's shape) before
+// blocking, so a test can wait for this file rather than guessing when
+// the barrier took effect.
+const preForwardBarrierObservedFile = "manager-pre-forward-observed.txt"
+
+// preForwardBarrierEnabled reports whether a test has created
+// preForwardBarrierControlFile under scratchDir.
+func preForwardBarrierEnabled(scratchDir string) bool {
+	if scratchDir == "" {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(scratchDir, preForwardBarrierControlFile))
+	return err == nil
+}
+
 // handleManagerMessage dispatches one delivered message per the section 7
 // manager operating contract, acknowledging it before the next wait in
 // every case. plannedFixReviews tracks every review id this manager has
@@ -1355,8 +1436,14 @@ func statusOutcomeForNotice(hopPath, repoDir, runID, noticeBodyPath string) (rej
 // re-served or redelivered rejection notice for a review already acted on
 // never plans a second fix (the verdict-channel instruction's own rule:
 // "never plan a second fix from the same shortfall once its path has
-// already matched a notice you acted on").
-func handleManagerMessage(hopPath, cwd, runID, scratchDir string, script *managerScript, labelToID map[string]string, fixCounter *int, plannedFixReviews map[string]bool, msg *deliveredMessage) {
+// already matched a notice you acted on"). resumed and selfKillControlPath
+// support the opt-in pre-forward barrier above: resumed is runManager's
+// own resolvePrompt flag (false on this incarnation's first launch, true
+// on every cold relaunch), and selfKillControlPath is the same self-kill
+// control file runManager's own background watchForSelfKill goroutine
+// already watches ("" when the manager has no scratch directory, in which
+// case the barrier can never be enabled either).
+func handleManagerMessage(hopPath, cwd, runID, scratchDir string, script *managerScript, labelToID map[string]string, fixCounter *int, plannedFixReviews map[string]bool, msg *deliveredMessage, resumed bool, selfKillControlPath string) {
 	body := readFileOrFatal(msg.BodyPath)
 	switch msg.Kind {
 	case "question":
@@ -1374,6 +1461,16 @@ func handleManagerMessage(hopPath, cwd, runID, scratchDir string, script *manage
 	case "answer":
 		if msg.From != "human" || msg.Origin == "" {
 			fatalf("manager received an answer it did not expect (from=%s origin=%s); the fixture manager only ever asks the human via a relay", msg.From, msg.Origin)
+		}
+		if !resumed && selfKillControlPath != "" && preForwardBarrierEnabled(scratchDir) {
+			writeContentDigest(filepath.Join(scratchDir, preForwardBarrierObservedFile), msg.ID, body)
+			fmt.Printf("FIXTURE-PRE-FORWARD-BARRIER answer=[%s]\n", msg.ID)
+			// Blocks here: watchForSelfKill polls the same control file its
+			// own already-running background goroutine watches and
+			// SIGKILLs this process the instant a test writes it -- this
+			// call's only purpose is to keep this goroutine from ever
+			// reaching the forward call below in the meantime.
+			watchForSelfKill(selfKillControlPath)
 		}
 		runHopCLIRetryable(hopPath, "msg", "send", "--kind", "answer", "--reply-to", msg.Origin, "--file", msg.BodyPath, "--request-id", newRequestID())
 		fmt.Printf("FIXTURE-FORWARDED origin=[%s]\n", msg.Origin)
