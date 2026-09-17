@@ -889,6 +889,104 @@ func TestFixtureManagerScriptDispatch(t *testing.T) {
 	}
 }
 
+// TestFixtureManagerResumeSkipsReplanning proves a cold-relaunched
+// manager (a resume-shaped invocation, exactly [<exe> --resume
+// <native-ref> <continuation prompt>]) never re-runs its own script's
+// task-creation/plan-close block: it re-reads the IDENTICAL assignment
+// (the same brief a resumed run's own frozen state never changes), and
+// each hop task create call mints a FRESH --request-id per invocation
+// (newRequestID), so request-id idempotency alone would not catch a
+// blind resumed re-run of the same script -- the manager itself must
+// know not to re-plan. Drives the compiled fixture directly (no herdr)
+// twice against the SAME state root and fake-hop invocation log: first
+// launch plans (one task create, one plan close); the resumed relaunch
+// must add neither.
+func TestFixtureManagerResumeSkipsReplanning(t *testing.T) {
+	artifacts := newArtifactDir(t)
+	principal := buildFixtureWorker(t, artifacts)
+	fakeHop := buildFakeHopStub(t, artifacts)
+
+	stateDir := artifacts.dir(t, "state")
+	scratchDir := artifacts.dir(t, "manager-scratch")
+	const runID = "c2c2c2c2-c2c2-4c2c-8c2c-c2c2c2c2c2c2"
+	assignmentPath := filepath.Join(stateDir, "runs", runID, "artifacts", "assignment.md")
+	if err := os.MkdirAll(filepath.Dir(assignmentPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	brief := fixtureManagerBrief(scratchDir, []fixtureManagerTask{{Label: "t1", Title: "Implement t1", Behavior: "worker-implement"}}, nil, "")
+	assignmentContent := "# HOP Manager Assignment\n\nRun: " + runID + "\n\n## Brief\n\n" + brief + "\n## Instructions\n"
+	if err := os.WriteFile(assignmentPath, []byte(assignmentContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	scriptDir := artifacts.dir(t, "manager-script")
+	counterPath := newFakeHopTaskCounter(t, scriptDir)
+	logPath := filepath.Join(scriptDir, "log.txt")
+	// No FAKE_HOP_MSG_SCRIPT: every hop msg wait call answers
+	// "none: ..." immediately (runMsgFetch's own unscripted default), so
+	// both launches just idle-poll harmlessly until their own context
+	// deadline, exactly like TestFixtureManagerScriptDispatch bounds an
+	// intentionally endless manager.
+
+	cwd, err := filepath.EvalSymlinks(artifacts.dir(t, "manager-cwd"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const rolePath, cribPath = "/state/runs/r/artifacts/roles/manager.md", "/state/runs/r/artifacts/worker-protocol.md"
+	baseEnv := []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOP_STATE_DIR=" + stateDir,
+		"HOP_RUN_ID=" + runID,
+		"HOP_SESSION_ID=33333333-3333-3333-3333-333333333333",
+		"HOP_INCARNATION_ID=44444444-4444-4444-4444-444444444444",
+		"HOP_ROLE=manager",
+		"FAKE_HOP_TASK_COUNTER_FILE=" + counterPath,
+		"FAKE_HOP_LOG=" + logPath,
+	}
+	run := func(args ...string) string {
+		ctx, cancel := context.WithTimeout(t.Context(), 1*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, principal, args...) //nolint:gosec // G204: fixed test-owned binary and arguments.
+		cmd.Dir = cwd
+		cmd.Env = baseEnv
+		var out strings.Builder
+		cmd.Stdout = &out
+		cmd.Stderr = &out
+		_ = cmd.Run() //nolint:errcheck // bounded by the context deadline; the manager never exits on its own (per-attempt retirement is what a real scenario proves terminates it).
+		return out.String()
+	}
+
+	firstPrompt := testManagerInitialPrompt(assignmentPath, rolePath, cribPath, fakeHop)
+	firstStdout := run("--session-id", "22222222-2222-2222-2222-222222222222", firstPrompt)
+	if !strings.Contains(firstStdout, "FIXTURE-TASK-CREATED label=[t1]") || !strings.Contains(firstStdout, "FIXTURE-PLAN-CLOSED") {
+		t.Fatalf("first (non-resumed) launch did not plan; stdout:\n%s", firstStdout)
+	}
+	logAfterFirst := readFakeHopLog(t, logPath)
+	if got := countLogLinesWithPrefix(logAfterFirst, "task\tcreate"); got != 1 {
+		t.Fatalf("task create count after the first launch = %d, want 1; log:\n%s", got, logAfterFirst)
+	}
+	if got := countLogLinesWithPrefix(logAfterFirst, "plan\tclose"); got != 1 {
+		t.Fatalf("plan close count after the first launch = %d, want 1; log:\n%s", got, logAfterFirst)
+	}
+
+	const nativeRef = "88888888-8888-4888-8888-888888888888"
+	continuationPrompt := testManagerContinuationPrompt(assignmentPath, rolePath, cribPath, fakeHop)
+	secondStdout := run("--resume", nativeRef, continuationPrompt)
+	if strings.Contains(secondStdout, "FIXTURE-TASK-CREATED") || strings.Contains(secondStdout, "FIXTURE-PLAN-CLOSED") {
+		t.Errorf("resumed launch re-planned; stdout:\n%s", secondStdout)
+	}
+	if !strings.Contains(secondStdout, "FIXTURE-MANAGER-READY") {
+		t.Errorf("resumed launch did not even report ready; stdout:\n%s", secondStdout)
+	}
+	logAfterSecond := readFakeHopLog(t, logPath)
+	if got := countLogLinesWithPrefix(logAfterSecond, "task\tcreate"); got != 1 {
+		t.Errorf("task create count after the resumed relaunch = %d, want still 1 (no re-plan); log:\n%s", got, logAfterSecond)
+	}
+	if got := countLogLinesWithPrefix(logAfterSecond, "plan\tclose"); got != 1 {
+		t.Errorf("plan close count after the resumed relaunch = %d, want still 1 (no re-plan); log:\n%s", got, logAfterSecond)
+	}
+}
+
 // requestIDFromLogLine extracts the value following a "--request-id"
 // token in one fake-hop invocation log line, "" if absent.
 func requestIDFromLogLine(t *testing.T, line string) string {

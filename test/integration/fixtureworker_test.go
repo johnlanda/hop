@@ -1145,6 +1145,13 @@ func runManager() {
 	observationPath := filepath.Join(filepath.Dir(assignmentPath), "manager-observed.txt")
 	if scratchDir != "" {
 		observationPath = filepath.Join(scratchDir, "manager-observed.txt")
+		// The same safe self-kill channel runWorker's own attempts use
+		// (Astra review finding P1): a test asks this VERIFIED process to
+		// kill ITSELF by writing a control file, never signals a pid it
+		// only observed. Named by this session's own id (the manager has
+		// no attempt id) so a cold-relaunched successor's watcher never
+		// collides with its predecessor's already-consumed control file.
+		go watchForSelfKill(filepath.Join(scratchDir, "self-kill-"+env["HOP_SESSION_ID"]))
 	}
 	writeObservation(observationPath, "manager", assignmentPath, promptAssignmentPath, hopPath, assignmentContent, behavior, nil, "", "")
 	fmt.Println("FIXTURE-MANAGER-READY")
@@ -1162,28 +1169,42 @@ func runManager() {
 		fatalf("resolve manager working directory: %v", err)
 	}
 	labelToID := map[string]string{}
-	for _, task := range script.Tasks {
-		instructionsPath := writeTempInstructions(cwd, task.Behavior, scratchDir)
-		args := []string{"task", "create", "--title", task.Title, "--file", instructionsPath, "--request-id", newRequestID()}
-		for _, dep := range task.DependsOn {
-			depID, known := labelToID[dep]
-			if !known {
-				fatalf("manager script: TASK %s depends on unknown label %s (declare it earlier)", task.Label, dep)
+	if !resumed {
+		// A cold-relaunched successor re-reads the SAME assignment (and
+		// therefore the same script) but must never re-plan: every task
+		// this script names was already created by a PRIOR incarnation
+		// (each hop task create call mints a FRESH --request-id per
+		// invocation, so request-id idempotency alone would not catch a
+		// resumed re-run, and the design's own reopen-on-create rule
+		// means a redundant create would not even be refused). Skipping
+		// this block on resume leaves labelToID/fixCounter's later use
+		// (a needs-rework retry, a reject-verdict fix task) unavailable
+		// to a cold-relaunched manager -- out of scope for the scenarios
+		// that exercise this resume path today, which never combine it
+		// with a retry or a fix task.
+		for _, task := range script.Tasks {
+			instructionsPath := writeTempInstructions(cwd, task.Behavior, scratchDir)
+			args := []string{"task", "create", "--title", task.Title, "--file", instructionsPath, "--request-id", newRequestID()}
+			for _, dep := range task.DependsOn {
+				depID, known := labelToID[dep]
+				if !known {
+					fatalf("manager script: TASK %s depends on unknown label %s (declare it earlier)", task.Label, dep)
+				}
+				args = append(args, "--depends-on", depID)
 			}
-			args = append(args, "--depends-on", depID)
+			res := runHopCLIRetryable(hopPath, args...)
+			taskID, ok := parseCreatedTaskID(res.Stdout)
+			if !ok {
+				fatalf("manager script: hop task create for %s was refused: %s", task.Label, res.FirstLine())
+			}
+			labelToID[task.Label] = taskID
+			fmt.Printf("FIXTURE-TASK-CREATED label=[%s] id=[%s]\n", task.Label, taskID)
 		}
-		res := runHopCLIRetryable(hopPath, args...)
-		taskID, ok := parseCreatedTaskID(res.Stdout)
-		if !ok {
-			fatalf("manager script: hop task create for %s was refused: %s", task.Label, res.FirstLine())
+		if res := runHopCLIRetryable(hopPath, "plan", "close", "--request-id", newRequestID()); res.ExitCode != 0 && !strings.HasPrefix(res.FirstLine(), "duplicate") {
+			fatalf("manager script: hop plan close was refused: %s", res.FirstLine())
 		}
-		labelToID[task.Label] = taskID
-		fmt.Printf("FIXTURE-TASK-CREATED label=[%s] id=[%s]\n", task.Label, taskID)
+		fmt.Println("FIXTURE-PLAN-CLOSED")
 	}
-	if res := runHopCLIRetryable(hopPath, "plan", "close", "--request-id", newRequestID()); res.ExitCode != 0 && !strings.HasPrefix(res.FirstLine(), "duplicate") {
-		fatalf("manager script: hop plan close was refused: %s", res.FirstLine())
-	}
-	fmt.Println("FIXTURE-PLAN-CLOSED")
 
 	fixCounter := len(script.Tasks)
 	plannedFixReviews := map[string]bool{}
