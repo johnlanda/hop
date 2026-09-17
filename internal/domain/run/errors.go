@@ -59,8 +59,11 @@ var ErrConflictingAnswer = errors.New("run: conflicting answer")
 // question and no session answers another address's question.
 var ErrAnswerNotRecipient = errors.New("run: answerer is not the question's recipient")
 
-// ErrStaleAck reports an ack from an incarnation that is not the acking
-// session's current, non-superseded one.
+// ErrStaleAck reports a first ack the acking session may no longer make:
+// its incarnation is not the session's current, non-superseded one
+// (AckContext.IncarnationCurrent), or the session is no longer its
+// address's current session (AckContext.AttemptCurrent,
+// CurrentAddressSession).
 var ErrStaleAck = errors.New("run: stale ack")
 
 // ErrNotDelivered reports an ack of a message with no delivery row recorded

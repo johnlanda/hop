@@ -83,9 +83,10 @@ const (
 	// identically so envelope content never leaks across runs.
 	GrammarReasonNotFound = "not-found"
 	// GrammarReasonUnauthorized: the caller session does not belong to the
-	// stated run, or its resolved address or incarnation disagrees with
-	// the request — including an answer from a session whose address is
-	// not the question's recipient (no session answers a human question).
+	// stated run, or its resolved address disagrees with the request or
+	// with the addressing rules — including an answer from a session whose
+	// address is not the question's recipient (no session answers a human
+	// question). An incarnation that is not current is stale instead.
 	GrammarReasonUnauthorized = "unauthorized"
 	// GrammarReasonMalformed: parse or bounds failure (section 7 step 1).
 	GrammarReasonMalformed = "malformed"
@@ -93,8 +94,9 @@ const (
 	// content, or a resubmission conflicting with accepted content; the
 	// accepted entity is never disturbed.
 	GrammarReasonConflicting = "conflicting"
-	// GrammarReasonStale: a stale incarnation, or a submission against an
-	// entity no longer eligible to accept it.
+	// GrammarReasonStale: a stale incarnation; a send or ack from a session
+	// that is no longer its address's current session; or a submission
+	// against an entity no longer eligible to accept it.
 	GrammarReasonStale = "stale"
 	// GrammarReasonNotDelivered: an ack of a message never delivered to
 	// the acking session itself.
@@ -110,9 +112,9 @@ const (
 	// GrammarReasonNotManager: a plan verb (task create/retry, plan close)
 	// from a session that is not the run's current manager.
 	GrammarReasonNotManager = "not-manager"
-	// GrammarReasonNotReviewer: a review submission from a session whose
-	// role is not reviewer, or that is not the review attempt's current
-	// session.
+	// GrammarReasonNotReviewer: a first review submission from a session
+	// that is not the review attempt's own reviewer session (another role,
+	// another run, or another attempt).
 	GrammarReasonNotReviewer = "not-reviewer"
 	// GrammarReasonDependencyCycle: a task create whose dependency edges
 	// would close a cycle.

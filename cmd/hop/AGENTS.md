@@ -80,9 +80,14 @@ commands expect the built binary at `.bin/hop` (see `make build`).
   error, since the CLI syntax was fine and the request itself was refused
   or must be rerun. `hop task create/retry`, `hop plan close` and
   `hop msg send` print the retryable run-not-running line while the run
-  is not yet running, with the store's value-free detail on stderr. `hop review submit`'s transient outcome
+  is not yet running, with the store's value-free detail on stderr. `hop review submit`
   is the one exception, rendered by its own `writeReviewResultAndExit`
-  (also exit 1, the fixed retry line only, Detail to stderr).
+  (also exit 1): a transient outcome prints exactly the one of its two
+  retry lines its typed reason selects (not-running or drain, Detail to
+  stderr), and a refusal prints `refused: <token>` from its typed
+  reason, detail after. `hop result submit` has no refusal prefix: a
+  final non-success prints `stale: <detail>`, `conflicting: <detail>` or
+  `malformed: <detail>`.
 - One state-root rule (section 4): controller commands resolve
   XDG-with-`HOP_STATE_DIR`-override through `resolveStateRoot`; worker
   commands (`launch`, `check-exec`, `result submit`, and every

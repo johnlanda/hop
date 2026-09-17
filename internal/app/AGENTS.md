@@ -629,7 +629,9 @@ sides together. `cmd/hop` never imports domain or identity types: every
   drain line's, comes before the rerun), every template quotation of a grammar line
   or verb asserted verbatim, each crib section's retryable lines (the
   run-not-running line under exactly task create, task retry, plan close
-  and msg send), and the role-artifact freeze (copies,
+  and msg send; the not-running and drain lines, instruction included,
+  under exactly the result and review submit verbs), and the
+  role-artifact freeze (copies,
   digests, the crib's exact bytes, the derived integration branch name,
   and its refusal table). cmd/hop's real-binary per-verb contract tests
   are slice 6's and assert the same constants.

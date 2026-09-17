@@ -760,7 +760,9 @@ first (duplicate or conflicting), then the caller's incarnation
 currency, the run's stop request, the attempt's state and launch claim,
 and only then the mailbox. A caller that can never be accepted — a
 superseded or replaced incarnation, a run with a stop request, an attempt
-already terminal — is therefore refused `stale` rather than told to
+already terminal — therefore gets the final stale outcome
+(`stale: <detail>` from `hop result submit`, `refused: stale` from
+`hop review submit`, section 7's grammar) rather than being told to
 drain a queue its own fetch could never serve, and an attempt still
 launching with an unsettled claim is told `transient: attempt not yet
 running; retry` whatever its mailbox holds; only an otherwise eligible
@@ -1168,11 +1170,25 @@ each CHECKED, not merely documented:
 
 ### Recipient operating contract
 
-The harness agents' behavior is specified, not assumed: every launch
-prompt and role artifact states the polling contract verbatim (quoting the
-section 7 grammar constants), and the fixture principals implement exactly
-it, so the deterministic suite proves the contract is followable as
-written.
+The harness agents' behavior is specified, not assumed, and every line
+HOP renders for it quotes the section 7 grammar constants. The manager's
+launch prompt names its polling command and points at its assignment,
+its frozen role artifact and the worker protocol reference (the crib),
+which quote every verb's lines; its assignment states the wait-and-ack
+loop and the verdict channel. The implementer's and reviewer's launch
+prompts name their submit command and one retry rule — on a first line
+beginning with `transient`, follow that line's instruction, then wait
+briefly and rerun the exact same command, so the drain line is drained
+before the resubmission — and their assignment artifacts state the
+exits: an accepted or duplicate submission means the work is done and
+the turn ends without polling; a stale line means stop without
+retrying. The worker's question-and-wait loop and its drain before
+submitting are in no HOP-rendered worker text: they are the repository's
+implementer and reviewer role instructions' to state, which HOP freezes
+verbatim and renders nothing into. The fixture principals implement exactly this split — the fixture
+worker drains when the drain line tells it to, and before submitting —
+so the deterministic suite proves the rendered instructions are
+followable as written.
 
 - **Manager**: after acting on its plan (creating tasks, sending
   messages), the manager's standing instruction is to run
@@ -1366,6 +1382,19 @@ the address the request digest covers (Send, below) — so a session that
 claims another principal's address never reads a duplicate or
 conflicting verdict about that principal's requests.
 
+The threat model these checks serve: every session of a run runs as the
+same OS user, with read access to the run's state root and its message
+bodies, so message content is not a confidentiality boundary between a
+run's sessions. What HOP enforces is mutation authority — who may send,
+answer, fetch, acknowledge or submit — and its credential is the
+caller's current incarnation together with its address currency; the
+session and run identities a caller names are only claims, checked
+against the session row. A caller that names another session's id (ids
+are printed in `from=` fields) with its own incarnation therefore passes
+the address check but can reach at most a receipt verdict (duplicate or
+conflicting) before the incarnation check refuses it, and never a
+mutation: an accepted residual of receipt-before-eligibility.
+
 Run-state acceptance follows the Phase 2 result-submission precedent
 ([phase-2-design.md](phase-2-design.md) section 7, step 4: a submission
 for a launching attempt whose claim has not settled is recorded as
@@ -1493,10 +1522,13 @@ the retryable nor the final line applies to them.
   once a session's attempt is TERMINAL its fetch (and its first ack, see
   Ack) is refused rather than answered `none:` — an accepted verdict
   completes the review attempt at once; an accepted result's attempt
-  stays `submitted`/`checking` (fetch still answers, and finds nothing,
-  since acceptance required a clear mailbox and closed it) until its
-  per-task check settles it `completed` or `failed`; an interrupted or
-  failed attempt is terminal immediately. The session has nothing left
+  stays `submitted`/`checking` until its per-task check settles it
+  `completed` or `failed`, but the same acceptance commits the session's
+  retirement intent (section 6), and once that retirement terminates the
+  session it is never current — so fetch answers (and finds nothing, since acceptance required a clear
+  mailbox and closed it) until the attempt settles or the session ends,
+  whichever comes first; an interrupted or failed attempt is terminal
+  immediately. The session has nothing left
   to consume there, and a terminal attempt's session must never take a
   message a retry's successor is meant to read; the recipient operating
   contract already ends the turn after an accepted submission, so a
@@ -1520,10 +1552,12 @@ the retryable nor the final line applies to them.
   after those checks, is a session that is no longer its address's
   current session (the Fetch rule; `refused: stale`, `ErrStaleAck`): the
   message it was served stays in flight and is re-served to the current
-  session. The order is fixed — an already-acknowledged message is an
-  idempotent duplicate first, then the delivery to this session (a
-  retired session never served the message is `not-delivered`), then the
-  incarnation, then address currency. The ack row commits with its
+  session. The order is fixed: a message unknown to the stated run is
+  `refused: not-found` and a session of another run `refused:
+  unauthorized` first; then an already-acknowledged message is an
+  idempotent duplicate; then the delivery to this session (a retired
+  session never served the message is `not-delivered`); then the
+  incarnation; then address currency. The ack row commits with its
   receipt.
 - **Answer** (`hop answer <question-id> --file <path> | --body "<text>"`):
   validates the question is `human`-addressed and unanswered; the answer
@@ -1587,30 +1621,39 @@ frozen subject: resubmit with the subject the review assignment names),
 `not-reviewer` (the caller is not the review attempt's own reviewer
 session), `stale` (every other ineligibility), `malformed` and
 `conflicting`; a refused outcome naming no token its kind admits prints
-no protocol line. `hop msg next` and `hop msg wait` have no refusal line: a fetch
-refused for authority (another run's session, a stale incarnation, an
-address the session does not resolve to, or a session that is not its
-address's current session) prints nothing on stdout, one
-`hop msg next: …` / `hop msg wait: …` diagnostic on stderr, and exits 1;
-`refused: stale` from `hop msg ack` also covers an ack from a session
-that is no longer its address's current session, and so does
-`refused: stale` from `hop msg send`. A retryable first line (`transient: …`) also exits 1. The two submit
-verbs each have two retryable lines that demand different actions (rerun
-after a short delay, or drain first), so their store outcome carries a
-TYPED transient reason — attempt-not-running or undelivered-messages, set
-where the store decides — and the CLI prints exactly the line that reason
-selects, never inferring it from detail text; a transient outcome naming
-no known reason is an error and prints no protocol line. A worker that
-could not tell the two apart would retry an undrained submission
-forever. Both verbs decide in section 5's one acceptance order, so the
-drain line reaches only a caller whose incarnation is current, whose run
-has no stop request and whose attempt can still accept — exactly a
-caller whose own `hop msg next` is served — while a caller that can
-never be accepted gets the final `stale` outcome instead. It is the only
+no protocol line. `hop result submit` is the one verb without the
+`refused:` prefix (Phase 2's shape, unchanged): its final non-success
+first line is the outcome kind with the detail on the same line —
+`stale: <detail>`, `conflicting: <detail>` or `malformed: <detail>` —
+and it too exits 1. `hop msg next` and `hop msg wait` have no refusal
+line: a fetch refused for authority (another run's session, a stale
+incarnation, an address the session does not resolve to, or a session
+that is not its address's current session) prints nothing on stdout,
+one `hop msg next: …` / `hop msg wait: …` diagnostic on stderr, and
+exits 1; `refused: stale` from `hop msg ack` and `hop msg send` also
+covers a session that is no longer its address's current session.
+
+A retryable first line (`transient: …`) also exits 1. It is the only
 stdout line, any detail goes to stderr, nothing changed, and the caller
-reruns the same command (same `--request-id`) after a short delay. The assignment and role templates quote these lines verbatim from the
-same constants, so template, CLI and fixture can never drift apart
-silently.
+follows the line's own instruction, then reruns the same command after
+a short delay — with the same `--request-id` for the verbs that take
+one (the submit verbs have none: their idempotency is the per-attempt
+digest). The two submit verbs each have two retryable lines that demand
+different actions (rerun after a short delay, or drain first), so their
+store outcome carries a TYPED transient reason — attempt-not-running or
+undelivered-messages, set where the store decides — and the CLI prints
+exactly the line that reason selects, never inferring it from detail
+text; a transient outcome naming no known reason is an error and prints
+no protocol line. A worker that could not tell the two apart would
+retry an undrained submission forever. Both verbs decide in section 5's
+one acceptance order, so the drain line reaches only a caller whose
+incarnation is current, whose run has no stop request and whose attempt
+can still accept — exactly a caller whose own `hop msg next` is served —
+while a caller that can never be accepted gets the final stale outcome
+instead (`stale: <detail>` from `hop result submit`, `refused: stale`
+from `hop review submit`). The assignment templates, the crib and the
+launch prompts quote these lines from the same constants, so template,
+CLI and fixture can never drift apart silently.
 
 ## 8. The built-in feature workflow: review, guards, serial integration
 
