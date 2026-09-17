@@ -165,11 +165,11 @@ func (s *Store) SendMessage(ctx context.Context, send app.MessageSend) (app.Mess
 		if err != nil {
 			return err
 		}
-		binding, hasBinding, err := currentBinding(ctx, tx, send.Sender.SessionID)
+		current, err := sessionIncarnationCurrent(ctx, tx, send.Sender.SessionID, send.IncarnationID)
 		if err != nil {
 			return err
 		}
-		if !hasBinding || binding.IncarnationID != send.IncarnationID || binding.Superseded {
+		if !current {
 			return record(app.MessageRefused, "", app.GrammarReasonStale, "incarnation is not current")
 		}
 
@@ -332,8 +332,9 @@ func persistBundledQuestionAck(ctx context.Context, q querier, question *run.Mes
 // for the caller's address if one exists, else the lowest-enqueue-sequence
 // queued message. Before touching the queue it independently re-derives
 // every caller-supplied identity from the session row itself — the
-// session's own run, its current non-superseded binding's incarnation and
-// its resolved logical address — and any disagreement is
+// session's own run, the claimed incarnation's currency
+// (sessionIncarnationCurrent) and its resolved logical address — and any
+// disagreement is
 // app.ErrMessagingUnauthorized with a refusal receipt committed (the one
 // evidence a refused fetch leaves). An EMPTY fetch commits neither a
 // delivery row nor a receipt, so a 1s poll loop cannot grow the store; a
@@ -364,11 +365,11 @@ func (s *Store) FetchNextMessage(ctx context.Context, fetch app.MessageFetch) (a
 		if err != nil {
 			return err
 		}
-		binding, hasBinding, err := currentBinding(ctx, tx, fetch.SessionID)
+		current, err := sessionIncarnationCurrent(ctx, tx, fetch.SessionID, fetch.IncarnationID)
 		if err != nil {
 			return err
 		}
-		if !hasBinding || binding.IncarnationID != fetch.IncarnationID || binding.Superseded {
+		if !current {
 			return refuse("incarnation is not current",
 				fmt.Errorf("%w: session %s incarnation %s is not current", app.ErrMessagingUnauthorized, fetch.SessionID, fetch.IncarnationID))
 		}
@@ -470,11 +471,10 @@ func (s *Store) AckMessage(ctx context.Context, ack app.MessageAck) (app.Message
 		).Scan(&deliveredToSession); scanErr != nil {
 			return fmt.Errorf("sqlite: read deliveries of message %s: %w", ack.MessageID, scanErr)
 		}
-		binding, hasBinding, err := currentBinding(ctx, tx, ack.SessionID)
+		incarnationIsCurrent, err := sessionIncarnationCurrent(ctx, tx, ack.SessionID, ack.IncarnationID)
 		if err != nil {
 			return err
 		}
-		incarnationIsCurrent := hasBinding && binding.IncarnationID == ack.IncarnationID && !binding.Superseded
 
 		outcomeVal, err := run.AcceptAck(message, priorAck,
 			run.AckContext{DeliveredToSession: deliveredToSession, IncarnationCurrent: incarnationIsCurrent},

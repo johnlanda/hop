@@ -78,10 +78,11 @@ func acceptedWorkflowReceipt(ctx context.Context, q querier, runID, op, requestI
 
 // requireManagerCaller resolves the manager-verb caller checks shared by
 // every PlanStore method: the caller session must be the run's manager and
-// its claimed incarnation must be the session's current, non-superseded
-// binding. It returns the refusal's grammar reason token and detail ("",
-// "" when the caller is legitimate) — set directly at each decision point,
-// never derived from the detail text downstream.
+// its claimed incarnation must be current under the one
+// principal-incarnation rule (sessionIncarnationCurrent). It returns the
+// refusal's grammar reason token and detail ("", "" when the caller is
+// legitimate) — set directly at each decision point, never derived from
+// the detail text downstream.
 func requireManagerCaller(ctx context.Context, q querier, runID identity.RunID, sessionID identity.SessionID, incarnationID identity.IncarnationID) (reason, detail string, err error) {
 	session, _, err := getSession(ctx, q, sessionID)
 	if errors.Is(err, app.ErrNotFound) || (err == nil && (session.Role != run.RoleManager || session.RunID != runID)) {
@@ -90,11 +91,11 @@ func requireManagerCaller(ctx context.Context, q querier, runID identity.RunID, 
 	if err != nil {
 		return "", "", err
 	}
-	binding, hasBinding, err := currentBinding(ctx, q, sessionID)
+	current, err := sessionIncarnationCurrent(ctx, q, sessionID, incarnationID)
 	if err != nil {
 		return "", "", err
 	}
-	if !hasBinding || binding.IncarnationID != incarnationID || binding.Superseded {
+	if !current {
 		return app.GrammarReasonStale, "incarnation is not current", nil
 	}
 	return "", "", nil
