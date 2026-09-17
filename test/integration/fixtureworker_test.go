@@ -1611,7 +1611,7 @@ func postForwardBarrierEnabled(scratchDir string) bool {
 // control file runManager's own background watchForSelfKill goroutine
 // already watches ("" when the manager has no scratch directory, in which
 // case the barrier can never be enabled either).
-func handleManagerMessage(hopPath, cwd, runID, scratchDir string, script *managerScript, labelToID map[string]string, fixCounter *int, plannedFixReviews map[string]bool, msg *deliveredMessage, resumed bool, selfKillControlPath string) {
+func handleManagerMessage(hopPath, cwd, runID, sessionID, scratchDir string, script *managerScript, labelToID map[string]string, fixCounter *int, plannedFixReviews map[string]bool, msg *deliveredMessage, resumed bool, selfKillControlPath string) {
 	body := readFileOrFatal(msg.BodyPath)
 	switch msg.Kind {
 	case "question":
@@ -1653,6 +1653,13 @@ func handleManagerMessage(hopPath, cwd, runID, scratchDir string, script *manage
 			fatalf("manager's forward of origin=%s was neither accepted nor duplicate: %s", msg.Origin, forwardFirst)
 		}
 		fmt.Printf("FIXTURE-FORWARDED origin=[%s] request-id=[%s] result=[%s]\n", msg.Origin, forwardRequestID, forwardFirst)
+		// The forward's own rendered first line, dumped per CALLING
+		// SESSION (never overwritten across incarnations, unlike a fixed
+		// path): a scenario asserting idempotency needs the exact text
+		// EACH incarnation's own forward call printed, not merely the
+		// store's duplicate-receipt outcome, since the CLI's own rendered
+		// line is what a real manager acts on.
+		atomicWriteFile(filepath.Join(scratchDir, "manager-forward-result-"+sessionID+".txt"), forwardFirst+"\n")
 		if !resumed && selfKillControlPath != "" && postForwardBarrierEnabled(scratchDir) {
 			writeContentDigest(filepath.Join(scratchDir, postForwardBarrierObservedFile), msg.ID, body)
 			fmt.Printf("FIXTURE-POST-FORWARD-BARRIER answer=[%s]\n", msg.ID)

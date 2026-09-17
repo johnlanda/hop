@@ -34,7 +34,7 @@ import (
 //   - PostForwardPreAckKill (reference trace 2's idempotency case): the
 //     barrier fires AFTER the forward is accepted and BEFORE the ack, so
 //     the relaunched manager's own incarnation re-fetches the re-served a2
-//     and redoes the forward call under the SAME recorded request id --
+//     and redoes the forward call under the SAME derived request id --
 //     proving the redo is idempotent (a duplicate outcome, not a second
 //     answer), never merely that the barrier never fires. Kept lean: it
 //     asserts the idempotency facts specifically, not the full row set
@@ -153,7 +153,7 @@ func testRelayedQuestionPreForwardKill(t *testing.T) {
 
 	// The relaunched manager recovers using ONLY CLI-returned data (the
 	// re-served a2's own origin field) and forwards idempotently under
-	// its own recorded request id, then acks a2 -- forward-before-ack.
+	// its own derived request id, then acks a2 -- forward-before-ack.
 	a1 := ""
 	if !waitUntilDeadline(featureRunTimeout, func() bool {
 		a1 = fx.scalar(t, fmt.Sprintf("SELECT id FROM messages WHERE run_id = '%s' AND reply_to = '%s' AND kind = 'answer';", fx.runID, q1))
@@ -181,6 +181,10 @@ func testRelayedQuestionPreForwardKill(t *testing.T) {
 	if got := fx.messageBodyContent(t, a1); got != releaseText {
 		t.Errorf("forwarded answer a1's body = %q, want the human's own answer text byte-exact: %q", got, releaseText)
 	}
+	// The CLI's own rendered first line for the RELAUNCHED session's one
+	// forward call -- the ORIGINAL session never attempts one, since the
+	// barrier fires before it ever reaches the forward call.
+	requireManagerForwardResult(t, scratchDir, newManagerSessionID, "sent "+a1)
 
 	// a2 is now acked by the RELAUNCHED manager, never the original.
 	if !waitUntilDeadline(featureRunTimeout, func() bool { return fx.messageAcked(t, a2) }) {
@@ -356,6 +360,9 @@ func testRelayedQuestionPostForwardPreAckKill(t *testing.T) {
 	if originalRequestID == "" {
 		t.Fatalf("no accepted msg-send receipt found for a1=%s", a1)
 	}
+	// The CLI's own rendered first line for the ORIGINAL session's
+	// forward call, not merely the store's accepted outcome.
+	requireManagerForwardResult(t, scratchDir, managerSessionID, "sent "+a1)
 
 	killControllerLeader(t, fx.controller)
 	fx.killSession(t, managerSessionID, managerSessionID)
@@ -398,6 +405,10 @@ func testRelayedQuestionPostForwardPreAckKill(t *testing.T) {
 	if duplicateRequestID != originalRequestID {
 		t.Errorf("relaunched manager's redo used request_id=%q, want the SAME deterministic id the original accepted forward used: %q", duplicateRequestID, originalRequestID)
 	}
+	// The CLI's own rendered first line for the RELAUNCHED session's own
+	// redo of the forward call: the idempotency proof a real manager acts
+	// on, not merely the store's duplicate receipt.
+	requireManagerForwardResult(t, scratchDir, newManagerSessionID, "duplicate "+a1)
 
 	if n := fx.scalar(t, fmt.Sprintf("SELECT count(*) FROM messages WHERE run_id = '%s' AND kind = 'answer' AND reply_to = '%s';", fx.runID, q1)); n != "1" {
 		t.Errorf("count(answers with reply_to=%s) = %s, want exactly 1 (an idempotent redo must never create a second answer)", q1, n)
@@ -416,6 +427,34 @@ func testRelayedQuestionPostForwardPreAckKill(t *testing.T) {
 	fx.requireRunState(t, "completed")
 	if !waitUntilDeadline(featureRunTimeout, func() bool { return fx.messageAcked(t, a1) }) {
 		t.Fatalf("forwarded answer a1 was never acknowledged by the worker within %s", featureRunTimeout)
+	}
+}
+
+// requireManagerForwardResult asserts the manager forward result dump for
+// sessionID (fixtureworker_test.go's handleManagerMessage, "answer" case:
+// "manager-forward-result-<sessionID>.txt" under scratchDir) is exactly
+// want -- the CLI's own rendered first line for THAT session's own forward
+// call, not merely the store's outcome, since the rendered line is what a
+// real manager acts on. Polled, not read once: the dump lands right after
+// the forward's own db commit, in the same synchronous call, but on the
+// fixture process's own disk, independent of this test's db polls above.
+func requireManagerForwardResult(t *testing.T, scratchDir, sessionID, want string) {
+	t.Helper()
+	path := filepath.Join(scratchDir, "manager-forward-result-"+sessionID+".txt")
+	var got string
+	ok := waitUntilDeadline(featureRunTimeout, func() bool {
+		content, err := os.ReadFile(path) //nolint:gosec // G304: a path this test constructed itself under its own scratch directory.
+		if err != nil {
+			return false
+		}
+		got = strings.TrimRight(string(content), "\n")
+		return true
+	})
+	if !ok {
+		t.Fatalf("manager forward result dump for session %s was never observed at %s within %s", sessionID, path, featureRunTimeout)
+	}
+	if got != want {
+		t.Errorf("manager forward result for session %s = %q, want %q", sessionID, got, want)
 	}
 }
 
