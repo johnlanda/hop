@@ -514,6 +514,30 @@ func (f *featureRun) integrationHead(t *testing.T) string {
 	return f.repo.Base
 }
 
+// requireCombinedCheckPassed asserts a PERSISTED, successful combined
+// check (a check.run operation — usecase_integration.go's
+// integrationCheckIntent/checkRunOutcome payloads — state succeeded,
+// exit code 0) whose subject commit is exactly candidateCommit: the
+// actual guard evidence design section 8's EvaluateReadiness requires,
+// independent of integration.state == "integrated" alone. A production
+// regression that marked an integration integrated without ever
+// persisting this evidence would otherwise satisfy every other check in
+// this suite (Astra review finding: "the end-to-end test infers check
+// evidence from integration state").
+func (f *featureRun) requireCombinedCheckPassed(t *testing.T, candidateCommit string) {
+	t.Helper()
+	row := f.scalar(t, fmt.Sprintf(
+		`SELECT count(*) FROM operations WHERE run_id = '%s' AND kind = 'check.run' AND state = 'succeeded' AND intent LIKE '%%"subject_commit_oid":%q%%' AND outcome LIKE '%%"exit_code":0%%';`,
+		f.runID, candidateCommit))
+	n, err := strconv.Atoi(row)
+	if err != nil {
+		t.Fatalf("combined-check evidence count %q for candidate %s does not parse: %v", row, candidateCommit, err)
+	}
+	if n == 0 {
+		t.Errorf("no persisted successful combined-check operation (kind=check.run, state=succeeded, exit_code=0) found for candidate commit %s (run %s)", candidateCommit, f.runID)
+	}
+}
+
 // reviewVerdict reads reviewTaskID's accepted verdict, if any.
 func (f *featureRun) reviewVerdict(t *testing.T, reviewTaskID string) (verdict string, ok bool) {
 	t.Helper()

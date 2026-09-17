@@ -161,11 +161,14 @@ func TestRealProcessFeatureRunEndToEnd(t *testing.T) {
 	fx.requireSessionState(t, managerSessionID, "terminated")
 
 	// Every guard row present in the store (design section 8): the plan
-	// closed, every implement task integrated (a passing combined check
-	// is exactly what integration.state=="integrated" means), and the
-	// approve verdict bound to the current head — all already asserted
-	// above; the plan flag is re-checked here at the run's own terminal
-	// state.
+	// closed, every implement task integrated, a PERSISTED passing
+	// combined-check execution for each integration's own merge commit
+	// (never inferred from integration.state == "integrated" alone — a
+	// production regression that marked an integration integrated
+	// without ever persisting that evidence would otherwise satisfy
+	// every other check here), and the approve verdict bound to the
+	// current head — the plan flag is re-checked here at the run's own
+	// terminal state.
 	if !fx.planClosed(t) {
 		t.Error("run completed with the plan flag not set")
 	}
@@ -174,5 +177,20 @@ func TestRealProcessFeatureRunEndToEnd(t *testing.T) {
 		if state := fx.taskState(t, taskID); state != "integrated" {
 			t.Errorf("task %s state at completion = %q, want integrated", taskID, state)
 		}
+		_, mergeCommit, ok := fx.integrationForTask(t, taskID)
+		if !ok || mergeCommit == "" {
+			t.Fatalf("task %s has no recorded integration merge commit", taskID)
+		}
+		fx.requireCombinedCheckPassed(t, mergeCommit)
+	}
+
+	// The final reviewed head specifically: its own persisted combined
+	// check (already covered above, since t4 integrated last and its
+	// merge commit IS the final head — asserted again by name for
+	// clarity) and the PUBLISHED git integration ref, read with git in
+	// the test's own repo rather than the store, must equal it.
+	fx.requireCombinedCheckPassed(t, head)
+	if publishedHead := repo.git(t, "rev-parse", "refs/heads/hop/"+fx.label+"/integration"); publishedHead != head {
+		t.Errorf("published integration ref refs/heads/hop/%s/integration = %s, want the final reviewed head %s", fx.label, publishedHead, head)
 	}
 }
