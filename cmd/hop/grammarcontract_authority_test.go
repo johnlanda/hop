@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"database/sql"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -37,5 +39,99 @@ func TestGrammarContractResultSubmitSupersededIncarnationIsStale(t *testing.T) {
 	next := execHop(t, worker.env(f, nil), f.StateRoot, "msg", "next")
 	if next.ExitCode != exitFailure || next.Stdout != "" || !strings.HasPrefix(next.Stderr, "hop msg next: ") {
 		t.Fatalf("msg next (superseded worker): exit=%d stdout=%q stderr=%q, want a refusal on stderr only", next.ExitCode, next.Stdout, next.Stderr)
+	}
+}
+
+// messageDeliveryCount reads, through a read-only raw query, how many
+// delivery rows messageID has.
+func messageDeliveryCount(t *testing.T, stateRoot, messageID string) int {
+	t.Helper()
+	return readOnlyCount(t, stateRoot, `SELECT COUNT(*) FROM message_deliveries WHERE message_id = ?`, messageID)
+}
+
+// taskMessageCount reads, through a read-only raw query, how many messages
+// address taskID.
+func taskMessageCount(t *testing.T, stateRoot, taskID string) int {
+	t.Helper()
+	return readOnlyCount(t, stateRoot, `SELECT COUNT(*) FROM messages WHERE recipient_address = ?`, "task:"+taskID)
+}
+
+// readOnlyCount runs one COUNT query against the fixture store through a
+// read-only raw connection.
+func readOnlyCount(t *testing.T, stateRoot, query string, args ...any) int {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(stateRoot, "hop.db")+"?mode=ro&_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open raw db for a read: %v", err)
+	}
+	defer func() {
+		if closeErr := db.Close(); closeErr != nil {
+			t.Errorf("close raw db after a read: %v", closeErr)
+		}
+	}()
+	var n int
+	if err := db.QueryRowContext(context.Background(), query, args...).Scan(&n); err != nil {
+		t.Fatalf("read-only count: %v", err)
+	}
+	return n
+}
+
+// TestGrammarContractMsgNextRetiredAttemptSessionIsRefused drives the task
+// address's fetch authority through the real binary. Attempt 1's worker was
+// settled by the worker-termination shape (attempt interrupted, session
+// terminated, binding left current) and the retry's attempt 2 runs behind
+// its own session when the manager queues an info to the task. The old
+// worker's `hop msg next` and `hop msg wait` print nothing on stdout, one
+// value-free diagnostic on stderr, and exit 1, with nothing served; its
+// `hop msg ack` is refused not-delivered; the successor is then served the
+// info as its first delivery and acks it.
+func TestGrammarContractMsgNextRetiredAttemptSessionIsRefused(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC()
+	f := newFeatureManager(t, 10400, defaultMessageWait)
+	old := f.addActiveChild(t, 10500, "implement", "", "", true)
+	if err := hopfixtures.SettleWorkerTermination(ctx, f.store, f.lease, old.TaskID, old.AttemptID, old.SessionID, now); err != nil {
+		t.Fatalf("settle worker termination: %v", err)
+	}
+	if err := hopfixtures.ConsumeRetry(ctx, f.store, f.lease, old.TaskID, now); err != nil {
+		t.Fatalf("consume retry: %v", err)
+	}
+	sessionID, incarnationID, attemptID, err := hopfixtures.SeedChildSession(ctx, f.store, f.lease, f.RunID, old.TaskID, f.ManagerID, "implementer", 10600, now)
+	if err != nil {
+		t.Fatalf("seed successor session: %v", err)
+	}
+	if err := hopfixtures.RunAttempt(ctx, f.store, f.lease, attemptID, now); err != nil {
+		t.Fatalf("run successor attempt: %v", err)
+	}
+	successor := childSession{TaskID: old.TaskID, AttemptID: attemptID, SessionID: sessionID, IncarnationID: incarnationID}
+	infoID := requireSentOnly(t, "msg send (manager info to the task)", execHop(t, f.env(nil), f.StateRoot, "msg", "send", "--to", "task:"+old.TaskID, "--kind", "info", "--body", "for the retry"))
+
+	for _, verb := range [][]string{{"msg", "next"}, {"msg", "wait", "--timeout", "2s"}} {
+		label := "hop " + strings.Join(verb[:2], " ")
+		result := execHop(t, old.env(f, nil), f.StateRoot, verb...)
+		if result.ExitCode != exitFailure || result.Stdout != "" || strings.Count(result.Stderr, "\n") != 1 || !strings.HasPrefix(result.Stderr, label+": ") {
+			t.Fatalf("%s (retired worker): exit=%d stdout=%q stderr=%q, want exit %d, no stdout and one %q line", label, result.ExitCode, result.Stdout, result.Stderr, exitFailure, label+": ")
+		}
+		if !strings.Contains(result.Stderr, "session is not its task's current attempt session") ||
+			strings.Contains(result.Stderr, old.SessionID) || strings.Contains(result.Stderr, old.IncarnationID) {
+			t.Fatalf("%s (retired worker): stderr = %q, want the value-free refusal", label, result.Stderr)
+		}
+	}
+	if n := messageDeliveryCount(t, f.StateRoot, infoID); n != 0 {
+		t.Fatalf("delivery rows after the refused fetches = %d, want 0", n)
+	}
+	if ack := execHop(t, old.env(f, nil), f.StateRoot, "msg", "ack", infoID); ack.ExitCode != exitFailure || ack.FirstStdoutLine() != app.GrammarRefusalLine(app.GrammarReasonNotDelivered) {
+		t.Fatalf("msg ack (retired worker): exit=%d stdout=%q stderr=%q, want %q", ack.ExitCode, ack.Stdout, ack.Stderr, app.GrammarRefusalLine(app.GrammarReasonNotDelivered))
+	}
+
+	next := execHop(t, successor.env(f, nil), f.StateRoot, "msg", "next")
+	if want := app.GrammarMessageLine(infoID, "info", f.ManagerID, "", "", ""); next.FirstStdoutLine() != want {
+		t.Fatalf("msg next (successor) first line = %q, want %q; stderr=%q", next.FirstStdoutLine(), want, next.Stderr)
+	}
+	if n := messageDeliveryCount(t, f.StateRoot, infoID); n != 1 {
+		t.Fatalf("delivery rows after the successor's fetch = %d, want 1", n)
+	}
+	if ack := execHop(t, successor.env(f, nil), f.StateRoot, "msg", "ack", infoID); ack.Stdout != app.GrammarAckAcceptedLine(infoID)+"\n" {
+		t.Fatalf("msg ack (successor): exit=%d stdout=%q stderr=%q", ack.ExitCode, ack.Stdout, ack.Stderr)
 	}
 }

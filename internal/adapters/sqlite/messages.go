@@ -272,6 +272,34 @@ func messageAck(ctx context.Context, q querier, id identity.MessageID) (*run.Ack
 	return &ack, nil
 }
 
+// addressSessionCurrent reports run.CurrentAddressSession for session: for
+// a session with an attempt, its own attempt row and its task's newest
+// attempt by the store's attempt numbering (latestAttempt), both read
+// inside the caller's transaction; a session with no attempt — the
+// manager — reads no attempt row.
+func addressSessionCurrent(ctx context.Context, q querier, session *run.Session) (bool, error) {
+	var attempt, newest run.Attempt
+	if session.AttemptID != "" {
+		var err error
+		if attempt, _, err = getAttempt(ctx, q, session.AttemptID); err != nil {
+			return false, err
+		}
+		if newest, err = latestAttempt(ctx, q, attempt.TaskID); err != nil {
+			return false, err
+		}
+	}
+	return run.CurrentAddressSession(*session, attempt, newest), nil
+}
+
+// addressSessionRefusal is the value-free detail a fetch refused by
+// addressSessionCurrent records and returns.
+func addressSessionRefusal(address run.Address) string {
+	if address.Kind == run.AddressManager {
+		return "session is not the run's current manager session"
+	}
+	return "session is not its task's current attempt session"
+}
+
 // resolveSessionAddress resolves a session's logical address: manager for
 // a manager session, task:<id> for an implementer or reviewer via its
 // attempt's task — lineage-based, so every session ever bound to that

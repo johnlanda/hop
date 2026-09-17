@@ -406,12 +406,14 @@ func persistBundledQuestionAck(ctx context.Context, q querier, question *run.Mes
 // queued message. Before touching the queue it independently re-derives
 // every caller-supplied identity from the session row itself — the
 // session's own run, the claimed incarnation's currency
-// (sessionIncarnationCurrent) and its resolved logical address — and any
-// disagreement is
-// app.ErrMessagingUnauthorized with a refusal receipt committed (the one
-// evidence a refused fetch leaves). An EMPTY fetch commits neither a
-// delivery row nor a receipt, so a 1s poll loop cannot grow the store; a
-// successful serve's evidence is its append-only delivery row.
+// (sessionIncarnationCurrent), its resolved logical address, and whether it
+// is that address's current session (addressSessionCurrent: not ended,
+// and for a task address bound to the task's newest, non-terminal attempt)
+// — and any disagreement is app.ErrMessagingUnauthorized with a refusal
+// receipt committed (the one evidence a refused fetch leaves). An EMPTY
+// fetch commits neither a delivery row nor a receipt, so a 1s poll loop
+// cannot grow the store; a successful serve's evidence is its append-only
+// delivery row.
 func (s *Store) FetchNextMessage(ctx context.Context, fetch app.MessageFetch) (app.MessageDelivery, bool, error) { //nolint:gocritic // hugeParam: the port passes the fetch value; the adapter mirrors its signature.
 	var (
 		delivery app.MessageDelivery
@@ -453,6 +455,18 @@ func (s *Store) FetchNextMessage(ctx context.Context, fetch app.MessageFetch) (a
 		if !resolvable || !address.Equal(fetch.Address) {
 			return refuse("session does not resolve to the claimed address",
 				fmt.Errorf("%w: session %s does not resolve to address %s", app.ErrMessagingUnauthorized, fetch.SessionID, app.AddressString(fetch.Address)))
+		}
+		// Only the address's CURRENT session consumes its queue: a session
+		// that has ended, or one whose attempt a retry has succeeded or
+		// that is already terminal, is refused before anything is served,
+		// so its successor is served every message it left in flight.
+		isCurrent, err := addressSessionCurrent(ctx, tx, &session)
+		if err != nil {
+			return err
+		}
+		if !isCurrent {
+			detail := addressSessionRefusal(address)
+			return refuse(detail, fmt.Errorf("%w: %s", app.ErrMessagingUnauthorized, detail))
 		}
 
 		queue, err := messagesByAddress(ctx, tx, fetch.RunID, fetch.Address)
@@ -502,8 +516,10 @@ func (s *Store) FetchNextMessage(ctx context.Context, fetch app.MessageFetch) (a
 // whatever the caller's current incarnation), then the acking session's
 // OWN run, a delivery row for the ACKING SESSION ITSELF at the CLAIMED
 // incarnation (a predecessor session's — or a superseded incarnation's —
-// delivery proves nothing), and that incarnation's currency. Insertion of
-// the ack row is the acknowledgement.
+// delivery proves nothing), that incarnation's currency, and whether the
+// session is still its address's current session (addressSessionCurrent;
+// refused stale otherwise, the message left in flight for the current
+// session). Insertion of the ack row is the acknowledgement.
 func (s *Store) AckMessage(ctx context.Context, ack app.MessageAck) (app.MessageAckOutcome, error) {
 	var outcome app.MessageAckOutcome
 	err := s.inWriteTx(ctx, func(tx *sql.Tx) error {
@@ -548,9 +564,13 @@ func (s *Store) AckMessage(ctx context.Context, ack app.MessageAck) (app.Message
 		if err != nil {
 			return err
 		}
+		attemptIsCurrent, err := addressSessionCurrent(ctx, tx, &acker)
+		if err != nil {
+			return err
+		}
 
 		outcomeVal, err := run.AcceptAck(message, priorAck,
-			run.AckContext{DeliveredToSession: deliveredToSession, IncarnationCurrent: incarnationIsCurrent},
+			run.AckContext{DeliveredToSession: deliveredToSession, IncarnationCurrent: incarnationIsCurrent, AttemptCurrent: attemptIsCurrent},
 			run.Ack{SessionID: ack.SessionID, IncarnationID: ack.IncarnationID}, now)
 		switch {
 		case err != nil:

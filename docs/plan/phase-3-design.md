@@ -715,8 +715,8 @@ artifact and its row; `hop task create` refuses `kind=review`.
 | From | To | Cause |
 | --- | --- | --- |
 | queued | delivered | first fetch by the recipient address's current session (delivery row written in the fetch transaction) |
-| delivered | delivered | re-serve: any later fetch while unacknowledged (a new delivery row each time — at-least-once, journaled) |
-| delivered | acknowledged | first valid ack: a delivery row exists for the acking session itself, at its current incarnation (section 7 — a predecessor's delivery never authorizes a successor's ack) |
+| delivered | delivered | re-serve: any later fetch by the address's current session while unacknowledged (a new delivery row each time — at-least-once, journaled) |
+| delivered | acknowledged | first valid ack: a delivery row exists for the acking session itself, at its current incarnation, and the session is still its address's current session (section 7 — a predecessor's delivery never authorizes a successor's ack, and a retired session's ack never settles its successor's message) |
 | queued, delivered | acknowledged | `human`-addressed questions only: the accepted `hop answer` acknowledges the question in the same transaction — directly from `queued`, since a human question is never fetched (its rendering in `hop status` is not a delivery) |
 
 Per-recipient serialization: for each recipient address (`manager`,
@@ -727,8 +727,17 @@ durable per-address sequence assigned inside the send transaction, so
 FIFO means commit order, never caller clocks (a delayed writer or a clock
 adjustment cannot jump the queue). The table above is exhaustive about
 acks too: `queued → acknowledged` exists ONLY for the human-answer row —
-a session's ack of a message that was never delivered to its lineage is
-refused (`ErrNotDelivered`), so a message can never be silently skipped.
+a session's ack of a message that was never delivered to it is refused
+(`ErrNotDelivered`), so a message can never be silently skipped.
+An address's "current session" is one lineage member, never the whole
+lineage: for `manager`, the run's manager session that has not ended;
+for `task:<id>`, the session of the task's CURRENT attempt — the task's
+newest (highest-numbered) attempt, not terminal — that has not ended. A
+retired attempt's session (its attempt terminal or succeeded by a retry,
+or the session itself lost or terminated, whatever its binding says) is
+never served the address and cannot acknowledge a message it was served
+while current: that message stays in flight and is re-served to the
+current session, which acknowledges it after its own fetch.
 There is no message TTL and no expiry in Phase 3; an unfetched queue ages
 visibly in `hop status` (section 7's attention condition).
 
@@ -1020,7 +1029,11 @@ current AT ITS CREATION — historical provenance, never rewritten — while
 `ClosePlan` validate against, and the recipient of the `manager` address)
 is always the run's sole non-terminal manager-role session. A retired
 manager incarnation's verbs and acks fail the ordinary
-incarnation-currency checks; nothing special is added for it.
+incarnation-currency checks, and a manager session that has ended (lost
+or terminated) is never served the `manager` address nor able to ack a
+message it was served, even while its binding is still current
+(section 7's fetch and ack authority) — so it can never consume its
+successor's queue.
 
 ### Integration branch and worktree bases
 
@@ -1181,10 +1194,13 @@ written.
   before `hop result submit` it must drain its queue (`hop msg next`
   until `none:`, acking each). After an accepted or duplicate submission
   its instruction is to end its turn — the controller owns everything
-  after submission, and the pane closes when the process exits.
+  after submission, and the pane closes when the process exits; once its
+  attempt is terminal its own `hop msg next`/`wait`/`ack` are refused
+  (message verbs below), never answered.
 - **Reviewer**: reads the frozen subject, may ask the manager questions
   under the same wait-loop rule, submits exactly one verdict, ends its
-  turn.
+  turn; the accepted verdict completes its attempt, after which its own
+  message verbs are refused.
 - Every ack is issued only after the body file has been read — the ack is
   the recipient's statement of receipt-and-read, which is what makes the
   serialization rule (next message only after ack) a pacing mechanism
@@ -1421,7 +1437,28 @@ the retryable nor the final line applies to them.
   resolve the caller's address (`manager` for the manager session;
   `task:<id>` for a worker or reviewer via its attempt's task;
   lineage-based, so a cold-relaunched or retried successor session fetches
-  its predecessors' queue without any re-addressing write); serve the
+  its predecessors' queue without any re-addressing write); after the
+  caller's own run, its current incarnation and its address, require it to
+  be that address's CURRENT session (section 5): a session that has not
+  ended (lost or terminated) and, for a task address, belongs to the
+  task's newest attempt, which is not terminal — the attempt numbering
+  read inside the fetch transaction. Any other caller is refused
+  (`ErrMessagingUnauthorized`: no protocol line, a stderr diagnostic,
+  exit 1) with a refusal receipt whose detail names no value ("session is
+  not its task's current attempt session", or "session is not the run's
+  current manager session") and nothing served, so a retired attempt's
+  session can never consume its successor's messages. In particular,
+  once a session's attempt is TERMINAL its fetch (and its first ack, see
+  Ack) is refused rather than answered `none:` — an accepted verdict
+  completes the review attempt at once; an accepted result's attempt
+  stays `submitted`/`checking` (fetch still answers, and finds nothing,
+  since acceptance required a clear mailbox and closed it) until its
+  per-task check settles it `completed` or `failed`; an interrupted or
+  failed attempt is terminal immediately. The session has nothing left
+  to consume there, and a terminal attempt's session must never take a
+  message a retry's successor is meant to read; the recipient operating
+  contract already ends the turn after an accepted submission, so a
+  well-behaved agent never polls again; serve the
   in-flight delivered-unacknowledged message if one exists, else the
   lowest-enqueue-sequence queued message; write the delivery row and
   receipt in the same transaction that decides; print the envelope and
@@ -1437,8 +1474,15 @@ the retryable nor the final line applies to them.
   successor saw. A successor session therefore always fetches (and is
   re-served) before it can acknowledge; an ack of a message the acking
   session never fetched is refused (`ErrNotDelivered`, receipt recorded).
-  A stale incarnation or a foreign session is refused with a receipt; the
-  ack row commits with its receipt.
+  A stale incarnation or a foreign session is refused with a receipt; so,
+  after those checks, is a session that is no longer its address's
+  current session (the Fetch rule; `refused: stale`, `ErrStaleAck`): the
+  message it was served stays in flight and is re-served to the current
+  session. The order is fixed — an already-acknowledged message is an
+  idempotent duplicate first, then the delivery to this session (a
+  retired session never served the message is `not-delivered`), then the
+  incarnation, then address currency. The ack row commits with its
+  receipt.
 - **Answer** (`hop answer <question-id> --file <path> | --body "<text>"`):
   validates the question is `human`-addressed and unanswered; the answer
   body artifact is written durably BEFORE the transaction (the same
@@ -1494,7 +1538,13 @@ parsing those same lines (section 11):
 
 Refusals exit 1 with one first line `refused: <reason-token>` and detail
 lines after; reason tokens are enumerated in the same grammar constant
-set. A retryable first line (`transient: …`) also exits 1. The two submit
+set. `hop msg next` and `hop msg wait` have no refusal line: a fetch
+refused for authority (another run's session, a stale incarnation, an
+address the session does not resolve to, or a session that is not its
+address's current session) prints nothing on stdout, one
+`hop msg next: …` / `hop msg wait: …` diagnostic on stderr, and exits 1;
+`refused: stale` from `hop msg ack` also covers an ack from a session
+that is no longer its address's current session. A retryable first line (`transient: …`) also exits 1. The two submit
 verbs each have two retryable lines that demand different actions (rerun
 after a short delay, or drain first), so their store outcome carries a
 TYPED transient reason — attempt-not-running or undelivered-messages, set

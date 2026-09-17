@@ -451,6 +451,42 @@ func (s *fakeStore) resolveSessionAddressLocked(sessionID identity.SessionID) (r
 	}
 }
 
+// addressSessionCurrentLocked mirrors the real store's
+// addressSessionCurrent: run.CurrentAddressSession over the session's own
+// attempt and its task's highest-numbered attempt, both read from the
+// fake's own rows; a session with no attempt — the manager — reads no
+// attempt row. An unknown session or attempt row fails closed. Callers
+// hold s.mu.
+func (s *fakeStore) addressSessionCurrentLocked(sessionID identity.SessionID) bool {
+	sRow, ok := s.Sessions[sessionID]
+	if !ok {
+		return false
+	}
+	var attempt, newest run.Attempt
+	if sRow.value.AttemptID != "" {
+		aRow, ok := s.Attempts[sRow.value.AttemptID]
+		if !ok {
+			return false
+		}
+		attempt = aRow.value
+		for _, candidate := range s.Attempts {
+			if candidate.value.TaskID == attempt.TaskID && candidate.value.Number > newest.Number {
+				newest = candidate.value
+			}
+		}
+	}
+	return run.CurrentAddressSession(sRow.value, attempt, newest)
+}
+
+// fakeAddressSessionRefusal mirrors the real store's
+// addressSessionRefusal detail.
+func fakeAddressSessionRefusal(address run.Address) string {
+	if address.Kind == run.AddressManager {
+		return "session is not the run's current manager session"
+	}
+	return "session is not its task's current attempt session"
+}
+
 func (s *fakeStore) SendMessage(_ context.Context, send app.MessageSend) (app.MessageOutcome, error) { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -670,6 +706,11 @@ func (s *fakeStore) FetchNextMessage(_ context.Context, fetch app.MessageFetch) 
 	if !ok || !resolvedAddress.Equal(fetch.Address) {
 		return app.MessageDelivery{}, false, fmt.Errorf("%w: session %s does not resolve to address %s", app.ErrMessagingUnauthorized, fetch.SessionID, app.AddressString(fetch.Address))
 	}
+	// Only the address's current session consumes its queue (the real
+	// store's addressSessionCurrent check, in the same place).
+	if !s.addressSessionCurrentLocked(fetch.SessionID) {
+		return app.MessageDelivery{}, false, fmt.Errorf("%w: %s", app.ErrMessagingUnauthorized, fakeAddressSessionRefusal(resolvedAddress))
+	}
 
 	var queue []run.Message
 	for _, m := range s.Messages { //nolint:gocritic // rangeValCopy: test fake; the domain snapshot is small and read-only here, and indexing would only obscure the loop.
@@ -736,8 +777,9 @@ func (s *fakeStore) AckMessage(_ context.Context, ack app.MessageAck) (app.Messa
 		}
 	}
 	incarnationCurrent := s.sessionIncarnationCurrentLocked(ack.SessionID, ack.IncarnationID)
+	attemptCurrent := s.addressSessionCurrentLocked(ack.SessionID)
 
-	outcomeVal, err := run.AcceptAck(msg, priorAck, run.AckContext{DeliveredToSession: deliveredToSession, IncarnationCurrent: incarnationCurrent}, run.Ack{SessionID: ack.SessionID, IncarnationID: ack.IncarnationID}, now)
+	outcomeVal, err := run.AcceptAck(msg, priorAck, run.AckContext{DeliveredToSession: deliveredToSession, IncarnationCurrent: incarnationCurrent, AttemptCurrent: attemptCurrent}, run.Ack{SessionID: ack.SessionID, IncarnationID: ack.IncarnationID}, now)
 	switch {
 	case err != nil:
 		reason := app.GrammarReasonUnauthorized

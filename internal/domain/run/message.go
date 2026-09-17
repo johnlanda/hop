@@ -205,11 +205,44 @@ type Ack struct {
 // AckContext is the application-assembled context AcceptAck needs beyond
 // message and its rows: whether a delivery row exists for the ACKING
 // SESSION ITSELF (never merely its lineage — a predecessor's delivery
-// never authorizes a successor's ack), and whether that session's
-// incarnation is its current, non-superseded one.
+// never authorizes a successor's ack), whether that session's incarnation
+// is its current, non-superseded one, and whether the session is still its
+// logical address's current session (CurrentAddressSession: for a task
+// address, the session of the task's current attempt). Every field's zero
+// value refuses.
 type AckContext struct {
 	DeliveredToSession bool
 	IncarnationCurrent bool
+	AttemptCurrent     bool
+}
+
+// CurrentAddressSession reports whether session is the current session of
+// its logical address: the only session a fetch serves, and the only one
+// whose first ack counts (section 7). A session that has ended (lost or
+// terminated) never is. A manager session needs nothing more — a run holds
+// at most one manager that has not ended — and has no attempt, so its
+// attempt and newest arguments are ignored (callers pass zero values and
+// read no attempt row). An implementer or reviewer session must be bound to
+// its task's CURRENT attempt: attempt is the session's own attempt row and
+// newest its task's highest-numbered attempt, both read by the caller in
+// the deciding transaction, and the two must be the same non-terminal
+// (neither completed, failed nor interrupted) attempt. Any other role —
+// the Phase 2 solo worker — has no logical address and is never current.
+func CurrentAddressSession(session Session, attempt, newest Attempt) bool { //nolint:gocritic // hugeParam: Session and Attempt are immutable domain values passed by value everywhere in this package.
+	if terminalSessionStates[session.State] {
+		return false
+	}
+	switch session.Role {
+	case RoleManager:
+		return true
+	case RoleImplementer, RoleReviewer:
+		return session.AttemptID != "" &&
+			attempt.ID == session.AttemptID &&
+			newest.ID == attempt.ID && newest.TaskID == attempt.TaskID &&
+			!terminalAttemptStates[attempt.State]
+	default:
+		return false
+	}
 }
 
 // AckOutcome is the state AcceptAck decided: the message after acceptance
@@ -226,8 +259,13 @@ type AckOutcome struct {
 // distinguishes "duplicate" from "accepted" by whether it passed a
 // non-nil priorAck, exactly as it assembled that fact. Otherwise: message
 // must be delivered (ErrNotDelivered otherwise), a delivery row must
-// exist for the acking session itself (ErrNotDelivered otherwise), and
-// that incarnation must be current (ErrStaleAck otherwise).
+// exist for the acking session itself (ErrNotDelivered otherwise — so a
+// session never served the message is not-delivered whatever its
+// currency), that incarnation must be current (ErrStaleAck otherwise), and
+// the session must still be its address's current session (ErrStaleAck
+// otherwise: a message served to a retired attempt's session stays in
+// flight and is re-served to the current one, whose own delivery lets it
+// ack).
 func AcceptAck(message Message, priorAck *Ack, ctx AckContext, ack Ack, now time.Time) (AckOutcome, error) { //nolint:gocritic // hugeParam: Message is an immutable domain value returned by every transition; a pointer receiver would let a caller's original be mutated through it, breaking the pure-transition contract.
 	if priorAck != nil {
 		return AckOutcome{Message: message, Ack: *priorAck}, nil
@@ -240,6 +278,9 @@ func AcceptAck(message Message, priorAck *Ack, ctx AckContext, ack Ack, now time
 	}
 	if !ctx.IncarnationCurrent {
 		return AckOutcome{Message: message}, fmt.Errorf("%w: message %s: session %s incarnation %s", ErrStaleAck, message.ID, ack.SessionID, ack.IncarnationID)
+	}
+	if !ctx.AttemptCurrent {
+		return AckOutcome{Message: message}, fmt.Errorf("%w: message %s: session is not its address's current session", ErrStaleAck, message.ID)
 	}
 	ack.MessageID = message.ID
 	ack.At = now

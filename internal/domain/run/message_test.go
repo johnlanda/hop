@@ -107,28 +107,28 @@ func TestAcceptAck(t *testing.T) {
 	})
 
 	t.Run("not delivered", func(t *testing.T) {
-		_, err := run.AcceptAck(baseMessage(run.MessageQueued), nil, run.AckContext{DeliveredToSession: true, IncarnationCurrent: true}, ack, later())
+		_, err := run.AcceptAck(baseMessage(run.MessageQueued), nil, run.AckContext{DeliveredToSession: true, IncarnationCurrent: true, AttemptCurrent: true}, ack, later())
 		if !errors.Is(err, run.ErrNotDelivered) {
 			t.Fatalf("AcceptAck(queued): error = %v, want ErrNotDelivered", err)
 		}
 	})
 
 	t.Run("no delivery to this session", func(t *testing.T) {
-		_, err := run.AcceptAck(baseMessage(run.MessageDelivered), nil, run.AckContext{DeliveredToSession: false, IncarnationCurrent: true}, ack, later())
+		_, err := run.AcceptAck(baseMessage(run.MessageDelivered), nil, run.AckContext{DeliveredToSession: false, IncarnationCurrent: true, AttemptCurrent: true}, ack, later())
 		if !errors.Is(err, run.ErrNotDelivered) {
 			t.Fatalf("AcceptAck(no delivery to session): error = %v, want ErrNotDelivered", err)
 		}
 	})
 
 	t.Run("stale incarnation", func(t *testing.T) {
-		_, err := run.AcceptAck(baseMessage(run.MessageDelivered), nil, run.AckContext{DeliveredToSession: true, IncarnationCurrent: false}, ack, later())
+		_, err := run.AcceptAck(baseMessage(run.MessageDelivered), nil, run.AckContext{DeliveredToSession: true, IncarnationCurrent: false, AttemptCurrent: true}, ack, later())
 		if !errors.Is(err, run.ErrStaleAck) {
 			t.Fatalf("AcceptAck(stale incarnation): error = %v, want ErrStaleAck", err)
 		}
 	})
 
 	t.Run("accepted", func(t *testing.T) {
-		outcome, err := run.AcceptAck(baseMessage(run.MessageDelivered), nil, run.AckContext{DeliveredToSession: true, IncarnationCurrent: true}, ack, later())
+		outcome, err := run.AcceptAck(baseMessage(run.MessageDelivered), nil, run.AckContext{DeliveredToSession: true, IncarnationCurrent: true, AttemptCurrent: true}, ack, later())
 		if err != nil {
 			t.Fatalf("AcceptAck: unexpected error: %v", err)
 		}

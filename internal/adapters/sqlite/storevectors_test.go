@@ -316,6 +316,74 @@ func TestStoreVectors(t *testing.T) {
 		}
 	})
 
+	t.Run("MessageFetchSupersededAttempt", func(t *testing.T) {
+		f := newTaskLineageFixture(t)
+		f.retireAndRetry(t)
+		message := queueTaskInfo(t, f.featureFixture, f.Task, 8090)
+		requireFetchRefused(t, f.store, ptr(storevectors.MessageFetchSupersededAttempt(f.spec.RunID, f.OldSession, f.OldIncarnation, f.Task)), storevectors.MessageFetchSupersededAttemptDetail)
+		if delivery, served, err := f.store.FetchNextMessage(t.Context(), f.fetch(f.NewSession, f.NewIncarnation)); err != nil || !served || delivery.Message.ID != message {
+			t.Fatalf("successor fetch = %+v, %t, %v; want the message", delivery, served, err)
+		}
+		if n := countRows(t, f.store, `SELECT COUNT(*) FROM message_deliveries WHERE message_id = ?`, message.String()); n != 1 {
+			t.Fatalf("delivery rows = %d, want the successor's first delivery only", n)
+		}
+	})
+
+	t.Run("AckMessageSupersededAttempt", func(t *testing.T) {
+		f := newTaskLineageFixture(t)
+		message := queueTaskInfo(t, f.featureFixture, f.Task, 8091)
+		if _, served, err := f.store.FetchNextMessage(t.Context(), f.fetch(f.OldSession, f.OldIncarnation)); err != nil || !served {
+			t.Fatalf("fetch while current = %t, %v", served, err)
+		}
+		f.retireAndRetry(t)
+		got, err := f.store.AckMessage(t.Context(), storevectors.AckMessageSupersededAttempt(f.spec.RunID, message, f.OldSession, f.OldIncarnation))
+		if err != nil || got.Kind != app.AckRefused || got.Reason != storevectors.AckMessageSupersededAttemptReason {
+			t.Fatalf("AckMessage(superseded attempt) = %+v, %v; want refused/%s", got, err, storevectors.AckMessageSupersededAttemptReason)
+		}
+		if n := countRows(t, f.store, `SELECT COUNT(*) FROM message_acks`); n != 0 {
+			t.Fatalf("ack rows = %d, want none", n)
+		}
+		if delivery, served, err := f.store.FetchNextMessage(t.Context(), f.fetch(f.NewSession, f.NewIncarnation)); err != nil || !served || delivery.Message.ID != message {
+			t.Fatalf("successor fetch = %+v, %t, %v; want the message re-served", delivery, served, err)
+		}
+		if ack, err := f.store.AckMessage(t.Context(), f.ack(message, f.NewSession, f.NewIncarnation)); err != nil || ack.Kind != app.AckAccepted {
+			t.Fatalf("successor ack = %+v, %v; want accepted", ack, err)
+		}
+	})
+
+	t.Run("MessageFetchEndedManager", func(t *testing.T) {
+		f := newMessagingFixture(t)
+		send := f.workerSend(8092, run.MessageQuestion, "")
+		if outcome, err := f.store.SendMessage(t.Context(), send); err != nil || outcome.Kind != app.MessageAccepted {
+			t.Fatalf("seed question: %+v, %v", outcome, err)
+		}
+		successor, successorIncarnation := endManagerWithSuccessor(t, f.featureFixture, 8093)
+		requireFetchRefused(t, f.store, ptr(storevectors.MessageFetchEndedManager(f.spec.RunID, f.ManagerID, f.ManagerIncarnation)), storevectors.MessageFetchEndedManagerDetail)
+		fetch := app.MessageFetch{RunID: f.spec.RunID, SessionID: successor, IncarnationID: successorIncarnation, Address: run.ManagerAddress()}
+		if delivery, served, err := f.store.FetchNextMessage(t.Context(), fetch); err != nil || !served || delivery.Message.ID != send.ID {
+			t.Fatalf("successor manager fetch = %+v, %t, %v; want the question", delivery, served, err)
+		}
+	})
+
+	t.Run("AckMessageEndedManager", func(t *testing.T) {
+		f := newMessagingFixture(t)
+		send := f.workerSend(8096, run.MessageQuestion, "")
+		if outcome, err := f.store.SendMessage(t.Context(), send); err != nil || outcome.Kind != app.MessageAccepted {
+			t.Fatalf("seed question: %+v, %v", outcome, err)
+		}
+		if _, served, err := f.store.FetchNextMessage(t.Context(), f.managerFetch()); err != nil || !served {
+			t.Fatalf("manager fetch while current = %t, %v", served, err)
+		}
+		endManagerWithSuccessor(t, f.featureFixture, 8097)
+		got, err := f.store.AckMessage(t.Context(), storevectors.AckMessageEndedManager(f.spec.RunID, send.ID, f.ManagerID, f.ManagerIncarnation))
+		if err != nil || got.Kind != app.AckRefused || got.Reason != storevectors.AckMessageEndedManagerReason {
+			t.Fatalf("AckMessage(ended manager) = %+v, %v; want refused/%s", got, err, storevectors.AckMessageEndedManagerReason)
+		}
+		if n := countRows(t, f.store, `SELECT COUNT(*) FROM message_acks`); n != 0 {
+			t.Fatalf("ack rows = %d, want none", n)
+		}
+	})
+
 	t.Run("AckMessageCrossRun", func(t *testing.T) {
 		clock := newFakeClock()
 		store := openStoreAt(t, t.TempDir(), clock)

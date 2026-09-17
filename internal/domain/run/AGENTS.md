@@ -28,7 +28,7 @@ integration — without changing any Phase 2 transition's legality.
 | [binding.go](binding.go) | `RuntimeBinding`, `LaunchKind`, `OccupantEvidence`, `NewRuntimeBinding`, `Observe`, `Supersede` | Append-only runtime placement history and evidence-gated supersession |
 | [worktree.go](worktree.go) | `Worktree`, `WorktreeState` (`WorktreeActive`, `WorktreeRemoved`, `WorktreeAbsent`, `WorktreeReleased`), `NewWorktree`, `NewAttemptWorktree`, `Retire` | Checkout provenance: one unlinked row per solo run (`NewWorktree`), one per attempt in feature mode (`NewAttemptWorktree`, carrying `AttemptID` and the verified `BaseCommit`); post-merge worktree retirement's final states ([phase-3-worktree-retirement.md](../../../docs/plan/phase-3-worktree-retirement.md) section 8) |
 | [result.go](result.go) | `Result`, `ResultSubmission`, `AcceptanceContext`, `AcceptanceOutcome`, `AcceptResult` | The section 7 result-acceptance rule as one pure, cross-entity function, in the one acceptance order results and verdicts share (receipt, eligibility, then the section 5 mailbox) |
-| [message.go](message.go) | `Message`, `MessageKind`, `MessageState`, `Principal`, `Address`, `Delivery`, `Ack`, `AckContext`, `AckOutcome`, `AnswerSubmission`, `AnswerContext`, `AnswerOutcome`, `NewQuestion`, `NewInfo`, `Deliver`, `AcceptAck`, `NextDeliverable`, `AcceptAnswer`, `ResolveOrigin`, `ValidateSendAddressing` | The durable message/delivery/ack model (section 7): the `queued`→`delivered`→`acknowledged` machine, FIFO selection, ack eligibility and the answer rules (recipient authority, derived destination, closed-destination admission) |
+| [message.go](message.go) | `Message`, `MessageKind`, `MessageState`, `Principal`, `Address`, `Delivery`, `Ack`, `AckContext`, `AckOutcome`, `AnswerSubmission`, `AnswerContext`, `AnswerOutcome`, `NewQuestion`, `NewInfo`, `Deliver`, `AcceptAck`, `CurrentAddressSession`, `NextDeliverable`, `AcceptAnswer`, `ResolveOrigin`, `ValidateSendAddressing` | The durable message/delivery/ack model (section 7): the `queued`→`delivered`→`acknowledged` machine, FIFO selection, the fetch and ack authority (only an address's current session consumes it), ack eligibility and the answer rules (recipient authority, derived destination, closed-destination admission) |
 | [review.go](review.go) | `Review`, `Verdict`, `ReviewSubmission`, `ReviewAcceptanceContext`, `VerdictOutcome`, `AcceptVerdict` | The section 8 review-verdict acceptance rule, in `AcceptResult`'s one acceptance order (receipt, eligibility, then the mailbox) |
 | [integration.go](integration.go) | `Integration`, `IntegrationState`, `NewIntegration`, `EnterChecking`, `Conflict`, `Integrate`, `FailCheck`, `RollBack`, `Interrupt` | Serial per-task integration's state machine (section 5, "Integration") |
 | [readiness.go](readiness.go) | `GuardContext`, `CheckReceipt`, `GuardShortfall`, `ShortfallKind`, `EvaluateReadiness` | The run-completion guard (section 8): a pure function meant to gate `Run.Complete` in feature mode (the actual wiring is a later application slice — see Invariants). The verdict guard checks SUBJECT CURRENCY BEFORE the verdict value (Astra F3, STATUS-1): a latest review whose subject differs from the head is `ShortfallVerdictStaleSubject` whether it approved or rejected, and `ShortfallVerdictRejected` means specifically a reject of the CURRENT head — reordering it the other way would let a rejected review of a long-superseded head keep reporting "rejected" forever. `ShortfallVerdictRejected` alone carries `GuardShortfall.ReviewID`/`SubjectCommitOID`, since the controller notice a caller fetches for it names no verdict and the shortfall itself must say WHICH review it reports |
@@ -184,7 +184,17 @@ integration — without changing any Phase 2 transition's legality.
   eligibility); a first ack requires a delivery row for the ACKING SESSION
   ITSELF (`ErrNotDelivered` otherwise — a predecessor's delivery never
   authorizes a successor's ack) at its current incarnation
-  (`ErrStaleAck` otherwise). `AcceptAnswer` takes an application-assembled
+  (`ErrStaleAck` otherwise), and that the session is still its address's
+  current session (`AckContext.AttemptCurrent`, whose zero value refuses:
+  `ErrStaleAck`, with a detail naming only the message).
+  `CurrentAddressSession` is that currency rule, shared with the stores'
+  fetch: a session that has ended (lost or terminated) never is; a
+  manager needs nothing more and is judged without any attempt (its
+  attempt arguments are ignored, so a store reads no attempt row for it);
+  an implementer or reviewer must be bound to its task's newest attempt
+  (the caller's own two rows: the session's attempt and the task's
+  highest-numbered attempt, read in the deciding transaction), the same
+  attempt, not terminal; any other role never is. `AcceptAnswer` takes an application-assembled
   `AnswerContext` (the `AckContext` precedent) and decides in this order:
   not a question (`ErrInvalidTransition`); the ANSWERER's logical address
   — re-derived by the application from its own session row, or the human
@@ -284,7 +294,17 @@ integration — without changing any Phase 2 transition's legality.
   state are stale and an unsettled claim is not-running, never the drain
   outcome — plus `AcceptVerdict`'s subject-match guard); `AcceptAck`/`NextDeliverable`/
   `AcceptAnswer` order and vectors (duplicate/conflicting, stale/not-
-  delivered, the human-question ack bundling, and
+  delivered, the human-question ack bundling,
+  `TestAcceptAckAttemptCurrency` — a duplicate first, not-delivered before
+  currency, the incarnation before the attempt, a retired session's ack
+  stale and value-free with the message left delivered, the zero value
+  refusing — and `TestCurrentAddressSession` against an independent
+  transcription of the terminal states: a manager in every session state
+  with no attempt and with unrelated attempts, a child in every
+  session × attempt state on its newest attempt, and the never-current
+  shapes: an attempt a retry succeeded, a live attempt that is not the
+  newest, unread or foreign attempt rows, a newest attempt of another
+  task, no attempt, a solo worker and no role; and
   `TestAcceptAnswerRecipientAuthority`/`TestAcceptAnswerClosedDestination`:
   every non-recipient pairing refused before any prior answer with the
   question untouched, a closed destination refusing only a first

@@ -94,7 +94,10 @@ func TestGrammarContractAnswerAnotherTaskUnauthorized(t *testing.T) {
 // for answers through the real binary: the reviewer asks the manager a
 // question, its verdict is accepted over its empty mailbox (closing it),
 // and the manager's later answer prints exactly `refused: mailbox-closed`
-// with exit 1 and never reaches the reviewer's queue.
+// with exit 1 and never reaches the reviewer's queue — no message ever
+// addresses the review task. The accepted verdict completed the review
+// attempt, so the reviewer is no longer its task's current attempt session
+// and its own `hop msg next` is refused on stderr.
 func TestGrammarContractAnswerClosedMailbox(t *testing.T) {
 	rf := newReviewFixture(t, 9500)
 	reviewerEnv := rf.reviewer.env(rf.featureManager, nil)
@@ -109,8 +112,11 @@ func TestGrammarContractAnswerClosedMailbox(t *testing.T) {
 		result := execHop(t, rf.env(nil), rf.StateRoot, "msg", "send", "--kind", "answer", "--reply-to", questionID, "--body", "yes", "--request-id", "late-answer")
 		requireRefusedOnly(t, label, result, app.GrammarReasonMailboxClosed, "mailbox is closed")
 	}
-	none := execHop(t, reviewerEnv, rf.StateRoot, "msg", "next")
-	if none.Stdout != app.GrammarMsgNoneLine+"\n" || none.ExitCode != exitOK {
-		t.Fatalf("msg next (reviewer) after the refused answer: exit=%d stdout=%q stderr=%q, want %q", none.ExitCode, none.Stdout, none.Stderr, app.GrammarMsgNoneLine)
+	if n := taskMessageCount(t, rf.StateRoot, rf.reviewer.TaskID); n != 0 {
+		t.Fatalf("messages addressed to the review task after the refused answer = %d, want 0", n)
+	}
+	refused := execHop(t, reviewerEnv, rf.StateRoot, "msg", "next")
+	if refused.Stdout != "" || refused.ExitCode != exitFailure || !strings.Contains(refused.Stderr, "session is not its task's current attempt session") {
+		t.Fatalf("msg next (reviewer) after its accepted verdict: exit=%d stdout=%q stderr=%q, want the current-attempt refusal on stderr only", refused.ExitCode, refused.Stdout, refused.Stderr)
 	}
 }

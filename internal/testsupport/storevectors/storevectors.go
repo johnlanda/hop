@@ -315,6 +315,75 @@ func MessageFetchCrossRun(claimedRunID identity.RunID, session identity.SessionI
 	return app.MessageFetch{RunID: claimedRunID, SessionID: session, IncarnationID: incarnation, Address: address}
 }
 
+// MessageFetchSupersededAttemptDetail is the refusal detail
+// MessageFetchSupersededAttempt's error carries, and the real store's
+// refusal receipt records.
+const MessageFetchSupersededAttemptDetail = "session is not its task's current attempt session"
+
+// MessageFetchSupersededAttempt returns a MessagingStore.FetchNextMessage
+// request from a task address's RETIRED session: the consuming fixture's
+// attempt 1 is terminal (interrupted) and its session terminated with its
+// binding NOT superseded — the live controller's worker-termination shape,
+// so incarnation is still the binding's — while the task's attempt 2 runs
+// with its own bound session and a message is queued to the task. Refused
+// with an error wrapping app.ErrMessagingUnauthorized whose text contains
+// MessageFetchSupersededAttemptDetail, with nothing served: no delivery row,
+// and attempt 2's session is then served the message as its first
+// delivery. Only the current session of the task's newest, non-terminal
+// attempt consumes the task address (section 7).
+func MessageFetchSupersededAttempt(runID identity.RunID, retiredSession identity.SessionID, incarnation identity.IncarnationID, task identity.TaskID) app.MessageFetch {
+	return app.MessageFetch{RunID: runID, SessionID: retiredSession, IncarnationID: incarnation, Address: run.TaskAddress(task)}
+}
+
+// AckMessageSupersededAttemptReason is AckMessageSupersededAttempt's
+// expected refusal reason token.
+const AckMessageSupersededAttemptReason = app.GrammarReasonStale
+
+// AckMessageSupersededAttempt returns a MessagingStore.AckMessage request
+// from a task address's RETIRED session for a message that session WAS
+// served while it was current: the consuming fixture fetches messageID
+// through attempt 1's session, then retires that attempt and session
+// exactly as MessageFetchSupersededAttempt describes (binding not
+// superseded) and runs attempt 2 with its own bound session. Refused
+// app.AckRefused (reason AckMessageSupersededAttemptReason) with no ack
+// row: the message stays delivered, attempt 2's session is re-served it
+// and its own ack is accepted. The delivery check comes first, so a
+// retired session acking a message it was never served is refused
+// AckMessageNotDeliveredReason instead.
+func AckMessageSupersededAttempt(runID identity.RunID, messageID identity.MessageID, retiredSession identity.SessionID, incarnation identity.IncarnationID) app.MessageAck {
+	return app.MessageAck{RunID: runID, MessageID: messageID, SessionID: retiredSession, IncarnationID: incarnation}
+}
+
+// MessageFetchEndedManagerDetail is the refusal detail
+// MessageFetchEndedManager's error carries, and the real store's refusal
+// receipt records.
+const MessageFetchEndedManagerDetail = "session is not the run's current manager session"
+
+// MessageFetchEndedManager returns a MessagingStore.FetchNextMessage
+// request from a manager session that has ENDED (terminated) while its
+// binding is still current, so incarnation is still the binding's; the
+// consuming fixture gives the run a successor manager session with its own
+// binding and queues a message to the manager address. Refused with an
+// error wrapping app.ErrMessagingUnauthorized whose text contains
+// MessageFetchEndedManagerDetail, with nothing served; the successor is
+// then served the message.
+func MessageFetchEndedManager(runID identity.RunID, endedManager identity.SessionID, incarnation identity.IncarnationID) app.MessageFetch {
+	return app.MessageFetch{RunID: runID, SessionID: endedManager, IncarnationID: incarnation, Address: run.ManagerAddress()}
+}
+
+// AckMessageEndedManagerReason is AckMessageEndedManager's expected refusal
+// reason token.
+const AckMessageEndedManagerReason = app.GrammarReasonStale
+
+// AckMessageEndedManager returns a MessagingStore.AckMessage request from
+// the manager session MessageFetchEndedManager describes, for a message it
+// WAS served before it ended. Refused app.AckRefused (reason
+// AckMessageEndedManagerReason) with no ack row: the successor manager is
+// re-served the message and acks it itself.
+func AckMessageEndedManager(runID identity.RunID, messageID identity.MessageID, endedManager identity.SessionID, incarnation identity.IncarnationID) app.MessageAck {
+	return app.MessageAck{RunID: runID, MessageID: messageID, SessionID: endedManager, IncarnationID: incarnation}
+}
+
 // AckMessageCrossRunReason is AckMessageCrossRun's expected refusal reason
 // token.
 const AckMessageCrossRunReason = app.GrammarReasonUnauthorized

@@ -172,24 +172,25 @@ func getAttempt(ctx context.Context, q querier, id identity.AttemptID) (run.Atte
 	}, revision, nil
 }
 
-// latestAttempt loads the task's highest-numbered attempt and its revision.
-func latestAttempt(ctx context.Context, q querier, taskID identity.TaskID) (run.Attempt, int64, error) {
+// latestAttempt loads the task's highest-numbered attempt.
+func latestAttempt(ctx context.Context, q querier, taskID identity.TaskID) (run.Attempt, error) {
 	var id string
 	err := q.QueryRowContext(ctx,
 		`SELECT id FROM attempts WHERE task_id = ? ORDER BY number DESC LIMIT 1`,
 		taskID.String(),
 	).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
-		return run.Attempt{}, 0, fmt.Errorf("sqlite: attempt of task %s: %w", taskID, app.ErrNotFound)
+		return run.Attempt{}, fmt.Errorf("sqlite: attempt of task %s: %w", taskID, app.ErrNotFound)
 	}
 	if err != nil {
-		return run.Attempt{}, 0, fmt.Errorf("sqlite: load attempt of task %s: %w", taskID, err)
+		return run.Attempt{}, fmt.Errorf("sqlite: load attempt of task %s: %w", taskID, err)
 	}
 	attemptID, err := identity.ParseAttemptID(id)
 	if err != nil {
-		return run.Attempt{}, 0, fmt.Errorf("sqlite: attempt id of task %s: %w", taskID, err)
+		return run.Attempt{}, fmt.Errorf("sqlite: attempt id of task %s: %w", taskID, err)
 	}
-	return getAttempt(ctx, q, attemptID)
+	attempt, _, err := getAttempt(ctx, q, attemptID)
+	return attempt, err
 }
 
 // scanSession maps one sessions row. attempt_id and parent_session_id are

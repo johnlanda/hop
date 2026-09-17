@@ -386,6 +386,69 @@ func TestStoreVectors(t *testing.T) {
 		}
 	})
 
+	t.Run("MessageFetchSupersededAttempt", func(t *testing.T) {
+		f := newFakeLineage(t)
+		f.retireAndRetry(t)
+		message := f.queue(t)
+		requireFakeFetchRefused(t, f.tc, fakePtr(storevectors.MessageFetchSupersededAttempt(f.fr.RunID, f.Old.Session, f.Old.Incarnation, f.Task)), storevectors.MessageFetchSupersededAttemptDetail)
+		if delivery, served, err := f.fetch(f.New); err != nil || !served || delivery.Message.ID != message || len(f.tc.Store.MessageDeliveries[message]) != 1 {
+			t.Fatalf("successor fetch = %+v, %t, %v; want the message as its first delivery", delivery, served, err)
+		}
+	})
+
+	t.Run("AckMessageSupersededAttempt", func(t *testing.T) {
+		f := newFakeLineage(t)
+		message := f.queue(t)
+		if _, served, err := f.fetch(f.Old); err != nil || !served {
+			t.Fatalf("fetch while current = %t, %v", served, err)
+		}
+		f.retireAndRetry(t)
+		got, err := f.tc.Controller.Messages.AckMessage(context.Background(), storevectors.AckMessageSupersededAttempt(f.fr.RunID, message, f.Old.Session, f.Old.Incarnation))
+		if err != nil || got.Kind != app.AckRefused || got.Reason != storevectors.AckMessageSupersededAttemptReason {
+			t.Fatalf("AckMessage(superseded attempt) = %+v, %v; want refused/%s", got, err, storevectors.AckMessageSupersededAttemptReason)
+		}
+		if _, acked := f.tc.Store.MessageAcks[message]; acked {
+			t.Fatal("a stale ack recorded an ack")
+		}
+		if delivery, served, err := f.fetch(f.New); err != nil || !served || delivery.Message.ID != message {
+			t.Fatalf("successor fetch = %+v, %t, %v; want the message re-served", delivery, served, err)
+		}
+		if ack := f.ack(t, message, f.New); ack.Kind != app.AckAccepted {
+			t.Fatalf("successor ack = %+v, want accepted", ack)
+		}
+	})
+
+	t.Run("MessageFetchEndedManager", func(t *testing.T) {
+		f := newFakeLineage(t)
+		endFakeManagerWithSuccessor(t, f.tc, f.fr)
+		requireFakeFetchRefused(t, f.tc, fakePtr(storevectors.MessageFetchEndedManager(f.fr.RunID, f.fr.ManagerID, f.fr.ManagerIncarnation)), storevectors.MessageFetchEndedManagerDetail)
+	})
+
+	t.Run("AckMessageEndedManager", func(t *testing.T) {
+		f := newFakeLineage(t)
+		messageID := mintMessageID(t, f.tc)
+		if outcome, err := f.tc.Controller.Messages.SendMessage(context.Background(), app.MessageSend{
+			ID: messageID, RunID: f.fr.RunID, Sender: run.SessionPrincipal(f.Old.Session), SenderAddress: run.TaskAddress(f.Task),
+			IncarnationID: f.Old.Incarnation, Recipient: run.ManagerAddress(), Kind: run.MessageQuestion,
+			BodyPath: "/state/q", BodyDigest: "q", BodyBytes: 1,
+		}); err != nil || outcome.Kind != app.MessageAccepted {
+			t.Fatalf("seed worker question = %+v, %v", outcome, err)
+		}
+		if _, served, err := f.tc.Controller.Messages.FetchNextMessage(context.Background(), app.MessageFetch{
+			RunID: f.fr.RunID, SessionID: f.fr.ManagerID, IncarnationID: f.fr.ManagerIncarnation, Address: run.ManagerAddress(),
+		}); err != nil || !served {
+			t.Fatalf("manager fetch while current = %t, %v", served, err)
+		}
+		endFakeManagerWithSuccessor(t, f.tc, f.fr)
+		got, err := f.tc.Controller.Messages.AckMessage(context.Background(), storevectors.AckMessageEndedManager(f.fr.RunID, messageID, f.fr.ManagerID, f.fr.ManagerIncarnation))
+		if err != nil || got.Kind != app.AckRefused || got.Reason != storevectors.AckMessageEndedManagerReason {
+			t.Fatalf("AckMessage(ended manager) = %+v, %v; want refused/%s", got, err, storevectors.AckMessageEndedManagerReason)
+		}
+		if _, acked := f.tc.Store.MessageAcks[messageID]; acked {
+			t.Fatal("a stale ack recorded an ack")
+		}
+	})
+
 	t.Run("AckMessageCrossRun", func(t *testing.T) {
 		tc := newTestController(defaultPolicy())
 		fr1 := seedFeatureRun(t, tc, 2)
