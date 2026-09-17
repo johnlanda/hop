@@ -50,6 +50,28 @@ func requireLiveFeatureHarness(t *testing.T) (claudePath, home string) {
 	if !info.IsDir() {
 		t.Fatalf("HOP_LIVE_HARNESS_HOME %q is not a directory", override)
 	}
+	// HOP_LIVE_HARNESS_HOME=$HOME is a natural carry-over from the solo
+	// live test, where the variable is optional and defaults to the
+	// operator's real home: it would pass every check above and then let
+	// three real Claude sessions read and write the operator's actual
+	// ~/.claude.json, exactly what this scenario must never do. Compared
+	// after EvalSymlinks so a symlinked override can never disguise
+	// itself as distinct; the failure message never echoes either path.
+	resolvedOverride, err := filepath.EvalSymlinks(override)
+	if err != nil {
+		t.Fatalf("HOP_LIVE_HARNESS_HOME could not be resolved (the path is never echoed): %v", err)
+	}
+	realHome, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("resolve the operator's own home directory: %v", err)
+	}
+	resolvedRealHome, err := filepath.EvalSymlinks(realHome)
+	if err != nil {
+		t.Fatalf("resolve the operator's own home directory (the path is never echoed): %v", err)
+	}
+	if resolvedOverride == resolvedRealHome {
+		t.Fatal("HOP_LIVE_HARNESS_HOME must not resolve to the operator's own home directory (never echoed); point it at a profile prepared specifically for this test")
+	}
 	return path, override
 }
 
