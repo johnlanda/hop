@@ -253,16 +253,89 @@ func (f *featureRun) nativeSessionRef(t *testing.T, sessionID string) string {
 }
 
 // ackRefusalReceiptRecorded reports whether a msg-ack receipt row exists
-// for messageID claimed by sessionID with outcome "refused" -- design
-// section 7's "a receipt row for every verb outcome including refusals"
-// (internal/adapters/sqlite/messaging.go's msgAckVerb = "msg-ack";
-// AckMessage's own record closure always writes outcome=string(kind), and
-// app.AckRefused's string value is "refused").
-func (f *featureRun) ackRefusalReceiptRecorded(t *testing.T, messageID, sessionID string) bool {
+// for messageID claimed by sessionID/incarnationID with outcome "refused"
+// -- design section 7's "a receipt row for every verb outcome including
+// refusals" (internal/adapters/sqlite/messaging.go's msgAckVerb =
+// "msg-ack"; AckMessage's own record closure always writes
+// outcome=string(kind), and app.AckRefused's string value is "refused").
+// Binding the check to the CLAIMED incarnation too (not just the session)
+// lets a caller assert both "no such row before the call" (using the
+// specific old incarnation that is about to be refused) and, after the
+// call, that the recorded row is claimed by that exact incarnation --
+// never merely inferred from timing.
+func (f *featureRun) ackRefusalReceiptRecorded(t *testing.T, messageID, sessionID, incarnationID string) bool {
 	t.Helper()
 	return f.scalar(t, fmt.Sprintf(
-		"SELECT count(*) FROM message_receipts WHERE run_id = '%s' AND op = 'msg-ack' AND claimed_message_id = '%s' AND claimed_session_id = '%s' AND outcome = 'refused';",
-		f.runID, messageID, sessionID)) != "0"
+		"SELECT count(*) FROM message_receipts WHERE run_id = '%s' AND op = 'msg-ack' AND claimed_message_id = '%s' AND claimed_session_id = '%s' AND claimed_incarnation_id = '%s' AND outcome = 'refused';",
+		f.runID, messageID, sessionID, incarnationID)) != "0"
+}
+
+// messageDeliveredAt reads the delivered_at timestamp of messageID's
+// delivery row to sessionID specifically, parsed with the store's own
+// fixed-width UTC timestamp layout (leaseTimeLayout, lifecycle_test.go,
+// mirrors internal/adapters/sqlite's unexported timeLayout) -- every
+// table's timestamp column is written through the SAME formatTime, so
+// this parse applies uniformly across messages/message_deliveries/
+// message_acks/message_receipts.
+func (f *featureRun) messageDeliveredAt(t *testing.T, messageID, sessionID string) time.Time {
+	t.Helper()
+	raw := f.scalar(t, fmt.Sprintf("SELECT delivered_at FROM message_deliveries WHERE message_id = '%s' AND session_id = '%s';", messageID, sessionID))
+	if raw == "" {
+		t.Fatalf("no delivery row for message %s to session %s", messageID, sessionID)
+	}
+	at, err := time.Parse(leaseTimeLayout, raw)
+	if err != nil {
+		t.Fatalf("parse delivered_at %q for message %s (session %s): %v", raw, messageID, sessionID, err)
+	}
+	return at
+}
+
+// messageCreatedAt reads messageID's created_at timestamp, parsed the same
+// way as messageDeliveredAt.
+func (f *featureRun) messageCreatedAt(t *testing.T, messageID string) time.Time {
+	t.Helper()
+	raw := f.scalar(t, fmt.Sprintf("SELECT created_at FROM messages WHERE id = '%s';", messageID))
+	if raw == "" {
+		t.Fatalf("no messages row for %s", messageID)
+	}
+	at, err := time.Parse(leaseTimeLayout, raw)
+	if err != nil {
+		t.Fatalf("parse created_at %q for message %s: %v", raw, messageID, err)
+	}
+	return at
+}
+
+// messageAckedAt reads messageID's acked_at timestamp, parsed the same way
+// as messageDeliveredAt.
+func (f *featureRun) messageAckedAt(t *testing.T, messageID string) time.Time {
+	t.Helper()
+	raw := f.scalar(t, fmt.Sprintf("SELECT acked_at FROM message_acks WHERE message_id = '%s';", messageID))
+	if raw == "" {
+		t.Fatalf("no message_acks row for %s", messageID)
+	}
+	at, err := time.Parse(leaseTimeLayout, raw)
+	if err != nil {
+		t.Fatalf("parse acked_at %q for message %s: %v", raw, messageID, err)
+	}
+	return at
+}
+
+// messageReceiptAt reads the `at` timestamp of the single message_receipts
+// row matching op/messageID/sessionID/incarnationID/outcome, parsed the
+// same way as messageDeliveredAt.
+func (f *featureRun) messageReceiptAt(t *testing.T, op, messageID, sessionID, incarnationID, outcome string) time.Time {
+	t.Helper()
+	raw := f.scalar(t, fmt.Sprintf(
+		"SELECT at FROM message_receipts WHERE run_id = '%s' AND op = '%s' AND claimed_message_id = '%s' AND claimed_session_id = '%s' AND claimed_incarnation_id = '%s' AND outcome = '%s';",
+		f.runID, op, messageID, sessionID, incarnationID, outcome))
+	if raw == "" {
+		t.Fatalf("no message_receipts row for op=%s message=%s session=%s incarnation=%s outcome=%s", op, messageID, sessionID, incarnationID, outcome)
+	}
+	at, err := time.Parse(leaseTimeLayout, raw)
+	if err != nil {
+		t.Fatalf("parse message_receipts.at %q for op=%s message=%s: %v", raw, op, messageID, err)
+	}
+	return at
 }
 
 // grammarTaskAddress mirrors internal/app/grammar.go's GrammarTaskAddress

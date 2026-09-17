@@ -1972,6 +1972,28 @@ func testFixtureWorkerFetchCrashResumedWaitsForReleaseThenAcks(t *testing.T) {
 	if !waitUntil(func() bool { return strings.Contains(out.snapshot(), wantAcked) }) {
 		t.Fatalf("resumed worker never acked after the release gate was created; output so far:\n%s", out.snapshot())
 	}
+
+	// P2-6's second, separate gate: after the drain (this fixture has only
+	// the one scripted message, so the drain is a no-op msg-next-until-
+	// none call) the worker pauses again, before its own submit, until
+	// this SEPARATE presubmit-release control file appears.
+	wantPresubmitHold := "FIXTURE-FETCH-CRASH-PRESUBMIT-HOLD attempt=[" + attemptID + "]"
+	if !waitUntil(func() bool { return strings.Contains(out.snapshot(), wantPresubmitHold) }) {
+		t.Fatalf("resumed worker never reached its presubmit hold after acking; output so far:\n%s", out.snapshot())
+	}
+	if strings.Contains(out.snapshot(), "FIXTURE-WORKER-IDLE") {
+		t.Fatalf("resumed worker reached its post-submit idle loop before the presubmit release gate was created; output:\n%s", out.snapshot())
+	}
+
+	presubmitReleasePath := filepath.Join(scratchDir, "fetch-crash-presubmit-release-"+attemptID)
+	presubmitTmp := presubmitReleasePath + ".tmp"
+	if err := os.WriteFile(presubmitTmp, []byte("FIXTURE-RELEASE\n"), 0o600); err != nil {
+		t.Fatalf("write presubmit release control file: %v", err)
+	}
+	if err := os.Rename(presubmitTmp, presubmitReleasePath); err != nil {
+		t.Fatalf("rename presubmit release control file into place: %v", err)
+	}
+
 	if !waitUntil(func() bool { return strings.Contains(out.snapshot(), "FIXTURE-WORKER-IDLE") }) {
 		t.Fatalf("resumed worker never reached its post-submit idle loop; output so far:\n%s", out.snapshot())
 	}

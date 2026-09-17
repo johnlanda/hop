@@ -108,14 +108,9 @@ func TestRealProcessDuplicateAndAmbiguousDelivery(t *testing.T) {
 
 	// The deterministic kill point: wait for the worker's own barrier
 	// observation naming m1, proving it has fetched (and is now blocked
-	// immediately before acking) m1 specifically. deliveredApprox is a
-	// real wall-clock reference point at or after m1's own delivery
-	// (design section 7's in-flight age is computed from the delivery
-	// row's own timestamp), used below as an upper bound on the parsed
-	// in-flight age.
+	// immediately before acking) m1 specifically.
 	observationPath := filepath.Join(scratchDir, "fetch-crash-observed-"+attempt1ID+".txt")
 	obs := waitForObservation(t, observationPath)
-	deliveredApprox := time.Now()
 	if obs.Fields["id"] != m1 {
 		t.Fatalf("worker's fetch-crash observation names id=%s, want m1=%s", obs.Fields["id"], m1)
 	}
@@ -131,6 +126,19 @@ func TestRealProcessDuplicateAndAmbiguousDelivery(t *testing.T) {
 		t.Fatalf("remove fetch-crash observation file before relaunch: %v", err)
 	}
 
+	// Both the worker and the controller must die before any
+	// reconciliation, and the CONTROLLER dies FIRST (P2-1): killControllerLeader
+	// signals only fx.controller's own leaderCmd, a process this test
+	// itself started and owns (never reaped by anything else), so this
+	// is safe regardless of ordering. Killing it before the self-kill
+	// below closes the window where a still-live controller's own next
+	// scheduling pass could run RetireSettledSessions/observeWorkerExit
+	// against the about-to-die worker and reconcile it as an ordinary
+	// interruption (a NEW attempt/worktree) instead of the same-attempt
+	// cold relaunch this trace needs -- a race the prior ordering
+	// (self-kill the worker, then kill the controller) left open for the
+	// width of one scheduling pass.
+	killControllerLeader(t, fx.controller)
 	fx.killSession(t, session1ID, attempt1ID)
 
 	// killSession's own self-kill control file is keyed by ATTEMPT id
@@ -150,12 +158,6 @@ func TestRealProcessDuplicateAndAmbiguousDelivery(t *testing.T) {
 		t.Fatalf("remove self-kill control file before relaunch: %v", err)
 	}
 
-	// Both the worker and the controller are killed before any
-	// reconciliation: a live controller would otherwise reconcile the
-	// dead worker as an ordinary interruption (a NEW attempt/worktree),
-	// never the same-attempt cold relaunch this trace needs.
-	killControllerLeader(t, fx.controller)
-
 	// While the worker is dead: hop status is a one-shot CLI invocation
 	// independent of any live controller, so it is checked here, before
 	// the lease even expires. Poll until the in-flight age has passed the
@@ -165,9 +167,36 @@ func TestRealProcessDuplicateAndAmbiguousDelivery(t *testing.T) {
 	// wall-clock time, never a substring/Contains match.
 	const attentionThreshold = 2 * time.Second
 	wantAddress := grammarTaskAddress(t1, "t1")
+
+	// m1's delivered_at (its ONE delivery row so far, to session1ID) and
+	// m2's created_at, read directly from the store rather than
+	// approximated from a wall-clock snapshot taken near the fetch:
+	// mailboxStatuses (internal/adapters/sqlite/workflow_read.go) computes
+	// both ages as exactly `now.Sub(...)` against these same two columns,
+	// and GrammarAttentionLine renders them via bare time.Duration.String()
+	// with no rounding or truncation anywhere in the read path (confirmed:
+	// no Round/Truncate call in internal/app/grammar.go or the sqlite
+	// read path) -- so bracketing each hop status call's own start/end
+	// against these exact values needs no fudge allowance at all: the
+	// CLI's own internal "now" necessarily falls inside [callStart,
+	// callEnd] on the same machine clock.
+	m1DeliveredAt := fx.messageDeliveredAt(t, m1, session1ID)
+	m2CreatedAt := fx.messageCreatedAt(t, m2)
+	requireAttentionAgesBracketed := func(inFlightAge, oldestQueuedAge time.Duration, callStart, callEnd time.Time) {
+		t.Helper()
+		if lower, upper := callStart.Sub(m1DeliveredAt), callEnd.Sub(m1DeliveredAt); inFlightAge < lower || inFlightAge > upper {
+			t.Errorf("attention line in-flight age %s outside [%s, %s] bracketed around this hop status call against m1's own delivered_at %s", inFlightAge, lower, upper, m1DeliveredAt)
+		}
+		if lower, upper := callStart.Sub(m2CreatedAt), callEnd.Sub(m2CreatedAt); oldestQueuedAge < lower || oldestQueuedAge > upper {
+			t.Errorf("attention line oldest-queued age %s outside [%s, %s] bracketed around this hop status call against m2's own created_at %s", oldestQueuedAge, lower, upper, m2CreatedAt)
+		}
+	}
+
 	var inFlightAge, oldestQueuedAge time.Duration
 	if !waitUntilDeadlineWithInterval(featureRunTimeout, attentionPollInterval, func() bool {
+		callStart := time.Now()
 		out := runHop(t, fx.env, repo.Root, "status", "-C", repo.Root, "-run", fx.runID)
+		callEnd := time.Now()
 		if out.ExitCode != 0 {
 			return false
 		}
@@ -175,37 +204,51 @@ func TestRealProcessDuplicateAndAmbiguousDelivery(t *testing.T) {
 		if !ok {
 			return false
 		}
+		requireAttentionAgesBracketed(age1, age2, callStart, callEnd)
 		inFlightAge, oldestQueuedAge = age1, age2
 		return inFlightAge > attentionThreshold
 	}) {
 		t.Fatalf("attention line for %s never reported an in-flight age past the %s threshold within %s", wantAddress, attentionThreshold, featureRunTimeout)
 	}
-	// inFlightAge must exceed the threshold (the wait condition above)
-	// and can never exceed the real wall-clock time elapsed since m1 was
-	// observed delivered, plus a small allowance for this poll's own CLI
-	// round-trip latency.
 	if inFlightAge <= attentionThreshold {
 		t.Errorf("attention line in-flight age %s does not exceed the %s threshold it was polled to satisfy", inFlightAge, attentionThreshold)
 	}
-	if upperBound := time.Since(deliveredApprox) + 5*time.Second; inFlightAge > upperBound {
-		t.Errorf("attention line in-flight age %s exceeds the real elapsed time since m1 was observed delivered (%s, +5s CLI-latency allowance)", inFlightAge, upperBound)
-	}
-	if oldestQueuedAge <= 0 || oldestQueuedAge > time.Since(deliveredApprox)+5*time.Second {
-		t.Errorf("attention line oldest-queued age %s is not plausible relative to real elapsed wall-clock time", oldestQueuedAge)
-	}
+	_ = oldestQueuedAge
+
+	callStart := time.Now()
 	finalStatus := runHop(t, fx.env, repo.Root, "status", "-C", repo.Root, "-run", fx.runID)
+	callEnd := time.Now()
 	if finalStatus.ExitCode != 0 {
 		t.Fatalf("hop status -run: exit=%d stdout=%q stderr=%q", finalStatus.ExitCode, finalStatus.Stdout, finalStatus.Stderr)
 	}
 	finalInFlightAge, finalOldestAge := requireAttentionLineBothClausesExact(t, finalStatus.Stdout, wantAddress, m1, 1)
+	requireAttentionAgesBracketed(finalInFlightAge, finalOldestAge, callStart, callEnd)
 	if finalInFlightAge <= attentionThreshold {
 		t.Errorf("final attention line in-flight age %s does not exceed the %s threshold", finalInFlightAge, attentionThreshold)
 	}
 	if finalOldestAge <= 0 {
 		t.Errorf("final attention line oldest-queued age %s is not plausible", finalOldestAge)
 	}
-	if !strings.Contains(finalStatus.Stdout, "(blocked, needs attention)") {
-		t.Errorf("hop status -run does not carry the run-summary attention marker once past the threshold; full output:\n%s", finalStatus.Stdout)
+	// The run-summary state line's attention marker, matched EXACTLY
+	// (P3-4): cmd/hop/statuscmd.go's renderRunDetail renders it as
+	// "  state:         " + state + listingMarkers(...), and
+	// listingMarkers appends "stop requested"/"reconciling"/
+	// app.GrammarAttentionMarker in that fixed order, joined ", " inside
+	// one parenthesized suffix -- neither of the first two markers
+	// applies here (no stop requested, and mailboxStatuses/messaging
+	// have nothing to do with the unrelated `operations` reconciling
+	// state), so the whole line is pinned, not just a Contains on the
+	// marker text.
+	wantStateLine := "  state:         running (blocked, needs attention)"
+	var gotStateLine string
+	for _, line := range strings.Split(finalStatus.Stdout, "\n") {
+		if strings.HasPrefix(line, "  state:") {
+			gotStateLine = line
+			break
+		}
+	}
+	if gotStateLine != wantStateLine {
+		t.Errorf("hop status -run state line = %q, want %q; full output:\n%s", gotStateLine, wantStateLine, finalStatus.Stdout)
 	}
 
 	waitForLeaseExpiry(t, fx.dbPath(), fx.runID)
@@ -223,27 +266,11 @@ func TestRealProcessDuplicateAndAmbiguousDelivery(t *testing.T) {
 		t.Errorf("relaunched worker's native_session_ref = %q, want the SAME reference the prior session carried: %q", got, want)
 	}
 
-	// The old (now superseded) incarnation's late ack, issued directly:
-	// refused stale, with a receipt recorded -- issued BEFORE the new
-	// incarnation's own ack (below), which matters because AcceptAck
-	// checks "already acknowledged" before incarnation currency (domain/
-	// run/message.go), so ordering decides stale vs. duplicate.
-	staleEnv := fx.sessionEnv(session1ID, oldIncarnationID)
-	staleResult := runHop(t, staleEnv, repo.Root, "msg", "ack", m1)
-	if staleResult.ExitCode != 1 {
-		t.Fatalf("hop msg ack (stale incarnation) exit=%d, want 1; stdout=%q", staleResult.ExitCode, staleResult.Stdout)
-	}
-	if got := staleResult.FirstStdoutLine(); got != "refused: stale" {
-		t.Errorf("hop msg ack (stale incarnation) first line = %q, want %q", got, "refused: stale")
-	}
-	if !fx.ackRefusalReceiptRecorded(t, m1, session1ID) {
-		t.Error("no msg-ack receipt row recorded for the stale-incarnation refusal")
-	}
-
-	// The re-served delivery: the SAME m1 delivered a second time, to the
-	// NEW session -- proven directly from the journal, and via the
-	// resumed worker's own observation of the exact fetched id, before
-	// releasing it to ack.
+	// P1-2: the re-serve must exist BEFORE the stale ack is ever issued --
+	// trace 3's ambiguity is the old incarnation's late ack refused stale
+	// WHILE a second delivery row exists, so this waits for the resumed
+	// worker's own re-fetch observation and the second delivery row
+	// FIRST, and only afterward issues the stale ack.
 	resumedObs := waitForObservation(t, observationPath)
 	if resumedObs.Fields["id"] != m1 {
 		t.Fatalf("resumed worker's fetch-crash observation names id=%s, want the re-served m1=%s", resumedObs.Fields["id"], m1)
@@ -251,8 +278,42 @@ func TestRealProcessDuplicateAndAmbiguousDelivery(t *testing.T) {
 	if !messageDeliveredToSession(t, fx, m1, newSession1ID) {
 		t.Fatalf("m1 was never delivered to the new session %s (the re-served \"second delivery row\")", newSession1ID)
 	}
+	if !messageDeliveredToSession(t, fx, m1, session1ID) {
+		t.Fatalf("m1's original delivery row to session %s is gone; the re-serve must be a SECOND row, not a replacement", session1ID)
+	}
 	if n := fx.scalar(t, fmt.Sprintf("SELECT count(*) FROM message_deliveries WHERE message_id = '%s';", m1)); n != "2" {
 		t.Errorf("total delivery-row count for m1 = %s, want exactly 2 (the original serve plus the one re-serve)", n)
+	}
+
+	// NOW the old (now superseded) incarnation's late ack, issued
+	// directly: refused stale, with a receipt recorded, in the state
+	// trace 3 actually needs -- the re-serve already exists. This matters
+	// because AcceptAck checks "already acknowledged" before incarnation
+	// currency (domain/run/message.go), so ordering decides stale vs.
+	// duplicate; the release gate below still guarantees this runs before
+	// the new incarnation's own ack.
+	staleEnv := fx.sessionEnv(session1ID, oldIncarnationID)
+	if fx.ackRefusalReceiptRecorded(t, m1, session1ID, oldIncarnationID) {
+		t.Fatalf("a stale-ack refusal receipt for m1 claimed by the old incarnation %s already exists before the stale ack was ever issued", oldIncarnationID)
+	}
+	staleResult := runHop(t, staleEnv, repo.Root, "msg", "ack", m1)
+	if staleResult.ExitCode != 1 {
+		t.Fatalf("hop msg ack (stale incarnation) exit=%d, want 1; stdout=%q", staleResult.ExitCode, staleResult.Stdout)
+	}
+	if got := staleResult.FirstStdoutLine(); got != "refused: stale" {
+		t.Errorf("hop msg ack (stale incarnation) first line = %q, want %q", got, "refused: stale")
+	}
+	if !fx.ackRefusalReceiptRecorded(t, m1, session1ID, oldIncarnationID) {
+		t.Error("no msg-ack receipt row recorded for the stale-incarnation refusal, claimed by the old incarnation specifically")
+	}
+	// The stale receipt's own `at` must be LATER than the second
+	// delivery's delivered_at -- the store-level fact that actually
+	// proves the ordering this scenario claims, never merely that both
+	// assertions happened to run in this order in Go.
+	secondDeliveredAt := fx.messageDeliveredAt(t, m1, newSession1ID)
+	staleReceiptAt := fx.messageReceiptAt(t, "msg-ack", m1, session1ID, oldIncarnationID, "refused")
+	if !staleReceiptAt.After(secondDeliveredAt) {
+		t.Errorf("stale-ack receipt at %s is not after m1's second delivery (to %s) at %s", staleReceiptAt, newSession1ID, secondDeliveredAt)
 	}
 
 	// Release the resumed incarnation's own ack, deterministically after
@@ -269,8 +330,12 @@ func TestRealProcessDuplicateAndAmbiguousDelivery(t *testing.T) {
 	if !waitUntilDeadline(featureRunTimeout, func() bool { return fx.messageAcked(t, m1) }) {
 		t.Fatalf("m1 was never acknowledged by the relaunched worker within %s", featureRunTimeout)
 	}
+	newIncarnationID := fx.incarnationForSession(t, newSession1ID)
 	if got := fx.scalar(t, fmt.Sprintf("SELECT session_id FROM message_acks WHERE message_id = '%s';", m1)); got != newSession1ID {
 		t.Errorf("m1's ack session_id = %q, want the RELAUNCHED worker session %q", got, newSession1ID)
+	}
+	if got := fx.scalar(t, fmt.Sprintf("SELECT incarnation_id FROM message_acks WHERE message_id = '%s';", m1)); got != newIncarnationID {
+		t.Errorf("m1's ack incarnation_id = %q, want the new incarnation %q", got, newIncarnationID)
 	}
 
 	// A further ack of m1, from anyone, is now idempotently duplicate:
@@ -286,35 +351,52 @@ func TestRealProcessDuplicateAndAmbiguousDelivery(t *testing.T) {
 	}
 
 	// The next fetch serves m2: the resumed worker's own pre-submit drain
-	// acks it too, delivered to the same new session.
+	// acks it too, delivered to the same new session, and only after m1's
+	// own ack settles (fetch always re-serves the in-flight message
+	// first).
 	if !waitUntilDeadline(featureRunTimeout, func() bool { return fx.messageAcked(t, m2) }) {
 		t.Fatalf("m2 was never acknowledged within %s", featureRunTimeout)
 	}
 	if !messageDeliveredToSession(t, fx, m2, newSession1ID) {
 		t.Errorf("m2 was never delivered to the new session %s", newSession1ID)
 	}
+	if n := fx.scalar(t, fmt.Sprintf("SELECT count(*) FROM message_deliveries WHERE message_id = '%s';", m2)); n != "1" {
+		t.Errorf("total delivery-row count for m2 = %s, want exactly 1", n)
+	}
+	if m2DeliveredAt, m1AckedAt := fx.messageDeliveredAt(t, m2, newSession1ID), fx.messageAckedAt(t, m1); m2DeliveredAt.Before(m1AckedAt) {
+		t.Errorf("m2's delivered_at %s is before m1's acked_at %s; fetch must re-serve the in-flight message first, so m2 can only be served once m1 is acked", m2DeliveredAt, m1AckedAt)
+	}
 
-	// The attention condition has fully cleared: no line for this address
-	// at all, checked against the FULL status output.
-	if !waitUntilDeadlineWithInterval(featureRunTimeout, attentionPollInterval, func() bool {
-		out := runHop(t, fx.env, repo.Root, "status", "-C", repo.Root, "-run", fx.runID)
-		if out.ExitCode != 0 {
-			return false
-		}
-		for _, line := range strings.Split(out.Stdout, "\n") {
-			if strings.HasPrefix(strings.TrimSpace(line), "attention: messages pending for "+wantAddress+":") {
-				return false
-			}
-		}
-		return true
-	}) {
-		t.Fatalf("attention line for %s never cleared within %s", wantAddress, featureRunTimeout)
+	// P2-6: the resumed worker pauses at its own opt-in presubmit gate,
+	// after its drain (m1 and m2 both acked) and before its own submit --
+	// so the attention line's absence below is asserted while
+	// newSession1ID is still ACTIVE, never merely because retirement made
+	// the address no-longer-live (the prior check could not distinguish
+	// those: the run completes within seconds of the drain, so a
+	// status-rendering bug that ignored ack rows would have passed just
+	// as well by waiting for the session to retire instead).
+	presubmitObservedPath := filepath.Join(scratchDir, "fetch-crash-presubmit-observed-"+attempt1ID+".txt")
+	waitForObservation(t, presubmitObservedPath)
+	if state := fx.sessionState(t, newSession1ID); state != "active" {
+		t.Fatalf("newSession1ID is %q immediately before the cleared-attention check, want active (the resumed worker's own opt-in presubmit gate should still be holding it)", state)
 	}
-	clearedStatus := runHop(t, fx.env, repo.Root, "status", "-C", repo.Root, "-run", fx.runID)
-	if clearedStatus.ExitCode != 0 {
-		t.Fatalf("hop status -run: exit=%d stdout=%q stderr=%q", clearedStatus.ExitCode, clearedStatus.Stdout, clearedStatus.Stderr)
+	preSubmitStatus := runHop(t, fx.env, repo.Root, "status", "-C", repo.Root, "-run", fx.runID)
+	if preSubmitStatus.ExitCode != 0 {
+		t.Fatalf("hop status -run: exit=%d stdout=%q stderr=%q", preSubmitStatus.ExitCode, preSubmitStatus.Stdout, preSubmitStatus.Stderr)
 	}
-	requireNoAttentionLineForAddress(t, clearedStatus.Stdout, wantAddress)
+	if state := fx.sessionState(t, newSession1ID); state != "active" {
+		t.Fatalf("newSession1ID is %q immediately after the cleared-attention check, want active (the check must observe the line's absence while this session is still live, not after it retired)", state)
+	}
+	requireNoAttentionLineForAddress(t, preSubmitStatus.Stdout, wantAddress)
+
+	presubmitReleasePath := filepath.Join(scratchDir, "fetch-crash-presubmit-release-"+attempt1ID)
+	presubmitTmp := presubmitReleasePath + ".tmp"
+	if err := os.WriteFile(presubmitTmp, []byte("FIXTURE-RELEASE\n"), 0o600); err != nil {
+		t.Fatalf("write fetch-crash presubmit release control file: %v", err)
+	}
+	if err := os.Rename(presubmitTmp, presubmitReleasePath); err != nil {
+		t.Fatalf("rename fetch-crash presubmit release control file into place: %v", err)
+	}
 
 	fx.requireTaskState(t, t1, "integrated")
 	fx.requireRunState(t, "completed")
