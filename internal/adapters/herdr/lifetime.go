@@ -2,14 +2,8 @@ package herdr
 
 import "net"
 
-// serverLifetimeTag versions the server-lifetime token format. A token of
-// any other shape — the earlier bare "peer-pid:<n>" included — never equals
-// one of these, so a recorded token of an older format compares as a
-// changed identity, never as the same server.
-const serverLifetimeTag = "herdr-server-lifetime/v1"
-
 // serverLifetime renders the lifetime identity of the server process that
-// accepted conn: its socket peer pid (fixed when the connection is
+// accepted conn (serverLifetimeTag's format where one is implemented): its socket peer pid (fixed when the connection is
 // established, before any request is sent) and that process's OS start
 // time (processLifetime). It is "" — unknown — when either cannot be read.
 // Herdr never re-execs a running server in place (a restart and a live

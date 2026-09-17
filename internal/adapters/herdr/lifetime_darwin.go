@@ -11,6 +11,12 @@ import (
 	"unsafe"
 )
 
+// serverLifetimeTag versions the server-lifetime token format. A token of
+// any other shape — the earlier bare "peer-pid:<n>" included — never equals
+// one of these, so a recorded token of an older format compares as a
+// changed identity, never as the same server.
+const serverLifetimeTag = "herdr-server-lifetime/v1"
+
 // solLocal and localPeerPID are macOS's <sys/un.h> getsockopt level and
 // option for a connected Unix-domain socket's peer pid; Go's syscall
 // package does not name them.
