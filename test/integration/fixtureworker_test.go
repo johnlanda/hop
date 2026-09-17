@@ -75,6 +75,7 @@ const fixtureWorkerSource = `package main
 
 import (
 	"bufio"
+	"crypto/rand"
 	"fmt"
 	"io"
 	"os"
@@ -436,6 +437,45 @@ func runHopCLI(hopPath string, args ...string) hopResult {
 	return hopResult{Stdout: out.String(), ExitCode: code}
 }
 
+// newRequestID mints a fresh lowercase-hex UUIDv4-shaped request id for one
+// logical mutating-verb call (design section 7: "the templates and
+// fixtures ALWAYS pass it"), reused UNCHANGED across every retry of that
+// SAME call — never regenerated per attempt — so a transient retry is
+// idempotent rather than minting a fresh, unrelated request each time.
+func newRequestID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		fatalf("generate request id: %v", err)
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// runHopCLIRetryable runs hopPath with args, retrying while the response's
+// first line begins with "transient:" — Phase 2's own hop result submit
+// retry convention (submitOnce), generalized here to every OTHER mutating
+// verb a validated manager/worker principal calls (design section 7/8): a
+// run still launching or resuming legitimately refuses a manager/message
+// verb with a retryable transient line rather than a hard refusal
+// (defect LAUNCH-1). It NEVER retries a "refused:" line — only a literal
+// "transient:" prefix is retryable — and reuses the identical args
+// (therefore the same --request-id, when the caller included one)
+// unchanged on every attempt, so a retry is idempotent. Bounded exactly
+// like submitOnce/reviewSubmitOnce so a persistently broken run does not
+// hang forever.
+func runHopCLIRetryable(hopPath string, args ...string) hopResult {
+	deadline := time.Now().Add(2 * time.Minute)
+	for {
+		res := runHopCLI(hopPath, args...)
+		if strings.HasPrefix(res.FirstLine(), "transient:") && time.Now().Before(deadline) {
+			time.Sleep(fixtureRetryInterval)
+			continue
+		}
+		return res
+	}
+}
+
 // submitOnce runs "<hopPath> result submit --summary <summary> --commit
 // <oid>", retrying while the first stdout line begins with "transient" (the
 // assignment template's own retry instruction), bounded so a persistent
@@ -730,7 +770,7 @@ func runWorker() {
 		oid := commitChange("fixture implementer change (held)")
 		questionPath := filepath.Join(scratchDir, "hold-question-"+env["HOP_ATTEMPT_ID"]+".txt")
 		atomicWriteFile(questionPath, fixtureHoldMarker+"\n")
-		res := runHopCLI(hopPath, "msg", "send", "--to", "manager", "--kind", "question", "--file", questionPath)
+		res := runHopCLIRetryable(hopPath, "msg", "send", "--to", "manager", "--kind", "question", "--file", questionPath, "--request-id", newRequestID())
 		question, ok := parseSentMessageID(res.Stdout)
 		if !ok {
 			fatalf("worker-hold: hop msg send did not accept the barrier question: %s", res.FirstLine())
@@ -1005,7 +1045,7 @@ func runManager() {
 	labelToID := map[string]string{}
 	for _, task := range script.Tasks {
 		instructionsPath := writeTempInstructions(cwd, task.Behavior, scratchDir)
-		args := []string{"task", "create", "--title", task.Title, "--file", instructionsPath}
+		args := []string{"task", "create", "--title", task.Title, "--file", instructionsPath, "--request-id", newRequestID()}
 		for _, dep := range task.DependsOn {
 			depID, known := labelToID[dep]
 			if !known {
@@ -1013,7 +1053,7 @@ func runManager() {
 			}
 			args = append(args, "--depends-on", depID)
 		}
-		res := runHopCLI(hopPath, args...)
+		res := runHopCLIRetryable(hopPath, args...)
 		taskID, ok := parseCreatedTaskID(res.Stdout)
 		if !ok {
 			fatalf("manager script: hop task create for %s was refused: %s", task.Label, res.FirstLine())
@@ -1021,7 +1061,7 @@ func runManager() {
 		labelToID[task.Label] = taskID
 		fmt.Printf("FIXTURE-TASK-CREATED label=[%s] id=[%s]\n", task.Label, taskID)
 	}
-	if res := runHopCLI(hopPath, "plan", "close"); res.ExitCode != 0 && !strings.HasPrefix(res.FirstLine(), "duplicate") {
+	if res := runHopCLIRetryable(hopPath, "plan", "close", "--request-id", newRequestID()); res.ExitCode != 0 && !strings.HasPrefix(res.FirstLine(), "duplicate") {
 		fatalf("manager script: hop plan close was refused: %s", res.FirstLine())
 	}
 	fmt.Println("FIXTURE-PLAN-CLOSED")
@@ -1068,20 +1108,20 @@ func handleManagerMessage(hopPath, cwd, runID, scratchDir string, script *manage
 	case "question":
 		rule := script.matchAnswer(body)
 		if rule != nil && rule.Action == "relay" {
-			res := runHopCLI(hopPath, "msg", "send", "--to", "human", "--kind", "question", "--relay-of", msg.ID, "--file", msg.BodyPath)
+			res := runHopCLIRetryable(hopPath, "msg", "send", "--to", "human", "--kind", "question", "--relay-of", msg.ID, "--file", msg.BodyPath, "--request-id", newRequestID())
 			fmt.Printf("FIXTURE-RELAYED question=[%s] relay=[%s]\n", msg.ID, res.FirstLine())
 		} else {
 			answerBody := fixtureAckGenericBody
 			if rule != nil {
 				answerBody = rule.Body
 			}
-			runHopCLI(hopPath, "msg", "send", "--kind", "answer", "--reply-to", msg.ID, "--body", answerBody)
+			runHopCLIRetryable(hopPath, "msg", "send", "--kind", "answer", "--reply-to", msg.ID, "--body", answerBody, "--request-id", newRequestID())
 		}
 	case "answer":
 		if msg.From != "human" || msg.Origin == "" {
 			fatalf("manager received an answer it did not expect (from=%s origin=%s); the fixture manager only ever asks the human via a relay", msg.From, msg.Origin)
 		}
-		runHopCLI(hopPath, "msg", "send", "--kind", "answer", "--reply-to", msg.Origin, "--file", msg.BodyPath)
+		runHopCLIRetryable(hopPath, "msg", "send", "--kind", "answer", "--reply-to", msg.Origin, "--file", msg.BodyPath, "--request-id", newRequestID())
 		fmt.Printf("FIXTURE-FORWARDED origin=[%s]\n", msg.Origin)
 	case "info":
 		if label, ok := parseNeedsReworkLabel(body); ok {
@@ -1089,7 +1129,7 @@ func handleManagerMessage(hopPath, cwd, runID, scratchDir string, script *manage
 			if !known {
 				fatalf("manager received a needs-rework notice for unknown label %s", label)
 			}
-			res := runHopCLI(hopPath, "task", "retry", "--reason", "fixture retry after interruption", taskID)
+			res := runHopCLIRetryable(hopPath, "task", "retry", "--reason", "fixture retry after interruption", "--request-id", newRequestID(), taskID)
 			fmt.Printf("FIXTURE-RETRIED label=[%s] result=[%s]\n", label, res.FirstLine())
 			break
 		}
@@ -1102,14 +1142,14 @@ func handleManagerMessage(hopPath, cwd, runID, scratchDir string, script *manage
 			*fixCounter++
 			label := "fix" + strconv.Itoa(*fixCounter)
 			instructionsPath := writeTempInstructions(cwd, script.FixBehavior, scratchDir)
-			res := runHopCLI(hopPath, "task", "create", "--title", "fix from reject", "--file", instructionsPath)
+			res := runHopCLIRetryable(hopPath, "task", "create", "--title", "fix from reject", "--file", instructionsPath, "--request-id", newRequestID())
 			taskID, ok := parseCreatedTaskID(res.Stdout)
 			if !ok {
 				fatalf("manager script: fix task creation was refused: %s", res.FirstLine())
 			}
 			labelToID[label] = taskID
 			fmt.Printf("FIXTURE-FIX-TASK-CREATED label=[%s] id=[%s]\n", label, taskID)
-			if closeRes := runHopCLI(hopPath, "plan", "close"); closeRes.ExitCode != 0 && !strings.HasPrefix(closeRes.FirstLine(), "duplicate") {
+			if closeRes := runHopCLIRetryable(hopPath, "plan", "close", "--request-id", newRequestID()); closeRes.ExitCode != 0 && !strings.HasPrefix(closeRes.FirstLine(), "duplicate") {
 				fatalf("manager script: hop plan close after the fix task was refused: %s", closeRes.FirstLine())
 			}
 		}

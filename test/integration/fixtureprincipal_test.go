@@ -80,6 +80,14 @@ func main() {
 	case "result submit":
 		fmt.Println("accepted 77777777-7777-4777-8777-777777777777")
 	case "task create":
+		if os.Getenv("FAKE_HOP_TASK_CREATE_REFUSED") == "1" {
+			fmt.Println("refused: dependency-cycle")
+			os.Exit(1)
+		}
+		if transientCallsLeft("FAKE_HOP_TASK_CREATE_TRANSIENT_COUNT", "FAKE_HOP_TASK_CREATE_TRANSIENT_COUNTER_FILE") {
+			fmt.Println("transient: run is launching; retry")
+			os.Exit(1)
+		}
 		n := nextCounter(os.Getenv("FAKE_HOP_TASK_COUNTER_FILE"))
 		fmt.Printf("task 00000000-0000-4000-8000-%012d t%d created\n", n, n)
 	case "task retry":
@@ -110,6 +118,32 @@ func nextCounter(path string) int {
 	n++
 	_ = os.WriteFile(path, []byte(strconv.Itoa(n)), 0o600)
 	return n
+}
+
+// transientCallsLeft reports whether this call should still return
+// "transient:" for the caller's own verb: countEnv names how many leading
+// calls stay transient, tracked durably in counterFileEnv's own file
+// (absent/unreadable counts as zero seen so far) so a SEPARATE fresh
+// process (the fixture principal's own retry, its own exec.Command) sees
+// the same running count. Both env vars empty/absent means "never
+// transient" (the ordinary success path for every existing test).
+func transientCallsLeft(countEnv, counterFileEnv string) bool {
+	target := os.Getenv(countEnv)
+	if target == "" {
+		return false
+	}
+	n, err := strconv.Atoi(target)
+	if err != nil || n <= 0 {
+		return false
+	}
+	counterFile := os.Getenv(counterFileEnv)
+	data, _ := os.ReadFile(counterFile)
+	seen, _ := strconv.Atoi(strings.TrimSpace(string(data)))
+	if seen >= n {
+		return false
+	}
+	_ = os.WriteFile(counterFile, []byte(strconv.Itoa(seen+1)), 0o600)
+	return true
 }
 
 func printScripted() {
@@ -218,6 +252,34 @@ func readFakeHopLog(t *testing.T, path string) string {
 		t.Fatal(err)
 	}
 	return string(content)
+}
+
+// logHasLine reports whether the fake-hop invocation log carries a line
+// starting with prefix and ending with suffix — used where a fresh
+// --request-id (newRequestID, a different value on every logical call)
+// sits between two fixed pieces of one invocation's argv, so neither an
+// exact line match nor a single Contains substring pins the whole line.
+func logHasLine(log, prefix, suffix string) bool {
+	for _, line := range strings.Split(log, "\n") {
+		if strings.HasPrefix(line, prefix) && strings.HasSuffix(line, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// countLogLinesWithPrefix counts the fake-hop invocation log's own lines
+// starting with prefix — used in place of an exact full-line count once a
+// verb's own trailing --request-id (a fresh value per call) makes an
+// exact line match brittle.
+func countLogLinesWithPrefix(log, prefix string) int {
+	n := 0
+	for _, line := range strings.Split(log, "\n") {
+		if strings.HasPrefix(line, prefix) {
+			n++
+		}
+	}
+	return n
 }
 
 // TestFixtureManagerScriptDispatch drives the compiled fixture principal as
@@ -360,7 +422,7 @@ func TestFixtureManagerScriptDispatch(t *testing.T) {
 		"plan\tclose",
 		"msg\tsend\t--to\thuman\t--kind\tquestion\t--relay-of\tmsg-hold-question\t--file\t" + holdBody,
 		"msg\tsend\t--kind\tanswer\t--reply-to\tmsg-hold-question\t--file\t" + humanAnswerBody,
-		"task\tretry\t--reason\tfixture retry after interruption\t00000000-0000-4000-8000-000000000001",
+		"task\tretry\t--reason\tfixture retry after interruption\t--request-id\t",
 		"status\t-C\t" + cwd + "\t-run\t" + runID,
 		"task\tcreate\t--title\tfix from reject\t--file\t",
 	} {
@@ -373,10 +435,198 @@ func TestFixtureManagerScriptDispatch(t *testing.T) {
 			t.Errorf("fake hop invocation log missing an ack of %s; got:\n%s", id, log)
 		}
 	}
+	// The retry call's own --request-id sits BEFORE the positional task id
+	// (task retry's one positional argument), so the retried task id is
+	// asserted as the line's own suffix rather than assuming adjacency to
+	// --reason.
+	if !logHasLine(log, "task\tretry\t--reason\tfixture retry after interruption\t--request-id\t", "\t00000000-0000-4000-8000-000000000001") {
+		t.Errorf("fake hop invocation log missing a task retry of the expected task id; got:\n%s", log)
+	}
 	// The fix task's own plan close (the second one, after the reject
-	// notice) must also appear: two "plan close" lines total.
-	if got := strings.Count(log, "plan\tclose\n"); got != 2 {
+	// notice) must also appear: two "plan close" lines total. Each now
+	// carries its own --request-id suffix (runHopCLIRetryable/newRequestID),
+	// so lines are matched by prefix rather than an exact "plan close\n" line.
+	if got := countLogLinesWithPrefix(log, "plan\tclose"); got != 2 {
 		t.Errorf("plan close invocation count = %d, want 2 (the initial close and the post-fix-task reclose); log:\n%s", got, log)
+	}
+}
+
+// requestIDFromLogLine extracts the value following a "--request-id"
+// token in one fake-hop invocation log line, "" if absent.
+func requestIDFromLogLine(t *testing.T, line string) string {
+	t.Helper()
+	fields := strings.Split(line, "\t")
+	for i, f := range fields {
+		if f == "--request-id" && i+1 < len(fields) {
+			return fields[i+1]
+		}
+	}
+	return ""
+}
+
+// managerScriptDispatchFixture bundles managerScriptDispatchFixture's setup
+// (a struct rather than many return values, so the two tests that build it
+// stay a plain field-access away from a single build call).
+type managerScriptDispatchFixture struct {
+	principal, fakeHop, stateDir, runID, cwd, logPath, counterPath, assignmentPath string
+}
+
+// buildManagerScriptDispatchFixture builds the common one-task manager
+// fixture TestFixtureManagerRetriesTransientTaskCreate and
+// TestFixtureManagerNeverRetriesRefused each drive with a different
+// FAKE_HOP_TASK_CREATE_* script: a single "t1" task, no answers, no fix
+// behavior — only hop task create's own outcome is under test here.
+func buildManagerScriptDispatchFixture(t *testing.T, artifacts *artifactDir) managerScriptDispatchFixture {
+	t.Helper()
+	fx := managerScriptDispatchFixture{
+		principal: buildFixtureWorker(t, artifacts),
+		fakeHop:   buildFakeHopStub(t, artifacts),
+		stateDir:  artifacts.dir(t, "state"),
+		runID:     "a1a1a1a1-a1a1-4a1a-8a1a-a1a1a1a1a1a1",
+	}
+	scratchDir := artifacts.dir(t, "manager-scratch")
+	fx.assignmentPath = filepath.Join(fx.stateDir, "runs", fx.runID, "artifacts", "assignment.md")
+	if err := os.MkdirAll(filepath.Dir(fx.assignmentPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	brief := fixtureManagerBrief(scratchDir, []fixtureManagerTask{{Label: "t1", Title: "Implement t1", Behavior: "worker-implement"}}, nil, "")
+	assignmentContent := "# HOP Manager Assignment\n\nRun: " + fx.runID + "\n\n## Brief\n\n" + brief + "\n## Instructions\n"
+	if err := os.WriteFile(fx.assignmentPath, []byte(assignmentContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	scriptDir := artifacts.dir(t, "manager-script")
+	fx.counterPath = newFakeHopTaskCounter(t, scriptDir)
+	fx.logPath = filepath.Join(scriptDir, "log.txt")
+
+	cwd, err := filepath.EvalSymlinks(artifacts.dir(t, "manager-cwd"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fx.cwd = cwd
+	return fx
+}
+
+// TestFixtureManagerRetriesTransientTaskCreate proves the fixture
+// principal's generalized transient-retry behavior (runHopCLIRetryable):
+// a "transient: ..." first line from hop task create is retried, backing
+// off fixtureRetryInterval, until it eventually succeeds — needed because
+// LAUNCH-1's production fix returns exactly this shape for a manager verb
+// racing its own launch corroboration while the run is still launching or
+// resuming (design section 7/8) — and the retry reuses the IDENTICAL
+// --request-id on every attempt of the same logical call, never minting a
+// fresh one per retry, so the retry is idempotent server-side.
+func TestFixtureManagerRetriesTransientTaskCreate(t *testing.T) {
+	artifacts := newArtifactDir(t)
+	fx := buildManagerScriptDispatchFixture(t, artifacts)
+	transientCounterPath := filepath.Join(filepath.Dir(fx.logPath), "transient-counter.txt")
+
+	const rolePath, cribPath = "/state/runs/a1/artifacts/roles/manager.md", "/state/runs/a1/artifacts/worker-protocol.md"
+	prompt := testManagerInitialPrompt(fx.assignmentPath, rolePath, cribPath, fx.fakeHop)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, fx.principal, "--session-id", "22222222-2222-2222-2222-222222222222", prompt) //nolint:gosec // G204: fixed test-owned binary and arguments.
+	cmd.Dir = fx.cwd
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOP_STATE_DIR=" + fx.stateDir,
+		"HOP_RUN_ID=" + fx.runID,
+		"HOP_SESSION_ID=33333333-3333-3333-3333-333333333333",
+		"HOP_INCARNATION_ID=44444444-4444-4444-4444-444444444444",
+		"HOP_ROLE=manager",
+		"FAKE_HOP_TASK_COUNTER_FILE=" + fx.counterPath,
+		"FAKE_HOP_LOG=" + fx.logPath,
+		// No FAKE_HOP_MSG_SCRIPT: an unset script path makes every msg
+		// wait/next return "none: ..." (printScripted's own os.ReadFile
+		// failure branch), exactly the idle-forever behavior this test
+		// needs once planning finishes — the context deadline is what
+		// ends the manager, mirroring TestFixtureManagerScriptDispatch.
+		"FAKE_HOP_TASK_CREATE_TRANSIENT_COUNT=1",
+		"FAKE_HOP_TASK_CREATE_TRANSIENT_COUNTER_FILE=" + transientCounterPath,
+	}
+	var out strings.Builder
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	_ = cmd.Run() //nolint:errcheck // the context deadline killing this intentionally endless manager is the expected outcome, asserted on its captured stdout below, never on this error.
+
+	stdout := out.String()
+	for _, want := range []string{
+		"FIXTURE-MANAGER-READY",
+		"FIXTURE-TASK-CREATED label=[t1] id=[00000000-0000-4000-8000-000000000001]",
+		"FIXTURE-PLAN-CLOSED",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("manager stdout missing %q (the transient retry must eventually succeed); got:\n%s", want, stdout)
+		}
+	}
+
+	log := readFakeHopLog(t, fx.logPath)
+	var createLines []string
+	for _, line := range strings.Split(log, "\n") {
+		if strings.HasPrefix(line, "task\tcreate\t--title\tImplement t1\t") {
+			createLines = append(createLines, line)
+		}
+	}
+	if len(createLines) != 2 {
+		t.Fatalf("task create invocation count for t1 = %d, want 2 (one transient, one accepted); log:\n%s", len(createLines), log)
+	}
+	firstID, secondID := requestIDFromLogLine(t, createLines[0]), requestIDFromLogLine(t, createLines[1])
+	if firstID == "" {
+		t.Fatalf("first task create attempt carries no --request-id; log line: %q", createLines[0])
+	}
+	if firstID != secondID {
+		t.Errorf("task create retry used request ids %q then %q, want the SAME id reused on retry (idempotency depends on it)", firstID, secondID)
+	}
+}
+
+// TestFixtureManagerNeverRetriesRefused proves runHopCLIRetryable never
+// retries a hard "refused:" line — only a literal "transient:" prefix is
+// ever retryable (design section 7: a refusal is not something the
+// protocol tells the caller to retry). The manager must call hop task
+// create EXACTLY once and then fail its own run loudly (fatalf), never
+// looping the way a transient response does.
+func TestFixtureManagerNeverRetriesRefused(t *testing.T) {
+	artifacts := newArtifactDir(t)
+	fx := buildManagerScriptDispatchFixture(t, artifacts)
+
+	const rolePath, cribPath = "/state/runs/a1/artifacts/roles/manager.md", "/state/runs/a1/artifacts/worker-protocol.md"
+	prompt := testManagerInitialPrompt(fx.assignmentPath, rolePath, cribPath, fx.fakeHop)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, fx.principal, "--session-id", "22222222-2222-2222-2222-222222222222", prompt) //nolint:gosec // G204: fixed test-owned binary and arguments.
+	cmd.Dir = fx.cwd
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOP_STATE_DIR=" + fx.stateDir,
+		"HOP_RUN_ID=" + fx.runID,
+		"HOP_SESSION_ID=33333333-3333-3333-3333-333333333333",
+		"HOP_INCARNATION_ID=44444444-4444-4444-4444-444444444444",
+		"HOP_ROLE=manager",
+		"FAKE_HOP_TASK_COUNTER_FILE=" + fx.counterPath,
+		"FAKE_HOP_LOG=" + fx.logPath,
+		"FAKE_HOP_TASK_CREATE_REFUSED=1",
+	}
+	var out strings.Builder
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	runErr := cmd.Run()
+	if runErr == nil {
+		t.Fatalf("manager exited 0 despite hop task create being refused; want a fatal non-zero exit; stdout/stderr:\n%s", out.String())
+	}
+
+	stdout := out.String()
+	if strings.Contains(stdout, "FIXTURE-TASK-CREATED") {
+		t.Errorf("manager reported a created task despite the refusal; got:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "fixture principal: manager script: hop task create for t1 was refused: refused: dependency-cycle") {
+		t.Errorf("manager output does not name the refusal it fataled on; got:\n%s", stdout)
+	}
+
+	log := readFakeHopLog(t, fx.logPath)
+	if got := countLogLinesWithPrefix(log, "task\tcreate\t--title\tImplement t1\t"); got != 1 {
+		t.Errorf("task create invocation count for t1 = %d, want exactly 1 (a refused: line must never be retried); log:\n%s", got, log)
 	}
 }
 
