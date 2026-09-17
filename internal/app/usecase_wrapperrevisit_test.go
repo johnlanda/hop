@@ -478,3 +478,55 @@ func TestManagerBootstrapContinuesTheWrapperReconciliation(t *testing.T) {
 		})
 	}
 }
+
+// TestManagerBootstrapIgnoresAReconciliationWithASettledClaim is the other
+// side of the manager arm, where wrapperReconciliation is the
+// DISCRIMINATOR rather than a passenger: every row of the table above
+// holds the claim at exec_pending, so the conjunct is true throughout and
+// deleting it changes nothing there.
+//
+// A settled claim under a reconciling session is the shape EVERY resume
+// path leaves behind, and the loop does not re-inspect it
+// (sessionUnderLaunchCorroboration skips it for the same reason). So the
+// bootstrap must not hand the run back to launching for it, even when the
+// pane answers with the claimed process under the placement's own
+// lifetime — every positive observation LAUNCH-5 requires. Handing that
+// session to a loop that will never look at it is the wedge this slice
+// exists to prevent, arriving through a different door.
+func TestManagerBootstrapIgnoresAReconciliationWithASettledClaim(t *testing.T) {
+	f := newResumeFixture(t)
+	managerBinding := wedgeWrappedManagerLaunch(t, f)
+	claim := f.tc.Store.LaunchClaims[f.fr.ManagerIncarnation]
+	claim.State = app.LaunchClaimExeced
+	f.tc.Store.LaunchClaims[f.fr.ManagerIncarnation] = claim
+
+	childBinding := resumeChildClaim(t, f, app.LaunchClaimExecPending)
+	managerPane := claimedManagerPane(f)
+	f.tc.Runtime.InspectPaneFn = func(id string) (app.PaneProcess, error) {
+		switch id {
+		case managerBinding.PaneID:
+			return managerPane, nil
+		case childBinding.PaneID:
+			return childPaneWith(childLaunchPID, corroboratingChild(childBinding.IncarnationID)), nil
+		}
+		return app.PaneProcess{}, app.ErrPaneNotFound
+	}
+
+	result, _ := f.resume(t, "")
+	if got := f.tc.Store.Runs[f.fr.RunID].value.State; got == run.RunLaunching {
+		t.Fatalf("run state = %s: the bootstrap returned the run to launching for a reconciliation whose claim is already settled", got)
+	}
+	// What happens instead is the ordinary resume: the settled claim's own
+	// occupant corroborates, so the manager warm-reattaches and the run
+	// resumes to running. The launch was never the loop's to finish.
+	if mgr := sessionReport(t, &result, f.fr.ManagerID.String()); mgr.Disposition != app.SessionWarm {
+		t.Fatalf("manager report = %+v, want warm: its settled claim's occupant corroborates here, not in the loop", mgr)
+	}
+	if got := f.tc.Store.Sessions[f.fr.ManagerID].value.State; got != run.SessionActive {
+		t.Fatalf("manager session state = %s, want active", got)
+	}
+	requireRunState(t, f, run.RunRunning)
+	if result.Outcome != "resumed" {
+		t.Fatalf("resume = %+v, want resumed", result)
+	}
+}

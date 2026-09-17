@@ -421,6 +421,13 @@ func unplacedContinuityText(renderedLabel string) string {
 	return "no pane answers for launch label " + renderedLabel + ", but server continuity since the launch is not established (the Herdr server may have restarted, and a pane renamed before a restart keeps its new name), so the launch may still run; if a pane of this run was renamed, rename it back to " + renderedLabel + " and a later round adopts it by its label"
 }
 
+// unplacedUnrecordedLifetimeText is the action an unplaced launch reports
+// when the launch itself recorded no server identity: continuity with it
+// can never be established, and there is no rename to undo.
+func unplacedUnrecordedLifetimeText(renderedLabel string) string {
+	return "no pane answers for launch label " + renderedLabel + ", but this launch recorded no server identity, so continuity with it can never be established and the launch is never concluded ended; nothing was renamed, so renaming a pane back cannot resolve it — confirm no agent of this session is still running before reusing this run's workspace"
+}
+
 // TestUnplacedLaunchAfterRestartHasNoAutomaticExit pins the residual the
 // continuity conjunct leaves on purpose: an unplaced launch whose creation
 // label answers nothing after a server restart — its pane renamed, or
@@ -482,6 +489,30 @@ func TestUnplacedLaunchAfterRestartHasNoAutomaticExit(t *testing.T) {
 		if len(f.tc.Groups.Listed) != 0 {
 			t.Errorf("listed groups = %v, want none without continuity", f.tc.Groups.Listed)
 		}
+	})
+
+	t.Run("a launch that recorded no identity names its own action, not the rename-back one", func(t *testing.T) {
+		u := unplacedWorker(t, true)
+		// No restart: the label simply answers nothing, and the launch
+		// intent never recorded a server identity to compare against —
+		// the ordinary shape wherever no lifetime identity exists.
+		delete(u.panes, u.label)
+		pendingIntentPayload(t, u)["server_instance"] = ""
+
+		report := u.driveStop(t, 3)
+		if report.Terminated || report.RunState != string(run.RunStopping) {
+			t.Fatalf("DriveFeatureStop() = %+v, want still stopping", report)
+		}
+		want := "session " + u.sessionID.String() + ": " + unplacedUnrecordedLifetimeText(u.label) + "; failing closed"
+		if !slices.Contains(report.Outstanding, want) {
+			t.Fatalf("outstanding = %q, want %q", report.Outstanding, want)
+		}
+		for _, entry := range report.Outstanding {
+			if strings.Contains(entry, "rename it back to") {
+				t.Fatalf("outstanding entry %q offers the rename-back action; nothing was renamed", entry)
+			}
+		}
+		requireUnplacedChildUnsettled(t, u)
 	})
 
 	t.Run("a hostile creation label renders escaped", func(t *testing.T) {

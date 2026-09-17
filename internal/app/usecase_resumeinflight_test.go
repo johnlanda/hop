@@ -173,6 +173,41 @@ func TestResumeFeatureChildLaunchInFlight(t *testing.T) {
 		}
 	})
 
+	t.Run("a reconciling session that is not the loop's own reconciliation is never in flight", func(t *testing.T) {
+		f := newResumeFixture(t)
+		binding, _ := f.tc.Store.currentBindingLocked(f.ChildID)
+		// Reconciling with NO claim: not the live wrapper reconciliation,
+		// which always carries the placement's own exec_pending claim. The
+		// loop's corroboration skips this session for exactly that reason
+		// (sessionUnderLaunchCorroboration asks wrapperReconciliation
+		// too), so reporting it in flight would hand a launch to a step
+		// that will never look at it — the wedge, through another door.
+		//
+		// The state is not reachable through any path today; the conjunct
+		// is what keeps it unreachable from the in-flight rule if one ever
+		// produced it, and this pins the rule rather than a live bug.
+		row := f.tc.Store.Sessions[f.ChildID]
+		reconciling, err := row.value.Reconcile(f.tc.Clock.Now())
+		if err != nil {
+			t.Fatalf("Reconcile() error = %v", err)
+		}
+		row.value = reconciling
+		row.revision++
+		// Its pane holds this session's own hop launch invocation — every
+		// positive observation the pre-claim leg of the rule requires.
+		f.tc.Runtime.InspectPaneFn = withChildPane(f, binding.PaneID, childPaneWith(childLaunchPID, childLauncher(f)))
+
+		result, _ := f.resume(t, "")
+		report := sessionReport(t, &result, f.ChildID.String())
+		if report.Detail == inFlightDetail {
+			t.Fatalf("child report = %+v, want NOT in flight: nothing re-inspects this session", report)
+		}
+		if !strings.Contains(report.Detail, "not a launch the controller loop still corroborates") {
+			t.Fatalf("child report = %+v, want the detail naming why it is not in flight", report)
+		}
+		requireRunState(t, f, run.RunResuming)
+	})
+
 	t.Run("the manager's own launch is unsettled: the run returns to launching, never running", func(t *testing.T) {
 		f := newResumeFixture(t)
 		mgrRow := f.tc.Store.Sessions[f.fr.ManagerID]

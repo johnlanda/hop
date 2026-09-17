@@ -694,6 +694,33 @@ func TestLaunchEndedRowAfterRestartHasNoAutomaticExit(t *testing.T) {
 		requireRunState(t, f, run.RunResuming)
 	})
 
+	t.Run("a placement that recorded no identity names its own action, not the rename-back one", func(t *testing.T) {
+		f := newResumeFixture(t)
+		binding := resumeChildClaim(t, f, app.LaunchClaimExecPending)
+		// The server answers its ordinary lifetime; the placement simply
+		// never recorded one, which is the shape of EVERY placement on a
+		// platform with no server-lifetime identity.
+		recordBindingServer(f, "")
+		f.tc.Runtime.InspectPaneFn = liveManagerOnly(f.fr, f.ManagerPID)
+
+		result, _ := f.resume(t, "")
+		if result.Outcome != "reconciling" {
+			t.Fatalf("resume = %+v, want reconciling", result)
+		}
+		report := sessionReport(t, &result, f.ChildID.String())
+		want := "launch claim not settled; corroboration continues (" + placedUnrecordedLifetimeText(binding.CreationLabel) + ")"
+		if report.Disposition != app.SessionPending || report.Detail != want {
+			t.Fatalf("child report = %+v, want pending with %q", report, want)
+		}
+		if strings.Contains(report.Detail, "rename it back to") {
+			t.Fatalf("child report = %+v, want no rename-back action: nothing was renamed", report)
+		}
+		if got := f.tc.Store.LaunchClaims[binding.IncarnationID].State; got != app.LaunchClaimExecPending {
+			t.Errorf("claim state = %s, want exec_pending", got)
+		}
+		requireRunState(t, f, run.RunResuming)
+	})
+
 	stopWithChildPaneGone := func(t *testing.T, instance string) (app.StopReport, *testController, launchingChild) {
 		t.Helper()
 		tc := newTestController(defaultPolicy())
