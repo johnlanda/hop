@@ -217,7 +217,7 @@ const selfKillPollInterval = 100 * time.Millisecond
 // races the OS's own pid-reuse window between observation and signal —
 // Herdr could reap this process and the kernel could recycle its pid
 // before the test's own signal call executes, killing an unrelated
-// process instead (Astra review finding P1). Asking the verified process
+// process instead. Asking the verified process
 // to kill itself closes that window: no other process is ever named by
 // the pid the test's signal ultimately targets. Runs forever in its own
 // goroutine; the process exits from this or on its own, whichever is
@@ -557,8 +557,8 @@ func deterministicUUIDFrom(seed string) string {
 // retry convention (submitOnce), generalized here to every OTHER mutating
 // verb a validated manager/worker principal calls (design section 7/8): a
 // run still launching or resuming legitimately refuses a manager/message
-// verb with a retryable transient line rather than a hard refusal
-// (defect LAUNCH-1). It NEVER retries a "refused:" line — only a literal
+// verb with a retryable transient line rather than a hard refusal. It
+// NEVER retries a "refused:" line — only a literal
 // "transient:" prefix is retryable — and reuses the identical args
 // (therefore the same --request-id, when the caller included one)
 // unchanged on every attempt, so a retry is idempotent. Bounded exactly
@@ -588,9 +588,8 @@ const fixtureGrammarTransientUndeliveredLine = "transient: undelivered messages;
 // assignment template's own retry instruction), bounded so a persistent
 // rejection does not hang the worker forever. observationPath, when
 // non-empty, dumps every attempt's exact first line, one per line, in
-// order -- P2-3's own evidence that the real binary's rendered sequence is
-// exactly what MailboxClosureRace/Race claims, never inferred from the
-// outcome alone.
+// order -- direct evidence of the real binary's rendered sequence,
+// never inferred from the outcome rows alone.
 func submitOnce(hopPath, oid, summary, observationPath string) {
 	// The retry budget must comfortably outlast the controller's own
 	// corroboration polling: launch claim settlement depends on real pane
@@ -614,8 +613,8 @@ func submitOnce(hopPath, oid, summary, observationPath string) {
 		// Feature mode's own mailbox-drain transient names a SPECIFIC
 		// required action, distinct from solo's "attempt not yet running"
 		// retry: the identical resubmit would see the SAME pending
-		// message forever without this drain. P2-3: matched EXACTLY,
-		// never by prefix -- a trailing-text drift in the real renderer
+		// message forever without this drain. Matched EXACTLY, never by
+		// prefix -- a trailing-text drift in the real renderer
 		// must fail this loop loudly (an unhandled transient line falls
 		// through to the deadline-bounded retry below with no drain,
 		// which for a genuinely undelivered-messages case would spin
@@ -718,25 +717,23 @@ func parseDeliveredMessage(stdout string) (deliveredMessage, bool) {
 }
 
 // fixtureFetchLoopDeadline bounds how long fetchDeliveredMessage tolerates
-// a transient or LAUNCH-7 pre-binding refusal before giving up loudly,
-// rather than spinning silently forever against a permanent regression
-// (P2-7).
+// a transient or pre-binding refusal before giving up loudly, rather than
+// spinning silently forever against a permanent regression.
 const fixtureFetchLoopDeadline = 2 * time.Minute
 
 // fetchDeliveredMessage runs "<hopPath> msg wait" in a loop until a
 // message is delivered, classifying and pacing every non-delivery outcome
-// (P2-7) instead of retrying unconditionally on anything -- worker-hold's
-// and worker-fetch-crash's shared fetch loop:
+// instead of retrying unconditionally on anything -- worker-hold's and
+// worker-fetch-crash's shared fetch loop:
 //   - "none: ..." (no message within the wait timeout) continues at once;
 //     the server-side wait itself already paced that call, so no sleep is
 //     added on top of it.
-//   - "transient: ..." -- and the LAUNCH-7 pre-binding window's own exact
+//   - "transient: ..." -- and the pre-binding launch window's own exact
 //     "refused: unauthorized" line (a session/incarnation not yet
-//     current; an already-confirmed, separately-tracked defect, matched
-//     by EXACT text, never a broader prefix, so a genuinely different
-//     unauthorized refusal still fails loudly below) -- sleeps
-//     fixtureRetryInterval within fixtureFetchLoopDeadline and prints the
-//     line.
+//     current, matched by EXACT text, never a broader prefix, so a
+//     genuinely different unauthorized refusal still fails loudly below)
+//     -- sleeps fixtureRetryInterval within fixtureFetchLoopDeadline and
+//     prints the line.
 //   - anything else fatalf's immediately, naming the exact line, rather
 //     than looping silently against a permanent regression.
 func fetchDeliveredMessage(hopPath string) deliveredMessage {
@@ -942,7 +939,7 @@ func runWorker() {
 		// A real-process scenario that ends this attempt mid-flight (design
 		// section 11 scenario 4) must never signal a pid it only OBSERVED
 		// via pane.process_info: Herdr could reap and the OS could recycle
-		// that pid before the signal lands (Astra review finding P1). This
+		// that pid before the signal lands. This
 		// watcher is the ONLY safe channel — the test asks this verified
 		// process to kill ITSELF (os.Getpid()) by writing a control file
 		// under the run's own scratch directory, never HOP_STATE_DIR and
@@ -957,9 +954,8 @@ func runWorker() {
 		oid := commitChange("fixture worker change")
 		submitOnce(hopPath, oid, "fixture worker result", "")
 	case "submit-valid-held":
-		// P2-3's opt-in first-submit gate (the simpler alternative to a
-		// held-dependency task): otherwise identical to submit-valid, but
-		// blocks immediately before its OWN first hop result submit call
+		// An opt-in first-submit gate: otherwise identical to submit-valid,
+		// but blocks immediately before its OWN first hop result submit call
 		// until this test-controlled release gate appears -- giving
 		// MailboxClosureRace/Race a guaranteed happens-before
 		// relationship between its own race message send and this
@@ -1021,10 +1017,9 @@ func runWorker() {
 		// commits, never submits. Its ONLY liveness signal is existing
 		// until this test's own self-kill control file appears -- the
 		// background watchForSelfKill goroutine already started above is
-		// the sole mechanism that ever ends it. This is option A's
-		// structural fix for MailboxClosureRace's failure-path variant
-		// (P2-2): a scenario sends to this worker's still-open mailbox
-		// WHILE it is provably alive (this behavior never drains, so
+		// the sole mechanism that ever ends it. Structurally, this lets a
+		// scenario send to this worker's still-open mailbox WHILE it is
+		// provably alive (this behavior never drains, so
 		// nothing it does can race the send), THEN self-kills it, THEN
 		// lets the live controller settle the failure -- no "comfortably
 		// ahead of the controller's cadence" timing assumption needed at
@@ -1296,7 +1291,7 @@ func parseNeedsReworkLabel(body string) (label string, ok bool) {
 // scripted table, relaying a barrier question to the human when scripted,
 // forwarding a human's answer back through the relay chain using only the
 // envelope's own origin field, retrying a task on its needs-rework notice,
-// and — the ONLY channel section 8/STATUS-1 actually name for a reject
+// and — the ONLY channel design section 8 names for a reject
 // verdict, since the acceptance notice's own body is just the reviewer's
 // raw reasons text with no distinguishing marker — checking hop status
 // for the rendered guard shortfall on any other info notice
@@ -1320,9 +1315,9 @@ func runManager() {
 	var selfKillControlPath string
 	if scratchDir != "" {
 		observationPath = filepath.Join(scratchDir, "manager-observed.txt")
-		// The same safe self-kill channel runWorker's own attempts use
-		// (Astra review finding P1): a test asks this VERIFIED process to
-		// kill ITSELF by writing a control file, never signals a pid it
+		// The same safe self-kill channel runWorker's own attempts use: a
+		// test asks this VERIFIED process to kill ITSELF by writing a
+		// control file, never signals a pid it
 		// only observed. Named by this session's own id (the manager has
 		// no attempt id) so a cold-relaunched successor's watcher never
 		// collides with its predecessor's already-consumed control file.
@@ -1397,7 +1392,7 @@ func runManager() {
 // (internal/app/grammar.go, itself mirroring run.ShortfallVerdictRejected):
 // EvaluateReadiness's reject-verdict guard-shortfall kind token,
 // "verdict-rejected". The manager's standing instruction (design section
-// 7/8, STATUS-1's manager verdict channel, internal/app/templates.go's
+// 7/8's manager verdict channel, internal/app/templates.go's
 // renderManagerAssignment) is to run hop status after any controller info
 // notice it does not otherwise recognize and read its shortfall lines —
 // the ONLY channel that names a reject verdict at all, since the
@@ -1454,7 +1449,7 @@ const verdictRejectedLinePrefix = "shortfall: " + verdictRejectedShortfallToken 
 
 // verdictRejection is one parsed "shortfall: verdict-rejected
 // review=<id> subject=<oid> reasons=<path>" line
-// (app.GrammarVerdictRejectedLine, STATUS-1): the specific review's
+// (app.GrammarVerdictRejectedLine): the specific review's
 // identity, its subject commit and its reasons artifact path — the three
 // fields the manager's own verdict-channel instruction says a
 // verdict-rejected shortfall carries so a manager can tell WHICH review
@@ -1660,7 +1655,7 @@ func handleManagerMessage(hopPath, cwd, runID, scratchDir string, script *manage
 			break
 		}
 		// Not a task-consequence notice: per the manager's own
-		// verdict-channel instruction (design section 7/8, STATUS-1), run
+		// verdict-channel instruction (design section 7/8), run
 		// hop status and correlate its verdict-rejected shortfall lines
 		// against THIS notice's own body path — the ONLY way to know WHICH
 		// review a reject verdict's notice reports, since the notice's body
@@ -1773,16 +1768,15 @@ func runReviewer() {
 // requireSelfKilled asserts wait (the process's already-resolved
 // cmd.Wait error) shows it was SIGKILLed by ITS OWN doing (a fixture
 // principal's watchForSelfKill, via its self-kill control file), never by
-// the caller's own context deadline expiring first (P3-1). A bare
-// non-zero exit, or even a confirmed SIGKILL exit status alone, cannot
-// tell the two apart: exec.CommandContext kills the process the IDENTICAL
-// way once its context is done, so a self-kill mechanism that never fires
-// at all (mutation m1: watchForSelfKill's syscall.Kill replaced by an
-// infinite sleep) would still exit non-zero, via the test's own context
-// timeout, and pass a check that only looks at the exit error. ctxErr
-// (the caller's own ctx.Err(), read at the moment wait() returns) == nil
-// proves the context had NOT yet fired, so any kill observed is provably
-// the fixture's own self-kill channel.
+// the caller's own context deadline expiring first. A bare non-zero exit,
+// or even a confirmed SIGKILL exit status alone, cannot tell the two
+// apart: exec.CommandContext kills the process the IDENTICAL way once
+// its context is done, so a self-kill mechanism that never fires at all
+// would still exit non-zero, via the test's own context timeout, and
+// pass a check that only looks at the exit error. ctxErr (the caller's
+// own ctx.Err(), read at the moment wait() returns) == nil proves the
+// context had NOT yet fired, so any kill observed is provably the
+// fixture's own self-kill channel.
 func requireSelfKilled(t *testing.T, ctxErr, waitErr error) {
 	t.Helper()
 	if ctxErr != nil {
@@ -2359,9 +2353,9 @@ func (o *syncOutput) snapshot() string {
 }
 
 // TestFixtureWorkerSelfKillOnControlFile proves the fixture principal's
-// self-kill watcher (Astra review finding P1: a real-process scenario
-// must never signal a pid it only OBSERVED via pane.process_info — the
-// OS could recycle it between observation and signal). Drives a
+// self-kill watcher: a real-process scenario must never signal a pid it
+// only OBSERVED via pane.process_info — the OS could recycle it between
+// observation and signal. Drives a
 // worker-hold implementer directly (no herdr, no pane) until it has sent
 // its own barrier question — genuinely blocked in its own hop msg wait
 // loop, exactly the state a real scenario kills it in — then writes the
@@ -2457,7 +2451,7 @@ func TestFixtureWorkerSelfKillOnControlFile(t *testing.T) {
 		t.Fatalf("rename self-kill control file into place: %v", err)
 	}
 
-	// P3-1: ctx.Err() == nil at this exact moment proves this SIGKILL is
+	// ctx.Err() == nil at this exact moment proves this SIGKILL is
 	// the fixture's own self-kill channel firing, never the context's own
 	// 30s deadline masking a self-kill that never happened (a bare
 	// non-zero-exit or even a confirmed-SIGKILL check alone cannot tell

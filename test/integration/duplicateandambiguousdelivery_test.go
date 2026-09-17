@@ -127,7 +127,7 @@ func TestRealProcessDuplicateAndAmbiguousDelivery(t *testing.T) {
 	}
 
 	// Both the worker and the controller must die before any
-	// reconciliation, and the CONTROLLER dies FIRST (P2-1): killControllerLeader
+	// reconciliation, and the CONTROLLER dies FIRST: killControllerLeader
 	// signals only fx.controller's own leaderCmd, a process this test
 	// itself started and owns (never reaped by anything else), so this
 	// is safe regardless of ordering. Killing it before the self-kill
@@ -229,8 +229,8 @@ func TestRealProcessDuplicateAndAmbiguousDelivery(t *testing.T) {
 	if finalOldestAge <= 0 {
 		t.Errorf("final attention line oldest-queued age %s is not plausible", finalOldestAge)
 	}
-	// The run-summary state line's attention marker, matched EXACTLY
-	// (P3-4): cmd/hop/statuscmd.go's renderRunDetail renders it as
+	// The run-summary state line's attention marker, matched EXACTLY:
+	// cmd/hop/statuscmd.go's renderRunDetail renders it as
 	// "  state:         " + state + listingMarkers(...), and
 	// listingMarkers appends "stop requested"/"reconciling"/
 	// app.GrammarAttentionMarker in that fixed order, joined ", " inside
@@ -266,7 +266,7 @@ func TestRealProcessDuplicateAndAmbiguousDelivery(t *testing.T) {
 		t.Errorf("relaunched worker's native_session_ref = %q, want the SAME reference the prior session carried: %q", got, want)
 	}
 
-	// P1-2: the re-serve must exist BEFORE the stale ack is ever issued --
+	// The re-serve must exist BEFORE the stale ack is ever issued --
 	// trace 3's ambiguity is the old incarnation's late ack refused stale
 	// WHILE a second delivery row exists, so this waits for the resumed
 	// worker's own re-fetch observation and the second delivery row
@@ -367,8 +367,8 @@ func TestRealProcessDuplicateAndAmbiguousDelivery(t *testing.T) {
 		t.Errorf("m2's delivered_at %s is before m1's acked_at %s; fetch must re-serve the in-flight message first, so m2 can only be served once m1 is acked", m2DeliveredAt, m1AckedAt)
 	}
 
-	// P2-6: the resumed worker pauses at its own opt-in presubmit gate,
-	// after its drain (m1 and m2 both acked) and before its own submit --
+	// The resumed worker pauses at its own opt-in presubmit gate, after
+	// its drain (m1 and m2 both acked) and before its own submit --
 	// so the attention line's absence below is asserted while
 	// newSession1ID is still ACTIVE, never merely because retirement made
 	// the address no-longer-live (the prior check could not distinguish

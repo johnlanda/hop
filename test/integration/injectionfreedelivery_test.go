@@ -322,7 +322,7 @@ func TestRealProcessInjectionFreeDelivery(t *testing.T) {
 	if endIdx <= startIdx {
 		t.Fatalf("window-end line %d is not after window-start line %d; the bracket is not usable for scoping a scan", endIdx, startIdx)
 	}
-	// P3-4: production never calls pane.list/tab.list today (verified by
+	// Production never calls pane.list/tab.list today (verified by
 	// grep), which is what makes firstLineIndex's FIRST-occurrence bracket
 	// safe -- but that safety is silent and would change meaning without
 	// warning if production ever did call either method. Asserting each
@@ -364,7 +364,7 @@ func messageDeliveredToSession(t *testing.T, fx *featureRun, messageID, sessionI
 // api.request.fail entry exists for any of terminalInputMethods, other than
 // the two identified positive-control lines (excluded BY INDEX, never by
 // string equality). Scanning "start" as well as "complete"/"fail" is load
-// bearing (P1-1): a forbidden wait-mode agent.prompt call can leave only a
+// bearing: a forbidden wait-mode agent.prompt call can leave only a
 // start record in the window (its completion lands only when the wait
 // resolves, possibly long after the window closes, or never on some error
 // paths) -- a completion-only scan would miss exactly that regression.

@@ -103,7 +103,7 @@ func testRealProcessMailboxClosureRaceOrdering(t *testing.T) {
 	managerEnv := fx.managerEnv(t)
 
 	// --- Order A: the send lands first. ---
-	// P2-3: STRUCTURAL, not a timed race. t1 (submit-valid-held) blocks
+	// STRUCTURAL, not a timed race: t1 (submit-valid-held) blocks
 	// immediately before its OWN first hop result submit call until this
 	// test writes its release gate -- so the worker cannot possibly
 	// complete a submit attempt before the race message below is already
@@ -160,12 +160,12 @@ func testRealProcessMailboxClosureRaceOrdering(t *testing.T) {
 		t.Errorf("accepted result_submissions receipt count for attempt %s = %s, want exactly 1", attempt1ID, n)
 	}
 
-	// P2-3: the exact sequence of first lines the real CLI rendered
-	// across every submit attempt, dumped by the fixture to its own
-	// observation file -- the retyped drain line at least once, then
-	// EXACTLY "accepted <id>", never inferred from the outcome rows
-	// alone (which prove acceptance but say nothing about the CLI's own
-	// rendered text -- RESULT-1's own gap, before its fix landed).
+	// The exact sequence of first lines the real CLI rendered across
+	// every submit attempt, dumped by the fixture to its own observation
+	// file -- the retyped drain line at least once, then EXACTLY
+	// "accepted <id>", never inferred from the outcome rows alone (which
+	// prove acceptance but say nothing about the CLI's own rendered
+	// text).
 	acceptedResultID := fx.scalar(t, fmt.Sprintf("SELECT id FROM results WHERE attempt_id = '%s' AND accepted = 1;", attempt1ID))
 	if acceptedResultID == "" {
 		t.Fatalf("no accepted results row for attempt %s", attempt1ID)
@@ -270,8 +270,8 @@ func testRealProcessMailboxClosureRaceFailure(t *testing.T) {
 	// identity does not depend on anything this test does to the worker.
 	managerEnv := fx.managerEnv(t)
 
-	// P2-2 (option A): the order is now STRUCTURAL, not timed. worker-block
-	// never calls hop msg wait (never drains, never submits, never asks a
+	// STRUCTURAL, not timed: worker-block never calls hop msg wait
+	// (never drains, never submits, never asks a
 	// question) -- its ONLY liveness signal is existing until self-killed
 	// -- so this send against t1's mailbox is addressed WHILE the worker
 	// is provably alive (asserted above: active, execed), with nothing on

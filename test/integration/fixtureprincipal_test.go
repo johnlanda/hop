@@ -83,8 +83,8 @@ const (
 // message sequence a scenario would; next and wait render DISTINCT
 // empty-queue lines, per design section 7's grammar, once the script is
 // exhausted or absent. Message ids used inside test-authored
-// fakeMessageBlock scripts are canonical lowercase UUIDs (Astra pass 2 F5:
-// real AckMessage/SendMessage call identity.ParseMessageID on ack targets
+// fakeMessageBlock scripts are canonical lowercase UUIDs: real
+// AckMessage/SendMessage call identity.ParseMessageID on ack targets
 // and on --reply-to/--relay-of, so a label like "msg-hold-question" would
 // succeed against this fake but never against the real binary), validated
 // here the same way as the caller identities (HOP_RUN_ID/HOP_SESSION_ID/
@@ -516,7 +516,7 @@ func runReviewSubmit(args []string) {
 
 // runStatus validates hop status's own minimal contract as this fake's
 // only non-worker-plumbing verb: -C and -run required. Its guard-shortfall
-// line reproduces STATUS-1's real rendering verbatim
+// line reproduces hop status's real rendering verbatim
 // (internal/app/grammar.go's GrammarVerdictRejectedLine/GrammarShortfallLine,
 // cmd/hop/statuscmd.go's featureDetailLines): FAKE_HOP_STATUS_SHORTFALL
 // selects "verdict-rejected" (rendered from FAKE_HOP_STATUS_REVIEW/
@@ -739,7 +739,7 @@ func countLogLinesWithPrefix(log, prefix string) int {
 // correct task id, and an unrecognized info notice (the review verdict's
 // own notice carries no marker at all — the fixture reviewer's reasons
 // text is opaque prose) triggering a hop status check whose verdict-rejected
-// guard shortfall (STATUS-1, scripted via FAKE_HOP_STATUS_SHORTFALL) names
+// guard shortfall (scripted via FAKE_HOP_STATUS_SHORTFALL) names
 // a reasons path equal to this exact notice's own body path, which plans a
 // fix task and a second plan close.
 func TestFixtureManagerScriptDispatch(t *testing.T) {
@@ -836,11 +836,11 @@ func TestFixtureManagerScriptDispatch(t *testing.T) {
 		"FAKE_HOP_MSG_INDEX=" + indexPath,
 		"FAKE_HOP_TASK_COUNTER_FILE=" + counterPath,
 		"FAKE_HOP_LOG=" + logPath,
-		// Scripts the fake hop's status output to carry STATUS-1's real
+		// Scripts the fake hop's status output to carry the real
 		// verdict-rejected shortfall line, its reasons path equal to
 		// rejectNoticeBody — the exact body path the scripted reject
 		// notice above carries — so the manager's own correlation rule
-		// (STATUS-1's manager verdict channel) matches this notice and
+		// (the manager verdict channel) matches this notice and
 		// plans a fix from it.
 		"FAKE_HOP_STATUS_SHORTFALL=verdict-rejected",
 		"FAKE_HOP_STATUS_REVIEW=dddddddd-dddd-4ddd-8ddd-dddddddddddd",
@@ -1129,14 +1129,11 @@ func runPreForwardBarrierManager(t *testing.T, fx preForwardBarrierFixture) stri
 // forwards a fetched human answer immediately, unaffected), the enabled
 // path (present, the manager's FIRST incarnation blocks after fetching the
 // answer and before forwarding it, dumping an observation naming what it
-// fetched but never reaching the forward or the ack), and P3-3's own
-// coverage gap: the barrier's ONE-SHOT property specifically, proven by
-// driving a RESUMED invocation with the control file present and asserting
-// the forward still happens (mutation m3, which drops the `!resumed`
-// guard, passed against this test's own Enabled/Disabled subtests alone —
-// EnabledButResumed is the subtest that actually exercises the uncovered
-// case RelayedQuestion itself relies on: the control file still present,
-// the invocation resume-shaped).
+// fetched but never reaching the forward or the ack), and the barrier's
+// ONE-SHOT property specifically: EnabledButResumed drives a RESUMED
+// invocation with the control file present and asserts the forward still
+// happens — the case RelayedQuestion itself relies on: the control file
+// still present, the invocation resume-shaped.
 func TestFixtureManagerPreForwardBarrier(t *testing.T) {
 	t.Run("Disabled", testFixtureManagerPreForwardBarrierDisabled)
 	t.Run("Enabled", testFixtureManagerPreForwardBarrierEnabled)
@@ -1202,8 +1199,8 @@ func testFixtureManagerPreForwardBarrierEnabled(t *testing.T) {
 	}
 }
 
-// testFixtureManagerPreForwardBarrierEnabledButResumed is P3-3's own
-// coverage: the control file is present (exactly as Enabled above), but
+// testFixtureManagerPreForwardBarrierEnabledButResumed proves the barrier's
+// one-shot property: the control file is present (exactly as Enabled above), but
 // this time the invocation is RESUME-shaped -- a real cold-relaunched
 // manager's argv is ALWAYS --resume-shaped (composeSessionArgvTail), and
 // the barrier is one-shot, keyed to runManager's own resumed flag, so this
@@ -1309,7 +1306,7 @@ func buildManagerScriptDispatchFixture(t *testing.T, artifacts *artifactDir) man
 // principal's generalized transient-retry behavior (runHopCLIRetryable):
 // a "transient: ..." first line from hop task create is retried, backing
 // off fixtureRetryInterval, until it eventually succeeds — needed because
-// LAUNCH-1's production fix returns exactly this shape for a manager verb
+// production returns exactly this shape for a manager verb
 // racing its own launch corroboration while the run is still launching or
 // resuming (design section 7/8) — and the retry reuses the IDENTICAL
 // --request-id on every attempt of the same logical call, never minting a
@@ -1477,7 +1474,7 @@ func runVerdictCorrelationCase(t *testing.T, artifacts *artifactDir, noticeBodyP
 }
 
 // TestFixtureManagerVerdictRejectedCorrelation proves the manager's own
-// STATUS-1 verdict-channel correlation rule in isolation
+// verdict-channel correlation rule in isolation
 // (fixtureworker_test.go's verdictRejectionMatchingNotice/
 // parseVerdictRejectedLines, per internal/app/templates.go's
 // renderManagerAssignment): a verdict-rejected shortfall plans a fix task
@@ -1796,11 +1793,11 @@ func TestFixtureWorkerHoldBarrier(t *testing.T) {
 	}
 }
 
-// TestFixtureWorkerHoldFetchLoopFatalsOnUnexpectedRefusal proves P2-7's
-// fatal path: fetchDeliveredMessage (shared by worker-hold and
+// TestFixtureWorkerHoldFetchLoopFatalsOnUnexpectedRefusal proves the fatal
+// path: fetchDeliveredMessage (shared by worker-hold and
 // worker-fetch-crash's own msg-wait fetch loop) must fatalf on any hop msg
 // wait outcome that is neither a delivered message, "none:", "transient:",
-// nor the LAUNCH-7 pre-binding window's own exact "refused: unauthorized"
+// nor the pre-binding launch window's own exact "refused: unauthorized"
 // line -- never spin silently against a permanent regression.
 func TestFixtureWorkerHoldFetchLoopFatalsOnUnexpectedRefusal(t *testing.T) {
 	artifacts := newArtifactDir(t)
@@ -1833,7 +1830,7 @@ func TestFixtureWorkerHoldFetchLoopFatalsOnUnexpectedRefusal(t *testing.T) {
 	scriptDir := artifacts.dir(t, "worker-hold-fatal-script")
 	// A hop msg wait outcome that is none of the tolerated shapes: not a
 	// delivered message, not "none:", not "transient:", and not the
-	// LAUNCH-7 pre-binding window's own exact "refused: unauthorized"
+	// pre-binding launch window's own exact "refused: unauthorized"
 	// line.
 	blocks := []string{"refused: not-found\n"}
 	scriptPath, indexPath := writeFakeHopMsgScript(t, scriptDir, blocks)
@@ -1989,8 +1986,8 @@ func testFixtureWorkerFetchCrashBlocksBeforeAck(t *testing.T) {
 	if err := os.Rename(tmp, controlPath); err != nil {
 		t.Fatalf("rename self-kill control file into place: %v", err)
 	}
-	// P3-1 (the finding's own executed case, m1): ctx.Err() == nil proves
-	// this SIGKILL is the fixture's own self-kill channel firing, never
+	// ctx.Err() == nil proves this SIGKILL is the fixture's own
+	// self-kill channel firing, never
 	// the context's 30s deadline masking a self-kill that never happened.
 	// wait() is called FIRST, on its own line: Go evaluates call
 	// arguments left to right, so inlining ctx.Err() as an argument would
@@ -2106,14 +2103,13 @@ func testFixtureWorkerFetchCrashResumedWaitsForReleaseThenAcks(t *testing.T) {
 	if !waitUntil(func() bool { return strings.Contains(out.snapshot(), wantObserved) }) {
 		t.Fatalf("resumed worker never reported observing the re-served message; output so far:\n%s", out.snapshot())
 	}
-	// P3-2: a single snapshot taken right after OBSERVED cannot reliably
+	// A single snapshot taken right after OBSERVED cannot reliably
 	// detect a release gate that returns instantly instead of actually
-	// holding (the reviewer's own mutation m2: waitForControlFile
-	// no-ops) -- there is still a real race window between the OBSERVED
+	// holding -- there is still a real race window between the OBSERVED
 	// print and a now-immediate ack, so a lucky snapshot can still catch
-	// "not yet acked" even under the bug (2 of 5 runs passed against m2).
-	// Polling repeatedly across a bounded, generous NEGATIVE window
-	// proves the gate actually held, deterministically, not by luck.
+	// "not yet acked" even when the gate never really held. Polling
+	// repeatedly across a bounded, generous NEGATIVE window proves the
+	// gate actually held, deterministically, not by luck.
 	const fetchCrashReleaseNegativeWindow = 2 * time.Second
 	const fetchCrashReleaseNegativePoll = 50 * time.Millisecond
 	for deadline := time.Now().Add(fetchCrashReleaseNegativeWindow); time.Now().Before(deadline); time.Sleep(fetchCrashReleaseNegativePoll) {
@@ -2139,7 +2135,7 @@ func testFixtureWorkerFetchCrashResumedWaitsForReleaseThenAcks(t *testing.T) {
 		t.Fatalf("resumed worker never acked after the release gate was created; output so far:\n%s", out.snapshot())
 	}
 
-	// P2-6's second, separate gate: after the drain (this fixture has only
+	// A second, separate gate: after the drain (this fixture has only
 	// the one scripted message, so the drain is a no-op msg-next-until-
 	// none call) the worker pauses again, before its own submit, until
 	// this SEPARATE presubmit-release control file appears.
@@ -2177,11 +2173,10 @@ func testFixtureWorkerFetchCrashResumedWaitsForReleaseThenAcks(t *testing.T) {
 }
 
 // TestFixtureWorkerHoldMissingBodyFailsLoudly proves the negative side of
-// the read-before-ack fix (Astra review pass 1, P2 "unread bodies"): a
-// delivered barrier-release answer whose body file does not exist must
-// never be acked — the worker must fail loudly (readFileOrFatal's own
-// fatalf) instead of silently releasing on an envelope it never actually
-// read.
+// the read-before-ack contract: a delivered barrier-release answer whose
+// body file does not exist must never be acked — the worker must fail
+// loudly (readFileOrFatal's own fatalf) instead of silently releasing on
+// an envelope it never actually read.
 func TestFixtureWorkerHoldMissingBodyFailsLoudly(t *testing.T) {
 	artifacts := newArtifactDir(t)
 	worker := buildFixtureWorker(t, artifacts)
@@ -2262,11 +2257,11 @@ func TestFixtureWorkerHoldMissingBodyFailsLoudly(t *testing.T) {
 }
 
 // TestFixtureWorkerDrainsOnUndeliveredResultTransient proves
-// submitOnce's own mailbox-drain retry (Astra review pass 1, P2):
-// previously it only slept and resubmitted on ANY transient line, so a
-// message the section 5 mailbox rule requires draining first would sit
-// undrained on every identical retry until the two-minute budget
-// expired. Drives the SOLO submit-valid behavior deliberately — it never
+// submitOnce's own mailbox-drain retry: sleeping and resubmitting on
+// ANY transient line without draining first would leave a message the
+// section 5 mailbox rule requires draining sitting undrained on every
+// identical retry until the two-minute budget expired. Drives the SOLO
+// submit-valid behavior deliberately — it never
 // drains before its own first submit call (unlike worker-implement/
 // worker-hold), so the scripted pending message survives untouched until
 // submitOnce's OWN post-transient drain is what has to find it, proving
@@ -2372,7 +2367,7 @@ func fakeHopValidEnv(t *testing.T, artifacts *artifactDir, overrides map[string]
 }
 
 // TestFakeHopRejectsInvalidInvocations proves the fake hop stub's
-// argv/context contract (Astra pass 2 finding F5): every invocation below
+// argv/context contract: every invocation below
 // is exactly the shape the real binary refuses before any store logic
 // ever runs (identity.ParseMessageID's canonical-lowercase-UUID contract
 // on ack/reply-to/relay-of, parseMessageKind's question/info/answer set,

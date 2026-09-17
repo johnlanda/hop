@@ -120,7 +120,7 @@ func testRelayedQuestionPreForwardKill(t *testing.T) {
 		t.Errorf("pre-forward barrier observation sha256 = %q, want %q (sha256 of the exact human answer bytes)", barrierObs.Fields["sha256"], want)
 	}
 
-	// P2-1: kill the controller FIRST -- killControllerLeader signals only
+	// Kill the controller FIRST -- killControllerLeader signals only
 	// fx.controller's own leaderCmd, a process this test started and owns
 	// (never reaped by anything else), so this is safe regardless of
 	// ordering -- THEN self-kill the manager. Closes the window where a
@@ -161,7 +161,7 @@ func testRelayedQuestionPreForwardKill(t *testing.T) {
 	}) {
 		t.Fatalf("forwarded answer a1 (reply-to %s) was never observed within %s", q1, featureRunTimeout)
 	}
-	// P2-4(b): exactly one answer replies to q1 -- an explicit count
+	// Exactly one answer replies to q1 -- an explicit count
 	// query, never inferred from a scalar SELECT that would silently
 	// return a newline-joined value if a second a1 ever existed.
 	if n := fx.scalar(t, fmt.Sprintf("SELECT count(*) FROM messages WHERE run_id = '%s' AND kind = 'answer' AND reply_to = '%s';", fx.runID, q1)); n != "1" {
@@ -213,7 +213,7 @@ func testRelayedQuestionPreForwardKill(t *testing.T) {
 		t.Errorf("a1's ack session_id = %q, want the worker's own session %q", got, session1ID)
 	}
 
-	// P2-4(b): every delivery this trace promises, asserted directly.
+	// Every delivery this trace promises, asserted directly.
 	// a2's TWO delivery rows, original manager then relaunched manager.
 	if !messageDeliveredToSession(t, fx, a2, managerSessionID) {
 		t.Errorf("a2 was never delivered to the original manager session %s", managerSessionID)
@@ -240,7 +240,7 @@ func testRelayedQuestionPreForwardKill(t *testing.T) {
 		t.Errorf("a1 was never delivered to the worker's session %s", session1ID)
 	}
 
-	// P2-4(b): a message_receipts row for every send and every ack this
+	// A message_receipts row for every send and every ack this
 	// trace promises.
 	requireMessageSendReceiptAccepted(t, fx, q1)
 	requireMessageSendReceiptAccepted(t, fx, q2)
@@ -454,9 +454,8 @@ func grammarMessageShowLine(messageID, kind, from, to, replyTo, relayOf string, 
 // requireMsgShowLine runs "hop msg show <id> -run <runID>" and asserts its
 // first line equals EXACTLY grammarMessageShowLine's rendering for
 // kind/from/to/replyTo/relayOf, with seq read from the store's own
-// enqueue_seq column -- P3-4: GrammarMessageShowLine is fully determined,
-// so a per-token Contains would miss a stray, reordered or malformed
-// field.
+// enqueue_seq column -- GrammarMessageShowLine is fully determined, so a
+// per-token Contains would miss a stray, reordered or malformed field.
 func requireMsgShowLine(t *testing.T, fx *featureRun, messageID, kind, from, to, replyTo, relayOf string) {
 	t.Helper()
 	seqRaw := fx.scalar(t, fmt.Sprintf("SELECT enqueue_seq FROM messages WHERE id = '%s';", messageID))
@@ -477,8 +476,8 @@ func requireMsgShowLine(t *testing.T, fx *featureRun, messageID, kind, from, to,
 // requireMsgShowAcknowledgedLine asserts hop msg show's output for
 // messageID carries its acknowledged line rendered EXACTLY as
 // GrammarAcknowledgedLine does (retyped, never imported): "acknowledged: "
-// plus GrammarTime's own at.UTC().Format(time.RFC3339) -- P3-4: never a
-// bare Contains("acknowledged: ").
+// plus GrammarTime's own at.UTC().Format(time.RFC3339) -- never a bare
+// Contains("acknowledged: ").
 func requireMsgShowAcknowledgedLine(t *testing.T, fx *featureRun, messageID string) {
 	t.Helper()
 	ackedAt := fx.messageAckedAt(t, messageID)
