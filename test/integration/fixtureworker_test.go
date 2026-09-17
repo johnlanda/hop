@@ -533,6 +533,25 @@ func newRequestID() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
+// deterministicUUIDFrom derives a UUID-shaped, DETERMINISTIC string from
+// seed -- never random, unlike newRequestID above -- so recomputing it from
+// the SAME seed always yields the identical value. The manager's forward of
+// a relayed human answer (handleManagerMessage's "answer" case) uses this,
+// seeded with the answer's own message id (CLI-returned data the manager
+// never persists), so a cold-relaunched successor recomputes the IDENTICAL
+// request id with no hidden state of its own -- design trace 2: "the
+// forward's request ID makes any redo idempotent". Not a cryptographic
+// UUIDv5 (no real namespace semantics needed here), just a stable,
+// collision-resistant hash rendered in UUID form for readability.
+func deterministicUUIDFrom(seed string) string {
+	sum := sha256.Sum256([]byte("hop-fixture-manager-forward-request-id:" + seed))
+	var b [16]byte
+	copy(b[:], sum[:16])
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
 // runHopCLIRetryable runs hopPath with args, retrying while the response's
 // first line begins with "transient:" — Phase 2's own hop result submit
 // retry convention (submitOnce), generalized here to every OTHER mutating
@@ -1446,6 +1465,37 @@ func preForwardBarrierEnabled(scratchDir string) bool {
 	return err == nil
 }
 
+// postForwardBarrierControlFile is the fixed name of the opt-in control
+// file a test creates under the manager's own scratch directory BEFORE
+// starting the run, to enable RelayedQuestion's idempotency-proving
+// post-forward, pre-ack kill variant (design trace 2: "a manager crash
+// between the two [forward and ack] re-serves a2, and the forward's
+// request ID makes any redo idempotent"): absent (every existing scenario,
+// including the pre-forward-kill variant above), the manager acks a2
+// immediately after its forward is accepted or found duplicate, exactly as
+// it always has; present, the manager's FIRST incarnation (never a
+// resumed one -- also one-shot, keyed the same way as the pre-forward
+// barrier) self-kills immediately after the forward call returns and
+// before its own ack of a2. Mutually exclusive with the pre-forward
+// barrier in practice (no scenario enables both), but nothing enforces
+// that here -- each is checked independently, at its own point in the
+// case.
+const postForwardBarrierControlFile = "manager-post-forward-barrier"
+
+// postForwardBarrierObservedFile is where the post-forward barrier dumps
+// its own digest of the fetched answer id/body, before blocking.
+const postForwardBarrierObservedFile = "manager-post-forward-observed.txt"
+
+// postForwardBarrierEnabled reports whether a test has created
+// postForwardBarrierControlFile under scratchDir.
+func postForwardBarrierEnabled(scratchDir string) bool {
+	if scratchDir == "" {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(scratchDir, postForwardBarrierControlFile))
+	return err == nil
+}
+
 // handleManagerMessage dispatches one delivered message per the section 7
 // manager operating contract, acknowledging it before the next wait in
 // every case. plannedFixReviews tracks every review id this manager has
@@ -1489,8 +1539,29 @@ func handleManagerMessage(hopPath, cwd, runID, scratchDir string, script *manage
 			// reaching the forward call below in the meantime.
 			watchForSelfKill(selfKillControlPath)
 		}
-		runHopCLIRetryable(hopPath, "msg", "send", "--kind", "answer", "--reply-to", msg.Origin, "--file", msg.BodyPath, "--request-id", newRequestID())
-		fmt.Printf("FIXTURE-FORWARDED origin=[%s]\n", msg.Origin)
+		// The forward's own request id is derived DETERMINISTICALLY from
+		// a2's own id (CLI-returned data, never generated fresh and never
+		// persisted anywhere by this fixture) -- a relaunched manager
+		// recomputes the IDENTICAL value with no hidden state, making its
+		// own redo of this exact call idempotent under request-ID reuse
+		// (design trace 2).
+		forwardRequestID := deterministicUUIDFrom(msg.ID)
+		forwardRes := runHopCLIRetryable(hopPath, "msg", "send", "--kind", "answer", "--reply-to", msg.Origin, "--file", msg.BodyPath, "--request-id", forwardRequestID)
+		forwardFirst := forwardRes.FirstLine()
+		if !strings.HasPrefix(forwardFirst, "sent ") && !strings.HasPrefix(forwardFirst, "duplicate ") {
+			fatalf("manager's forward of origin=%s was neither accepted nor duplicate: %s", msg.Origin, forwardFirst)
+		}
+		fmt.Printf("FIXTURE-FORWARDED origin=[%s] request-id=[%s] result=[%s]\n", msg.Origin, forwardRequestID, forwardFirst)
+		if !resumed && selfKillControlPath != "" && postForwardBarrierEnabled(scratchDir) {
+			writeContentDigest(filepath.Join(scratchDir, postForwardBarrierObservedFile), msg.ID, body)
+			fmt.Printf("FIXTURE-POST-FORWARD-BARRIER answer=[%s]\n", msg.ID)
+			// Blocks here, exactly like the pre-forward barrier above, but
+			// AFTER the forward has already landed and BEFORE this
+			// process ever reaches the shared ack call at the end of this
+			// function -- design trace 2's "crash between forward and
+			// ack" idempotency case.
+			watchForSelfKill(selfKillControlPath)
+		}
 	case "info":
 		if label, ok := parseNeedsReworkLabel(body); ok {
 			taskID, known := labelToID[label]

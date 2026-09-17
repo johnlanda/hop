@@ -52,6 +52,17 @@ const (
 	preForwardBarrierObservedFile = "manager-pre-forward-observed.txt"
 )
 
+// postForwardBarrierControlFile and postForwardBarrierObservedFile mirror
+// the identically named constants inside fixtureWorkerSource: the opt-in
+// control file a test creates under the manager's own scratch directory
+// to enable RelayedQuestion's post-forward, pre-ack kill variant (design
+// trace 2's idempotency case), and the fixed name of the observation that
+// barrier dumps before blocking.
+const (
+	postForwardBarrierControlFile  = "manager-post-forward-barrier"
+	postForwardBarrierObservedFile = "manager-post-forward-observed.txt"
+)
+
 // fakeHopSource is a minimal, scriptable stand-in for the real hop binary
 // — the handwritten-fake law (design's review brief): it validates each
 // supported verb's real argv/context contract before ever returning a
@@ -1015,7 +1026,7 @@ const preForwardBarrierAnswerBody = "release the barrier\n"
 // directly (no herdr).
 type preForwardBarrierFixture struct {
 	principal, cwd, scratchDir, logPath string
-	prompt                              string
+	prompt, continuationPrompt          string
 	env                                 []string
 	msgHoldQuestionID, msgHumanAnswerID string
 }
@@ -1074,9 +1085,11 @@ func buildPreForwardBarrierFixture(t *testing.T, artifacts *artifactDir) preForw
 	}
 	const rolePath, cribPath = "/state/runs/r/artifacts/roles/manager.md", "/state/runs/r/artifacts/worker-protocol.md"
 	prompt := testManagerInitialPrompt(assignmentPath, rolePath, cribPath, fakeHop)
+	continuationPrompt := testManagerContinuationPrompt(assignmentPath, rolePath, cribPath, fakeHop)
 
 	return preForwardBarrierFixture{
-		principal: principal, cwd: cwd, scratchDir: scratchDir, logPath: logPath, prompt: prompt,
+		principal: principal, cwd: cwd, scratchDir: scratchDir, logPath: logPath,
+		prompt: prompt, continuationPrompt: continuationPrompt,
 		env: []string{
 			"PATH=" + os.Getenv("PATH"),
 			"HOP_STATE_DIR=" + stateDir,
@@ -1111,16 +1124,23 @@ func runPreForwardBarrierManager(t *testing.T, fx preForwardBarrierFixture) stri
 }
 
 // TestFixtureManagerPreForwardBarrier proves RelayedQuestion's opt-in
-// pre-forward barrier (design section 11 scenario 2) in isolation, for
-// both the disabled path (every existing scenario's own shape: absent,
-// the manager forwards a fetched human answer immediately, unaffected)
-// and the enabled path (present, the manager's first incarnation blocks
-// after fetching the answer and before forwarding it, dumping an
-// observation naming what it fetched but never reaching the forward or
-// the ack).
+// pre-forward barrier (design section 11 scenario 2) in isolation, for the
+// disabled path (every existing scenario's own shape: absent, the manager
+// forwards a fetched human answer immediately, unaffected), the enabled
+// path (present, the manager's FIRST incarnation blocks after fetching the
+// answer and before forwarding it, dumping an observation naming what it
+// fetched but never reaching the forward or the ack), and P3-3's own
+// coverage gap: the barrier's ONE-SHOT property specifically, proven by
+// driving a RESUMED invocation with the control file present and asserting
+// the forward still happens (mutation m3, which drops the `!resumed`
+// guard, passed against this test's own Enabled/Disabled subtests alone —
+// EnabledButResumed is the subtest that actually exercises the uncovered
+// case RelayedQuestion itself relies on: the control file still present,
+// the invocation resume-shaped).
 func TestFixtureManagerPreForwardBarrier(t *testing.T) {
 	t.Run("Disabled", testFixtureManagerPreForwardBarrierDisabled)
 	t.Run("Enabled", testFixtureManagerPreForwardBarrierEnabled)
+	t.Run("EnabledButResumed", testFixtureManagerPreForwardBarrierEnabledButResumed)
 }
 
 func testFixtureManagerPreForwardBarrierDisabled(t *testing.T) {
@@ -1180,6 +1200,53 @@ func testFixtureManagerPreForwardBarrierEnabled(t *testing.T) {
 	if !strings.Contains(string(obsContent), "sha256="+wantHex+"\n") {
 		t.Errorf("barrier observation missing sha256=%s; got:\n%s", wantHex, obsContent)
 	}
+}
+
+// testFixtureManagerPreForwardBarrierEnabledButResumed is P3-3's own
+// coverage: the control file is present (exactly as Enabled above), but
+// this time the invocation is RESUME-shaped -- a real cold-relaunched
+// manager's argv is ALWAYS --resume-shaped (composeSessionArgvTail), and
+// the barrier is one-shot, keyed to runManager's own resumed flag, so this
+// specific incarnation must forward immediately, never block, and must
+// never write an observation file at all.
+func testFixtureManagerPreForwardBarrierEnabledButResumed(t *testing.T) {
+	artifacts := newArtifactDir(t)
+	fx := buildPreForwardBarrierFixture(t, artifacts)
+	if err := os.WriteFile(filepath.Join(fx.scratchDir, preForwardBarrierControlFile), []byte("enable\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	const nativeRef = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+	stdout := runPreForwardBarrierManagerResumed(t, fx, nativeRef)
+	if !strings.Contains(stdout, "FIXTURE-FORWARDED origin=["+fx.msgHoldQuestionID+"]") {
+		t.Errorf("resumed manager stdout missing the forward despite the barrier control file being present; got:\n%s", stdout)
+	}
+	if strings.Contains(stdout, "FIXTURE-PRE-FORWARD-BARRIER") {
+		t.Errorf("resumed manager stdout shows the pre-forward barrier firing on a RESUMED incarnation; the barrier must be one-shot, keyed to the first incarnation only; got:\n%s", stdout)
+	}
+	if _, err := os.Stat(filepath.Join(fx.scratchDir, preForwardBarrierObservedFile)); err == nil {
+		t.Error("pre-forward barrier observation file exists despite this incarnation being resumed; the barrier must never engage on resume")
+	}
+	log := readFakeHopLog(t, fx.logPath)
+	if !strings.Contains(log, "msg\tsend\t--kind\tanswer\t--reply-to\t"+fx.msgHoldQuestionID) {
+		t.Errorf("fake hop invocation log missing the forward call on the resumed incarnation; got:\n%s", log)
+	}
+}
+
+// runPreForwardBarrierManagerResumed runs fx's compiled manager principal
+// with a --resume-shaped argv (nativeRef, fx.continuationPrompt) instead of
+// runPreForwardBarrierManager's --session-id first-launch shape.
+func runPreForwardBarrierManagerResumed(t *testing.T, fx preForwardBarrierFixture, nativeRef string) string { //nolint:gocritic // hugeParam: preForwardBarrierFixture is a one-shot per-subtest fixture struct; a pointer would only complicate the call sites.
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, fx.principal, "--resume", nativeRef, fx.continuationPrompt) //nolint:gosec // G204: fixed test-owned binary and arguments.
+	cmd.Dir = fx.cwd
+	cmd.Env = fx.env
+	var out strings.Builder
+	cmd.Stdout, cmd.Stderr = &out, &out
+	_ = cmd.Run() //nolint:errcheck // the context deadline ending this intentionally endless manager is the expected outcome, asserted on its captured stdout below.
+	return out.String()
 }
 
 // requestIDFromLogLine extracts the value following a "--request-id"
