@@ -2166,8 +2166,20 @@ func testFixtureWorkerFetchCrashResumedWaitsForReleaseThenAcks(t *testing.T) {
 	if !waitUntil(func() bool { return strings.Contains(out.snapshot(), wantPresubmitHold) }) {
 		t.Fatalf("resumed worker never reached its presubmit hold after acking; output so far:\n%s", out.snapshot())
 	}
-	if strings.Contains(out.snapshot(), "FIXTURE-WORKER-IDLE") {
-		t.Fatalf("resumed worker reached its post-submit idle loop before the presubmit release gate was created; output:\n%s", out.snapshot())
+	// The same bounded negative window as the release gate above, for the
+	// same reason: a single snapshot right after the hold marker cannot
+	// reliably detect a presubmit gate that returns instantly instead of
+	// actually holding, since there is still a real race window before a
+	// now-immediate submit. Polling repeatedly across a bounded, generous
+	// window, checking both the stdout idle marker and the fake-hop log's
+	// own result-submit invocation, proves the gate actually held.
+	for deadline := time.Now().Add(fetchCrashReleaseNegativeWindow); time.Now().Before(deadline); time.Sleep(fetchCrashReleaseNegativePoll) {
+		if strings.Contains(out.snapshot(), "FIXTURE-WORKER-IDLE") {
+			t.Fatalf("resumed worker reached its post-submit idle loop before the presubmit release gate was ever created; output:\n%s", out.snapshot())
+		}
+		if log := readFakeHopLog(t, logPath); strings.Contains(log, "result\tsubmit\t") {
+			t.Fatalf("fake hop invocation log shows a result submit before the presubmit release gate was ever created; got:\n%s", log)
+		}
 	}
 
 	presubmitReleasePath := filepath.Join(scratchDir, "fetch-crash-presubmit-release-"+attemptID)
