@@ -79,6 +79,14 @@ func TestRealProcessManagerColdRelaunch(t *testing.T) {
 	}
 	worker1SessionID := fx.sessionForAttempt(t, attempt1ID)
 	worktreePath, worktreeBranch, worktreeBase := fx.requireWorktreeForAttempt(t, attempt1ID)
+	// The ORIGINAL controller must corroborate the worker's own launch
+	// (its claim settled, session active) before it is killed: killing
+	// too early leaves the worker's placed launch still in flight from
+	// the resumed controller's point of view, which correctly reports it
+	// "pending" rather than "warm" — a different, weaker outcome this
+	// scenario does not exercise, since it is not what a live crash
+	// (worker already running) looks like.
+	fx.requireSessionState(t, worker1SessionID, "active")
 
 	managerSessionID := fx.managerSessionID(t)
 	managerPaneID := fx.requirePane(t, managerSessionID)
