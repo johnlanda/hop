@@ -230,6 +230,41 @@ func watchForSelfKill(controlPath string) {
 	}
 }
 
+// vanishOnceMarkerPath is the test-owned scratch marker recording that
+// worker-vanish-once has already spent its one vanish for taskID: this
+// process's own claim on that file, not any pane or OS-level identity, is
+// the sole state the behavior consults.
+func vanishOnceMarkerPath(scratchDir, taskID string) string {
+	return filepath.Join(scratchDir, "vanish-once-"+taskID)
+}
+
+// vanishOnceOrProceed ends this process at once, before anything about it
+// is observable — no observation dump, no FIXTURE-WORKER-READY, no hop
+// call — on the first invocation of worker-vanish-once for taskID, then
+// returns normally on every later invocation (the retried attempt), so
+// the caller can fall through into worker-implement's own behavior. This
+// process IS the claimed executable for its whole life: never a shell
+// wrapper that execs a differently-pathed binary, since a foreground
+// member's own mid-exec identity depends on when corroboration happens to
+// sample it and can present a different pid under the SAME recognized
+// executable and marker — precisely the forking-wrapper topology section
+// 6 refuses (fails closed to reconciling, a state no later scheduling
+// pass revisits). The marker file, not any process signal, is the only
+// state this decision consults, created with O_EXCL so exactly one
+// invocation ever observes its own absence.
+func vanishOnceOrProceed(scratchDir, taskID string) {
+	marker := vanishOnceMarkerPath(scratchDir, taskID)
+	f, err := os.OpenFile(marker, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		if os.IsExist(err) {
+			return
+		}
+		fatalf("worker-vanish-once: create marker %s: %v", marker, err)
+	}
+	f.Close()
+	os.Exit(0)
+}
+
 // isResumeInvocation reports whether argv is a resume-SHAPED invocation:
 // any element equals the exact "--resume". Detection only — it routes the
 // invocation to requireResumeShape's strict validation, so a malformed
@@ -813,6 +848,9 @@ func runWorker() {
 	// there instead. Phase 2 behaviors are unchanged: they keep writing
 	// beside the assignment file, exactly as they always have.
 	scratchDir := requireScratchDir(behavior, behaviorArgs)
+	if behavior == "worker-vanish-once" {
+		vanishOnceOrProceed(scratchDir, env["HOP_TASK_ID"])
+	}
 	observationPath := filepath.Join(filepath.Dir(assignmentPath), "worker-observed.txt")
 	if scratchDir != "" {
 		observationPath = filepath.Join(scratchDir, "worker-observed-"+env["HOP_ATTEMPT_ID"]+".txt")
@@ -847,6 +885,12 @@ func runWorker() {
 	case "exec-keep-pid":
 		waitForGo()
 		reexecSelf()
+	case "worker-vanish-once":
+		// vanishOnceOrProceed above already ended the process on its first
+		// invocation for this task; reaching here means the marker already
+		// existed (the retried attempt), so it behaves exactly like
+		// worker-implement.
+		fallthrough
 	case "worker-implement":
 		oid := commitChange("fixture implementer change")
 		drainMailbox(hopPath)
@@ -917,6 +961,7 @@ func cmp(role, fallback string) string {
 // instead. Phase 2 behaviors carry no such argument and are unaffected.
 var scratchDirRequiringBehaviors = map[string]bool{
 	"worker-implement":     true,
+	"worker-vanish-once":   true,
 	"worker-hold":          true,
 	"worker-conflict":      true,
 	"idle-self-kill":       true,
@@ -2199,6 +2244,103 @@ func TestFixtureWorkerSelfKillOnControlFile(t *testing.T) {
 	}
 }
 
+// TestFixtureWorkerVanishOnce proves the "worker-vanish-once" behavior
+// (WorkerLaunchEndsBeforeSettlement, task 7c): the first invocation for a
+// given task exits at once — before printing FIXTURE-WORKER-READY or
+// calling hop at all — through the compiled fixture binary's own
+// os.Exit, never an exec chain into a differently pathed binary, and a
+// second invocation for the SAME task (a fresh attempt, as the real
+// retried attempt always is) reaches ready, drains its mailbox and
+// submits exactly like worker-implement.
+func TestFixtureWorkerVanishOnce(t *testing.T) {
+	artifacts := newArtifactDir(t)
+	worker := buildFixtureWorker(t, artifacts)
+	fakeHop := buildFakeHopStub(t, artifacts)
+	repo := newFixtureRepo(t, artifacts, nil, "repo")
+
+	stateDir := artifacts.dir(t, "state")
+	scratchDir := artifacts.dir(t, "vanish-scratch")
+	const (
+		runID  = "c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1"
+		taskID = "c2c2c2c2-c2c2-4c2c-8c2c-c2c2c2c2c2c2"
+	)
+	instructionsPath := filepath.Join(stateDir, "runs", runID, "tasks", taskID+".md")
+	if err := os.MkdirAll(filepath.Dir(instructionsPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(instructionsPath, []byte("FIXTURE-BEHAVIOR: worker-vanish-once "+scratchDir+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	runAttempt := func(attemptID string) (output string, exitCode int) {
+		t.Helper()
+		assignmentPath := filepath.Join(stateDir, "runs", runID, "attempts", attemptID, "assignment.md")
+		if err := os.MkdirAll(filepath.Dir(assignmentPath), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(assignmentPath, []byte("# HOP Task Assignment\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		prompt := testAssignmentPrompt(assignmentPath, fakeHop)
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, worker, "--session-id", "c3c3c3c3-c3c3-4c3c-8c3c-c3c3c3c3c3c3", prompt) //nolint:gosec // G204: fixed test-owned binary and arguments.
+		cmd.Dir = repo.Root
+		cmd.Env = []string{
+			"PATH=" + os.Getenv("PATH"),
+			"HOP_STATE_DIR=" + stateDir,
+			"HOP_RUN_ID=" + runID,
+			"HOP_TASK_ID=" + taskID,
+			"HOP_ATTEMPT_ID=" + attemptID,
+			"HOP_SESSION_ID=c4c4c4c4-c4c4-4c4c-8c4c-c4c4c4c4c4c4",
+			"HOP_INCARNATION_ID=c5c5c5c5-c5c5-4c5c-8c5c-c5c5c5c5c5c5",
+			"HOP_ROLE=implementer",
+		}
+		var out strings.Builder
+		cmd.Stdout = &out
+		cmd.Stderr = &out
+		cmd.Stdin = strings.NewReader("FIXTURE-QUIT\n")
+		err := cmd.Run()
+		code := 0
+		if err != nil {
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) {
+				t.Fatalf("run fixture worker attempt %s: %v\noutput:\n%s", attemptID, err, out.String())
+			}
+			code = exitErr.ExitCode()
+		}
+		return out.String(), code
+	}
+
+	firstOut, firstCode := runAttempt("c6c6c6c6-c6c6-4c6c-8c6c-c6c6c6c6c601")
+	if firstCode != 0 {
+		t.Fatalf("first (vanishing) attempt exit code = %d, want 0\noutput:\n%s", firstCode, firstOut)
+	}
+	if strings.Contains(firstOut, "FIXTURE-WORKER-READY") {
+		t.Errorf("first attempt printed FIXTURE-WORKER-READY; want it to exit before becoming observable:\n%s", firstOut)
+	}
+	if _, err := os.Stat(vanishOnceMarkerPathForTest(scratchDir, taskID)); err != nil {
+		t.Fatalf("vanish-once marker not written by the first attempt: %v", err)
+	}
+
+	secondOut, secondCode := runAttempt("c7c7c7c7-c7c7-4c7c-8c7c-c7c7c7c7c702")
+	if secondCode != 0 {
+		t.Fatalf("second attempt exit code = %d, want 0\noutput:\n%s", secondCode, secondOut)
+	}
+	for _, want := range []string{"FIXTURE-WORKER-READY", "FIXTURE-SUBMIT-RESULT", "FIXTURE-WORKER-IDLE"} {
+		if !strings.Contains(secondOut, want) {
+			t.Errorf("second attempt output missing %q; got:\n%s", want, secondOut)
+		}
+	}
+}
+
+// vanishOnceMarkerPathForTest mirrors the fixture principal's own
+// vanishOnceMarkerPath (embedded source, unreachable from this package)
+// so the test can assert the marker file's exact name independently.
+func vanishOnceMarkerPathForTest(scratchDir, taskID string) string {
+	return filepath.Join(scratchDir, "vanish-once-"+taskID)
+}
+
 // TestFixtureWorkerIdleSelfKillOnControlFile proves the "idle-self-kill"
 // solo behavior TEST-1 added: unlike worker-hold, it reaches the shared
 // idle() composer loop immediately (nothing to do first), so this test
@@ -2263,7 +2405,9 @@ func TestFixtureWorkerIdleSelfKillOnControlFile(t *testing.T) {
 		return waitErr
 	}
 	t.Cleanup(func() {
-		_ = stdin.Close()
+		if err := stdin.Close(); err != nil {
+			t.Logf("cleanup: close fixture worker stdin: %v", err)
+		}
 		if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
 			t.Logf("cleanup: kill fixture worker: %v", err)
 		}

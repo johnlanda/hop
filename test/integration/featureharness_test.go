@@ -76,7 +76,7 @@ type featureFixtureOptions struct {
 // review task's own assignment carries no manager-authored free text at
 // all) and the feature-mode config.toml. server is passed to
 // registerWorktreeCleanup exactly as newFixtureRepo's is.
-func newFeatureFixtureRepo(t *testing.T, artifacts *artifactDir, server *testServer, name string, opts featureFixtureOptions) *fixtureRepo { //nolint:gocritic // hugeParam: featureFixtureOptions is a one-shot scenario-build options struct, constructed once per test; a pointer would only complicate every call site.
+func newFeatureFixtureRepo(t *testing.T, artifacts *artifactDir, server *testServer, name string, opts featureFixtureOptions) *fixtureRepo { //nolint:gocritic,unparam // hugeParam: featureFixtureOptions is a one-shot scenario-build options struct, constructed once per test; a pointer would only complicate every call site. unparam: name is forwarded to initFixtureRepo like newFixtureRepo's own; every current scenario happens to pass "repo", but it is a real, independent parameter, not a decorative one.
 	t.Helper()
 	repo := initFixtureRepo(t, artifacts, name)
 	repo.writeFile(t, "hello.go", trivialSourceFile, 0o644)
@@ -170,6 +170,47 @@ func (f *featureRun) requireTaskState(t *testing.T, taskID string, want ...strin
 		state = f.taskState(t, taskID)
 		return slices.Contains(want, state)
 	})
+	if !reached {
+		t.Fatalf("task %s ended %q, want one of %v after %s", taskID, state, want, featureRunTimeout)
+	}
+}
+
+// reconciledSessionID returns the id of the first session belonging to
+// this run that the transitions journal has ever recorded going to
+// "reconciling", or "" if none has. The journal is append-only, so one
+// query answers this regardless of when it is asked: a session that
+// reconciled is never re-corroborated by CorroborateSessionLaunches
+// (which only inspects sessions still in "launching"), so once entered,
+// "reconciling" is a durable, silent wedge for that session, not a
+// transient state a later sample could miss.
+func (f *featureRun) reconciledSessionID(t *testing.T) string {
+	t.Helper()
+	return f.scalar(t, fmt.Sprintf(
+		"SELECT entity_id FROM transitions WHERE entity_kind = 'session' AND to_state = 'reconciling' "+
+			"AND entity_id IN (SELECT id FROM sessions WHERE run_id = '%s') ORDER BY at LIMIT 1;",
+		f.runID))
+}
+
+// requireTaskStateNeverReconciling is requireTaskState, additionally
+// failing at once — rather than only after the full featureRunTimeout —
+// if any session in this run ever reconciles while it waits: a session
+// stuck reconciling can never settle the launch its own principal keeps
+// retrying against, so waiting out the ordinary timeout would otherwise
+// report a generic, uninformative failure for what is actually this
+// specific, durable wedge.
+func (f *featureRun) requireTaskStateNeverReconciling(t *testing.T, taskID string, want ...string) {
+	t.Helper()
+	var state, reconciled string
+	reached := waitUntilDeadline(featureRunTimeout, func() bool {
+		if reconciled == "" {
+			reconciled = f.reconciledSessionID(t)
+		}
+		state = f.taskState(t, taskID)
+		return slices.Contains(want, state) || reconciled != ""
+	})
+	if reconciled != "" {
+		t.Fatalf("session %s entered reconciling while waiting for task %s to reach one of %v; a corroboration wedge, never a settlement, so it can never resolve on its own", reconciled, taskID, want)
+	}
 	if !reached {
 		t.Fatalf("task %s ended %q, want one of %v after %s", taskID, state, want, featureRunTimeout)
 	}
