@@ -476,6 +476,21 @@ func waitForRunState(t *testing.T, env []string, repoRoot, runID string, deadlin
 	return fields, reached
 }
 
+// sqliteBusyRetryLimit and sqliteBusyRetryInterval bound querySQLite's
+// retry of a transient SQLite WAL lock ("database is locked", the
+// sqlite3 CLI's own report of SQLITE_BUSY): a well-known, expected SQLite
+// behavior under concurrent access to a WAL-mode database -- never a HOP
+// behavior bug -- most likely to appear in the brief window right after a
+// scenario SIGKILLs the store's own writer (a controller mid-transaction)
+// and then polls the store directly. A retried READ-ONLY query can only
+// ever return the SAME correct answer once the lock clears, never a
+// different or wrong one, so retrying it here weakens no assertion
+// anywhere it is used.
+const (
+	sqliteBusyRetryLimit    = 10
+	sqliteBusyRetryInterval = 150 * time.Millisecond
+)
+
 // querySQLite runs one read-only query against a test's own throwaway
 // sqlite state database via the sqlite3 CLI — a standard tool on this
 // suite's supported platforms, shelled out to the same way this suite
@@ -483,12 +498,21 @@ func waitForRunState(t *testing.T, env []string, repoRoot, runID string, deadlin
 // evidence a rendered `hop status` block does not carry (row history, not
 // just current state). dbPath is always this test's own isolated
 // HOP_STATE_DIR/hop.db, never a real one. Returns trimmed combined output;
-// fails the test on any error.
+// fails the test on any error other than a transient SQLITE_BUSY lock,
+// which it retries (bounded) instead.
 func querySQLite(t *testing.T, dbPath, query string) string {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, "sqlite3", dbPath, query).CombinedOutput() //nolint:gosec // G204: fixed sqlite3 invocation against this test's own database path and a query it composed itself.
+	var out []byte
+	var err error
+	for attempt := 0; attempt < sqliteBusyRetryLimit; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+		out, err = exec.CommandContext(ctx, "sqlite3", dbPath, query).CombinedOutput() //nolint:gosec // G204: fixed sqlite3 invocation against this test's own database path and a query it composed itself.
+		cancel()
+		if err == nil || !strings.Contains(string(out), "database is locked") {
+			break
+		}
+		time.Sleep(sqliteBusyRetryInterval)
+	}
 	if err != nil {
 		t.Fatalf("sqlite3 %s %q: %v\n%s", dbPath, query, err, out)
 	}

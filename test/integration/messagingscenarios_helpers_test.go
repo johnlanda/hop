@@ -197,6 +197,32 @@ func waitForObservation(t *testing.T, path string) workerObservation {
 	return readWorkerObservation(t, path)
 }
 
+// attentionPollInterval paces a poll loop that spawns a full `hop status`
+// CLI subprocess (opening the sqlite store) on every iteration, rather
+// than the suite's default 25ms pollInterval: hammering the store that
+// frequently, right after a SIGKILL of its own writer (killControllerLeader),
+// risks transient SQLite WAL lock contention ("database is locked") with no
+// retry tolerance further up the stack (querySQLite fails the test
+// immediately). A condition that only needs to observe crossing a
+// multi-second attention threshold does not need millisecond polling
+// granularity.
+const attentionPollInterval = 500 * time.Millisecond
+
+// waitUntilDeadlineWithInterval polls condition like waitUntilDeadline, but
+// at a caller-chosen interval instead of the suite's default pollInterval.
+func waitUntilDeadlineWithInterval(deadline, interval time.Duration, condition func() bool) bool {
+	end := time.Now().Add(deadline)
+	for {
+		if condition() {
+			return true
+		}
+		if time.Now().After(end) {
+			return false
+		}
+		time.Sleep(interval)
+	}
+}
+
 // requireByteExactFile fails the test unless the file at path exists and
 // its content equals want byte for byte -- design section 11's
 // injection-free claim rests on exact bytes, never a substring or

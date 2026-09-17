@@ -166,7 +166,7 @@ func TestRealProcessDuplicateAndAmbiguousDelivery(t *testing.T) {
 	const attentionThreshold = 2 * time.Second
 	wantAddress := grammarTaskAddress(t1, "t1")
 	var inFlightAge, oldestQueuedAge time.Duration
-	if !waitUntilDeadline(featureRunTimeout, func() bool {
+	if !waitUntilDeadlineWithInterval(featureRunTimeout, attentionPollInterval, func() bool {
 		out := runHop(t, fx.env, repo.Root, "status", "-C", repo.Root, "-run", fx.runID)
 		if out.ExitCode != 0 {
 			return false
@@ -296,7 +296,7 @@ func TestRealProcessDuplicateAndAmbiguousDelivery(t *testing.T) {
 
 	// The attention condition has fully cleared: no line for this address
 	// at all, checked against the FULL status output.
-	if !waitUntilDeadline(featureRunTimeout, func() bool {
+	if !waitUntilDeadlineWithInterval(featureRunTimeout, attentionPollInterval, func() bool {
 		out := runHop(t, fx.env, repo.Root, "status", "-C", repo.Root, "-run", fx.runID)
 		if out.ExitCode != 0 {
 			return false
