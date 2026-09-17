@@ -365,6 +365,26 @@ func workerExecFailure() workerTermination {
 	}
 }
 
+// workerLaunchEnded is an exec_failed launch claim the controller settled
+// because the launch ended before corroboration (settleIfLaunchEnded): the
+// same terminal attempt outcome as workerExecFailure — the claim is
+// exec_failed, the attempt failed — with reasons naming the observation
+// that settled it.
+func workerLaunchEnded() workerTermination {
+	return workerTermination{
+		kind:          "exec failure",
+		failAttempt:   true,
+		reason:        "exec_failed claim: " + launchEndedReason,
+		sessionReason: "exec_failed claim: " + launchEndedReason,
+		noticeReason: func(consequence taskConsequence) string {
+			if consequence == taskConsequenceInterrupted {
+				return "the attempt's launch ended before it was corroborated (its pane and launched process were observed gone; claim settled exec_failed) while a stop was pending"
+			}
+			return "the attempt's launch ended before it was corroborated (its pane and launched process were observed gone; claim settled exec_failed)"
+		},
+	}
+}
+
 // settleWorkerInterruption settles an observed self-exit.
 func (c *Controller) settleWorkerInterruption(ctx context.Context, handle RunHandle, frozen *FrozenRun, session *run.Session) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per established self-exit.
 	return c.settleWorkerTermination(ctx, handle, frozen, session, workerSelfExit())
@@ -379,23 +399,44 @@ func (c *Controller) settleWorkerInterruption(ctx context.Context, handle RunHan
 // An attempt already past launching or relaunching carries no launch
 // outcome to settle; only the session is terminated. It assumes nothing
 // about its caller beyond a held lease: the scheduling pass's launch
-// corroboration and resume's reconciliation both settle through it.
+// corroboration and resume's reconciliation both settle through it. A
+// claim the controller settled for a launch that ended before
+// corroboration settles identically, under workerLaunchEnded's reasons —
+// chosen from the claim's recorded error, so every round reads the same
+// durable evidence.
 func (c *Controller) settleChildExecFailure(ctx context.Context, handle RunHandle, frozen *FrozenRun, session *run.Session) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per exec-failed child session.
 	if session.AttemptID == "" {
 		return fmt.Errorf("app: session %s has no attempt; an exec-failed manager fails the run instead", session.ID)
 	}
-	var attemptState run.AttemptState
+	var (
+		attemptState run.AttemptState
+		outcome      = workerExecFailure()
+	)
 	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 		a, _, err := uow.Attempts().Get(ctx, session.AttemptID)
+		if err != nil {
+			return err
+		}
 		attemptState = a.State
-		return err
+		binding, bindingFound, err := uow.Bindings().Current(ctx, session.ID)
+		if err != nil {
+			return err
+		}
+		claim, claimFound, err := sessionLaunchClaimLocked(ctx, uow, handle.runID, session.ID, binding, bindingFound)
+		if err != nil {
+			return err
+		}
+		if claimFound && launchEndedByController(&claim) {
+			outcome = workerLaunchEnded()
+		}
+		return nil
 	}); err != nil {
 		return err
 	}
 	if attemptState != run.AttemptLaunching && attemptState != run.AttemptRelaunching {
-		return c.terminateRetiredSession(ctx, handle, session.ID, workerExecFailure().sessionReason)
+		return c.terminateRetiredSession(ctx, handle, session.ID, outcome.sessionReason)
 	}
-	return c.settleWorkerTermination(ctx, handle, frozen, session, workerExecFailure())
+	return c.settleWorkerTermination(ctx, handle, frozen, session, outcome)
 }
 
 // settleWorkerTermination settles one child session's terminal attempt
@@ -646,6 +687,9 @@ func (c *Controller) retireChildSession(ctx context.Context, handle RunHandle, d
 		PID:           claim.PID,
 		Markers:       markers,
 		Reason:        reason,
+		// An unsettled launch is observed terminated only as the
+		// corroborated-absence pair: pane absent and claimed process gone.
+		requireProcessGone: claim.State == LaunchClaimExecPending,
 	}
 	retired, outstanding, err := c.closePaneOperation(ctx, handle, detail, &target)
 	if err != nil {

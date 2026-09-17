@@ -34,7 +34,10 @@ type paneReportMetadataParams struct {
 
 // ReportMetadata applies one pane metadata token patch under HOP's source:
 // set tokens are written and cleared tokens are sent as JSON null so Herdr
-// removes them.
+// removes them. Herdr answers pane_not_found ("pane <id> not found") for a
+// pane id it no longer resolves or a pane with no terminal; that answer
+// becomes an error wrapping both app.ErrPaneNotFound and this adapter's
+// ErrPaneNotFound, and every other error keeps its own type.
 func (p *Presentation) ReportMetadata(ctx context.Context, metadata app.PaneMetadata) error {
 	tokens := make(map[string]any, len(metadata.Tokens)+len(metadata.Clear))
 	for name, value := range metadata.Tokens {
@@ -50,6 +53,9 @@ func (p *Presentation) ReportMetadata(ctx context.Context, metadata app.PaneMeta
 		TTLMs:  metadata.TTLMillis,
 	}
 	if err := p.client.Call(ctx, "pane.report_metadata", params, nil); err != nil {
+		if isPaneNotFound(err) {
+			return fmt.Errorf("report metadata for pane %s: %w (%w)", metadata.PaneID, app.ErrPaneNotFound, ErrPaneNotFound)
+		}
 		return fmt.Errorf("report metadata for pane %s: %w", metadata.PaneID, err)
 	}
 	return nil

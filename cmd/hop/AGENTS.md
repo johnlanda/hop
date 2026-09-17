@@ -150,6 +150,8 @@ commands expect the built binary at `.bin/hop` (see `make build`).
   `controllerAPI` fake and fully-faked `deps` (no real adapter is opened):
   dispatch and exit codes, the feature loop printing unresolved attempt
   launches and continuing (`TestFeatureLoopKeepsRunningOverUnresolvedLaunches`),
+  the feature loop running on past a vanished pane the presentation round
+  skipped (`TestFeatureLoopContinuesPastAVanishedPane`),
   `hop run --workflow` dispatch and exit codes
   for both workflows (`TestRunRunWorkflowDispatch`), a feature run
   started from a repository subdirectory scheduled in the root it froze

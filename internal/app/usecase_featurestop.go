@@ -284,6 +284,9 @@ func (c *Controller) stopFeatureSessions(ctx context.Context, handle RunHandle, 
 			PID:           claim.PID,
 			Markers:       markers,
 			Reason:        closeReasonStop,
+			// An unsettled launch is observed terminated only as the
+			// corroborated-absence pair: pane absent and claimed process gone.
+			requireProcessGone: claim.State == LaunchClaimExecPending,
 		}
 		retired, still, closeErr := c.closePaneOperation(ctx, handle, detail, &target)
 		if closeErr != nil {

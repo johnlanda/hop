@@ -58,6 +58,8 @@ this tree, and drives everything through HOP's own protocol client.
 | [resume_test.go](resume_test.go) | `testLaunchArgvDigest`, `TestRealProcessControllerKillResumeWarmReattach`, `coldRelaunchAfterCrash`, `TestRealProcessConfirmAbsentColdRelaunchNonRestart`, `TestRealProcessStaleSubmissionFromRetiredIncarnation`, `TestRealProcessConfirmAbsentRefusedAfterServerRestart` | Design section 5's resume cases against real hard kills. Warm reattach: only the controller dies (worker/pane untouched); once the lease expires, `hop resume` reattaches to the same live occupant (same pid, same incarnation, no new session). `coldRelaunchAfterCrash` additionally SIGKILLs the worker itself (its no-shell command pane closes itself, S6, giving both required absence conjuncts) before killing the controller, then drives `hop resume --confirm-absent` to a cold relaunch — shared by the non-restart-litmus-test and stale-submission scenarios. The non-restart scenario also pins the relaunched claim's exact argv: it recomputes the canonical `hop-argv-v1` digest (`testLaunchArgvDigest`) over `<claim executable> --resume <native-ref> <continuation prompt>` — the prompt rebuilt byte for byte from the run's assignment path and the hop path the relaunched worker's own observation dump records — and requires it to equal `launch_claims.argv_digest`, so a prompt-less relaunch argv fails. `TestRealProcessConfirmAbsentRefusedAfterServerRestart` repeats the identical crash but restarts the herdr server first: continuity breaks, the attestation is still journaled, and the relaunch is refused |
 | [trustseed_test.go](trustseed_test.go) | `TestRealProcessLaunchSeedsWorkspaceTrust`, `TestRealProcessLaunchWithoutProfileConfigNotSeeded`, `trustFixtureConfig`, `seededTrustConfig`, `fixtureRun.resolvedWorktreePath`, `fixtureRun.seedEvidence` | The launcher-boundary workspace-trust pre-seed against a real run: a fixture `.claude.json` in the worker pane's isolated HOME ends up with exactly `projects[<symlink-resolved worktree path>].hasTrustDialogAccepted = true` and every other byte preserved (asserted byte-exact), the launch claim's `seed_evidence` and the `hop status -run` trust-seed line both carry the seeded evidence; and with no `.claude.json` at all, the claim records "not seeded: profile config absent", the run still completes, and no config file is created |
 | [herdradapter_test.go](herdradapter_test.go) | `TestRealProcessHerdrAdapterWorkspaceAndWorktreeLabels` | Phase 3 slice 5: drives the herdr adapter's `CreateWorkspace`, `FindWorkspaceByLabel` and the labeled `CreateWorktree` end to end through `herdr.Runtime` itself (not raw wire calls, unlike the S8/S9 spikes) against a disposable test-owned server — a labeled workspace created and recovered by label, a not-found label proven non-erroring, and a labeled worktree checked out, HEAD-verified against its base and recovered through the same label descent |
+| [spike_panevanish_test.go](spike_panevanish_test.go) | `TestSpikeVanishedPaneShapes`, `openGatedPane`, `requireVanishedShapes`, `waitPaneGone`, `vanishingPane`, `gatedPaneScript` | The executed probe behind the launch-ended decision row and the vanished-pane tolerance (docs/plan/phase-3-design.md sections 4 and 9), through the production `herdr.Runtime` and `herdr.Presentation` against a disposable server: a `layout.apply` `/bin/sh` command pane whose process exits, and one the test closes. While the pane lives, its command pid is the pane's shell pid and foreground group id, `getpgid` and `getsid` both return it (a session leader leading its own group), and the suite's own `listGroupMembers` lists it in that group; once the pane is gone, `pane.process_info` answers `pane_not_found` "pane not found", `pane.report_metadata` and `pane.close` answer `pane_not_found` "pane <id> not found", each adapter method reports `app.ErrPaneNotFound`, the creation label resolves nothing, and the group no longer lists the pid. Process observation goes through `listGroupMembers`, never the process adapter under test |
+| [launchvanish_test.go](launchvanish_test.go) | `TestRealProcessManagerLaunchVanishesBeforeCorroboration`, `vanishingClaudeStub`, `featureConfigTOML`, `newFeatureFixtureRepo` | The real-process proof of the launch-ended row for the manager: `hop run --workflow feature` against a feature-configured fixture repository (feature mode plus the three role instruction files) whose `claude` stub is a shebang script that exits at once — executed as `/bin/sh`, so corroboration can never settle it whatever the timing. The live controller keeps running until it observes the pane and the claimed process gone, settles the manager's claim `exec_failed` with the fixed reason (the bound pane and claimed pid as evidence), fails the run through the terminal-failure path (the manager session terminated, the manager-launch cause recorded, never a transition to running), prints `launch failed` and exits 1 with no controller error. A worker dying before settlement is covered by `internal/app`'s tables and is left to the fixture-principal feature scenarios |
 | [livehop_test.go](livehop_test.go) | `requireLiveHarness`, `installRealClaudeStub`, `liveTranscriptExists`, `TestLiveClaudeDefaultProfileRun` | Design section 9's one opt-in live scenario: real Claude Code (symlinked, not copied, as the `claude` stub) driven through the real `hop run`/`hop launch` pipeline in the operator's own default profile, with one small brief to a passing check, then a forced cold relaunch (`claude --resume <preassigned-uuid> "<continuation prompt>"`) continuation — interactive Claude Code never re-runs a pending turn on `--resume` (observed live), so this run passing is the verification that a restored session acts on the positional continuation prompt (native-harness-compat.md's Claude Code verified list, 2026-09-15 against 2.1.270). See "Live scenario" below |
 
 ## Invariants
@@ -273,12 +275,19 @@ scenario (compiles, skips cleanly by default, never run by this task).
   6): the window between `PrepareLaunchExec`'s claim write and the
   caller's `syscall.Exec` is a handful of Go statements in a single OS
   process — no external observer, even a tight in-process
-  `pane.process_info` poll, can reliably land a signal inside it.
+  `pane.process_info` poll, can reliably land a signal inside it. Its
+  disposition is no longer an indefinite wait: the claim stays
+  `exec_pending` behind a pane that closes with the launcher, and the
+  Phase 3 launch-ended row settles it once pane and process are both
+  observed gone (`internal/app`'s
+  `TestLaunchEndedRowResolvesDeferredClaimWindows`; the same row's
+  real-process proof is `TestRealProcessManagerLaunchVanishesBeforeCorroboration`).
 - **Exec failure with the `exec_failed` write itself suppressed**: the
   same class of problem one step later, between the exec failing and
   `FailLaunchExec`'s write landing. (The *unsuppressed* exec-failure case
   — the write lands normally — is expressible and covered by
-  `TestRealProcessExecFailureSettlesExecFailed`.)
+  `TestRealProcessExecFailureSettlesExecFailed`.) The suppressed case now
+  settles through the same launch-ended row as the case above.
 - **Paused pre-exec launcher argv exclusion**: requires catching the
   launcher's own argv as the pane's foreground process before it execs —
   the identical race as the first case above.
@@ -329,7 +338,8 @@ Defects found while implementing this slice, reported to and confirmed by the ma
   repository construction and the fixture worker's own commits — isolated
   per repository from any developer git configuration, never the invariant
   the suite is proving), `ps` (`listGroupMembers`'s independent process-group
-  listing), `sqlite3` (`querySQLite`'s read-only inspection of a test's own
+  listing), `/bin/sh` (the vanished-pane probe's gated pane command and the
+  vanishing `claude` stub's interpreter), `sqlite3` (`querySQLite`'s read-only inspection of a test's own
   throwaway `hop.db`, shelled out to the same way this suite already uses
   `git`/`ps`), and — for S4 and the live scenario only — `claude` (both
   opt-in behind `HOP_LIVE_HARNESS=1` and skipped, not failed, when that is
@@ -368,7 +378,8 @@ Defects found while implementing this slice, reported to and confirmed by the ma
   probe: `TestSpikeWorktreeRemoveHerdrShapes`,
   `TestSpikeWorktreeRemoveNeedsOpenWorkspace`,
   `TestSpikeWorkspaceIDReissuedAfterRestart`,
-  `TestSpikeGitWorktreeRemoveLeavesHerdrWorkspace`). S4 is skipped
+  `TestSpikeGitWorktreeRemoveLeavesHerdrWorkspace`; plus the vanished-pane
+  probe behind the launch-ended row: `TestSpikeVanishedPaneShapes`). S4 is skipped
   here; run it opt-in with `HOP_LIVE_HARNESS=1 go test -count=1 -run
   TestSpikeClaudePreassignedSessionID ./test/integration`, which invokes the
   real `claude` in print mode against a scratch profile.
