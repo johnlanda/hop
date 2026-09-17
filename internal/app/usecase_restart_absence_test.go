@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/johnlanda/hop/internal/app"
 	"github.com/johnlanda/hop/internal/domain/identity"
 	"github.com/johnlanda/hop/internal/domain/run"
 )
@@ -275,4 +276,38 @@ func TestPlacementWithNoRecordedLifetimeGetsItsOwnAction(t *testing.T) {
 	if renameBack := placedContinuityText(label); slices.ContainsFunc(report.Outstanding, func(entry string) bool { return strings.Contains(entry, renameBack) }) {
 		t.Fatalf("outstanding = %q, want no rename-back action: nothing was renamed", report.Outstanding)
 	}
+}
+
+// TestStopDuringARestartConcludesNoAbsence pins the AFTER half of the
+// continuity bracket. The placement's own lifetime answers the read taken
+// before the observation, and the server restarts DURING it, so the read
+// taken after does not: the absence by id and by label was observed
+// across a restart, which is precisely what a single read before the
+// observation cannot catch. Absence is not concluded, and the run stays
+// stopping with the rename-back action.
+func TestStopDuringARestartConcludesNoAbsence(t *testing.T) {
+	tc := newTestController(defaultPolicy())
+	handle, detail := runningRun(t, tc)
+	if err := tc.Controller.RequestStop(context.Background(), detail.RunID.String()); err != nil {
+		t.Fatalf("RequestStop() error = %v", err)
+	}
+	// The pane is positively absent by id and by label, and the restart
+	// lands between the two continuity reads — while the observation
+	// itself is in flight.
+	tc.Runtime.InspectPaneFn = func(id string) (app.PaneProcess, error) {
+		tc.Runtime.ServerInstanceValue = fakeServerToken(2)
+		return app.PaneProcess{}, pinnedPaneNotFound("inspect", id)
+	}
+
+	report, err := tc.Controller.DriveStop(context.Background(), handle)
+	if err != nil {
+		t.Fatalf("DriveStop() error = %v", err)
+	}
+	if report.Terminated || report.RunState != string(run.RunStopping) {
+		t.Fatalf("stop across a restart that landed during the observation = %+v, want stopping with nothing terminated", report)
+	}
+	if len(tc.Runtime.ClosedPanes) != 0 {
+		t.Fatalf("panes closed = %v, want none: absence was never concluded", tc.Runtime.ClosedPanes)
+	}
+	requireOutstandingContinuity(t, report.Outstanding, detail.Binding.CreationLabel)
 }

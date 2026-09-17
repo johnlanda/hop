@@ -193,3 +193,50 @@ func TestFeatureLoopReportsACombinedCheckFailure(t *testing.T) {
 		t.Fatalf("err = %v, want the round's failure reported", err)
 	}
 }
+
+// TestFeatureLoopDoesNotEndOnACombinedCheckStopRefusal pins the other leg
+// of roundError's skip. A held stop can refuse one of the combined-check
+// round's OWN dispatches, and the round then returns an
+// ErrStopRequested-wrapping error. That refusal is the loop's own doing,
+// exactly as a cancellation is, so it must not end the loop: the pass
+// ends, the stop is driven, and the run finishes normally. Only the
+// cancellation leg was exercised before, so deleting the
+// ErrStopRequested arm of the skip left this package green.
+func TestFeatureLoopDoesNotEndOnACombinedCheckStopRefusal(t *testing.T) {
+	ctrl := &fakeController{}
+	td := newTestDeps(ctrl, map[string]string{"PATH": "/bin"}, t.TempDir())
+	td.useCheckBarriers()
+
+	var refused atomic.Bool
+	ctrl.driveIntegration = func(context.Context, string, []string) (app.IntegrationReport, error) {
+		return app.IntegrationReport{IntegrationID: "integration-1", State: "checking", CheckDue: true}, nil
+	}
+	ctrl.driveIntegrationCheck = func(context.Context, string, []string) (app.IntegrationReport, error) {
+		td.checkStarted <- struct{}{}
+		refused.Store(true)
+		return app.IntegrationReport{}, fmt.Errorf("app: revalidate before the merge spawn: %w", app.ErrStopRequested)
+	}
+	ctrl.status = func(app.StatusRequest) (app.StatusResult, error) {
+		if refused.Load() {
+			return detailStep("stopping", "", true), nil
+		}
+		return detailStep("running", "", false), nil
+	}
+	ctrl.driveFeatureStop = func() (app.StopReport, error) {
+		return app.StopReport{RunState: "stopped", Terminated: true}, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var stdout bytes.Buffer
+	result, err := runFeatureControllerLoop(ctx, td.deps, ctrl, app.RunHandle{}, testRunID, "r1", "/opt/hop/bin/hop", &stdout)
+	if err != nil {
+		t.Fatalf("runFeatureControllerLoop: %v; a round's stop refusal is the loop's own doing and is never reported as a failure", err)
+	}
+	if result.FinalState != "stopped" {
+		t.Fatalf("result = %+v, want the loop to have driven the stop to stopped", result)
+	}
+	if got := countCalls(ctrl.recorded(), "DriveFeatureStop"); got == 0 {
+		t.Fatalf("the stop was never driven after the round's refusal; calls = %v", ctrl.recorded())
+	}
+}
