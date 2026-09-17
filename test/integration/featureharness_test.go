@@ -292,6 +292,34 @@ func (f *featureRun) requirePane(t *testing.T, sessionID string) string {
 	return paneID
 }
 
+// requireManagerFirstAgentTokens polls agent.list (f.server.agentTokens)
+// until at least one HOP-ordered agent is published, then asserts the
+// manager pane sorts first (assertManagerFirst, presentation_test.go).
+// PublishRunPresentation runs as a step of the SAME scheduling pass that
+// assigns tasks (cmd/hop's runFeatureSchedulingPass), not inside the
+// assignment transaction itself, so a caller that has only observed a
+// task/session state must poll here rather than assume tokens are already
+// published. A timeout with the run otherwise healthy is deliberately
+// distinguished as a presentation-publishing gap, not a harness timing
+// issue this bounded poll would otherwise paper over.
+func (f *featureRun) requireManagerFirstAgentTokens(t *testing.T, managerPaneID string) {
+	t.Helper()
+	var tokens map[string]map[string]string
+	reached := waitUntilDeadline(featureRunTimeout, func() bool {
+		tokens = f.server.agentTokens(t)
+		for _, tk := range tokens {
+			if tk["hop_order"] != "" {
+				return true
+			}
+		}
+		return false
+	})
+	if !reached {
+		t.Fatalf("no HOP-ordered agent observed via agent.list for run %s after %s (a presentation-publishing gap, not a timing issue, if the run is otherwise healthy)", f.runID, featureRunTimeout)
+	}
+	assertManagerFirst(t, tokens, managerPaneID)
+}
+
 // foregroundPID returns sessionID's current launch claim pid, asserting
 // it is among paneID's observed foreground members — mirrors pgroup_test.
 // go's fixtureRun.workerForegroundPID, generalized to any role: the
@@ -424,15 +452,36 @@ func (f *featureRun) requireManagerNoticeFirstLine(t *testing.T, deadline time.D
 
 // worktreeForAttempt reads one attempt's own worktree row: path, branch
 // and its recorded base commit (empty for a Phase 2 row, never expected
-// here since every feature attempt gets its own).
-func (f *featureRun) worktreeForAttempt(t *testing.T, attemptID string) (path, branch, baseCommit string) {
+// here since every feature attempt gets its own). ok is false when no
+// worktree row exists yet: worktree creation (usecase_schedule.go's
+// AssignReadyTasks, createAttemptWorktree — a real git/herdr act) commits
+// AFTER, and separately from, the transaction that first moves the task
+// to active/the attempt to launching, so a caller that has only observed
+// the task state must poll (requireWorktreeForAttempt), never assume the
+// row already exists.
+func (f *featureRun) worktreeForAttempt(t *testing.T, attemptID string) (path, branch, baseCommit string, ok bool) {
 	t.Helper()
 	row := f.scalar(t, fmt.Sprintf("SELECT path || '|' || branch || '|' || ifnull(base_commit,'') FROM worktrees WHERE attempt_id = '%s';", attemptID))
 	parts := strings.SplitN(row, "|", 3)
 	if len(parts) != 3 {
-		t.Fatalf("no worktree found for attempt %s", attemptID)
+		return "", "", "", false
 	}
-	return parts[0], parts[1], parts[2]
+	return parts[0], parts[1], parts[2], true
+}
+
+// requireWorktreeForAttempt polls worktreeForAttempt until its row exists,
+// bounded by featureRunTimeout, naming the attempt id on timeout.
+func (f *featureRun) requireWorktreeForAttempt(t *testing.T, attemptID string) (path, branch, baseCommit string) {
+	t.Helper()
+	var ok bool
+	reached := waitUntilDeadline(featureRunTimeout, func() bool {
+		path, branch, baseCommit, ok = f.worktreeForAttempt(t, attemptID)
+		return ok
+	})
+	if !reached {
+		t.Fatalf("no worktree row observed for attempt %s after %s", attemptID, featureRunTimeout)
+	}
+	return path, branch, baseCommit
 }
 
 // integrationForTask reads taskID's most recently created integration row

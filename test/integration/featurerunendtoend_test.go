@@ -69,7 +69,7 @@ func TestRealProcessFeatureRunEndToEnd(t *testing.T) {
 	// held workers are all live (agent.list, as in Phase 1).
 	managerSessionID := fx.managerSessionID(t)
 	managerPaneID := fx.requirePane(t, managerSessionID)
-	assertManagerFirst(t, server.agentTokens(t), managerPaneID)
+	fx.requireManagerFirstAgentTokens(t, managerPaneID)
 
 	t1AttemptID, _ := fx.currentAttempt(t, t1)
 	t1SessionID := fx.sessionForAttempt(t, t1AttemptID)

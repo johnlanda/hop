@@ -56,7 +56,7 @@ func TestRealProcessWorkerInterruption(t *testing.T) {
 		t.Fatalf("first attempt number = %d, want 1", attempt1Number)
 	}
 	session1ID := fx.sessionForAttempt(t, attempt1ID)
-	worktree1Path, worktree1Branch, worktree1Base := fx.worktreeForAttempt(t, attempt1ID)
+	worktree1Path, worktree1Branch, worktree1Base := fx.requireWorktreeForAttempt(t, attempt1ID)
 	if worktree1Path == "" || worktree1Branch == "" {
 		t.Fatalf("attempt 1's worktree row is incomplete: path=%q branch=%q", worktree1Path, worktree1Branch)
 	}
@@ -103,7 +103,7 @@ func TestRealProcessWorkerInterruption(t *testing.T) {
 	if session2ID == session1ID {
 		t.Fatal("the retried attempt's session is the same as the interrupted one's")
 	}
-	worktree2Path, worktree2Branch, worktree2Base := fx.worktreeForAttempt(t, attempt2ID)
+	worktree2Path, worktree2Branch, worktree2Base := fx.requireWorktreeForAttempt(t, attempt2ID)
 	if worktree2Path == "" || worktree2Branch == "" {
 		t.Fatalf("attempt 2's worktree row is incomplete: path=%q branch=%q", worktree2Path, worktree2Branch)
 	}
