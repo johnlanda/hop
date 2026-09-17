@@ -434,7 +434,7 @@ func TestManagerBootstrapContinuesTheWrapperReconciliation(t *testing.T) {
 		},
 		{
 			name: "the pane's own process is not the claimed launch process",
-			arrange: func(f *resumeFixture) app.PaneProcess {
+			arrange: func(*resumeFixture) app.PaneProcess {
 				return app.PaneProcess{
 					ShellPID: 7777, ForegroundGroupID: 7777,
 					Foreground: []app.ProcessInfo{{PID: 7777, Name: "zsh", Argv: []string{"-zsh"}}},
