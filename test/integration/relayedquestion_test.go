@@ -240,14 +240,23 @@ func testRelayedQuestionPreForwardKill(t *testing.T) {
 		t.Errorf("a1 was never delivered to the worker's session %s", session1ID)
 	}
 
-	// A message_receipts row for every send and every ack this
-	// trace promises.
-	requireMessageSendReceiptAccepted(t, fx, q1)
-	requireMessageSendReceiptAccepted(t, fx, q2)
-	requireMessageSendReceiptAccepted(t, fx, a2)
-	requireMessageSendReceiptAccepted(t, fx, a1)
+	// A message_receipts row for every send and every ack this trace
+	// promises. q1/q2/a1 travel through hop msg send (op "msg-send"), but
+	// a2 travels through hop answer, a SEPARATE verb with its own
+	// acceptance key (internal/adapters/sqlite/messaging.go's
+	// AnswerQuestion: op "answer", the receipt's own claimed_message_id
+	// is q2 -- the question it answers -- never a2 itself, though
+	// created_entity_id is still a2). q2's own ack is bundled INTO that
+	// same hop answer transaction (persistBundledQuestionAck) and writes
+	// directly to message_acks with no session/incarnation (a human ack
+	// has neither) -- it inserts no message_receipts row at all, so it is
+	// asserted directly against message_acks instead of through a receipt.
+	requireMessageSendReceiptAccepted(t, fx, "msg-send", q1)
+	requireMessageSendReceiptAccepted(t, fx, "msg-send", q2)
+	requireMessageSendReceiptAccepted(t, fx, "answer", a2)
+	requireMessageSendReceiptAccepted(t, fx, "msg-send", a1)
 	requireMessageAckReceiptAccepted(t, fx, q1)
-	requireMessageAckReceiptAccepted(t, fx, q2)
+	requireBundledQuestionAck(t, fx, q2)
 	requireMessageAckReceiptAccepted(t, fx, a2)
 	requireMessageAckReceiptAccepted(t, fx, a1)
 
@@ -410,27 +419,46 @@ func testRelayedQuestionPostForwardPreAckKill(t *testing.T) {
 	}
 }
 
-// requireMessageSendReceiptAccepted asserts an accepted msg-send receipt
-// row exists naming messageID as its created_entity_id -- design section
-// 7's "a receipt row for every verb outcome," checked for the acceptance
-// case specifically.
-func requireMessageSendReceiptAccepted(t *testing.T, fx *featureRun, messageID string) {
+// requireMessageSendReceiptAccepted asserts an accepted receipt row exists
+// naming messageID as its created_entity_id, under the given op -- design
+// section 7's "a receipt row for every verb outcome," checked for the
+// acceptance case specifically. op is "msg-send" for a question/info/
+// answer sent through hop msg send, or "answer" for one accepted through
+// hop answer specifically (internal/adapters/sqlite/messaging.go's
+// AnswerQuestion: a distinct verb with its own request-ID acceptance key,
+// keyed by the question's own id, never the answer's).
+func requireMessageSendReceiptAccepted(t *testing.T, fx *featureRun, op, messageID string) {
 	t.Helper()
 	if n := fx.scalar(t, fmt.Sprintf(
-		"SELECT count(*) FROM message_receipts WHERE run_id = '%s' AND op = 'msg-send' AND created_entity_id = '%s' AND outcome = 'accepted';",
-		fx.runID, messageID)); n == "0" {
-		t.Errorf("no accepted msg-send receipt found for message %s", messageID)
+		"SELECT count(*) FROM message_receipts WHERE run_id = '%s' AND op = '%s' AND created_entity_id = '%s' AND outcome = 'accepted';",
+		fx.runID, op, messageID)); n == "0" {
+		t.Errorf("no accepted %s receipt found for message %s", op, messageID)
 	}
 }
 
 // requireMessageAckReceiptAccepted asserts an accepted msg-ack receipt row
-// exists claiming messageID.
+// exists claiming messageID -- a real, session-based `hop msg ack` call.
 func requireMessageAckReceiptAccepted(t *testing.T, fx *featureRun, messageID string) {
 	t.Helper()
 	if n := fx.scalar(t, fmt.Sprintf(
 		"SELECT count(*) FROM message_receipts WHERE run_id = '%s' AND op = 'msg-ack' AND claimed_message_id = '%s' AND outcome = 'accepted';",
 		fx.runID, messageID)); n == "0" {
 		t.Errorf("no accepted msg-ack receipt found for message %s", messageID)
+	}
+}
+
+// requireBundledQuestionAck asserts questionID's own message_acks row
+// exists with a NULL session_id/incarnation_id -- the shape
+// persistBundledQuestionAck writes when hop answer accepts the reply and
+// acks the question it replies to atomically, in the SAME transaction,
+// with no separate hop msg ack call and therefore no message_receipts row
+// at all for this specific ack.
+func requireBundledQuestionAck(t *testing.T, fx *featureRun, questionID string) {
+	t.Helper()
+	if n := fx.scalar(t, fmt.Sprintf(
+		"SELECT count(*) FROM message_acks WHERE message_id = '%s' AND session_id IS NULL AND incarnation_id IS NULL;",
+		questionID)); n != "1" {
+		t.Errorf("bundled (session-less) ack row count for question %s = %s, want exactly 1", questionID, n)
 	}
 }
 

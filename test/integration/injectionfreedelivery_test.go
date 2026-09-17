@@ -326,13 +326,19 @@ func TestRealProcessInjectionFreeDelivery(t *testing.T) {
 	// grep), which is what makes firstLineIndex's FIRST-occurrence bracket
 	// safe -- but that safety is silent and would change meaning without
 	// warning if production ever did call either method. Asserting each
-	// marker occurs EXACTLY ONCE across the whole capture makes that
-	// assumption an executed check, not just a cited fact.
-	if n := countLinesContaining(lines, `method="pane.list"`); n != 1 {
-		t.Fatalf("herdr-server.log contains %d line(s) naming method=\"pane.list\" (the window-start marker), want exactly 1", n)
-	}
-	if n := countLinesContaining(lines, `method="tab.list"`); n != 1 {
-		t.Fatalf("herdr-server.log contains %d line(s) naming method=\"tab.list\" (the window-end marker), want exactly 1", n)
+	// marker's call occurred EXACTLY ONCE across the whole capture makes
+	// that assumption an executed check, not just a cited fact -- one API
+	// call logs TWO lines (its own start and complete), both sharing the
+	// same method="..." text, so the start and complete events are
+	// counted separately rather than as raw method-matching lines (which
+	// would always be even, never 1, for a method called exactly once).
+	for _, m := range []string{"pane.list", "tab.list"} {
+		if n := countLinesContainingAll(lines, `event="api.request.start"`, `method="`+m+`"`); n != 1 {
+			t.Fatalf("herdr-server.log contains %d api.request.start line(s) naming method=%q, want exactly 1", n, m)
+		}
+		if n := countLinesContainingAll(lines, `event="api.request.complete"`, `method="`+m+`"`); n != 1 {
+			t.Fatalf("herdr-server.log contains %d api.request.complete line(s) naming method=%q, want exactly 1", n, m)
+		}
 	}
 
 	// S11's own finding: a request-log line never carries the pane/agent
