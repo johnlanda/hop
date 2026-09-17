@@ -120,7 +120,7 @@ func (w *preBindingWindow) ack(message identity.MessageID) app.MessageAck {
 }
 
 // TestPreBindingWindowResultAndMessaging pins the implementer's verbs in
-// the launch window before its binding row exists (LAUNCH-7). With an
+// the launch window before its binding row exists. With an
 // agreeing pending intent the caller is current: a result is
 // attempt-not-running whether or not a message is queued, the queued
 // message is served, an ack before any fetch is not-delivered and one
@@ -198,7 +198,7 @@ func TestPreBindingWindowResultAndMessaging(t *testing.T) {
 }
 
 // TestPreBindingWindowReviewSubmit pins the reviewer's verdict in the same
-// window (LAUNCH-7): attempt-not-running with an agreeing pending intent
+// window: attempt-not-running with an agreeing pending intent
 // and stale with a disagreeing or absent one, whether or not a message is
 // queued to the review task, with no review row either way.
 func TestPreBindingWindowReviewSubmit(t *testing.T) {

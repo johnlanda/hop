@@ -360,7 +360,7 @@ this package never resolves environment variables or defaults.
   the successor is re-served the question and its answer is accepted as
   the manager's first message, and the successor manager's info is
   accepted); the pre-binding
-  launch window (`prebinding_window_test.go`, LAUNCH-7: a child whose
+  launch window (`prebinding_window_test.go`: a child whose
   attempt and session are launching with no binding row, under an
   agreeing, a disagreeing or an absent pending intent, each with and
   without a message queued to the task —

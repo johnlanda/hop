@@ -1315,8 +1315,8 @@ outcome leaves exactly this state. A live principal in it — manager or
 child — is therefore never refused `stale` for the missing binding; its
 verbs proceed normally, the run-state acceptance below still applying
 (`transient` while the run can still reach `running`). For a child whose
-attempt is still launching behind an `exec_pending` claim (LAUNCH-7,
-pinned on both stores), that means: `hop result submit` and
+attempt is still launching behind an `exec_pending` claim (pinned on
+both stores), that means: `hop result submit` and
 `hop review submit` print `transient: attempt not yet running; retry`
 whether or not a message is queued to the task (section 5's one
 acceptance order), a queued message is served, and an ack is accepted
