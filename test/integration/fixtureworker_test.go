@@ -726,12 +726,14 @@ const fixtureFetchLoopDeadline = 2 * time.Minute
 // section 7's Fetch prints NO protocol line on stdout for any authority
 // refusal -- only a stderr diagnostic ("hop msg wait: app: fetch message: "
 // +this text+": <detail>"), which runHopCLI's merged capture still
-// surfaces as the line's own stable substring. Main's own address/session-
-// currency fix (LAUNCH-7) SERVES a pre-binding-window fetch whenever the
-// caller's pending launch intent agrees -- the launch intent is always
-// recorded before the pane starts, so a current fixture session's own
-// fetch is never refused this way anymore. Its appearance at all is
-// therefore an authority bug, never a benign race to retry past.
+// surfaces as the line's own stable substring. A pending launch intent
+// that agrees with the caller's own incarnation serves a pre-binding-
+// window fetch (design section 7); a disagreeing or absent one refuses
+// it. One case still refuses a live, claimed principal this way: a
+// pane.open whose own act errors after the launcher already claimed is
+// recorded with no binding and no readable pending intent, so that
+// session's fetch stays refused until label recovery later commits the
+// binding.
 const fixtureMessagingUnauthorizedText = "messaging session is not authorized for this request"
 
 // fetchDeliveredMessage runs "<hopPath> msg wait" in a loop until a
@@ -744,9 +746,11 @@ const fixtureMessagingUnauthorizedText = "messaging session is not authorized fo
 //   - "transient: ..." sleeps fixtureRetryInterval within
 //     fixtureFetchLoopDeadline and prints the line.
 //   - a line carrying fixtureMessagingUnauthorizedText's stable substring
-//     fatalf's at once, naming the line: a current fixture session is
-//     always served (LAUNCH-7), so this outcome means an authority bug,
-//     never something to retry past silently.
+//     fatalf's at once, naming the line: a fixture session with an
+//     agreeing pending launch intent is served, so this outcome means
+//     either an authority bug or the one accepted residual
+//     fixtureMessagingUnauthorizedText's own doc comment names -- a
+//     scenario should surface either rather than silently wait it out.
 //   - anything else also fatalf's immediately, naming the exact line,
 //     rather than looping silently against a permanent regression.
 func fetchDeliveredMessage(hopPath string) deliveredMessage {
@@ -760,7 +764,7 @@ func fetchDeliveredMessage(hopPath string) deliveredMessage {
 		switch {
 		case strings.HasPrefix(first, "none:"):
 		case strings.Contains(first, fixtureMessagingUnauthorizedText):
-			fatalf("hop msg wait returned an unauthorized fetch refusal for what should be a current session (main serves an agreeing pre-binding intent -- LAUNCH-7): %q", first)
+			fatalf("hop msg wait returned an unauthorized fetch refusal for what should be a current session: %q", first)
 		case strings.HasPrefix(first, "transient:"):
 			if !time.Now().Before(deadline) {
 				fatalf("hop msg wait kept returning %q past the %s retry deadline", first, fixtureFetchLoopDeadline)

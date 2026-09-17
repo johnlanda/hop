@@ -205,12 +205,11 @@ func waitForObservation(t *testing.T, path string) workerObservation {
 // frequently, right after a SIGKILL of its own writer (killControllerLeader),
 // risks transient SQLite WAL lock contention. querySQLite tolerates this via
 // sqlite3's own busy-timeout (`-cmd ".timeout 5000"`, matching production's
-// busy_timeout(5000)), not the string-matching Go-level retry loop it
-// replaced (17533e0) -- but that is a per-call busy-WAIT inside one sqlite3
-// invocation, not a retry of the whole command: a lock still held after 5s
-// still fails the test immediately. A condition that only needs to observe
-// crossing a multi-second attention threshold does not need millisecond
-// polling granularity regardless.
+// busy_timeout(5000)) -- a per-call busy-WAIT inside one sqlite3 invocation,
+// not a retry of the whole command: a lock still held after 5s still fails
+// the test immediately. A condition that only needs to observe crossing a
+// multi-second attention threshold does not need millisecond polling
+// granularity regardless.
 const attentionPollInterval = 500 * time.Millisecond
 
 // waitUntilDeadlineWithInterval polls condition like waitUntilDeadline, but

@@ -135,9 +135,7 @@ func TestRealProcessDuplicateAndAmbiguousDelivery(t *testing.T) {
 	// scheduling pass could run RetireSettledSessions/observeWorkerExit
 	// against the about-to-die worker and reconcile it as an ordinary
 	// interruption (a NEW attempt/worktree) instead of the same-attempt
-	// cold relaunch this trace needs -- a race the prior ordering
-	// (self-kill the worker, then kill the controller) left open for the
-	// width of one scheduling pass.
+	// cold relaunch this trace needs.
 	killControllerLeader(t, fx.controller)
 	fx.killSession(t, session1ID, attempt1ID)
 
@@ -368,13 +366,17 @@ func TestRealProcessDuplicateAndAmbiguousDelivery(t *testing.T) {
 	}
 
 	// The resumed worker pauses at its own opt-in presubmit gate, after
-	// its drain (m1 and m2 both acked) and before its own submit --
-	// so the attention line's absence below is asserted while
-	// newSession1ID is still ACTIVE, never merely because retirement made
-	// the address no-longer-live (the prior check could not distinguish
-	// those: the run completes within seconds of the drain, so a
-	// status-rendering bug that ignored ack rows would have passed just
-	// as well by waiting for the session to retire instead).
+	// its drain (m1 and m2 both acked) and before its own submit -- so
+	// the attention line's absence below is checked while newSession1ID
+	// is still ACTIVE, pinning the observation to this run's own
+	// mid-flight state. The line's own presence does not depend on
+	// address liveness at all (hop status -run renders it for every
+	// address with any unacknowledged message, regardless of whether the
+	// address is live) -- only the run-summary's separate
+	// "(blocked, needs attention)" marker and its "action:" line do --
+	// so this is not needed to avoid a vacuous pass, but it is still
+	// direct evidence that the drain, not the session's own later
+	// retirement, is what cleared the line.
 	presubmitObservedPath := filepath.Join(scratchDir, "fetch-crash-presubmit-observed-"+attempt1ID+".txt")
 	waitForObservation(t, presubmitObservedPath)
 	if state := fx.sessionState(t, newSession1ID); state != "active" {

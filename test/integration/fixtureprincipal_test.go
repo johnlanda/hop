@@ -1801,11 +1801,11 @@ func TestFixtureWorkerHoldBarrier(t *testing.T) {
 //     nor "transient:" fatalf's, naming the exact line;
 //   - a line carrying the messaging-unauthorized fetch refusal's stable
 //     substring (fixtureMessagingUnauthorizedText) ALSO fatalf's, with its
-//     own distinct message: main's own address/session-currency fix
-//     (LAUNCH-7) serves a current session's pre-binding-window fetch
-//     whenever its own pending launch intent agrees, so this outcome is
-//     an authority bug to fail loudly on, never a benign race to retry
-//     past.
+//     own distinct message: a fixture session with an agreeing pending
+//     launch intent is served, so this outcome means either an authority
+//     bug or the one accepted residual fixtureMessagingUnauthorizedText's
+//     own doc comment names -- a scenario should surface either rather
+//     than silently wait it out.
 func TestFixtureWorkerHoldFetchLoopFatalsOnUnexpectedRefusal(t *testing.T) {
 	cases := []struct {
 		name          string
@@ -1818,7 +1818,7 @@ func TestFixtureWorkerHoldFetchLoopFatalsOnUnexpectedRefusal(t *testing.T) {
 			wantFatalText: `fixture principal: hop msg wait returned an unexpected line: "refused: not-found"`,
 		},
 		{
-			name: "the messaging-unauthorized fetch refusal, fatal per LAUNCH-7",
+			name: "the messaging-unauthorized fetch refusal",
 			block: "hop msg wait: app: fetch message: app: messaging session is not authorized for this request: " +
 				"session is not its task's current attempt session\n",
 			wantFatalText: "fixture principal: hop msg wait returned an unauthorized fetch refusal for what should be a current session",
