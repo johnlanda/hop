@@ -38,7 +38,7 @@ this package never resolves environment variables or defaults.
 | [statestore.go](statestore.go) | `InitializeRun`, `AcquireLease`, `Heartbeat`, `ReleaseLease`, `Begin`, `validateLease` | The controller authority: run bootstrap in one transaction (the snapshot's workflow JSON round-tripped, NULL for solo; a feature spec inserts the run, snapshot, manager session and lease only, refusing `app.ErrFeatureRunSpecInvalid` before the transaction and `app.ErrRunSequenceMismatch` inside it), lease CAS with monotonic generations, fenced unit-of-work begin |
 | [uow.go](uow.go) | `unitOfWork` and the typed repositories (`Runs`…`CheckExecClaims`), `OperationRepository.Pending`/`ByKind`, `Commit`, `Rollback` | One immediate transaction per unit of work; optimistic-concurrency saves; append-only bindings and transitions; journal payloads persisted as uninterpreted JSON; controller-side launch-claim settlement |
 | [entities.go](entities.go) | `getRun`, `getTask`, `getAttempt`, `getSession`, `currentSession`, `currentBinding`, `getWorktree`, `scanWorktree`, `selectWorktreeColumns`, `getLaunchClaim`, `acceptedResult`, `incarnationCurrent`, `sessionIncarnationCurrent`, `pendingLaunchIntentDisagrees`, `pendingLaunchIntentOfSession` | Row ↔ domain-value mapping shared by all three authorities through the `querier` interface; `sessionIncarnationCurrent` is the one principal-incarnation rule every caller-incarnation check decides through (see Invariants) (`getWorktree` and the listing's `scanWorktree` map NULL `attempt_id`/`base_commit` to the solo row's empty links; a worktree's `state` column is read verbatim, including the retirement states `removed`/`absent`/`released`) |
-| [submission.go](submission.go) | `SubmitResult`, `RecordMalformed`, `ClaimLaunch`, `SettleLaunchFailure`, `ClaimCheckExec`, `RequestStop`, `insertReceipt` | The worker authority: the section 7 validation order with the domain's `AcceptResult` inside one transaction, receipts for every outcome (a transient result carries its typed reason: undelivered-messages from the mailbox check that precedes `AcceptResult`, attempt-not-running from its `ErrTransientNotRunning`), the pre-exec claim contracts, the monotonic stop request |
+| [submission.go](submission.go) | `SubmitResult`, `RecordMalformed`, `ClaimLaunch`, `SettleLaunchFailure`, `ClaimCheckExec`, `RequestStop`, `insertReceipt` | The worker authority: the section 7 validation order with the domain's `AcceptResult` inside one transaction — the task's mailbox passed in as `AcceptanceContext.MailboxClear` and consulted after every other eligibility check, `SubmitReview`'s order — receipts for every outcome (a transient result carries `app.TransientReasonOf` its acceptance error: undelivered-messages from `ErrMailboxNotClear`, with the fixed drain detail `undeliveredMessagesDetail`, attempt-not-running from `ErrTransientNotRunning`), the pre-exec claim contracts, the monotonic stop request |
 | [readstore.go](readstore.go) | `ListRuns`, `LoadRunStatus`, `attachSessionBinding`, `LoadFrozenRun`, `LoadCheckExecutionContext`, `lastCheckSummary`, `retirementIntentExecution` | Lease-free reads, each inside one deferred read transaction for a consistent WAL snapshot; `LoadRunStatus` names the solo worker's (or feature manager's) session, its current binding and the claim of the incarnation `sessionLaunchIncarnation` resolves (`attachSessionBinding`: the binding's, else the session's newest pending launch intent's, none when any pending launch intent of the session disagrees with the binding), and carries the snapshot's frozen `TargetBranch` and the run's `worktrees_retired_at` fact, and for a feature run `featureWorktreeDetail` adds every worktree row (oldest first, non-nil) and the run's `worktree.retire` operations (newest first, through the shared `operationsByKind`) |
 | [worktreeretirement_read.go](worktreeretirement_read.go) | `Store` as `app.RetirementReadStore`: `ListRetirementCandidates`, `terminalUnretiredRuns`, `retirementCandidateRecord`, `collectIntegrations` | The worktree-retirement triage read, in one read transaction. It returns the repository's completed, failed and stopped runs whose fact is unset, whose frozen workflow is feature mode with a target, and that integrated at least one row adding content, in sequence order. Each record carries its integrated rows (oldest first), its `retirement.check` operations (newest first) and whether any `retirement.check` or `worktree.retire` is pending or reconciling. An unknown root has no candidates |
 | [worktreeretirement.go](worktreeretirement.go) | `unitOfWork` as `app.WorktreeRetirementRepositories`: `WorktreesForRetirement`, `WorktreesRetiredAt`, `MarkWorktreesRetired`; `runWorktrees`, `runWorktreesRetiredAt` | `WorktreesForRetirement` lists every worktree row of the leased run (another run is `ErrFenced`) in insertion order (`created_at, rowid`), any state, with its revision; row state saves go through `Worktrees().Save`. `WorktreesRetiredAt` reads the leased run's fact inside the transaction (another run is `ErrFenced`). Migration 004's worktrees-retired run fact: written once inside the fenced unit of work (the leased run only; the UPDATE applies only while NULL, so a repeat keeps the first value; a set-once housekeeping column that does not move `runs.revision`), read back as nil for NULL or the canonical time (anything else fails closed) |
@@ -90,7 +90,7 @@ this package never resolves environment variables or defaults.
   commit-time clock reading.
 - `SubmitResult` runs the domain's `run.AcceptResult` inside one write
   transaction (load run/task/attempt/prior accepted result and the
-  incarnation/claim context → decide → persist), and every outcome —
+  incarnation, claim and mailbox context → decide → persist), and every outcome —
   accepted, duplicate, stale, conflicting, transient, malformed — commits a
   `result_submissions` receipt whose claimed identities are plain text with
   no foreign keys. Recorded outcomes return a nil error; a non-nil error is
@@ -186,12 +186,16 @@ this package never resolves environment variables or defaults.
   delivery/ack rows, the enqueue sequence is assigned in commit order
   inside the send transaction (FIFO authority, never caller clocks), and
   a successful serve's evidence is its append-only delivery row.
-- Acceptance closes the mailbox in the same commit: `SubmitResult`'s
-  first acceptance re-reads the task mailbox (queued or
-  delivered-unacknowledged → the retryable transient outcome with the
-  drain grammar) and closes it atomically, as does `SubmitReview`'s,
-  which also commits the controller's reasons-bearing info notice to the
-  manager; `PlanStore.RequestRetry` is the only reopen path, and
+- Acceptance closes the mailbox in the same commit: `SubmitResult` and
+  `SubmitReview` re-read the task mailbox inside the accepting transaction
+  and hand it to `AcceptResult`/`AcceptVerdict`, which consult it only
+  after the receipt, the incarnation, the stop request and the attempt
+  state and claim (queued or delivered-unacknowledged → the retryable
+  transient outcome with the drain grammar, so a stale or superseded
+  caller is refused `stale` rather than told to drain); a first acceptance
+  closes it atomically, and `SubmitReview`'s also commits the controller's
+  reasons-bearing info notice to the manager;
+  `PlanStore.RequestRetry` is the only reopen path, and
   `taskRepository.Save` persists the flag under the revision discipline
   for the controller's failure-closure settlement.
 - `runtime_bindings.server_instance` maps to
@@ -302,7 +306,17 @@ this package never resolves environment variables or defaults.
   `TestSubmitReviewTransientReasons` — both reasons for results and
   verdicts with Detail and the transient receipt unchanged, a launching
   review attempt with a pending mailbox attempt-not-running, accepted
-  outcomes carrying none); the raced contracts across
+  outcomes carrying none); the one acceptance order for results
+  (`result_eligibility_test.go`: `TestSubmitResultEligibilityBeforeMailbox`
+  — with a message queued to the task, a superseded binding, an
+  incarnation a relaunch replaced, a stop request and an interrupted
+  attempt whose session is still bound are each stale on the first
+  submission and a retry, a launching attempt with an exec_pending claim is
+  attempt-not-running, and only a running attempt is told to drain, each
+  with its receipt and no result row —
+  `TestSubmitResultOldIncarnationStaysStaleWhileTheSuccessorDrains`: the
+  replaced incarnation stays stale before and after its successor
+  incarnation fetches, acks and is accepted); the raced contracts across
   separate handles (`TestFetchFetchRaced` — one serialized in-flight
   message, a delivery row per serve — `TestAckAckRaced`,
   `TestAnswerAnswerRaced`, `TestRequestIDReuseRaced`,

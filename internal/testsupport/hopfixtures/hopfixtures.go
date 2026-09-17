@@ -480,6 +480,30 @@ func SeedChildSession(ctx context.Context, store Store, lease app.Lease, runID, 
 	return sessionID, incarnationID, attemptID, nil
 }
 
+// SupersedeBinding supersedes sessionID's current runtime binding, with
+// fixed replacement-occupant evidence and no successor: the incarnation it
+// carried is no longer current for any verb, and with a binding row
+// present no pending launch intent can make it current again.
+func SupersedeBinding(ctx context.Context, store Store, lease app.Lease, sessionID string, now time.Time) error {
+	return withUOW(ctx, store, lease, func(uow app.UnitOfWork) error {
+		binding, ok, err := uow.Bindings().Current(ctx, identity.SessionID(sessionID))
+		if err != nil {
+			return fmt.Errorf("hopfixtures: current binding: %w", err)
+		}
+		if !ok {
+			return fmt.Errorf("hopfixtures: session %s has no current binding", sessionID)
+		}
+		superseded, err := binding.Supersede("fixture: replacement occupant observed", now)
+		if err != nil {
+			return fmt.Errorf("hopfixtures: supersede binding: %w", err)
+		}
+		if err := uow.Bindings().Save(ctx, superseded); err != nil {
+			return fmt.Errorf("hopfixtures: save superseded binding: %w", err)
+		}
+		return nil
+	})
+}
+
 // SeedInterruptedAttempt reserves the next attempt on taskID and records
 // it straight in its terminal "interrupted" state (reserved ->
 // interrupted is a legal transition): the terminal prior attempt a

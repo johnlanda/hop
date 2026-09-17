@@ -9,39 +9,24 @@ import (
 	"github.com/johnlanda/hop/internal/domain/run"
 )
 
-// featureStore wraps fakeStore with the acceptance-side mailbox contract
-// the real store's slice-3 transactions will own (docs/plan/
-// phase-3-design.md section 5, "Mailbox closure and admission"): the
-// RESULT- and VERDICT-ACCEPTANCE transactions re-read the task's mailbox
-// — a queued or delivered-unacknowledged message refuses the submission
-// with the retryable transient outcome — and acceptance commits AND
-// closes the mailbox atomically. Verdict acceptance additionally
-// enforces the section 8 reviewer-session eligibility the base fake does
-// not model. Receipt order is preserved: a duplicate or conflicting
-// submission resolves BEFORE the mailbox eligibility check, exactly as
-// AcceptResult/AcceptVerdict order their receipts.
+// featureStore wraps fakeStore with the acceptance-side effects the real
+// store's accepting transactions commit (docs/plan/phase-3-design.md
+// section 5, "Mailbox closure and admission"): an accepted result or
+// verdict closes the task's mailbox atomically, and an accepted verdict
+// commits the controller's notice to the manager. The mailbox rule itself
+// — a queued or delivered-unacknowledged message refuses a submission with
+// the retryable transient outcome — is decided by the base fakeStore
+// through AcceptResult and AcceptVerdict, after every other eligibility
+// check, exactly as the real store decides it. Verdict acceptance
+// additionally enforces the section 8 reviewer-session eligibility.
+// Receipt order is preserved: a duplicate or conflicting submission
+// resolves BEFORE any eligibility check.
 type featureStore struct{ *fakeStore }
 
 func (s *featureStore) SubmitResult(ctx context.Context, submission app.ResultSubmission) (app.SubmissionOutcome, error) { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
-	s.mu.Lock()
-	_, hasPrior := s.Results[submission.AttemptID]
-	taskID := submission.TaskID
-	mailboxPending := !s.mailboxClearLocked(taskID)
-	s.mu.Unlock()
-
-	if !hasPrior && mailboxPending {
-		outcome := app.SubmissionOutcome{
-			Kind: app.SubmissionTransient, Detail: "transient: undelivered messages; drain with hop msg next, ack, then resubmit",
-			Transient: app.TransientUndeliveredMessages,
-		}
-		s.mu.Lock()
-		s.Submissions = append(s.Submissions, outcome)
-		s.mu.Unlock()
-		return outcome, nil
-	}
 	outcome, err := s.fakeStore.SubmitResult(ctx, submission)
 	if err == nil && outcome.Kind == app.SubmissionAccepted {
-		s.closeTaskMailbox(taskID)
+		s.closeTaskMailbox(submission.TaskID)
 	}
 	return outcome, err
 }

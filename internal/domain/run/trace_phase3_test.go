@@ -64,7 +64,7 @@ func TestReferenceTraceFeatureHappyPathDependencyRelease(t *testing.T) {
 	// A submits, and the acceptance commits with it the retirement
 	// intent for A's session.
 	submissionA := run.ResultSubmission{ID: testResultID, CommitOID: "a-commit", Summary: "A done", Digest: "digest-a1"}
-	resultOutcome, err := run.AcceptResult(r, taskA, attemptA, nil, run.AcceptanceContext{IncarnationCurrent: true}, submissionA, later())
+	resultOutcome, err := run.AcceptResult(r, taskA, attemptA, nil, run.AcceptanceContext{IncarnationCurrent: true, MailboxClear: true}, submissionA, later())
 	mustNoError(t, err)
 	r, taskA, attemptA = resultOutcome.Run, resultOutcome.Task, resultOutcome.Attempt
 	mustState(t, "taskA", string(taskA.State), string(run.TaskChecking))
@@ -126,7 +126,7 @@ func TestReferenceTraceFeatureHappyPathDependencyRelease(t *testing.T) {
 	mustNoError(t, err)
 
 	submissionB := run.ResultSubmission{ID: identityOtherResultID, CommitOID: "b-commit", Summary: "B done", Digest: "digest-b1"}
-	resultOutcome, err = run.AcceptResult(r, taskB, attemptB, nil, run.AcceptanceContext{IncarnationCurrent: true}, submissionB, later())
+	resultOutcome, err = run.AcceptResult(r, taskB, attemptB, nil, run.AcceptanceContext{IncarnationCurrent: true, MailboxClear: true}, submissionB, later())
 	mustNoError(t, err)
 	r, taskB, attemptB = resultOutcome.Run, resultOutcome.Task, resultOutcome.Attempt
 	implB, err = implB.Stop(later())
@@ -411,7 +411,7 @@ func TestReferenceTraceWorkerInterruptionRetryProvenance(t *testing.T) {
 
 		submission := run.ResultSubmission{ID: testResultID, CommitOID: "b2-commit", Summary: "B retried", Digest: "digest-b2"}
 		r := run.Run{ID: testRunID, State: run.RunRunning}
-		outcome, err := run.AcceptResult(r, taskB, attemptB2, nil, run.AcceptanceContext{IncarnationCurrent: true}, submission, later())
+		outcome, err := run.AcceptResult(r, taskB, attemptB2, nil, run.AcceptanceContext{IncarnationCurrent: true, MailboxClear: true}, submission, later())
 		mustNoError(t, err)
 		attemptB2, taskB = outcome.Attempt, outcome.Task
 		attemptB2, err = attemptB2.EnterChecking(later())
@@ -502,7 +502,7 @@ func TestReferenceTraceReviewerRejectionAndReReview(t *testing.T) {
 	fixAttempt, err = fixAttempt.MarkRunning(later())
 	mustNoError(t, err)
 	fixSubmission := run.ResultSubmission{ID: testResultID, CommitOID: "fix-commit", Summary: "fix", Digest: "digest-fix-1"}
-	resultOutcome, err := run.AcceptResult(r, fixTask, fixAttempt, nil, run.AcceptanceContext{IncarnationCurrent: true}, fixSubmission, later())
+	resultOutcome, err := run.AcceptResult(r, fixTask, fixAttempt, nil, run.AcceptanceContext{IncarnationCurrent: true, MailboxClear: true}, fixSubmission, later())
 	mustNoError(t, err)
 	r, fixTask, fixAttempt = resultOutcome.Run, resultOutcome.Task, resultOutcome.Attempt
 	fixAttempt, err = fixAttempt.EnterChecking(later())

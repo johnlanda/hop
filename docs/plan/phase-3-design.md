@@ -742,7 +742,17 @@ delivered-unacknowledged message addresses the task, the submission is
 refused with the retryable outcome `transient: undelivered messages;
 drain with hop msg next, ack, then resubmit` (a receipt, no state
 change); if the mailbox is clear, acceptance commits AND closes the
-mailbox atomically. Closure is not only acceptance's: EVERY transaction
+mailbox atomically. Results and verdicts share ONE acceptance order
+(`AcceptResult`, `AcceptVerdict`): a prior accepted result or verdict
+first (duplicate or conflicting), then the caller's incarnation
+currency, the run's stop request, the attempt's state and launch claim,
+and only then the mailbox. A caller that can never be accepted — a
+superseded or replaced incarnation, a run with a stop request, an attempt
+already terminal — is therefore refused `stale` rather than told to
+drain a queue its own fetch could never serve, and an attempt still
+launching with an unsettled claim is told `transient: attempt not yet
+running; retry` whatever its mailbox holds; only an otherwise eligible
+caller gets the drain line. Closure is not only acceptance's: EVERY transaction
 that makes the recipient permanently non-resumable closes admission in
 the same commit — a task settling `failed` (retry exhaustion or an
 unretryable terminal attempt, with or without any accepted result)
@@ -1471,7 +1481,7 @@ parsing those same lines (section 11):
 
 | Verb | First line on success | First line on retryable non-success |
 | --- | --- | --- |
-| `hop result submit` | `accepted <result-uuid>` / `duplicate <result-uuid>` | `transient: attempt not yet running; retry` (Phase 2, unchanged: the attempt's launch claim has not settled); feature mode adds `transient: undelivered messages; drain with hop msg next, ack, then resubmit` (the section 5 mailbox rule) |
+| `hop result submit` | `accepted <result-uuid>` / `duplicate <result-uuid>` | `transient: attempt not yet running; retry` (Phase 2, unchanged: the attempt's launch claim has not settled — checked before the mailbox); feature mode adds `transient: undelivered messages; drain with hop msg next, ack, then resubmit` (the section 5 mailbox rule) |
 | `hop msg next` | `message <uuid> kind=<kind> from=<principal>[ reply-to=<uuid>][ relay-of=<uuid>][ origin=<uuid>]` then `body: <abs path>` then `ack: hop msg ack <uuid>` — `origin` appears on an `answer` whose reply-to question carries relay provenance: the store resolves reply-to → relayed_from server-side and prints the ORIGINAL question's ID, so a restarted manager forwards a human answer using only the envelope, no store spelunking | `none: no queued message` |
 | `hop msg wait` | as `next` | `none: no message within <timeout>; run hop msg wait again` |
 | `hop msg show <uuid>` | `message <uuid> kind=<kind> from=<principal> to=<address>[ reply-to=<uuid>][ relay-of=<uuid>] seq=<n>` then `body: <abs path>` then one `delivered: <session> <time>` line per delivery and `acknowledged: <time>` when acked — a READ-ONLY same-run envelope lookup (any of the run's sessions, or the human context), the historical recovery surface for relay chains and audits; it writes nothing, delivers nothing and never substitutes for `next` | `refused: not-found` |
@@ -1492,7 +1502,11 @@ where the store decides — and the CLI prints exactly the line that reason
 selects, never inferring it from detail text; a transient outcome naming
 no known reason is an error and prints no protocol line. A worker that
 could not tell the two apart would retry an undrained submission
-forever. It is the only
+forever. Both verbs decide in section 5's one acceptance order, so the
+drain line reaches only a caller whose incarnation is current, whose run
+has no stop request and whose attempt can still accept — exactly a
+caller whose own `hop msg next` is served — while a caller that can
+never be accepted gets the final `stale` outcome instead. It is the only
 stdout line, any detail goes to stderr, nothing changed, and the caller
 reruns the same command (same `--request-id`) after a short delay. The assignment and role templates quote these lines verbatim from the
 same constants, so template, CLI and fixture can never drift apart

@@ -442,8 +442,11 @@ sides together. `cmd/hop` never imports domain or identity types: every
   the transaction first read, strict lease expiry, binding-key uniqueness,
   claim-settlement legality, operation-payload serializability failing the
   commit atomically), `SubmitResult` applies existence/agreement before
-  receipts and moves the same row revisions the real acceptance and stop
-  transactions do (`TestWorkerWritesMoveRevisions`), `ClaimLaunch`
+  receipts, hands the task's mailbox (`mailboxClearLocked`) to
+  `AcceptResult` exactly as the real store does, and moves the same row
+  revisions the real acceptance and stop transactions do
+  (`TestWorkerWritesMoveRevisions`; the `featureStore` wrapper adds only
+  the acceptance's mailbox closure and the verdict notice), `ClaimLaunch`
   enforces the stop/incarnation-currency/different-pid rules, every
   caller-incarnation check (the claim, the plan verbs, message send, fetch
   and ack, review and result submission) decides through ONE fake helper
@@ -991,6 +994,14 @@ sides together. `cmd/hop` never imports domain or identity types: every
     (AcceptVerdict's order), accepted outcomes carry no reason, and both
     driving use cases return `ErrTransientReasonInvalid` for a store
     outcome whose reason does not match its kind.
+  - `go test ./internal/app -run TestFakeSubmitResultEligibilityBeforeMailbox` —
+    `fakes_result_eligibility_test.go`, the fake half of the sqlite
+    adapter's `TestSubmitResultEligibilityBeforeMailbox`, vector for
+    vector: with a message queued to the task, a superseded binding, an
+    incarnation a relaunch replaced, a stop request and an interrupted
+    attempt are stale, a launching attempt with an exec_pending claim is
+    attempt-not-running, and only a running attempt is told to drain,
+    with no result recorded.
   - `go test ./internal/app -run TestStatus` — the presentation/status
     integration: the feature-mode task table (seq, kind, state,
     dependencies, attempt count); the run's most recently created

@@ -998,8 +998,12 @@ func (s *fakeStore) SubmitResult(_ context.Context, submission app.ResultSubmiss
 	}
 	claim, hasClaim := s.LaunchClaims[submission.IncarnationID]
 	launchClaimSettled := hasClaim && claim.State == app.LaunchClaimExeced
+	// The real store re-reads the task's mailbox inside the accepting
+	// transaction and hands it to AcceptResult, which consults it last; a
+	// solo task, which no message ever addresses, is clear.
+	mailboxClear := s.mailboxClearLocked(submission.TaskID)
 
-	ctx := run.AcceptanceContext{IncarnationCurrent: incarnationCurrent, LaunchClaimSettled: launchClaimSettled}
+	ctx := run.AcceptanceContext{IncarnationCurrent: incarnationCurrent, LaunchClaimSettled: launchClaimSettled, MailboxClear: mailboxClear}
 	outcomeVal, err := run.AcceptResult(rRow.value, tRow.value, aRow.value, prior, ctx, run.ResultSubmission{
 		ID: submission.ID, CommitOID: submission.CommitOID, Summary: submission.Summary, Digest: submission.Digest,
 	}, now)
@@ -1026,9 +1030,13 @@ func (s *fakeStore) SubmitResult(_ context.Context, submission app.ResultSubmiss
 		outcome = app.SubmissionOutcome{Kind: app.SubmissionDuplicate, ResultID: outcomeVal.Result.ID}
 	case errors.Is(err, run.ErrConflictingResult):
 		outcome = app.SubmissionOutcome{Kind: app.SubmissionConflicting, ResultID: outcomeVal.Result.ID}
-	case errors.Is(err, run.ErrTransientNotRunning):
+	case errors.Is(err, run.ErrTransientNotRunning), errors.Is(err, run.ErrMailboxNotClear):
 		reason, _ := app.TransientReasonOf(err)
-		outcome = app.SubmissionOutcome{Kind: app.SubmissionTransient, Detail: "attempt not yet running; retry", Transient: reason}
+		detail := "attempt not yet running; retry"
+		if reason == app.TransientUndeliveredMessages {
+			detail = "transient: undelivered messages; drain with hop msg next, ack, then resubmit"
+		}
+		outcome = app.SubmissionOutcome{Kind: app.SubmissionTransient, Detail: detail, Transient: reason}
 	default:
 		outcome = app.SubmissionOutcome{Kind: app.SubmissionStale, Detail: err.Error()}
 	}
