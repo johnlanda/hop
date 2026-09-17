@@ -51,21 +51,22 @@ const fixtureHoldMarker = "FIXTURE-HOLD-BARRIER"
 // persistent index file, so a test can hand the principal exactly the
 // message sequence a scenario would; next and wait render DISTINCT
 // empty-queue lines, per design section 7's grammar, once the script is
-// exhausted or absent. Message ids used inside test-authored fakeMessageBlock
-// scripts are deliberately test-owned LABELS (e.g. "msg-hold-question"),
-// not UUIDs, so this fake's own UUID validation is scoped to the caller
-// IDENTITIES (HOP_RUN_ID/HOP_SESSION_ID/HOP_TASK_ID/HOP_ATTEMPT_ID/
-// HOP_INCARNATION_ID) and to task ids this fake itself mints
-// (task create's own id, --depends-on, task retry's positional
-// argument) — never to a message's own reply-to/relay-of/ack target,
-// which real production code never requires to be UUID-shaped either
-// (an opaque message id is still just an id).
+// exhausted or absent. Message ids used inside test-authored
+// fakeMessageBlock scripts are canonical lowercase UUIDs (Astra pass 2 F5:
+// real AckMessage/SendMessage call identity.ParseMessageID on ack targets
+// and on --reply-to/--relay-of, so a label like "msg-hold-question" would
+// succeed against this fake but never against the real binary), validated
+// here the same way as the caller identities (HOP_RUN_ID/HOP_SESSION_ID/
+// HOP_TASK_ID/HOP_ATTEMPT_ID/HOP_INCARNATION_ID) and the task ids this
+// fake itself mints (task create's own id, --depends-on, task retry's
+// positional argument).
 const fakeHopSource = `package main
 
 import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -159,14 +160,20 @@ func requireEnv(names ...string) map[string]string {
 
 // requireCallerContext validates the caller-identity contract every
 // manager and message verb shares (HOP_RUN_ID/HOP_SESSION_ID/
-// HOP_INCARNATION_ID, every one UUID-shaped) — task create/retry, plan
-// close and msg send/next/wait/ack all resolve their caller this same
-// way, regardless of role (manager, worker or reviewer).
+// HOP_INCARNATION_ID, every one UUID-shaped, plus an absolute
+// HOP_STATE_DIR — cmd/hop's requireWorkerStateRoot, which every message
+// command calls, refuses a missing or relative value rather than
+// resolving a default) — task create/retry, plan close and msg
+// send/next/wait/ack all resolve their caller this same way, regardless
+// of role (manager, worker or reviewer).
 func requireCallerContext() {
-	env := requireEnv("HOP_RUN_ID", "HOP_SESSION_ID", "HOP_INCARNATION_ID")
+	env := requireEnv("HOP_RUN_ID", "HOP_SESSION_ID", "HOP_INCARNATION_ID", "HOP_STATE_DIR")
 	requireUUID("HOP_RUN_ID", env["HOP_RUN_ID"])
 	requireUUID("HOP_SESSION_ID", env["HOP_SESSION_ID"])
 	requireUUID("HOP_INCARNATION_ID", env["HOP_INCARNATION_ID"])
+	if !filepath.IsAbs(env["HOP_STATE_DIR"]) {
+		usageFail("HOP_STATE_DIR is not an absolute path")
+	}
 }
 
 func requireUUID(label, value string) string {
@@ -310,20 +317,47 @@ func runPlanClose(args []string) {
 	fmt.Println("plan closed")
 }
 
-// runMsgSend validates hop msg send's real contract: --kind required;
-// --to required unless --kind answer (forbidden then); --reply-to
-// required for --kind answer (forbidden otherwise); exactly one of
-// --file/--body, the file readable; no positional arguments; a session
-// context (every sender role — manager, worker, reviewer — resolves the
-// same way).
+// isSupportedMessageKind mirrors internal/app/usecase_message.go's
+// parseMessageKind: exactly question, info or answer.
+func isSupportedMessageKind(s string) bool {
+	switch s {
+	case "question", "info", "answer":
+		return true
+	default:
+		return false
+	}
+}
+
+// isSupportedAddress mirrors internal/app/usecase_message.go's
+// parseAddress: manager, human, or task:<uuid>.
+func isSupportedAddress(s string) bool {
+	switch {
+	case s == "manager", s == "human":
+		return true
+	case strings.HasPrefix(s, "task:"):
+		return isUUIDShape(strings.TrimPrefix(s, "task:"))
+	default:
+		return false
+	}
+}
+
+// runMsgSend validates hop msg send's real contract: --kind required and
+// one of question/info/answer; --to required (and a recognized address)
+// unless --kind answer (forbidden then); --reply-to required for --kind
+// answer (forbidden otherwise), and — like --relay-of — UUID-shaped when
+// supplied, mirroring identity.ParseMessageID; exactly one of --file/
+// --body, the resulting body non-empty (the real use case's own
+// MessageMalformed rule); no positional arguments; a session context
+// (every sender role — manager, worker, reviewer — resolves the same
+// way).
 func runMsgSend(args []string) {
 	fs := flag.NewFlagSet("msg send", flag.ContinueOnError)
 	to := fs.String("to", "", "")
 	kind := fs.String("kind", "", "")
 	replyTo := fs.String("reply-to", "", "")
-	fs.String("relay-of", "", "")
+	relayOf := fs.String("relay-of", "", "")
 	file := fs.String("file", "", "")
-	fs.String("body", "", "")
+	body := fs.String("body", "", "")
 	fs.String("request-id", "", "")
 	rest := parseFlags(fs, args)
 	supplied := map[string]bool{}
@@ -333,6 +367,9 @@ func runMsgSend(args []string) {
 	}
 	if *kind == "" {
 		usageFail("msg send: --kind is required")
+	}
+	if !isSupportedMessageKind(*kind) {
+		usageFail("msg send: --kind %q is not one of question, info, answer", *kind)
 	}
 	if *kind == "answer" {
 		if supplied["to"] {
@@ -345,30 +382,48 @@ func runMsgSend(args []string) {
 		if *to == "" {
 			usageFail("msg send: --to is required")
 		}
+		if !isSupportedAddress(*to) {
+			usageFail("msg send: --to %q is not a recognized address (manager, human, task:<uuid>)", *to)
+		}
 		if supplied["reply-to"] {
 			usageFail("msg send: --reply-to is only valid for --kind answer")
 		}
 	}
+	if supplied["reply-to"] {
+		requireUUID("--reply-to", *replyTo)
+	}
+	if supplied["relay-of"] {
+		requireUUID("--relay-of", *relayOf)
+	}
 	if supplied["file"] == supplied["body"] {
 		usageFail("msg send: exactly one of --file and --body is required")
 	}
+	var bodyBytes []byte
 	if supplied["file"] {
-		requireReadableFile("--file", *file)
+		bodyBytes = requireReadableFile("--file", *file)
+	} else {
+		bodyBytes = []byte(*body)
+	}
+	if len(bodyBytes) == 0 {
+		usageFail("msg send: body is empty")
 	}
 	requireCallerContext()
 	fmt.Println("sent 99999999-9999-4999-8999-999999999999")
 }
 
 // runMsgFetch validates hop msg next/wait's real contract: no positional
-// arguments, a session context. waitVerb selects between the two verbs'
+// arguments, a session context, and — for wait — a real duration
+// --timeout that a nonsense value fails to parse (flag.Duration exits 2
+// on a bad value exactly like every other malformed flag, mirroring the
+// real CLI's own duration flag). waitVerb selects between the two verbs'
 // DISTINCT empty-queue lines (design section 7's grammar: next's is the
 // fixed "none: no queued message"; wait's names its own timeout) once
 // the scripted message sequence is exhausted or absent.
 func runMsgFetch(args []string, waitVerb bool) {
 	fs := flag.NewFlagSet("msg fetch", flag.ContinueOnError)
-	var timeout *string
+	var timeout *time.Duration
 	if waitVerb {
-		timeout = fs.String("timeout", "3s", "")
+		timeout = fs.Duration("timeout", 3*time.Second, "")
 	}
 	rest := parseFlags(fs, args)
 	if len(rest) > 0 {
@@ -380,22 +435,22 @@ func runMsgFetch(args []string, waitVerb bool) {
 	}
 	if waitVerb {
 		time.Sleep(50 * time.Millisecond)
-		fmt.Println("none: no message within " + *timeout + "; run hop msg wait again")
+		fmt.Println("none: no message within " + timeout.String() + "; run hop msg wait again")
 		return
 	}
 	fmt.Println("none: no queued message")
 }
 
 // runMsgAck validates hop msg ack's real contract: exactly one
-// positional message-id, a session context. The message id itself is
-// NEVER validated as UUID-shaped: fakeMessageBlock's own scripted ids
-// are test-owned labels, matching how real message ids are opaque too.
+// positional message-id, UUID-shaped (identity.ParseMessageID's
+// contract), a session context.
 func runMsgAck(args []string) {
 	fs := flag.NewFlagSet("msg ack", flag.ContinueOnError)
 	rest := parseFlags(fs, args)
 	if len(rest) != 1 {
 		usageFail("msg ack: exactly one message-id argument is required")
 	}
+	requireUUID("message-id", rest[0])
 	requireCallerContext()
 	fmt.Println("acknowledged " + rest[0])
 }
@@ -702,11 +757,23 @@ func TestFixtureManagerScriptDispatch(t *testing.T) {
 	// does not key off it — detection is via hop status only.
 	rejectNoticeBody := writeBody("verdict-notice.txt", "fixture reviewer reasons: reject\n")
 
+	const (
+		msgHoldQuestionID  = "55555555-5555-4555-8555-555555555555"
+		msgHumanAnswerID   = "66666666-6666-4666-8666-666666666666"
+		msgNeedsReworkID   = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+		msgRejectVerdictID = "ffffffff-ffff-4fff-8fff-ffffffffffff"
+		// msgRelayedQuestionID is the fixed id the fake hop stub's own "msg
+		// send" always returns ("sent 99999999-..."): the human-facing
+		// relay question's reply-to must equal it, exactly as the real
+		// manager extracts the question id from that CLI response rather
+		// than guessing one.
+		msgRelayedQuestionID = "99999999-9999-4999-8999-999999999999"
+	)
 	blocks := []string{
-		fakeMessageBlock("msg-hold-question", "question", "worker-session-1", "", "", holdBody),
-		fakeMessageBlock("msg-human-answer", "answer", "human", "msg-relay-question", "msg-hold-question", humanAnswerBody),
-		fakeMessageBlock("msg-needs-rework", "info", "controller", "", "", needsReworkBody),
-		fakeMessageBlock("msg-reject-verdict", "info", "controller", "", "", rejectNoticeBody),
+		fakeMessageBlock(msgHoldQuestionID, "question", "worker-session-1", "", "", holdBody),
+		fakeMessageBlock(msgHumanAnswerID, "answer", "human", msgRelayedQuestionID, msgHoldQuestionID, humanAnswerBody),
+		fakeMessageBlock(msgNeedsReworkID, "info", "controller", "", "", needsReworkBody),
+		fakeMessageBlock(msgRejectVerdictID, "info", "controller", "", "", rejectNoticeBody),
 	}
 	scriptPath, indexPath := writeFakeHopMsgScript(t, scriptDir, blocks)
 	counterPath := newFakeHopTaskCounter(t, scriptDir)
@@ -745,7 +812,7 @@ func TestFixtureManagerScriptDispatch(t *testing.T) {
 		// (STATUS-1's manager verdict channel) matches this notice and
 		// plans a fix from it.
 		"FAKE_HOP_STATUS_SHORTFALL=verdict-rejected",
-		"FAKE_HOP_STATUS_REVIEW=99999999-9999-4999-8999-999999999999",
+		"FAKE_HOP_STATUS_REVIEW=dddddddd-dddd-4ddd-8ddd-dddddddddddd",
 		"FAKE_HOP_STATUS_SUBJECT=cccccccccccccccccccccccccccccccccccccccc",
 		"FAKE_HOP_STATUS_REASONS=" + rejectNoticeBody,
 	}
@@ -765,14 +832,14 @@ func TestFixtureManagerScriptDispatch(t *testing.T) {
 		"FIXTURE-TASK-CREATED label=[t1] id=[00000000-0000-4000-8000-000000000001]",
 		"FIXTURE-TASK-CREATED label=[t2] id=[00000000-0000-4000-8000-000000000002]",
 		"FIXTURE-PLAN-CLOSED",
-		"FIXTURE-RELAYED question=[msg-hold-question]",
-		"FIXTURE-FORWARDED origin=[msg-hold-question]",
+		"FIXTURE-RELAYED question=[" + msgHoldQuestionID + "]",
+		"FIXTURE-FORWARDED origin=[" + msgHoldQuestionID + "]",
 		"FIXTURE-RETRIED label=[t1] result=[retry accepted t0 attempt 2]",
 		"FIXTURE-STATUS-CHECKED matched=[true]",
 		// fixCounter starts at len(script.Tasks) (2: t1, t2), so the first
 		// fix task's own local label is "fix3", not "fix1" — a manager-side
 		// bookkeeping label distinct from the store's own t<seq> numbering.
-		"FIXTURE-FIX-TASK-CREATED label=[fix3] id=[00000000-0000-4000-8000-000000000003] review=[99999999-9999-4999-8999-999999999999]",
+		"FIXTURE-FIX-TASK-CREATED label=[fix3] id=[00000000-0000-4000-8000-000000000003] review=[dddddddd-dddd-4ddd-8ddd-dddddddddddd]",
 	} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("manager stdout missing %q; got:\n%s", want, stdout)
@@ -785,8 +852,8 @@ func TestFixtureManagerScriptDispatch(t *testing.T) {
 		"task\tcreate\t--title\tImplement t2\t--file\t",
 		"--depends-on\t00000000-0000-4000-8000-000000000001",
 		"plan\tclose",
-		"msg\tsend\t--to\thuman\t--kind\tquestion\t--relay-of\tmsg-hold-question\t--file\t" + holdBody,
-		"msg\tsend\t--kind\tanswer\t--reply-to\tmsg-hold-question\t--file\t" + humanAnswerBody,
+		"msg\tsend\t--to\thuman\t--kind\tquestion\t--relay-of\t" + msgHoldQuestionID + "\t--file\t" + holdBody,
+		"msg\tsend\t--kind\tanswer\t--reply-to\t" + msgHoldQuestionID + "\t--file\t" + humanAnswerBody,
 		"task\tretry\t--reason\tfixture retry after interruption\t--request-id\t",
 		"status\t-C\t" + cwd + "\t-run\t" + runID,
 		"task\tcreate\t--title\tfix from reject\t--file\t",
@@ -795,7 +862,7 @@ func TestFixtureManagerScriptDispatch(t *testing.T) {
 			t.Errorf("fake hop invocation log missing %q; got:\n%s", want, log)
 		}
 	}
-	for _, id := range []string{"msg-hold-question", "msg-human-answer", "msg-needs-rework", "msg-reject-verdict"} {
+	for _, id := range []string{msgHoldQuestionID, msgHumanAnswerID, msgNeedsReworkID, msgRejectVerdictID} {
 		if !strings.Contains(log, "msg\tack\t"+id) {
 			t.Errorf("fake hop invocation log missing an ack of %s; got:\n%s", id, log)
 		}
@@ -1009,7 +1076,7 @@ func runVerdictCorrelationCase(t *testing.T, artifacts *artifactDir, noticeBodyP
 	scriptDir := filepath.Dir(fx.counterPath)
 	var blocks []string
 	for i, body := range noticeBodyPaths {
-		blocks = append(blocks, fakeMessageBlock(fmt.Sprintf("msg-notice-%d", i), "info", "controller", "", "", body))
+		blocks = append(blocks, fakeMessageBlock(fmt.Sprintf("cccccccc-0000-4000-8000-%012d", i), "info", "controller", "", "", body))
 	}
 	scriptPath, indexPath := writeFakeHopMsgScript(t, scriptDir, blocks)
 
@@ -1261,7 +1328,8 @@ func TestFixtureWorkerHoldBarrier(t *testing.T) {
 	// The barrier release's reply-to must equal the fixed id the fake hop
 	// stub's own "msg send" always returns ("sent 99999999-...") — the
 	// worker extracts the question id from THAT response, never a guess.
-	blocks := []string{fakeMessageBlock("msg-answer", "answer", "manager-session", "99999999-9999-4999-8999-999999999999", "", answerBody)}
+	const msgAnswerID = "aaaaaaaa-2222-4aaa-8222-222222222222"
+	blocks := []string{fakeMessageBlock(msgAnswerID, "answer", "manager-session", "99999999-9999-4999-8999-999999999999", "", answerBody)}
 	scriptPath, indexPath := writeFakeHopMsgScript(t, scriptDir, blocks)
 	logPath := filepath.Join(scriptDir, "log.txt")
 
@@ -1295,7 +1363,7 @@ func TestFixtureWorkerHoldBarrier(t *testing.T) {
 	for _, want := range []string{
 		"FIXTURE-WORKER-READY",
 		"FIXTURE-HOLD-SENT question=[99999999-9999-4999-8999-999999999999]",
-		"FIXTURE-HOLD-RELEASED answer=[msg-answer]",
+		"FIXTURE-HOLD-RELEASED answer=[" + msgAnswerID + "]",
 		"FIXTURE-SUBMIT-RESULT",
 		"FIXTURE-WORKER-IDLE",
 	} {
@@ -1307,7 +1375,7 @@ func TestFixtureWorkerHoldBarrier(t *testing.T) {
 	if !strings.Contains(log, "msg\tsend\t--to\tmanager\t--kind\tquestion\t--file\t") {
 		t.Errorf("fake hop invocation log missing the barrier question send; got:\n%s", log)
 	}
-	if !strings.Contains(log, "msg\tack\tmsg-answer") {
+	if !strings.Contains(log, "msg\tack\t"+msgAnswerID) {
 		t.Errorf("fake hop invocation log missing the release answer's ack; got:\n%s", log)
 	}
 	if !strings.Contains(log, "result\tsubmit\t") {
@@ -1359,7 +1427,8 @@ func TestFixtureWorkerHoldMissingBodyFailsLoudly(t *testing.T) {
 	// Deliberately never created: the answer envelope names a body path
 	// this fixture must attempt to read and fail on, never silently skip.
 	missingBody := filepath.Join(scriptDir, "does-not-exist.txt")
-	blocks := []string{fakeMessageBlock("msg-answer", "answer", "manager-session", "99999999-9999-4999-8999-999999999999", "", missingBody)}
+	const msgAnswerID = "bbbbbbbb-3333-4bbb-8333-333333333333"
+	blocks := []string{fakeMessageBlock(msgAnswerID, "answer", "manager-session", "99999999-9999-4999-8999-999999999999", "", missingBody)}
 	scriptPath, indexPath := writeFakeHopMsgScript(t, scriptDir, blocks)
 	logPath := filepath.Join(scriptDir, "log.txt")
 
@@ -1399,7 +1468,7 @@ func TestFixtureWorkerHoldMissingBodyFailsLoudly(t *testing.T) {
 	}
 
 	log := readFakeHopLog(t, logPath)
-	if strings.Contains(log, "msg\tack\tmsg-answer") {
+	if strings.Contains(log, "msg\tack\t"+msgAnswerID) {
 		t.Errorf("fixture acked a message whose body it never successfully read; log:\n%s", log)
 	}
 }
@@ -1437,7 +1506,8 @@ func TestFixtureWorkerDrainsOnUndeliveredResultTransient(t *testing.T) {
 	if err := os.WriteFile(pendingBody, []byte("pending notice\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	blocks := []string{fakeMessageBlock("msg-pending", "info", "manager-session", "", "", pendingBody)}
+	const msgPendingID = "cccccccc-4444-4ccc-8444-444444444444"
+	blocks := []string{fakeMessageBlock(msgPendingID, "info", "manager-session", "", "", pendingBody)}
 	scriptPath, indexPath := writeFakeHopMsgScript(t, scriptDir, blocks)
 	logPath := filepath.Join(scriptDir, "log.txt")
 	undeliveredCounterPath := filepath.Join(scriptDir, "undelivered-counter.txt")
@@ -1479,13 +1549,89 @@ func TestFixtureWorkerDrainsOnUndeliveredResultTransient(t *testing.T) {
 	}
 
 	log := readFakeHopLog(t, logPath)
-	if !strings.Contains(log, "msg\tack\tmsg-pending") {
+	if !strings.Contains(log, "msg\tack\t"+msgPendingID) {
 		t.Errorf("fixture never drained (acked) the pending message between submit attempts; log:\n%s", log)
 	}
 	firstSubmit := strings.Index(log, "result\tsubmit\t")
-	ackIdx := strings.Index(log, "msg\tack\tmsg-pending")
+	ackIdx := strings.Index(log, "msg\tack\t"+msgPendingID)
 	secondSubmit := strings.LastIndex(log, "result\tsubmit\t")
 	if firstSubmit < 0 || ackIdx < 0 || firstSubmit >= ackIdx || ackIdx >= secondSubmit {
 		t.Errorf("the drain did not happen strictly between the two submit attempts; log:\n%s", log)
+	}
+}
+
+// fakeHopValidEnv returns a legitimate message-verb environment (a
+// UUID-shaped caller context, absolute HOP_STATE_DIR), with overrides
+// applied on top — a table case sets exactly the one field it means to
+// break, so a failure can only be attributed to that field.
+func fakeHopValidEnv(t *testing.T, artifacts *artifactDir, overrides map[string]string) []string {
+	t.Helper()
+	fields := map[string]string{
+		"PATH":               os.Getenv("PATH"),
+		"HOP_STATE_DIR":      artifacts.dir(t, "fake-hop-contract-state"),
+		"HOP_RUN_ID":         "10101010-1010-4101-8101-101010101010",
+		"HOP_SESSION_ID":     "20202020-2020-4202-8202-202020202020",
+		"HOP_INCARNATION_ID": "30303030-3030-4303-8303-303030303030",
+	}
+	for k, v := range overrides {
+		fields[k] = v
+	}
+	env := make([]string, 0, len(fields))
+	for k, v := range fields {
+		env = append(env, k+"="+v)
+	}
+	return env
+}
+
+// TestFakeHopRejectsInvalidInvocations proves the fake hop stub's
+// argv/context contract (Astra pass 2 finding F5): every invocation below
+// is exactly the shape the real binary refuses before any store logic
+// ever runs (identity.ParseMessageID's canonical-lowercase-UUID contract
+// on ack/reply-to/relay-of, parseMessageKind's question/info/answer set,
+// parseAddress's manager/human/task:<uuid> set, SendMessage's non-empty-
+// body rule, flag.Duration's own parse failure on a nonsense --timeout,
+// and requireWorkerStateRoot's absolute-path/present rule) — so this fake
+// must fail on all of them too, exit 2 (a usage error, never a scripted
+// "refused:" business outcome), rather than silently accepting a shape no
+// real hop invocation ever could.
+func TestFakeHopRejectsInvalidInvocations(t *testing.T) {
+	artifacts := newArtifactDir(t)
+	fakeHop := buildFakeHopStub(t, artifacts)
+
+	const validMessageID = "40404040-4040-4404-8404-404040404040"
+	tests := []struct {
+		name      string
+		args      []string
+		overrides map[string]string
+	}{
+		{"msg ack: message id is not UUID-shaped", []string{"msg", "ack", "not-a-uuid"}, nil},
+		{"msg send: reply-to is not UUID-shaped", []string{"msg", "send", "--kind", "answer", "--reply-to", "not-a-uuid", "--body", "x"}, nil},
+		{"msg send: relay-of is not UUID-shaped", []string{"msg", "send", "--kind", "question", "--to", "human", "--relay-of", "not-a-uuid", "--body", "x"}, nil},
+		{"msg send: unsupported kind", []string{"msg", "send", "--kind", "bogus", "--to", "manager", "--body", "x"}, nil},
+		{"msg send: unrecognized address", []string{"msg", "send", "--kind", "question", "--to", "somewhere", "--body", "x"}, nil},
+		{"msg send: task address is not UUID-shaped", []string{"msg", "send", "--kind", "info", "--to", "task:not-a-uuid", "--body", "x"}, nil},
+		{"msg send: empty inline body", []string{"msg", "send", "--kind", "question", "--to", "manager", "--body", ""}, nil},
+		{"msg wait: nonsense --timeout", []string{"msg", "wait", "--timeout", "not-a-duration"}, nil},
+		{"message verb: relative HOP_STATE_DIR", []string{"msg", "ack", validMessageID}, map[string]string{"HOP_STATE_DIR": "relative/path"}},
+		{"message verb: missing HOP_STATE_DIR", []string{"msg", "ack", validMessageID}, map[string]string{"HOP_STATE_DIR": ""}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, fakeHop, tc.args...) //nolint:gosec // G204: fixed test-owned binary; args are this table's own fixed literals.
+			cmd.Env = fakeHopValidEnv(t, artifacts, tc.overrides)
+			out, err := cmd.CombinedOutput()
+			if err == nil {
+				t.Fatalf("invocation succeeded, want a usage failure; output:\n%s", out)
+			}
+			exitErr, ok := err.(*exec.ExitError) //nolint:errorlint // a direct type assertion suffices for this test's own exec of a single known binary.
+			if !ok {
+				t.Fatalf("run error = %v (%T), want *exec.ExitError", err, err)
+			}
+			if exitErr.ExitCode() != 2 {
+				t.Errorf("exit code = %d, want 2 (a usage error, not a scripted refusal); output:\n%s", exitErr.ExitCode(), out)
+			}
+		})
 	}
 }
