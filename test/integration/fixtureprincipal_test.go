@@ -1538,6 +1538,80 @@ func TestFixtureManagerNeverRetriesRefused(t *testing.T) {
 	}
 }
 
+// TestFixtureManagerFetchLoopFatalsOnUnexpectedRefusal proves runManager's
+// own idle-poll loop shares fetchDeliveredMessage's exact discipline, not
+// its own inline retry-on-anything loop: a hop msg wait outcome that is
+// neither a delivered message, "none:" nor "transient:" fatalf's, and a
+// line carrying the messaging-unauthorized fetch refusal's stable
+// substring fatalf's too -- never spin silently against a permanent
+// regression. Mirrors TestFixtureWorkerHoldFetchLoopFatalsOnUnexpectedRefusal
+// at the manager role, since a relaunched manager's own first fetch runs
+// in the identical pre-binding window a relaunched worker's does.
+func TestFixtureManagerFetchLoopFatalsOnUnexpectedRefusal(t *testing.T) {
+	cases := []struct {
+		name          string
+		block         string
+		wantFatalText string
+	}{
+		{
+			name:          "a genuinely unexpected refusal",
+			block:         "refused: not-found\n",
+			wantFatalText: `fixture principal: hop msg wait returned an unexpected line: "refused: not-found"`,
+		},
+		{
+			name: "the messaging-unauthorized fetch refusal",
+			block: "hop msg wait: app: fetch message: app: messaging session is not authorized for this request: " +
+				"session is not the run's current manager session\n",
+			wantFatalText: "fixture principal: hop msg wait returned an unauthorized fetch refusal for what should be a current session",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			artifacts := newArtifactDir(t)
+			fx := buildManagerScriptDispatchFixture(t, artifacts)
+
+			scriptDir := filepath.Dir(fx.counterPath)
+			scriptPath, indexPath := writeFakeHopMsgScript(t, scriptDir, []string{tc.block})
+
+			const rolePath, cribPath = "/state/runs/a1/artifacts/roles/manager.md", "/state/runs/a1/artifacts/worker-protocol.md"
+			prompt := testManagerInitialPrompt(fx.assignmentPath, rolePath, cribPath, fx.fakeHop)
+
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, fx.principal, "--session-id", "22222222-2222-2222-2222-222222222222", prompt) //nolint:gosec // G204: fixed test-owned binary and arguments.
+			cmd.Dir = fx.cwd
+			cmd.Env = []string{
+				"PATH=" + os.Getenv("PATH"),
+				"HOP_STATE_DIR=" + fx.stateDir,
+				"HOP_RUN_ID=" + fx.runID,
+				"HOP_SESSION_ID=33333333-3333-3333-3333-333333333333",
+				"HOP_INCARNATION_ID=44444444-4444-4444-4444-444444444444",
+				"HOP_ROLE=manager",
+				"FAKE_HOP_MSG_SCRIPT=" + scriptPath,
+				"FAKE_HOP_MSG_INDEX=" + indexPath,
+				"FAKE_HOP_TASK_COUNTER_FILE=" + fx.counterPath,
+				"FAKE_HOP_LOG=" + fx.logPath,
+			}
+			var out strings.Builder
+			cmd.Stdout, cmd.Stderr = &out, &out
+			runErr := cmd.Run()
+			if runErr == nil {
+				t.Fatalf("manager exited 0 despite an unexpected hop msg wait refusal; output:\n%s", out.String())
+			}
+			exitErr, ok := runErr.(*exec.ExitError) //nolint:errorlint // a direct type assertion suffices for this test's own exec of a single known binary.
+			if !ok {
+				t.Fatalf("run error = %v (%T), want *exec.ExitError", runErr, runErr)
+			}
+			if exitErr.ExitCode() != 1 {
+				t.Fatalf("exit code = %d, want 1 (fatalf); output:\n%s", exitErr.ExitCode(), out.String())
+			}
+			if !strings.Contains(out.String(), tc.wantFatalText) {
+				t.Errorf("output missing the expected fatalf message %q; got:\n%s", tc.wantFatalText, out.String())
+			}
+		})
+	}
+}
+
 // runVerdictCorrelationCase drives the compiled fixture principal as a
 // manager-feature manager against noticeBodyPaths' info notices, in
 // order, under the fake hop stub's scripted hop-status output

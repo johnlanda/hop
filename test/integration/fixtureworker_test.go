@@ -1399,11 +1399,13 @@ func runManager() {
 	fixCounter := len(script.Tasks)
 	plannedFixReviews := map[string]bool{}
 	for {
-		msg, delivered := parseDeliveredMessage(runHopCLI(hopPath, "msg", "wait").Stdout)
-		if !delivered {
-			continue
-		}
-		handleManagerMessage(hopPath, cwd, env["HOP_RUN_ID"], scratchDir, script, labelToID, &fixCounter, plannedFixReviews, &msg, resumed, selfKillControlPath)
+		// The same discipline as the worker loops' own shared fetch loop:
+		// continue on none:, retry transient: with pacing and a bounded
+		// deadline, fatalf on anything else -- a relaunched manager's OWN
+		// first fetch runs in the identical pre-binding window a
+		// relaunched worker's does.
+		msg := fetchDeliveredMessage(hopPath)
+		handleManagerMessage(hopPath, cwd, env["HOP_RUN_ID"], env["HOP_SESSION_ID"], scratchDir, script, labelToID, &fixCounter, plannedFixReviews, &msg, resumed, selfKillControlPath)
 	}
 }
 
