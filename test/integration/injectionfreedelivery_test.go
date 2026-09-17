@@ -162,13 +162,13 @@ func TestRealProcessInjectionFreeDelivery(t *testing.T) {
 	if err := os.WriteFile(instructionsPath, []byte(instructionsContent), 0o600); err != nil {
 		t.Fatalf("write hostile instructions file: %v", err)
 	}
-	createResult := runHop(t, managerEnv, repo.Root, "task", "create", "--title", "hostile task", "--file", instructionsPath, "--request-id", newSpikeUUID(t))
+	createResult := runManagerVerb(t, managerEnv, repo.Root, "task", "create", "--title", "hostile task", "--file", instructionsPath, "--request-id", newSpikeUUID(t))
 	if createResult.ExitCode != 0 {
 		t.Fatalf("hop task create (hostile instructions): exit=%d stdout=%q stderr=%q", createResult.ExitCode, createResult.Stdout, createResult.Stderr)
 	}
 	taskID := parseTaskID(t, createResult.Stdout)
 
-	closeResult := runHop(t, managerEnv, repo.Root, "plan", "close", "--request-id", newSpikeUUID(t))
+	closeResult := runManagerVerb(t, managerEnv, repo.Root, "plan", "close", "--request-id", newSpikeUUID(t))
 	if closeResult.ExitCode != 0 && !strings.HasPrefix(closeResult.FirstStdoutLine(), "duplicate") {
 		t.Fatalf("hop plan close: exit=%d stdout=%q stderr=%q", closeResult.ExitCode, closeResult.Stdout, closeResult.Stderr)
 	}
@@ -197,7 +197,7 @@ func TestRealProcessInjectionFreeDelivery(t *testing.T) {
 	if err := os.WriteFile(answerPath, []byte(hostilePayload), 0o600); err != nil {
 		t.Fatalf("write hostile answer file: %v", err)
 	}
-	answerResult := runHop(t, managerEnv, repo.Root, "msg", "send", "--kind", "answer", "--reply-to", questionID, "--file", answerPath, "--request-id", newSpikeUUID(t))
+	answerResult := runManagerVerb(t, managerEnv, repo.Root, "msg", "send", "--kind", "answer", "--reply-to", questionID, "--file", answerPath, "--request-id", newSpikeUUID(t))
 	if answerResult.ExitCode != 0 {
 		t.Fatalf("hop msg send --kind answer (hostile body): exit=%d stdout=%q stderr=%q", answerResult.ExitCode, answerResult.Stdout, answerResult.Stderr)
 	}

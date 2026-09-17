@@ -5,7 +5,36 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
+
+// managerVerbRetryInterval paces runManagerVerb's retry-on-transient
+// loop, mirroring the embedded fixture's own fixtureRetryInterval.
+const managerVerbRetryInterval = 200 * time.Millisecond
+
+// managerVerbRetryDeadline bounds runManagerVerb, mirroring the embedded
+// fixture's own submitOnce/runHopCLIRetryable bound.
+const managerVerbRetryDeadline = 2 * time.Minute
+
+// runManagerVerb runs one manager-identity verb (task create, plan
+// close, msg send/answer) as a direct one-shot process, retrying while
+// the first stdout line begins with "transient:" -- design section 7's
+// run-state acceptance rule (a manager verb legitimately gets a
+// retryable line while the run is still launching or resuming) applies
+// to a directly-issued call exactly as it does to the scripted fixture
+// manager's own runHopCLIRetryable, which this mirrors. It never retries
+// a "refused:" line.
+func runManagerVerb(t *testing.T, env []string, dir string, args ...string) hopResult {
+	t.Helper()
+	deadline := time.Now().Add(managerVerbRetryDeadline)
+	for {
+		result := runHop(t, env, dir, args...)
+		if !strings.HasPrefix(result.FirstStdoutLine(), "transient:") || !time.Now().Before(deadline) {
+			return result
+		}
+		time.Sleep(managerVerbRetryInterval)
+	}
+}
 
 // This file adds the one capability slice 7a's harness does not itself
 // provide: driving a manager verb (hop task create/plan close/msg send)
@@ -29,6 +58,17 @@ import (
 
 // managerEnv returns the environment for a one-shot hop CLI invocation
 // authenticated as this run's own manager session.
+//
+// This never collides with the live manager process's OWN concurrent
+// hop msg wait loop (scripted or unscripted, whichever a scenario uses):
+// fetch is scoped strictly to the caller's own RESOLVED LOGICAL ADDRESS
+// (LoadMessagingContext -- a manager session always resolves to
+// "manager"; a worker/reviewer session resolves to "task:<its task>").
+// The manager process has no code path that ever fetches from a
+// "task:<id>" mailbox at all, so a message this helper addresses to a
+// task can never be seen, consumed or acted on by the concurrently
+// running manager, regardless of timing -- the address space itself
+// rules it out, not any ordering this test happens to get right.
 func (f *featureRun) managerEnv(t *testing.T) []string {
 	t.Helper()
 	sessionID := f.managerSessionID(t)

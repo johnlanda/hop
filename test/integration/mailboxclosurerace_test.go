@@ -94,7 +94,7 @@ func testRealProcessMailboxClosureRaceOrdering(t *testing.T) {
 	if err := os.WriteFile(sendFirstPath, []byte("manager info racing t1's own first submission attempt\n"), 0o600); err != nil {
 		t.Fatalf("write race message body: %v", err)
 	}
-	sendFirstResult := runHop(t, managerEnv, repo.Root, "msg", "send", "--to", taskAddress(t1), "--kind", "info", "--file", sendFirstPath, "--request-id", newSpikeUUID(t))
+	sendFirstResult := runManagerVerb(t, managerEnv, repo.Root, "msg", "send", "--to", taskAddress(t1), "--kind", "info", "--file", sendFirstPath, "--request-id", newSpikeUUID(t))
 	if sendFirstResult.ExitCode != 0 {
 		t.Fatalf("hop msg send (send-lands-first race message): exit=%d stdout=%q stderr=%q", sendFirstResult.ExitCode, sendFirstResult.Stdout, sendFirstResult.Stderr)
 	}
@@ -145,7 +145,7 @@ func testRealProcessMailboxClosureRaceOrdering(t *testing.T) {
 	if err := os.WriteFile(closureFirstPath, []byte(closureFirstBody), 0o600); err != nil {
 		t.Fatalf("write race message body: %v", err)
 	}
-	closureFirstResult := runHop(t, managerEnv, repo.Root, "msg", "send", "--to", taskAddress(t2), "--kind", "info", "--file", closureFirstPath, "--request-id", newSpikeUUID(t))
+	closureFirstResult := runManagerVerb(t, managerEnv, repo.Root, "msg", "send", "--to", taskAddress(t2), "--kind", "info", "--file", closureFirstPath, "--request-id", newSpikeUUID(t))
 	if closureFirstResult.ExitCode == 0 {
 		t.Fatalf("hop msg send to a closed mailbox unexpectedly succeeded: stdout=%q", closureFirstResult.Stdout)
 	}
@@ -234,7 +234,7 @@ func testRealProcessMailboxClosureRaceFailure(t *testing.T) {
 	if err := os.WriteFile(orphanPath, []byte("manager info addressed to t1 while its worker is dead and its mailbox still open\n"), 0o600); err != nil {
 		t.Fatalf("write orphan message body: %v", err)
 	}
-	orphanResult := runHop(t, managerEnv, repo.Root, "msg", "send", "--to", taskAddress(t1), "--kind", "info", "--file", orphanPath, "--request-id", newSpikeUUID(t))
+	orphanResult := runManagerVerb(t, managerEnv, repo.Root, "msg", "send", "--to", taskAddress(t1), "--kind", "info", "--file", orphanPath, "--request-id", newSpikeUUID(t))
 	if orphanResult.ExitCode != 0 {
 		t.Fatalf("hop msg send (orphan info) exit=%d stdout=%q stderr=%q", orphanResult.ExitCode, orphanResult.Stdout, orphanResult.Stderr)
 	}
@@ -269,7 +269,7 @@ func testRealProcessMailboxClosureRaceFailure(t *testing.T) {
 	if err := os.WriteFile(laterPath, []byte("a later manager send against the same, now failure-closed, mailbox\n"), 0o600); err != nil {
 		t.Fatalf("write later message body: %v", err)
 	}
-	laterResult := runHop(t, managerEnv, repo.Root, "msg", "send", "--to", taskAddress(t1), "--kind", "info", "--file", laterPath, "--request-id", newSpikeUUID(t))
+	laterResult := runManagerVerb(t, managerEnv, repo.Root, "msg", "send", "--to", taskAddress(t1), "--kind", "info", "--file", laterPath, "--request-id", newSpikeUUID(t))
 	if laterResult.ExitCode == 0 {
 		t.Fatalf("hop msg send to a failure-closed mailbox unexpectedly succeeded: stdout=%q", laterResult.Stdout)
 	}
