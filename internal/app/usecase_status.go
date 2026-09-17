@@ -28,11 +28,14 @@ type RunSummaryView struct {
 	Reconciling   bool
 	UpdatedAt     time.Time
 	// NeedsAttention is section 7's "blocked, needs attention" condition:
-	// true when at least one of the run's mailboxes is Attention. Populated
-	// only by the `-run` detail render (runDetailView derives it from
-	// Mailboxes); the bare listing (Status with no RunID) has no per-
-	// address message data to compute it from and always leaves it false,
-	// like every other field the underlying store has not populated yet.
+	// true when at least one of the run's mailboxes is Attention. The bare
+	// listing (Status with no RunID) copies it straight from
+	// RunStatus.NeedsAttention (ReadStore.ListRuns computes it there,
+	// Astra F4); the `-run` detail render (runDetailView) instead derives
+	// it by OR-reducing the Mailboxes it already loaded — a second call
+	// site of the same mailboxStatuses threshold rule, not a second
+	// implementation of it — so the listing and the detail can never
+	// disagree about one run.
 	NeedsAttention bool
 }
 
@@ -80,10 +83,18 @@ type IntegrationView struct {
 
 // GuardShortfallView is one unmet completion guard, rendered verbatim from
 // EvaluateReadiness's missing list. TaskID is "" except for
-// "task-not-integrated".
+// "task-not-integrated". ReviewID, SubjectCommitOID and ReasonsPath are ""
+// except for "verdict-rejected", where they identify exactly which review
+// is being reported — the controller notice a caller fetches for it names
+// no verdict, so a caller correlates by comparing ReasonsPath (computed
+// the same way the accepting transaction's own notice body is) against
+// the fetched notice's body path (STATUS-1's manager verdict channel).
 type GuardShortfallView struct {
-	Kind   string
-	TaskID string
+	Kind             string
+	TaskID           string
+	ReviewID         string
+	SubjectCommitOID string
+	ReasonsPath      string
 }
 
 // MailboxView is one recipient address's queue condition: section 7's
@@ -104,6 +115,19 @@ type PendingQuestionView struct {
 	MessageID string
 	BodyPath  string
 	Age       time.Duration
+}
+
+// SessionView is one row of RunDetailView's feature-mode per-session
+// roles/bindings listing. TaskID is "" and AttemptNumber 0 for the
+// manager, which binds no attempt. BindingSummary is "" when the session
+// currently has no binding.
+type SessionView struct {
+	SessionID      string
+	Role           string
+	State          string
+	TaskID         string
+	AttemptNumber  int
+	BindingSummary string
 }
 
 // WorktreeOperationView is one unresolved per-attempt worktree.create
@@ -172,6 +196,9 @@ type RunDetailView struct {
 	// WorktreeOperations is every unresolved per-attempt worktree.create
 	// operation, oldest first, with its human action; nil for a solo run.
 	WorktreeOperations []WorktreeOperationView
+	// Sessions is every session the run has ever created, oldest first;
+	// nil for a solo run.
+	Sessions []SessionView
 }
 
 // StatusResult is Status's success value: exactly one of Runs (the -run-less
@@ -207,10 +234,16 @@ func (c *Controller) Status(ctx context.Context, req StatusRequest) (StatusResul
 	return StatusResult{Detail: &view}, nil
 }
 
-func runSummaryView(s RunStatus) RunSummaryView {
+func runSummaryView(s RunStatus) RunSummaryView { //nolint:gocritic // hugeParam: RunStatus is a ReadStore DTO rendered at most once per hop status listing row.
 	return RunSummaryView{
 		RunID: s.RunID.String(), Sequence: s.Sequence, State: string(s.State),
 		StopRequested: s.StopRequested, Reconciling: s.Reconciling, UpdatedAt: s.UpdatedAt,
+		// NeedsAttention here is ListRuns' own computation (Astra F4):
+		// always false for a LoadRunStatus-sourced RunStatus, which never
+		// sets it, since runDetailView's own mailbox OR-reduction (below)
+		// is authoritative for the detail view and only ever turns it
+		// true, never back to false.
+		NeedsAttention: s.NeedsAttention,
 	}
 }
 
@@ -271,6 +304,11 @@ func runDetailView(d RunDetail) RunDetailView { //nolint:gocritic // hugeParam: 
 		if s.Kind == run.ShortfallTaskNotIntegrated {
 			gv.TaskID = s.TaskID.String()
 		}
+		if s.Kind == run.ShortfallVerdictRejected {
+			gv.ReviewID = s.ReviewID.String()
+			gv.SubjectCommitOID = s.SubjectCommitOID
+			gv.ReasonsPath = reviewReasonsPath(d.StateRoot, d.RunID, s.ReviewID)
+		}
 		view.GuardShortfalls = append(view.GuardShortfalls, gv)
 	}
 	for _, m := range d.Mailboxes {
@@ -291,6 +329,19 @@ func runDetailView(d RunDetail) RunDetailView { //nolint:gocritic // hugeParam: 
 		view.PendingQuestions = append(view.PendingQuestions, PendingQuestionView{
 			MessageID: q.MessageID.String(), BodyPath: q.BodyPath, Age: q.Age,
 		})
+	}
+	for _, s := range d.Sessions {
+		sv := SessionView{
+			SessionID: s.SessionID.String(), Role: string(s.Role), State: string(s.State),
+			AttemptNumber: s.AttemptNumber,
+		}
+		if s.TaskID != "" {
+			sv.TaskID = s.TaskID.String()
+		}
+		if s.Binding != nil {
+			sv.BindingSummary = fmt.Sprintf("%s/%s/%s", s.Binding.WorkspaceID, s.Binding.TabID, s.Binding.PaneID)
+		}
+		view.Sessions = append(view.Sessions, sv)
 	}
 	if d.Mode == WorkflowModeFeature {
 		for i := range d.PendingOperations {

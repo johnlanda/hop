@@ -438,7 +438,28 @@ func (s *fakeStore) runStatusLocked(runID identity.RunID) app.RunStatus {
 			break
 		}
 	}
-	return app.RunStatus{RunID: runID, Sequence: r.Sequence, State: r.State, StopRequested: r.StopRequested, Reconciling: reconciling, UpdatedAt: r.UpdatedAt}
+	return app.RunStatus{
+		RunID: runID, Sequence: r.Sequence, State: r.State, StopRequested: r.StopRequested,
+		Reconciling: reconciling, UpdatedAt: r.UpdatedAt, NeedsAttention: s.runNeedsAttentionLocked(runID),
+	}
+}
+
+// runNeedsAttentionLocked mirrors the real sqlite adapter's
+// runNeedsAttentionLocked (Astra F4): false for a solo run, else the
+// OR-reduction of the SAME mailboxesLocked call featureRunDetail's own
+// Mailboxes population uses — one implementation of the attention
+// threshold rule, so ListRuns and LoadRunStatus can never disagree
+// about one run. Callers hold s.mu.
+func (s *fakeStore) runNeedsAttentionLocked(runID identity.RunID) bool {
+	if !s.Snapshots[runID].Workflow.Feature() {
+		return false
+	}
+	for _, m := range s.mailboxesLocked(runID, s.clock.Now()) {
+		if m.Attention {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *fakeStore) LoadRunStatus(_ context.Context, runID identity.RunID) (app.RunDetail, error) {
@@ -553,6 +574,7 @@ func (s *fakeStore) LoadRunStatus(_ context.Context, runID identity.RunID) (app.
 	detail.GuardShortfalls = s.guardShortfallsLocked(runID)
 	detail.Mailboxes = s.mailboxesLocked(runID, s.clock.Now())
 	detail.PendingQuestions = s.pendingQuestionsLocked(runID, s.clock.Now())
+	detail.Sessions = s.sessionsLocked(runID)
 
 	return detail, nil
 }

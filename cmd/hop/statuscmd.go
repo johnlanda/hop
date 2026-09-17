@@ -5,14 +5,76 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/johnlanda/hop/internal/app"
 )
 
 // defaultStatusTimeout bounds one hop status invocation.
 const defaultStatusTimeout = 10 * time.Second
+
+// safeRenderExternal renders a path or an opaque Herdr-assigned
+// identifier for a status line: raw when it is valid UTF-8 with no
+// control character (C0, DEL, C1), no double quote and no backslash —
+// the shapes that could otherwise forge a line boundary (a newline
+// inserting a fake protocol line), emit a terminal control sequence, or
+// make the two rendering forms ambiguous. Otherwise it renders as Go's
+// quoted-string form (strconv.Quote), which escapes exactly those bytes
+// and always starts with a double quote — so a raw rendering never
+// starts with one, and a reader can always tell which form a field
+// took. Ordinary paths and identifiers are untouched, so every existing
+// render table stays byte-identical. Applied to every externally sourced
+// string hop status prints, each as one whole field:
+//   - paths: the solo worktree, each feature worktree row, the task
+//     table's worktree, artifacts, check evidence, a question's body and
+//     a rejected review's reasons;
+//   - Herdr binding identifiers: the detail's binding, each session's
+//     binding and an attention action's binding;
+//   - branch names: the target (its own line and inside the worktrees
+//     sentence), each worktree row's and each worktree operation's
+//     branch;
+//   - text that embeds such values: the trust-seed evidence, which names
+//     the seeded worktree path, and the last check's detail, which is
+//     recorded error text;
+//   - git object ids: the integration's source, pre-merge and merge
+//     commits and a rejected review's subject.
+//
+// These are operator-, principal- or git-sourced strings (a checkout
+// location, a workspace/tab/pane id, a ref name, a process's error
+// output), and they reach rendering unvalidated by the stores that
+// accept and pass them through. The design's "paths appear only where the
+// design names them" invariant is about WHICH fields carry a path, not
+// about what bytes those fields may contain. Every other field is a
+// HOP-generated token (a parsed uuid, a typed state or kind, a count, an
+// age, a time) or fixed text, and renders raw.
+func safeRenderExternal(s string) string {
+	if isSafeExternalString(s) {
+		return s
+	}
+	return strconv.Quote(s)
+}
+
+// isSafeExternalString reports whether s can render raw per
+// safeRenderExternal's contract.
+func isSafeExternalString(s string) bool {
+	if !utf8.ValidString(s) {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r == '"' || r == '\\':
+			return false
+		case r < 0x20 || r == 0x7f: // C0 controls and DEL
+			return false
+		case r >= 0x80 && r <= 0x9f: // C1 controls
+			return false
+		}
+	}
+	return true
+}
 
 // runStatus implements `hop status`: without -run one line per run of the
 // repository (non-terminal runs by default; -all includes completed,
@@ -152,6 +214,9 @@ func listingMarkers(r *app.RunSummaryView) string {
 	if r.Reconciling {
 		markers = append(markers, "reconciling")
 	}
+	if r.NeedsAttention {
+		markers = append(markers, app.GrammarAttentionMarker)
+	}
 	if len(markers) == 0 {
 		return ""
 	}
@@ -182,33 +247,37 @@ func renderRunDetail(w io.Writer, detail *app.RunDetailView) (int, error) {
 	if isFeatureMode(detail.Mode) {
 		lines = append(lines, worktreeDetailLines(detail.Worktrees)...)
 	} else {
-		lines = append(lines, "  worktree:      "+orUnset(detail.WorktreePath))
+		lines = append(lines, "  worktree:      "+safeRenderExternal(orUnset(detail.WorktreePath)))
 	}
 	lines = append(lines,
-		"  binding:       "+orUnset(detail.BindingSummary),
+		"  binding:       "+safeRenderExternal(orUnset(detail.BindingSummary)),
 		"  launch claim:  "+orUnset(detail.ClaimState),
-		"  trust seed:    "+orUnset(detail.SeedEvidence),
+		// The trust-seed evidence embeds the worktree path it seeded.
+		"  trust seed:    "+safeRenderExternal(orUnset(detail.SeedEvidence)),
 		fmt.Sprintf("  pending ops:   %d", detail.PendingOps),
 		"  last submit:   "+orUnset(detail.LastSubmission),
 	)
 	for _, op := range detail.WorktreeOperations {
-		lines = append(lines, "  worktree op:   "+op.OperationID+" "+orUnset(op.Branch)+" ("+op.State+")",
-			"    action:      "+op.Action)
+		lines = append(lines, "  worktree op:   "+op.OperationID+" "+safeRenderExternal(orUnset(op.Branch))+" ("+op.State+")",
+			"    "+app.GrammarActionPrefix+"      "+op.Action)
 	}
 	for _, artifact := range detail.Artifacts {
-		lines = append(lines, "  artifact:      "+artifact)
+		lines = append(lines, "  artifact:      "+safeRenderExternal(artifact))
 	}
 	if detail.LastCheckOperation != "" {
 		lines = append(lines,
 			"  last check:    "+detail.LastCheckOperation+" ("+detail.LastCheckState+")",
-			"    detail:      "+orUnset(detail.LastCheckDetail))
+			// The detail is recorded error text, which can carry git's
+			// multi-line stderr.
+			"    detail:      "+safeRenderExternal(orUnset(detail.LastCheckDetail)))
 		for _, path := range detail.LastCheckEvidence {
-			lines = append(lines, "    evidence:    "+path)
+			lines = append(lines, "    evidence:    "+safeRenderExternal(path))
 		}
 		if detail.LastCheckUnknown {
 			lines = append(lines, "    unknown outcome — options: "+detail.LastCheckOptions)
 		}
 	}
+	lines = append(lines, featureDetailLines(detail)...)
 	for _, line := range lines {
 		if _, err := fmt.Fprintln(w, line); err != nil {
 			return exitFailure, err
@@ -217,18 +286,147 @@ func renderRunDetail(w io.Writer, detail *app.RunDetailView) (int, error) {
 	return exitOK, nil
 }
 
+// featureDetailLines renders the section 10 feature-mode detail block:
+// the task table, the latest integration, EvaluateReadiness's guard
+// shortfalls verbatim, the section 7 per-mailbox attention lines, the
+// pending human questions and the per-session roles/bindings listing. A
+// solo run (detail.Mode == "") renders none of this, so solo output stays
+// byte-identical to Phase 2's. Every fixed line's text comes from
+// internal/app/grammar.go; this function only resolves task-uuid-to-label
+// lookups and assembles the block's indentation.
+func featureDetailLines(detail *app.RunDetailView) []string {
+	if !isFeatureMode(detail.Mode) {
+		return nil
+	}
+	labels := taskLabelsByID(detail.Tasks)
+	var lines []string
+
+	for _, t := range detail.Tasks {
+		lines = append(lines, "  "+app.GrammarTaskLine(
+			app.GrammarTaskLabel(t.Seq), t.TaskID, t.Kind, t.State, depLabels(t.DependsOn, labels),
+			t.AttemptCount, safeRenderExternal(orUnset(t.WorktreePath)),
+		))
+	}
+
+	if integ := detail.LatestIntegration; integ != nil {
+		lines = append(lines, "  "+app.GrammarIntegrationLine(
+			integ.ID, taskLabelFor(integ.TaskID, labels), integ.State,
+			safeRenderExternal(orUnset(integ.SourceCommitOID)),
+			safeRenderExternal(orUnset(integ.PremergeHeadOID)),
+			safeRenderExternal(orUnset(integ.MergeCommitOID)),
+		))
+	}
+
+	for _, s := range detail.GuardShortfalls {
+		if s.Kind == app.GrammarShortfallVerdictRejected {
+			lines = append(lines, "  "+app.GrammarVerdictRejectedLine(s.ReviewID, safeRenderExternal(s.SubjectCommitOID), safeRenderExternal(s.ReasonsPath)))
+			continue
+		}
+		taskLabel := ""
+		if s.TaskID != "" {
+			taskLabel = taskLabelFor(s.TaskID, labels)
+		}
+		lines = append(lines, "  "+app.GrammarShortfallLine(s.Kind, taskLabel, s.TaskID))
+	}
+
+	for _, m := range detail.Mailboxes {
+		address := m.Address
+		if strings.HasPrefix(address, "task:") {
+			taskID := strings.TrimPrefix(address, "task:")
+			address = app.GrammarTaskAddress(taskID, taskLabelFor(taskID, labels))
+		}
+		lines = append(lines, "  "+app.GrammarAttentionLine(address, m.InFlightMessageID, m.InFlightAge, m.QueuedCount, m.OldestQueuedAge))
+		if m.Attention {
+			action := app.GrammarAttentionActionHuman
+			if m.Address != "human" {
+				action = app.GrammarAttentionActionSession(safeRenderExternal(sessionBindingFor(m.Address, detail.Sessions)))
+			}
+			lines = append(lines, "    "+app.GrammarActionPrefix+"      "+action)
+		}
+	}
+
+	for _, q := range detail.PendingQuestions {
+		lines = append(lines,
+			"  "+app.GrammarQuestionLine(q.MessageID, q.Age, safeRenderExternal(q.BodyPath)),
+			"    "+app.GrammarAnswerInvocationLine(q.MessageID),
+		)
+	}
+
+	for _, s := range detail.Sessions {
+		taskLabel := "(none)"
+		if s.TaskID != "" {
+			taskLabel = taskLabelFor(s.TaskID, labels)
+		}
+		lines = append(lines, "  "+app.GrammarSessionLine(s.SessionID, s.Role, s.State, taskLabel, s.AttemptNumber, safeRenderExternal(orUnset(s.BindingSummary))))
+	}
+
+	return lines
+}
+
+// taskLabelsByID maps a feature run's task uuids to their stable t<seq>
+// display sequence, for resolving a uuid reference (a dependency edge, a
+// guard shortfall's task, an integration's task, a mailbox address) to its
+// label without a second store round trip.
+func taskLabelsByID(tasks []app.TaskSummaryView) map[string]int {
+	labels := make(map[string]int, len(tasks))
+	for _, t := range tasks {
+		labels[t.TaskID] = t.Seq
+	}
+	return labels
+}
+
+// taskLabelFor resolves one task uuid to its "t<seq>" label.
+func taskLabelFor(taskID string, labels map[string]int) string {
+	return app.GrammarTaskLabel(labels[taskID])
+}
+
+// depLabels renders a task's dependency edges as comma-separated t<seq>
+// labels, or "(none)" when it depends on nothing.
+func depLabels(dependsOn []string, labels map[string]int) string {
+	if len(dependsOn) == 0 {
+		return "(none)"
+	}
+	rendered := make([]string, len(dependsOn))
+	for i, id := range dependsOn {
+		rendered[i] = taskLabelFor(id, labels)
+	}
+	return strings.Join(rendered, ",")
+}
+
+// sessionBindingFor resolves a mailbox address ("manager" or
+// "task:<uuid>") to its live session's current binding summary, the most
+// recently created matching session in sessions (oldest first) — the
+// manager's own succession, or a task's latest attempt — or "" when that
+// session currently has none. The human address is never passed here: it
+// has no session to bind.
+func sessionBindingFor(address string, sessions []app.SessionView) string {
+	taskID, isTask := strings.CutPrefix(address, "task:")
+	var binding string
+	for _, s := range sessions {
+		switch {
+		case isTask && s.TaskID == taskID:
+			binding = s.BindingSummary
+		case !isTask && address == "manager" && s.Role == "manager":
+			binding = s.BindingSummary
+		}
+	}
+	return binding
+}
+
 // targetBranchLabel renders a feature run's frozen worktree-retirement
-// target (docs/plan/phase-3-worktree-retirement.md section 6).
+// target (docs/plan/phase-3-worktree-retirement.md section 6), safe-rendered
+// like every branch name.
 func targetBranchLabel(target string) string {
 	if target == "" {
 		return "none (detached HEAD at freeze; worktrees are never retired automatically)"
 	}
-	return target
+	return safeRenderExternal(target)
 }
 
 // worktreeRetirementLabel renders a feature run's worktrees-retired fact,
 // and before it is set, when and how retirement will happen — including
-// the plain warning that removal deletes ignored files.
+// the plain warning that removal deletes ignored files. The target branch
+// inside that sentence is safe-rendered.
 func worktreeRetirementLabel(target string, retiredAt *time.Time) string {
 	switch {
 	case retiredAt != nil:
@@ -236,7 +434,7 @@ func worktreeRetirementLabel(target string, retiredAt *time.Time) string {
 	case target == "":
 		return "kept (no target branch)"
 	default:
-		return "not retired (removed once the integration branch is merged into " + target +
+		return "not retired (removed once the integration branch is merged into " + safeRenderExternal(target) +
 			"; removal deletes ignored files such as build output; commit anything you want to keep)"
 	}
 }

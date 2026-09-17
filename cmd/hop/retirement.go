@@ -130,59 +130,66 @@ func reportLines(label string, report *app.WorktreeRetirementReport) []string {
 	return lines
 }
 
-// worktreeOutcomeLines renders one worktree's pass outcome.
+// worktreeOutcomeLines renders one worktree's pass outcome. Branch and
+// path are operator-selected strings the app layer passes through
+// unvalidated; safeRenderExternal renders each raw only when it cannot
+// forge a line boundary or emit a terminal control sequence.
 func worktreeOutcomeLines(label string, w *app.WorktreeRetirementLine) []string {
-	prefix := label + " worktree " + w.Branch
+	prefix := label + " worktree " + safeRenderExternal(w.Branch)
+	path := safeRenderExternal(w.Path)
 	switch w.Outcome {
 	case app.WorktreeOutcomeRemoved:
-		return []string{fmt.Sprintf("%s removed: %s (close its Herdr workspace if one is still open)", prefix, w.Path)}
+		return []string{fmt.Sprintf("%s removed: %s (close its Herdr workspace if one is still open)", prefix, path)}
 	case app.WorktreeOutcomeAbsent:
-		return []string{fmt.Sprintf("%s already absent: %s", prefix, w.Path)}
+		return []string{fmt.Sprintf("%s already absent: %s", prefix, path)}
 	case app.WorktreeOutcomeReleased:
 		if w.LeftOnDisk {
-			return []string{fmt.Sprintf("%s released (%s): %s; left on disk; no longer managed by HOP", prefix, releasedLabel(w.Released), w.Path)}
+			return []string{fmt.Sprintf("%s released (%s): %s; left on disk; no longer managed by HOP", prefix, releasedLabel(w.Released), path)}
 		}
-		return []string{fmt.Sprintf("%s released (%s): %s; HOP will not remove it", prefix, releasedLabel(w.Released), w.Path)}
+		return []string{fmt.Sprintf("%s released (%s): %s; HOP will not remove it", prefix, releasedLabel(w.Released), path)}
 	case app.WorktreeOutcomeRetained:
 		category := retainedLabel(w.Retained)
 		if w.Retained == app.RetainedRemoveRefused {
 			category = fmt.Sprintf("%s, exit %d", category, w.ExitCode)
 		}
 		return []string{
-			fmt.Sprintf("%s retained (%s): %s", prefix, category, w.Path),
-			"  action: " + retainedAction(w.Retained, w.EvidencePath),
+			fmt.Sprintf("%s retained (%s): %s", prefix, category, path),
+			"  " + app.GrammarActionPrefix + " " + retainedAction(w.Retained, w.EvidencePath),
 		}
 	case app.WorktreeOutcomeIncomplete:
-		return []string{fmt.Sprintf("%s removal incomplete: %s; hop status will finish the removal", prefix, w.Path)}
+		return []string{fmt.Sprintf("%s removal incomplete: %s; hop status will finish the removal", prefix, path)}
 	case app.WorktreeOutcomeUnresolved:
-		return []string{fmt.Sprintf("%s removal unresolved: %s; hop status will finish the removal", prefix, w.Path)}
+		return []string{fmt.Sprintf("%s removal unresolved: %s; hop status will finish the removal", prefix, path)}
 	case app.WorktreeOutcomeNotDispatched:
-		return []string{fmt.Sprintf("%s not removed yet: %s; hop status will retry", prefix, w.Path)}
+		return []string{fmt.Sprintf("%s not removed yet: %s; hop status will retry", prefix, path)}
 	default:
-		return []string{fmt.Sprintf("%s %s: %s", prefix, w.Outcome, w.Path)}
+		return []string{fmt.Sprintf("%s %s: %s", prefix, w.Outcome, path)}
 	}
 }
 
 // worktreeDetailLines renders hop status -run's per-row lines for a
 // feature run (section 6), each non-final row with its human action.
+// Branch and path render through safeRenderExternal, exactly like
+// worktreeOutcomeLines.
 func worktreeDetailLines(views []app.WorktreeView) []string {
 	var lines []string
 	for i := range views {
 		w := &views[i]
-		prefix := "  worktree:      " + w.Branch + " "
+		prefix := "  worktree:      " + safeRenderExternal(w.Branch) + " "
+		path := safeRenderExternal(w.Path)
 		switch {
 		case w.State == "released":
-			lines = append(lines, prefix+"released ("+releasedLabel(w.Released)+") "+w.Path+"; left on disk; no longer managed by HOP")
+			lines = append(lines, prefix+"released ("+releasedLabel(w.Released)+") "+path+"; left on disk; no longer managed by HOP")
 		case w.State != "active":
-			lines = append(lines, prefix+w.State+" "+w.Path)
+			lines = append(lines, prefix+w.State+" "+path)
 		case w.Removal != "":
-			lines = append(lines, prefix+"removal "+w.Removal+" "+w.Path+"; hop status will finish the removal")
+			lines = append(lines, prefix+"removal "+w.Removal+" "+path+"; hop status will finish the removal")
 		case w.Retained != "":
 			lines = append(lines,
-				prefix+"retained ("+retainedLabel(w.Retained)+") "+w.Path,
-				"    action:      "+retainedAction(w.Retained, w.EvidencePath))
+				prefix+"retained ("+retainedLabel(w.Retained)+") "+path,
+				"    "+app.GrammarActionPrefix+"      "+retainedAction(w.Retained, w.EvidencePath))
 		default:
-			lines = append(lines, prefix+"active "+w.Path)
+			lines = append(lines, prefix+"active "+path)
 		}
 	}
 	return lines
@@ -224,7 +231,7 @@ func retainedAction(category app.WorktreeRetainedCategory, evidencePath string) 
 	case app.RetainedRemoveRefused:
 		action = "inspect the retained evidence"
 		if evidencePath != "" {
-			action += " at " + evidencePath
+			action += " at " + safeRenderExternal(evidencePath)
 		}
 	case app.RetainedInspectionFailed:
 		action = "the checkout could not be fully inspected; check it and its repository"

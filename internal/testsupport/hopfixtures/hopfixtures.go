@@ -631,6 +631,30 @@ func SeedAttemptWorktree(ctx context.Context, store Store, lease app.Lease, runI
 	return worktreeID, nil
 }
 
+// SeedCheckEvidence records one settled check execution of runID as the
+// check pipeline leaves a failed one: a failed check.run operation whose
+// outcome carries exit code 1 and detail, and the retained stdout
+// evidence artifact at evidencePath in the same unit of work. Seeds
+// occupy seed and seed+1.
+func SeedCheckEvidence(ctx context.Context, store Store, lease app.Lease, runID string, seed int, detail, evidencePath string, now time.Time) error {
+	return withUOW(ctx, store, lease, func(uow app.UnitOfWork) error {
+		if err := uow.Operations().Create(ctx, app.Operation{
+			ID: identity.OperationID(uid(seed)), RunID: identity.RunID(runID), Generation: lease.Generation,
+			Kind: app.OpCheckRun, State: app.OperationFailed,
+			Intent:    map[string]any{"check_argv": []string{"sh", "-c", "false"}},
+			Outcome:   map[string]any{"exit_code": 1, "detail": detail},
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			return fmt.Errorf("hopfixtures: create check.run operation: %w", err)
+		}
+		artifact := run.NewArtifact(identity.ArtifactID(uid(seed+1)), identity.RunID(runID), run.ArtifactCheckStdout, evidencePath, "fixture-digest")
+		if err := uow.Artifacts().Save(ctx, artifact); err != nil {
+			return fmt.Errorf("hopfixtures: save check evidence artifact: %w", err)
+		}
+		return nil
+	})
+}
+
 // FinishRun drives runID from running to state — "completed" (through
 // completing), "failed", or "stopped" (a stop request, then stopping) —
 // and releases lease, leaving the run exactly as a finished controller

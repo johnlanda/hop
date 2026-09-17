@@ -133,6 +133,30 @@ type managerAssignmentFields struct {
 	RolePath       string // absolute; the frozen manager role copy
 	CribPath       string // absolute; the worker-protocol crib
 	HOPPath        string // absolute
+	// RepositoryRoot is the run's frozen repository root: the manager's
+	// verdict-channel instruction renders it into the exact `hop status`
+	// invocation the manager runs to learn a review verdict
+	// (docs/plan/phase-3-design.md section 7's "the manager's verdict
+	// channel"; STATUS-1).
+	RepositoryRoot string
+}
+
+// posixShellQuote renders s as a single POSIX shell word: wrapped in
+// single quotes, each embedded single quote closed, escaped and reopened
+// ('\”), the standard POSIX technique and the only one that neutralizes
+// every shell metacharacter (spaces, $(...), backticks, semicolons,
+// newlines) with no exceptions. Used only for the verdict-channel
+// instruction's concrete arguments (hop path, repository root, run id):
+// a repository root or an installation path can legitimately contain a
+// space, and this run's id and repository root are otherwise the only
+// arguments in this file interpolated into shell syntax rather than a
+// plain instruction sentence. Every other verb line's argument
+// placeholders (<task-uuid>, <message-uuid>, ...) stay unquoted,
+// exactly as before: those are literal placeholders a human or agent
+// retypes, never a frozen run fact substituted in here, and they are
+// pinned prompt goldens a later slice parses byte for byte.
+func posixShellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // renderManagerAssignment renders the manager's brief assignment
@@ -141,6 +165,9 @@ type managerAssignmentFields struct {
 // deterministic like renderAssignment, whose solo shape it deliberately
 // does not touch.
 func renderManagerAssignment(f *managerAssignmentFields) []byte {
+	hopPath := posixShellQuote(f.HOPPath)
+	repositoryRoot := posixShellQuote(f.RepositoryRoot)
+	runID := posixShellQuote(f.RunID)
 	return fmt.Appendf(nil, `# HOP Manager Assignment
 
 Run: %s
@@ -171,9 +198,34 @@ Answer a question with %s msg send --kind answer --reply-to
 needs-rework task with %s task retry <task-uuid> --reason "<why>".
 Every verb's first line is fixed by the protocol reference, and a
 refusal's first line is refused: <reason-token> with detail after.
+
+## Verdict channel
+
+A review verdict's controller notice carries only the reviewer's reasons
+text as its body; it never names the verdict itself. After any
+controller info notice, run:
+
+    %s status -C %s -run %s
+
+and read its shortfall lines. A shortfall naming verdict-rejected names
+its own review's id, subject commit and reasons path — never just "the
+latest review", since an older rejection stays reported only until a
+fix's new head gets its own new review. Compare that reasons path
+against the notice you just fetched: EQUAL means this notice IS that
+review's rejection — plan exactly one fix task for it, from the reasons
+it names. DIFFERENT (or no verdict-rejected line at all) means the
+notice is not this shortfall; act on the notice itself instead — a
+needs-rework notice already carries its own retry path (%s task retry
+<task-uuid> --reason "<why>") — and never plan a second fix from the
+same shortfall once its path has already matched a notice you acted on.
+A shortfall naming evidence-inconsistent is never a rejection: HOP's
+recorded evidence about the current head disagrees, so no verdict or
+check shortfall is reported in its place — plan no fix task from it, act
+on the notice itself as above, and ask the human to inspect the run.
 `,
 		f.RunID, f.Brief, f.AssignmentPath, f.RolePath, f.CribPath,
-		f.HOPPath, f.HOPPath, f.HOPPath, f.HOPPath, f.HOPPath, f.HOPPath)
+		f.HOPPath, f.HOPPath, f.HOPPath, f.HOPPath, f.HOPPath, f.HOPPath,
+		hopPath, repositoryRoot, runID, f.HOPPath)
 }
 
 // priorAttemptFeedback is the retry section of a task assignment: the

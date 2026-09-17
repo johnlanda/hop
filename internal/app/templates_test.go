@@ -5,6 +5,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -138,6 +142,7 @@ func TestTemplatesQuoteGrammar(t *testing.T) {
 
 	manager := string(renderManagerAssignment(&managerAssignmentFields{
 		RunID: "r", Brief: "b", AssignmentPath: "/a.md", RolePath: "/r.md", CribPath: "/c.md", HOPPath: "/hop",
+		RepositoryRoot: "/repo",
 	}))
 	for _, quote := range []string{
 		"/hop " + GrammarVerbTaskCreate + " --title",
@@ -147,6 +152,9 @@ func TestTemplatesQuoteGrammar(t *testing.T) {
 		"/hop " + GrammarVerbMsgSend + " --kind answer",
 		"/hop " + GrammarVerbTaskRetry + " <task-uuid>",
 		GrammarRefusalLine("<reason-token>"),
+		"'/hop' status -C '/repo' -run 'r'",
+		GrammarShortfallVerdictRejected,
+		"naming " + GrammarShortfallEvidenceInconsistent + " is never a rejection",
 	} {
 		if !strings.Contains(manager, quote) {
 			t.Errorf("manager assignment does not quote %q", quote)
@@ -177,6 +185,96 @@ func TestTemplatesQuoteGrammar(t *testing.T) {
 		if !strings.Contains(review, quote) {
 			t.Errorf("review assignment does not quote %q", quote)
 		}
+	}
+}
+
+// TestPosixShellQuoteRoundTrips proves posixShellQuote's output, fed back
+// through a real POSIX shell's own word-splitting and expansion, always
+// reproduces the original string byte for byte — the harmless recorder
+// here is the trusted printf builtin/binary, exactly as the reviewer's
+// own reproduction used printf in place of hop. Every hostile class the
+// review named is covered, in both a repository-root-shaped and a
+// hop-path-shaped string (posixShellQuote does not know or care which
+// role its argument plays).
+func TestPosixShellQuoteRoundTrips(t *testing.T) {
+	if _, err := exec.LookPath("/bin/sh"); err != nil {
+		t.Skip("no /bin/sh available")
+	}
+	cases := []struct {
+		name, value string
+	}{
+		{"plain", "/repo/checkout"},
+		{"spaces (root-shaped)", "/repo with spaces/checkout"},
+		{"spaces (hop-path-shaped)", "/opt/hop install/bin/hop"},
+		{"single quote", "it's here"},
+		{"double quote", `say "hi"`},
+		{"dollar substitution", "$(printf INJECTED)"},
+		{"backticks", "`printf INJECTED`"},
+		{"semicolon", "a; printf INJECTED"},
+		{"newline (root-shaped)", "/repo\nwith/a/newline"},
+		{"newline (hop-path-shaped)", "/opt/hop\nbin/hop"},
+		{"everything at once", "it's \"/repo\" $(printf INJECTED) `printf INJECTED`; printf INJECTED\ndone"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			quoted := posixShellQuote(tc.value)
+			out, err := exec.CommandContext(t.Context(), "/bin/sh", "-c", "printf '%s' "+quoted).Output() //nolint:gosec // the quoted value is exactly what is under test; no other input reaches this command.
+			if err != nil {
+				t.Fatalf("sh -c: %v", err)
+			}
+			if string(out) != tc.value {
+				t.Errorf("round-trip = %q, want %q", out, tc.value)
+			}
+		})
+	}
+}
+
+// TestManagerAssignmentVerdictCommandSurvivesShell renders the actual
+// verdict-channel command line with a hostile repository root and a
+// hostile (but filesystem-legal) hop executable path, then executes it
+// for real against a harmless argv-recording script standing in for hop
+// — proving the whole rendered line, not just the quoting primitive in
+// isolation, tokenizes back into exactly the original arguments.
+func TestManagerAssignmentVerdictCommandSurvivesShell(t *testing.T) {
+	if _, err := exec.LookPath("/bin/sh"); err != nil {
+		t.Skip("no /bin/sh available")
+	}
+	dir := t.TempDir()
+	recorderName := `it's "hop" $(printf INJECTED) ` + "`printf INJECTED`" + `; printf INJECTED bin`
+	recorder := filepath.Join(dir, recorderName)
+	script := "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\0' \"$a\"; done\n"
+	if err := os.WriteFile(recorder, []byte(script), 0o755); err != nil { //nolint:gosec // a test fixture script, deliberately executable.
+		t.Fatal(err)
+	}
+
+	// No embedded newline here: this test locates the rendered command by
+	// splitting the assignment into text lines, which an argument's own
+	// raw newline would legitimately spread across — TestPosixShellQuoteRoundTrips
+	// already proves posixShellQuote handles a newline correctly in
+	// isolation, for both a root-shaped and a hop-path-shaped string.
+	root := `/repo with spaces/it's "quoted" $(printf INJECTED)/` + "`printf INJECTED`" + ";printf INJECTED"
+	runID := "11111111-1111-4111-8111-111111111111"
+	assignment := string(renderManagerAssignment(&managerAssignmentFields{
+		HOPPath: recorder, RepositoryRoot: root, RunID: runID,
+	}))
+	var line string
+	for _, l := range strings.Split(assignment, "\n") {
+		if strings.Contains(l, " status -C ") {
+			line = strings.TrimSpace(l)
+		}
+	}
+	if line == "" {
+		t.Fatalf("no status command line found in assignment:\n%s", assignment)
+	}
+
+	out, err := exec.CommandContext(t.Context(), "/bin/sh", "-c", line).Output() //nolint:gosec // line is the exact rendered instruction under test.
+	if err != nil {
+		t.Fatalf("sh -c %q: %v", line, err)
+	}
+	got := strings.Split(strings.TrimRight(string(out), "\x00"), "\x00")
+	want := []string{"status", "-C", root, "-run", runID}
+	if !slices.Equal(got, want) {
+		t.Errorf("recorded argv = %q, want %q", got, want)
 	}
 }
 

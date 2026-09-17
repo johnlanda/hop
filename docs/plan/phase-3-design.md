@@ -1099,6 +1099,16 @@ surface is asserted in the `DuplicateAndAmbiguousDelivery` exit scenario
 worker is dead and asserts the condition line, its counts and its age
 fields, then asserts the line clears after the relaunch acks.
 
+The manager's verdict channel is exactly this surface: a review verdict's
+controller notice (section 8) carries only the reviewer's reasons text as
+its body, never the verdict itself, so `hop status -run`'s
+`verdict-rejected` guard-shortfall line — naming the review's own id,
+subject commit and reasons path, never just "the latest review" — is how
+the manager learns a review was rejected, per the manager assignment's
+own standing instruction to run it after every controller info notice
+and compare the shortfall's reasons path against the fetched notice's
+own body path before acting.
+
 Deferred capability — a dialog-safe nudge: a typed wake-up for an idle
 recipient stays out of HOP until Herdr offers a surface that removes the
 misdetection window, none of which exists on 0.9.0. Research leads a
@@ -1481,6 +1491,16 @@ harmless by construction: the guard compares object IDs, so staleness is
 computed, never stored (the gate-evaluation immutability principle of
 [domain-model.md](../architecture/domain-model.md)).
 
+Since the accepting transaction's controller notice names no verdict (its
+body is the reasons artifact, read separately through the notice's own
+`body:` path), `hop status -run`'s `verdict-rejected` shortfall line —
+named in the manager's own standing instruction — is the only channel
+that tells the manager a verdict was a reject rather than an approve; it
+names the review's own id, subject and reasons path (never just "the
+latest review") precisely so the manager can match it against a
+specific fetched notice and never plan a second fix for a rejection it
+already addressed or a fix has since superseded.
+
 ### Reviewer independence
 
 Structural: the reviewer session is a distinct session (its own native
@@ -1597,6 +1617,41 @@ discipline; message and review refusals exit 1 with the `refused:`
 grammar, a retryable `transient:` first line also exits 1, and usage
 errors exit 2.
 
+Once the worktree-retirement slice (section 12) lands, `hop status` also
+runs the lazy post-merge retirement pass (open question 6) before it
+renders: the detail block below is a separate, later concern from that
+pass, and neither reads the other's output.
+
+The feature-mode detail block's own fixed line text (section 10's `hop
+status` row) is specified as its own small grammar, in
+`internal/app/grammar.go` alongside the verb table above, since the
+fixture manager and the deterministic scenarios (section 11) parse it
+exactly as they parse the verb grammar. Every path and Herdr binding
+identifier in the table below, and every such value in the detail's
+common header — the binding, the solo worktree, the target branch (also
+inside the `worktrees:` sentence), artifact and check-evidence paths, the
+trust-seed evidence and the last check's detail, both of which embed
+them — plus the git object ids (`cmd/hop`'s `safeRenderExternal`, applied
+consistently to worktree-retirement's own report and per-row lines too)
+renders raw only when it is valid UTF-8 with no C0/DEL/C1 control byte,
+no double quote and no backslash; otherwise it renders as Go's
+`strconv.Quote` form, which always starts with a double quote a raw
+rendering never can — these are operator-, principal- or git-sourced
+strings (a checkout location, a workspace/tab/pane id, a ref name, a
+process's error output), never HOP-generated, and none of the stores or
+resolvers on their path reject control bytes:
+
+| Line | Shape |
+| --- | --- |
+| Task table row | `task t<seq> <task-uuid>: kind=<kind> state=<state> deps=<t<seq> labels, or (none)> attempts=<n> worktree=<path, or (none)>` |
+| Latest integration | `integration <id>: task=t<seq> state=<state> source=<oid, or (none)> premerge=<oid, or (none)> merge=<oid, or (none)>` |
+| Guard shortfall | `shortfall: <kind>` (`plan-open`, `check-missing`, `verdict-missing`, `verdict-stale-subject`), `shortfall: <kind> t<seq> <task-uuid>` (`task-not-integrated`), or `shortfall: verdict-rejected review=<review-uuid> subject=<oid> reasons=<path>` — the kind token exactly as `run.ShortfallKind` defines it. `verdict-rejected` names the SPECIFIC review it reports (Astra F3): `EvaluateReadiness` checks subject currency before the verdict value, so a review whose subject no longer equals the head is `verdict-stale-subject` whatever its verdict, and `verdict-rejected` fires only for a reject of the CURRENT head — carrying that review's id, subject commit and reasons path (`reviewReasonsPath`, the exact path its accepting transaction's controller notice used as its own body) so a manager can tell which review is being reported, without guessing from "the latest one". The status read's head is the newest integrated row's merge commit, and its tree is the one HOP recorded for exactly that commit (a review task's frozen subject or an accepted review's subject, each resolved from git), never the commit id; with no such record the tree stays unknown, which can report a review only as stale (its commit then differs from the head) and a check only as missing, never as current. When the recorded trees for the head commit disagree, the check and verdict shortfalls are not reported and one value-free `shortfall: evidence-inconsistent` takes their place — never a rejection, as the manager's standing instruction says — while the plan and task shortfalls and the rest of the block render as usual |
+| Attention (section 7, verbatim) | `attention: messages pending for <address>: in-flight <age> (message <uuid>), queued <n>, oldest <age>`, either clause optional but never both absent; `<address>` is `manager`, `human`, or `task:<uuid> (t<seq>)` |
+| Attention action (only when the mailbox's Attention condition holds) | `open <workspace>/<tab>/<pane> and check that the agent is following its polling instructions` (a manager or task address, its live session's binding named when known, else "that session's pane"), or `answer pending human questions with hop answer` (the human address) |
+| Listing/state-line marker | `blocked, needs attention`, appended alongside `stop requested`/`reconciling` whenever any mailbox is in the Attention condition |
+| Pending question | `question <uuid> age=<age> body: <path>` then `hop answer <uuid> --file <path>` (`<path>` a literal placeholder: the answer file does not exist yet) |
+| Per-session row | `session <uuid>: role=<role> state=<state> task=<t<seq>, or (none)> attempt=<n> binding=<workspace/tab/pane, or (none)>` |
+
 ## 11. Test plan
 
 Integration-first, per the Phase 2 lesson: every new external surface gets
@@ -1647,7 +1702,7 @@ structural countermeasure, not just a test:
 
 | Layer | Tests |
 | --- | --- |
-| Domain (`internal/domain/run`, `identity`) | Independent transcription tables for the extended Task machines (both kinds), Message delivery, Integration; multi-attempt density and `ErrRetryNotTerminal`/`ErrRetryLimit`; dependency acyclicity and `ReleaseEligible`; delegation-depth and manager-uniqueness rules; `AcceptVerdict`, `AcceptAck`, `NextDeliverable` orders (receipt-before-eligibility, duplicate/conflicting/stale vectors); `EvaluateReadiness` shortfall vectors (missing integration, stale-subject approve, reject present, head moved); the six section 5 reference traces as complete multi-entity traces; new ID parsing with fuzz |
+| Domain (`internal/domain/run`, `identity`) | Independent transcription tables for the extended Task machines (both kinds), Message delivery, Integration; multi-attempt density and `ErrRetryNotTerminal`/`ErrRetryLimit`; dependency acyclicity and `ReleaseEligible`; delegation-depth and manager-uniqueness rules; `AcceptVerdict`, `AcceptAck`, `NextDeliverable` orders (receipt-before-eligibility, duplicate/conflicting/stale vectors); `EvaluateReadiness` shortfall vectors (missing integration, stale-subject approve, stale-subject reject — subject currency checked before the verdict value, Astra F3 — reject present at the current head carrying its review's id and subject, head moved); the six section 5 reference traces as complete multi-entity traces; new ID parsing with fuzz |
 | Application (`internal/app`) | Extended fakes with the shared refused-input vectors; scheduler scenarios: slot bound enforced inside the assignment transaction, release only on `integrated`, deterministic pass order, per-attempt session retirement freeing slots only on observed absence, retry consumption and exhaustion (direct-to-failed), plan closure (empty-plan refusal, reopen-on-create, late create/retry refused by run state, readiness re-validated in the final transaction), review-task creation exactly once per head; integration decision-table rows (all crash columns for merge/publish/reset, the no-op adoption, conflict evidence, stop mid-merge, stop completing a pending rollback) and the two INTEGRATION BARRIERS: (a) controller A resumes after B has taken over, rolled back and advanced the branch — A's zombie publish/reset CAS fails and its scratch group is retired by claim; (b) the unmoved-head window — stop (or takeover) with A's publish intent unresolved and the head unchanged: the ref-fencing rollback lands first and A's late CAS fails, and in the reverse interleaving A's landed publish is rolled back by the stop path and its outcome commit is fenced — the ref never rests on an unvalidated candidate; guard enforcement (no verb reaches the guard rows; a scripted "manager" calling every verb cannot complete a run without real receipts); messaging scenarios (serialization per enqueue sequence, re-serve, ack refused for a queued message AND for one delivered only to a predecessor session, stale/duplicate ack, derived answer destination incl. a wrong-task answer refused, relay-chain recovery driven ONLY through CLI-returned data — the `origin` envelope field and `hop msg show` — across a manager restart, answer-acks-question atomicity, forward-before-ack redo idempotency, lineage fetch after relaunch and retry, request-ID idempotency for every mutating verb incl. an accepted-write/lost-response retry — distinct from fetch-before-ack; mailbox closure: acceptance refused while a message is pending, send refused after closure, reopen on acceptance-closure retry but never after failure-closure, exhaustion-without-result closing the mailbox with the orphaned obligations journaled, raced in both orders and on both closure causes); the D1 retirement-kind barriers (pending publish fenced with the current tree; pending reset COMPLETED — persisted R adopted, or the validated pre-merge tree used with the observed head as parent — never fenced over; a crash after a fence CAS before its outcome recovered through integration.fence's own row) and the D2 materialization barrier (preparer paused after HEAD is visible but before checkout completes: the successor abandons the directory and allocates a fresh operation, never merging in a still-mutable tree); the no-injection invariant checked at its section 7 scope (port-surface allowlist over every port, the type-aware forbidden-call rule's fixtures, zero typed-input calls in every scenario); presentation republication and rehydration; manager lineage (historical parents preserved, successor validation, stale-manager verb refusal); six reference traces at app level |
 | SQLite (`internal/adapters/sqlite`) | Migration 003 applied over a POPULATED 001(+002) store — every rebuild preserves rows byte-for-byte where unchanged: bindings and claims intact with backfilled session IDs, solo sessions/roles intact, task seq/kind defaults, check requests re-keyed with `subject_kind='result'`, foreign_key_check clean — and from empty; the migrator's rebuild support (foreign_keys off + check before commit); the shared refused-input vectors against the real store; raced contracts across separate handles: fetch/fetch (exactly ONE serialized in-flight message; a delivery row per successful serve, so two rows when both fetches served it — the at-least-once contract stated unambiguously), ack/ack (one ack), answer/answer (one accepted), request-ID reuse raced (one created entity, the loser reading the winner's receipt), CreateTask cycle check under concurrent edge inserts, serial-integration index raced, manager-uniqueness index raced, retry-request unique-pending raced, two concurrent pending launch intents validating independently under the session-keyed lookup (B2); enqueue-sequence FIFO under interleaved writers (an inverted caller timestamp cannot jump the queue); lineage fetch queries; workflow- and message-receipt key uniqueness on the shared (run, verb, request-ID) acceptance key with duplicate-returns-original vectors, including the SAME request ID accepted independently across two runs and across two verbs, and a reused ID with a different question or body refused; the human-answer digest vectors (question UUID load-bearing: identical bodies to two questions are two requests); the plan flag surviving reopen and takeover; the mailbox send/accept AND send/failure-settlement races from separate handles in both orders, including a send committed AFTER the failure notice's snapshot preparation but BEFORE the first settlement transaction — the first settlement must retry on the snapshot mismatch and the eventual committed notice must include that message ID; the populated-003 fixtures of slice 3 (active, completed, failed and claim-without-binding 001(+002) stores, ambiguous-backfill refusal); receipts for every refusal path and none for empty fetches; `RunDetail` extensions |
 | Herdr adapter | `CreateWorkspace` + `FindWorkspaceByLabel` protocol tests (S8 shapes: the label as a workspace attribute, the sole-tab/sole-pane descent, ambiguity errors, full-structural request fixtures, partial-response tables, cancellation); the `SendText` port removal (the adapter type's method set pinned — the transport allowlist of section 7) |

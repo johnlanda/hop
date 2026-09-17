@@ -302,7 +302,64 @@ func featureRunDetail(ctx context.Context, q querier, detail *app.RunDetail, sna
 	if detail.PendingQuestions, err = pendingQuestions(ctx, q, runID, now); err != nil {
 		return err
 	}
+	if detail.Sessions, err = sessionSummaries(ctx, q, runID); err != nil {
+		return err
+	}
 	return nil
+}
+
+// sessionSummaries lists every session the run has ever created, oldest
+// first, with its current binding (nil when it has none) and — for a
+// child (implementer or reviewer) session — the task and attempt number it
+// is delegated to. A manager session's TaskID stays "" and AttemptNumber 0
+// (a manager binds no attempt).
+func sessionSummaries(ctx context.Context, q querier, runID identity.RunID) ([]app.SessionSummary, error) {
+	rows, err := q.QueryContext(ctx, `SELECT id FROM sessions WHERE run_id = ? ORDER BY rowid`, runID.String())
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: list sessions of run %s: %w", runID, err)
+	}
+	defer rows.Close() //nolint:errcheck // the deferred close of a fully-iterated read cursor has no failure the rows.Err check below misses.
+	var ids []identity.SessionID
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			return nil, fmt.Errorf("sqlite: scan session row: %w", err)
+		}
+		id, parseErr := identity.ParseSessionID(raw)
+		if parseErr != nil {
+			return nil, fmt.Errorf("sqlite: listed session id: %w", parseErr)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("sqlite: iterate session rows: %w", err)
+	}
+
+	summaries := make([]app.SessionSummary, 0, len(ids))
+	for _, id := range ids {
+		session, _, sessionErr := getSession(ctx, q, id)
+		if sessionErr != nil {
+			return nil, sessionErr
+		}
+		summary := app.SessionSummary{SessionID: session.ID, Role: session.Role, State: session.State}
+		if session.AttemptID != "" {
+			attempt, _, attemptErr := getAttempt(ctx, q, session.AttemptID)
+			if attemptErr != nil {
+				return nil, attemptErr
+			}
+			summary.TaskID = attempt.TaskID
+			summary.AttemptNumber = attempt.Number
+		}
+		binding, hasBinding, bindingErr := currentBinding(ctx, q, id)
+		if bindingErr != nil {
+			return nil, bindingErr
+		}
+		if hasBinding {
+			summary.Binding = &binding
+		}
+		summaries = append(summaries, summary)
+	}
+	return summaries, nil
 }
 
 // latestIntegrationSummary loads the run's most recently CREATED
@@ -326,14 +383,16 @@ func latestIntegrationSummary(ctx context.Context, q querier, runID identity.Run
 }
 
 // guardShortfalls assembles a GuardContext from exactly the evidence this
-// read model tracks and evaluates it: the plan flag and implement tasks
-// are real; the head object IDs come from the most recently INTEGRATED
-// integration row, both collapsing to its merge commit (Integration
-// carries no separate tree id); LatestCheck is nil — no combined-candidate
-// check receipt is recorded by this slice's tables, so check-missing is
-// reported whenever a head exists, honestly reflecting the absent evidence
-// (the completion guard itself, usecase_completion.go, assembles its own
-// context from the live ref, never from this status surface).
+// read model tracks and evaluates it through app.StatusGuardShortfalls:
+// the plan flag and implement tasks are real; the head commit is the most
+// recently INTEGRATED integration row's merge commit, and its tree is the
+// one the run's recorded subjects name for exactly that commit
+// (recordedSubjects; the integration row itself records no tree);
+// LatestCheck is nil — this read does not assemble a combined-candidate
+// check receipt, so check-missing is reported whenever the check guard is
+// evaluated (the completion guard itself, usecase_completion.go,
+// assembles its own context from the live ref, never from this status
+// surface).
 func guardShortfalls(ctx context.Context, q querier, runID identity.RunID, tasks []run.Task) ([]run.GuardShortfall, error) {
 	runV, _, err := getRun(ctx, q, runID)
 	if err != nil {
@@ -349,10 +408,13 @@ func guardShortfalls(ctx context.Context, q querier, runID identity.RunID, tasks
 		selectIntegrationColumns+` WHERE run_id = ? AND state = 'integrated' ORDER BY updated_at DESC, rowid DESC LIMIT 1`,
 		runID.String(),
 	).Scan)
+	var recorded []app.RecordedSubject
 	switch {
 	case err == nil:
 		guardCtx.HeadCommitOID = integrated.MergeCommitOID
-		guardCtx.HeadTreeOID = integrated.MergeCommitOID
+		if recorded, err = recordedSubjects(ctx, q, runID, integrated.MergeCommitOID); err != nil {
+			return nil, err
+		}
 	case errors.Is(err, sql.ErrNoRows):
 	default:
 		return nil, fmt.Errorf("sqlite: load integrated head of run %s: %w", runID, err)
@@ -360,8 +422,63 @@ func guardShortfalls(ctx context.Context, q querier, runID identity.RunID, tasks
 	if guardCtx.LatestReview, err = latestReview(ctx, q, runID); err != nil {
 		return nil, err
 	}
-	_, missing := run.EvaluateReadiness(guardCtx)
-	return missing, nil
+	return app.StatusGuardShortfalls(guardCtx, recorded), nil
+}
+
+// recordedSubjects lists the run's recorded subjects for exactly commit:
+// every review task's frozen subject and every accepted review's subject,
+// each resolved from git by the application.
+func recordedSubjects(ctx context.Context, q querier, runID identity.RunID, commit string) ([]app.RecordedSubject, error) {
+	rows, err := q.QueryContext(ctx,
+		`SELECT subject_commit_oid, subject_tree_oid FROM tasks WHERE run_id = ? AND kind = ? AND subject_commit_oid = ?
+		UNION ALL
+		SELECT subject_commit_oid, subject_tree_oid FROM reviews WHERE run_id = ? AND subject_commit_oid = ?`,
+		runID.String(), string(run.TaskKindReview), commit, runID.String(), commit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: list recorded subjects of run %s: %w", runID, err)
+	}
+	defer rows.Close() //nolint:errcheck // the deferred close of a fully-iterated read cursor has no failure the rows.Err check below misses.
+	var subjects []app.RecordedSubject
+	for rows.Next() {
+		var commitOID, treeOID sql.NullString
+		if err := rows.Scan(&commitOID, &treeOID); err != nil {
+			return nil, fmt.Errorf("sqlite: scan recorded subject: %w", err)
+		}
+		subjects = append(subjects, app.RecordedSubject{CommitOID: commitOID.String, TreeOID: treeOID.String})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("sqlite: iterate recorded subjects: %w", err)
+	}
+	return subjects, nil
+}
+
+// runNeedsAttentionLocked reports section 7's "blocked, needs attention"
+// listing condition for one run (Astra F4): false for a solo run
+// (Workflow.Feature() false), otherwise the OR-reduction of the SAME
+// mailboxStatuses call featureRunDetail's own Mailboxes population
+// makes — one implementation of the attention threshold rule, reused by
+// both ListRuns (this function) and LoadRunStatus (via
+// featureRunDetail), so the bare listing and the `-run` detail can never
+// disagree about one run.
+func runNeedsAttentionLocked(ctx context.Context, q querier, runID identity.RunID, now time.Time) (bool, error) {
+	snapshot, err := loadSnapshot(ctx, q, runID)
+	if err != nil {
+		return false, err
+	}
+	if !snapshot.Workflow.Feature() {
+		return false, nil
+	}
+	mailboxes, err := mailboxStatuses(ctx, q, runID, snapshot.Workflow.MessageAttention, now)
+	if err != nil {
+		return false, err
+	}
+	for i := range mailboxes {
+		if mailboxes[i].Attention {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // mailboxStatuses assembles section 7's per-address status surface: one

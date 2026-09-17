@@ -170,6 +170,50 @@ func TestEvaluateReadinessStaleSubjectApprove(t *testing.T) {
 	}
 }
 
+// TestEvaluateReadinessStaleSubjectReject proves subject currency is
+// checked BEFORE the verdict value: a reject bound to a superseded head
+// (a fix already integrated a new one) is ShortfallVerdictStaleSubject,
+// never ShortfallVerdictRejected — a rejection of an old, already-
+// addressed candidate must not resurrect itself forever every time
+// EvaluateReadiness runs against the new head.
+func TestEvaluateReadinessStaleSubjectReject(t *testing.T) {
+	ctx := readyContext()
+	ctx.LatestReview = &run.Review{ID: testReviewID, Verdict: run.VerdictReject, SubjectCommitOID: "old-commit", SubjectTreeOID: "old-tree"}
+
+	ready, missing := run.EvaluateReadiness(ctx)
+	if ready {
+		t.Fatal("EvaluateReadiness(stale-subject reject) ready = true, want false")
+	}
+	if !hasShortfall(missing, run.ShortfallVerdictStaleSubject) {
+		t.Fatalf("EvaluateReadiness(stale-subject reject) missing = %+v, want ShortfallVerdictStaleSubject", missing)
+	}
+	if hasShortfall(missing, run.ShortfallVerdictRejected) {
+		t.Fatalf("EvaluateReadiness(stale-subject reject) missing = %+v, want no ShortfallVerdictRejected", missing)
+	}
+}
+
+// TestEvaluateReadinessRejectCarriesReviewIdentity proves
+// ShortfallVerdictRejected names the specific review it reports: its id
+// and subject commit, so a caller (the manager's status-driven verdict
+// channel) can tell which review a shortfall is about without guessing
+// from "the latest one".
+func TestEvaluateReadinessRejectCarriesReviewIdentity(t *testing.T) {
+	ctx := readyContext()
+	ctx.LatestReview = &run.Review{ID: testReviewID, Verdict: run.VerdictReject, SubjectCommitOID: "head-commit", SubjectTreeOID: "head-tree"}
+
+	_, missing := run.EvaluateReadiness(ctx)
+	for _, m := range missing {
+		if m.Kind != run.ShortfallVerdictRejected {
+			continue
+		}
+		if m.ReviewID != testReviewID || m.SubjectCommitOID != "head-commit" {
+			t.Fatalf("ShortfallVerdictRejected = %+v, want ReviewID %s and SubjectCommitOID head-commit", m, testReviewID)
+		}
+		return
+	}
+	t.Fatalf("missing = %+v, want ShortfallVerdictRejected", missing)
+}
+
 // TestEvaluateReadinessReportsEveryShortfall proves missing is not just
 // the first failing guard: every unsatisfied guard is reported together.
 func TestEvaluateReadinessReportsEveryShortfall(t *testing.T) {

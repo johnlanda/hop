@@ -20,6 +20,14 @@ type RunStatus struct {
 	StopRequested bool
 	Reconciling   bool // at least one operation for the run is OperationReconciling
 	UpdatedAt     time.Time
+	// NeedsAttention is section 7's "blocked, needs attention" condition
+	// (Astra F4): true when a feature run has at least one mailbox in the
+	// Attention condition, computed by the SAME mailboxStatuses function
+	// the `-run` detail render's own Mailboxes[].Attention OR-reduction
+	// consumes — one implementation of the threshold rule, two call
+	// sites — so the bare listing and the detail block can never
+	// disagree about one run. Always false for a solo run.
+	NeedsAttention bool
 }
 
 // TaskSummary is one row of RunDetail's feature-mode task table (section
@@ -96,6 +104,21 @@ type PendingQuestion struct {
 	Age       time.Duration
 }
 
+// SessionSummary is one of a feature run's sessions: its role, state and
+// current binding, plus the task and attempt it is delegated to (the zero
+// TaskID and AttemptNumber 0 for the manager, which binds no attempt) —
+// `hop status -run`'s per-session roles/bindings listing (section 10).
+// Binding is nil when the session currently has none (a reserved session,
+// or one between a lost binding and its replacement).
+type SessionSummary struct {
+	SessionID     identity.SessionID
+	Role          run.Role
+	State         run.SessionState
+	TaskID        identity.TaskID // "" for the manager
+	AttemptNumber int             // 0 for the manager
+	Binding       *run.RuntimeBinding
+}
+
 // RunDetail is the full detail block `hop status -run` renders, and the
 // identities the controller use cases (stop, resume) need to load and
 // mutate the run's task, attempt and session directly. Phase 2 gives every
@@ -153,9 +176,10 @@ type RunDetail struct {
 	// row, if any; nil for a solo run or a feature run with no integration
 	// attempted yet.
 	LatestIntegration *IntegrationSummary
-	// GuardShortfalls is EvaluateReadiness's missing list, rendered
-	// verbatim (section 3): always empty for a solo run, since only a
-	// feature run ever assembles a GuardContext.
+	// GuardShortfalls is StatusGuardShortfalls' list — EvaluateReadiness's
+	// missing list, rendered verbatim (section 3), unless the recorded
+	// evidence about the head contradicts itself: always empty for a solo
+	// run, since only a feature run ever assembles a GuardContext.
 	GuardShortfalls []run.GuardShortfall
 	// Mailboxes is section 7's per-address queue-depth/in-flight-age
 	// status surface: one entry per address with a non-empty queue or an
@@ -164,6 +188,94 @@ type RunDetail struct {
 	// PendingQuestions is every unanswered human-addressed question,
 	// oldest first.
 	PendingQuestions []PendingQuestion
+	// Sessions is every session the run has ever created, oldest first;
+	// nil for a solo run (solo's single worker session is already named by
+	// SessionID/Binding/Claim above).
+	Sessions []SessionSummary
+}
+
+// ShortfallEvidenceInconsistent is the one guard shortfall kind only the
+// status read model reports, never EvaluateReadiness: the run's recorded
+// subjects name more than one tree object id for the integration head's
+// commit. A commit determines exactly one tree, so that evidence
+// contradicts itself, and no check or verdict condition — current,
+// stale, missing or rejected — can be stated from it. It names no
+// review and is never a rejection.
+const ShortfallEvidenceInconsistent run.ShortfallKind = GrammarShortfallEvidenceInconsistent
+
+// RecordedSubject is one candidate subject HOP resolved from git and
+// recorded: a commit object id and the tree object id resolved for that
+// commit — a review task's frozen subject (EnsureReviewTask, from the
+// guard head) or an accepted review's subject (SubmitReviewVerdict's
+// rev-parse).
+type RecordedSubject struct {
+	CommitOID string
+	TreeOID   string
+}
+
+// StatusGuardShortfalls evaluates the completion guard for the status
+// read model (RunDetail.GuardShortfalls), for both stores. guard carries
+// the plan flag, the implement tasks, the head commit (the newest
+// integrated row's merge commit, "" when none has settled), any check
+// receipt and the latest review; its HeadTreeOID is ignored and derived
+// here from recorded. The completion guard never uses this function: it
+// resolves the head tree from git (resolveGuardHead).
+//
+// The head tree is the tree recorded for exactly the head commit. A
+// commit determines its tree, and every recorded subject was resolved
+// from git for its own commit, so that tree is the head's. The
+// integration row records no tree, and a commit id is never a tree id. A
+// subject with an empty tree records nothing.
+//
+// When no subject records a tree for the head commit, the head tree
+// stays empty, and the evaluation is still truthful. Every accepted
+// review carries a non-empty tree, so no review can match an empty head
+// tree and be reported current, whether as a cleared approve or as a
+// rejection of the head. A review whose commit is the head is itself a
+// recorded subject for it, so an unknown tree means the latest review's
+// commit differs from the head, which is exactly what
+// verdict-stale-subject reports. A check receipt carries a tree too, so
+// none can match either, and check-missing is reported.
+//
+// When the recorded subjects name different trees for the head commit,
+// the check and verdict guards are not reported at all: their shortfalls
+// are dropped and ShortfallEvidenceInconsistent takes their place. The
+// plan and task guards do not depend on the head and are reported as
+// usual.
+func StatusGuardShortfalls(guard run.GuardContext, recorded []RecordedSubject) []run.GuardShortfall { //nolint:gocritic // hugeParam: GuardContext is passed by value, like run.EvaluateReadiness's own parameter.
+	guard.HeadTreeOID = ""
+	consistent := true
+	if guard.HeadCommitOID != "" {
+		guard.HeadTreeOID, consistent = recordedTree(guard.HeadCommitOID, recorded)
+	}
+	_, missing := run.EvaluateReadiness(guard)
+	if consistent {
+		return missing
+	}
+	kept := make([]run.GuardShortfall, 0, len(missing)+1)
+	for _, shortfall := range missing {
+		switch shortfall.Kind {
+		case run.ShortfallCheckMissing, run.ShortfallVerdictMissing, run.ShortfallVerdictRejected, run.ShortfallVerdictStaleSubject:
+		default:
+			kept = append(kept, shortfall)
+		}
+	}
+	return append(kept, run.GuardShortfall{Kind: ShortfallEvidenceInconsistent})
+}
+
+// recordedTree returns the tree recorded for commit ("" when none is);
+// consistent is false when recorded names more than one.
+func recordedTree(commit string, recorded []RecordedSubject) (tree string, consistent bool) {
+	for _, subject := range recorded {
+		if subject.CommitOID != commit || subject.TreeOID == "" {
+			continue
+		}
+		if tree != "" && subject.TreeOID != tree {
+			return "", false
+		}
+		tree = subject.TreeOID
+	}
+	return tree, true
 }
 
 // CheckExecutionContext is what the check exec boundary (`hop check-exec`)
