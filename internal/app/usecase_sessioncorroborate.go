@@ -116,6 +116,17 @@ func (c *Controller) sessionUnderLaunchCorroboration(ctx context.Context, handle
 // resume path marks a session reconciling only after reading its claim as
 // settled, so an exec_pending claim under a live placement can only be a
 // launch this step is still corroborating.
+//
+// Two of the four conjuncts are defensive rather than discriminating as
+// this is called today: every caller sources binding and claim from
+// sessionCloseEvidence, which reads Bindings().Current — already
+// unsuperseded, since the store selects on it — and then keys the claim by
+// that binding's own incarnation. So !Superseded and the incarnation
+// equality cannot be false through any current path, and no test can make
+// them false without a caller that sources the pair some other way. They
+// are kept because this predicate states the whole shape it identifies,
+// and the sqlite read model's twin (launchCorroborationPending) rests on
+// the same currentBinding property rather than re-deriving it.
 func wrapperReconciliation(binding *run.RuntimeBinding, claimFound bool, claim *LaunchClaim) bool {
 	return binding.PaneID != "" && !binding.Superseded &&
 		claimFound && claim.State == LaunchClaimExecPending && claim.IncarnationID == binding.IncarnationID
