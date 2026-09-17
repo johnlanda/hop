@@ -291,7 +291,7 @@ func addressSessionCurrent(ctx context.Context, q querier, session *run.Session)
 	return run.CurrentAddressSession(*session, attempt, newest), nil
 }
 
-// addressSessionRefusal is the value-free detail a fetch refused by
+// addressSessionRefusal is the value-free detail a fetch or send refused by
 // addressSessionCurrent records and returns.
 func addressSessionRefusal(address run.Address) string {
 	if address.Kind == run.AddressManager {

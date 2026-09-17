@@ -301,3 +301,121 @@ func TestFakeManagerMessagingRequiresAManagerSessionThatHasNotEnded(t *testing.T
 		t.Fatalf("successor manager's next fetch = %+v, %t, %v; want the second message", delivery, served, fetchErr)
 	}
 }
+
+// queueQuestion sends the task one manager question and requires its
+// acceptance.
+func (f *fakeLineage) queueQuestion(t *testing.T) identity.MessageID {
+	t.Helper()
+	question := managerSender(f.fr).question(t, f.tc, f.fr.RunID, run.TaskAddress(f.Task), nil)
+	requireFakeSend(t, f.tc, "manager question to the task", question, app.MessageAccepted, "")
+	return question.ID
+}
+
+// sender is child's messaging identity at the task's lineage address.
+func (f *fakeLineage) sender(child fakeChild) answerSender {
+	return answerSender{session: child.Session, address: run.TaskAddress(f.Task), incarnation: child.Incarnation}
+}
+
+// requireFakeSendStale sends one request the fake must refuse as not its
+// address's current session: stale with the value-free detail and no
+// envelope.
+func requireFakeSendStale(t *testing.T, tc *testController, label string, send app.MessageSend, detail string) { //nolint:gocritic // hugeParam: the port passes the send value; the helper mirrors it.
+	t.Helper()
+	got := requireFakeSend(t, tc, label, send, app.MessageRefused, app.GrammarReasonStale)
+	if got.Detail != detail || got.MessageID != "" {
+		t.Fatalf("%s: SendMessage() = %+v, want detail %q naming no message", label, got, detail)
+	}
+	if _, exists := tc.Store.Messages[send.ID]; exists {
+		t.Fatalf("%s: the refused send created an envelope", label)
+	}
+}
+
+// TestFakeSendRequiresTheAddressCurrentSession is the fake half of the
+// sqlite adapter's TestSendRequiresTheAddressCurrentSession.
+func TestFakeSendRequiresTheAddressCurrentSession(t *testing.T) {
+	infoToManager := func(t *testing.T, f *fakeLineage, child fakeChild) app.MessageSend {
+		t.Helper()
+		send := f.sender(child).question(t, f.tc, f.fr.RunID, run.ManagerAddress(), nil)
+		send.Kind, send.BodyDigest = run.MessageInfo, "info-"+send.ID.String()
+		return send
+	}
+
+	t.Run("a retired attempt's session after a retry; the successor answers", func(t *testing.T) {
+		f := newFakeLineage(t)
+		question := f.queueQuestion(t)
+		if delivery, served, err := f.fetch(f.Old); err != nil || !served || delivery.Message.ID != question {
+			t.Fatalf("fetch while current = %+v, %t, %v; want the question", delivery, served, err)
+		}
+		f.retireAndRetry(t)
+
+		requireFakeSendStale(t, f.tc, "retired session's answer",
+			storevectors.MessageSendSupersededAttempt(f.fr.RunID, f.Old.Session, f.Task, f.Old.Incarnation, mintMessageID(t, f.tc), question, "/state/a.md", "stale-answer", 5),
+			storevectors.MessageSendSupersededAttemptDetail)
+		requireFakeSendStale(t, f.tc, "retired session's info", infoToManager(t, f, f.Old), storevectors.MessageSendSupersededAttemptDetail)
+		requireFakeSendStale(t, f.tc, "retired session's question", f.sender(f.Old).question(t, f.tc, f.fr.RunID, run.ManagerAddress(), nil), storevectors.MessageSendSupersededAttemptDetail)
+		if n := fakeAnswersTo(f.tc, question); n != 0 {
+			t.Fatalf("answers after the retired session's answer = %d, want 0", n)
+		}
+
+		if delivery, served, err := f.fetch(f.New); err != nil || !served || delivery.Message.ID != question {
+			t.Fatalf("successor fetch = %+v, %t, %v; want the question re-served", delivery, served, err)
+		}
+		accepted := requireFakeSend(t, f.tc, "successor's answer", f.sender(f.New).answer(t, f.tc, f.fr.RunID, question, "", "fresh-answer"), app.MessageAccepted, "")
+		if seq := f.tc.Store.Messages[accepted.MessageID].EnqueueSeq; seq != 1 {
+			t.Fatalf("successor's answer = seq %d; want the manager's first message", seq)
+		}
+		requireFakeSend(t, f.tc, "successor's info", infoToManager(t, f, f.New), app.MessageAccepted, "")
+	})
+
+	t.Run("an interrupted attempt whose session is stopping and bound", func(t *testing.T) {
+		f := newFakeLineage(t)
+		question := f.queueQuestion(t)
+		if _, served, err := f.fetch(f.Old); err != nil || !served {
+			t.Fatalf("fetch while current = %t, %v", served, err)
+		}
+		f.tc.Store.Attempts[f.Old.Attempt].value.State = run.AttemptInterrupted
+		f.tc.Store.Sessions[f.Old.Session].value.State = run.SessionStopping
+		requireFakeSendStale(t, f.tc, "stopping session's answer", f.sender(f.Old).answer(t, f.tc, f.fr.RunID, question, "", "late-answer"), storevectors.MessageSendSupersededAttemptDetail)
+		if n := fakeAnswersTo(f.tc, question); n != 0 {
+			t.Fatalf("answers after the stopping session's answer = %d, want 0", n)
+		}
+	})
+
+	t.Run("a terminated session on a live, newest attempt", func(t *testing.T) {
+		f := newFakeLineage(t)
+		f.tc.Store.Sessions[f.Old.Session].value.State = run.SessionTerminated
+		requireFakeSendStale(t, f.tc, "terminated session's info", infoToManager(t, f, f.Old), storevectors.MessageSendSupersededAttemptDetail)
+	})
+
+	t.Run("receipt first, then the incarnation, then currency", func(t *testing.T) {
+		f := newFakeLineage(t)
+		question := f.queueQuestion(t)
+		answer := f.sender(f.Old).answer(t, f.tc, f.fr.RunID, question, "s1-answer", "s1-body")
+		accepted := requireFakeSend(t, f.tc, "answer while current", answer, app.MessageAccepted, "")
+		f.retireAndRetry(t)
+
+		if replay := requireFakeSend(t, f.tc, "the retired session's identical retry", answer, app.MessageDuplicate, ""); replay.MessageID != accepted.MessageID {
+			t.Fatalf("duplicate names %s, want the accepted answer %s", replay.MessageID, accepted.MessageID)
+		}
+		requireFakeSend(t, f.tc, "the retired session reusing its request id with another body",
+			f.sender(f.Old).answer(t, f.tc, f.fr.RunID, question, "s1-answer", "other-body"), app.MessageRefused, app.GrammarReasonConflicting)
+		requireFakeSendStale(t, f.tc, "the retired session's fresh request id with the same body",
+			f.sender(f.Old).answer(t, f.tc, f.fr.RunID, question, "s1-again", "s1-body"), storevectors.MessageSendSupersededAttemptDetail)
+		other := infoToManager(t, f, f.Old)
+		other.IncarnationID = identity.IncarnationID(mintMessageID(t, f.tc).String())
+		if got := requireFakeSend(t, f.tc, "the retired session at another incarnation", other, app.MessageRefused, app.GrammarReasonStale); got.Detail != "incarnation is not current" {
+			t.Fatalf("SendMessage() detail = %q, want the incarnation refusal first", got.Detail)
+		}
+	})
+
+	t.Run("an ended manager beside its successor", func(t *testing.T) {
+		f := newFakeLineage(t)
+		successor := endFakeManagerWithSuccessor(t, f.tc, f.fr)
+		requireFakeSendStale(t, f.tc, "ended manager's info",
+			storevectors.MessageSendEndedManager(f.fr.RunID, f.fr.ManagerID, f.fr.ManagerIncarnation, mintMessageID(t, f.tc), f.Task, "/state/i.md", "ended-info", 4),
+			storevectors.MessageSendEndedManagerDetail)
+		requireFakeSend(t, f.tc, "successor manager's info",
+			storevectors.MessageSendEndedManager(f.fr.RunID, successor.Session, successor.Incarnation, mintMessageID(t, f.tc), f.Task, "/state/i.md", "successor-info", 4),
+			app.MessageAccepted, "")
+	})
+}

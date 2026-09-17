@@ -203,8 +203,10 @@ newer.
 
 ```go
 type MessagingStore interface {
-    // Section 7. All validate the caller's session and incarnation
-    // currency; every outcome except an empty fetch commits a receipt.
+    // Section 7. All session verbs validate the caller's session, its
+    // incarnation currency and its address currency (only the address's
+    // current session sends, fetches or acks); every outcome except an
+    // empty fetch commits a receipt.
     // Mutating verbs carry an optional caller-stable RequestID: an
     // identical retry returns the original outcome, a conflicting reuse
     // is refused (ErrRequestConflict).
@@ -735,9 +737,10 @@ for `task:<id>`, the session of the task's CURRENT attempt — the task's
 newest (highest-numbered) attempt, not terminal — that has not ended. A
 retired attempt's session (its attempt terminal or succeeded by a retry,
 or the session itself lost or terminated, whatever its binding says) is
-never served the address and cannot acknowledge a message it was served
-while current: that message stays in flight and is re-served to the
-current session, which acknowledges it after its own fetch.
+never served the address, cannot acknowledge a message it was served
+while current — that message stays in flight and is re-served to the
+current session, which acknowledges it after its own fetch — and cannot
+send anything: no answer, question or info (section 7).
 There is no message TTL and no expiry in Phase 3; an unfetched queue ages
 visibly in `hop status` (section 7's attention condition).
 
@@ -1030,10 +1033,10 @@ current AT ITS CREATION — historical provenance, never rewritten — while
 is always the run's sole non-terminal manager-role session. A retired
 manager incarnation's verbs and acks fail the ordinary
 incarnation-currency checks, and a manager session that has ended (lost
-or terminated) is never served the `manager` address nor able to ack a
-message it was served, even while its binding is still current
-(section 7's fetch and ack authority) — so it can never consume its
-successor's queue.
+or terminated) is never served the `manager` address, nor able to ack a
+message it was served or send one, even while its binding is still
+current (section 7's address currency) — so it can never consume its
+successor's queue or speak for it.
 
 ### Integration branch and worktree bases
 
@@ -1195,8 +1198,8 @@ written.
   until `none:`, acking each). After an accepted or duplicate submission
   its instruction is to end its turn — the controller owns everything
   after submission, and the pane closes when the process exits; once its
-  attempt is terminal its own `hop msg next`/`wait`/`ack` are refused
-  (message verbs below), never answered.
+  attempt is terminal its own `hop msg next`/`wait`/`ack`/`send` are
+  refused (message verbs below), never answered.
 - **Reviewer**: reads the frozen subject, may ask the manager questions
   under the same wait-loop rule, submits exactly one verdict, ends its
   turn; the accepted verdict completes its attempt, after which its own
@@ -1312,6 +1315,19 @@ after the launcher had already claimed is not read, so that principal is
 `stale` until label recovery commits the binding (LAUNCH-6, an accepted
 residual; widening it widens the claim rule with it).
 
+"Current session", wherever a verb requires it, is likewise ONE rule —
+section 5's address currency (`run.CurrentAddressSession`) — applied
+identically by `msg send` (every kind: question, info and answer),
+`msg next`/`msg wait` and `msg ack`, each after the caller's own run, its
+address and its current incarnation, inside the deciding transaction: a
+session that has ended (lost or terminated) never is; a manager needs
+nothing more; a worker or reviewer must belong to its task's newest
+attempt, and that attempt must not be terminal. A send or first ack from
+any other session is `refused: stale`, and a fetch is refused with no
+protocol line (Fetch below); each records a receipt whose detail names no
+value ("session is not its task's current attempt session", or "session
+is not the run's current manager session").
+
 Every mutating verb here and in section 8 (`msg send`, `answer`,
 `task create`, `task retry`, `plan close`; `review submit` already has
 per-attempt digest idempotency) takes a caller-stable
@@ -1401,7 +1417,12 @@ the retryable nor the final line applies to them.
   conflicting`: the request key is run-wide and the digest names the
   sender's address, so the digest never matches and the outcome is the
   same whatever the body — the caller learns only that the ID is taken,
-  never whether its content matches. Kind/address legality
+  never whether its content matches. After the receipt and the
+  incarnation, the sender must be its address's current session (the
+  rule above), whatever the kind: a retired attempt's session or an
+  ended manager is `refused: stale` with that rule's value-free detail
+  and nothing inserted, while its own already-accepted request still
+  replays as duplicate from the receipt. Kind/address legality
   by role: workers and reviewers → `question`/`info` to `manager` only;
   the manager → `question` to `human` or `question`/`info` to `task:<id>`;
   an `answer` is legal only from the session answering a question
@@ -1565,7 +1586,8 @@ address the session does not resolve to, or a session that is not its
 address's current session) prints nothing on stdout, one
 `hop msg next: …` / `hop msg wait: …` diagnostic on stderr, and exits 1;
 `refused: stale` from `hop msg ack` also covers an ack from a session
-that is no longer its address's current session. A retryable first line (`transient: …`) also exits 1. The two submit
+that is no longer its address's current session, and so does
+`refused: stale` from `hop msg send`. A retryable first line (`transient: …`) also exits 1. The two submit
 verbs each have two retryable lines that demand different actions (rerun
 after a short delay, or drain first), so their store outcome carries a
 TYPED transient reason — attempt-not-running or undelivered-messages, set

@@ -104,7 +104,9 @@ func sendRequestDigest(send *app.MessageSend) string {
 // derived address decides); then the request-ID receipt (an identical
 // retry returns the original acceptance as duplicate; a reused ID with
 // different content is refused), so only a caller at the claimed address
-// reads it; then the current incarnation, and — for an
+// reads it; then the current incarnation and whether the sender is its
+// address's current session (addressSessionCurrent; refused stale
+// otherwise, whatever the kind), and — for an
 // ordinary send — addressing legality, the run's acceptance
 // (run.Run.CanAcceptManagerVerb: transient while the run can still reach
 // running, refused once it never will) and the recipient mailbox; an
@@ -192,6 +194,18 @@ func (s *Store) SendMessage(ctx context.Context, send app.MessageSend) (app.Mess
 		}
 		if !current {
 			return record(app.MessageRefused, "", app.GrammarReasonStale, "incarnation is not current")
+		}
+		// Only the address's CURRENT session sends, whatever the kind: a
+		// session that has ended, or one whose attempt a retry has
+		// succeeded or that is already terminal, is refused stale like a
+		// replaced incarnation. The receipt is read first, so its own
+		// accepted request still replays as duplicate.
+		senderIsCurrent, err := addressSessionCurrent(ctx, tx, &sender)
+		if err != nil {
+			return err
+		}
+		if !senderIsCurrent {
+			return record(app.MessageRefused, "", app.GrammarReasonStale, addressSessionRefusal(senderAddress))
 		}
 
 		if send.Kind == run.MessageAnswer {

@@ -217,8 +217,9 @@ type AckContext struct {
 }
 
 // CurrentAddressSession reports whether session is the current session of
-// its logical address: the only session a fetch serves, and the only one
-// whose first ack counts (section 7). A session that has ended (lost or
+// its logical address: the only session a fetch serves, the only one whose
+// first ack counts and the only one whose send — answer, question or info —
+// is accepted (section 7). A session that has ended (lost or
 // terminated) never is. A manager session needs nothing more — a run holds
 // at most one manager that has not ended — and has no attempt, so its
 // attempt and newest arguments are ignored (callers pass zero values and

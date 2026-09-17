@@ -502,6 +502,43 @@ func TestStoreVectors(t *testing.T) {
 		}
 	})
 
+	t.Run("MessageSendSupersededAttempt", func(t *testing.T) {
+		f := newFakeLineage(t)
+		question := f.queueQuestion(t)
+		if _, served, err := f.fetch(f.Old); err != nil || !served {
+			t.Fatalf("fetch while current = %t, %v", served, err)
+		}
+		f.retireAndRetry(t)
+		answerID := mintMessageID(t, f.tc)
+		got, err := f.tc.Controller.Messages.SendMessage(context.Background(), storevectors.MessageSendSupersededAttempt(f.fr.RunID, f.Old.Session, f.Task, f.Old.Incarnation, answerID, question, "/state/a.md", "stale-answer", 5))
+		if err != nil || got.Kind != app.MessageRefused || got.Reason != storevectors.MessageSendSupersededAttemptReason || got.Detail != storevectors.MessageSendSupersededAttemptDetail {
+			t.Fatalf("SendMessage(superseded attempt) = %+v, %v; want refused/%s %q", got, err, storevectors.MessageSendSupersededAttemptReason, storevectors.MessageSendSupersededAttemptDetail)
+		}
+		if _, exists := f.tc.Store.Messages[answerID]; exists || fakeAnswersTo(f.tc, question) != 0 {
+			t.Fatal("the refused answer left an envelope; want none")
+		}
+		if delivery, served, err := f.fetch(f.New); err != nil || !served || delivery.Message.ID != question {
+			t.Fatalf("successor fetch = %+v, %t, %v; want the question re-served", delivery, served, err)
+		}
+		requireFakeSend(t, f.tc, "successor's answer", f.sender(f.New).answer(t, f.tc, f.fr.RunID, question, "", "fresh-answer"), app.MessageAccepted, "")
+	})
+
+	t.Run("MessageSendEndedManager", func(t *testing.T) {
+		f := newFakeLineage(t)
+		successor := endFakeManagerWithSuccessor(t, f.tc, f.fr)
+		messageID := mintMessageID(t, f.tc)
+		got, err := f.tc.Controller.Messages.SendMessage(context.Background(), storevectors.MessageSendEndedManager(f.fr.RunID, f.fr.ManagerID, f.fr.ManagerIncarnation, messageID, f.Task, "/state/i.md", "ended-info", 4))
+		if err != nil || got.Kind != app.MessageRefused || got.Reason != storevectors.MessageSendEndedManagerReason || got.Detail != storevectors.MessageSendEndedManagerDetail {
+			t.Fatalf("SendMessage(ended manager) = %+v, %v; want refused/%s %q", got, err, storevectors.MessageSendEndedManagerReason, storevectors.MessageSendEndedManagerDetail)
+		}
+		if len(f.tc.Store.Messages) != 0 {
+			t.Fatalf("the refused send left %d envelope(s); want none", len(f.tc.Store.Messages))
+		}
+		requireFakeSend(t, f.tc, "successor manager's info",
+			storevectors.MessageSendEndedManager(f.fr.RunID, successor.Session, successor.Incarnation, mintMessageID(t, f.tc), f.Task, "/state/i.md", "successor-info", 4),
+			app.MessageAccepted, "")
+	})
+
 	t.Run("AckMessageCrossRun", func(t *testing.T) {
 		tc := newTestController(defaultPolicy())
 		fr1 := seedFeatureRun(t, tc, 2)

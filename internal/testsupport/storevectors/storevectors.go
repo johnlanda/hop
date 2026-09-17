@@ -412,6 +412,54 @@ func AckMessageEndedManager(runID identity.RunID, messageID identity.MessageID, 
 	return app.MessageAck{RunID: runID, MessageID: messageID, SessionID: endedManager, IncarnationID: incarnation}
 }
 
+// MessageSendSupersededAttemptReason and MessageSendSupersededAttemptDetail
+// are MessageSendSupersededAttempt's expected refusal reason token and
+// detail: a stale incarnation's token, with the fetch refusal's value-free
+// detail.
+const (
+	MessageSendSupersededAttemptReason = app.GrammarReasonStale
+	MessageSendSupersededAttemptDetail = MessageFetchSupersededAttemptDetail
+)
+
+// MessageSendSupersededAttempt returns a MessagingStore.SendMessage request
+// (Kind answer) from a task address's RETIRED session, at its true lineage
+// address, answering questionID: the consuming fixture queues a manager
+// question to the task, serves it to attempt 1's session, then retires that
+// attempt and session exactly as MessageFetchSupersededAttempt describes
+// (binding not superseded) and runs attempt 2 behind its own bound session.
+// Refused app.MessageRefused (reason MessageSendSupersededAttemptReason),
+// detail MessageSendSupersededAttemptDetail, with no answer envelope and no
+// enqueue sequence consumed: only an address's current session sends,
+// whatever the kind, so attempt 2's session is re-served the question and
+// its own answer is accepted. The check follows the request-ID receipt and
+// the incarnation, so the retired session's already-accepted request still
+// replays as duplicate.
+func MessageSendSupersededAttempt(runID identity.RunID, retiredSession identity.SessionID, task identity.TaskID, incarnation identity.IncarnationID, answerID, questionID identity.MessageID, bodyPath, bodyDigest string, bodyBytes int64) app.MessageSend {
+	return answerSend(runID, retiredSession, run.TaskAddress(task), incarnation, answerID, questionID, bodyPath, bodyDigest, bodyBytes)
+}
+
+// MessageSendEndedManagerReason and MessageSendEndedManagerDetail are
+// MessageSendEndedManager's expected refusal reason token and detail.
+const (
+	MessageSendEndedManagerReason = app.GrammarReasonStale
+	MessageSendEndedManagerDetail = MessageFetchEndedManagerDetail
+)
+
+// MessageSendEndedManager returns a MessagingStore.SendMessage request (Kind
+// info) to task from the ended manager session MessageFetchEndedManager
+// describes (terminated, its binding still current, beside a bound
+// successor), whose incarnation is still the binding's. Refused
+// app.MessageRefused (reason MessageSendEndedManagerReason), detail
+// MessageSendEndedManagerDetail, with no envelope created; the successor
+// manager's own send to the task is accepted.
+func MessageSendEndedManager(runID identity.RunID, endedManager identity.SessionID, incarnation identity.IncarnationID, messageID identity.MessageID, task identity.TaskID, bodyPath, bodyDigest string, bodyBytes int64) app.MessageSend {
+	return app.MessageSend{
+		ID: messageID, RunID: runID, Sender: run.SessionPrincipal(endedManager), SenderAddress: run.ManagerAddress(),
+		IncarnationID: incarnation, Recipient: run.TaskAddress(task), Kind: run.MessageInfo,
+		BodyPath: bodyPath, BodyDigest: bodyDigest, BodyBytes: bodyBytes,
+	}
+}
+
 // AckMessageCrossRunReason is AckMessageCrossRun's expected refusal reason
 // token.
 const AckMessageCrossRunReason = app.GrammarReasonUnauthorized

@@ -536,6 +536,12 @@ func (s *fakeStore) SendMessage(_ context.Context, send app.MessageSend) (app.Me
 	if !s.sessionIncarnationCurrentLocked(send.Sender.SessionID, send.IncarnationID) {
 		return app.MessageOutcome{Kind: app.MessageRefused, Reason: app.GrammarReasonStale, Detail: "incarnation is not current"}, nil
 	}
+	// Only the address's current session sends, whatever the kind (the
+	// real store's addressSessionCurrent check, in the same place: after
+	// the receipt and the incarnation).
+	if !s.addressSessionCurrentLocked(send.Sender.SessionID) {
+		return app.MessageOutcome{Kind: app.MessageRefused, Reason: app.GrammarReasonStale, Detail: fakeAddressSessionRefusal(senderAddress)}, nil
+	}
 
 	var outcome app.MessageOutcome
 	switch send.Kind {

@@ -135,3 +135,54 @@ func TestGrammarContractMsgNextRetiredAttemptSessionIsRefused(t *testing.T) {
 		t.Fatalf("msg ack (successor): exit=%d stdout=%q stderr=%q", ack.ExitCode, ack.Stdout, ack.Stderr)
 	}
 }
+
+// TestGrammarContractMsgSendRetiredAttemptSessionIsStale drives the one
+// currency rule for sends through the real binary. The manager asks the
+// task a question and attempt 1's worker is served it; the attempt is then
+// settled by the worker-termination shape (binding left current) and the
+// retry's attempt 2 runs behind its own session. The old worker's answer
+// to that question, and its question to the manager, each print exactly
+// `refused: stale` and the value-free detail, exit 1 and create no
+// envelope; the successor is re-served the question and its answer is
+// sent.
+func TestGrammarContractMsgSendRetiredAttemptSessionIsStale(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC()
+	f := newFeatureManager(t, 10700, defaultMessageWait)
+	old := f.addActiveChild(t, 10800, "implement", "", "", true)
+	questionID := requireSentOnly(t, "msg send (manager question to the task)", execHop(t, f.env(nil), f.StateRoot, "msg", "send", "--to", "task:"+old.TaskID, "--kind", "question", "--body", "which approach?"))
+	if next := execHop(t, old.env(f, nil), f.StateRoot, "msg", "next"); next.FirstStdoutLine() != app.GrammarMessageLine(questionID, "question", f.ManagerID, "", "", "") {
+		t.Fatalf("msg next (worker while current): stdout=%q stderr=%q", next.Stdout, next.Stderr)
+	}
+	if err := hopfixtures.SettleWorkerTermination(ctx, f.store, f.lease, old.TaskID, old.AttemptID, old.SessionID, now); err != nil {
+		t.Fatalf("settle worker termination: %v", err)
+	}
+	if err := hopfixtures.ConsumeRetry(ctx, f.store, f.lease, old.TaskID, now); err != nil {
+		t.Fatalf("consume retry: %v", err)
+	}
+	sessionID, incarnationID, attemptID, err := hopfixtures.SeedChildSession(ctx, f.store, f.lease, f.RunID, old.TaskID, f.ManagerID, "implementer", 10900, now)
+	if err != nil {
+		t.Fatalf("seed successor session: %v", err)
+	}
+	if err := hopfixtures.RunAttempt(ctx, f.store, f.lease, attemptID, now); err != nil {
+		t.Fatalf("run successor attempt: %v", err)
+	}
+	successor := childSession{TaskID: old.TaskID, AttemptID: attemptID, SessionID: sessionID, IncarnationID: incarnationID}
+
+	const detail = "session is not its task's current attempt session"
+	requireRefusedOnly(t, "msg send --kind answer (retired worker)",
+		execHop(t, old.env(f, nil), f.StateRoot, "msg", "send", "--kind", "answer", "--reply-to", questionID, "--body", "a stale answer"),
+		app.GrammarReasonStale, detail)
+	requireRefusedOnly(t, "msg send --kind question (retired worker)",
+		execHop(t, old.env(f, nil), f.StateRoot, "msg", "send", "--to", "manager", "--kind", "question", "--body", "a stale question"),
+		app.GrammarReasonStale, detail)
+	if n := readOnlyCount(t, f.StateRoot, `SELECT COUNT(*) FROM messages`); n != 1 {
+		t.Fatalf("envelopes after the refused sends = %d, want only the manager's question", n)
+	}
+
+	if next := execHop(t, successor.env(f, nil), f.StateRoot, "msg", "next"); next.FirstStdoutLine() != app.GrammarMessageLine(questionID, "question", f.ManagerID, "", "", "") {
+		t.Fatalf("msg next (successor): stdout=%q stderr=%q, want the question re-served", next.Stdout, next.Stderr)
+	}
+	requireSentOnly(t, "msg send --kind answer (successor)",
+		execHop(t, successor.env(f, nil), f.StateRoot, "msg", "send", "--kind", "answer", "--reply-to", questionID, "--body", "the current answer"))
+}
