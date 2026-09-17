@@ -125,6 +125,14 @@ func TestRealProcessCombinedCheckFailure(t *testing.T) {
 	if got := fx.repo.git(t, "rev-parse", "--verify", rollbackOID+"^"); got != rejectedMergeOID {
 		t.Errorf("rollback commit %s's parent = %s, want the rejected merge commit %s (kept reachable, never orphaned)", rollbackOID, got, rejectedMergeOID)
 	}
+	// The rollback commit's own TREE, not merely its parent linkage, must
+	// be the pre-merge content (design section 4): the rejected merge's
+	// own tree still carries whatever the failed combined check rejected,
+	// so a rollback built from THAT tree instead of the merge's first
+	// parent's would restore nothing.
+	if got, want := fx.repo.git(t, "rev-parse", rollbackOID+"^{tree}"), fx.repo.git(t, "rev-parse", rejectedMergeOID+"^1^{tree}"); got != want {
+		t.Errorf("rollback commit %s's tree = %s, want the rejected merge's own pre-merge (first-parent) tree %s", rollbackOID, got, want)
+	}
 	// fixtureRepo.git fails the test itself on a non-zero exit, so a
 	// successful return here IS the ancestry assertion.
 	fx.repo.git(t, "merge-base", "--is-ancestor", rejectedMergeOID, integrationRef)

@@ -3,7 +3,9 @@ package integration
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -46,6 +48,22 @@ func withStopMidIntegrationCheck(t *testing.T, repo *fixtureRepo, opts featureFi
 	if err := syscall.Mkfifo(gatePath, 0o600); err != nil {
 		t.Fatalf("create stop-mid-integration check gate fifo %s: %v", gatePath, err)
 	}
+	// A failure path that ends the test before hop stop ever runs (or
+	// before stop's own retirement kills the check's process group) would
+	// otherwise leave "sh -c 'cat gatePath'" blocked on this FIFO forever,
+	// in its own process group outside the controller's — nothing this
+	// harness's cleanup would ever retire. Opening it O_RDWR never blocks
+	// (unlike the O_WRONLY open a normal release needs a live reader
+	// for), so this is always safe, whether or not the check ever reached
+	// its blocking read: closing the fd delivers EOF to any blocked
+	// reader, ending it.
+	t.Cleanup(func() {
+		gate, err := os.OpenFile(gatePath, os.O_RDWR, 0) //nolint:gosec // G304: gatePath is the FIFO this test created under its own artifact directory.
+		if err != nil {
+			return
+		}
+		_ = gate.Close()
+	})
 	repo.writeFile(t, stopMidIntegrationCheckScriptName, stopMidIntegrationCheckScriptSource(markerPath, gatePath), 0o755)
 	repo.writeFile(t, configRelPath, featureConfigTOML([]string{"sh", stopMidIntegrationCheckScriptName}, opts.MaxWorkers, opts.RetryLimit, opts.MessageWaitTimeout, opts.MessageAttentionAfter), 0o644)
 	repo.commit(t, "wire a check that holds only on its second (combined) execution")
@@ -135,6 +153,23 @@ func TestRealProcessStopDuringFeatureRun(t *testing.T) {
 		t.Fatalf("the combined check's own check_exec_claims row never appeared for run %s", fx.runID)
 	}
 
+	// Captured before stop: the manager's pane binding (a durable
+	// runtime_bindings row, safe to resolve while the session is still
+	// live) and the combined check's own process-group pid (its own pid
+	// IS its pgid — process/runner.go sets Setpgid on every claimed
+	// group) — the "merge group retired" and "manager pane gone"
+	// assertions below need evidence from while the run was still
+	// healthy, not a name resolved after the fact.
+	managerSessionID := fx.managerSessionID(t)
+	managerPaneID := fx.requirePane(t, managerSessionID)
+	checkPIDStr := fx.scalar(t, fmt.Sprintf(
+		"SELECT c.pid FROM check_exec_claims c JOIN operations o ON o.id = c.operation_id WHERE o.run_id = '%s' AND o.kind = 'check.run' ORDER BY o.created_at DESC LIMIT 1;",
+		fx.runID))
+	checkPID, err := strconv.Atoi(checkPIDStr)
+	if err != nil || checkPID <= 0 {
+		t.Fatalf("combined check's own check_exec_claims pid = %q, want a positive integer", checkPIDStr)
+	}
+
 	result := runHop(t, fx.env, fx.repo.Root, "stop", "-C", fx.repo.Root, fx.runID)
 	if result.ExitCode != 0 {
 		t.Fatalf("hop stop exit=%d, want 0; stdout=%q stderr=%q", result.ExitCode, result.Stdout, result.Stderr)
@@ -176,20 +211,79 @@ func TestRealProcessStopDuringFeatureRun(t *testing.T) {
 	if got := fx.repo.git(t, "rev-parse", "--verify", rollbackOID+"^"); got != rejectedMergeOID {
 		t.Errorf("rollback commit %s's parent = %s, want the rejected merge commit %s (kept reachable, never orphaned)", rollbackOID, got, rejectedMergeOID)
 	}
+	// The rollback commit's own TREE, not merely its parent linkage, must
+	// be the pre-merge content (design section 4): the rejected merge's
+	// own tree still carries whatever stop caught mid-check, so a
+	// rollback built from THAT tree instead of the merge's first
+	// parent's would restore nothing.
+	if got, want := fx.repo.git(t, "rev-parse", rollbackOID+"^{tree}"), fx.repo.git(t, "rev-parse", rejectedMergeOID+"^1^{tree}"); got != want {
+		t.Errorf("rollback commit %s's tree = %s, want the rejected merge's own pre-merge (first-parent) tree %s", rollbackOID, got, want)
+	}
 	// fixtureRepo.git fails the test itself on a non-zero exit, so a
 	// successful return here IS the ancestry assertion.
 	fx.repo.git(t, "merge-base", "--is-ancestor", rejectedMergeOID, integrationRef)
 
-	// Every session terminated: the manager, and the implementer (already
-	// retired at its own per-attempt acceptance boundary, well before
-	// integration began — restated here as the scenario's own "every
-	// session" requirement, not merely inferred from an earlier scenario).
-	managerSessionID := fx.scalar(t, fmt.Sprintf("SELECT id FROM sessions WHERE run_id = '%s' AND role = 'manager' ORDER BY rowid DESC LIMIT 1;", fx.runID))
-	if managerSessionID == "" {
-		t.Fatalf("no manager session found for run %s", fx.runID)
+	// Merge/check group retired: no member of the combined check's own
+	// process group remains — evidence against the OS process table
+	// directly (listGroupMembers is ps-based and sends no signal), since
+	// process/runner.go's Setpgid makes the claimed pid double as the
+	// group's pgid.
+	if members := listGroupMembers(t, checkPID); len(members) != 0 {
+		t.Errorf("combined check process group %d still has %d member(s) after stop, want 0: %+v", checkPID, len(members), members)
 	}
+
+	// Unresolved ref intents fenced: no integration ref-move operation
+	// (init/merge/publish/reset) is left pending or reconciling once stop
+	// reports (design section 4's fencing rule, section 6's quiescence
+	// requirement before the terminal report).
+	if n := fx.scalar(t, fmt.Sprintf(
+		"SELECT count(*) FROM operations WHERE run_id = '%s' AND kind LIKE 'integration.%%' AND state IN ('pending', 'reconciling');",
+		fx.runID)); n != "0" {
+		t.Errorf("run %s has %s unresolved integration operation(s) after stop, want 0 (unresolved ref intents fenced)", fx.runID, n)
+	}
+
+	// The manager's own pane is gone: the session ended by the close
+	// rule's own observed-absence outcome, never merely marked terminated
+	// with the pane left dangling.
+	if fx.server.paneExists(t, managerPaneID) {
+		t.Errorf("manager pane %s still exists after stop", managerPaneID)
+	}
+
+	// Every session in the run terminated — not merely the two hand-
+	// picked ones the scenario's own narrative names below.
+	if n := fx.scalar(t, fmt.Sprintf("SELECT count(*) FROM sessions WHERE run_id = '%s' AND state != 'terminated';", fx.runID)); n != "0" {
+		t.Errorf("run %s has %s non-terminated session(s) after stop, want 0", fx.runID, n)
+	}
+
+	// The manager, and the implementer (already retired at its own
+	// per-attempt acceptance boundary, well before integration began).
 	fx.requireSessionState(t, managerSessionID, "terminated")
 	attemptID, _ := fx.currentAttempt(t, t1)
 	implementerSessionID := fx.sessionForAttempt(t, attemptID)
 	fx.requireSessionState(t, implementerSessionID, "terminated")
+
+	// "stopped" only on observed absence: the run's own stopped
+	// transition must never precede the evidence that termination
+	// actually happened — every session's own terminated transition, and
+	// the combined check operation's last update — read directly from the
+	// journal's canonical, lexically comparable timestamps, never
+	// inferred from reading end states only after the controller has
+	// already exited.
+	stoppedAt := fx.requireTransitionAt(t, "run", fx.runID, "stopped")
+	managerTerminatedAt := fx.requireTransitionAt(t, "session", managerSessionID, "terminated")
+	implementerTerminatedAt := fx.requireTransitionAt(t, "session", implementerSessionID, "terminated")
+	checkUpdatedAt := fx.scalar(t, fmt.Sprintf(
+		"SELECT updated_at FROM operations WHERE run_id = '%s' AND kind = 'check.run' ORDER BY created_at DESC LIMIT 1;", fx.runID))
+	if checkUpdatedAt == "" {
+		t.Fatalf("no check.run operation found for run %s", fx.runID)
+	}
+	if stoppedAt < managerTerminatedAt {
+		t.Errorf("run reported stopped at %s before the manager session terminated at %s", stoppedAt, managerTerminatedAt)
+	}
+	if stoppedAt < implementerTerminatedAt {
+		t.Errorf("run reported stopped at %s before the implementer session terminated at %s", stoppedAt, implementerTerminatedAt)
+	}
+	if stoppedAt < checkUpdatedAt {
+		t.Errorf("run reported stopped at %s before the combined check operation's last update at %s", stoppedAt, checkUpdatedAt)
+	}
 }
