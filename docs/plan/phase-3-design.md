@@ -1385,13 +1385,18 @@ conflicting verdict about that principal's requests.
 The threat model these checks serve: every session of a run runs as the
 same OS user, with read access to the run's state root and its message
 bodies, so message content is not a confidentiality boundary between a
-run's sessions. What HOP enforces is mutation authority — who may send,
-answer, fetch, acknowledge or submit — and its credential is the
-caller's current incarnation together with its address currency; the
-session and run identities a caller names are only claims, checked
-against the session row. A caller that names another session's id (ids
-are printed in `from=` fields) with its own incarnation therefore passes
-the address check but can reach at most a receipt verdict (duplicate or
+run's sessions. Nor is the incarnation id a secret: the run's store,
+which every session's own `hop` process opens read-write, records every
+session's current incarnation in plain text. The session, run and
+incarnation ids a caller names are claims checked against the store's
+rows. The incarnation and address-currency checks, which decide who may
+send, answer, fetch, acknowledge or submit, keep a principal acting on
+its own launch identity from acting as a stale, retired or mistaken one.
+They are not a boundary against a same-user process that reads another
+session's ids and incarnation from the store and presents them, or that
+writes the store directly. A caller that names another session's id (ids
+are printed in `from=` fields) with its own incarnation passes the
+address check but can reach at most a receipt verdict (duplicate or
 conflicting) before the incarnation check refuses it, and never a
 mutation: an accepted residual of receipt-before-eligibility.
 
