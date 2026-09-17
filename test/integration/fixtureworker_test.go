@@ -1,6 +1,7 @@
 package integration
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -1910,6 +1912,36 @@ func (o workerObservation) HasEnvName(name string) bool {
 	return false
 }
 
+// syncOutput is a mutex-protected byte buffer safe as an exec.Cmd's
+// Stdout/Stderr target while a live poll reads its accumulated content
+// concurrently — os/exec copies a child's output into that writer from
+// its own goroutine the moment Start returns, and a bare
+// strings.Builder/bytes.Buffer provides no synchronization against a
+// concurrent read of its internal slice header (a real data race, caught
+// by `go test -race`, distinct from the writes themselves being
+// serialized by os/exec since Stdout and Stderr share this same
+// target). Mirrors ptyClient's own mu+buffer+snapshot shape (pty_test.go).
+type syncOutput struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (o *syncOutput) Write(p []byte) (int, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.buf.Write(p)
+}
+
+// snapshot returns the bytes captured so far. Safe to call at any time,
+// including while the child is still running and writing concurrently;
+// contrast with reading the raw buffer only after Wait, which this test
+// also still does for its final failure-message content.
+func (o *syncOutput) snapshot() string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.buf.String()
+}
+
 // TestFixtureWorkerSelfKillOnControlFile proves the fixture principal's
 // self-kill watcher (Astra review finding P1: a real-process scenario
 // must never signal a pid it only OBSERVED via pane.process_info — the
@@ -1966,20 +1998,38 @@ func TestFixtureWorkerSelfKillOnControlFile(t *testing.T) {
 		"HOP_ROLE=implementer",
 		"FAKE_HOP_LOG=" + logPath,
 	}
-	var out strings.Builder
+	var out syncOutput
 	cmd.Stdout = &out
 	cmd.Stderr = &out
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start fixture worker: %v", err)
 	}
+	// Exactly one goroutine ever calls cmd.Wait, on every path: the happy
+	// path below calls it directly, and cleanup calls it too (a no-op via
+	// sync.Once if the happy path already did) so an early t.Fatalf before
+	// that point — the readiness poll failing, say — still reaps this
+	// directly-started child and lets its output-copy goroutine finish,
+	// rather than leaving both dangling. Never signals or waits on any pid
+	// other than this cmd's own Process handle.
+	var (
+		waitOnce sync.Once
+		waitErr  error
+	)
+	wait := func() error {
+		waitOnce.Do(func() { waitErr = cmd.Wait() })
+		return waitErr
+	}
 	t.Cleanup(func() {
 		if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
 			t.Logf("cleanup: kill fixture worker: %v", err)
 		}
+		if err := wait(); err != nil {
+			t.Logf("cleanup: reap fixture worker: %v", err)
+		}
 	})
 
-	if !waitUntil(func() bool { return strings.Contains(out.String(), "FIXTURE-HOLD-SENT") }) {
-		t.Fatalf("worker never reported sending its barrier question; output so far:\n%s", out.String())
+	if !waitUntil(func() bool { return strings.Contains(out.snapshot(), "FIXTURE-HOLD-SENT") }) {
+		t.Fatalf("worker never reported sending its barrier question; output so far:\n%s", out.snapshot())
 	}
 
 	controlPath := filepath.Join(scratchDir, "self-kill-"+attemptID)
@@ -1991,9 +2041,8 @@ func TestFixtureWorkerSelfKillOnControlFile(t *testing.T) {
 		t.Fatalf("rename self-kill control file into place: %v", err)
 	}
 
-	waitErr := cmd.Wait()
-	if waitErr == nil {
-		t.Fatalf("worker exited 0 after the self-kill control file was written; want it SIGKILLed; output:\n%s", out.String())
+	if err := wait(); err == nil {
+		t.Fatalf("worker exited 0 after the self-kill control file was written; want it SIGKILLed; output:\n%s", out.snapshot())
 	}
 	exitErr, ok := waitErr.(*exec.ExitError) //nolint:errorlint // a direct type assertion suffices for this test's own exec of a single known binary.
 	if !ok {
