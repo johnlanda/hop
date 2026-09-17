@@ -230,7 +230,7 @@ func TestResumeFeatureChildLaunchInFlight(t *testing.T) {
 		{
 			name: "restart: the recorded id answers with a fresh occupant under a changed server instance",
 			arrange: func(f *resumeFixture, binding run.RuntimeBinding) {
-				f.tc.Runtime.ServerInstanceValue = "peer-pid:2"
+				f.tc.Runtime.ServerInstanceValue = fakeServerToken(2)
 				f.tc.Runtime.InspectPaneFn = withChildPane(f, binding.PaneID, childPaneWith(9191, app.ProcessInfo{PID: 9191, Name: "zsh", Argv: []string{"-zsh"}}))
 			},
 			detail: "server continuity since the placement is not established",
@@ -238,7 +238,7 @@ func TestResumeFeatureChildLaunchInFlight(t *testing.T) {
 		{
 			name: "restart: even the claimed process answering proves nothing once the server changed",
 			arrange: func(f *resumeFixture, binding run.RuntimeBinding) {
-				f.tc.Runtime.ServerInstanceValue = "peer-pid:2"
+				f.tc.Runtime.ServerInstanceValue = fakeServerToken(2)
 				f.tc.Runtime.InspectPaneFn = withChildPane(f, binding.PaneID, childPaneWith(childLaunchPID, corroboratingChild(binding.IncarnationID)))
 			},
 			detail: "server continuity since the placement is not established",
@@ -247,6 +247,44 @@ func TestResumeFeatureChildLaunchInFlight(t *testing.T) {
 			name: "an unknown server instance",
 			arrange: func(f *resumeFixture, binding run.RuntimeBinding) {
 				f.tc.Runtime.ServerInstanceErr = errors.New("socket gone")
+				f.tc.Runtime.InspectPaneFn = withChildPane(f, binding.PaneID, childPaneWith(childLaunchPID, corroboratingChild(binding.IncarnationID)))
+			},
+			detail: "server continuity since the placement is not established",
+		},
+		{
+			name: "restart: the server changes during the recorded pane's own inspection",
+			arrange: func(f *resumeFixture, binding run.RuntimeBinding) {
+				child := childPaneWith(childLaunchPID, corroboratingChild(binding.IncarnationID))
+				manager := liveManagerPane(f, nil)
+				inspections := 0
+				f.tc.Runtime.InspectPaneFn = func(id string) (app.PaneProcess, error) {
+					if id != binding.PaneID {
+						return manager(id)
+					}
+					// The launch-ended row inspects the pane first; the server
+					// restarts during the in-flight rule's own inspection.
+					inspections++
+					if inspections == 2 {
+						f.tc.Runtime.ServerInstanceValue = fakeServerToken(2)
+					}
+					return child, nil
+				}
+			},
+			detail: "server continuity since the placement is not established",
+		},
+		{
+			name: "the placement recorded a server identity in an older format",
+			arrange: func(f *resumeFixture, binding run.RuntimeBinding) {
+				recordBindingServer(f, "peer-pid:41001")
+				f.tc.Runtime.InspectPaneFn = withChildPane(f, binding.PaneID, childPaneWith(childLaunchPID, corroboratingChild(binding.IncarnationID)))
+			},
+			detail: "server continuity since the placement is not established",
+		},
+		{
+			name: "the placement recorded no server identity",
+			arrange: func(f *resumeFixture, binding run.RuntimeBinding) {
+				recordBindingServer(f, "")
+				f.tc.Runtime.ServerInstanceValue = ""
 				f.tc.Runtime.InspectPaneFn = withChildPane(f, binding.PaneID, childPaneWith(childLaunchPID, corroboratingChild(binding.IncarnationID)))
 			},
 			detail: "server continuity since the placement is not established",
@@ -308,6 +346,193 @@ func TestResumeFeatureChildLaunchInFlight(t *testing.T) {
 			}
 			if got := f.tc.Store.Sessions[f.ChildID].value.State; got != run.SessionLaunching {
 				t.Errorf("child session state = %s, want launching", got)
+			}
+		})
+	}
+}
+
+// recordBindingServer rewrites the server identity the resume fixture
+// child's current binding recorded at its placement.
+func recordBindingServer(f *resumeFixture, token string) {
+	history := f.tc.Store.Bindings[f.ChildID]
+	history[len(history)-1].ServerInstance = token
+}
+
+// childLauncher is the resume fixture child's own `hop launch` process at
+// the pane's shell pid, with the argv the scheduler froze for it.
+func childLauncher(f *resumeFixture) app.ProcessInfo {
+	return app.ProcessInfo{PID: childLaunchPID, Name: "hop", Argv: []string{"/usr/local/bin/hop", "launch", "--run", f.fr.RunID.String(), "--session", f.ChildID.String()}}
+}
+
+// TestResumeFeatureChildRestartAtInspection reproduces a server restart
+// between resume's earlier observations and the child pane's own
+// inspection: public pane ids survive the restart, so the recorded id
+// answers with a restored shell. The inspection is stamped with the
+// server lifetime that answered it, which is not the placement's, so the
+// launch is never in flight and the run stays resuming.
+func TestResumeFeatureChildRestartAtInspection(t *testing.T) {
+	f := newResumeFixture(t)
+	binding, _ := f.tc.Store.currentBindingLocked(f.ChildID)
+	manager := liveManagerPane(f, nil)
+	f.tc.Runtime.InspectPaneFn = func(id string) (app.PaneProcess, error) {
+		if id != binding.PaneID {
+			return manager(id)
+		}
+		// The server restarted after every earlier identity read, before
+		// process_info answered.
+		f.tc.Runtime.ServerInstanceValue = fakeServerToken(2)
+		return childPaneWith(9191, app.ProcessInfo{PID: 9191, Name: "zsh", Argv: []string{"-zsh"}}), nil
+	}
+
+	result, _ := f.resume(t, "")
+	if result.Outcome == "resumed" {
+		t.Fatalf("resume = %+v; a restored shell after a server restart was taken for the launch in flight", result)
+	}
+	report := sessionReport(t, &result, f.ChildID.String())
+	if report.Disposition != app.SessionPending || !strings.Contains(report.Detail, "server continuity since the placement is not established") {
+		t.Fatalf("child report = %+v, want pending naming the missing server continuity", report)
+	}
+	requireRunState(t, f, run.RunResuming)
+}
+
+// TestResumeFeatureChildRecycledServerIdentity reproduces an unclaimed
+// child whose recorded pane answers with a foreign shell under the very
+// server identity the placement recorded — what a pid-only identity
+// yields for a restarted server that reused the pid. Continuity alone is
+// then no proof: with no claim, only HOP's own launcher for this session
+// is the launch in flight, so the run stays resuming.
+func TestResumeFeatureChildRecycledServerIdentity(t *testing.T) {
+	f := newResumeFixture(t)
+	binding, _ := f.tc.Store.currentBindingLocked(f.ChildID)
+	f.tc.Runtime.ServerInstanceValue = binding.ServerInstance
+	f.tc.Runtime.InspectPaneFn = withChildPane(f, binding.PaneID, childPaneWith(9191, app.ProcessInfo{PID: 9191, Name: "zsh", Argv: []string{"-zsh"}}))
+
+	result, _ := f.resume(t, "")
+	if result.Outcome == "resumed" {
+		t.Fatalf("resume = %+v; a foreign shell was taken for the launch in flight", result)
+	}
+	report := sessionReport(t, &result, f.ChildID.String())
+	if report.Disposition != app.SessionPending || !strings.Contains(report.Detail, "not this session's hop launch invocation") {
+		t.Fatalf("child report = %+v, want pending naming the missing launcher", report)
+	}
+	requireRunState(t, f, run.RunResuming)
+}
+
+// TestResumeFeatureChildUnclaimedLaunchNeedsItsLauncher proves the no-claim
+// half of the in-flight rule: the pane's own process must be HOP's launcher
+// for exactly this session, its argv equal to the placement's frozen
+// command, observed under the placement's server lifetime. Every other
+// occupant keeps the run resuming with the reason named.
+func TestResumeFeatureChildUnclaimedLaunchNeedsItsLauncher(t *testing.T) {
+	const notLauncher = "no launch claim yet, and the recorded pane's own process is not this session's hop launch invocation"
+	for _, tt := range []struct {
+		name    string
+		arrange func(f *resumeFixture, binding run.RuntimeBinding)
+		detail  string
+	}{
+		{
+			name: "the pane's own process is a login shell",
+			arrange: func(f *resumeFixture, binding run.RuntimeBinding) {
+				f.tc.Runtime.InspectPaneFn = withChildPane(f, binding.PaneID, childPaneWith(childLaunchPID, app.ProcessInfo{PID: childLaunchPID, Name: "zsh", Argv: []string{"-zsh"}}))
+			},
+			detail: notLauncher,
+		},
+		{
+			name: "a hop launch for another session",
+			arrange: func(f *resumeFixture, binding run.RuntimeBinding) {
+				other := childLauncher(f)
+				other.Argv = []string{"/usr/local/bin/hop", "launch", "--run", f.fr.RunID.String(), "--session", f.fr.ManagerID.String()}
+				f.tc.Runtime.InspectPaneFn = withChildPane(f, binding.PaneID, childPaneWith(childLaunchPID, other))
+			},
+			detail: notLauncher,
+		},
+		{
+			name: "the launcher argv on a member that is not the pane's own process",
+			arrange: func(f *resumeFixture, binding run.RuntimeBinding) {
+				f.tc.Runtime.InspectPaneFn = withChildPane(f, binding.PaneID, childPaneWith(7777,
+					app.ProcessInfo{PID: 7777, Name: "zsh", Argv: []string{"-zsh"}}, childLauncher(f)))
+			},
+			detail: notLauncher,
+		},
+		{
+			name: "the pane's own process runs another hop binary",
+			arrange: func(f *resumeFixture, binding run.RuntimeBinding) {
+				other := childLauncher(f)
+				other.Argv = append([]string{"/tmp/hop"}, other.Argv[1:]...)
+				f.tc.Runtime.InspectPaneFn = withChildPane(f, binding.PaneID, childPaneWith(childLaunchPID, other))
+			},
+			detail: notLauncher,
+		},
+		{
+			name: "the launcher argv carries an extra argument",
+			arrange: func(f *resumeFixture, binding run.RuntimeBinding) {
+				other := childLauncher(f)
+				other.Argv = append(append([]string{}, other.Argv...), "--verbose")
+				f.tc.Runtime.InspectPaneFn = withChildPane(f, binding.PaneID, childPaneWith(childLaunchPID, other))
+			},
+			detail: notLauncher,
+		},
+		{
+			name: "the pane's own process is not inspectable",
+			arrange: func(f *resumeFixture, binding run.RuntimeBinding) {
+				launcher := childLauncher(f)
+				launcher.PID = 0
+				f.tc.Runtime.InspectPaneFn = withChildPane(f, binding.PaneID, childPaneWith(0, launcher))
+			},
+			detail: notLauncher,
+		},
+		{
+			name: "the placement froze a command that is not a session launch",
+			arrange: func(f *resumeFixture, binding run.RuntimeBinding) {
+				frozen := []any{"/usr/local/bin/hop", "launch", "--run", f.fr.RunID.String(), "--attempt", f.tc.Store.Sessions[f.ChildID].value.AttemptID.String()}
+				op := f.tc.Store.Operations[identity.OperationID(binding.CreationLabel)]
+				intent, ok := op.Intent.(map[string]any)
+				if !ok {
+					t.Fatalf("pane.open intent = %T, want the committed JSON map", op.Intent)
+				}
+				intent["command"] = frozen
+				launcher := childLauncher(f)
+				launcher.Argv = []string{"/usr/local/bin/hop", "launch", "--run", f.fr.RunID.String(), "--attempt", f.tc.Store.Sessions[f.ChildID].value.AttemptID.String()}
+				f.tc.Runtime.InspectPaneFn = withChildPane(f, binding.PaneID, childPaneWith(childLaunchPID, launcher))
+			},
+			detail: notLauncher,
+		},
+		{
+			name: "the launcher answers under another server lifetime",
+			arrange: func(f *resumeFixture, binding run.RuntimeBinding) {
+				f.tc.Runtime.ServerInstanceValue = fakeServerToken(2)
+				f.tc.Runtime.InspectPaneFn = withChildPane(f, binding.PaneID, childPaneWith(childLaunchPID, childLauncher(f)))
+			},
+			detail: "server continuity since the placement is not established",
+		},
+		{
+			name: "the server lifetime is unknown",
+			arrange: func(f *resumeFixture, binding run.RuntimeBinding) {
+				f.tc.Runtime.ServerInstanceErr = errors.New("socket gone")
+				f.tc.Runtime.InspectPaneFn = withChildPane(f, binding.PaneID, childPaneWith(childLaunchPID, childLauncher(f)))
+			},
+			detail: "server continuity since the placement is not established",
+		},
+	} {
+		t.Run(tt.name+": the run stays resuming", func(t *testing.T) {
+			f := newResumeFixture(t)
+			binding, _ := f.tc.Store.currentBindingLocked(f.ChildID)
+			tt.arrange(f, binding)
+
+			result, _ := f.resume(t, "")
+			if result.Outcome != "reconciling" {
+				t.Fatalf("resume = %+v, want reconciling", result)
+			}
+			report := sessionReport(t, &result, f.ChildID.String())
+			if report.Disposition != app.SessionPending || !strings.Contains(report.Detail, tt.detail) {
+				t.Fatalf("child report = %+v, want pending naming %q", report, tt.detail)
+			}
+			requireRunState(t, f, run.RunResuming)
+			if got := f.tc.Store.Sessions[f.ChildID].value.State; got != run.SessionLaunching {
+				t.Errorf("child session state = %s, want launching", got)
+			}
+			if _, claimed := f.tc.Store.LaunchClaims[binding.IncarnationID]; claimed {
+				t.Errorf("a launch claim appeared for the unclaimed child")
 			}
 		})
 	}

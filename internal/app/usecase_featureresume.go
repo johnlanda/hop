@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"slices"
 	"sort"
 
 	"github.com/johnlanda/hop/internal/domain/identity"
@@ -873,20 +875,30 @@ func (c *Controller) sessionTaskID(ctx context.Context, handle RunHandle, sessio
 //   - its binding is committed, current and not superseded, and its claim
 //     is absent or that placement's own exec_pending claim;
 //   - the pane.open operation that recorded the placement is not failed;
-//   - server continuity holds between the placement and now: a graceful
-//     restart keeps public pane ids (pinned by
+//   - the recorded pane answers by id, and that very inspection was
+//     answered by the server lifetime the placement recorded
+//     (PaneProcess.ServerInstance, established on the inspection's own
+//     connection): a graceful restart keeps public pane ids (pinned by
 //     test/integration/spike_panevanish_test.go
-//     TestSpikeLabelSurvivesRestart), so a recorded id answering after a
-//     restart is no evidence of the original launch, only an unchanged
-//     server identity is;
-//   - the recorded pane answers by id with a foreground occupant, and with
-//     a claim, the pane's own process is the claimed process.
+//     TestSpikeLabelSurvivesRestart), so a recorded id answering under any
+//     other or an unknown lifetime is no evidence of the original launch —
+//     including a restart between an earlier identity read and the
+//     inspection itself;
+//   - the pane has a foreground occupant, and its own process is the
+//     launch's: with a claim, the claimed process; with none yet, HOP's
+//     own launcher for exactly this session, its argv equal to the
+//     placement's frozen `hop launch --run <run> --session <session>`
+//     command (pinnedLauncherOccupies). Under one server lifetime a pane id
+//     names one pane and a command pane keeps its process for its whole
+//     life, so that process is the one the placement spawned with this
+//     incarnation's environment.
 //
 // Anything else is not in flight, and detail names why.
 func (c *Controller) placedLaunchInFlight(ctx context.Context, handle RunHandle, sessionID identity.SessionID, binding *run.RuntimeBinding, claimFound bool, claim *LaunchClaim) (inFlight bool, detail string, err error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per pending session per resume round.
 	var (
-		session run.Session
-		placed  *Operation
+		session      run.Session
+		placed       *Operation
+		placedIntent paneOpenIntent
 	)
 	err = c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 		s, _, getErr := uow.Sessions().Get(ctx, sessionID)
@@ -902,7 +914,7 @@ func (c *Controller) placedLaunchInFlight(ctx context.Context, handle RunHandle,
 			intent, ok := decodeOperationPayload[paneOpenIntent](ops[i].Intent)
 			if ok && intent.SessionID == sessionID && intent.IncarnationID == binding.IncarnationID {
 				op := ops[i]
-				placed = &op
+				placed, placedIntent = &op, intent
 				return nil
 			}
 		}
@@ -925,19 +937,43 @@ func (c *Controller) placedLaunchInFlight(ctx context.Context, handle RunHandle,
 	case placed.State == OperationFailed:
 		return false, "the placement's pane.open operation settled failed", nil
 	}
-	if !ServerContinuityEstablished(binding.ServerInstance, c.observeServerInstance(ctx)) {
-		return false, "server continuity since the placement is not established (the Herdr server may have restarted), so the recorded pane is no evidence of the launch", nil
-	}
 	pane, inspectErr := c.Runtime.InspectPane(ctx, binding.PaneID)
 	switch {
 	case errors.Is(inspectErr, ErrPaneNotFound):
 		return false, "the recorded pane does not answer by id", nil
 	case inspectErr != nil:
 		return false, "the recorded pane could not be inspected; ambiguous, never in flight", nil
+	case !ServerContinuityEstablished(binding.ServerInstance, pane.ServerInstance):
+		return false, "server continuity since the placement is not established for the inspection (the Herdr server may have restarted), so the recorded pane is no evidence of the launch", nil
 	case len(pane.Foreground) == 0:
 		return false, "the recorded pane answers with no foreground occupant", nil
 	case claimFound && pane.ShellPID != claim.PID:
 		return false, fmt.Sprintf("the recorded pane's process (pid %d) is not the claimed launch process (pid %d)", pane.ShellPID, claim.PID), nil
+	case !claimFound && !pinnedLauncherOccupies(&pane, placedIntent.Command, handle.runID, sessionID):
+		return false, "no launch claim yet, and the recorded pane's own process is not this session's hop launch invocation", nil
 	}
 	return true, "", nil
+}
+
+// pinnedLauncherOccupies reports whether the pane's own process is HOP's
+// launcher for sessionID of runID: pinned must be the frozen session
+// launch command — exactly [<absolute hop path> launch --run <runID>
+// --session <sessionID>], a launcher invocation (isLauncherInvocation) —
+// and the foreground member whose pid is the pane's own process (its shell
+// pid) must report exactly that argv. Any other occupant, a pane with no
+// inspectable process, and a command of any other shape report false.
+func pinnedLauncherOccupies(pane *PaneProcess, pinned []string, runID identity.RunID, sessionID identity.SessionID) bool {
+	if len(pinned) != 6 || !filepath.IsAbs(pinned[0]) || !isLauncherInvocation(pinned) ||
+		pinned[2] != "--run" || pinned[3] != runID.String() || pinned[4] != "--session" || pinned[5] != sessionID.String() {
+		return false
+	}
+	if pane.ShellPID <= 1 {
+		return false
+	}
+	for _, fg := range pane.Foreground {
+		if fg.PID == pane.ShellPID && slices.Equal(fg.Argv, pinned) {
+			return true
+		}
+	}
+	return false
 }
