@@ -93,7 +93,11 @@ type MessageOutcome struct {
 // call, per the file-first protocol. Kind MessageAnswer leaves Recipient
 // the zero Address: the destination is derived by the store from the
 // referenced question's sender, never caller-chosen, and Recipient is
-// never consulted for that kind.
+// never consulted for that kind. For an answer the store re-derives the
+// sender's address from its session row (a disagreement with
+// SenderAddress is refused unauthorized) and accepts it only when that
+// address is the question's recipient, and only while a task
+// destination's mailbox is open.
 type MessageSend struct {
 	ID            identity.MessageID
 	RunID         identity.RunID

@@ -540,10 +540,16 @@ func (s *fakeStore) SendMessage(_ context.Context, send app.MessageSend) (app.Me
 
 // acceptSessionAnswerLocked handles a session's answer to a question
 // addressed to its own logical address (e.g. the manager forwarding an
-// answer to a worker's question), via run.AcceptAnswer. destination is
-// derived from the question's own sender, never from send.Recipient (an
-// answer's destination is never caller-chosen). Callers hold s.mu.
+// answer to a worker's question), via run.AcceptAnswer — the SQLite
+// adapter's acceptSessionAnswer order exactly: the answering session's
+// address is re-derived from its own session row (send.SenderAddress must
+// merely agree with it), and the destination is derived from the
+// question's own sender, never from send.Recipient. Callers hold s.mu.
 func (s *fakeStore) acceptSessionAnswerLocked(send app.MessageSend, now time.Time) app.MessageOutcome { //nolint:gocritic // hugeParam: MessageSend is a per-call DTO; mirrors the port method's own convention.
+	answerer, ok := s.resolveSessionAddressLocked(send.Sender.SessionID)
+	if !ok || !answerer.Equal(send.SenderAddress) {
+		return app.MessageOutcome{Kind: app.MessageRefused, Reason: app.GrammarReasonUnauthorized, Detail: "session does not resolve to the claimed address"}
+	}
 	if send.ReplyTo == nil {
 		return app.MessageOutcome{Kind: app.MessageMalformed, Reason: app.GrammarReasonMalformed, Detail: "answer requires reply-to"}
 	}
@@ -551,11 +557,28 @@ func (s *fakeStore) acceptSessionAnswerLocked(send app.MessageSend, now time.Tim
 	if !ok || question.RunID != send.RunID {
 		return app.MessageOutcome{Kind: app.MessageMalformed, Reason: app.GrammarReasonMalformed, Detail: "unknown question"}
 	}
+	return s.decideAnswerLocked(question, answerer, send.Sender, run.AnswerSubmission{
+		ID: send.ID, BodyPath: send.BodyPath, BodyDigest: send.BodyDigest, BodyBytes: send.BodyBytes,
+	}, now)
+}
+
+// decideAnswerLocked mirrors the SQLite adapter's decideAnswer and
+// recordAnswerOutcome together: it assembles run.AcceptAnswer's inputs
+// (derived destination, the destination task mailbox's closure, the prior
+// accepted answer, the destination's next enqueue sequence), commits an
+// acceptance — the answer, the question, any bundled question ack and the
+// consumed sequence number — and maps every refusal to the adapter's
+// outcome, token and detail. A refused answer consumes no sequence number,
+// exactly as the adapter's MAX+1 read consumes none. Callers hold s.mu.
+func (s *fakeStore) decideAnswerLocked(question run.Message, answerer run.Address, sender run.Principal, submission run.AnswerSubmission, now time.Time) app.MessageOutcome { //nolint:gocritic // hugeParam: Message is passed by value everywhere in this package; mirrors that convention.
 	destination, ok := s.answerDestinationLocked(question)
 	if !ok {
 		return app.MessageOutcome{Kind: app.MessageMalformed, Reason: app.GrammarReasonMalformed, Detail: "question originator is not resolvable"}
 	}
-
+	closed := false
+	if destination.Kind == run.AddressTask {
+		closed = s.Tasks[destination.TaskID].value.MailboxClosed
+	}
 	var prior *run.Message
 	for _, m := range s.Messages { //nolint:gocritic // rangeValCopy: test fake; the domain snapshot is small and read-only here, and indexing would only obscure the loop.
 		if m.Kind == run.MessageAnswer && m.ReplyTo != nil && *m.ReplyTo == question.ID {
@@ -565,22 +588,32 @@ func (s *fakeStore) acceptSessionAnswerLocked(send app.MessageSend, now time.Tim
 		}
 	}
 
-	seq := nextEnqueueSeq(s, send.RunID, destination)
-	outcomeVal, err := run.AcceptAnswer(question, prior, destination, send.Sender, run.AnswerSubmission{
-		ID: send.ID, BodyPath: send.BodyPath, BodyDigest: send.BodyDigest, BodyBytes: send.BodyBytes,
-	}, seq, now)
+	outcomeVal, err := run.AcceptAnswer(question, prior,
+		run.AnswerContext{AnswererAddress: answerer, DestinationMailboxClosed: closed},
+		destination, sender, submission, peekEnqueueSeq(s, question.RunID, destination), now)
 	switch {
 	case err == nil:
+		nextEnqueueSeq(s, question.RunID, destination)
 		s.Messages[outcomeVal.Question.ID] = outcomeVal.Question
 		s.Messages[outcomeVal.Answer.ID] = outcomeVal.Answer
+		// The adapter's persistBundledQuestionAck: a human question is
+		// never fetched, so its own ack is bundled atomically into its
+		// answer's acceptance (section 5/7); an existing ack is kept.
+		if _, acked := s.MessageAcks[question.ID]; !acked && outcomeVal.Question.State == run.MessageAcknowledged {
+			s.MessageAcks[question.ID] = run.Ack{MessageID: question.ID, At: now}
+		}
 		return app.MessageOutcome{Kind: app.MessageAccepted, MessageID: outcomeVal.Answer.ID}
+	case errors.Is(err, run.ErrAnswerNotRecipient):
+		return app.MessageOutcome{Kind: app.MessageRefused, Reason: app.GrammarReasonUnauthorized, Detail: "session is not the question's recipient"}
 	case errors.Is(err, run.ErrDuplicateAnswer):
 		return app.MessageOutcome{Kind: app.MessageDuplicate, MessageID: outcomeVal.Answer.ID}
 	case errors.Is(err, run.ErrConflictingAnswer):
 		return app.MessageOutcome{Kind: app.MessageConflicting, Reason: app.GrammarReasonConflicting, Detail: err.Error()}
+	case errors.Is(err, run.ErrMailboxClosed):
+		return app.MessageOutcome{Kind: app.MessageMailboxClose, Reason: app.GrammarReasonMailboxClosed, Detail: "mailbox is closed"}
 	default:
 		// The only other error AcceptAnswer returns is ErrInvalidTransition
-		// (the reply-to id names a message that is not a question) — a
+		// (the referenced id names a message that is not a question) — a
 		// shape failure, not an authorization one.
 		return app.MessageOutcome{Kind: app.MessageRefused, Reason: app.GrammarReasonMalformed, Detail: err.Error()}
 	}
@@ -588,9 +621,8 @@ func (s *fakeStore) acceptSessionAnswerLocked(send app.MessageSend, now time.Tim
 
 // answerDestinationLocked resolves an answer's destination from the
 // referenced question's own sender (never caller-chosen): the sender's
-// logical address for a session, or human for a human-authored question —
-// though a human never sends a question in this design, so only the
-// session case is reachable in practice. Callers hold s.mu.
+// logical address for a session; a controller- or human-authored message
+// has no fetchable originator address. Callers hold s.mu.
 func (s *fakeStore) answerDestinationLocked(question run.Message) (run.Address, bool) { //nolint:gocritic // hugeParam: Message is passed by value everywhere in this package; mirrors that convention.
 	if question.Sender.Kind != run.PrincipalSession {
 		return run.Address{}, false
@@ -751,42 +783,9 @@ func (s *fakeStore) AnswerQuestion(_ context.Context, answer app.HumanAnswer) (a
 	if question.Recipient.Kind != run.AddressHuman {
 		return app.MessageOutcome{Kind: app.MessageRefused, Reason: app.GrammarReasonMalformed, Detail: "question is not human-addressed"}, nil
 	}
-	destination, ok := s.answerDestinationLocked(question)
-	if !ok {
-		return app.MessageOutcome{Kind: app.MessageMalformed, Reason: app.GrammarReasonMalformed, Detail: "question originator is not resolvable"}, nil
-	}
-	var prior *run.Message
-	for _, m := range s.Messages { //nolint:gocritic // rangeValCopy: test fake; the domain snapshot is small and read-only here, and indexing would only obscure the loop.
-		if m.Kind == run.MessageAnswer && m.ReplyTo != nil && *m.ReplyTo == question.ID {
-			p := m
-			prior = &p
-			break
-		}
-	}
-
-	seq := nextEnqueueSeq(s, answer.RunID, destination)
-	outcomeVal, err := run.AcceptAnswer(question, prior, destination, run.HumanPrincipal(), run.AnswerSubmission{
+	outcome := s.decideAnswerLocked(question, run.HumanAddress(), run.HumanPrincipal(), run.AnswerSubmission{
 		ID: answer.ID, BodyPath: answer.BodyPath, BodyDigest: answer.BodyDigest, BodyBytes: answer.BodyBytes,
-	}, seq, now)
-	var outcome app.MessageOutcome
-	switch {
-	case err == nil:
-		s.Messages[outcomeVal.Question.ID] = outcomeVal.Question
-		s.Messages[outcomeVal.Answer.ID] = outcomeVal.Answer
-		// A human question is never fetched, so its own ack is bundled
-		// atomically into its answer's acceptance (section 5/7).
-		s.MessageAcks[question.ID] = run.Ack{MessageID: question.ID, At: now}
-		outcome = app.MessageOutcome{Kind: app.MessageAccepted, MessageID: outcomeVal.Answer.ID}
-	case errors.Is(err, run.ErrDuplicateAnswer):
-		outcome = app.MessageOutcome{Kind: app.MessageDuplicate, MessageID: outcomeVal.Answer.ID}
-	case errors.Is(err, run.ErrConflictingAnswer):
-		outcome = app.MessageOutcome{Kind: app.MessageConflicting, Reason: app.GrammarReasonConflicting, Detail: err.Error()}
-	default:
-		// The only other error AcceptAnswer returns is ErrInvalidTransition
-		// (the question id names a message that is not a question) — a
-		// shape failure, not an authorization one.
-		outcome = app.MessageOutcome{Kind: app.MessageRefused, Reason: app.GrammarReasonMalformed, Detail: err.Error()}
-	}
+	}, now)
 	if answer.RequestID != "" && outcome.Kind == app.MessageAccepted {
 		s.RequestReceipts[requestReceiptKey{run: answer.RunID, verb: verb, requestID: answer.RequestID}] = requestReceipt{digest: digest, outcome: outcome}
 	}

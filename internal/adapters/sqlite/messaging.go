@@ -104,8 +104,11 @@ func sendRequestDigest(send *app.MessageSend) string {
 // current incarnation, and — for an ordinary send — addressing legality,
 // the run's acceptance (run.Run.CanAcceptManagerVerb: transient while the
 // run can still reach running, refused once it never will) and the
-// recipient mailbox; an answer's destination is derived from the
-// referenced question's sender, never caller-chosen, and an answer has no
+// recipient mailbox; an answer is accepted only from the session whose
+// re-derived logical address is the question's recipient (so no session
+// ever answers a human question), its destination is derived from the
+// referenced question's sender, never caller-chosen, a closed destination
+// task mailbox refuses it once any prior answer is resolved, and it has no
 // run-state gate. Every outcome leaves a receipt; only an acceptance
 // occupies the (run, verb, request ID) key, so a request retried after a
 // transient receipt is decided afresh.
@@ -219,9 +222,19 @@ func (s *Store) SendMessage(ctx context.Context, send app.MessageSend) (app.Mess
 }
 
 // acceptSessionAnswer handles a session's answer to a question addressed
-// to its own logical address, via run.AcceptAnswer: the destination is
-// derived from the question's own sender, never from send.Recipient.
+// to its own logical address, via run.AcceptAnswer: the answering
+// session's address is re-derived from its own session row inside this
+// transaction (never taken from send.SenderAddress, which must merely
+// agree with it), and the destination is derived from the question's own
+// sender, never from send.Recipient.
 func acceptSessionAnswer(ctx context.Context, tx *sql.Tx, send *app.MessageSend, record func(kind app.MessageOutcomeKind, messageID identity.MessageID, reason, detail string) error, now time.Time) error {
+	answerer, resolvable, err := sessionAddress(ctx, tx, send.Sender.SessionID)
+	if err != nil {
+		return err
+	}
+	if !resolvable || !answerer.Equal(send.SenderAddress) {
+		return record(app.MessageRefused, "", app.GrammarReasonUnauthorized, "session does not resolve to the claimed address")
+	}
 	if send.ReplyTo == nil {
 		return record(app.MessageMalformed, "", app.GrammarReasonMalformed, "answer requires reply-to")
 	}
@@ -232,26 +245,60 @@ func acceptSessionAnswer(ctx context.Context, tx *sql.Tx, send *app.MessageSend,
 	if questionErr != nil {
 		return questionErr
 	}
-	destination, resolvable, destErr := answerDestination(ctx, tx, &question)
-	if destErr != nil {
-		return destErr
+	outcomeVal, acceptErr, err := decideAnswer(ctx, tx, &question, answerer, send.Sender, run.AnswerSubmission{
+		ID: send.ID, BodyPath: send.BodyPath, BodyDigest: send.BodyDigest, BodyBytes: send.BodyBytes,
+	}, now)
+	if err != nil {
+		return err
+	}
+	return recordAnswerOutcome(ctx, tx, &outcomeVal, acceptErr, record, now)
+}
+
+// decideAnswer assembles run.AcceptAnswer's inputs for one answer inside the
+// accepting transaction — the derived destination, whether that
+// destination's task mailbox has closed, the question's prior accepted
+// answer and the destination's next enqueue sequence — and returns its
+// decision as acceptErr. err is an infrastructure failure only; an
+// originator with no resolvable address is reported as
+// errAnswerOriginatorUnresolvable in acceptErr.
+func decideAnswer(ctx context.Context, tx querier, question *run.Message, answerer run.Address, sender run.Principal, submission run.AnswerSubmission, now time.Time) (outcome run.AnswerOutcome, acceptErr, err error) {
+	destination, resolvable, err := answerDestination(ctx, tx, question)
+	if err != nil {
+		return run.AnswerOutcome{}, nil, err
 	}
 	if !resolvable {
-		return record(app.MessageMalformed, "", app.GrammarReasonMalformed, "question originator is not resolvable")
+		return run.AnswerOutcome{}, errAnswerOriginatorUnresolvable, nil
 	}
-	prior, priorErr := acceptedAnswer(ctx, tx, question.ID)
-	if priorErr != nil {
-		return priorErr
+	closed, err := answerDestinationClosed(ctx, tx, destination)
+	if err != nil {
+		return run.AnswerOutcome{}, nil, err
 	}
-	seq, seqErr := nextEnqueueSeq(ctx, tx, send.RunID, destination)
-	if seqErr != nil {
-		return seqErr
+	prior, err := acceptedAnswer(ctx, tx, question.ID)
+	if err != nil {
+		return run.AnswerOutcome{}, nil, err
 	}
-	outcomeVal, err := run.AcceptAnswer(question, prior, destination, send.Sender, run.AnswerSubmission{
-		ID: send.ID, BodyPath: send.BodyPath, BodyDigest: send.BodyDigest, BodyBytes: send.BodyBytes,
-	}, seq, now)
+	seq, err := nextEnqueueSeq(ctx, tx, question.RunID, destination)
+	if err != nil {
+		return run.AnswerOutcome{}, nil, err
+	}
+	outcome, acceptErr = run.AcceptAnswer(*question, prior,
+		run.AnswerContext{AnswererAddress: answerer, DestinationMailboxClosed: closed},
+		destination, sender, submission, seq, now)
+	return outcome, acceptErr, nil
+}
+
+// errAnswerOriginatorUnresolvable reports a question whose sender has no
+// fetchable logical address to answer back to (a controller- or
+// human-authored question, or a sender with no messaging role).
+var errAnswerOriginatorUnresolvable = errors.New("sqlite: question originator is not resolvable")
+
+// recordAnswerOutcome persists and records run.AcceptAnswer's decision,
+// shared by a session answer and hop answer: an acceptance inserts the
+// answer envelope and any bundled question ack; every other decision
+// records its refusal with the grammar token section 7 assigns it.
+func recordAnswerOutcome(ctx context.Context, tx *sql.Tx, outcomeVal *run.AnswerOutcome, acceptErr error, record func(kind app.MessageOutcomeKind, messageID identity.MessageID, reason, detail string) error, now time.Time) error {
 	switch {
-	case err == nil:
+	case acceptErr == nil:
 		if insertErr := insertMessage(ctx, tx, &outcomeVal.Answer); insertErr != nil {
 			return insertErr
 		}
@@ -259,16 +306,47 @@ func acceptSessionAnswer(ctx context.Context, tx *sql.Tx, send *app.MessageSend,
 			return ackErr
 		}
 		return record(app.MessageAccepted, outcomeVal.Answer.ID, "", "")
-	case errors.Is(err, run.ErrDuplicateAnswer):
+	case errors.Is(acceptErr, errAnswerOriginatorUnresolvable):
+		return record(app.MessageMalformed, "", app.GrammarReasonMalformed, "question originator is not resolvable")
+	case errors.Is(acceptErr, run.ErrAnswerNotRecipient):
+		return record(app.MessageRefused, "", app.GrammarReasonUnauthorized, "session is not the question's recipient")
+	case errors.Is(acceptErr, run.ErrDuplicateAnswer):
 		return record(app.MessageDuplicate, outcomeVal.Answer.ID, "", "")
-	case errors.Is(err, run.ErrConflictingAnswer):
-		return record(app.MessageConflicting, "", app.GrammarReasonConflicting, err.Error())
+	case errors.Is(acceptErr, run.ErrConflictingAnswer):
+		return record(app.MessageConflicting, "", app.GrammarReasonConflicting, acceptErr.Error())
+	case errors.Is(acceptErr, run.ErrMailboxClosed):
+		return record(app.MessageMailboxClose, "", app.GrammarReasonMailboxClosed, "mailbox is closed")
 	default:
 		// The only other error AcceptAnswer returns is ErrInvalidTransition
-		// (the reply-to id names a message that is not a question) —
-		// a shape failure, not an authorization one.
-		return record(app.MessageRefused, "", app.GrammarReasonMalformed, err.Error())
+		// (the referenced id names a message that is not a question) — a
+		// shape failure, not an authorization one.
+		return record(app.MessageRefused, "", app.GrammarReasonMalformed, acceptErr.Error())
 	}
+}
+
+// sessionAddress re-derives sessionID's logical address from its own
+// session row; ok is false for a session with no messaging role.
+func sessionAddress(ctx context.Context, q querier, sessionID identity.SessionID) (run.Address, bool, error) {
+	session, _, err := getSession(ctx, q, sessionID)
+	if err != nil {
+		return run.Address{}, false, err
+	}
+	return resolveSessionAddress(ctx, q, &session)
+}
+
+// answerDestinationClosed reports whether an answer's derived destination
+// is a task mailbox whose admission has closed (section 5): result or
+// verdict acceptance, or task failure. The manager address carries no
+// closure flag.
+func answerDestinationClosed(ctx context.Context, q querier, destination run.Address) (bool, error) {
+	if destination.Kind != run.AddressTask {
+		return false, nil
+	}
+	task, _, err := getTask(ctx, q, destination.TaskID)
+	if err != nil {
+		return false, err
+	}
+	return task.MailboxClosed, nil
 }
 
 // answerDestination resolves an answer's destination from the referenced
@@ -511,8 +589,11 @@ func (s *Store) AckMessage(ctx context.Context, ack app.MessageAck) (app.Message
 // with no session — in the section 7 order: the request-ID receipt first
 // (the digest binds the QUESTION UUID with the body digest, so identical
 // bodies to two questions are two requests), then the question's
-// existence, its human address, its derived destination and any prior
-// accepted answer through run.AcceptAnswer. Acceptance commits the answer
+// existence and its human address, then run.AcceptAnswer with the human as
+// the answering address, the derived destination (always the relaying
+// manager, since only the manager may address the human), the same
+// closed-mailbox admission as a session answer and any prior accepted
+// answer. Acceptance commits the answer
 // envelope AND the question's bundled acknowledgement atomically — a
 // human question is never fetched, so its answer's acceptance is its ack.
 func (s *Store) AnswerQuestion(ctx context.Context, answer app.HumanAnswer) (app.MessageOutcome, error) { //nolint:gocritic // hugeParam: the port passes the answer value; the adapter mirrors its signature.
@@ -557,43 +638,13 @@ func (s *Store) AnswerQuestion(ctx context.Context, answer app.HumanAnswer) (app
 		if question.Recipient.Kind != run.AddressHuman {
 			return record(app.MessageRefused, "", app.GrammarReasonMalformed, "question is not human-addressed")
 		}
-		destination, resolvable, err := answerDestination(ctx, tx, &question)
-		if err != nil {
-			return err
-		}
-		if !resolvable {
-			return record(app.MessageMalformed, "", app.GrammarReasonMalformed, "question originator is not resolvable")
-		}
-		prior, err := acceptedAnswer(ctx, tx, question.ID)
-		if err != nil {
-			return err
-		}
-		seq, err := nextEnqueueSeq(ctx, tx, answer.RunID, destination)
-		if err != nil {
-			return err
-		}
-		outcomeVal, err := run.AcceptAnswer(question, prior, destination, run.HumanPrincipal(), run.AnswerSubmission{
+		outcomeVal, acceptErr, err := decideAnswer(ctx, tx, &question, run.HumanAddress(), run.HumanPrincipal(), run.AnswerSubmission{
 			ID: answer.ID, BodyPath: answer.BodyPath, BodyDigest: answer.BodyDigest, BodyBytes: answer.BodyBytes,
-		}, seq, now)
-		switch {
-		case err == nil:
-			if insertErr := insertMessage(ctx, tx, &outcomeVal.Answer); insertErr != nil {
-				return insertErr
-			}
-			if ackErr := persistBundledQuestionAck(ctx, tx, &outcomeVal.Question, now); ackErr != nil {
-				return ackErr
-			}
-			return record(app.MessageAccepted, outcomeVal.Answer.ID, "", "")
-		case errors.Is(err, run.ErrDuplicateAnswer):
-			return record(app.MessageDuplicate, outcomeVal.Answer.ID, "", "")
-		case errors.Is(err, run.ErrConflictingAnswer):
-			return record(app.MessageConflicting, "", app.GrammarReasonConflicting, err.Error())
-		default:
-			// The only other error AcceptAnswer returns is ErrInvalidTransition
-			// (the question id names a message that is not a question) — a
-			// shape failure, not an authorization one.
-			return record(app.MessageRefused, "", app.GrammarReasonMalformed, err.Error())
+		}, now)
+		if err != nil {
+			return err
 		}
+		return recordAnswerOutcome(ctx, tx, &outcomeVal, acceptErr, record, now)
 	})
 	if err != nil {
 		return app.MessageOutcome{}, err

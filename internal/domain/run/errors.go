@@ -53,6 +53,12 @@ var ErrDuplicateAnswer = errors.New("run: duplicate answer")
 // is never replaced.
 var ErrConflictingAnswer = errors.New("run: conflicting answer")
 
+// ErrAnswerNotRecipient reports an answer from a principal whose logical
+// address is not the question's recipient: only the addressed recipient
+// may answer a question, so no session ever answers a human-addressed
+// question and no session answers another address's question.
+var ErrAnswerNotRecipient = errors.New("run: answerer is not the question's recipient")
+
 // ErrStaleAck reports an ack from an incarnation that is not the acking
 // session's current, non-superseded one.
 var ErrStaleAck = errors.New("run: stale ack")
@@ -92,8 +98,8 @@ var ErrRunNotYetRunning = errors.New("run: run not yet running")
 // created.
 var ErrEmptyPlan = errors.New("run: plan has no implement task")
 
-// ErrMailboxClosed reports a send addressed to a task whose mailbox
-// admission has closed.
+// ErrMailboxClosed reports a send or an answer addressed to a task whose
+// mailbox admission has closed.
 var ErrMailboxClosed = errors.New("run: mailbox is closed")
 
 // ErrRequestConflict reports a caller-stable request ID reused with

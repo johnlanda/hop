@@ -215,6 +215,76 @@ func TestStoreVectors(t *testing.T) {
 		}
 	})
 
+	t.Run("MessageSendAnswerNotRecipient", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		fr := seedFeatureRun(t, tc, 2)
+		taskB := seedImplementTask(t, tc, fr.RunID, 1, "B", false, run.TaskReady)
+		workerID, workerIncarnation := seedWorkerSession(t, tc, fr, taskB)
+		humanQuestion := mintMessageID(t, tc)
+		if outcome, err := tc.Controller.Messages.SendMessage(context.Background(), app.MessageSend{
+			ID: humanQuestion, RunID: fr.RunID, Sender: run.SessionPrincipal(fr.ManagerID), SenderAddress: run.ManagerAddress(),
+			IncarnationID: fr.ManagerIncarnation, Recipient: run.HumanAddress(), Kind: run.MessageQuestion,
+			BodyPath: "/state/q.md", BodyDigest: "digest-q", BodyBytes: 1,
+		}); err != nil || outcome.Kind != app.MessageAccepted {
+			t.Fatalf("seed human question: %+v, %v", outcome, err)
+		}
+		answerID := mintMessageID(t, tc)
+
+		// The worker is current and in the run, but the question is the
+		// human's to answer.
+		got, err := tc.Controller.Messages.SendMessage(context.Background(), storevectors.MessageSendAnswerNotRecipient(
+			fr.RunID, workerID, run.TaskAddress(taskB), workerIncarnation, answerID, humanQuestion, "/state/body.md", "digest", 3,
+		))
+		if err != nil {
+			t.Fatalf("SendMessage() error = %v", err)
+		}
+		if got.Kind != app.MessageRefused || got.Reason != storevectors.MessageSendAnswerNotRecipientReason {
+			t.Fatalf("SendMessage(answer by a non-recipient) = %+v, want refused/%s", got, storevectors.MessageSendAnswerNotRecipientReason)
+		}
+		if _, exists := tc.Store.Messages[answerID]; exists {
+			t.Fatal("refused answer created an envelope; want none")
+		}
+		if _, acked := tc.Store.MessageAcks[humanQuestion]; acked {
+			t.Fatal("refused answer acknowledged the human question; want it unacknowledged")
+		}
+		if state := tc.Store.Messages[humanQuestion].State; state != run.MessageQueued {
+			t.Fatalf("human question state = %s after a refused answer, want queued", state)
+		}
+	})
+
+	t.Run("MessageSendAnswerMailboxClosed", func(t *testing.T) {
+		f := newMailboxFixture(t)
+		question := mintMessageID(t, f.tc)
+		if outcome, err := f.tc.Store.SendMessage(context.Background(), app.MessageSend{
+			ID: question, RunID: f.fr.RunID, Sender: run.SessionPrincipal(f.w.SessionID), SenderAddress: run.TaskAddress(f.TaskID),
+			IncarnationID: f.w.IncarnationID, Recipient: run.ManagerAddress(), Kind: run.MessageQuestion,
+			BodyPath: "/state/q.md", BodyDigest: "digest-q", BodyBytes: 1,
+		}); err != nil || outcome.Kind != app.MessageAccepted {
+			t.Fatalf("seed worker question: %+v, %v", outcome, err)
+		}
+		// The worker's own mailbox is empty, so its result is accepted and
+		// the task mailbox closes in the same commit.
+		if outcome := f.submit(t); outcome.Kind != app.SubmissionAccepted {
+			t.Fatalf("SubmitResult() = %+v, want accepted", outcome)
+		}
+		answerID := mintMessageID(t, f.tc)
+
+		got, err := f.tc.Store.SendMessage(context.Background(), storevectors.MessageSendAnswerMailboxClosed(
+			f.fr.RunID, f.fr.ManagerID, run.ManagerAddress(), f.fr.ManagerIncarnation, answerID, question, "/state/a.md", "digest-a", 1,
+		))
+		if err != nil {
+			t.Fatalf("SendMessage() error = %v", err)
+		}
+		if got.Kind != storevectors.MessageSendAnswerMailboxClosedKind || got.Reason != storevectors.MessageSendAnswerMailboxClosedReason {
+			t.Fatalf("SendMessage(answer into a closed mailbox) = %+v, want %s/%s", got, storevectors.MessageSendAnswerMailboxClosedKind, storevectors.MessageSendAnswerMailboxClosedReason)
+		}
+		for id := range f.tc.Store.Messages {
+			if f.tc.Store.Messages[id].Recipient.Equal(run.TaskAddress(f.TaskID)) {
+				t.Fatalf("refused answer left envelope %s for the closed task; want none", id)
+			}
+		}
+	})
+
 	t.Run("MessageSendCrossRun", func(t *testing.T) {
 		tc := newTestController(defaultPolicy())
 		fr1 := seedFeatureRun(t, tc, 2)

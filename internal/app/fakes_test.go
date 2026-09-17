@@ -251,9 +251,21 @@ func (s *fakeStore) nextTaskSeqLocked(runID identity.RunID) int {
 // nextEnqueueSeq assigns the next durable per-(run, recipient address)
 // message sequence number — the FIFO authority (section 7).
 func nextEnqueueSeq(s *fakeStore, runID identity.RunID, address run.Address) int {
-	key := runID.String() + "|" + app.AddressString(address)
+	key := enqueueSeqKey(runID, address)
 	s.enqueueSeq[key]++
 	return s.enqueueSeq[key]
+}
+
+// peekEnqueueSeq returns the number nextEnqueueSeq would assign without
+// consuming it — the adapter's read-only MAX+1, for a decision that may
+// still refuse.
+func peekEnqueueSeq(s *fakeStore, runID identity.RunID, address run.Address) int {
+	return s.enqueueSeq[enqueueSeqKey(runID, address)] + 1
+}
+
+// enqueueSeqKey is the fake's per-(run, recipient address) sequence key.
+func enqueueSeqKey(runID identity.RunID, address run.Address) string {
+	return runID.String() + "|" + app.AddressString(address)
 }
 
 // --- StateStore ---

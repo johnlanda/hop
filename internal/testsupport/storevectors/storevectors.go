@@ -192,6 +192,54 @@ func MessageSendAnswerUnknownQuestion(runID identity.RunID, session identity.Ses
 	}
 }
 
+// MessageSendAnswerNotRecipientReason is MessageSendAnswerNotRecipient's
+// expected refusal reason token.
+const MessageSendAnswerNotRecipientReason = app.GrammarReasonUnauthorized
+
+// MessageSendAnswerNotRecipient returns a MessagingStore.SendMessage request
+// (Kind answer) from a current session of the run whose logical address
+// (senderAddress, its true resolved address) is NOT the recipient of
+// questionID — refused app.MessageRefused (reason
+// MessageSendAnswerNotRecipientReason), detail "session is not the
+// question's recipient", with no answer envelope created and the question
+// left unacknowledged: only the addressed recipient may answer (section 7),
+// so no session ever answers a human-addressed question and no task answers
+// another address's question.
+func MessageSendAnswerNotRecipient(runID identity.RunID, session identity.SessionID, senderAddress run.Address, incarnation identity.IncarnationID, answerID, questionID identity.MessageID, bodyPath, bodyDigest string, bodyBytes int64) app.MessageSend {
+	return answerSend(runID, session, senderAddress, incarnation, answerID, questionID, bodyPath, bodyDigest, bodyBytes)
+}
+
+// MessageSendAnswerMailboxClosedKind and MessageSendAnswerMailboxClosedReason
+// are MessageSendAnswerMailboxClosed's expected outcome kind and refusal
+// reason token.
+const (
+	MessageSendAnswerMailboxClosedKind   = app.MessageMailboxClose
+	MessageSendAnswerMailboxClosedReason = app.GrammarReasonMailboxClosed
+)
+
+// MessageSendAnswerMailboxClosed returns a MessagingStore.SendMessage
+// request (Kind answer) from the question's own recipient (senderAddress,
+// its true resolved address) to a question whose originator's task mailbox
+// has closed and which has no accepted answer yet — refused
+// MessageSendAnswerMailboxClosedKind (reason
+// MessageSendAnswerMailboxClosedReason), detail "mailbox is closed", with
+// no answer envelope created: an answer's derived task destination is
+// admitted only while that mailbox is open (section 5), exactly like an
+// ordinary send, and with no run-state gate.
+func MessageSendAnswerMailboxClosed(runID identity.RunID, session identity.SessionID, senderAddress run.Address, incarnation identity.IncarnationID, answerID, questionID identity.MessageID, bodyPath, bodyDigest string, bodyBytes int64) app.MessageSend {
+	return answerSend(runID, session, senderAddress, incarnation, answerID, questionID, bodyPath, bodyDigest, bodyBytes)
+}
+
+// answerSend is the shared answer-request shape: no Recipient (an answer's
+// destination is derived) and no request ID.
+func answerSend(runID identity.RunID, session identity.SessionID, senderAddress run.Address, incarnation identity.IncarnationID, answerID, questionID identity.MessageID, bodyPath, bodyDigest string, bodyBytes int64) app.MessageSend {
+	return app.MessageSend{
+		ID: answerID, RunID: runID, Sender: run.SessionPrincipal(session), SenderAddress: senderAddress,
+		IncarnationID: incarnation, Kind: run.MessageAnswer, ReplyTo: &questionID,
+		BodyPath: bodyPath, BodyDigest: bodyDigest, BodyBytes: bodyBytes,
+	}
+}
+
 // MessageSendCrossRunReason is MessageSendCrossRun's expected refusal
 // reason token.
 const MessageSendCrossRunReason = app.GrammarReasonUnauthorized

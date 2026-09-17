@@ -28,12 +28,12 @@ integration — without changing any Phase 2 transition's legality.
 | [binding.go](binding.go) | `RuntimeBinding`, `LaunchKind`, `OccupantEvidence`, `NewRuntimeBinding`, `Observe`, `Supersede` | Append-only runtime placement history and evidence-gated supersession |
 | [worktree.go](worktree.go) | `Worktree`, `WorktreeState` (`WorktreeActive`, `WorktreeRemoved`, `WorktreeAbsent`, `WorktreeReleased`), `NewWorktree`, `NewAttemptWorktree`, `Retire` | Checkout provenance: one unlinked row per solo run (`NewWorktree`), one per attempt in feature mode (`NewAttemptWorktree`, carrying `AttemptID` and the verified `BaseCommit`); post-merge worktree retirement's final states ([phase-3-worktree-retirement.md](../../../docs/plan/phase-3-worktree-retirement.md) section 8) |
 | [result.go](result.go) | `Result`, `ResultSubmission`, `AcceptanceContext`, `AcceptanceOutcome`, `AcceptResult` | The section 7 result-acceptance rule as one pure, cross-entity function |
-| [message.go](message.go) | `Message`, `MessageKind`, `MessageState`, `Principal`, `Address`, `Delivery`, `Ack`, `AckContext`, `AckOutcome`, `AnswerSubmission`, `AnswerOutcome`, `NewQuestion`, `NewInfo`, `Deliver`, `AcceptAck`, `NextDeliverable`, `AcceptAnswer`, `ResolveOrigin`, `ValidateSendAddressing` | The durable message/delivery/ack model (section 7): the `queued`→`delivered`→`acknowledged` machine, FIFO selection, ack eligibility and the derived-destination answer rule |
+| [message.go](message.go) | `Message`, `MessageKind`, `MessageState`, `Principal`, `Address`, `Delivery`, `Ack`, `AckContext`, `AckOutcome`, `AnswerSubmission`, `AnswerContext`, `AnswerOutcome`, `NewQuestion`, `NewInfo`, `Deliver`, `AcceptAck`, `NextDeliverable`, `AcceptAnswer`, `ResolveOrigin`, `ValidateSendAddressing` | The durable message/delivery/ack model (section 7): the `queued`→`delivered`→`acknowledged` machine, FIFO selection, ack eligibility and the answer rules (recipient authority, derived destination, closed-destination admission) |
 | [review.go](review.go) | `Review`, `Verdict`, `ReviewSubmission`, `ReviewAcceptanceContext`, `VerdictOutcome`, `AcceptVerdict` | The section 8 review-verdict acceptance rule, mirroring `AcceptResult`'s receipt-before-eligibility order |
 | [integration.go](integration.go) | `Integration`, `IntegrationState`, `NewIntegration`, `EnterChecking`, `Conflict`, `Integrate`, `FailCheck`, `RollBack`, `Interrupt` | Serial per-task integration's state machine (section 5, "Integration") |
 | [readiness.go](readiness.go) | `GuardContext`, `CheckReceipt`, `GuardShortfall`, `ShortfallKind`, `EvaluateReadiness` | The run-completion guard (section 8): a pure function meant to gate `Run.Complete` in feature mode (the actual wiring is a later application slice — see Invariants). The verdict guard checks SUBJECT CURRENCY BEFORE the verdict value (Astra F3, STATUS-1): a latest review whose subject differs from the head is `ShortfallVerdictStaleSubject` whether it approved or rejected, and `ShortfallVerdictRejected` means specifically a reject of the CURRENT head — reordering it the other way would let a rejected review of a long-superseded head keep reporting "rejected" forever. `ShortfallVerdictRejected` alone carries `GuardShortfall.ReviewID`/`SubjectCommitOID`, since the controller notice a caller fetches for it names no verdict and the shortfall itself must say WHICH review it reports |
 | [artifact.go](artifact.go) | `Artifact`, `ArtifactKind`, `NewArtifact`, `NewResultArtifact` | File references owned by a run or a result |
-| [errors.go](errors.go) | `ErrInvalidTransition`, `ErrStaleSubmission`, `ErrConflictingResult`, `ErrDuplicateResult`, `ErrTransientNotRunning`, `ErrDependencyCycle`, `ErrDependencyNotIntegrated`, `ErrDependencyEvidenceMissing`, `ErrDelegationDepth`, `ErrDuplicateAnswer`, `ErrConflictingAnswer`, `ErrStaleAck`, `ErrNotDelivered`, `ErrVerdictSubjectMismatch`, `ErrRetryNotTerminal`, `ErrRetryLimit`, `ErrRunNotAccepting`, `ErrRunNotYetRunning`, `ErrEmptyPlan`, `ErrMailboxClosed`, `ErrMailboxNotClear`, `ErrRequestConflict`, `ErrTaskNotReleased` | Typed errors every transition and cross-entity acceptance function returns |
+| [errors.go](errors.go) | `ErrInvalidTransition`, `ErrStaleSubmission`, `ErrConflictingResult`, `ErrDuplicateResult`, `ErrTransientNotRunning`, `ErrDependencyCycle`, `ErrDependencyNotIntegrated`, `ErrDependencyEvidenceMissing`, `ErrDelegationDepth`, `ErrDuplicateAnswer`, `ErrConflictingAnswer`, `ErrAnswerNotRecipient`, `ErrStaleAck`, `ErrNotDelivered`, `ErrVerdictSubjectMismatch`, `ErrRetryNotTerminal`, `ErrRetryLimit`, `ErrRunNotAccepting`, `ErrRunNotYetRunning`, `ErrEmptyPlan`, `ErrMailboxClosed`, `ErrMailboxNotClear`, `ErrRequestConflict`, `ErrTaskNotReleased` | Typed errors every transition and cross-entity acceptance function returns |
 | [transition.go](transition.go) | `transitionTable`, `fromAny`, `concatPairs` | The generic, table-driven legality check shared by every entity's state machine |
 
 ## Invariants
@@ -179,9 +179,18 @@ integration — without changing any Phase 2 transition's legality.
   eligibility); a first ack requires a delivery row for the ACKING SESSION
   ITSELF (`ErrNotDelivered` otherwise — a predecessor's delivery never
   authorizes a successor's ack) at its current incarnation
-  (`ErrStaleAck` otherwise). `AcceptAnswer` resolves any prior accepted
-  answer first (`ErrDuplicateAnswer`/`ErrConflictingAnswer`, the accepted
-  answer never disturbed) and otherwise imposes NO delivery-state
+  (`ErrStaleAck` otherwise). `AcceptAnswer` takes an application-assembled
+  `AnswerContext` (the `AckContext` precedent) and decides in this order:
+  not a question (`ErrInvalidTransition`); the ANSWERER's logical address
+  — re-derived by the application from its own session row, or the human
+  address for `hop answer` — unequal to the question's recipient
+  (`ErrAnswerNotRecipient`: no session answers a human question or another
+  address's question, and a refused answerer never reads a verdict about
+  the accepted answer); any prior accepted answer
+  (`ErrDuplicateAnswer`/`ErrConflictingAnswer`, the accepted answer never
+  disturbed); then a closed destination task mailbox
+  (`ErrMailboxClosed`, so an answer accepted before the closure still
+  replays as a duplicate). It imposes NO delivery-state
   precondition on the question being answered — an ordinary (non-human)
   question's own ack is independent of when it is eventually answered
   (the manager typically acks on read, before composing its reply). The
@@ -266,7 +275,12 @@ integration — without changing any Phase 2 transition's legality.
   conflicting never disturbing the accepted row, plus `AcceptVerdict`'s own
   mailbox-clear and subject-match guards); `AcceptAck`/`NextDeliverable`/
   `AcceptAnswer` order and vectors (duplicate/conflicting, stale/not-
-  delivered, the human-question ack bundling); `EvaluateReadiness`'s
+  delivered, the human-question ack bundling, and
+  `TestAcceptAnswerRecipientAuthority`/`TestAcceptAnswerClosedDestination`:
+  every non-recipient pairing refused before any prior answer with the
+  question untouched, a closed destination refusing only a first
+  acceptance, a human answer to a closed destination leaving the question
+  unacknowledged); `EvaluateReadiness`'s
   shortfall vectors (plan open, missing integration, check missing, a
   failing check, a stale/head-moved passing check, no verdict, reject
   present, stale-subject approve, every shortfall reported together).

@@ -148,6 +148,64 @@ func TestStoreVectors(t *testing.T) {
 		}
 	})
 
+	t.Run("MessageSendAnswerNotRecipient", func(t *testing.T) {
+		f := newMessagingFixture(t)
+		humanQuestion := seedHumanQuestion(t, f.store, f, 8060)
+		answerID := identity.MessageID(uid(8062))
+
+		// The worker is current and in the run, but the question is the
+		// human's to answer.
+		got, err := f.store.SendMessage(t.Context(), storevectors.MessageSendAnswerNotRecipient(
+			f.spec.RunID, f.WorkerID, run.TaskAddress(f.TaskB), f.WorkerIncarnation, answerID, humanQuestion, "/state/body.md", "digest", 3,
+		))
+		if err != nil {
+			t.Fatalf("SendMessage() error = %v", err)
+		}
+		if got.Kind != app.MessageRefused || got.Reason != storevectors.MessageSendAnswerNotRecipientReason {
+			t.Fatalf("SendMessage(answer by a non-recipient) = %+v, want refused/%s", got, storevectors.MessageSendAnswerNotRecipientReason)
+		}
+		if n := countRows(t, f.store, `SELECT COUNT(*) FROM messages WHERE id = ? OR reply_to = ?`, answerID.String(), humanQuestion.String()); n != 0 {
+			t.Fatalf("refused answer left %d envelope(s); want none", n)
+		}
+		if n := countRows(t, f.store, `SELECT COUNT(*) FROM message_acks WHERE message_id = ?`, humanQuestion.String()); n != 0 {
+			t.Fatalf("refused answer acknowledged the human question (%d ack rows); want none", n)
+		}
+	})
+
+	t.Run("MessageSendAnswerMailboxClosed", func(t *testing.T) {
+		clock := newFakeClock()
+		store := openStoreAt(t, t.TempDir(), clock)
+		f := newMailboxFixtureAt(t, store, clock)
+		question := app.MessageSend{
+			ID: identity.MessageID(uid(8063)), RunID: f.spec.RunID,
+			Sender: run.SessionPrincipal(f.WorkerID), SenderAddress: run.TaskAddress(f.TaskB),
+			IncarnationID: f.WorkerIncarnation, Recipient: run.ManagerAddress(), Kind: run.MessageQuestion,
+			BodyPath: "/state/q.md", BodyDigest: "digest-q", BodyBytes: 1,
+		}
+		if outcome, err := store.SendMessage(t.Context(), question); err != nil || outcome.Kind != app.MessageAccepted {
+			t.Fatalf("seed worker question: %+v, %v", outcome, err)
+		}
+		// The worker's own mailbox is empty, so its result is accepted and
+		// the task mailbox closes in the same commit.
+		if outcome, err := store.SubmitResult(t.Context(), f.resultFor(8064)); err != nil || outcome.Kind != app.SubmissionAccepted {
+			t.Fatalf("SubmitResult() = %+v, %v; want accepted", outcome, err)
+		}
+		answerID := identity.MessageID(uid(8065))
+
+		got, err := store.SendMessage(t.Context(), storevectors.MessageSendAnswerMailboxClosed(
+			f.spec.RunID, f.ManagerID, run.ManagerAddress(), f.ManagerIncarnation, answerID, question.ID, "/state/a.md", "digest-a", 1,
+		))
+		if err != nil {
+			t.Fatalf("SendMessage() error = %v", err)
+		}
+		if got.Kind != storevectors.MessageSendAnswerMailboxClosedKind || got.Reason != storevectors.MessageSendAnswerMailboxClosedReason {
+			t.Fatalf("SendMessage(answer into a closed mailbox) = %+v, want %s/%s", got, storevectors.MessageSendAnswerMailboxClosedKind, storevectors.MessageSendAnswerMailboxClosedReason)
+		}
+		if n := countRows(t, store, `SELECT COUNT(*) FROM messages WHERE id = ? OR recipient_address = ?`, answerID.String(), app.AddressString(run.TaskAddress(f.TaskB))); n != 0 {
+			t.Fatalf("refused answer left %d envelope(s) for the closed task; want none", n)
+		}
+	})
+
 	t.Run("MessageSendCrossRun", func(t *testing.T) {
 		clock := newFakeClock()
 		store := openStoreAt(t, t.TempDir(), clock)

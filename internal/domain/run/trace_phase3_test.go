@@ -247,7 +247,7 @@ func TestReferenceTraceRelayedQuestion(t *testing.T) {
 	// Human hop answer on q2 (answer a2 accepted, q2 acknowledged,
 	// atomically).
 	a2Submission := run.AnswerSubmission{ID: testThirdMessageID, BodyPath: "/a2", BodyDigest: "digest-a2", BodyBytes: 8}
-	a2Outcome, err := run.AcceptAnswer(q2, nil, run.ManagerAddress(), run.HumanPrincipal(), a2Submission, 1, later())
+	a2Outcome, err := run.AcceptAnswer(q2, nil, run.AnswerContext{AnswererAddress: run.HumanAddress()}, run.ManagerAddress(), run.HumanPrincipal(), a2Submission, 1, later())
 	mustNoError(t, err)
 	q2, a2 := a2Outcome.Question, a2Outcome.Answer
 	mustState(t, "q2", string(q2.State), string(run.MessageAcknowledged))
@@ -266,7 +266,7 @@ func TestReferenceTraceRelayedQuestion(t *testing.T) {
 	// before-ack, so a manager crash between the two re-serves a2 and
 	// the forward's request ID makes the redo idempotent).
 	a1Submission := run.AnswerSubmission{ID: testFourthMessageID, BodyPath: "/a1", BodyDigest: "digest-a1", BodyBytes: 8}
-	a1Outcome, err := run.AcceptAnswer(q1, nil, workerAddress, run.SessionPrincipal(testManagerSessionID), a1Submission, 2, later())
+	a1Outcome, err := run.AcceptAnswer(q1, nil, run.AnswerContext{AnswererAddress: run.ManagerAddress()}, workerAddress, run.SessionPrincipal(testManagerSessionID), a1Submission, 2, later())
 	mustNoError(t, err)
 	q1Reconfirmed, a1 := a1Outcome.Question, a1Outcome.Answer
 	// q1 was not human-addressed, so answering it does not itself

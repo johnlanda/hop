@@ -293,6 +293,16 @@ type AnswerSubmission struct {
 	BodyBytes  int64
 }
 
+// AnswerContext is the application-assembled context AcceptAnswer needs
+// beyond the question and its prior answer: the ANSWERING principal's own
+// logical address, re-derived by the application from its session row (or
+// HumanAddress for hop answer) and never taken from the caller, and whether
+// the derived destination is a task mailbox whose admission has closed.
+type AnswerContext struct {
+	AnswererAddress          Address
+	DestinationMailboxClosed bool
+}
+
 // AnswerOutcome is the state AcceptAnswer decided: the answer (existing,
 // for a duplicate/conflict; newly accepted, otherwise) and question after
 // any transition acceptance implies. question is only ever mutated
@@ -306,25 +316,35 @@ type AnswerOutcome struct {
 }
 
 // AcceptAnswer decides the outcome of one answer to question, in the
-// validation order of section 7 (receipt before eligibility): question
-// must be a MessageQuestion (ErrInvalidTransition otherwise); any prior
-// accepted answer is resolved first — an equal body digest is
+// validation order of section 7 (the caller's request-ID receipt lookup
+// precedes this call): question must be a MessageQuestion
+// (ErrInvalidTransition otherwise); ctx.AnswererAddress must equal the
+// question's recipient (ErrAnswerNotRecipient otherwise) — checked before
+// any prior answer, so a principal that may not answer never learns
+// whether its body matches the accepted one, and an authorized answerer's
+// address is lineage-stable, so its own retries resolve below unchanged;
+// any prior accepted answer is then resolved — an equal body digest is
 // ErrDuplicateAnswer (idempotent, the accepted answer returned unchanged),
-// an unequal one is ErrConflictingAnswer (the accepted answer undisturbed).
-// "Unanswered" is entirely governed by prior: an ordinary (non-human)
-// question's own delivery/ack status is orthogonal to answering it — the
-// manager typically acks q1 upon reading it, well before composing and
-// forwarding its answer, so this function imposes no delivery-state
-// precondition of its own. destination is the question's ORIGINATOR's
-// logical address, resolved by the application from the original sender's
-// role/task at question time — the new answer's derived recipient, never
-// caller-chosen. sender is the answering principal. enqueueSeq is the new
-// answer's durable per-recipient-address position, assigned by the
-// application inside the accepting transaction.
-func AcceptAnswer(question Message, prior *Message, destination Address, sender Principal, submission AnswerSubmission, enqueueSeq int, now time.Time) (AnswerOutcome, error) { //nolint:gocritic // hugeParam: Message is an immutable domain value returned by every transition; a pointer receiver would let a caller's original be mutated through it, breaking the pure-transition contract.
+// an unequal one is ErrConflictingAnswer (the accepted answer undisturbed);
+// only then does a closed destination mailbox refuse a FIRST acceptance
+// (ErrMailboxClosed), so an answer accepted before its destination closed
+// still replays as a duplicate. "Unanswered" is entirely governed by
+// prior: an ordinary (non-human) question's own delivery/ack status is
+// orthogonal to answering it — the manager typically acks q1 upon reading
+// it, well before composing and forwarding its answer, so this function
+// imposes no delivery-state precondition of its own. destination is the
+// question's ORIGINATOR's logical address, resolved by the application
+// from the original sender's role/task at question time — the new
+// answer's derived recipient, never caller-chosen. sender is the answering
+// principal. enqueueSeq is the new answer's durable per-recipient-address
+// position, assigned by the application inside the accepting transaction.
+func AcceptAnswer(question Message, prior *Message, ctx AnswerContext, destination Address, sender Principal, submission AnswerSubmission, enqueueSeq int, now time.Time) (AnswerOutcome, error) { //nolint:gocritic // hugeParam: Message is an immutable domain value returned by every transition; a pointer receiver would let a caller's original be mutated through it, breaking the pure-transition contract.
 	unchanged := AnswerOutcome{Question: question}
 	if question.Kind != MessageQuestion {
 		return unchanged, fmt.Errorf("%w: message %s: not a question", ErrInvalidTransition, question.ID)
+	}
+	if !ctx.AnswererAddress.Equal(question.Recipient) {
+		return unchanged, fmt.Errorf("%w: question %s is addressed to %s, not %s", ErrAnswerNotRecipient, question.ID, question.Recipient.Kind, ctx.AnswererAddress.Kind)
 	}
 	if prior != nil {
 		unchanged.Answer = *prior
@@ -332,6 +352,9 @@ func AcceptAnswer(question Message, prior *Message, destination Address, sender 
 			return unchanged, fmt.Errorf("%w: question %s: answer %s", ErrDuplicateAnswer, question.ID, prior.ID)
 		}
 		return unchanged, fmt.Errorf("%w: question %s: answer %s", ErrConflictingAnswer, question.ID, prior.ID)
+	}
+	if ctx.DestinationMailboxClosed {
+		return unchanged, fmt.Errorf("%w: answer to question %s", ErrMailboxClosed, question.ID)
 	}
 
 	ackedQuestion := question

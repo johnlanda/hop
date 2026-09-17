@@ -679,9 +679,15 @@ analogue of closure) refuses `refused: run-not-accepting`; a run that
 can still reach `running` (created, launching, resuming or completing)
 answers the retryable `transient: run not yet running; retry` instead
 (section 7, "Run-state acceptance"); a closed mailbox refuses
-`refused: mailbox-closed`. Every outcome leaves a receipt — the sender's
+`refused: mailbox-closed`. A session `answer` whose DERIVED destination
+is a task is admitted by the same mailbox rule, with no run-state gate:
+once any prior answer to the question is resolved (a replay of an answer
+accepted before the closure stays a duplicate), a closed destination
+mailbox refuses it `refused: mailbox-closed` and nothing is inserted —
+otherwise a task could proceed past acceptance with an unconsumed
+answer. Every outcome leaves a receipt — the sender's
 CLI failure is the manager's signal, never a stranded row. SQLite serializes every
-send/close pair, so exactly one order exists: either the send lands
+send/close pair, answers included, so exactly one order exists: either the send lands
 first (a pending acceptance is refused `transient` until the worker
 drains it; a pending failure settlement records the just-landed message
 among the orphaned obligations), or the closure lands first and the send
@@ -1216,9 +1222,22 @@ the retryable nor the final line applies to them.
   --file <path>` with NO `--to`): parse and bound. Kind/address legality
   by role: workers and reviewers → `question`/`info` to `manager` only;
   the manager → `question` to `human` or `question`/`info` to `task:<id>`;
-  an `answer` is legal from ANY session answering a question addressed to
-  its own address — no `--to` legality applies, since the destination is
-  derived; `info` to `human` is refused at send — humans have no fetch or ack verb,
+  an `answer` is legal only from the session answering a question
+  addressed to its own address — no `--to` legality applies, since the
+  destination is derived. Recipient authority is checked in the accepting
+  transaction: the answering session's logical address is re-derived from
+  its own session row (never taken from the request) and must equal the
+  question's recipient, else `refused: unauthorized` with a receipt. No
+  session therefore ever answers a `human`-addressed question — only
+  `hop answer` does, and a session's answer can never bundle a human
+  question's acknowledgement — and no session answers a question
+  addressed to another task or to the manager. The check follows the
+  request-ID receipt lookup (a same-request-ID retry still resolves as
+  duplicate or conflicting first) and precedes the prior-answer
+  comparison below, so a non-recipient never reads a duplicate or
+  conflicting verdict about someone else's answer; a recipient's address
+  is lineage-stable, so its own retries are decided exactly as before.
+  `info` to `human` is refused at send — humans have no fetch or ack verb,
   so a human-addressed info could never settle (the only human-addressed
   kind is `question`, settled by its answer). An `answer`'s destination is
   never caller-chosen: it is DERIVED from the referenced question's
@@ -1235,9 +1254,14 @@ the retryable nor the final line applies to them.
   a question or info, the run-state acceptance above — `transient` while
   the run can still reach `running`, `refused: run-not-accepting` (the
   section 5 run-level closure) once it never will; and for a
-  `task:<id>` destination an OPEN mailbox — a closed one is
-  `refused: mailbox-closed` with a receipt, per the
-  section 5 closure rule); accept: body artifact written durably BEFORE the
+  `task:<id>` destination — the requested recipient of a question or
+  info, the DERIVED destination of an answer — an OPEN mailbox: a closed
+  one is `refused: mailbox-closed` with a receipt, per the section 5
+  closure rule. An answer carries no run-state gate, but its admission
+  check applies after the duplicate/conflict resolution, so an answer
+  accepted before its destination closed still replays as duplicate
+  while a first answer to a closed mailbox is refused and inserts
+  nothing); accept: body artifact written durably BEFORE the
   row's transaction (temp-file-then-rename, digest recorded), then
   envelope row (enqueue sequence assigned here) + receipt in one
   transaction. Controller info notices follow the same file-first
@@ -1274,7 +1298,14 @@ the retryable nor the final line applies to them.
   file-first protocol as Send), then the answer message row (sender
   `human`, recipient `manager`), the question's acknowledgement and the
   receipt commit in one transaction. Duplicate (equal digest) idempotent;
-  conflicting refused.
+  conflicting refused. The human is the answering address, and the
+  derived destination is always `manager` — only the manager may address
+  the human — so a human answer never enters a task mailbox: it is
+  accepted even after the relayed worker's task mailbox has closed, and
+  it is the manager's forward to that task that the closed mailbox
+  refuses. The acceptance still runs the same admission check as a
+  session answer, so the rule holds by construction rather than by the
+  addressing matrix alone.
 
 ### Exactly what is journaled
 

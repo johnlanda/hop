@@ -83,7 +83,8 @@ const (
 	GrammarReasonNotFound = "not-found"
 	// GrammarReasonUnauthorized: the caller session does not belong to the
 	// stated run, or its resolved address or incarnation disagrees with
-	// the request.
+	// the request — including an answer from a session whose address is
+	// not the question's recipient (no session answers a human question).
 	GrammarReasonUnauthorized = "unauthorized"
 	// GrammarReasonMalformed: parse or bounds failure (section 7 step 1).
 	GrammarReasonMalformed = "malformed"
@@ -101,8 +102,9 @@ const (
 	// a run that can never accept one again (completed, failed, stopping or
 	// stopped, or a stop request; run.ErrRunNotAccepting).
 	GrammarReasonRunNotAccepting = "run-not-accepting"
-	// GrammarReasonMailboxClosed: a send addressed to a task whose mailbox
-	// admission has closed.
+	// GrammarReasonMailboxClosed: a send, or an answer whose derived
+	// destination is a task, addressed to a task whose mailbox admission
+	// has closed.
 	GrammarReasonMailboxClosed = "mailbox-closed"
 	// GrammarReasonNotManager: a plan verb (task create/retry, plan close)
 	// from a session that is not the run's current manager.
