@@ -168,19 +168,21 @@ func TestRunResultSubmit(t *testing.T) {
 		})
 	}
 
-	// The assignment template's own retry instruction
-	// (internal/app/usecase_execboundary.go's renderInitialPrompt) tells
-	// the worker to retry when "the first output line begins with
-	// \"transient\"". This package cannot call that unexported function
-	// directly, but this assertion ties the two contracts together: if
-	// either retry line ever stopped satisfying the prompt's own prefix
-	// check, this fails immediately instead of the two silently drifting
-	// apart.
-	t.Run("every retry line satisfies the prompt's own retry prefix check", func(t *testing.T) {
+	// The launch prompt's retry instruction
+	// (internal/app/usecase_execboundary.go's renderInitialPrompt, pinned by
+	// internal/app's TestWorkerPromptsFollowTheTransientLine) tells the
+	// worker, when "the first output line begins with \"transient\"", to
+	// follow that line's instruction before rerunning. This package cannot
+	// call that unexported function directly, but this assertion ties the
+	// two contracts together: each retry line this command prints begins
+	// with the prompt's prefix and names its own instruction, so a worker
+	// told to drain is never told only to rerun.
+	t.Run("every retry line carries the prompt's prefix and its own instruction", func(t *testing.T) {
 		for _, reason := range []app.TransientReason{app.TransientAttemptNotRunning, app.TransientUndeliveredMessages} {
 			line, ok := app.GrammarSubmissionTransientLine(reason)
-			if !ok || !strings.HasPrefix(line, "transient") {
-				t.Fatalf("retry line for %s = %q (known %t), want one beginning with %q, which the prompt instructs the worker to check for", reason, line, ok, "transient")
+			_, instruction, named := strings.Cut(line, "; ")
+			if !ok || !strings.HasPrefix(line, "transient") || !named || instruction == "" {
+				t.Fatalf("retry line for %s = %q (known %t), want one beginning with %q and naming its instruction after \"; \"", reason, line, ok, "transient")
 			}
 		}
 	})

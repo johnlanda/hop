@@ -648,7 +648,7 @@ func TestGoldenRolePrompts(t *testing.T) {
 			renderInitialPrompt(a, hop),
 			"Read your assignment at " + a + " and complete it. " +
 				"When your work is committed, submit it by running: " + hop + " result submit --summary \"<one-line summary>\" --commit <commit-oid>. " +
-				"If the first output line begins with \"transient\", wait briefly and run the exact same command again.",
+				"If the first output line begins with \"transient\", follow its instruction, then wait briefly and run the exact same command again.",
 		},
 		{
 			"worker continuation (Phase 2, frozen for the fixture mirrors)",
@@ -656,14 +656,14 @@ func TestGoldenRolePrompts(t *testing.T) {
 			"You were relaunched after an interruption; your restored session may show earlier, unfinished work. " +
 				"Re-read your assignment at " + a + " and continue it. " +
 				"When your work is committed, submit it by running: " + hop + " result submit --summary \"<one-line summary>\" --commit <commit-oid>. " +
-				"If the first output line begins with \"transient\", wait briefly and run the exact same command again.",
+				"If the first output line begins with \"transient\", follow its instruction, then wait briefly and run the exact same command again.",
 		},
 		{
 			"reviewer initial",
 			renderReviewerInitialPrompt(a, hop),
 			"Read your review assignment at " + a + " and evaluate the frozen subject it names. " +
 				"When your review is complete, submit your verdict by running: " + hop + " review submit --verdict <approve|reject> --subject <commit-oid> --reasons-file <absolute path>. " +
-				"If the first output line begins with \"transient\", wait briefly and run the exact same command again.",
+				"If the first output line begins with \"transient\", follow its instruction, then wait briefly and run the exact same command again.",
 		},
 		{
 			"reviewer continuation",
@@ -671,7 +671,7 @@ func TestGoldenRolePrompts(t *testing.T) {
 			"You were relaunched after an interruption; your restored session may show earlier, unfinished work. " +
 				"Re-read your review assignment at " + a + " and continue it. " +
 				"When your review is complete, submit your verdict by running: " + hop + " review submit --verdict <approve|reject> --subject <commit-oid> --reasons-file <absolute path>. " +
-				"If the first output line begins with \"transient\", wait briefly and run the exact same command again.",
+				"If the first output line begins with \"transient\", follow its instruction, then wait briefly and run the exact same command again.",
 		},
 		{
 			"manager initial",
@@ -693,6 +693,35 @@ func TestGoldenRolePrompts(t *testing.T) {
 				t.Errorf("rendered:\n%s\ngolden:\n%s", tc.got, tc.want)
 			}
 		})
+	}
+}
+
+// TestWorkerPromptsFollowTheTransientLine pins the one retry sentence every
+// implementer and reviewer prompt ends with: a transient first line's own
+// instruction comes before the rerun. The submit verbs' drain line
+// (GrammarTransientUndeliveredLine) is satisfied only by draining first, so
+// a prompt that said only "rerun" would loop a worker on it forever; each
+// submit retry line therefore begins with the prefix the prompt checks and
+// names its instruction after "; ".
+func TestWorkerPromptsFollowTheTransientLine(t *testing.T) {
+	const retry = `If the first output line begins with "transient", follow its instruction, then wait briefly and run the exact same command again.`
+	prompts := map[string]string{
+		"implementer initial":      renderInitialPrompt("/a", "/hop"),
+		"implementer continuation": renderContinuationPrompt("/a", "/hop"),
+		"reviewer initial":         renderReviewerInitialPrompt("/a", "/hop"),
+		"reviewer continuation":    renderReviewerContinuationPrompt("/a", "/hop"),
+	}
+	for name, prompt := range prompts {
+		if !strings.HasSuffix(prompt, " "+retry) || strings.Count(prompt, "transient") != 1 {
+			t.Errorf("%s prompt = %q, want it to end with the one retry sentence %q", name, prompt, retry)
+		}
+	}
+	for _, reason := range []TransientReason{TransientAttemptNotRunning, TransientUndeliveredMessages} {
+		line, ok := GrammarSubmissionTransientLine(reason)
+		_, instruction, named := strings.Cut(line, "; ")
+		if !ok || !strings.HasPrefix(line, "transient") || !named || instruction == "" {
+			t.Errorf("retry line for %s = %q (known %t), want %q followed by an instruction after \"; \"", reason, line, ok, "transient")
+		}
 	}
 }
 

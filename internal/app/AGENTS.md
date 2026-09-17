@@ -617,14 +617,16 @@ sides together. `cmd/hop` never imports domain or identity types: every
   number spellings, exponents and escapes byte-identical,
   duplicate-key last-wins, escaped keys, and the
   unparsable-document error table).
-- `go test ./internal/app -run 'TestGoldenGrammar|TestGoldenRolePrompts|TestTemplatesQuoteGrammar|TestCribRetryableLinesPerVerb|TestFreezeWorkflowArtifacts'` —
+- `go test ./internal/app -run 'TestGoldenGrammar|TestGoldenRolePrompts|TestWorkerPromptsFollowTheTransientLine|TestTemplatesQuoteGrammar|TestCribRetryableLinesPerVerb|TestFreezeWorkflowArtifacts'` —
   the golden-grammar countermeasure (design section 11, L1569): every
   grammar constant and rendered line pinned against retyped golden
   literals (grammar_test.go), all six launch prompt shapes pinned
   byte-exactly — the two Phase 2 solo shapes included, since the
   test/integration fixture mirrors reproduce them, and
   test/integration's `TestRolePromptMirrors` pins the mirror side
-  against the same goldens — every template quotation of a grammar line
+  against the same goldens — the implementer and reviewer prompts'
+  one retry sentence (a transient line's own instruction, such as the
+  drain line's, comes before the rerun), every template quotation of a grammar line
   or verb asserted verbatim, each crib section's retryable lines (the
   run-not-running line under exactly task create, task retry, plan close
   and msg send), and the role-artifact freeze (copies,

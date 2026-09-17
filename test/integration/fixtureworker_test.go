@@ -1535,7 +1535,7 @@ func buildFixtureWorker(t *testing.T, artifacts *artifactDir) string {
 func testAssignmentPrompt(assignmentPath, hopPath string) string {
 	return fmt.Sprintf("Read your assignment at %s and complete it. "+
 		"When your work is committed, submit it by running: %s result submit --summary \"<one-line summary>\" --commit <commit-oid>. "+
-		"If the first output line begins with \"transient\", wait briefly and run the exact same command again.",
+		"If the first output line begins with \"transient\", follow its instruction, then wait briefly and run the exact same command again.",
 		assignmentPath, hopPath)
 }
 
@@ -1550,7 +1550,7 @@ func testContinuationPrompt(assignmentPath, hopPath string) string {
 	return fmt.Sprintf("You were relaunched after an interruption; your restored session may show earlier, unfinished work. "+
 		"Re-read your assignment at %s and continue it. "+
 		"When your work is committed, submit it by running: %s result submit --summary \"<one-line summary>\" --commit <commit-oid>. "+
-		"If the first output line begins with \"transient\", wait briefly and run the exact same command again.",
+		"If the first output line begins with \"transient\", follow its instruction, then wait briefly and run the exact same command again.",
 		assignmentPath, hopPath)
 }
 
