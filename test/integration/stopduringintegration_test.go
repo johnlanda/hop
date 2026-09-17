@@ -60,7 +60,10 @@ func jsonStringField(t *testing.T, jsonText, field string) string {
 	if err := json.Unmarshal([]byte(jsonText), &decoded); err != nil {
 		t.Fatalf("parse JSON %q: %v", jsonText, err)
 	}
-	v, _ := decoded[field].(string)
+	v, ok := decoded[field].(string)
+	if !ok {
+		return ""
+	}
 	return v
 }
 
