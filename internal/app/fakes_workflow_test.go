@@ -502,8 +502,12 @@ func (s *fakeStore) SendMessage(_ context.Context, send app.MessageSend) (app.Me
 			outcome = app.MessageOutcome{Kind: app.MessageRefused, Reason: app.GrammarReasonUnauthorized, Detail: err.Error()}
 			break
 		}
-		if rRow.value.State != run.RunRunning {
-			outcome = app.MessageOutcome{Kind: app.MessageRunNotAccept, Reason: app.GrammarReasonRunNotAccepting, Detail: "run is not accepting messages"}
+		if err := rRow.value.CanAcceptManagerVerb(); err != nil {
+			if errors.Is(err, run.ErrRunNotYetRunning) {
+				outcome = app.MessageOutcome{Kind: app.MessageTransient, Detail: app.RunNotRunningDetail(rRow.value.State)}
+				break
+			}
+			outcome = app.MessageOutcome{Kind: app.MessageRunNotAccept, Reason: fakeRunAcceptanceReason(err), Detail: "run is not accepting messages"}
 			break
 		}
 		if send.Recipient.Kind == run.AddressTask {
@@ -791,6 +795,15 @@ func (s *fakeStore) AnswerQuestion(_ context.Context, answer app.HumanAnswer) (a
 
 // --- fakeStore: app.PlanStore ---
 
+// fakeRunAcceptanceReason mirrors the SQLite adapter's runAcceptanceReason:
+// the refusal token of a final CanAcceptManagerVerb error.
+func fakeRunAcceptanceReason(err error) string {
+	if errors.Is(err, run.ErrRunNotAccepting) {
+		return app.GrammarReasonRunNotAccepting
+	}
+	return app.GrammarReasonUnauthorized
+}
+
 func (s *fakeStore) CreateTask(_ context.Context, req app.TaskCreate) (app.TaskCreated, error) { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -832,11 +845,10 @@ func (s *fakeStore) CreateTask(_ context.Context, req app.TaskCreate) (app.TaskC
 		return app.TaskCreated{Outcome: app.WorkflowMalformed, Reason: app.GrammarReasonMalformed, Detail: "unknown run"}, nil
 	}
 	if err := rRow.value.CanAcceptManagerVerb(); err != nil {
-		reason := app.GrammarReasonUnauthorized
-		if errors.Is(err, run.ErrRunNotAccepting) {
-			reason = app.GrammarReasonRunNotAccepting
+		if errors.Is(err, run.ErrRunNotYetRunning) {
+			return app.TaskCreated{Outcome: app.WorkflowTransient, Detail: app.RunNotRunningDetail(rRow.value.State)}, nil
 		}
-		return app.TaskCreated{Outcome: app.WorkflowRefused, Reason: reason, Detail: err.Error()}, nil
+		return app.TaskCreated{Outcome: app.WorkflowRefused, Reason: fakeRunAcceptanceReason(err), Detail: err.Error()}, nil
 	}
 	if req.Title == "" || len(req.Title) > app.TaskTitleLimit || req.InstructionsDigest == "" {
 		return app.TaskCreated{Outcome: app.WorkflowMalformed, Reason: app.GrammarReasonMalformed, Detail: "invalid title or instructions"}, nil
@@ -906,11 +918,10 @@ func (s *fakeStore) RequestRetry(_ context.Context, req app.RetryRequest) (app.R
 		return app.RetryAccepted{Outcome: app.WorkflowMalformed, Reason: app.GrammarReasonMalformed, Detail: "unknown run"}, nil
 	}
 	if err := rRow.value.CanAcceptManagerVerb(); err != nil {
-		reason := app.GrammarReasonUnauthorized
-		if errors.Is(err, run.ErrRunNotAccepting) {
-			reason = app.GrammarReasonRunNotAccepting
+		if errors.Is(err, run.ErrRunNotYetRunning) {
+			return app.RetryAccepted{Outcome: app.WorkflowTransient, Detail: app.RunNotRunningDetail(rRow.value.State)}, nil
 		}
-		return app.RetryAccepted{Outcome: app.WorkflowRefused, Reason: reason, Detail: err.Error()}, nil
+		return app.RetryAccepted{Outcome: app.WorkflowRefused, Reason: fakeRunAcceptanceReason(err), Detail: err.Error()}, nil
 	}
 	tRow, ok := s.Tasks[req.TaskID]
 	if !ok || tRow.value.RunID != req.RunID {
@@ -1016,15 +1027,14 @@ func (s *fakeStore) ClosePlan(_ context.Context, req app.PlanClose) (app.PlanClo
 		}
 	}
 	closed, err := rRow.value.ClosePlan(hasImplementTask, now)
-	if err != nil {
-		reason, detail := app.GrammarReasonUnauthorized, err.Error()
-		switch {
-		case errors.Is(err, run.ErrEmptyPlan):
-			reason, detail = app.GrammarReasonEmptyPlan, "plan has no implement task"
-		case errors.Is(err, run.ErrRunNotAccepting):
-			reason = app.GrammarReasonRunNotAccepting
-		}
-		return app.PlanCloseResult{Outcome: app.WorkflowRefused, Reason: reason, Detail: detail}, nil
+	switch {
+	case err == nil:
+	case errors.Is(err, run.ErrRunNotYetRunning):
+		return app.PlanCloseResult{Outcome: app.WorkflowTransient, Detail: app.RunNotRunningDetail(rRow.value.State)}, nil
+	case errors.Is(err, run.ErrEmptyPlan):
+		return app.PlanCloseResult{Outcome: app.WorkflowRefused, Reason: app.GrammarReasonEmptyPlan, Detail: "plan has no implement task"}, nil
+	default:
+		return app.PlanCloseResult{Outcome: app.WorkflowRefused, Reason: fakeRunAcceptanceReason(err), Detail: err.Error()}, nil
 	}
 	rRow.value = closed
 	rRow.revision++

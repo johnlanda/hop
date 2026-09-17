@@ -65,6 +65,12 @@ const (
 	MessageMalformed    MessageOutcomeKind = "malformed"
 	MessageRunNotAccept MessageOutcomeKind = "refused-run-not-accepting"
 	MessageMailboxClose MessageOutcomeKind = "refused-mailbox-closed"
+	// MessageTransient is an ordinary send's retryable outcome while the
+	// run is not yet running (run.ErrRunNotYetRunning): nothing was
+	// enqueued, the receipt records "transient" outside the acceptance
+	// key, and the same request may be retried. Reason is empty; cmd/hop
+	// renders GrammarTransientRunNotRunningLine.
+	MessageTransient MessageOutcomeKind = "transient"
 )
 
 // MessageOutcome is the recorded result of one send or answer. MessageID is
@@ -94,9 +100,9 @@ type MessageSend struct {
 	Sender        run.Principal
 	SenderAddress run.Address
 	// IncarnationID is the sending session's current incarnation: section
-	// 7 requires eligibility (current incarnation; run running; for a
-	// task:<id> destination, an open mailbox) before an ordinary send is
-	// accepted.
+	// 7 requires eligibility (current incarnation; the run accepting per
+	// run.Run.CanAcceptManagerVerb; for a task:<id> destination, an open
+	// mailbox) before an ordinary send is accepted.
 	IncarnationID identity.IncarnationID
 	Recipient     run.Address
 	Kind          run.MessageKind

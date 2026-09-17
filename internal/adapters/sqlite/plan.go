@@ -100,6 +100,16 @@ func requireManagerCaller(ctx context.Context, q querier, runID identity.RunID, 
 	return "", "", nil
 }
 
+// runAcceptanceReason is the refusal token of a final
+// CanAcceptManagerVerb error (run.ErrRunNotAccepting); anything else it
+// could return is unexpected and renders the generic token.
+func runAcceptanceReason(err error) string {
+	if errors.Is(err, run.ErrRunNotAccepting) {
+		return app.GrammarReasonRunNotAccepting
+	}
+	return app.GrammarReasonUnauthorized
+}
+
 // CreateTask validates title/instructions bounds and the dependency edges
 // against the persisted graph (acyclic, same run — every edge points at an
 // already-existing task, so the persisted graph stays a DAG by
@@ -107,8 +117,9 @@ func requireManagerCaller(ctx context.Context, q querier, runID identity.RunID, 
 // reference atomically, and clears the run's plan flag (ReopenPlan) in the
 // same commit. Section 8's validation order mirrors internal/app's
 // fakeStore: the request-ID receipt first, then the manager caller, the
-// current incarnation, the run's manager-verb acceptance, bounds, and the
-// dependency set.
+// current incarnation, the run's manager-verb acceptance (a run that can
+// still reach running records a transient receipt, outside the acceptance
+// key, and changes nothing), bounds, and the dependency set.
 func (s *Store) CreateTask(ctx context.Context, req app.TaskCreate) (app.TaskCreated, error) { //nolint:gocritic // hugeParam: the port passes the request value; the adapter mirrors its signature.
 	var outcome app.TaskCreated
 	err := s.inWriteTx(ctx, func(tx *sql.Tx) error {
@@ -168,11 +179,10 @@ func (s *Store) CreateTask(ctx context.Context, req app.TaskCreate) (app.TaskCre
 			return err
 		}
 		if acceptErr := runV.CanAcceptManagerVerb(); acceptErr != nil {
-			acceptReason := app.GrammarReasonUnauthorized
-			if errors.Is(acceptErr, run.ErrRunNotAccepting) {
-				acceptReason = app.GrammarReasonRunNotAccepting
+			if errors.Is(acceptErr, run.ErrRunNotYetRunning) {
+				return record(app.WorkflowTransient, "", 0, "", app.RunNotRunningDetail(runV.State))
 			}
-			return record(app.WorkflowRefused, "", 0, acceptReason, acceptErr.Error())
+			return record(app.WorkflowRefused, "", 0, runAcceptanceReason(acceptErr), acceptErr.Error())
 		}
 		if req.Title == "" || len(req.Title) > app.TaskTitleLimit || req.InstructionsDigest == "" {
 			return record(app.WorkflowMalformed, "", 0, app.GrammarReasonMalformed, "title is empty or exceeds the size bound, or the instructions digest is empty")
@@ -309,11 +319,10 @@ func (s *Store) RequestRetry(ctx context.Context, req app.RetryRequest) (app.Ret
 			return err
 		}
 		if acceptErr := runV.CanAcceptManagerVerb(); acceptErr != nil {
-			acceptReason := app.GrammarReasonUnauthorized
-			if errors.Is(acceptErr, run.ErrRunNotAccepting) {
-				acceptReason = app.GrammarReasonRunNotAccepting
+			if errors.Is(acceptErr, run.ErrRunNotYetRunning) {
+				return record(app.WorkflowTransient, "", 0, 0, "", app.RunNotRunningDetail(runV.State))
 			}
-			return record(app.WorkflowRefused, "", 0, 0, acceptReason, acceptErr.Error())
+			return record(app.WorkflowRefused, "", 0, 0, runAcceptanceReason(acceptErr), acceptErr.Error())
 		}
 		task, taskRevision, err := getTask(ctx, tx, req.TaskID)
 		if errors.Is(err, app.ErrNotFound) || (err == nil && task.RunID != req.RunID) {
@@ -420,7 +429,8 @@ func (s *Store) RequestRetry(ctx context.Context, req app.RetryRequest) (app.Ret
 }
 
 // ClosePlan sets the run's durable plan flag; a plan with zero implement
-// tasks is refused, and only a running run accepts the verb.
+// tasks is refused, and only a running run accepts the verb (transient
+// while the run can still reach running, refused once it never will).
 func (s *Store) ClosePlan(ctx context.Context, req app.PlanClose) (app.PlanCloseResult, error) {
 	var outcome app.PlanCloseResult
 	err := s.inWriteTx(ctx, func(tx *sql.Tx) error {
@@ -473,12 +483,12 @@ func (s *Store) ClosePlan(ctx context.Context, req app.PlanClose) (app.PlanClose
 		closed, closeErr := runV.ClosePlan(hasImplementTask, now)
 		switch {
 		case closeErr == nil:
+		case errors.Is(closeErr, run.ErrRunNotYetRunning):
+			return record(app.WorkflowTransient, "", app.RunNotRunningDetail(runV.State))
 		case errors.Is(closeErr, run.ErrEmptyPlan):
 			return record(app.WorkflowRefused, app.GrammarReasonEmptyPlan, "plan has no implement task")
-		case errors.Is(closeErr, run.ErrRunNotAccepting):
-			return record(app.WorkflowRefused, app.GrammarReasonRunNotAccepting, closeErr.Error())
 		default:
-			return record(app.WorkflowRefused, app.GrammarReasonUnauthorized, closeErr.Error())
+			return record(app.WorkflowRefused, runAcceptanceReason(closeErr), closeErr.Error())
 		}
 		result, err := tx.ExecContext(ctx,
 			`UPDATE runs SET plan_closed_at = ?, updated_at = ?, revision = revision + 1 WHERE id = ? AND revision = ?`,

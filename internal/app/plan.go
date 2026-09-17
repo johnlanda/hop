@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/johnlanda/hop/internal/domain/identity"
+	"github.com/johnlanda/hop/internal/domain/run"
 )
 
 // Task title/instructions bounds. The design names an explicit 64 KiB/4
@@ -27,7 +28,21 @@ const (
 	WorkflowConflicting WorkflowOutcomeKind = "conflicting"
 	WorkflowRefused     WorkflowOutcomeKind = "refused"
 	WorkflowMalformed   WorkflowOutcomeKind = "malformed"
+	// WorkflowTransient is the retryable outcome of a validated manager
+	// whose run is not yet running (run.ErrRunNotYetRunning): nothing
+	// changed, the receipt records "transient" outside the (run, verb,
+	// request ID) acceptance key, and the same request may be retried.
+	// Reason is empty; cmd/hop renders GrammarTransientRunNotRunningLine.
+	WorkflowTransient WorkflowOutcomeKind = "transient"
 )
+
+// RunNotRunningDetail is the Detail every store sets on a WorkflowTransient
+// or MessageTransient outcome: the run's state and nothing else, so the
+// stderr line cmd/hop prints never echoes an identity, a path or an
+// environment value.
+func RunNotRunningDetail(state run.RunState) string {
+	return "run is " + string(state) + ", not yet running"
+}
 
 // TaskCreate is the application-validated content of one `hop task
 // create`: identities already parsed, the instructions artifact already
@@ -113,9 +128,10 @@ type PlanCloseResult struct {
 
 // PlanStore holds the section 8 worker-authority plan writes: manager-only
 // verbs, validated by session role and current incarnation inside each
-// method's own transaction (never a controller lease), which also
-// validates the run is running (ErrRunNotAccepting otherwise) so a create
-// can never race completion. Every method accepts an optional
+// method's own transaction (never a controller lease), which then applies
+// run.Run.CanAcceptManagerVerb so a create can never race completion:
+// WorkflowTransient for a run that can still reach running, WorkflowRefused
+// with GrammarReasonRunNotAccepting for one that never will. Every method accepts an optional
 // caller-stable RequestID: an identical retry returns the original
 // outcome and entity, surviving consumption, relaunch, retirement and
 // manager succession; a reused ID with different content is refused.

@@ -394,8 +394,14 @@ func (f *fakeController) AssignReadyTasks(_ context.Context, _ app.RunHandle, op
 	}
 	// The real use case's Run.CanAcceptManagerVerb gate, checked inside the
 	// assignment transaction before any task is read: every state but
-	// running is refused, whether or not a task is ready.
-	if state := f.currentRunState(); state != runStateRunning {
+	// running is refused, whether or not a task is ready, with the
+	// retryable sentinel's text for a run that can still reach running and
+	// the final one's otherwise.
+	switch state := f.currentRunState(); state {
+	case runStateRunning:
+	case "created", "launching", "resuming", "completing":
+		return app.AssignmentReport{}, fmt.Errorf("run: run not yet running: state %s", state)
+	default:
 		return app.AssignmentReport{}, fmt.Errorf("run: run is not accepting this request: state %s", state)
 	}
 	if f.assignReadyTasks == nil {

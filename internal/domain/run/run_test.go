@@ -173,9 +173,9 @@ func TestRunRequestStopIsMonotonic(t *testing.T) {
 	}
 }
 
-// TestRunClosePlan proves ClosePlan's two guards: the run must be running
-// (ErrRunNotAccepting), and the plan must have at least one implement task
-// (ErrEmptyPlan).
+// TestRunClosePlan proves ClosePlan's two guards: the run must accept a
+// manager verb (CanAcceptManagerVerb's retryable or final refusal), and
+// the plan must have at least one implement task (ErrEmptyPlan).
 func TestRunClosePlan(t *testing.T) {
 	t.Run("running with an implement task", func(t *testing.T) {
 		r := run.Run{ID: testRunID, State: run.RunRunning}
@@ -201,16 +201,23 @@ func TestRunClosePlan(t *testing.T) {
 		}
 	})
 
-	t.Run("not running refused", func(t *testing.T) {
+	t.Run("not running refused with the acceptance check's error", func(t *testing.T) {
 		for _, from := range runStates() {
-			if from == run.RunRunning {
-				continue
-			}
-			r := run.Run{ID: testRunID, State: from}
+			for _, stop := range []bool{false, true} {
+				r := run.Run{ID: testRunID, State: from, StopRequested: stop}
+				wantErr := r.CanAcceptManagerVerb()
+				if wantErr == nil {
+					continue
+				}
 
-			_, err := r.ClosePlan(true, epoch())
-			if !errors.Is(err, run.ErrRunNotAccepting) {
-				t.Fatalf("ClosePlan from %s: error = %v, want ErrRunNotAccepting", from, err)
+				got, err := r.ClosePlan(true, epoch())
+				notYet := errors.Is(wantErr, run.ErrRunNotYetRunning)
+				if errors.Is(err, run.ErrRunNotYetRunning) != notYet || errors.Is(err, run.ErrRunNotAccepting) == notYet {
+					t.Fatalf("ClosePlan from %s (stop %v): error = %v, want the acceptance check's %v", from, stop, err, wantErr)
+				}
+				if got.PlanClosed {
+					t.Fatalf("ClosePlan from %s (stop %v): PlanClosed = true, want unchanged", from, stop)
+				}
 			}
 		}
 	})
@@ -230,22 +237,116 @@ func TestRunReopenPlan(t *testing.T) {
 	}
 }
 
+// verbAcceptance names CanAcceptManagerVerb's three outcomes for the
+// table below.
+type verbAcceptance int
+
+const (
+	verbAccepted verbAcceptance = iota
+	verbNotYet
+	verbNeverAgain
+)
+
 // TestRunCanAcceptManagerVerb proves the shared eligibility check every
-// manager verb's accepting transaction re-validates: only running.
+// manager verb and ordinary message send re-validates inside its
+// accepting transaction, for every run state with and without a stop
+// request: only running accepts; created, launching, resuming and
+// completing are ErrRunNotYetRunning (retryable); completed, failed,
+// stopping and stopped are ErrRunNotAccepting (final); and a stop request
+// makes every state final. Each want is transcribed here rather than
+// derived from the production sets.
 func TestRunCanAcceptManagerVerb(t *testing.T) {
-	for _, from := range runStates() {
-		r := run.Run{ID: testRunID, State: from}
-		err := r.CanAcceptManagerVerb()
-		if from == run.RunRunning {
-			if err != nil {
-				t.Fatalf("CanAcceptManagerVerb from %s: unexpected error: %v", from, err)
-			}
-			continue
+	cases := []struct {
+		state         run.RunState
+		stopRequested bool
+		want          verbAcceptance
+	}{
+		{run.RunCreated, false, verbNotYet},
+		{run.RunLaunching, false, verbNotYet},
+		{run.RunRunning, false, verbAccepted},
+		{run.RunResuming, false, verbNotYet},
+		{run.RunCompleting, false, verbNotYet},
+		{run.RunCompleted, false, verbNeverAgain},
+		{run.RunFailed, false, verbNeverAgain},
+		{run.RunStopping, false, verbNeverAgain},
+		{run.RunStopped, false, verbNeverAgain},
+		{run.RunCreated, true, verbNeverAgain},
+		{run.RunLaunching, true, verbNeverAgain},
+		{run.RunRunning, true, verbNeverAgain},
+		{run.RunResuming, true, verbNeverAgain},
+		{run.RunCompleting, true, verbNeverAgain},
+		{run.RunCompleted, true, verbNeverAgain},
+		{run.RunFailed, true, verbNeverAgain},
+		{run.RunStopping, true, verbNeverAgain},
+		{run.RunStopped, true, verbNeverAgain},
+	}
+	covered := map[run.RunState]int{}
+	for _, tc := range cases {
+		covered[tc.state]++
+		name := string(tc.state)
+		if tc.stopRequested {
+			name += "_stop_requested"
 		}
-		if !errors.Is(err, run.ErrRunNotAccepting) {
-			t.Fatalf("CanAcceptManagerVerb from %s: error = %v, want ErrRunNotAccepting", from, err)
+		t.Run(name, func(t *testing.T) {
+			r := run.Run{ID: testRunID, State: tc.state, StopRequested: tc.stopRequested}
+
+			err := r.CanAcceptManagerVerb()
+
+			switch tc.want {
+			case verbAccepted:
+				if err != nil {
+					t.Fatalf("CanAcceptManagerVerb: unexpected error: %v", err)
+				}
+			case verbNotYet:
+				if !errors.Is(err, run.ErrRunNotYetRunning) || errors.Is(err, run.ErrRunNotAccepting) {
+					t.Fatalf("CanAcceptManagerVerb: error = %v, want only ErrRunNotYetRunning", err)
+				}
+			case verbNeverAgain:
+				if !errors.Is(err, run.ErrRunNotAccepting) || errors.Is(err, run.ErrRunNotYetRunning) {
+					t.Fatalf("CanAcceptManagerVerb: error = %v, want only ErrRunNotAccepting", err)
+				}
+			}
+		})
+	}
+	for _, state := range runStates() {
+		if covered[state] != 2 {
+			t.Errorf("state %s has %d cases, want 2 (with and without a stop request)", state, covered[state])
 		}
 	}
+}
+
+// TestRunCanAcceptManagerVerbAcrossCompletion proves why completing is
+// retryable rather than final: a verb refused while completing is
+// accepted once a failed readiness re-validation returns the run to
+// running, and refused for good once the run completes.
+func TestRunCanAcceptManagerVerbAcrossCompletion(t *testing.T) {
+	completing, err := run.Run{ID: testRunID, State: run.RunRunning}.EnterCompleting(epoch())
+	if err != nil {
+		t.Fatalf("EnterCompleting: %v", err)
+	}
+	if err := completing.CanAcceptManagerVerb(); !errors.Is(err, run.ErrRunNotYetRunning) {
+		t.Fatalf("CanAcceptManagerVerb while completing: error = %v, want ErrRunNotYetRunning", err)
+	}
+
+	t.Run("completing then running accepts", func(t *testing.T) {
+		running, err := completing.MarkRunning(later())
+		if err != nil {
+			t.Fatalf("MarkRunning: %v", err)
+		}
+		if err := running.CanAcceptManagerVerb(); err != nil {
+			t.Fatalf("CanAcceptManagerVerb after returning to running: %v", err)
+		}
+	})
+
+	t.Run("completing then completed refuses", func(t *testing.T) {
+		completed, err := completing.Complete(later())
+		if err != nil {
+			t.Fatalf("Complete: %v", err)
+		}
+		if err := completed.CanAcceptManagerVerb(); !errors.Is(err, run.ErrRunNotAccepting) {
+			t.Fatalf("CanAcceptManagerVerb once completed: error = %v, want ErrRunNotAccepting", err)
+		}
+	})
 }
 
 func TestNewRun(t *testing.T) {
