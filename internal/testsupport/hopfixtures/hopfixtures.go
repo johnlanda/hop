@@ -519,6 +519,16 @@ func RunAttempt(ctx context.Context, store Store, lease app.Lease, attemptID str
 	})
 }
 
+// LaunchAttempt drives attemptID from its freshly reserved state to
+// launching only, with no launch claim: the early-submission window in
+// which a result or verdict is refused `transient: attempt not yet running;
+// retry` because the claim has not settled.
+func LaunchAttempt(ctx context.Context, store Store, lease app.Lease, attemptID string, now time.Time) error {
+	return withUOW(ctx, store, lease, func(uow app.UnitOfWork) error {
+		return launchAttempt(ctx, uow, attemptID, now)
+	})
+}
+
 // SeedIntegratedTask seeds one implement task (sequence seq) of managerID's
 // running feature run whose accepted result was integrated: the task
 // active with a running implementer attempt (SeedChildSession,

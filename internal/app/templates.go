@@ -120,6 +120,7 @@ func renderWorkerProtocolCrib() []byte {
 
 	b.WriteString("## hop " + GrammarVerbReviewSubmit + " (reviewer only)\n\n")
 	b.WriteString("First line: `" + GrammarVerdictAcceptedLine("<review-uuid>") + "` or `" + GrammarVerdictDuplicateLine("<review-uuid>") + "`.\n")
+	b.WriteString("Retryable: `" + GrammarTransientNotRunningLine + "` — wait briefly, rerun the same command.\n")
 	b.WriteString("Retryable: `" + GrammarTransientUndeliveredLine + "`.\n")
 	return []byte(b.String())
 }

@@ -44,13 +44,14 @@ const (
 
 // Fixed whole-line constants.
 const (
-	// GrammarTransientNotRunningLine is hop result submit's Phase 2
-	// retryable line, unchanged: the attempt is launching or relaunching
-	// with an unsettled claim.
+	// GrammarTransientNotRunningLine is the retryable line of hop result
+	// submit (Phase 2, unchanged) AND hop review submit: the attempt is
+	// launching or relaunching with an unsettled claim
+	// (TransientAttemptNotRunning).
 	GrammarTransientNotRunningLine = "transient: attempt not yet running; retry"
 	// GrammarTransientUndeliveredLine is the feature-mode retryable line
 	// of hop result submit AND hop review submit: the section 5 mailbox
-	// rule — drain before submitting.
+	// rule — drain before submitting (TransientUndeliveredMessages).
 	GrammarTransientUndeliveredLine = "transient: undelivered messages; drain with hop msg next, ack, then resubmit"
 	// GrammarTransientRunNotRunningLine is the retryable line of hop task
 	// create, hop task retry, hop plan close and hop msg send: the run is
@@ -128,6 +129,22 @@ const (
 	// the review task's frozen subject.
 	GrammarReasonSubjectMismatch = "subject-mismatch"
 )
+
+// GrammarSubmissionTransientLine renders hop result submit's and hop
+// review submit's retryable first line for a typed transient reason: the
+// one line that tells the worker what to do before rerunning. ok is false
+// for any other reason; a caller then prints no protocol line at all rather
+// than guess one.
+func GrammarSubmissionTransientLine(reason TransientReason) (line string, ok bool) {
+	switch reason {
+	case TransientAttemptNotRunning:
+		return GrammarTransientNotRunningLine, true
+	case TransientUndeliveredMessages:
+		return GrammarTransientUndeliveredLine, true
+	default:
+		return "", false
+	}
+}
 
 // GrammarRefusalLine renders a refusal's first line from one enumerated
 // reason token.

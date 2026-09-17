@@ -962,7 +962,8 @@ func (s *fakeStore) SubmitResult(_ context.Context, submission app.ResultSubmiss
 	case errors.Is(err, run.ErrConflictingResult):
 		outcome = app.SubmissionOutcome{Kind: app.SubmissionConflicting, ResultID: outcomeVal.Result.ID}
 	case errors.Is(err, run.ErrTransientNotRunning):
-		outcome = app.SubmissionOutcome{Kind: app.SubmissionTransient, Detail: "attempt not yet running; retry"}
+		reason, _ := app.TransientReasonOf(err)
+		outcome = app.SubmissionOutcome{Kind: app.SubmissionTransient, Detail: "attempt not yet running; retry", Transient: reason}
 	default:
 		outcome = app.SubmissionOutcome{Kind: app.SubmissionStale, Detail: err.Error()}
 	}

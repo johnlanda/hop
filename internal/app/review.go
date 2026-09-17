@@ -46,11 +46,13 @@ type ReviewSubmission struct {
 }
 
 // ReviewOutcome is the recorded result of one review submission. ReviewID
-// is set for Accepted and Duplicate.
+// is set for Accepted and Duplicate. Transient is set exactly when Kind is
+// ReviewTransient (TransientReasonOf the AcceptVerdict error).
 type ReviewOutcome struct {
-	Kind     ReviewOutcomeKind
-	ReviewID identity.ReviewID
-	Detail   string
+	Kind      ReviewOutcomeKind
+	ReviewID  identity.ReviewID
+	Detail    string
+	Transient TransientReason
 }
 
 // ReviewStore holds the section 8 worker-authority review write: one

@@ -13,18 +13,6 @@ import (
 // defaultSubmitTimeout bounds one hop result submit invocation.
 const defaultSubmitTimeout = 30 * time.Second
 
-// transientRetrySignal is section 7's fixed worker-facing retry protocol:
-// hop result submit's first stdout line for a transient outcome is this
-// exact text, regardless of the store's own Detail. The assignment
-// template's retry instruction (internal/app/usecase_execboundary.go's
-// renderInitialPrompt) tells the worker to retry when the first output
-// line begins with "transient", so this constant IS that parsed
-// contract — quoted from the one grammar constant set (internal/app's
-// grammar.go) so the CLI cannot drift from it silently. The store's
-// Detail is diagnostic evidence, printed to stderr instead, never part of
-// the protocol line.
-const transientRetrySignal = app.GrammarTransientNotRunningLine
-
 // runResult dispatches the `hop result` subcommands; submit is the only
 // one.
 func runResult(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
@@ -43,9 +31,10 @@ func runResult(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 // are handed to the application verbatim, whose section 7 step 1 records
 // an invalid submission as `malformed` through the protocol; the command
 // never pre-judges a value. The submission outcome is printed as the
-// first output line: the fixed transientRetrySignal for `transient`
-// (never the store's own Detail text, which goes to stderr instead), and
-// the outcome kind plus its own detail for everything else. Exit 0 for
+// first output line: for `transient`, exactly the grammar line its typed
+// reason selects (app.GrammarSubmissionTransientLine — never inferred from
+// the store's own Detail text, which goes to stderr instead), and the
+// outcome kind plus its own detail for everything else. Exit 0 for
 // accepted and duplicate; 1 for transient, stale, conflicting and
 // malformed; 2 on usage.
 func runResultSubmit(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
@@ -113,7 +102,15 @@ func runResultSubmit(args []string, stdout, stderr io.Writer, d *deps) (int, err
 		_, werr := fmt.Fprintf(stderr, "hop result submit: %v\n", err)
 		return exitFailure, werr
 	}
-	if _, err := fmt.Fprintln(stdout, submissionLine(&result)); err != nil {
+	line, ok := submissionLine(&result)
+	if !ok {
+		// A transient outcome whose reason names no grammar line gets no
+		// protocol line at all: a guessed retry line could send the worker
+		// into a loop the real condition never ends.
+		_, werr := fmt.Fprintln(stderr, "hop result submit: transient outcome names no known retry reason")
+		return exitFailure, werr
+	}
+	if _, err := fmt.Fprintln(stdout, line); err != nil {
 		return exitFailure, err
 	}
 	if result.Kind == string(app.SubmissionTransient) && result.Detail != "" {
@@ -133,22 +130,23 @@ func runResultSubmit(args []string, stdout, stderr io.Writer, d *deps) (int, err
 }
 
 // submissionLine renders one submission outcome as the command's first
-// output line. A transient outcome's line is always transientRetrySignal,
-// the fixed section 7 protocol text — never the store's own Detail, which
-// is diagnostic evidence the caller prints separately to stderr, not part
-// of the line a worker parses by prefix. Accepted and duplicate name the
-// result id; every other outcome embeds its own Detail directly in the
-// line.
-func submissionLine(result *app.SubmitResultResult) string {
+// output line. A transient outcome's line is the section 7 retry line its
+// typed reason selects — the not-running line (rerun after a short delay)
+// or the undelivered-messages line (drain, then resubmit) — never the
+// store's own Detail, which is diagnostic evidence the caller prints
+// separately to stderr; ok is false for a transient outcome with no known
+// reason. Accepted and duplicate name the result id; every other outcome
+// embeds its own Detail directly in the line.
+func submissionLine(result *app.SubmitResultResult) (line string, ok bool) {
 	switch result.Kind {
 	case string(app.SubmissionTransient):
-		return transientRetrySignal
+		return app.GrammarSubmissionTransientLine(app.TransientReason(result.TransientReason))
 	case string(app.SubmissionAccepted), string(app.SubmissionDuplicate):
-		return result.Kind + " " + result.ResultID
+		return result.Kind + " " + result.ResultID, true
 	default:
 		if result.Detail != "" {
-			return result.Kind + ": " + result.Detail
+			return result.Kind + ": " + result.Detail, true
 		}
-		return result.Kind
+		return result.Kind, true
 	}
 }

@@ -136,8 +136,10 @@ func (s *Store) SubmitResult(ctx context.Context, submission app.ResultSubmissio
 				return mailboxErr
 			}
 			if !boxClear {
+				// The mailbox rule is decided here, before AcceptResult, so
+				// its typed reason is set at this decision point.
 				const detail = "transient: undelivered messages; drain with hop msg next, ack, then resubmit"
-				outcome = app.SubmissionOutcome{Kind: app.SubmissionTransient, Detail: detail}
+				outcome = app.SubmissionOutcome{Kind: app.SubmissionTransient, Detail: detail, Transient: app.TransientUndeliveredMessages}
 				return insertReceipt(ctx, tx, submissionReceipt(&submission, app.SubmissionTransient, "", detail), now)
 			}
 		}
@@ -169,7 +171,8 @@ func (s *Store) SubmitResult(ctx context.Context, submission app.ResultSubmissio
 			outcome = app.SubmissionOutcome{Kind: app.SubmissionStale, Detail: err.Error()}
 			return insertReceipt(ctx, tx, submissionReceipt(&submission, app.SubmissionStale, "", err.Error()), now)
 		case errors.Is(err, run.ErrTransientNotRunning):
-			outcome = app.SubmissionOutcome{Kind: app.SubmissionTransient, Detail: err.Error()}
+			reason, _ := app.TransientReasonOf(err)
+			outcome = app.SubmissionOutcome{Kind: app.SubmissionTransient, Detail: err.Error(), Transient: reason}
 			return insertReceipt(ctx, tx, submissionReceipt(&submission, app.SubmissionTransient, "", err.Error()), now)
 		default:
 			return fmt.Errorf("sqlite: acceptance decision: %w", err)

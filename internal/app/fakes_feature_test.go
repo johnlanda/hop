@@ -30,7 +30,10 @@ func (s *featureStore) SubmitResult(ctx context.Context, submission app.ResultSu
 	s.mu.Unlock()
 
 	if !hasPrior && mailboxPending {
-		outcome := app.SubmissionOutcome{Kind: app.SubmissionTransient, Detail: "transient: undelivered messages; drain with hop msg next, ack, then resubmit"}
+		outcome := app.SubmissionOutcome{
+			Kind: app.SubmissionTransient, Detail: "transient: undelivered messages; drain with hop msg next, ack, then resubmit",
+			Transient: app.TransientUndeliveredMessages,
+		}
 		s.mu.Lock()
 		s.Submissions = append(s.Submissions, outcome)
 		s.mu.Unlock()

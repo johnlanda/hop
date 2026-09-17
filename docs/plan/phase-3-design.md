@@ -1340,7 +1340,7 @@ parsing those same lines (section 11):
 
 | Verb | First line on success | First line on retryable non-success |
 | --- | --- | --- |
-| `hop result submit` | `accepted <result-uuid>` / `duplicate <result-uuid>` | `transient: attempt not yet running; retry` (Phase 2, unchanged); feature mode adds `transient: undelivered messages; drain with hop msg next, ack, then resubmit` (the section 5 mailbox rule; also the retryable line of `hop review submit`) |
+| `hop result submit` | `accepted <result-uuid>` / `duplicate <result-uuid>` | `transient: attempt not yet running; retry` (Phase 2, unchanged: the attempt's launch claim has not settled); feature mode adds `transient: undelivered messages; drain with hop msg next, ack, then resubmit` (the section 5 mailbox rule) |
 | `hop msg next` | `message <uuid> kind=<kind> from=<principal>[ reply-to=<uuid>][ relay-of=<uuid>][ origin=<uuid>]` then `body: <abs path>` then `ack: hop msg ack <uuid>` — `origin` appears on an `answer` whose reply-to question carries relay provenance: the store resolves reply-to → relayed_from server-side and prints the ORIGINAL question's ID, so a restarted manager forwards a human answer using only the envelope, no store spelunking | `none: no queued message` |
 | `hop msg wait` | as `next` | `none: no message within <timeout>; run hop msg wait again` |
 | `hop msg show <uuid>` | `message <uuid> kind=<kind> from=<principal> to=<address>[ reply-to=<uuid>][ relay-of=<uuid>] seq=<n>` then `body: <abs path>` then one `delivered: <session> <time>` line per delivery and `acknowledged: <time>` when acked — a READ-ONLY same-run envelope lookup (any of the run's sessions, or the human context), the historical recovery surface for relay chains and audits; it writes nothing, delivers nothing and never substitutes for `next` | `refused: not-found` |
@@ -1349,11 +1349,19 @@ parsing those same lines (section 11):
 | `hop task create` | `task <uuid> t<seq> created` / `duplicate <uuid> t<seq>` (request-ID retry) | `transient: run not yet running; retry` (run-state acceptance above) |
 | `hop task retry` | `retry accepted t<seq> attempt <n>` / `duplicate t<seq> attempt <n>` | `transient: run not yet running; retry` (run-state acceptance above) |
 | `hop plan close` | `plan closed` / `duplicate plan closed` | `transient: run not yet running; retry` (run-state acceptance above) |
-| `hop review submit` | `verdict accepted <review-uuid>` / `duplicate <review-uuid>` | — |
+| `hop review submit` | `verdict accepted <review-uuid>` / `duplicate <review-uuid>` | the same two lines as `hop result submit`: `transient: attempt not yet running; retry` (the review attempt's launch claim has not settled — checked before the mailbox) or `transient: undelivered messages; drain with hop msg next, ack, then resubmit` (the section 5 mailbox rule) |
 
 Refusals exit 1 with one first line `refused: <reason-token>` and detail
 lines after; reason tokens are enumerated in the same grammar constant
-set. A retryable first line (`transient: …`) also exits 1. It is the only
+set. A retryable first line (`transient: …`) also exits 1. The two submit
+verbs each have two retryable lines that demand different actions (rerun
+after a short delay, or drain first), so their store outcome carries a
+TYPED transient reason — attempt-not-running or undelivered-messages, set
+where the store decides — and the CLI prints exactly the line that reason
+selects, never inferring it from detail text; a transient outcome naming
+no known reason is an error and prints no protocol line. A worker that
+could not tell the two apart would retry an undrained submission
+forever. It is the only
 stdout line, any detail goes to stderr, nothing changed, and the caller
 reruns the same command (same `--request-id`) after a short delay. The assignment and role templates quote these lines verbatim from the
 same constants, so template, CLI and fixture can never drift apart

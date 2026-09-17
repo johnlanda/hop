@@ -25,9 +25,11 @@ func runReview(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 
 // runReviewSubmit implements `hop review submit` (design section 8):
 // reviewer-only, identities from HOP_* env, the reasons body read from
-// --reasons-file before any store call. Retryable:
+// --reasons-file before any store call. Retryable, by the outcome's typed
+// reason exactly like hop result submit: GrammarTransientNotRunningLine
+// (the review attempt's launch claim has not settled) or
 // GrammarTransientUndeliveredLine (the reviewer's mailbox must drain
-// first, exactly like hop result submit's own transient protocol).
+// first).
 func runReviewSubmit(args []string, stdout, stderr io.Writer, d *deps) (int, error) {
 	diagnostics := &recordingWriter{w: stderr}
 	flags := flag.NewFlagSet("hop review submit", flag.ContinueOnError)
@@ -84,13 +86,19 @@ func runReviewSubmit(args []string, stdout, stderr io.Writer, d *deps) (int, err
 }
 
 // writeReviewResultAndExit renders SubmitReviewResult per the grammar: a
-// transient outcome is always the fixed retry line on its own (the
-// store's own Detail, if any, goes to stderr, mirroring hop result
-// submit's identical convention), accepted/duplicate name the review,
-// and everything else is a refusal.
+// transient outcome is exactly the retry line its typed reason selects,
+// on its own (the store's own Detail, if any, goes to stderr, mirroring
+// hop result submit's identical convention; a transient outcome naming no
+// known reason prints no protocol line and fails), accepted/duplicate
+// name the review, and everything else is a refusal.
 func writeReviewResultAndExit(stdout, stderr io.Writer, result *app.SubmitReviewResult) (int, error) {
-	if result.Outcome == "transient" {
-		if _, err := fmt.Fprintln(stdout, app.GrammarTransientUndeliveredLine); err != nil {
+	if result.Outcome == string(app.ReviewTransient) {
+		line, ok := app.GrammarSubmissionTransientLine(app.TransientReason(result.TransientReason))
+		if !ok {
+			_, err := fmt.Fprintln(stderr, "hop review submit: transient outcome names no known retry reason")
+			return exitFailure, err
+		}
+		if _, err := fmt.Fprintln(stdout, line); err != nil {
 			return exitFailure, err
 		}
 		if result.Detail != "" {

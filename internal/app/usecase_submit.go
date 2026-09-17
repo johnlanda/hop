@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"unicode/utf8"
 
@@ -25,12 +26,15 @@ type SubmitResultRequest struct {
 
 // SubmitResultResult is what hop result submit reports: Kind is one of the
 // SubmissionOutcomeKind values as a string, for the caller's exit-code and
-// message decision. Detail carries the required first-line transient
-// message verbatim when Kind is "transient".
+// message decision. TransientReason is one of the TransientReason values
+// as a string, set exactly when Kind is "transient": it alone selects the
+// worker-facing retry line (GrammarSubmissionTransientLine). Detail is the
+// store's diagnostic evidence, never the protocol line.
 type SubmitResultResult struct {
-	Kind     string
-	ResultID string
-	Detail   string
+	Kind            string
+	ResultID        string
+	Detail          string
+	TransientReason string
 }
 
 // SubmitResult performs section 7 step 1 (parse and bound the inputs) here,
@@ -82,7 +86,7 @@ func (c *Controller) SubmitResult(ctx context.Context, req SubmitResultRequest) 
 	if err != nil {
 		return SubmitResultResult{}, fmt.Errorf("app: submit result: %w", err)
 	}
-	return toSubmitResultResult(outcome), nil
+	return toSubmitResultResult(outcome)
 }
 
 // recordMalformed reports one section 7 step 1 failure through
@@ -94,11 +98,40 @@ func (c *Controller) recordMalformed(ctx context.Context, claimed ClaimedSubmiss
 	if err != nil {
 		return SubmitResultResult{}, fmt.Errorf("app: record malformed submission: %w", err)
 	}
-	return toSubmitResultResult(outcome), nil
+	return toSubmitResultResult(outcome)
 }
 
-func toSubmitResultResult(outcome SubmissionOutcome) SubmitResultResult {
-	return SubmitResultResult{Kind: string(outcome.Kind), ResultID: outcome.ResultID.String(), Detail: outcome.Detail}
+// toSubmitResultResult converts a store outcome, refusing a transient
+// outcome that names no known reason: the worker's retry line cannot be
+// chosen without one, and guessing it is how a worker retries forever
+// without draining.
+func toSubmitResultResult(outcome SubmissionOutcome) (SubmitResultResult, error) {
+	if err := checkTransientReason(outcome.Kind == SubmissionTransient, outcome.Transient); err != nil {
+		return SubmitResultResult{}, fmt.Errorf("app: submit result: %w", err)
+	}
+	return SubmitResultResult{
+		Kind: string(outcome.Kind), ResultID: outcome.ResultID.String(), Detail: outcome.Detail,
+		TransientReason: string(outcome.Transient),
+	}, nil
+}
+
+// ErrTransientReasonInvalid reports a store outcome whose transient reason
+// does not match its kind: a transient outcome with no known
+// TransientReason, or a reason on a non-transient outcome.
+var ErrTransientReasonInvalid = errors.New("app: transient outcome reason does not match its kind")
+
+// checkTransientReason enforces the store contract that reason is a known
+// TransientReason exactly when the outcome is transient.
+func checkTransientReason(transient bool, reason TransientReason) error {
+	_, known := GrammarSubmissionTransientLine(reason)
+	switch {
+	case transient && !known:
+		return fmt.Errorf("%w: transient outcome with reason %q", ErrTransientReasonInvalid, reason)
+	case !transient && reason != "":
+		return fmt.Errorf("%w: non-transient outcome with reason %q", ErrTransientReasonInvalid, reason)
+	default:
+		return nil
+	}
 }
 
 // isCommitObjectID reports whether s is a full 40-hex lowercase commit

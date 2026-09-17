@@ -34,11 +34,15 @@ type SubmitReviewRequest struct {
 	ReasonsBody []byte
 }
 
-// SubmitReviewResult is SubmitReviewVerdict's outcome.
+// SubmitReviewResult is SubmitReviewVerdict's outcome. TransientReason is
+// one of the TransientReason values as a string, set exactly when Outcome
+// is "transient": it alone selects the reviewer's retry line
+// (GrammarSubmissionTransientLine); Detail is diagnostic evidence.
 type SubmitReviewResult struct {
-	Outcome  string
-	ReviewID string
-	Detail   string
+	Outcome         string
+	ReviewID        string
+	Detail          string
+	TransientReason string
 }
 
 // SubmitReviewVerdict is the driving use case behind `hop review submit`
@@ -115,5 +119,11 @@ func (c *Controller) SubmitReviewVerdict(ctx context.Context, req SubmitReviewRe
 	if err != nil {
 		return SubmitReviewResult{}, fmt.Errorf("app: submit review: %w", err)
 	}
-	return SubmitReviewResult{Outcome: string(outcome.Kind), ReviewID: outcome.ReviewID.String(), Detail: outcome.Detail}, nil
+	if err := checkTransientReason(outcome.Kind == ReviewTransient, outcome.Transient); err != nil {
+		return SubmitReviewResult{}, fmt.Errorf("app: submit review: %w", err)
+	}
+	return SubmitReviewResult{
+		Outcome: string(outcome.Kind), ReviewID: outcome.ReviewID.String(), Detail: outcome.Detail,
+		TransientReason: string(outcome.Transient),
+	}, nil
 }

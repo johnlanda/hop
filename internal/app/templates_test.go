@@ -45,7 +45,10 @@ func (a *tmplArtifacts) ReadArtifact(_ context.Context, path string) ([]byte, er
 // TestCribRetryableLinesPerVerb pins which crib sections list which
 // retryable first line: the run-not-running line under exactly the verbs
 // whose accepting transaction checks the run state (task create, task
-// retry, plan close, msg send), and nowhere else.
+// retry, plan close, msg send), and nowhere else; the attempt-not-running
+// and undelivered-messages lines, byte-identical to the grammar
+// constants, under exactly the two submit verbs whose typed transient
+// reason selects between them.
 func TestCribRetryableLinesPerVerb(t *testing.T) {
 	sections := map[string]string{}
 	for _, part := range strings.Split(string(renderWorkerProtocolCrib()), "\n## hop ")[1:] {
@@ -62,7 +65,7 @@ func TestCribRetryableLinesPerVerb(t *testing.T) {
 		GrammarVerbTaskCreate + " (manager only)":           {retryable(GrammarTransientRunNotRunningLine)},
 		GrammarVerbTaskRetry + " (manager only)":            {retryable(GrammarTransientRunNotRunningLine)},
 		GrammarVerbPlanClose + " (manager only)":            {retryable(GrammarTransientRunNotRunningLine)},
-		GrammarVerbReviewSubmit + " (reviewer only)":        {retryable(GrammarTransientUndeliveredLine)},
+		GrammarVerbReviewSubmit + " (reviewer only)":        {retryable(GrammarTransientNotRunningLine), retryable(GrammarTransientUndeliveredLine)},
 	}
 	if len(sections) != len(want) {
 		t.Fatalf("crib sections = %d, want %d", len(sections), len(want))
@@ -82,6 +85,17 @@ func TestCribRetryableLinesPerVerb(t *testing.T) {
 		}
 		if strings.Join(got, "\n") != strings.Join(lines, "\n") {
 			t.Errorf("section %q retryable lines = %q, want %q", heading, got, lines)
+		}
+	}
+
+	// hop result submit and hop review submit print the same two retry
+	// lines for the same two typed reasons, so a worker reads the same
+	// whole crib line, instruction included, under either verb.
+	submitRetryable := "Retryable: `" + GrammarTransientNotRunningLine + "` — wait briefly, rerun the same command.\n" +
+		"Retryable: `" + GrammarTransientUndeliveredLine + "`.\n"
+	for _, heading := range []string{GrammarVerbResultSubmit, GrammarVerbReviewSubmit + " (reviewer only)"} {
+		if !strings.Contains(sections[heading], submitRetryable) {
+			t.Errorf("section %q = %q, want the retry lines %q verbatim", heading, sections[heading], submitRetryable)
 		}
 	}
 }

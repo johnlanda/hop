@@ -147,7 +147,11 @@ func (s *Store) SubmitReview(ctx context.Context, submission app.ReviewSubmissio
 		case errors.Is(err, run.ErrConflictingResult):
 			return record(app.ReviewConflicting, outcomeVal.Review.ID, err.Error())
 		case errors.Is(err, run.ErrTransientNotRunning), errors.Is(err, run.ErrMailboxNotClear):
-			return record(app.ReviewTransient, "", err.Error())
+			if recordErr := record(app.ReviewTransient, "", err.Error()); recordErr != nil {
+				return recordErr
+			}
+			outcome.Transient, _ = app.TransientReasonOf(err)
+			return nil
 		default:
 			return record(app.ReviewStale, "", err.Error())
 		}

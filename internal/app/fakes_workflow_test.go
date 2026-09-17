@@ -1113,7 +1113,8 @@ func (s *fakeStore) SubmitReview(_ context.Context, submission app.ReviewSubmiss
 	case errors.Is(err, run.ErrConflictingResult):
 		return app.ReviewOutcome{Kind: app.ReviewConflicting, ReviewID: outcomeVal.Review.ID}, nil
 	case errors.Is(err, run.ErrTransientNotRunning), errors.Is(err, run.ErrMailboxNotClear):
-		return app.ReviewOutcome{Kind: app.ReviewTransient, Detail: err.Error()}, nil
+		reason, _ := app.TransientReasonOf(err)
+		return app.ReviewOutcome{Kind: app.ReviewTransient, Detail: err.Error(), Transient: reason}, nil
 	default:
 		return app.ReviewOutcome{Kind: app.ReviewStale, Detail: err.Error()}, nil
 	}
