@@ -1295,7 +1295,15 @@ the pane's own command and can claim before the controller records the
 outcome leaves exactly this state. A live principal in it — manager or
 child — is therefore never refused `stale` for the missing binding; its
 verbs proceed normally, the run-state acceptance below still applying
-(`transient` while the run can still reach `running`). The change reaches
+(`transient` while the run can still reach `running`). For a child whose
+attempt is still launching behind an `exec_pending` claim (LAUNCH-7,
+pinned on both stores), that means: `hop result submit` and
+`hop review submit` print `transient: attempt not yet running; retry`
+whether or not a message is queued to the task (section 5's one
+acceptance order), a queued message is served, and an ack is accepted
+after the session's own fetch and `not-delivered` before it; with a
+pending intent naming another incarnation, or none at all, the same
+caller is `stale` for both submissions and its fetch is refused. The change reaches
 the Phase 2 solo result submission too: a solo worker submitting before
 its binding is recorded is `transient`, the currency its own claim
 already had. The intent source is `pending` only, the claim's own: a

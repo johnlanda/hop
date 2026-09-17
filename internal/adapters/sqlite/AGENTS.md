@@ -333,7 +333,18 @@ this package never resolves environment variables or defaults.
   repeat is then a duplicate —
   `TestManagerMessagingRequiresAManagerSessionThatHasNotEnded` — a
   terminated manager whose binding is still current is refused fetch and
-  ack, and its successor manager is re-served and acks); the raced contracts across
+  ack, and its successor manager is re-served and acks); the pre-binding
+  launch window (`prebinding_window_test.go`, LAUNCH-7: a child whose
+  attempt and session are launching with no binding row, under an
+  agreeing, a disagreeing or an absent pending intent, each with and
+  without a message queued to the task —
+  `TestPreBindingWindowResultAndMessaging`: agreeing, the result is
+  attempt-not-running before and after the drain, the fetch serves the
+  message, an ack before it is not-delivered and after it accepted;
+  disagreeing or absent, the result is stale, the fetch refused as not
+  current and an ack of a message delivered to that incarnation stale —
+  `TestPreBindingWindowReviewSubmit`: the verdict attempt-not-running
+  with an agreeing intent and stale otherwise, with no review row); the raced contracts across
   separate handles (`TestFetchFetchRaced` — one serialized in-flight
   message, a delivery row per serve — `TestAckAckRaced`,
   `TestAnswerAnswerRaced`, `TestRequestIDReuseRaced`,

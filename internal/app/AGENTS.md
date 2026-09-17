@@ -1010,6 +1010,12 @@ sides together. `cmd/hop` never imports domain or identity types: every
     session's own attempt and its task's highest-numbered attempt; no
     attempt row read for the manager), in the real store's place, with
     `fakeAddressSessionRefusal`'s identical detail.
+  - `go test ./internal/app -run 'TestFakePreBindingWindowResultAndMessaging|TestFakePreBindingWindowReviewSubmit'` —
+    `fakes_prebinding_window_test.go`, the fake half of the sqlite
+    adapter's `prebinding_window_test.go` (LAUNCH-7), shape for shape: the
+    launch window before the binding row, its claim written through the
+    fake's own `ClaimLaunch` under an agreeing or disagreeing pending
+    intent, or no intent at all.
   - `go test ./internal/app -run TestStatus` — the presentation/status
     integration: the feature-mode task table (seq, kind, state,
     dependencies, attempt count); the run's most recently created
