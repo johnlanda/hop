@@ -422,6 +422,23 @@ func commitChange(message string) string {
 	return strings.TrimSpace(runGit("rev-parse", "HEAD^{commit}"))
 }
 
+// commitConflictingChange writes content to a FIXED, shared filename
+// (fixture-conflict.txt) and commits it — unlike commitChange's own
+// unique-per-call filename, this path is deliberately the SAME across
+// every attempt that uses it, so two independent tasks writing DIFFERENT
+// content to it (each from its own worktree, branched from the same
+// integration head) produce a genuine git merge conflict once both reach
+// integration, rather than two disjoint files that merge cleanly no
+// matter the timing.
+func commitConflictingChange(content string) string {
+	if err := os.WriteFile("fixture-conflict.txt", []byte(content+"\n"), 0o644); err != nil {
+		fatalf("write conflicting change: %v", err)
+	}
+	runGit("add", "-A")
+	runGit("commit", "-m", "conflicting change: "+content)
+	return strings.TrimSpace(runGit("rev-parse", "HEAD^{commit}"))
+}
+
 func runGit(args ...string) string {
 	cmd := exec.Command("git", args...)
 	out, err := cmd.CombinedOutput()
@@ -834,6 +851,16 @@ func runWorker() {
 		oid := commitChange("fixture implementer change")
 		drainMailbox(hopPath)
 		submitOnce(hopPath, oid, "fixture implementer result")
+	case "worker-conflict":
+		// The manager's own directive rendering always appends the scratch
+		// directory as this behavior's one argument (requireScratchDir), so
+		// there is no room for a second, caller-chosen argument here; the
+		// task's own id is already unique per task and needs no plumbing —
+		// exactly the distinguishing content two independent conflicting
+		// tasks need.
+		oid := commitConflictingChange(env["HOP_TASK_ID"])
+		drainMailbox(hopPath)
+		submitOnce(hopPath, oid, "fixture implementer result (conflict "+env["HOP_TASK_ID"]+")")
 	case "worker-hold":
 		oid := commitChange("fixture implementer change (held)")
 		questionPath := filepath.Join(scratchDir, "hold-question-"+env["HOP_ATTEMPT_ID"]+".txt")
@@ -883,6 +910,7 @@ func cmp(role, fallback string) string {
 var scratchDirRequiringBehaviors = map[string]bool{
 	"worker-implement":     true,
 	"worker-hold":          true,
+	"worker-conflict":      true,
 	"manager-feature":      true,
 	"reviewer-approve":     true,
 	"reviewer-reject-once": true,
