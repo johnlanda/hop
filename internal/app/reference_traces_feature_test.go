@@ -386,7 +386,7 @@ func TestFeatureTraceDuplicateAndAmbiguousDelivery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse incarnation id: %v", err)
 	}
-	tc.Store.Bindings[successorID] = append(tc.Store.Bindings[successorID], run.NewRuntimeBinding(successorID, newIncarnation, "", "peer-pid:1", "ws-w", "tab-w", "pane-w2", "label-w2", run.LaunchResume, tc.Clock.Now()))
+	tc.Store.Bindings[successorID] = append(tc.Store.Bindings[successorID], run.NewRuntimeBinding(successorID, newIncarnation, "", fakeServerToken(1), "ws-w", "tab-w", "pane-w2", "label-w2", run.LaunchResume, tc.Clock.Now()))
 
 	// The new worker's fetch re-serves the SAME m1: a second delivery row.
 	reserved, ok, err := tc.Store.FetchNextMessage(ctx, app.MessageFetch{

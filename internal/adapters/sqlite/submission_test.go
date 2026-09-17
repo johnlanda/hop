@@ -624,29 +624,31 @@ func TestClaimLaunch(t *testing.T) {
 		}
 	})
 
-	t.Run("binding decides once it exists even against a differing intent", func(t *testing.T) {
+	t.Run("a binding and a differing pending intent fail closed", func(t *testing.T) {
 		f := newFixture(t)
 		f.launchAttempt(t)
 		f.createBinding(t)
 		other := identity.IncarnationID(uid(6206))
 		f.createLaunchIntent(t, f.spec.SessionID, other)
 
-		err := f.store.ClaimLaunch(t.Context(), app.LaunchClaim{
-			IncarnationID: other,
-			RunID:         f.spec.RunID,
-			AttemptID:     f.spec.AttemptID,
-			Executable:    "/opt/harness/claude",
-			ArgvDigest:    "argv-digest",
-			PID:           fixturePID,
-		})
-		if err == nil {
-			t.Fatal("the intent fallback overrode an existing current binding")
+		// The intent fallback never overrides an existing current binding,
+		// and the disagreement retires the binding's own incarnation too:
+		// the launch context refuses exactly this state.
+		for _, incarnation := range []identity.IncarnationID{other, f.spec.IncarnationID} {
+			err := f.store.ClaimLaunch(t.Context(), app.LaunchClaim{
+				IncarnationID: incarnation,
+				RunID:         f.spec.RunID,
+				AttemptID:     f.spec.AttemptID,
+				Executable:    "/opt/harness/claude",
+				ArgvDigest:    "argv-digest",
+				PID:           fixturePID,
+			})
+			if err == nil || !strings.Contains(err.Error(), "current identity") {
+				t.Fatalf("ClaimLaunch(%s) under a disagreeing binding and intent = %v; want the currency refusal", incarnation, err)
+			}
 		}
-
-		f.claimLaunch(t)
-
-		if n := countRows(t, f.store, `SELECT COUNT(*) FROM launch_claims WHERE incarnation_id = ?`, f.spec.IncarnationID.String()); n != 1 {
-			t.Fatalf("claims for the binding's incarnation = %d, want 1", n)
+		if n := countRows(t, f.store, `SELECT COUNT(*) FROM launch_claims WHERE run_id = ?`, f.spec.RunID.String()); n != 0 {
+			t.Fatalf("claims after the refusals = %d, want 0", n)
 		}
 	})
 

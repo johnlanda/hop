@@ -503,43 +503,65 @@ func getLaunchClaim(ctx context.Context, q querier, incarnationID identity.Incar
 }
 
 // incarnationCurrent reports whether incarnationID is the attempt's current
-// identity: the attempt has a non-terminated session whose current
-// (non-superseded) binding carries exactly this incarnation.
+// identity: the attempt's non-terminated session holds it under the one
+// principal-incarnation rule (sessionIncarnationCurrent).
 func incarnationCurrent(ctx context.Context, q querier, attemptID identity.AttemptID, incarnationID identity.IncarnationID) (bool, error) {
 	session, _, ok, err := currentSession(ctx, q, attemptID)
 	if err != nil || !ok {
 		return false, err
 	}
-	binding, ok, err := currentBinding(ctx, q, session.ID)
-	if err != nil || !ok {
-		return false, err
-	}
-	return binding.IncarnationID == incarnationID, nil
+	return sessionIncarnationCurrent(ctx, q, session.ID, incarnationID)
 }
 
-// sessionIncarnationCurrent decides the session-keyed launch currency rule
-// (docs/plan/phase-3-design.md section 4's re-keying), which must also
-// work in the window before the controller records the binding row: the
-// launcher is the pane's own command and can claim first. The incarnation
-// is current for sessionID iff (a) the session's current binding carries
-// exactly this incarnation, or (b) no binding row exists yet for the
-// session — a superseded row without a successor retires the incarnation,
-// so any row at all disables the fallback — and the SESSION's newest
-// pending launch operation (kind pane.open or launch.send) carries the
-// claim's incarnation in its intent JSON under the documented
-// "incarnation_id" key, matched to the session by the "session_id" key the
-// controller commits before dispatching the pane request. Keying the
-// intent lookup to the claimed session (never the run's newest pending
-// launch) is what lets two concurrently pending launches validate
-// independently: another session's later intent can no longer invalidate
-// this session's own (B2).
+// sessionIncarnationCurrent is the one principal-incarnation currency rule
+// (docs/plan/phase-3-design.md section 7). Every worker-authority write
+// that validates its caller's incarnation decides through it: ClaimLaunch,
+// the plan verbs, message send, fetch and ack, review submission and
+// result submission, solo and feature alike. It must also hold in the
+// window before the controller records the binding row: the launcher is
+// the pane's own command and can claim first, and a principal whose
+// pane.open outcome the controller never recorded still runs. The
+// incarnation is current for sessionID iff
+//
+//   - the session's current (non-superseded) binding carries exactly this
+//     incarnation, and no pending launch intent of the session — ANY of
+//     them, not only the newest (pendingLaunchIntentDisagrees) — names a
+//     different one or none usable: a binding and a pending intent that
+//     disagree fail closed, as the launch context does; or
+//   - no binding row exists for the session at all — a superseded row
+//     without a successor retires the incarnation, so any row disables the
+//     fallback — and the SESSION's newest pending launch operation (kind
+//     pane.open or launch.send) carries this incarnation in its intent
+//     JSON under the documented "incarnation_id" key, matched to the
+//     session by the "session_id" key the controller commits before
+//     dispatching the pane request.
+//
+// Keying the intent lookup to the session (never the run's newest pending
+// launch) lets two concurrently pending launches validate independently:
+// another session's later intent can no longer invalidate this session's
+// own (B2).
+//
+// The intent source is state pending only (pendingLaunchIntentDisagrees,
+// pendingLaunchIntentOfSession). A pane.open the controller recorded
+// reconciling — its act returned an error after the launcher had already
+// claimed — is not read, so its principal is stale until label recovery
+// commits the binding (LAUNCH-6, an accepted residual; widening it would
+// widen ClaimLaunch too).
 func sessionIncarnationCurrent(ctx context.Context, q querier, sessionID identity.SessionID, incarnationID identity.IncarnationID) (bool, error) {
-	binding, ok, err := currentBinding(ctx, q, sessionID)
+	binding, hasBinding, err := currentBinding(ctx, q, sessionID)
 	if err != nil {
 		return false, err
 	}
-	if ok {
+	if hasBinding {
+		disagrees, disagreeErr := pendingLaunchIntentDisagrees(ctx, q, sessionID, binding.IncarnationID)
+		if disagreeErr != nil || disagrees {
+			return false, disagreeErr
+		}
 		return binding.IncarnationID == incarnationID, nil
+	}
+	intentIncarnation, hasIntent, err := pendingLaunchIntentOfSession(ctx, q, sessionID)
+	if err != nil {
+		return false, err
 	}
 	var bindingRows int64
 	if countErr := q.QueryRowContext(ctx,
@@ -550,17 +572,37 @@ func sessionIncarnationCurrent(ctx context.Context, q querier, sessionID identit
 	if bindingRows > 0 {
 		return false, nil
 	}
-	intentIncarnation, ok, err := pendingLaunchIntentOfSession(ctx, q, sessionID)
+	return hasIntent && intentIncarnation == incarnationID.String(), nil
+}
+
+// pendingLaunchIntentDisagrees reports whether ANY pending launch operation
+// of the session (kind pane.open or launch.send, matched on the intent
+// JSON's "session_id" key) fails to name exactly incarnationID under its
+// "incarnation_id" key: one naming a different incarnation, and one whose
+// incarnation is unusable — absent, null or not a string — alike. It is the
+// bound half of the one principal-incarnation rule and of the launch
+// identity resolution: with a binding, an older pending intent naming
+// another incarnation fails closed even when the newest one agrees.
+func pendingLaunchIntentDisagrees(ctx context.Context, q querier, sessionID identity.SessionID, incarnationID identity.IncarnationID) (bool, error) {
+	var disagrees int64
+	err := q.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM operations
+		  WHERE state = ? AND kind IN (?, ?) AND json_extract(intent, '$.session_id') = ?
+		    AND (json_type(intent, '$.incarnation_id') IS NOT 'text' OR json_extract(intent, '$.incarnation_id') != ?))`,
+		string(app.OperationPending), string(app.OpPaneOpen), string(app.OpLaunchSend), sessionID.String(), incarnationID.String(),
+	).Scan(&disagrees)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("sqlite: read pending launch intents of session %s: %w", sessionID, err)
 	}
-	return ok && intentIncarnation == incarnationID.String(), nil
+	return disagrees != 0, nil
 }
 
 // pendingLaunchIntentOfSession reads the SESSION's newest pending launch
 // operation (kind pane.open or launch.send, matched on the intent JSON's
 // "session_id" key) and returns its intent's "incarnation_id"; ok is false
-// when the session has no pending launch operation.
+// when the session has no pending launch operation. It is the source of
+// the no-binding fallback only: with a binding, every pending intent
+// decides (pendingLaunchIntentDisagrees).
 func pendingLaunchIntentOfSession(ctx context.Context, q querier, sessionID identity.SessionID) (incarnationID string, ok bool, err error) {
 	var intentIncarnation sql.NullString
 	err = q.QueryRowContext(ctx,

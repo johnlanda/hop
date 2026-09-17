@@ -366,21 +366,28 @@ func workerExecFailure() workerTermination {
 }
 
 // workerLaunchEnded is an exec_failed launch claim the controller settled
-// because the launch ended before corroboration (settleIfLaunchEnded): the
-// same terminal attempt outcome as workerExecFailure — the claim is
-// exec_failed, the attempt failed — with reasons naming the observation
-// that settled it.
-func workerLaunchEnded() workerTermination {
+// because the launch ended before corroboration — settleIfLaunchEnded, or
+// its label-only variant settleIfUnplacedLaunchEnded, named by the claim's
+// recorded reason: the same terminal attempt outcome as workerExecFailure
+// — the claim is exec_failed, the attempt failed — with reasons naming the
+// observation that settled it.
+func workerLaunchEnded(reason string) workerTermination {
+	observed := "its pane and launched process were observed gone"
+	ended := "the attempt's launch ended before it was corroborated"
+	if reason == launchEndedUnplacedReason {
+		observed = "no pane answered for its creation label and its launched process was observed gone"
+		ended = "the attempt's launch ended before its placement was recorded"
+	}
 	return workerTermination{
 		kind:          "exec failure",
 		failAttempt:   true,
-		reason:        "exec_failed claim: " + launchEndedReason,
-		sessionReason: "exec_failed claim: " + launchEndedReason,
+		reason:        "exec_failed claim: " + reason,
+		sessionReason: "exec_failed claim: " + reason,
 		noticeReason: func(consequence taskConsequence) string {
 			if consequence == taskConsequenceInterrupted {
-				return "the attempt's launch ended before it was corroborated (its pane and launched process were observed gone; claim settled exec_failed) while a stop was pending"
+				return ended + " (" + observed + "; claim settled exec_failed) while a stop was pending"
 			}
-			return "the attempt's launch ended before it was corroborated (its pane and launched process were observed gone; claim settled exec_failed)"
+			return ended + " (" + observed + "; claim settled exec_failed)"
 		},
 	}
 }
@@ -427,7 +434,7 @@ func (c *Controller) settleChildExecFailure(ctx context.Context, handle RunHandl
 			return err
 		}
 		if claimFound && launchEndedByController(&claim) {
-			outcome = workerLaunchEnded()
+			outcome = workerLaunchEnded(claim.Error)
 		}
 		return nil
 	}); err != nil {
@@ -605,7 +612,14 @@ func (c *Controller) sessionCloseEvidence(ctx context.Context, handle RunHandle,
 // current incarnation the way the session launch context does (design
 // section 4): the current binding's incarnation, else — while the
 // pane.open outcome is unrecorded — the incarnation of the session's
-// newest unresolved pane.open or launch.send intent.
+// newest unresolved pane.open or launch.send intent, else — once the
+// label-only launch-ended row resolved that intent failed — the
+// incarnation of the session's newest pane.open it resolved
+// (launchEndedIntentLocked), so the settled exec_failed claim stays the
+// session's claim for every later reader: the child's settlement, the
+// manager-lineage failure cause, stop and retirement. The store-side
+// twins (the launch context and ClaimLaunch) deliberately do not follow
+// that last step: nothing may launch or claim for that incarnation again.
 func sessionLaunchClaimLocked(ctx context.Context, uow UnitOfWork, runID identity.RunID, sessionID identity.SessionID, binding run.RuntimeBinding, bindingFound bool) (LaunchClaim, bool, error) { //nolint:gocritic // hugeParam: RuntimeBinding is a read snapshot passed by value like every binding.
 	incarnation := binding.IncarnationID
 	if !bindingFound {
@@ -614,10 +628,14 @@ func sessionLaunchClaimLocked(ctx context.Context, uow UnitOfWork, runID identit
 			return LaunchClaim{}, false, err
 		}
 		_, intent, found := newestPendingPaneOpenForSession(pending, sessionID)
-		if !found {
-			return LaunchClaim{}, false, nil
-		}
 		incarnation = intent.IncarnationID
+		if !found {
+			resolved, ended, endedErr := launchEndedIntentLocked(ctx, uow, runID, sessionID)
+			if endedErr != nil || !ended {
+				return LaunchClaim{}, false, endedErr
+			}
+			incarnation = resolved
+		}
 	}
 	return uow.LaunchClaims().Get(ctx, incarnation)
 }

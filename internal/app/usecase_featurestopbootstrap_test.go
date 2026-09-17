@@ -3,6 +3,7 @@ package app_test
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -26,6 +27,63 @@ type unplacedLaunch struct {
 }
 
 const unplacedPID = 4711
+
+// launchEndedUnplacedReason is the controller's fixed exec_failed
+// settlement reason for a launch whose placement was never recorded, whose
+// creation label answers nothing and whose claimed process is gone.
+const launchEndedUnplacedReason = "launch ended before its placement was recorded: no pane answers for the creation label; claimed process gone"
+
+// unplacedLiveDetail is the outstanding detail for u's launch while its
+// label answers nothing and its claimed process still runs.
+func unplacedLiveDetail(u *unplacedLaunch) string {
+	return "no pane answers for launch label " + u.label + " but the claimed launch process (pid 4711) still runs; end that process, and a later round observes its exit"
+}
+
+// requireUnplacedLaunchEnded asserts the label-only launch-ended row
+// settled incarnation's claim exec_failed with pid as its evidence (no
+// pane id was ever recorded) and resolved the pane.open naming it failed,
+// as dispatched, with the typed launch-ended outcome.
+func requireUnplacedLaunchEnded(t *testing.T, tc *testController, incarnation identity.IncarnationID, pid int) {
+	t.Helper()
+	tc.Store.mu.Lock()
+	defer tc.Store.mu.Unlock()
+	claim := tc.Store.LaunchClaims[incarnation]
+	if claim.State != app.LaunchClaimExecFailed || claim.Error != launchEndedUnplacedReason {
+		t.Fatalf("claim = %s (%q), want exec_failed with the label-only launch-ended reason", claim.State, claim.Error)
+	}
+	if !strings.HasPrefix(claim.SettlementEvidence, "pane= pid="+strconv.Itoa(pid)+" ") {
+		t.Errorf("settlement evidence = %q, want no pane and pid %d", claim.SettlementEvidence, pid)
+	}
+	var resolved []app.Operation
+	for id := range tc.Store.Operations {
+		op := tc.Store.Operations[id]
+		var intent struct {
+			IncarnationID string `json:"incarnation_id"`
+		}
+		decodeInto(t, op.Intent, &intent)
+		if op.Kind == app.OpPaneOpen && intent.IncarnationID == incarnation.String() {
+			resolved = append(resolved, op)
+		}
+	}
+	if len(resolved) != 1 || resolved[0].State != app.OperationFailed {
+		t.Fatalf("pane.open operations for %s = %+v, want exactly one, failed", incarnation, resolved)
+	}
+	var outcome struct {
+		LaunchEnded        bool   `json:"launch_ended"`
+		Dispatched         bool   `json:"dispatched"`
+		PaneAbsentByLabel  bool   `json:"pane_absent_by_label"`
+		ClaimedProcessGone bool   `json:"claimed_process_gone"`
+		IncarnationID      string `json:"incarnation_id"`
+		PID                int    `json:"pid"`
+		Reason             string `json:"reason"`
+		Refused            bool   `json:"refused_before_dispatch"`
+	}
+	decodeInto(t, resolved[0].Outcome, &outcome)
+	if !outcome.LaunchEnded || !outcome.Dispatched || !outcome.PaneAbsentByLabel || !outcome.ClaimedProcessGone ||
+		outcome.IncarnationID != incarnation.String() || outcome.PID != pid || outcome.Reason != launchEndedUnplacedReason || outcome.Refused {
+		t.Errorf("pane.open outcome = %+v, want the dispatched launch-ended outcome", outcome)
+	}
+}
 
 // pendingPaneIntent decodes the unresolved pane.open intent of session.
 func pendingPaneIntent(t *testing.T, tc *testController, session identity.SessionID) (label string, incarnation identity.IncarnationID) {
@@ -209,15 +267,39 @@ func TestFeatureStopUnplacedLaunch(t *testing.T) {
 				}
 			})
 
+			t.Run("ended: no pane answers and the claimed process is gone, so the launch settles and the run stops", func(t *testing.T) {
+				u := role.build(t, true)
+				delete(u.panes, u.label)
+				report := u.driveStop(t, 2)
+				if !report.Terminated || report.RunState != string(run.RunStopped) {
+					t.Fatalf("DriveFeatureStop() = %+v, want stopped", report)
+				}
+				requireUnplacedLaunchEnded(t, u.tc, u.incarnation, unplacedPID)
+				if got := u.tc.Store.Sessions[u.sessionID].value.State; got != run.SessionTerminated {
+					t.Fatalf("session state = %s, want terminated", got)
+				}
+				if len(u.tc.Runtime.ClosedPanes) != 0 {
+					t.Fatalf("ClosedPanes = %v; no pane answers, so nothing is closed", u.tc.Runtime.ClosedPanes)
+				}
+				if len(u.tc.Store.Bindings[u.sessionID]) != 0 {
+					t.Fatalf("bindings = %+v, want none for a pane that no longer exists", u.tc.Store.Bindings[u.sessionID])
+				}
+			})
+
 			for _, tt := range []struct {
 				name    string
 				claimed bool
 				setup   func(u *unplacedLaunch)
 				want    string
 			}{
-				{"absent: a claimed process with no pane answering stays outstanding", true, func(u *unplacedLaunch) {
+				{"absent: a live claimed process with no pane answering stays outstanding", true, func(u *unplacedLaunch) {
 					delete(u.panes, u.label)
-				}, "no pane answers for launch label"},
+					u.tc.Groups.liveLeader(unplacedPID, "/usr/local/bin/claude")
+				}, "but the claimed launch process (pid 4711) still runs; end that process, and a later round observes its exit"},
+				{"absent: a claimed process that cannot be listed stays outstanding", true, func(u *unplacedLaunch) {
+					delete(u.panes, u.label)
+					u.tc.Groups.ListErr[unplacedPID] = errors.New("list the process table with ps: exit status 1")
+				}, "the claimed process's group listing failed"},
 				{"ambiguous: a failed label lookup stays outstanding", true, func(u *unplacedLaunch) {
 					u.tc.Runtime.FindPaneByLabelFn = func(string) (app.PaneRef, bool, error) {
 						return app.PaneRef{}, false, errors.New("2 panes carry this label, want at most one")
@@ -413,15 +495,31 @@ func TestRetirementUnplacedLaunch(t *testing.T) {
 			t.Fatalf("session state = %s, want terminated once absence is observed", got)
 		}
 	})
-	t.Run("absent: outstanding, never retired", func(t *testing.T) {
+	t.Run("absent with the claimed process alive: outstanding, never retired", func(t *testing.T) {
 		u := unplacedWorkerWith(t, true, false)
 		delete(u.panes, u.label)
+		u.tc.Groups.liveLeader(unplacedPID, "/usr/local/bin/claude")
 		report := retire(t, u)
-		if len(report.Outstanding) == 0 || !strings.Contains(strings.Join(report.Outstanding, "\n"), "no pane answers for launch label") {
-			t.Fatalf("report = %+v, want the unanswered label outstanding", report)
+		if len(report.Outstanding) == 0 || !strings.Contains(strings.Join(report.Outstanding, "\n"), unplacedLiveDetail(u)) {
+			t.Fatalf("report = %+v, want the unanswered label outstanding with the live process named", report)
 		}
 		if got := u.tc.Store.Sessions[u.sessionID].value.State; got == run.SessionTerminated {
 			t.Fatalf("an unresolved launch was retired")
+		}
+		if got := u.tc.Store.LaunchClaims[u.incarnation].State; got != app.LaunchClaimExecPending {
+			t.Fatalf("claim state = %s, want exec_pending while its process runs", got)
+		}
+	})
+	t.Run("absent with the claimed process gone: settled and retired", func(t *testing.T) {
+		u := unplacedWorkerWith(t, true, false)
+		delete(u.panes, u.label)
+		report := retire(t, u)
+		if len(report.Outstanding) != 0 {
+			t.Fatalf("report = %+v, want nothing outstanding once the launch is observed ended", report)
+		}
+		requireUnplacedLaunchEnded(t, u.tc, u.incarnation, unplacedPID)
+		if got := u.tc.Store.Sessions[u.sessionID].value.State; got != run.SessionTerminated {
+			t.Fatalf("session state = %s, want terminated", got)
 		}
 	})
 }

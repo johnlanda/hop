@@ -61,8 +61,11 @@ type fakeRuntime struct {
 
 	PaneContents map[string]string
 
-	// ServerInstanceValue is what ServerInstance reports; "" means the
-	// server process identity could not be established (unknown).
+	// ServerInstanceValue is what ServerInstance reports, and what
+	// InspectPane stamps an observation with when it is unchanged across the
+	// scripted inspection; "" means the server lifetime could not be
+	// established (unknown). Scripted values use the adapter's pinned token
+	// format (fakeServerToken).
 	ServerInstanceValue string
 	ServerInstanceErr   error
 
@@ -139,7 +142,26 @@ func (r *fakeRuntime) FindWorkspaceByLabel(_ context.Context, label string) (app
 }
 
 func newFakeRuntime() *fakeRuntime {
-	return &fakeRuntime{PaneContents: map[string]string{}, ServerInstanceValue: "peer-pid:1"}
+	return &fakeRuntime{PaneContents: map[string]string{}, ServerInstanceValue: fakeServerToken(1)}
+}
+
+// fakeServerToken renders a server-lifetime token in the herdr adapter's
+// pinned format ("herdr-server-lifetime/v1 pid=<pid> start=<sec>.<usec>",
+// pinned under the production transport by test/integration's
+// TestSpikeLabelSurvivesRestart) for fake server lifetime n; distinct n are
+// distinct lifetimes.
+func fakeServerToken(n int) string {
+	return fmt.Sprintf("herdr-server-lifetime/v1 pid=%d start=1789000000.%06d", 41000+n, n)
+}
+
+// currentServerLocked is the lifetime token the fake server answers with
+// right now: ServerInstanceValue, or unknown while ServerInstanceErr is
+// scripted. Callers hold r.mu.
+func (r *fakeRuntime) currentServerLocked() string {
+	if r.ServerInstanceErr != nil {
+		return ""
+	}
+	return r.ServerInstanceValue
 }
 
 func (r *fakeRuntime) ServerInstance(context.Context) (string, error) {
@@ -250,10 +272,24 @@ func (r *fakeRuntime) InspectPane(_ context.Context, paneID string) (app.PanePro
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.InspectPaneFn != nil {
-		return r.InspectPaneFn(paneID)
+	if r.InspectPaneFn == nil {
+		return app.PaneProcess{}, fmt.Errorf("app_test: no InspectPaneFn configured")
 	}
-	return app.PaneProcess{}, fmt.Errorf("app_test: no InspectPaneFn configured")
+	// The adapter stamps an observation with the lifetime of the server
+	// that answered it, read before the request and after the response on
+	// the request's own connection, and only when both reads agree: a
+	// script that changes the server during the inspection gets an
+	// unknown stamp, exactly as a restart mid-request would.
+	before := r.currentServerLocked()
+	pane, err := r.InspectPaneFn(paneID)
+	if err != nil {
+		return app.PaneProcess{}, err
+	}
+	pane.ServerInstance = ""
+	if after := r.currentServerLocked(); before != "" && before == after {
+		pane.ServerInstance = before
+	}
+	return pane, nil
 }
 
 func (r *fakeRuntime) ClosePane(_ context.Context, paneID string) error {

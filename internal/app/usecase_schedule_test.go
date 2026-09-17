@@ -88,7 +88,7 @@ func seedFeatureRun(t *testing.T, tc *testController, maxWorkers int) featureRun
 	if err != nil {
 		t.Fatalf("parse manager incarnation id: %v", err)
 	}
-	binding := run.NewRuntimeBinding(managerID, managerIncarnation, "", "peer-pid:1", "workspace-mgr", "tab-mgr", "pane-mgr", "label-mgr", run.LaunchInitial, now)
+	binding := run.NewRuntimeBinding(managerID, managerIncarnation, "", fakeServerToken(1), "workspace-mgr", "tab-mgr", "pane-mgr", "label-mgr", run.LaunchInitial, now)
 	tc.Store.Bindings[managerID] = append(tc.Store.Bindings[managerID], binding)
 
 	lease := app.Lease{Run: runID, ControllerID: "controller-1", Generation: 1, ExpiresAt: now.Add(leaseTTL)}

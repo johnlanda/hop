@@ -63,7 +63,7 @@ func seedReviewerFor(t *testing.T, f *integrationFixture, reviewTaskID identity.
 	if err != nil {
 		t.Fatalf("parse incarnation id: %v", err)
 	}
-	binding := run.NewRuntimeBinding(sessionID, incarnationID, "", "peer-pid:1", "ws-r", "tab-r", "pane-r", "label-r", run.LaunchInitial, now)
+	binding := run.NewRuntimeBinding(sessionID, incarnationID, "", fakeServerToken(1), "ws-r", "tab-r", "pane-r", "label-r", run.LaunchInitial, now)
 	tc.Store.Bindings[sessionID] = append(tc.Store.Bindings[sessionID], binding)
 	tc.Store.LaunchClaims[incarnationID] = app.LaunchClaim{
 		IncarnationID: incarnationID, RunID: f.fr.RunID, SessionID: sessionID, AttemptID: attemptID,

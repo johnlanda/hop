@@ -559,6 +559,60 @@ func TestRunResume(t *testing.T) {
 		}
 	})
 
+	t.Run("a resumed feature run with a child launch in flight enters the loop, whose corroboration settles it", func(t *testing.T) {
+		ctrl := &fakeController{runState: runStateRunning}
+		ctrl.status = func(app.StatusRequest) (app.StatusResult, error) {
+			return app.StatusResult{Detail: &app.RunDetailView{
+				RunSummaryView: app.RunSummaryView{RunID: testRunID, Sequence: 1, State: ctrl.currentRunState()},
+				Mode:           "feature",
+			}}, nil
+		}
+		const inFlight = "launch claim not settled; the placed launch is in flight, and the controller loop corroborates it"
+		ctrl.resumeFeature = func(app.ResumeFeatureRequest) (app.ResumeFeatureResult, app.RunHandle, error) {
+			return app.ResumeFeatureResult{
+				Outcome:  "resumed",
+				RunState: "running",
+				Sessions: []app.FeatureSessionReport{
+					{SessionID: "manager-session", Role: "manager", Disposition: app.SessionWarm},
+					{SessionID: "worker-session-3", Role: "implementer", Disposition: app.SessionPending, Detail: inFlight},
+				},
+			}, app.RunHandle{}, nil
+		}
+		ctrl.requestStop = func(string) error {
+			t.Fatal("a stop was requested for a run whose launch the loop corroborates")
+			return nil
+		}
+		corroborations := 0
+		ctrl.corroborateSessions = func() ([]app.SessionLaunchProgress, error) {
+			corroborations++
+			// The loop's corroboration settles the in-flight launch; the run
+			// then completes on its own.
+			ctrl.setRunState("completed")
+			return []app.SessionLaunchProgress{{SessionID: "worker-session-3", Role: "implementer", Progress: app.LaunchSettled}}, nil
+		}
+		td := newTestDeps(ctrl, env, t.TempDir())
+		var stdout, stderr bytes.Buffer
+
+		code, err := runResume([]string{testRunID}, &stdout, &stderr, td.deps)
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+		if code != exitOK || corroborations == 0 {
+			t.Errorf("exit code = %d after %d corroboration rounds, want %d after at least one (stderr: %s)", code, corroborations, exitOK, stderr.String())
+		}
+		out := stdout.String()
+		for _, want := range []string{
+			"resume resumed: running",
+			"session worker-session-3 (implementer): pending - " + inFlight,
+			"run r1 running",
+			"run r1 completed",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("output lacks %q:\n%s", want, out)
+			}
+		}
+	})
+
 	t.Run("a feature-mode run with no --confirm-absent omits the attestation and can still resume", func(t *testing.T) {
 		ctrl := &fakeController{}
 		ctrl.status = func(app.StatusRequest) (app.StatusResult, error) {

@@ -301,6 +301,13 @@ func RunBase(ctx context.Context, store Store, lease app.Lease, f Base, now time
 // Call this AFTER LaunchBase (or RunBase's own LaunchBase step) has put
 // the session in the launching state a claim requires.
 func SeedLaunchClaim(ctx context.Context, store Store, runID, sessionID, attemptID, incarnationID string, pid int, now time.Time) error {
+	return SeedLaunchClaimWithSeedEvidence(ctx, store, runID, sessionID, attemptID, incarnationID, pid, "", now)
+}
+
+// SeedLaunchClaimWithSeedEvidence is SeedLaunchClaim with the
+// workspace-trust seed evidence hop launch records on the claim, for
+// status renderings of that evidence.
+func SeedLaunchClaimWithSeedEvidence(ctx context.Context, store Store, runID, sessionID, attemptID, incarnationID string, pid int, seedEvidence string, now time.Time) error {
 	claim := app.LaunchClaim{
 		IncarnationID: identity.IncarnationID(incarnationID),
 		RunID:         identity.RunID(runID),
@@ -308,6 +315,7 @@ func SeedLaunchClaim(ctx context.Context, store Store, runID, sessionID, attempt
 		Executable:    "/opt/harness/fixture-claude",
 		ArgvDigest:    "fixture-argv-digest",
 		PID:           pid,
+		SeedEvidence:  seedEvidence,
 		ClaimedAt:     now,
 	}
 	if attemptID != "" {

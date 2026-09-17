@@ -81,40 +81,61 @@ func (s *Store) LoadSessionLaunchContext(ctx context.Context, runID identity.Run
 }
 
 // sessionLaunchIdentity resolves the incarnation HOP_INCARNATION_ID must
-// match for one session-addressed launch: the session's current binding
-// when one exists, the session's newest pending launch intent otherwise,
-// and when both exist they must agree. A disagreement, a malformed intent
-// identity or neither source fails closed with ErrNotFound.
+// match for one session-addressed launch (sessionLaunchIncarnation), and
+// fails closed with ErrNotFound when it resolves none.
 func sessionLaunchIdentity(ctx context.Context, q querier, sessionID identity.SessionID) (identity.IncarnationID, error) {
-	binding, hasBinding, err := currentBinding(ctx, q, sessionID)
+	resolved, err := sessionLaunchIncarnation(ctx, q, sessionID)
 	if err != nil {
 		return "", err
+	}
+	if resolved.unresolved != "" {
+		return "", fmt.Errorf("sqlite: session %s: %s: %w", sessionID, resolved.unresolved, app.ErrNotFound)
+	}
+	return resolved.incarnation, nil
+}
+
+// launchIncarnation is one session's resolved launch identity.
+// unresolved is "" exactly when incarnation names it, else a value-free
+// reason.
+type launchIncarnation struct {
+	incarnation identity.IncarnationID
+	unresolved  string
+}
+
+// sessionLaunchIncarnation is the one launch-identity resolution the
+// launch context and the status read model share: the session's current
+// binding's incarnation when one exists, provided no pending launch intent
+// of the session — any of them, not only the newest — names another
+// incarnation or none usable (pendingLaunchIntentDisagrees); else the
+// session's newest pending launch intent's. A disagreement, a malformed
+// intent identity or neither source resolves nothing.
+func sessionLaunchIncarnation(ctx context.Context, q querier, sessionID identity.SessionID) (launchIncarnation, error) {
+	binding, hasBinding, err := currentBinding(ctx, q, sessionID)
+	if err != nil {
+		return launchIncarnation{}, err
+	}
+	if hasBinding {
+		disagrees, disagreeErr := pendingLaunchIntentDisagrees(ctx, q, sessionID, binding.IncarnationID)
+		switch {
+		case disagreeErr != nil:
+			return launchIncarnation{}, disagreeErr
+		case disagrees:
+			return launchIncarnation{unresolved: fmt.Sprintf("binding incarnation %s and a pending launch intent of the session disagree", binding.IncarnationID)}, nil
+		}
+		return launchIncarnation{incarnation: binding.IncarnationID}, nil
 	}
 	rawIntent, hasIntent, err := pendingLaunchIntentOfSession(ctx, q, sessionID)
 	if err != nil {
-		return "", err
+		return launchIncarnation{}, err
 	}
-	var intentIncarnation identity.IncarnationID
-	if hasIntent {
-		parsed, parseErr := identity.ParseIncarnationID(rawIntent)
-		if parseErr != nil {
-			return "", fmt.Errorf("sqlite: pending launch intent of session %s carries a malformed incarnation id (%s): %w", sessionID, parseErr.Error(), app.ErrNotFound)
-		}
-		intentIncarnation = parsed
+	if !hasIntent {
+		return launchIncarnation{unresolved: "no binding and no pending launch intent"}, nil
 	}
-	switch {
-	case hasBinding && hasIntent:
-		if binding.IncarnationID != intentIncarnation {
-			return "", fmt.Errorf("sqlite: binding incarnation %s and pending intent incarnation %s disagree for session %s: %w", binding.IncarnationID, intentIncarnation, sessionID, app.ErrNotFound)
-		}
-		return binding.IncarnationID, nil
-	case hasBinding:
-		return binding.IncarnationID, nil
-	case hasIntent:
-		return intentIncarnation, nil
-	default:
-		return "", fmt.Errorf("sqlite: no binding and no pending launch intent for session %s: %w", sessionID, app.ErrNotFound)
+	intentIncarnation, err := identity.ParseIncarnationID(rawIntent)
+	if err != nil {
+		return launchIncarnation{unresolved: "the pending launch intent carries a malformed incarnation id"}, nil
 	}
+	return launchIncarnation{incarnation: intentIncarnation}, nil
 }
 
 // worktreePathForAttempt resolves the recorded worktree path the launch

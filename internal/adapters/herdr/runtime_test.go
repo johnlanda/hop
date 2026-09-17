@@ -9,6 +9,8 @@ import (
 	"net"
 	"os"
 	"reflect"
+	"regexp"
+	goruntime "runtime"
 	"strings"
 	"testing"
 	"time"
@@ -498,6 +500,9 @@ func TestRuntimeInspectPane(t *testing.T) {
 	if strings.Join(fg.Argv, " ") != "claude --run r1" {
 		t.Errorf("argv = %q, want the full argv vector", fg.Argv)
 	}
+	// The observation carries the lifetime of the server that answered it,
+	// read on the request's own connection.
+	wantServerLifetime(t, process.ServerInstance)
 
 	assertRequestParams(t, <-got, "pane.process_info", `{"pane_id":"w1:p1"}`)
 }
@@ -736,11 +741,29 @@ func TestRuntimeClosePaneAppErrPaneNotFoundClassification(t *testing.T) {
 	}
 }
 
-// TestRuntimeServerInstance proves the token identifies the server process
-// behind the dialed socket: the fake endpoint's listener and this test's
-// dialer are the same OS process, so the observed peer pid is this
-// process's own pid on every platform the adapter implements the lookup
-// for (darwin, linux).
+// wantServerLifetime is the token ServerInstance renders for a server that
+// is this very test process — the fake endpoint's listener and the dialer
+// are the same OS process: on darwin the lifetime format naming this
+// process's pid (its start time is pinned against ps by the package's
+// internal TestProcessStartTimeMatchesTheProcessTable); on every other
+// platform unknown.
+func wantServerLifetime(t *testing.T, token string) {
+	t.Helper()
+	if goruntime.GOOS != "darwin" {
+		if token != "" {
+			t.Errorf("token = %q, want \"\" (no lifetime identity is implemented on %s)", token, goruntime.GOOS)
+		}
+		return
+	}
+	pattern := regexp.MustCompile(fmt.Sprintf(`^herdr-server-lifetime/v1 pid=%d start=[1-9][0-9]*\.[0-9]{6}$`, os.Getpid()))
+	if !pattern.MatchString(token) {
+		t.Errorf("token = %q, want %s", token, pattern)
+	}
+}
+
+// TestRuntimeServerInstance proves the token identifies the server
+// lifetime behind the dialed socket, and is stable across calls to the
+// same server.
 func TestRuntimeServerInstance(t *testing.T) {
 	endpoint := startFakeEndpoint(t, func(_ *testing.T, conn net.Conn) {
 		holdUntilPeerCloses(conn)
@@ -751,10 +774,14 @@ func TestRuntimeServerInstance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ServerInstance: %v", err)
 	}
+	wantServerLifetime(t, token)
 
-	want := fmt.Sprintf("peer-pid:%d", os.Getpid())
-	if token != want {
-		t.Errorf("token = %q, want %q", token, want)
+	again, err := runtime.ServerInstance(testContext(t))
+	if err != nil {
+		t.Fatalf("second ServerInstance: %v", err)
+	}
+	if again != token {
+		t.Errorf("second token = %q, want %q: one server lifetime has one token", again, token)
 	}
 }
 

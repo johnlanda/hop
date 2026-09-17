@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"slices"
 	"sort"
 
 	"github.com/johnlanda/hop/internal/domain/identity"
@@ -177,7 +179,7 @@ func (c *Controller) ResumeFeature(ctx context.Context, req ResumeFeatureRequest
 	}
 	allSettled := true
 	for i := range sessions {
-		report, reconErr := c.reconcileFeatureSession(ctx, handle, &frozen, &req, &sessions[i])
+		report, placedInFlight, reconErr := c.reconcileFeatureSession(ctx, handle, &frozen, &req, &sessions[i])
 		if reconErr != nil {
 			return result, handle, reconErr
 		}
@@ -194,12 +196,16 @@ func (c *Controller) ResumeFeature(ctx context.Context, req ResumeFeatureRequest
 			report.Detail = "attempt launch unresolved: " + condition.Detail
 		}
 		result.Sessions = append(result.Sessions, report)
-		// A launch in flight — the manager's, or a child's whose pane this
-		// round opened — reports pending under the one predicate; its
-		// settlement belongs to the loop's corroboration, so it does not
-		// hold the run in reconciliation.
+		// A launch in flight — the manager's, a child's whose pane this
+		// round opened, or a child's placed launch the lost controller left
+		// unsettled (placedLaunchInFlight) — reports pending under the one
+		// predicate; its settlement belongs to the loop's corroboration, so
+		// it does not hold the run in reconciliation. An ambiguous launch
+		// blocks its own relaunch, never the loop that corroborates it
+		// (docs/plan/phase-2-design.md section 4, the launch row's takeover
+		// column).
 		launchInFlight := report.Disposition == SessionPending &&
-			((bootstrap.ManagerLaunching && report.SessionID == bootstrap.ManagerSessionID.String()) || launches.opened[sessions[i].ID])
+			((bootstrap.ManagerLaunching && report.SessionID == bootstrap.ManagerSessionID.String()) || launches.opened[sessions[i].ID] || placedInFlight)
 		if report.Disposition != SessionWarm && report.Disposition != SessionRelaunched && report.Disposition != SessionRetiredNoProcess &&
 			report.Disposition != SessionLaunchSuppressed && !launchInFlight {
 			allSettled = false
@@ -341,21 +347,46 @@ func (c *Controller) featureRunSessions(ctx context.Context, handle RunHandle) (
 }
 
 // reconcileFeatureSession reconciles one session under the one predicate.
-func (c *Controller) reconcileFeatureSession(ctx context.Context, handle RunHandle, frozen *FrozenRun, req *ResumeFeatureRequest, session *run.Session) (FeatureSessionReport, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per session per resume round.
-	report := FeatureSessionReport{SessionID: session.ID.String(), Role: string(session.Role)}
+// inFlight reports a pending session whose placed launch the controller
+// loop's corroboration finishes (placedLaunchInFlight), so it does not
+// hold the run in reconciliation.
+func (c *Controller) reconcileFeatureSession(ctx context.Context, handle RunHandle, frozen *FrozenRun, req *ResumeFeatureRequest, session *run.Session) (report FeatureSessionReport, inFlight bool, err error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per session per resume round.
+	report = FeatureSessionReport{SessionID: session.ID.String(), Role: string(session.Role)}
 	binding, bindingFound, claim, claimFound, markers, err := c.sessionCloseEvidence(ctx, handle, session)
 	if err != nil {
-		return report, err
+		return report, false, err
+	}
+	if !bindingFound && (!claimFound || claim.State != LaunchClaimExecFailed) {
+		// A takeover adopts an unresolved pane.open by its unique creation
+		// label (the decision table's pane.open row) before deciding: a
+		// launch whose outcome the lost controller never recorded is
+		// placed here, never left for a loop that would not run.
+		if recoverErr := c.recoverSessionBindingByLabel(ctx, handle, session, bindingFound, binding); recoverErr != nil {
+			return report, false, recoverErr
+		}
+		if binding, bindingFound, claim, claimFound, markers, err = c.sessionCloseEvidence(ctx, handle, session); err != nil {
+			return report, false, err
+		}
 	}
 	pendingDetail := ""
-	if claimFound && claim.State == LaunchClaimExecPending && bindingFound && binding.PaneID != "" {
+	switch {
+	case claimFound && claim.State == LaunchClaimExecPending && bindingFound && binding.PaneID != "":
 		// The launch-ended row, exactly as the loop's corroboration applies
 		// it: a placed, unsettled launch whose pane and claimed process are
 		// both observed gone is settled exec_failed, and the exec_failed
 		// branch below then retires it.
 		current, detail, endErr := c.settleIfLaunchEnded(ctx, handle, &binding, &claim)
 		if endErr != nil {
-			return report, endErr
+			return report, false, endErr
+		}
+		claim = current
+		pendingDetail = detail
+	case claimFound && claim.State == LaunchClaimExecPending && !bindingFound:
+		// Its label-only variant, for a launch whose placement was never
+		// recorded and whose creation label answers nothing.
+		current, detail, endErr := c.settleIfUnplacedLaunchEnded(ctx, handle, session)
+		if endErr != nil {
+			return report, false, endErr
 		}
 		claim = current
 		pendingDetail = detail
@@ -371,31 +402,44 @@ func (c *Controller) reconcileFeatureSession(ctx context.Context, handle RunHand
 		// retirement pass.
 		managerReason := "resume: exec failed, no process"
 		if launchEndedByController(&claim) {
-			report.Detail = launchEndedReason
-			managerReason = "resume: " + workerLaunchEnded().sessionReason
+			report.Detail = claim.Error
+			managerReason = "resume: " + workerLaunchEnded(claim.Error).sessionReason
 		}
 		if session.Role != run.RoleManager {
 			if err := c.settleChildExecFailure(ctx, handle, frozen, session); err != nil {
-				return report, err
+				return report, false, err
 			}
 		} else if err := c.terminateRetiredSession(ctx, handle, session.ID, managerReason); err != nil {
-			return report, err
+			return report, false, err
 		}
 		report.Disposition = SessionRetiredNoProcess
-		return report, nil
+		return report, false, nil
 	}
 	if !bindingFound || binding.PaneID == "" {
 		report.Disposition = SessionPending
 		report.Detail = "no recorded placement; the launch may still be in flight"
-		return report, nil
-	}
-	if !claimFound || claim.State != LaunchClaimExeced {
-		report.Disposition = SessionPending
-		report.Detail = "launch claim not settled; corroboration continues"
 		if pendingDetail != "" {
 			report.Detail += " (" + pendingDetail + ")"
 		}
-		return report, nil
+		return report, false, nil
+	}
+	if !claimFound || claim.State != LaunchClaimExeced {
+		report.Disposition = SessionPending
+		if pendingDetail == "" {
+			var flightErr error
+			inFlight, pendingDetail, flightErr = c.placedLaunchInFlight(ctx, handle, session.ID, &binding, claimFound, &claim)
+			if flightErr != nil {
+				return report, false, flightErr
+			}
+		}
+		report.Detail = "launch claim not settled; corroboration continues"
+		switch {
+		case inFlight:
+			report.Detail = "launch claim not settled; the placed launch is in flight, and the controller loop corroborates it"
+		case pendingDetail != "":
+			report.Detail += " (" + pendingDetail + ")"
+		}
+		return report, inFlight, nil
 	}
 
 	pane, inspectErr := c.Runtime.InspectPane(ctx, binding.PaneID)
@@ -403,22 +447,22 @@ func (c *Controller) reconcileFeatureSession(ctx context.Context, handle RunHand
 		settlement, _ := CorroborateSettlement(true, pane, markers, claim)
 		if settlement == SettlementSettled {
 			if err := c.confirmSessionActive(ctx, handle, session.ID, "warm reattach: occupant corroborated under the one predicate"); err != nil {
-				return report, err
+				return report, false, err
 			}
 			report.Disposition = SessionWarm
-			return report, nil
+			return report, false, nil
 		}
 		report.Disposition = SessionReconciling
 		report.Detail = fmt.Sprintf("occupant did not corroborate (%s); failing closed", settlement)
 		if err := c.markSessionReconciling(ctx, handle, session.ID); err != nil {
-			return report, err
+			return report, false, err
 		}
-		return report, nil
+		return report, false, nil
 	}
 	if !errors.Is(inspectErr, ErrPaneNotFound) {
 		report.Disposition = SessionReconciling
 		report.Detail = "pane inspection failed; ambiguous, never absence"
-		return report, nil
+		return report, false, nil
 	}
 
 	// The pane is positively gone by id; absence also requires the label
@@ -428,18 +472,18 @@ func (c *Controller) reconcileFeatureSession(ctx context.Context, handle RunHand
 		report.Disposition = SessionReconciling
 		report.Detail = "absence not established: " + ambiguous
 		if err := c.markSessionReconciling(ctx, handle, session.ID); err != nil {
-			return report, err
+			return report, false, err
 		}
-		return report, nil
+		return report, false, nil
 	}
 
 	if req.ConfirmAbsentSession != session.ID.String() {
 		report.Disposition = SessionReconciling
 		report.Detail = "pane absent; cold relaunch requires --confirm-absent " + session.ID.String()
 		if err := c.markSessionReconciling(ctx, handle, session.ID); err != nil {
-			return report, err
+			return report, false, err
 		}
-		return report, nil
+		return report, false, nil
 	}
 
 	// The per-session attestation: journaled with its own continuity
@@ -447,31 +491,31 @@ func (c *Controller) reconcileFeatureSession(ctx context.Context, handle RunHand
 	// non-empty and equal.
 	observedInstance := c.observeServerInstance(ctx)
 	if err := c.journalAttestation(ctx, handle, session.ID, binding.ServerInstance, observedInstance); err != nil {
-		return report, err
+		return report, false, err
 	}
 	if !ServerContinuityEstablished(binding.ServerInstance, observedInstance) {
 		report.Disposition = SessionReconciling
 		report.Detail = fmt.Sprintf("attestation recorded, but server continuity is not established (recorded %q, observed %q); a deferred native restore may still fire", binding.ServerInstance, observedInstance)
 		if err := c.markSessionReconciling(ctx, handle, session.ID); err != nil {
-			return report, err
+			return report, false, err
 		}
-		return report, nil
+		return report, false, nil
 	}
 	if session.Harness != run.HarnessClaude {
 		report.Disposition = SessionRelaunchUnsupported
 		report.Detail = "cold resume is Claude-only; recover this session by retiring the attempt and retrying the task"
-		return report, nil
+		return report, false, nil
 	}
 	if session.NativeSessionRef == "" {
 		report.Disposition = SessionReconciling
 		report.Detail = "no native reference recorded; a cold relaunch cannot be rendered"
-		return report, nil
+		return report, false, nil
 	}
 	if err := c.coldRelaunchFeatureSession(ctx, handle, frozen, req, session, &binding); err != nil {
-		return report, err
+		return report, false, err
 	}
 	report.Disposition = SessionRelaunched
-	return report, nil
+	return report, false, nil
 }
 
 // confirmSessionActive moves a launching or reconciling session to
@@ -814,4 +858,122 @@ func (c *Controller) sessionTaskID(ctx context.Context, handle RunHandle, sessio
 		return nil
 	})
 	return taskID, err
+}
+
+// placedLaunchInFlight is resume's in-flight rule for a child launch the
+// lost controller placed but never settled (docs/plan/phase-3-design.md
+// section 5): the run resumes and the controller loop's corroboration
+// finishes it — settlement, the forking-wrapper reconcile, the
+// launch-ended row, or the pre-claim launch deadline — exactly as a live
+// controller would have, since an ambiguous launch blocks its own
+// relaunch, not the loop. It holds only when every conjunct is a positive
+// observation:
+//
+//   - the session is an implementer or reviewer (the manager's launch is
+//     the bootstrap continuation's) and is launching (the loop corroborates
+//     nothing else, so a session left reconciling keeps failing closed);
+//   - its binding is committed, current and not superseded, and its claim
+//     is absent or that placement's own exec_pending claim;
+//   - the pane.open operation that recorded the placement is not failed;
+//   - the recorded pane answers by id, and that very inspection was
+//     answered by the server lifetime the placement recorded
+//     (PaneProcess.ServerInstance, established on the inspection's own
+//     connection): a graceful restart keeps public pane ids (pinned by
+//     test/integration/spike_panevanish_test.go
+//     TestSpikeLabelSurvivesRestart), so a recorded id answering under any
+//     other or an unknown lifetime is no evidence of the original launch —
+//     including a restart between an earlier identity read and the
+//     inspection itself;
+//   - the pane has a foreground occupant, and its own process is the
+//     launch's: with a claim, the claimed process; with none yet, HOP's
+//     own launcher for exactly this session, its argv equal to the
+//     placement's frozen `hop launch --run <run> --session <session>`
+//     command (pinnedLauncherOccupies). Under one server lifetime a pane id
+//     names one pane and a command pane keeps its process for its whole
+//     life, so that process is the one the placement spawned with this
+//     incarnation's environment.
+//
+// Anything else is not in flight, and detail names why.
+func (c *Controller) placedLaunchInFlight(ctx context.Context, handle RunHandle, sessionID identity.SessionID, binding *run.RuntimeBinding, claimFound bool, claim *LaunchClaim) (inFlight bool, detail string, err error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per pending session per resume round.
+	var (
+		session      run.Session
+		placed       *Operation
+		placedIntent paneOpenIntent
+	)
+	err = c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		s, _, getErr := uow.Sessions().Get(ctx, sessionID)
+		if getErr != nil {
+			return getErr
+		}
+		session = s
+		ops, opErr := uow.Operations().ByKind(ctx, handle.runID, OpPaneOpen)
+		if opErr != nil {
+			return opErr
+		}
+		for i := range ops { // newest first
+			intent, ok := decodeOperationPayload[paneOpenIntent](ops[i].Intent)
+			if ok && intent.SessionID == sessionID && intent.IncarnationID == binding.IncarnationID {
+				op := ops[i]
+				placed, placedIntent = &op, intent
+				return nil
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return false, "", err
+	}
+	switch {
+	case session.Role != run.RoleImplementer && session.Role != run.RoleReviewer:
+		return false, "", nil
+	case session.State != run.SessionLaunching:
+		return false, fmt.Sprintf("the session is %s, not launching", session.State), nil
+	case binding.PaneID == "" || binding.Superseded:
+		return false, "the session has no current placement", nil
+	case claimFound && (claim.State != LaunchClaimExecPending || claim.IncarnationID != binding.IncarnationID):
+		return false, "the launch claim is not the placement's own unsettled claim", nil
+	case placed == nil:
+		return false, "no pane.open operation records the placement", nil
+	case placed.State == OperationFailed:
+		return false, "the placement's pane.open operation settled failed", nil
+	}
+	pane, inspectErr := c.Runtime.InspectPane(ctx, binding.PaneID)
+	switch {
+	case errors.Is(inspectErr, ErrPaneNotFound):
+		return false, "the recorded pane does not answer by id", nil
+	case inspectErr != nil:
+		return false, "the recorded pane could not be inspected; ambiguous, never in flight", nil
+	case !ServerContinuityEstablished(binding.ServerInstance, pane.ServerInstance):
+		return false, "server continuity since the placement is not established for the inspection (the Herdr server may have restarted), so the recorded pane is no evidence of the launch", nil
+	case len(pane.Foreground) == 0:
+		return false, "the recorded pane answers with no foreground occupant", nil
+	case claimFound && pane.ShellPID != claim.PID:
+		return false, fmt.Sprintf("the recorded pane's process (pid %d) is not the claimed launch process (pid %d)", pane.ShellPID, claim.PID), nil
+	case !claimFound && !pinnedLauncherOccupies(&pane, placedIntent.Command, handle.runID, sessionID):
+		return false, "no launch claim yet, and the recorded pane's own process is not this session's hop launch invocation", nil
+	}
+	return true, "", nil
+}
+
+// pinnedLauncherOccupies reports whether the pane's own process is HOP's
+// launcher for sessionID of runID: pinned must be the frozen session
+// launch command — exactly [<absolute hop path> launch --run <runID>
+// --session <sessionID>], a launcher invocation (isLauncherInvocation) —
+// and the foreground member whose pid is the pane's own process (its shell
+// pid) must report exactly that argv. Any other occupant, a pane with no
+// inspectable process, and a command of any other shape report false.
+func pinnedLauncherOccupies(pane *PaneProcess, pinned []string, runID identity.RunID, sessionID identity.SessionID) bool {
+	if len(pinned) != 6 || !filepath.IsAbs(pinned[0]) || !isLauncherInvocation(pinned) ||
+		pinned[2] != "--run" || pinned[3] != runID.String() || pinned[4] != "--session" || pinned[5] != sessionID.String() {
+		return false
+	}
+	if pane.ShellPID <= 1 {
+		return false
+	}
+	for _, fg := range pane.Foreground {
+		if fg.PID == pane.ShellPID && slices.Equal(fg.Argv, pinned) {
+			return true
+		}
+	}
+	return false
 }
