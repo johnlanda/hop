@@ -263,7 +263,7 @@ func TestResumeFeatureBootstrapManagerExecFailure(t *testing.T) {
 		f.requireManagerLaunchFailed()
 	})
 
-	t.Run("unbound: an exec-pending claim with no pane answering stays in flight", func(t *testing.T) {
+	t.Run("unbound: an exec-pending claim whose process lives, with no pane answering, stays in flight", func(t *testing.T) {
 		f := newFeatureStart(t)
 		f.onOpenPane = func(req app.WorkerPaneRequest) (app.PaneHandle, bool, error) {
 			handle := f.openPaneLocked(&req)
@@ -275,6 +275,7 @@ func TestResumeFeatureBootstrapManagerExecFailure(t *testing.T) {
 		label, incarnation := pendingPaneIntent(t, f.tc, f.manager().ID)
 		delete(f.createdPanes, label)
 		f.recordManagerClaim(incarnation, app.LaunchClaimExecPending)
+		f.tc.Groups.liveLeader(managerLaunchPID, "/usr/local/bin/claude")
 
 		result, handle, err := f.resume("controller-2")
 		if err != nil {
@@ -305,6 +306,47 @@ func TestResumeFeatureBootstrapManagerExecFailure(t *testing.T) {
 		if got := f.opState(app.OpPaneOpen); got != app.OperationPending {
 			t.Fatalf("pane.open state = %s, want still pending, never re-sent", got)
 		}
+	})
+
+	t.Run("unbound: an exec-pending claim whose label and process are both gone fails the run", func(t *testing.T) {
+		f := newFeatureStart(t)
+		f.onOpenPane = func(req app.WorkerPaneRequest) (app.PaneHandle, bool, error) {
+			handle := f.openPaneLocked(&req)
+			f.killController()
+			return handle, true, nil
+		}
+		f.crash()
+		f.onOpenPane = nil
+		label, incarnation := pendingPaneIntent(t, f.tc, f.manager().ID)
+		delete(f.createdPanes, label)
+		f.recordManagerClaim(incarnation, app.LaunchClaimExecPending)
+		f.tc.Runtime.InspectPaneFn = allPanesAbsent
+
+		result, handle, err := f.resume("controller-2")
+		if err != nil {
+			t.Fatalf("ResumeFeature() error = %v", err)
+		}
+		mgr := sessionReport(t, &result, f.manager().ID.String())
+		if mgr.Disposition != app.SessionRetiredNoProcess || mgr.Detail != launchEndedUnplacedReason {
+			t.Fatalf("manager report = %+v, want %s with the label-only launch-ended reason", mgr, app.SessionRetiredNoProcess)
+		}
+		requireUnplacedLaunchEnded(t, f.tc, incarnation, managerLaunchPID)
+		if got := f.opState(app.OpPaneOpen); got != app.OperationFailed {
+			t.Fatalf("pane.open state = %s, want failed as dispatched and gone", got)
+		}
+		if _, bound := f.managerBinding(); bound {
+			t.Fatalf("a binding appeared for a pane that no longer exists")
+		}
+		if result.RunState != string(run.RunLaunching) {
+			t.Fatalf("resume run state = %s, want launching", result.RunState)
+		}
+
+		// The loop's launching pass reads the settled claim through the
+		// resolved intent and fails the run.
+		if _, err := f.tc.Controller.CorroborateSessionLaunches(context.Background(), handle); err != nil {
+			t.Fatalf("CorroborateSessionLaunches() error = %v", err)
+		}
+		f.requireManagerLaunchFailed()
 	})
 }
 
@@ -491,21 +533,40 @@ func TestFeatureTerminalFailureWaitsOnUnplacedLaunch(t *testing.T) {
 		}
 	})
 
-	t.Run("absent: the run stays failing, never failed", func(t *testing.T) {
+	t.Run("absent with the claimed process alive: the run stays failing, never failed", func(t *testing.T) {
 		u := unplacedWorkerWith(t, true, false)
 		failTask(u)
 		delete(u.panes, u.label)
+		u.tc.Groups.liveLeader(unplacedPID, "/usr/local/bin/claude")
 		for range 3 {
 			report := retire(t, u)
 			if !report.RunFailing || report.RunFailed {
 				t.Fatalf("report = %+v, want RunFailing while the launch is unresolved", report)
 			}
-			if !strings.Contains(strings.Join(report.Outstanding, "\n"), "no pane answers for launch label") {
-				t.Fatalf("outstanding = %v, want the unanswered label", report.Outstanding)
+			want := unplacedLiveDetail(u)
+			if !strings.Contains(strings.Join(report.Outstanding, "\n"), want) {
+				t.Fatalf("outstanding = %v, want %q", report.Outstanding, want)
 			}
 		}
 		if got := u.tc.Store.Runs[u.runID].value.State; got != run.RunRunning {
 			t.Fatalf("run state = %s, want running while the failure waits", got)
+		}
+	})
+
+	t.Run("absent with the claimed process gone: the launch settles and the run fails", func(t *testing.T) {
+		u := unplacedWorkerWith(t, true, false)
+		failTask(u)
+		delete(u.panes, u.label)
+		report := retire(t, u)
+		if !report.RunFailed {
+			t.Fatalf("report = %+v, want RunFailed once the unplaced launch is observed ended", report)
+		}
+		requireUnplacedLaunchEnded(t, u.tc, u.incarnation, unplacedPID)
+		if got := u.tc.Store.Sessions[u.sessionID].value.State; got != run.SessionTerminated {
+			t.Fatalf("worker state = %s, want terminated", got)
+		}
+		if len(u.tc.Runtime.ClosedPanes) != 0 {
+			t.Fatalf("ClosedPanes = %v, want none: no pane answers", u.tc.Runtime.ClosedPanes)
 		}
 	})
 }

@@ -347,13 +347,35 @@ func (c *Controller) reconcileFeatureSession(ctx context.Context, handle RunHand
 	if err != nil {
 		return report, err
 	}
+	if !bindingFound && (!claimFound || claim.State != LaunchClaimExecFailed) {
+		// A takeover adopts an unresolved pane.open by its unique creation
+		// label (the decision table's pane.open row) before deciding: a
+		// launch whose outcome the lost controller never recorded is
+		// placed here, never left for a loop that would not run.
+		if recoverErr := c.recoverSessionBindingByLabel(ctx, handle, session, bindingFound, binding); recoverErr != nil {
+			return report, recoverErr
+		}
+		if binding, bindingFound, claim, claimFound, markers, err = c.sessionCloseEvidence(ctx, handle, session); err != nil {
+			return report, err
+		}
+	}
 	pendingDetail := ""
-	if claimFound && claim.State == LaunchClaimExecPending && bindingFound && binding.PaneID != "" {
+	switch {
+	case claimFound && claim.State == LaunchClaimExecPending && bindingFound && binding.PaneID != "":
 		// The launch-ended row, exactly as the loop's corroboration applies
 		// it: a placed, unsettled launch whose pane and claimed process are
 		// both observed gone is settled exec_failed, and the exec_failed
 		// branch below then retires it.
 		current, detail, endErr := c.settleIfLaunchEnded(ctx, handle, &binding, &claim)
+		if endErr != nil {
+			return report, endErr
+		}
+		claim = current
+		pendingDetail = detail
+	case claimFound && claim.State == LaunchClaimExecPending && !bindingFound:
+		// Its label-only variant, for a launch whose placement was never
+		// recorded and whose creation label answers nothing.
+		current, detail, endErr := c.settleIfUnplacedLaunchEnded(ctx, handle, session)
 		if endErr != nil {
 			return report, endErr
 		}
@@ -371,8 +393,8 @@ func (c *Controller) reconcileFeatureSession(ctx context.Context, handle RunHand
 		// retirement pass.
 		managerReason := "resume: exec failed, no process"
 		if launchEndedByController(&claim) {
-			report.Detail = launchEndedReason
-			managerReason = "resume: " + workerLaunchEnded().sessionReason
+			report.Detail = claim.Error
+			managerReason = "resume: " + workerLaunchEnded(claim.Error).sessionReason
 		}
 		if session.Role != run.RoleManager {
 			if err := c.settleChildExecFailure(ctx, handle, frozen, session); err != nil {
@@ -387,6 +409,9 @@ func (c *Controller) reconcileFeatureSession(ctx context.Context, handle RunHand
 	if !bindingFound || binding.PaneID == "" {
 		report.Disposition = SessionPending
 		report.Detail = "no recorded placement; the launch may still be in flight"
+		if pendingDetail != "" {
+			report.Detail += " (" + pendingDetail + ")"
+		}
 		return report, nil
 	}
 	if !claimFound || claim.State != LaunchClaimExeced {

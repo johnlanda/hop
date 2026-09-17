@@ -152,7 +152,20 @@ func (c *Controller) corroborateSessionLaunch(ctx context.Context, handle RunHan
 		if recoverErr := c.recoverSessionBindingByLabel(ctx, handle, session, bindingFound, binding); recoverErr != nil {
 			return "", recoverErr
 		}
-		return LaunchPending, nil
+		if bindingFound {
+			return LaunchPending, nil
+		}
+		// The label-only variant of the launch-ended row: a launch whose
+		// placement was never recorded, whose creation label answers
+		// nothing and whose claimed process is gone, is settled exec_failed.
+		current, _, endErr := c.settleIfUnplacedLaunchEnded(ctx, handle, session)
+		if endErr != nil {
+			return "", endErr
+		}
+		if current.State != LaunchClaimExecFailed {
+			return LaunchPending, nil
+		}
+		return c.settleSessionExecFailure(ctx, handle, frozen, session, &current)
 	}
 	pane, err := c.Runtime.InspectPane(ctx, binding.PaneID)
 	if errors.Is(err, ErrPaneNotFound) {
@@ -213,7 +226,7 @@ func (c *Controller) settleSessionExecFailure(ctx context.Context, handle RunHan
 	}
 	reason := "exec_failed claim"
 	if launchEndedByController(claim) {
-		reason = workerLaunchEnded().sessionReason
+		reason = workerLaunchEnded(claim.Error).sessionReason
 	}
 	if err := c.terminateRetiredSession(ctx, handle, session.ID, reason); err != nil {
 		return "", err
