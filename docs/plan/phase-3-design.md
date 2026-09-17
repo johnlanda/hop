@@ -670,12 +670,16 @@ lands between preparation and settlement forces the retry rather than
 vanishing from the notice. A RETRIABLE
 interruption is explicitly different: `needs-rework` leaves the mailbox
 OPEN, since the successor attempt's session fetches the same task
-address. `SendMessage` admission requires the run `running` (a
-completing, completed, failed, stopping or stopped run refuses — the
-run-level analogue of closure) AND, for a `task:<id>` destination, an
-open mailbox; both refusals are `refused: mailbox-closed` (or
-`refused: run-not-accepting`) with receipts — the sender's CLI failure is
-the manager's signal, never a stranded row. SQLite serializes every
+address. An ordinary `SendMessage` (question or info) is admitted only
+while the run is `running` AND, for a `task:<id>` destination, the
+mailbox is open. A run that can never accept again (completed, failed,
+stopping or stopped, or any run with a stop request — the run-level
+analogue of closure) refuses `refused: run-not-accepting`; a run that
+can still reach `running` (created, launching, resuming or completing)
+answers the retryable `transient: run not yet running; retry` instead
+(section 7, "Run-state acceptance"); a closed mailbox refuses
+`refused: mailbox-closed`. Every outcome leaves a receipt — the sender's
+CLI failure is the manager's signal, never a stranded row. SQLite serializes every
 send/close pair, so exactly one order exists: either the send lands
 first (a pending acceptance is refused `transient` until the worker
 drains it; a pending failure settlement records the just-landed message
@@ -1156,6 +1160,43 @@ re-running would otherwise duplicate. The flag is optional at the CLI
 and fixtures ALWAYS pass it; the duplicate lookup by request key runs
 before any other validation (receipt-before-eligibility, as everywhere).
 
+Run-state acceptance follows the Phase 2 result-submission precedent
+([phase-2-design.md](phase-2-design.md) section 7, step 4: a submission
+for a launching attempt whose claim has not settled is recorded as
+`transient: attempt not yet running; retry`, exit 1, never as a final
+refusal). The run-gated verbs are `task create`, `task retry` and
+`plan close` (section 8) and an ordinary `msg send` (a question or an
+info, relays included). Each checks the run inside its accepting
+transaction, AFTER the caller's authority and current incarnation
+(`Run.CanAcceptManagerVerb`):
+
+- `running` with no stop request: eligible; the verb's own checks
+  follow.
+- `created`, `launching`, `resuming` or `completing` with no stop
+  request: retryable. The first line is
+  `transient: run not yet running; retry`, the exit is 1 and nothing
+  changes. The receipt records outcome `transient`, outside the (run,
+  verb, request ID) acceptance key, so the SAME request retried later is
+  decided afresh and accepted at most once. Each of these states can
+  still reach `running`:
+  - the controller corroborates the manager's launch claim on its next
+    scheduling pass, and a manager that plans immediately issues its
+    first `task create` before that;
+  - `hop resume` restores a resuming run whose manager kept running;
+  - a completion whose final readiness re-validation fails returns the
+    run to `running`.
+  A retry loop terminates: a run that never gets there reaches a final
+  state, and the next retry is refused.
+- `completed`, `failed`, `stopping` or `stopped`, or ANY state once a stop
+  is requested: `refused: run-not-accepting`, final. A stopping run that
+  `hop resume` moves to `resuming` keeps its monotonic stop request.
+
+Fetch (`msg next`, `msg wait`), `msg ack`, a session `answer`
+(`msg send --kind answer`) and `hop answer` deliberately carry no
+run-state gate in any state. They deliver, acknowledge or answer
+messages that already exist rather than creating new work, so neither
+the retryable nor the final line applies to them.
+
 - **Send** (`hop msg send --to manager|task:<id> --kind question|info
   [--relay-of <id>] --file <path>`, or `--kind answer --reply-to <id>
   --file <path>` with NO `--to`): parse and bound. Kind/address legality
@@ -1176,9 +1217,10 @@ before any other validation (receipt-before-eligibility, as everywhere).
   worker question it relays so the chain is reconstructible after any
   interruption. Duplicate answer (equal body digest for the same
   question) → idempotent success; conflicting answer → refused, receipt,
-  the accepted answer undisturbed; eligibility (current incarnation; run
-  `running` — a completing, completed, failed, stopping or stopped run is
-  `refused: run-not-accepting`, the section 5 run-level closure; and for a
+  the accepted answer undisturbed; eligibility (current incarnation; for
+  a question or info, the run-state acceptance above — `transient` while
+  the run can still reach `running`, `refused: run-not-accepting` (the
+  section 5 run-level closure) once it never will; and for a
   `task:<id>` destination an OPEN mailbox — a closed one is
   `refused: mailbox-closed` with a receipt, per the
   section 5 closure rule); accept: body artifact written durably BEFORE the
@@ -1252,15 +1294,17 @@ parsing those same lines (section 11):
 | `hop msg wait` | as `next` | `none: no message within <timeout>; run hop msg wait again` |
 | `hop msg show <uuid>` | `message <uuid> kind=<kind> from=<principal> to=<address>[ reply-to=<uuid>][ relay-of=<uuid>] seq=<n>` then `body: <abs path>` then one `delivered: <session> <time>` line per delivery and `acknowledged: <time>` when acked — a READ-ONLY same-run envelope lookup (any of the run's sessions, or the human context), the historical recovery surface for relay chains and audits; it writes nothing, delivers nothing and never substitutes for `next` | `refused: not-found` |
 | `hop msg ack` | `acknowledged <uuid>` / `duplicate <uuid>` | — |
-| `hop msg send` | `sent <uuid>` / `duplicate <uuid>` | — |
-| `hop task create` | `task <uuid> t<seq> created` / `duplicate <uuid> t<seq>` (request-ID retry) | — |
-| `hop task retry` | `retry accepted t<seq> attempt <n>` / `duplicate t<seq> attempt <n>` | — |
-| `hop plan close` | `plan closed` / `duplicate plan closed` | — |
+| `hop msg send` | `sent <uuid>` / `duplicate <uuid>` | `transient: run not yet running; retry` (a question or info while the run can still reach `running`; run-state acceptance above) |
+| `hop task create` | `task <uuid> t<seq> created` / `duplicate <uuid> t<seq>` (request-ID retry) | `transient: run not yet running; retry` (run-state acceptance above) |
+| `hop task retry` | `retry accepted t<seq> attempt <n>` / `duplicate t<seq> attempt <n>` | `transient: run not yet running; retry` (run-state acceptance above) |
+| `hop plan close` | `plan closed` / `duplicate plan closed` | `transient: run not yet running; retry` (run-state acceptance above) |
 | `hop review submit` | `verdict accepted <review-uuid>` / `duplicate <review-uuid>` | — |
 
 Refusals exit 1 with one first line `refused: <reason-token>` and detail
 lines after; reason tokens are enumerated in the same grammar constant
-set. The assignment and role templates quote these lines verbatim from the
+set. A retryable first line (`transient: …`) also exits 1. It is the only
+stdout line, any detail goes to stderr, nothing changed, and the caller
+reruns the same command (same `--request-id`) after a short delay. The assignment and role templates quote these lines verbatim from the
 same constants, so template, CLI and fixture can never drift apart
 silently.
 
@@ -1278,9 +1322,11 @@ clears it, reopening the plan (the reject-verdict fix-task path closes it
 again afterwards). Review-task creation and `EvaluateReadiness` both
 require the plan closed. Racing creation against completion is
 impossible by construction: `CreateTask`/`RequestRetry`/`ClosePlan`
-validate the run is `running` INSIDE their store transaction
-(`ErrRunNotAccepting` with a receipt otherwise — the defined fate of a
-late request), the run leaves `running` for `completing` only in the
+validate the run INSIDE their store transaction (section 7's run-state
+acceptance: `ErrRunNotAccepting` with a receipt once the run can never
+accept again — the defined fate of a late request — and a retryable
+`transient` receipt while it can still reach `running`, `completing`
+included), the run leaves `running` for `completing` only in the
 transaction that first establishes readiness, and the final
 `completing → completed` transaction RE-VALIDATES `EvaluateReadiness`
 against the then-current task set and plan flag, so nothing created in
@@ -1520,14 +1566,14 @@ Existing commands keep their Phase 2 contracts (`run`, `status`, `stop`,
 | `hop status` | unchanged flags | Detail block gains: task table (seq, kind, state, deps, attempt count, worktree), integration head and per-integration states, message queue depth and in-flight age per address, pending human questions (`question <uuid> …` with the body path and the `hop answer` invocation), guard shortfalls verbatim from `EvaluateReadiness`, per-session roles/bindings |
 | `hop stop <run-id>` | unchanged | Now retires manager + workers + reviewer + check and merge groups; same observed-termination contract |
 | `hop resume <run-id>` | unchanged, except `--confirm-absent <session-id>` takes a required session argument in feature mode | Reconciles every session under the one predicate; each attestation is journaled per session with its own continuity evidence |
-| `hop task create` | `--title`, `--file <instructions>`, `--depends-on <task>` (repeatable), `--request-id <uuid>`; identities from the manager's `HOP_*` env | Manager-only (validated); prints `task <uuid> t<seq> created`; refuses cycles, cross-run deps, non-manager callers, `kind=review`, and any manager verb once the run leaves `running` |
-| `hop task retry <task>` | `--reason <text>`, `--request-id <uuid>` | Manager-only; legal only for a terminal attempt of a `needs-rework` task under the retry limit; prints `retry accepted t<seq> attempt <n>` |
-| `hop plan close` | `--request-id <uuid>` | Manager-only; refuses an empty plan; prints `plan closed` (section 8) |
-| `hop msg send` | `--to`, `--kind`, `--reply-to` (answer only, `--to` forbidden — the destination is derived), `--relay-of` (relayed questions), `--request-id <uuid>`, `--file` (or `--body` ≤ 4 KiB) | Section 7 validation; worker/manager contexts |
-| `hop msg next` / `hop msg wait` | `wait`: `--timeout` (default `[messages] wait_timeout`, 50s) | Section 7 grammar; `next` never blocks; an empty fetch writes nothing |
-| `hop msg ack <message-id>` | — | Section 7 ack rules (delivery to the acking session itself required) |
+| `hop task create` | `--title`, `--file <instructions>`, `--depends-on <task>` (repeatable), `--request-id <uuid>`; identities from the manager's `HOP_*` env | Manager-only (validated); prints `task <uuid> t<seq> created`; refuses cycles, cross-run deps, non-manager callers and `kind=review`. Run-state acceptance (section 7, after the Phase 2 `hop result submit` precedent): while the run can still reach `running` (created, launching, resuming, completing) it prints `transient: run not yet running; retry` and exits 1, and the manager reruns it with the same `--request-id`; once the run never can (completed, failed, stopping, stopped, or a stop requested) it is `refused: run-not-accepting` |
+| `hop task retry <task>` | `--reason <text>`, `--request-id <uuid>` | Manager-only; legal only for a terminal attempt of a `needs-rework` task under the retry limit; prints `retry accepted t<seq> attempt <n>`; the same run-state acceptance as `hop task create` |
+| `hop plan close` | `--request-id <uuid>` | Manager-only; refuses an empty plan; prints `plan closed` (section 8); the same run-state acceptance as `hop task create` |
+| `hop msg send` | `--to`, `--kind`, `--reply-to` (answer only, `--to` forbidden — the destination is derived), `--relay-of` (relayed questions), `--request-id <uuid>`, `--file` (or `--body` ≤ 4 KiB) | Section 7 validation; worker/manager contexts; a question or info has the same run-state acceptance as `hop task create`, an answer none |
+| `hop msg next` / `hop msg wait` | `wait`: `--timeout` (default `[messages] wait_timeout`, 50s) | Section 7 grammar; `next` never blocks; an empty fetch writes nothing; no run-state gate |
+| `hop msg ack <message-id>` | — | Section 7 ack rules (delivery to the acking session itself required); no run-state gate |
 | `hop msg show <message-id>` | — | Read-only same-run envelope lookup: kind, principals, reply-to/relay-of, sequence, body path, delivery and ack history (section 7 grammar); the relay-recovery and audit surface; writes nothing |
-| `hop answer <question-id>` | `--file` or `--body`, `--request-id <uuid>` | Human command (controller-machine state root); acks the question atomically with the accepted answer |
+| `hop answer <question-id>` | `--file` or `--body`, `--request-id <uuid>` | Human command (controller-machine state root); acks the question atomically with the accepted answer; no run-state gate |
 | `hop review submit` | `--verdict approve\|reject`, `--subject <commit-oid>`, `--reasons-file <path>` | Reviewer-only; section 8 validation; `verdict accepted <uuid>` |
 | `hop view set` / `hop view clear` | `set`: `--run <id\|r<seq>>` | Owned native-view selection/clear (section 9); exit 0 on server acknowledgement |
 
@@ -1537,7 +1583,8 @@ Worker plumbing (`launch`, `check-exec`, `result submit`, `msg *`,
 rendered it — solo-mode panes continue to carry the Phase 2 argv verbatim,
 and the two forms are mutually exclusive. Exit codes keep the Phase 2
 discipline; message and review refusals exit 1 with the `refused:`
-grammar; usage errors 2.
+grammar, a retryable `transient:` first line also exits 1, and usage
+errors exit 2.
 
 ## 11. Test plan
 
