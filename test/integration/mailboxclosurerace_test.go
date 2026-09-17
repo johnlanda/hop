@@ -63,16 +63,17 @@ func TestRealProcessMailboxClosureRace(t *testing.T) {
 }
 
 // testRealProcessMailboxClosureRaceOrdering covers both commit orders in
-// one run: task t1 (behavior submit-valid, a legacy Phase-2 behavior
-// with no messaging awareness at all -- it never pre-drains) proves
-// "the send lands first" (queued from the moment the task exists, long
-// before any worker process even launches, so the worker's own FIRST
-// hop result submit call is refused transient by construction, and its
-// own built-in retry-on-transient logic, submitOnce, drains and
-// resubmits); task t2 (behavior worker-implement, which drains before
-// ever submitting and so integrates normally) proves "the closure lands
-// first" (a send issued only once its mailbox is already durably closed
-// is refused).
+// one run: task t1 (behavior submit-valid-held, a legacy Phase-2 behavior
+// with no messaging awareness at all -- it never pre-drains -- gated by
+// an opt-in first-submit release) proves "the send lands first" (the send
+// is issued once t1's own session is active, then the release gate holds
+// until the store shows the attempt running with its launch claim execed,
+// so the worker's own FIRST hop result submit call runs against a
+// mailbox that is not yet clear by construction, and its own built-in
+// retry-on-transient logic, submitOnce, drains and resubmits); task t2
+// (behavior worker-implement, which drains before ever submitting and so
+// integrates normally) proves "the closure lands first" (a send issued
+// only once its mailbox is already durably closed is refused).
 func testRealProcessMailboxClosureRaceOrdering(t *testing.T) {
 	start := time.Now()
 	defer func() { t.Logf("MailboxClosureRace/Race wall time: %s", time.Since(start)) }()
@@ -246,7 +247,7 @@ func testRealProcessMailboxClosureRaceOrdering(t *testing.T) {
 }
 
 // testRealProcessMailboxClosureRaceFailure proves the failure-path
-// variant: a worker-hold task killed mid-attempt with its retry budget
+// variant: a worker-block task killed mid-attempt with its retry budget
 // already exhausted (RetryLimit=1: one attempt, no room) fails directly
 // -- never a needs-rework detour (design section 5 reference trace 4's
 // exhaustion variant) -- and the failing settlement's snapshot-equality
@@ -303,7 +304,7 @@ func testRealProcessMailboxClosureRaceFailure(t *testing.T) {
 	// obligation the failing settlement's snapshot-equality contract
 	// (design section 5) must capture in its notice.
 	orphanPath := filepath.Join(scratchDir, "orphan-info-t1.md")
-	if err := os.WriteFile(orphanPath, []byte("manager info addressed to t1 while its worker is dead and its mailbox still open\n"), 0o600); err != nil {
+	if err := os.WriteFile(orphanPath, []byte("manager info addressed to t1 while its worker is still alive and its mailbox still open\n"), 0o600); err != nil {
 		t.Fatalf("write orphan message body: %v", err)
 	}
 	orphanResult := runManagerVerb(t, managerEnv, repo.Root, "msg", "send", "--to", taskAddress(t1), "--kind", "info", "--file", orphanPath, "--request-id", newSpikeUUID(t))

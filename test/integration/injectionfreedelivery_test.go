@@ -432,9 +432,10 @@ func apiLogLineFields(line string) (event, method, requestID string, ok bool) {
 // record silently unpaired without failing loudly, and would make the
 // window-scoped zero-violation count above less trustworthy. Pairing is
 // counted per (method, request_id) key rather than matched line-for-line,
-// since request_id is a per-connection counter (S11): two DIFFERENT
-// connections can log the same id for the same method, but the counts
-// still balance per key as long as every start eventually resolves.
+// since request_id is a CLIENT-chosen label the server only echoes (S11):
+// two DIFFERENT connections can log the same id for the same method, but
+// the counts still balance per key as long as every start eventually
+// resolves.
 func requireEveryRequestPaired(t *testing.T, lines []string, startIdx, endIdx int) {
 	t.Helper()
 	type reqKey struct{ method, requestID string }

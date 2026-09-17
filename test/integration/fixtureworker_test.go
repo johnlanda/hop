@@ -1081,13 +1081,13 @@ func runWorker() {
 		drainMailbox(hopPath)
 		// A THIRD, separate gate -- distinct from both the self-kill
 		// control file and the ack-release gate above -- so a scenario can
-		// assert the section 7 attention condition has fully cleared WHILE
-		// this session is still active, never merely because retirement
-		// made the address no-longer-live (design section 11 scenario 3's
-		// own status-surface assertion needs the drain to have already
-		// happened -- both m1 and m2 acked -- but this process not yet
-		// exited). Dumps an observation the instant the post-drain,
-		// pre-submit checkpoint is reached, then blocks until released.
+		// check the section 7 attention line's absence WHILE this session
+		// is still active, pinning that check to the run's own mid-flight
+		// state (design section 11 scenario 3's own status-surface
+		// assertion needs the drain to have already happened -- both m1
+		// and m2 acked -- but this process not yet exited). Dumps an
+		// observation the instant the post-drain, pre-submit checkpoint is
+		// reached, then blocks until released.
 		presubmitObservedPath := filepath.Join(scratchDir, "fetch-crash-presubmit-observed-"+env["HOP_ATTEMPT_ID"]+".txt")
 		writeContentDigest(presubmitObservedPath, env["HOP_ATTEMPT_ID"], "fetch-crash-presubmit-hold")
 		fmt.Printf("FIXTURE-FETCH-CRASH-PRESUBMIT-HOLD attempt=[%s]\n", env["HOP_ATTEMPT_ID"])
