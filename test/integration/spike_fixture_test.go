@@ -570,6 +570,51 @@ func (s *testServer) waitForAgent(t *testing.T, paneID, agent string) spikeAgent
 	return last[paneID]
 }
 
+// requirePaneShellResolves proves, BEFORE anything runs a bare executable
+// name in a pane, that the pane's own login shell resolves that name to
+// want. Every test that lets a bare name be typed into a pane shell — its
+// own send_text, Herdr's agent.start, or Herdr's deferred agent restore in
+// a shell no test controls — depends on the fixture or stub directory
+// winning PATH resolution, and that is a race the test can LOSE SILENTLY: a
+// macOS login shell runs path_helper, which places every directory in
+// /etc/paths and /etc/paths.d AHEAD of the inherited hermetic PATH, and a
+// developer machine has real claude, codex and opencode installed in one of
+// them. A PATH prepend written into the temporary HOME is the arrangement;
+// this is the check that the arrangement held, and it fails LOUDLY with the
+// path actually resolved rather than letting a real harness binary run.
+//
+// The resolution is written to a file in the test's own artifact directory
+// rather than read off the screen: `command -v` is a shell builtin, so
+// nothing is executed, and a file carries the answer whole — a terminal
+// snapshot would wrap a long path at the pane width and echo the request
+// back as well. A name that resolves to nothing writes the sentinel, so the
+// assertion always has something to report.
+func requirePaneShellResolves(t *testing.T, server *testServer, artifacts *artifactDir, paneID, name, want string) {
+	t.Helper()
+	const unresolved = "NOT-RESOLVED"
+	server.waitForShellReady(t, paneID)
+	out := filepath.Join(artifacts.dir(t, "path-resolution"), "resolved-"+name+".txt")
+	server.call(t, "pane.send_text", map[string]any{
+		"pane_id": paneID,
+		"text":    "{ command -v " + name + " || echo " + unresolved + " ; } > " + out + " 2>/dev/null\n",
+	}, nil)
+	var resolved string
+	if !waitUntil(func() bool {
+		content, err := os.ReadFile(out) //nolint:gosec // G304: the path is inside this test's own artifact directory.
+		if err != nil {
+			return false
+		}
+		resolved = strings.TrimSpace(string(content))
+		return resolved != ""
+	}) {
+		t.Fatalf("the pane %s login shell never reported how it resolves %q; this test cannot let a bare %q run without knowing that", paneID, name, name)
+	}
+	if resolved != want {
+		t.Fatalf("the pane login shell resolves %q to %q, want this test's own %q. The PATH arrangement this test depends on is not holding, and a bare %q here would run that other binary — on a developer machine that is the real harness", name, resolved, want, name)
+	}
+	t.Logf("the pane login shell resolves %q to this test's own %s", name, resolved)
+}
+
 // waitForShellReady polls pane.process_info until the pane's own login shell
 // is observed as the sole foreground process (nonzero shell pid, foreground
 // group equal to it, exactly one foreground process whose pid is the shell),

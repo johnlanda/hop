@@ -79,6 +79,13 @@ func TestSpikeAgentStartArgvCapability(t *testing.T) {
 	// pane shell to be idle and the sole foreground process, so wait for that
 	// before issuing it (otherwise it races the login shell's startup and
 	// returns agent_pane_busy).
+	// agent.start is about to type a bare `claude` into this shell. The
+	// .profile prepend above only ARRANGES for that to be the stub; this
+	// proves it, before the name is ever run, so losing the race to
+	// path_helper fails here instead of silently starting the real harness
+	// installed on a developer machine.
+	requirePaneShellResolves(t, server, artifacts, pane, "claude", filepath.Join(server.base, "bin", "claude"))
+
 	server.waitForShellReady(t, pane)
 	runID := newSpikeUUID(t)
 	server.waitForAgentStart(t, map[string]any{

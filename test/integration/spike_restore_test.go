@@ -138,6 +138,19 @@ func TestSpikeRestoreAutoRelaunchBypassesLauncher(t *testing.T) {
 	}, &tab)
 	pane := tab.RootPane.PaneID
 
+	// Before ANY bare `claude` is run — this test's own send_text below, and
+	// later Herdr's deferred restore, which types one into a login shell
+	// this test does not control — prove that a pane login shell resolves
+	// the name to the fixture. The PATH prepend above is the arrangement;
+	// this is the guarantee, and it is needed because the arrangement is a
+	// race it can lose silently: a macOS login shell runs path_helper,
+	// which puts the directories in /etc/paths and /etc/paths.d AHEAD of
+	// the inherited hermetic PATH, and a developer machine has a real
+	// claude installed in one of them. Resolving to anything else stops the
+	// test here, before any process is started, rather than letting Herdr
+	// run the operator's real harness unsupervised in a restored pane.
+	requirePaneShellResolves(t, server, artifacts, pane, "claude", fixtures.claude)
+
 	// Launch the fixture harness so the pane is a live, detected claude agent,
 	// carrying the additive HOP_RUN_ID. Wait for its env dump to be durably
 	// written (SPIKE-ENV-WRITTEN follows the atomic rename) and capture the
