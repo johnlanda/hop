@@ -348,7 +348,8 @@ Diff scope: %s..%s
 
 Your worktree is checked out at the subject commit. Review exactly this
 candidate: the completion guard compares object IDs, and a verdict for
-any other commit is refused with refused: %s.
+any other commit is refused with refused: %s. On that first line,
+resubmit with the subject commit this assignment names.
 
 ## Instructions
 

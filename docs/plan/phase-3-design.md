@@ -1580,7 +1580,14 @@ parsing those same lines (section 11):
 
 Refusals exit 1 with one first line `refused: <reason-token>` and detail
 lines after; reason tokens are enumerated in the same grammar constant
-set. `hop msg next` and `hop msg wait` have no refusal line: a fetch
+set, and every token is the store's typed reason, set where it decides —
+never inferred from detail text. `hop review submit`'s refusals are
+`subject-mismatch` (a verdict about any candidate but the review task's
+frozen subject: resubmit with the subject the review assignment names),
+`not-reviewer` (the caller is not the review attempt's own reviewer
+session), `stale` (every other ineligibility), `malformed` and
+`conflicting`; a refused outcome naming no token its kind admits prints
+no protocol line. `hop msg next` and `hop msg wait` have no refusal line: a fetch
 refused for authority (another run's session, a stale incarnation, an
 address the session does not resolve to, or a session that is not its
 address's current session) prints nothing on stdout, one
@@ -1750,17 +1757,20 @@ the head's commit + tree object IDs, frozen into the task row and the
 review assignment artifact) and assigns it into a concurrency slot like
 any task. `SubmitReview`'s validation order: parse and bound (verdict
 token, reasons ≤ 64 KiB, subject a full object-ID pair); existence and
-agreement (attempt belongs to the review task, task to the run); prior
-accepted verdict for the attempt — equal reasons digest and verdict →
-duplicate, idempotent; different → conflicting, refused, accepted verdict
-undisturbed; eligibility — caller session is the attempt's current session
-with a current incarnation, session role `reviewer`, run not
-stopping/stopped, attempt `running` (or `launching`/`relaunching` with a
-settled claim — the Phase 2 early-submission rule), the review task's
-mailbox clear (else the section 5 `transient: undelivered messages`
-refusal), AND the submitted
-subject equals the review task's frozen subject (`ErrVerdictSubjectMismatch`
-→ refused: the reviewer reviewed the wrong candidate); accept atomically —
+agreement (attempt belongs to the review task, task to the run;
+`refused: malformed` otherwise); prior accepted verdict for the attempt —
+equal reasons digest and verdict → duplicate, idempotent; different →
+`refused: conflicting`, accepted verdict undisturbed; eligibility — the
+caller session is the attempt's own reviewer session (a `reviewer` of the
+run bound to this attempt; `refused: not-reviewer` otherwise), with a
+current incarnation, run not stopping/stopped, attempt `running` (or
+`launching`/`relaunching` with a settled claim — the Phase 2
+early-submission rule; `refused: stale` for any of these), the review
+task's mailbox clear (else the section 5 `transient: undelivered
+messages` refusal), AND the submitted subject equals the review task's
+frozen subject (`ErrVerdictSubjectMismatch` → `refused: subject-mismatch`:
+the reviewer reviewed the wrong candidate and resubmits with the frozen
+subject); accept atomically —
 verdict row, receipt, `Attempt.Submit` then the review-only
 `Attempt.CompleteReview` transition (section 5: review attempts never
 enter `checking`) and `Task→completed`, with their evidence rows, and the

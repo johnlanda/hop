@@ -472,6 +472,14 @@ func AckMessageCrossRun(claimedRunID identity.RunID, messageID identity.MessageI
 	return app.MessageAck{RunID: claimedRunID, MessageID: messageID, SessionID: session, IncarnationID: incarnation}
 }
 
+// ReviewSubmitForeignReviewerReason and ReviewSubmitForeignReviewerDetail
+// are ReviewSubmitForeignReviewer's expected refusal reason token and
+// detail.
+const (
+	ReviewSubmitForeignReviewerReason = app.GrammarReasonNotReviewer
+	ReviewSubmitForeignReviewerDetail = app.ReviewNotReviewerDetail
+)
+
 // ReviewSubmitForeignReviewer returns a ReviewStore.SubmitReview request
 // whose submitting session is a live, currently-bound reviewer that is
 // NOT the claimed attempt's own reviewer session: a reviewer of another
@@ -479,8 +487,9 @@ func AckMessageCrossRun(claimedRunID identity.RunID, messageID identity.MessageI
 // consuming test's fixture decides which shape it builds — both must be
 // refused identically). foreignIncarnation is that session's own CURRENT
 // incarnation, so nothing but the session-to-attempt binding can be the
-// refusal's cause. Refused app.ReviewStale, detail "caller is not the
-// review task's reviewer session", with NO review row and NO state
+// refusal's cause. Refused app.ReviewStale (reason
+// ReviewSubmitForeignReviewerReason), detail
+// ReviewSubmitForeignReviewerDetail, with NO review row and NO state
 // transition committed: the acceptance context is never assembled from a
 // foreign session's binding or launch claim, which would otherwise let a
 // live reviewer elsewhere complete this attempt.

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/johnlanda/hop/internal/app"
@@ -125,22 +124,66 @@ func TestRunReviewSubmit(t *testing.T) {
 		})
 	}
 
-	t.Run("a refusal renders refused: <token>", func(t *testing.T) {
-		ctrl := &fakeController{}
-		ctrl.submitReview = func(app.SubmitReviewRequest) (app.SubmitReviewResult, error) {
-			return app.SubmitReviewResult{Outcome: "stale", Detail: "verdict subject mismatch"}, nil
-		}
-		td := newTestDeps(ctrl, reviewerEnv(), t.TempDir())
-		var stdout, stderr bytes.Buffer
+	refusals := []struct {
+		name       string
+		result     app.SubmitReviewResult
+		wantStdout string
+		wantStderr string
+	}{
+		{
+			name:       "a subject mismatch renders refused: subject-mismatch",
+			result:     app.SubmitReviewResult{Outcome: "stale", Reason: app.GrammarReasonSubjectMismatch, Detail: "run: verdict subject mismatch: task t"},
+			wantStdout: "refused: subject-mismatch\nrun: verdict subject mismatch: task t\n",
+		},
+		{
+			name:       "a caller that is not the attempt's reviewer renders refused: not-reviewer",
+			result:     app.SubmitReviewResult{Outcome: "stale", Reason: app.GrammarReasonNotReviewer, Detail: app.ReviewNotReviewerDetail},
+			wantStdout: "refused: not-reviewer\n" + app.ReviewNotReviewerDetail + "\n",
+		},
+		{
+			name:       "a stale caller renders refused: stale",
+			result:     app.SubmitReviewResult{Outcome: "stale", Reason: app.GrammarReasonStale, Detail: "run: stale submission"},
+			wantStdout: "refused: stale\nrun: stale submission\n",
+		},
+		{
+			name:       "a malformed submission renders refused: malformed",
+			result:     app.SubmitReviewResult{Outcome: "malformed", Reason: app.GrammarReasonMalformed, Detail: "attempt/task/run do not agree"},
+			wantStdout: "refused: malformed\nattempt/task/run do not agree\n",
+		},
+		{
+			name:       "the reason decides, never the detail text",
+			result:     app.SubmitReviewResult{Outcome: "stale", Reason: app.GrammarReasonNotReviewer, Detail: "verdict subject mismatch"},
+			wantStdout: "refused: not-reviewer\nverdict subject mismatch\n",
+		},
+		{
+			name:       "a refusal naming no reason prints no protocol line",
+			result:     app.SubmitReviewResult{Outcome: "stale", Detail: "verdict subject mismatch"},
+			wantStderr: "hop review submit: refused outcome names no known reason\n",
+		},
+		{
+			name:       "a reason its kind does not admit prints no protocol line",
+			result:     app.SubmitReviewResult{Outcome: "malformed", Reason: app.GrammarReasonSubjectMismatch},
+			wantStderr: "hop review submit: refused outcome names no known reason\n",
+		},
+	}
+	for _, tc := range refusals {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := &fakeController{}
+			ctrl.submitReview = func(app.SubmitReviewRequest) (app.SubmitReviewResult, error) {
+				return tc.result, nil
+			}
+			td := newTestDeps(ctrl, reviewerEnv(), t.TempDir())
+			var stdout, stderr bytes.Buffer
 
-		code, err := runReview([]string{"submit", "--verdict", "approve", "--subject", "cccccccccccccccccccccccccccccccccccccccc", "--reasons-file", reasonsFile}, &stdout, &stderr, td.deps)
-		if err != nil {
-			t.Fatalf("write error: %v", err)
-		}
-		if code != exitFailure || !strings.HasPrefix(stdout.String(), "refused: stale\n") {
-			t.Errorf("code = %d, stdout = %q", code, stdout.String())
-		}
-	})
+			code, err := runReview([]string{"submit", "--verdict", "approve", "--subject", "cccccccccccccccccccccccccccccccccccccccc", "--reasons-file", reasonsFile}, &stdout, &stderr, td.deps)
+			if err != nil {
+				t.Fatalf("write error: %v", err)
+			}
+			if code != exitFailure || stdout.String() != tc.wantStdout || stderr.String() != tc.wantStderr {
+				t.Errorf("code = %d, stdout = %q, stderr = %q; want %d, %q, %q", code, stdout.String(), stderr.String(), exitFailure, tc.wantStdout, tc.wantStderr)
+			}
+		})
+	}
 
 	t.Run("missing required flags is a usage error", func(t *testing.T) {
 		td := newTestDeps(&fakeController{}, reviewerEnv(), t.TempDir())

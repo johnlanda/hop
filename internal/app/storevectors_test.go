@@ -606,8 +606,8 @@ func TestStoreVectors(t *testing.T) {
 				if err != nil {
 					t.Fatalf("%s.SubmitReview() error = %v", name, err)
 				}
-				if got.Kind != app.ReviewStale {
-					t.Fatalf("%s.SubmitReview(foreign reviewer) = %+v, want stale refusal", name, got)
+				if got.Kind != app.ReviewStale || got.Reason != storevectors.ReviewSubmitForeignReviewerReason || got.Detail != storevectors.ReviewSubmitForeignReviewerDetail {
+					t.Fatalf("%s.SubmitReview(foreign reviewer) = %+v, want stale/%s %q", name, got, storevectors.ReviewSubmitForeignReviewerReason, storevectors.ReviewSubmitForeignReviewerDetail)
 				}
 				if _, exists := rf.tc.Store.Reviews[rf.AttemptID]; exists {
 					t.Fatalf("%s accepted a foreign reviewer's verdict: review row exists", name)

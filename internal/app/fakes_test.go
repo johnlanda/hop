@@ -963,6 +963,14 @@ func (s *fakeStore) RequestStop(_ context.Context, runID identity.RunID) error {
 func (s *fakeStore) SubmitResult(_ context.Context, submission app.ResultSubmission) (app.SubmissionOutcome, error) { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.submitResultLocked(&submission, nil), nil
+}
+
+// submitResultLocked decides and records one result submission. onAccept,
+// when non-nil, runs after an acceptance is applied and before the lock is
+// released, as the real store's accepting transaction commits its own side
+// effects. Callers hold s.mu.
+func (s *fakeStore) submitResultLocked(submission *app.ResultSubmission, onAccept func()) app.SubmissionOutcome {
 	now := s.clock.Now()
 
 	// Section 7 step 2 first: existence and agreement (attempt belongs to
@@ -973,14 +981,14 @@ func (s *fakeStore) SubmitResult(_ context.Context, submission app.ResultSubmiss
 	if !ok {
 		outcome := app.SubmissionOutcome{Kind: app.SubmissionMalformed, Detail: "unknown attempt"}
 		s.Submissions = append(s.Submissions, outcome)
-		return outcome, nil
+		return outcome
 	}
 	tRow := s.Tasks[submission.TaskID]
 	rRow := s.Runs[submission.RunID]
 	if tRow == nil || rRow == nil || aRow.value.TaskID != submission.TaskID || tRow.value.RunID != submission.RunID {
 		outcome := app.SubmissionOutcome{Kind: app.SubmissionMalformed, Detail: "attempt/task/run do not agree"}
 		s.Submissions = append(s.Submissions, outcome)
-		return outcome, nil
+		return outcome
 	}
 
 	// Step 3 onward is the domain's AcceptResult, handed any prior
@@ -1026,6 +1034,9 @@ func (s *fakeStore) SubmitResult(_ context.Context, submission app.ResultSubmiss
 			State: app.CheckRequestRequested, CreatedAt: now,
 		}
 		outcome = app.SubmissionOutcome{Kind: app.SubmissionAccepted, ResultID: submission.ID}
+		if onAccept != nil {
+			onAccept()
+		}
 	case errors.Is(err, run.ErrDuplicateResult):
 		outcome = app.SubmissionOutcome{Kind: app.SubmissionDuplicate, ResultID: outcomeVal.Result.ID}
 	case errors.Is(err, run.ErrConflictingResult):
@@ -1041,7 +1052,7 @@ func (s *fakeStore) SubmitResult(_ context.Context, submission app.ResultSubmiss
 		outcome = app.SubmissionOutcome{Kind: app.SubmissionStale, Detail: err.Error()}
 	}
 	s.Submissions = append(s.Submissions, outcome)
-	return outcome, nil
+	return outcome
 }
 
 func (s *fakeStore) RecordMalformed(_ context.Context, claimed app.ClaimedSubmission) (app.SubmissionOutcome, error) { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.

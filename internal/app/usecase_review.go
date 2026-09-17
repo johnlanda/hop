@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 
@@ -37,12 +38,27 @@ type SubmitReviewRequest struct {
 // SubmitReviewResult is SubmitReviewVerdict's outcome. TransientReason is
 // one of the TransientReason values as a string, set exactly when Outcome
 // is "transient": it alone selects the reviewer's retry line
-// (GrammarSubmissionTransientLine); Detail is diagnostic evidence.
+// (GrammarSubmissionTransientLine). Reason is the grammar reason token,
+// set exactly when Outcome is "malformed", "conflicting" or "stale": it
+// alone selects the `refused: <token>` line. Detail is diagnostic
+// evidence.
 type SubmitReviewResult struct {
 	Outcome         string
 	ReviewID        string
 	Detail          string
+	Reason          string
 	TransientReason string
+}
+
+// ErrReviewReasonInvalid reports a store outcome whose refusal reason does
+// not match its kind (ReviewReasonAdmitted): a refused outcome naming no
+// token, or one its kind does not admit, or a reason on any other outcome.
+var ErrReviewReasonInvalid = errors.New("app: review outcome reason does not match its kind")
+
+// reviewMalformed is a malformed outcome decided before the store is
+// reached, carrying its grammar reason token.
+func reviewMalformed(detail string) SubmitReviewResult {
+	return SubmitReviewResult{Outcome: string(ReviewMalformed), Reason: GrammarReasonMalformed, Detail: detail}
 }
 
 // SubmitReviewVerdict is the driving use case behind `hop review submit`
@@ -58,23 +74,23 @@ func (c *Controller) SubmitReviewVerdict(ctx context.Context, req SubmitReviewRe
 	}
 	runID, err := identity.ParseRunID(req.RunID)
 	if err != nil {
-		return SubmitReviewResult{Outcome: string(ReviewMalformed), Detail: "run id does not parse"}, nil
+		return reviewMalformed("run id does not parse"), nil
 	}
 	taskID, err := identity.ParseTaskID(req.TaskID)
 	if err != nil {
-		return SubmitReviewResult{Outcome: string(ReviewMalformed), Detail: "task id does not parse"}, nil
+		return reviewMalformed("task id does not parse"), nil
 	}
 	attemptID, err := identity.ParseAttemptID(req.AttemptID)
 	if err != nil {
-		return SubmitReviewResult{Outcome: string(ReviewMalformed), Detail: "attempt id does not parse"}, nil
+		return reviewMalformed("attempt id does not parse"), nil
 	}
 	sessionID, err := identity.ParseSessionID(req.SessionID)
 	if err != nil {
-		return SubmitReviewResult{Outcome: string(ReviewMalformed), Detail: "session id does not parse"}, nil
+		return reviewMalformed("session id does not parse"), nil
 	}
 	incarnationID, err := identity.ParseIncarnationID(req.IncarnationID)
 	if err != nil {
-		return SubmitReviewResult{Outcome: string(ReviewMalformed), Detail: "incarnation id does not parse"}, nil
+		return reviewMalformed("incarnation id does not parse"), nil
 	}
 	var verdict run.Verdict
 	switch req.Verdict {
@@ -83,13 +99,13 @@ func (c *Controller) SubmitReviewVerdict(ctx context.Context, req SubmitReviewRe
 	case string(run.VerdictReject):
 		verdict = run.VerdictReject
 	default:
-		return SubmitReviewResult{Outcome: string(ReviewMalformed), Detail: "verdict must be approve or reject"}, nil
+		return reviewMalformed("verdict must be approve or reject"), nil
 	}
 	if req.SubjectCommitOID == "" {
-		return SubmitReviewResult{Outcome: string(ReviewMalformed), Detail: "subject commit is required"}, nil
+		return reviewMalformed("subject commit is required"), nil
 	}
 	if len(req.ReasonsBody) > ReviewReasonsLimit {
-		return SubmitReviewResult{Outcome: string(ReviewMalformed), Detail: "reasons exceed the 64 KiB bound"}, nil
+		return reviewMalformed("reasons exceed the 64 KiB bound"), nil
 	}
 
 	frozen, err := c.Read.LoadFrozenRun(ctx, runID)
@@ -98,7 +114,7 @@ func (c *Controller) SubmitReviewVerdict(ctx context.Context, req SubmitReviewRe
 	}
 	subjectTree, err := c.runGit(ctx, frozen.RepositoryRoot, "rev-parse", req.SubjectCommitOID+"^{tree}")
 	if err != nil {
-		return SubmitReviewResult{Outcome: string(ReviewMalformed), Detail: "subject commit does not resolve in the recorded repository"}, nil
+		return reviewMalformed("subject commit does not resolve in the recorded repository"), nil
 	}
 
 	reviewID, err := identity.ParseReviewID(c.IDs.NewID())
@@ -122,8 +138,11 @@ func (c *Controller) SubmitReviewVerdict(ctx context.Context, req SubmitReviewRe
 	if err := checkTransientReason(outcome.Kind == ReviewTransient, outcome.Transient); err != nil {
 		return SubmitReviewResult{}, fmt.Errorf("app: submit review: %w", err)
 	}
+	if !ReviewReasonAdmitted(outcome.Kind, outcome.Reason) {
+		return SubmitReviewResult{}, fmt.Errorf("app: submit review: %w: %s outcome with reason %q", ErrReviewReasonInvalid, outcome.Kind, outcome.Reason)
+	}
 	return SubmitReviewResult{
 		Outcome: string(outcome.Kind), ReviewID: outcome.ReviewID.String(), Detail: outcome.Detail,
-		TransientReason: string(outcome.Transient),
+		Reason: outcome.Reason, TransientReason: string(outcome.Transient),
 	}, nil
 }

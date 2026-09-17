@@ -1097,13 +1097,29 @@ func (s *fakeStore) ClosePlan(_ context.Context, req app.PlanClose) (app.PlanClo
 func (s *fakeStore) SubmitReview(_ context.Context, submission app.ReviewSubmission) (app.ReviewOutcome, error) { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.submitReviewLocked(&submission, nil), nil
+}
+
+// submitReviewLocked decides one review submission in the real store's
+// order: existence and agreement (malformed), then any prior accepted
+// verdict (duplicate or conflicting, whatever the caller's eligibility),
+// then — for a first acceptance only — the reviewer session, which must be
+// a reviewer of the submission's own run bound to exactly the review
+// attempt being settled (not-reviewer otherwise: a foreign session's
+// binding and launch claim never assemble this attempt's acceptance
+// context), then AcceptVerdict. Every refusal carries the grammar reason
+// token the real store sets at the same decision point. onAccept, when
+// non-nil, runs after an acceptance is applied and before the lock is
+// released, as the real store's accepting transaction commits its own
+// side effects. Callers hold s.mu.
+func (s *fakeStore) submitReviewLocked(submission *app.ReviewSubmission, onAccept func()) app.ReviewOutcome {
 	now := s.clock.Now()
 
 	rRow, ok := s.Runs[submission.RunID]
 	tRow := s.Tasks[submission.TaskID]
 	aRow, aok := s.Attempts[submission.AttemptID]
 	if !ok || tRow == nil || !aok || aRow.value.TaskID != submission.TaskID || tRow.value.RunID != submission.RunID {
-		return app.ReviewOutcome{Kind: app.ReviewMalformed, Detail: "attempt/task/run do not agree"}, nil
+		return app.ReviewOutcome{Kind: app.ReviewMalformed, Reason: app.GrammarReasonMalformed, Detail: "attempt/task/run do not agree"}
 	}
 
 	var prior *run.Review
@@ -1111,21 +1127,11 @@ func (s *fakeStore) SubmitReview(_ context.Context, submission app.ReviewSubmiss
 		p := existing
 		prior = &p
 	}
-
-	// Receipt before eligibility: a prior accepted verdict resolves as
-	// duplicate or conflicting whatever the caller's current eligibility;
-	// only a FIRST acceptance validates the reviewer session, which must
-	// be a reviewer of the submission's own run bound to exactly the
-	// review attempt being settled — a foreign session's binding and
-	// launch claim must never assemble this attempt's acceptance context
-	// (the real store's reviewerSessionEligible, enforced here too so a
-	// direct caller of the base fake is refused exactly like one going
-	// through the featureStore wrapper).
 	if prior == nil {
 		sRow, sessionOK := s.Sessions[submission.Session]
 		if !sessionOK || sRow.value.Role != run.RoleReviewer || tRow.value.Kind != run.TaskKindReview ||
 			sRow.value.RunID != submission.RunID || sRow.value.AttemptID != submission.AttemptID {
-			return app.ReviewOutcome{Kind: app.ReviewStale, Detail: "caller is not the review task's reviewer session"}, nil
+			return app.ReviewOutcome{Kind: app.ReviewStale, Reason: app.GrammarReasonNotReviewer, Detail: app.ReviewNotReviewerDetail}
 		}
 	}
 
@@ -1149,16 +1155,19 @@ func (s *fakeStore) SubmitReview(_ context.Context, submission app.ReviewSubmiss
 		tRow.revision++
 		aRow.value = outcomeVal.Attempt
 		aRow.revision++
-		return app.ReviewOutcome{Kind: app.ReviewAccepted, ReviewID: submission.ID}, nil
+		if onAccept != nil {
+			onAccept()
+		}
+		return app.ReviewOutcome{Kind: app.ReviewAccepted, ReviewID: submission.ID}
 	case errors.Is(err, run.ErrDuplicateResult):
-		return app.ReviewOutcome{Kind: app.ReviewDuplicate, ReviewID: outcomeVal.Review.ID}, nil
+		return app.ReviewOutcome{Kind: app.ReviewDuplicate, ReviewID: outcomeVal.Review.ID}
 	case errors.Is(err, run.ErrConflictingResult):
-		return app.ReviewOutcome{Kind: app.ReviewConflicting, ReviewID: outcomeVal.Review.ID}, nil
+		return app.ReviewOutcome{Kind: app.ReviewConflicting, ReviewID: outcomeVal.Review.ID, Reason: app.GrammarReasonConflicting}
 	case errors.Is(err, run.ErrTransientNotRunning), errors.Is(err, run.ErrMailboxNotClear):
 		reason, _ := app.TransientReasonOf(err)
-		return app.ReviewOutcome{Kind: app.ReviewTransient, Detail: err.Error(), Transient: reason}, nil
+		return app.ReviewOutcome{Kind: app.ReviewTransient, Detail: err.Error(), Transient: reason}
 	default:
-		return app.ReviewOutcome{Kind: app.ReviewStale, Detail: err.Error()}, nil
+		return app.ReviewOutcome{Kind: app.ReviewStale, Reason: app.ReviewRefusalReasonOf(err), Detail: err.Error()}
 	}
 }
 

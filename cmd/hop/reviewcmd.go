@@ -90,7 +90,10 @@ func runReviewSubmit(args []string, stdout, stderr io.Writer, d *deps) (int, err
 // on its own (the store's own Detail, if any, goes to stderr, mirroring
 // hop result submit's identical convention; a transient outcome naming no
 // known reason prints no protocol line and fails), accepted/duplicate
-// name the review, and everything else is a refusal.
+// name the review, and everything else is a refusal whose token is its
+// typed Reason (refused: stale, not-reviewer, subject-mismatch, malformed
+// or conflicting) followed by its detail — a refusal naming no admitted
+// reason prints no protocol line and fails.
 func writeReviewResultAndExit(stdout, stderr io.Writer, result *app.SubmitReviewResult) (int, error) {
 	if result.Outcome == string(app.ReviewTransient) {
 		line, ok := app.GrammarSubmissionTransientLine(app.TransientReason(result.TransientReason))
@@ -114,6 +117,11 @@ func writeReviewResultAndExit(stdout, stderr io.Writer, result *app.SubmitReview
 	case "duplicate":
 		return writeLinesAndExit(stdout, []string{app.GrammarVerdictDuplicateLine(result.ReviewID)})
 	default:
-		return writeLinesAndExit(stdout, renderRefusal(reviewRefusalToken(result.Outcome), result.Detail))
+		token, ok := reviewRefusalToken(result.Outcome, result.Reason)
+		if !ok {
+			_, err := fmt.Fprintln(stderr, "hop review submit: refused outcome names no known reason")
+			return exitFailure, err
+		}
+		return writeLinesAndExit(stdout, renderRefusal(token, result.Detail))
 	}
 }

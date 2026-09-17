@@ -193,7 +193,7 @@ func TestTemplatesQuoteGrammar(t *testing.T) {
 	}))
 	for _, quote := range []string{
 		"/hop " + GrammarVerbReviewSubmit + " --verdict <approve|reject> --subject headoid",
-		GrammarRefusalLine(GrammarReasonSubjectMismatch),
+		GrammarRefusalLine(GrammarReasonSubjectMismatch) + ". On that first line,\nresubmit with the subject commit this assignment names.",
 		"Diff scope: baseoid..headoid",
 	} {
 		if !strings.Contains(review, quote) {

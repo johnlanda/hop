@@ -1,6 +1,7 @@
 package main
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/johnlanda/hop/internal/app"
@@ -21,31 +22,36 @@ func TestRefusalTokenFallsBackOnEmptyReason(t *testing.T) {
 	}
 }
 
-// TestReviewRefusalTokenIsExhaustive pins reviewRefusalToken's claim that
-// the only ReviewOutcomeKind values it is ever called with are malformed,
-// conflicting and stale — accepted, duplicate and transient are rendered
-// by writeReviewResultAndExit before reviewRefusalToken is ever reached
-// (reviewcmd.go). If a future ReviewOutcomeKind is added without updating
-// this table, this test documents exactly which kinds are covered today so
-// the gap is visible in a diff rather than silently falling back to
-// "unauthorized".
+// TestReviewRefusalTokenIsExhaustive pins reviewRefusalToken against every
+// refused review outcome kind and every reason token: a pair renders its
+// reason exactly when the kind admits it — stale admits stale, not-reviewer
+// and subject-mismatch; malformed and conflicting only their own token —
+// and any other pair, an empty reason or an unknown kind renders nothing,
+// never a guessed token.
 func TestReviewRefusalTokenIsExhaustive(t *testing.T) {
-	cases := map[app.ReviewOutcomeKind]string{
-		app.ReviewMalformed:   app.GrammarReasonMalformed,
-		app.ReviewConflicting: app.GrammarReasonConflicting,
-		app.ReviewStale:       app.GrammarReasonStale,
+	admitted := map[app.ReviewOutcomeKind][]string{
+		app.ReviewMalformed:   {app.GrammarReasonMalformed},
+		app.ReviewConflicting: {app.GrammarReasonConflicting},
+		app.ReviewStale:       {app.GrammarReasonStale, app.GrammarReasonNotReviewer, app.GrammarReasonSubjectMismatch},
 	}
-	for kind, want := range cases {
-		if got := reviewRefusalToken(string(kind)); got != want {
-			t.Errorf("reviewRefusalToken(%q) = %q, want %q", kind, got, want)
+	reasons := []string{
+		"", app.GrammarReasonNotFound, app.GrammarReasonUnauthorized, app.GrammarReasonMalformed,
+		app.GrammarReasonConflicting, app.GrammarReasonStale, app.GrammarReasonNotDelivered,
+		app.GrammarReasonRunNotAccepting, app.GrammarReasonMailboxClosed, app.GrammarReasonNotManager,
+		app.GrammarReasonNotReviewer, app.GrammarReasonDependencyCycle, app.GrammarReasonEmptyPlan,
+		app.GrammarReasonRetryNotTerminal, app.GrammarReasonRetryLimit, app.GrammarReasonSubjectMismatch,
+	}
+	kinds := []app.ReviewOutcomeKind{
+		app.ReviewMalformed, app.ReviewConflicting, app.ReviewStale,
+		app.ReviewAccepted, app.ReviewDuplicate, app.ReviewTransient, "some-future-kind",
+	}
+	for _, kind := range kinds {
+		for _, reason := range reasons {
+			want := slices.Contains(admitted[kind], reason)
+			token, ok := reviewRefusalToken(string(kind), reason)
+			if ok != want || (ok && token != reason) || (!ok && token != "") {
+				t.Errorf("reviewRefusalToken(%q, %q) = %q, %t; want the reason rendered: %t", kind, reason, token, ok, want)
+			}
 		}
-	}
-	// Every ReviewOutcomeKind this function is ever actually called with
-	// (accepted/duplicate/transient are intercepted by the caller first)
-	// is covered above; a kind outside that set is a defect elsewhere, not
-	// something this function can classify correctly, so the fallback
-	// stays the documented generic token.
-	if got := reviewRefusalToken("some-future-kind"); got != app.GrammarReasonUnauthorized {
-		t.Fatalf("reviewRefusalToken(unrecognized) = %q, want the generic fallback %q", got, app.GrammarReasonUnauthorized)
 	}
 }
