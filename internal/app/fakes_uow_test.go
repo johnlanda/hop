@@ -262,6 +262,11 @@ func (u *fakeUnitOfWork) Commit() error {
 	}
 	for incarnation, settlement := range u.launchClaimSettled {
 		claim := s.LaunchClaims[incarnation]
+		if claim.State == settlement.State {
+			// Resettling to the same state is a no-op in the real store: the
+			// first settlement's error and evidence stand.
+			continue
+		}
 		claim.State = settlement.State
 		claim.SettledAt = settlement.At
 		claim.SettlementEvidence = fmt.Sprintf("pane=%s pid=%d exe=%s marker=%s", settlement.PaneID, settlement.PID, settlement.Executable, settlement.ArgvMarker)
@@ -426,8 +431,13 @@ func (u *fakeUnitOfWork) validateStagedLocked() error {
 		if !ok {
 			return fmt.Errorf("%w: launch claim %s", app.ErrNotFound, incarnation)
 		}
-		// Settle is legal only from exec_pending; resettling to the same
-		// state is idempotent (LaunchClaimRepository's documented contract).
+		// Settle is legal only from exec_pending, only to execed or
+		// exec_failed; resettling to the same state is idempotent
+		// (LaunchClaimRepository's documented contract, as the sqlite
+		// adapter enforces it).
+		if settlement.State != app.LaunchClaimExeced && settlement.State != app.LaunchClaimExecFailed {
+			return fmt.Errorf("app_test: launch claim %s: %q is not a settlement state", incarnation, settlement.State)
+		}
 		if claim.State != app.LaunchClaimExecPending && claim.State != settlement.State {
 			return fmt.Errorf("app_test: launch claim %s cannot settle from %s to %s", incarnation, claim.State, settlement.State)
 		}

@@ -347,6 +347,19 @@ func (c *Controller) reconcileFeatureSession(ctx context.Context, handle RunHand
 	if err != nil {
 		return report, err
 	}
+	pendingDetail := ""
+	if claimFound && claim.State == LaunchClaimExecPending && bindingFound && binding.PaneID != "" {
+		// The launch-ended row, exactly as the loop's corroboration applies
+		// it: a placed, unsettled launch whose pane and claimed process are
+		// both observed gone is settled exec_failed, and the exec_failed
+		// branch below then retires it.
+		current, detail, endErr := c.settleIfLaunchEnded(ctx, handle, &binding, &claim)
+		if endErr != nil {
+			return report, endErr
+		}
+		claim = current
+		pendingDetail = detail
+	}
 	if claimFound && claim.State == LaunchClaimExecFailed {
 		// Nothing is live for this incarnation, placed or not (a launcher
 		// whose exec failed has exited, closing its pane). A child's exec
@@ -356,11 +369,16 @@ func (c *Controller) reconcileFeatureSession(ctx context.Context, handle RunHand
 		// the attempt-less manager's session is only terminated, and the
 		// manager-lineage failure cause then fails the run on the next
 		// retirement pass.
+		managerReason := "resume: exec failed, no process"
+		if launchEndedByController(&claim) {
+			report.Detail = launchEndedReason
+			managerReason = "resume: " + workerLaunchEnded().sessionReason
+		}
 		if session.Role != run.RoleManager {
 			if err := c.settleChildExecFailure(ctx, handle, frozen, session); err != nil {
 				return report, err
 			}
-		} else if err := c.terminateRetiredSession(ctx, handle, session.ID, "resume: exec failed, no process"); err != nil {
+		} else if err := c.terminateRetiredSession(ctx, handle, session.ID, managerReason); err != nil {
 			return report, err
 		}
 		report.Disposition = SessionRetiredNoProcess
@@ -374,6 +392,9 @@ func (c *Controller) reconcileFeatureSession(ctx context.Context, handle RunHand
 	if !claimFound || claim.State != LaunchClaimExeced {
 		report.Disposition = SessionPending
 		report.Detail = "launch claim not settled; corroboration continues"
+		if pendingDetail != "" {
+			report.Detail += " (" + pendingDetail + ")"
+		}
 		return report, nil
 	}
 

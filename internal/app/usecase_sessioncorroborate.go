@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -122,18 +123,7 @@ func (c *Controller) corroborateSessionLaunch(ctx context.Context, handle RunHan
 
 	switch claim.State {
 	case LaunchClaimExecFailed:
-		if session.Role != run.RoleManager {
-			if settleErr := c.settleChildExecFailure(ctx, handle, frozen, session); settleErr != nil {
-				return "", settleErr
-			}
-			return LaunchFailed, nil
-		}
-		// The manager has no attempt to settle; the run's terminal failure
-		// carries the consequence.
-		if termErr := c.terminateRetiredSession(ctx, handle, session.ID, "exec_failed claim"); termErr != nil {
-			return "", termErr
-		}
-		return LaunchFailed, nil
+		return c.settleSessionExecFailure(ctx, handle, frozen, session, &claim)
 	case LaunchClaimExeced:
 		// Already settled (an adoption path, or a prior round's settlement
 		// whose session activation — or, for the manager, the run's own
@@ -165,6 +155,19 @@ func (c *Controller) corroborateSessionLaunch(ctx context.Context, handle RunHan
 		return LaunchPending, nil
 	}
 	pane, err := c.Runtime.InspectPane(ctx, binding.PaneID)
+	if errors.Is(err, ErrPaneNotFound) {
+		// The one decision row for a placed, unsettled launch whose pane
+		// is gone: settled exec_failed only once the corroborated-absence
+		// predicate holds, pending otherwise.
+		current, _, endErr := c.settleIfLaunchEnded(ctx, handle, &binding, &claim)
+		if endErr != nil {
+			return "", endErr
+		}
+		if current.State != LaunchClaimExecFailed {
+			return LaunchPending, nil
+		}
+		return c.settleSessionExecFailure(ctx, handle, frozen, session, &current)
+	}
 	if err != nil {
 		return LaunchPending, nil //nolint:nilerr // an inspection failure leaves the claim ambiguous, not an error the caller need surface.
 	}
@@ -188,6 +191,34 @@ func (c *Controller) corroborateSessionLaunch(ctx context.Context, handle RunHan
 		return LaunchPending, nil
 	}
 	return LaunchPending, nil
+}
+
+// settleSessionExecFailure applies the exec_failed row to one session
+// whose current launch claim is exec_failed, whether the launcher wrote
+// it or the controller settled a launch that ended before corroboration
+// (settleIfLaunchEnded). A child settles through settleChildExecFailure:
+// docs/plan/phase-2-design.md section 5's Attempt row "launching → failed:
+// exec_failed claim, unrecoverable", with the docs/plan/phase-3-design.md
+// section 5 budgeted task consequence ("active, checking → needs-rework:
+// … exec failure" below the retry limit, "→ failed" at it, interrupted
+// under a held stop). The manager has no attempt to settle: its session
+// is terminated and the manager-lineage failure cause, read from the same
+// exec_failed claim, fails the run.
+func (c *Controller) settleSessionExecFailure(ctx context.Context, handle RunHandle, frozen *FrozenRun, session *run.Session, claim *LaunchClaim) (LaunchProgress, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per exec-failed session per round.
+	if session.Role != run.RoleManager {
+		if err := c.settleChildExecFailure(ctx, handle, frozen, session); err != nil {
+			return "", err
+		}
+		return LaunchFailed, nil
+	}
+	reason := "exec_failed claim"
+	if launchEndedByController(claim) {
+		reason = workerLaunchEnded().sessionReason
+	}
+	if err := c.terminateRetiredSession(ctx, handle, session.ID, reason); err != nil {
+		return "", err
+	}
+	return LaunchFailed, nil
 }
 
 // settleSessionExeced records one feature-mode session's launch-claim

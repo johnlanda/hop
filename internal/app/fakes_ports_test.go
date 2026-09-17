@@ -450,29 +450,57 @@ func attemptBranchVerify(k string) bool {
 }
 
 // fakeGroups is a handwritten ProcessGroupInspector. Calls refuse to run
-// while a store unit of work is open.
+// while a store unit of work is open. An unscripted group is empty — the
+// real inspector's successful listing of a group with no member left.
 type fakeGroups struct {
 	mu        sync.Mutex
 	store     *fakeStore
 	Processes map[int][]app.GroupProcess
 	ListErr   map[int]error
 	Signaled  []int
+	// Listed records every pgid GroupProcesses was asked for.
+	Listed []int
 }
 
 func newFakeGroups() *fakeGroups {
 	return &fakeGroups{Processes: map[int][]app.GroupProcess{}, ListErr: map[int]error{}}
 }
 
+// GroupProcesses enforces the process adapter's argument contract
+// (internal/adapters/process.GroupInspector): a group id of 1 or less is
+// never inspectable and is an error, never an empty listing.
 func (g *fakeGroups) GroupProcesses(_ context.Context, pgid int) ([]app.GroupProcess, error) {
 	if err := g.store.refuseInsideTransaction("ProcessGroupInspector.GroupProcesses"); err != nil {
 		return nil, err
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	g.Listed = append(g.Listed, pgid)
+	if pgid <= 1 {
+		return nil, fmt.Errorf("app_test: process group id %d is not inspectable; a real group id is greater than 1", pgid)
+	}
 	if err, ok := g.ListErr[pgid]; ok {
 		return nil, err
 	}
 	return g.Processes[pgid], nil
+}
+
+// liveLeader scripts pid as a live process leading its own group, the
+// relation the spike_panevanish probe pins for a command pane's process.
+func (g *fakeGroups) liveLeader(pid int, argv ...string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.Processes[pid] = []app.GroupProcess{{PID: pid, Argv: argv}}
+}
+
+// pinnedPaneNotFound reproduces the Herdr adapter's error for a pane-
+// addressed call Herdr answers with pane_not_found, as the executed probe
+// test/integration/spike_panevanish_test.go pins it for pane.process_info,
+// pane.report_metadata and pane.close: the action and pane id as context,
+// wrapping app.ErrPaneNotFound (the adapter also wraps its own sentinel,
+// which the application never reads).
+func pinnedPaneNotFound(action, paneID string) error {
+	return fmt.Errorf("%s pane %s: %w (herdr: pane not found)", action, paneID, app.ErrPaneNotFound)
 }
 
 func (g *fakeGroups) SignalGroup(_ context.Context, pgid int) error {
