@@ -248,6 +248,18 @@ addresses launch context by session — covering sessions without attempts
 assignment path; its pending-intent resolution is session-keyed like the
 claim fallback above. The Phase 2 `LoadLaunchContext` stays until the
 integrator slice removes it with the `hop launch --run --attempt` flip.
+`RunDetail`'s launch claim follows the same resolution, for the solo
+worker and the feature manager alike: the claim of the incarnation the
+session launch context resolves — the current binding's, else, while the
+`pane.open` outcome is unrecorded, the session's newest pending launch
+intent's; a binding and a pending intent that disagree surface no claim.
+Every reader of the detail therefore decides by claim state whether or
+not the binding was recorded (Phase 2 section 4, "claim state decides"):
+solo stop retires a live pre-binding launch by its creation label under
+the close rule, solo corroboration settles a pre-binding `exec_failed`
+claim as the terminal launch failure, the launch-claim deadline applies
+only while no claim exists, and `hop status` renders that claim with no
+binding.
 `RunDetail` gains the task table (states, dependencies, attempt counts),
 per-address message queue depths and in-flight message age, pending
 human questions, the integration head and guard shortfalls

@@ -156,8 +156,15 @@ type RunDetail struct {
 	WorktreePath        string
 	// StateRoot is the run snapshot's frozen absolute state root: where the
 	// run's artifact directories live, needed by evidence capture.
-	StateRoot         string
-	Binding           *run.RuntimeBinding
+	StateRoot string
+	// Binding is SessionID's current (non-superseded) binding, nil when
+	// it has none.
+	Binding *run.RuntimeBinding
+	// Claim is the launch claim of the incarnation SessionID's launch
+	// context resolves: the binding's, else — before the pane.open outcome
+	// is recorded — the session's newest pending launch intent's (claim
+	// state decides, binding or not). nil when that incarnation has no
+	// claim, or when a binding and a pending intent disagree.
 	Claim             *LaunchClaim
 	PendingOperations []Operation
 	LastSubmission    *SubmissionOutcome

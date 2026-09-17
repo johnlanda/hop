@@ -232,3 +232,37 @@ func TestGrammarContractStatusHostileStateRootNeverForgesALine(t *testing.T) {
 		}
 	}
 }
+
+// TestGrammarContractStatusPreBindingClaim proves hop status -run renders
+// a launch claim written before its binding end to end: the solo worker's
+// launcher claimed against the pending pane.open intent and the outcome
+// was never recorded, so the detail shows no binding and the claim the
+// launch context resolves — its state, and its trust-seed evidence through
+// the render boundary's quoting (a hostile control sequence never reaches
+// the output raw or forges a line).
+func TestGrammarContractStatusPreBindingClaim(t *testing.T) {
+	f := newSoloReserved(t, 8900)
+	f.launch(t)
+	hostileSeed := "workspace trust seeded for /work\x1b[2J\n  binding:       forged"
+	if err := hopfixtures.SeedLaunchClaimWithSeedEvidence(context.Background(), f.store, f.RunID, f.SessionID, f.AttemptID, f.IncarnationID, 4343, hostileSeed, time.Now().UTC()); err != nil {
+		t.Fatalf("claim the launch before its binding: %v", err)
+	}
+
+	detail := execHop(t, map[string]string{"HOP_STATE_DIR": f.StateRoot}, f.RepositoryRoot, "status", "-C", f.RepositoryRoot, "-run", f.RunID)
+	if detail.ExitCode != exitOK {
+		t.Fatalf("status -run: exit=%d stdout=%q stderr=%q", detail.ExitCode, detail.Stdout, detail.Stderr)
+	}
+	out := detail.Stdout
+	for _, want := range []string{
+		"\n  binding:       (none)\n",
+		"\n  launch claim:  exec_pending\n",
+		"\n  trust seed:    " + strconv.Quote(hostileSeed) + "\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("status -run output lacks %q; got:\n%q", want, out)
+		}
+	}
+	if strings.Contains(out, "\x1b") || strings.Contains(out, "\n  binding:       forged") {
+		t.Errorf("status -run output carries the raw seed evidence:\n%q", out)
+	}
+}
