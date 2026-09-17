@@ -348,3 +348,46 @@ func TestFakeAnswerMailboxAdmission(t *testing.T) {
 		}
 	})
 }
+
+// TestFakeEnqueueSequenceIsTheAdaptersMaxPlusOne pins the fake's per-address
+// enqueue sequence to the adapter's own rule: one more than the highest
+// sequence a stored message to that address carries, so a message seeded
+// directly counts, a refused answer leaves no gap, and a unit of work
+// rolled back leaves no gap either.
+func TestFakeEnqueueSequenceIsTheAdaptersMaxPlusOne(t *testing.T) {
+	tc := newTestController(defaultPolicy())
+	fr, workerB, workerC := seedTwoWorkers(t, tc)
+	seeded := mintMessageID(t, tc)
+	tc.Store.Messages[seeded] = run.NewInfo(seeded, fr.RunID, run.ControllerPrincipal(), run.ManagerAddress(), "", "/state/n", "n", 1, 1, tc.Clock.Now())
+	seqOf := func(t *testing.T, label string, send app.MessageSend) int { //nolint:gocritic // hugeParam: the port passes the send value; the helper mirrors it.
+		t.Helper()
+		accepted := requireFakeSend(t, tc, label, send, app.MessageAccepted, "")
+		return tc.Store.Messages[accepted.MessageID].EnqueueSeq
+	}
+
+	question := workerB.question(t, tc, fr.RunID, run.ManagerAddress(), nil)
+	if seq := seqOf(t, "task B question after a seeded notice", question); seq != 2 {
+		t.Fatalf("seq = %d, want 2 after the seeded notice at 1", seq)
+	}
+	requireFakeSend(t, tc, "task C answering task B's question", workerC.answer(t, tc, fr.RunID, question.ID, "", "stolen"), app.MessageRefused, app.GrammarReasonUnauthorized)
+
+	uow, err := tc.Store.Begin(context.Background(), tc.Store.Leases[fr.RunID].lease)
+	if err != nil {
+		t.Fatalf("Begin() error = %v", err)
+	}
+	wf, err := app.RequireWorkflowRepositories(uow, "fake sequence test")
+	if err != nil {
+		t.Fatalf("RequireWorkflowRepositories: %v", err)
+	}
+	staged, err := wf.Messages().Create(context.Background(), run.NewInfo(mintMessageID(t, tc), fr.RunID, run.ControllerPrincipal(), run.ManagerAddress(), "", "/state/r", "r", 1, 0, tc.Clock.Now()))
+	if err != nil || staged.EnqueueSeq != 3 {
+		t.Fatalf("staged notice = seq %d, %v; want 3", staged.EnqueueSeq, err)
+	}
+	if err := uow.Rollback(); err != nil {
+		t.Fatalf("Rollback() error = %v", err)
+	}
+
+	if seq := seqOf(t, "task C question after the refusal and the rollback", workerC.question(t, tc, fr.RunID, run.ManagerAddress(), nil)); seq != 3 {
+		t.Fatalf("seq = %d, want 3: neither the refused answer nor the rolled-back notice takes a number", seq)
+	}
+}

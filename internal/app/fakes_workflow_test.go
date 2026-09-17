@@ -243,7 +243,9 @@ func (r fakeSessionIndexRepo) ByRun(_ context.Context, runID identity.RunID) ([]
 type fakeMessageRepo struct{ u *fakeUnitOfWork }
 
 func (r fakeMessageRepo) Create(_ context.Context, m run.Message) (run.Message, error) { //nolint:gocritic // hugeParam: implements the port's interface signature exactly.
-	m.EnqueueSeq = nextEnqueueSeq(r.u.store, m.RunID, m.Recipient)
+	r.u.store.mu.Lock()
+	m.EnqueueSeq = nextEnqueueSeq(r.u.store, m.RunID, m.Recipient, r.u.messagesCreated...)
+	r.u.store.mu.Unlock()
 	r.u.messagesCreated = append(r.u.messagesCreated, m)
 	return m, nil
 }
@@ -611,11 +613,10 @@ func (s *fakeStore) acceptSessionAnswerLocked(send app.MessageSend, answerer run
 // decideAnswerLocked mirrors the SQLite adapter's decideAnswer and
 // recordAnswerOutcome together: it assembles run.AcceptAnswer's inputs
 // (derived destination, the destination task mailbox's closure, the prior
-// accepted answer, the destination's next enqueue sequence), commits an
-// acceptance — the answer, the question, any bundled question ack and the
-// consumed sequence number — and maps every refusal to the adapter's
-// outcome, token and detail. A refused answer consumes no sequence number,
-// exactly as the adapter's MAX+1 read consumes none. Callers hold s.mu.
+// accepted answer, the destination's next enqueue sequence — the adapter's
+// MAX+1 read, so a refused answer leaves no gap), commits an acceptance —
+// the answer, the question and any bundled question ack — and maps every
+// refusal to the adapter's outcome, token and detail. Callers hold s.mu.
 func (s *fakeStore) decideAnswerLocked(question run.Message, answerer run.Address, sender run.Principal, submission run.AnswerSubmission, now time.Time) app.MessageOutcome { //nolint:gocritic // hugeParam: Message is passed by value everywhere in this package; mirrors that convention.
 	destination, ok := s.answerDestinationLocked(question)
 	if !ok {
@@ -636,10 +637,9 @@ func (s *fakeStore) decideAnswerLocked(question run.Message, answerer run.Addres
 
 	outcomeVal, err := run.AcceptAnswer(question, prior,
 		run.AnswerContext{AnswererAddress: answerer, DestinationMailboxClosed: closed},
-		destination, sender, submission, peekEnqueueSeq(s, question.RunID, destination), now)
+		destination, sender, submission, nextEnqueueSeq(s, question.RunID, destination), now)
 	switch {
 	case err == nil:
-		nextEnqueueSeq(s, question.RunID, destination)
 		s.Messages[outcomeVal.Question.ID] = outcomeVal.Question
 		s.Messages[outcomeVal.Answer.ID] = outcomeVal.Answer
 		// The adapter's persistBundledQuestionAck: a human question is

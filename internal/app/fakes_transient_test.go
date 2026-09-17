@@ -28,8 +28,9 @@ func TestFakeSubmitResultTransientReasons(t *testing.T) {
 		if err != nil || result.Kind != string(app.SubmissionTransient) || result.TransientReason != string(app.TransientAttemptNotRunning) {
 			t.Fatalf("SubmitResult() = %+v, %v; want transient/%s", result, err, app.TransientAttemptNotRunning)
 		}
-		if last := tc.Store.Submissions[len(tc.Store.Submissions)-1]; last.Transient != app.TransientAttemptNotRunning {
-			t.Fatalf("store outcome = %+v, want reason %s", last, app.TransientAttemptNotRunning)
+		last := tc.Store.Submissions[len(tc.Store.Submissions)-1]
+		if last.Transient != app.TransientAttemptNotRunning || last.Detail != "run: attempt not yet running: attempt "+detail.AttemptID.String() {
+			t.Fatalf("store outcome = %+v, want reason %s with the domain error's own detail, as the real store records", last, app.TransientAttemptNotRunning)
 		}
 	})
 
@@ -47,6 +48,9 @@ func TestFakeSubmitResultTransientReasons(t *testing.T) {
 		result, err := f.tc.Controller.SubmitResult(context.Background(), request)
 		if err != nil || result.Kind != string(app.SubmissionTransient) || result.TransientReason != string(app.TransientUndeliveredMessages) {
 			t.Fatalf("SubmitResult(pending mailbox) = %+v, %v; want transient/%s", result, err, app.TransientUndeliveredMessages)
+		}
+		if result.Detail != app.GrammarTransientUndeliveredLine {
+			t.Fatalf("SubmitResult(pending mailbox) detail = %q, want the drain line, as the real store records", result.Detail)
 		}
 
 		f.drain(t)

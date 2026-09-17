@@ -989,7 +989,10 @@ sides together. `cmd/hop` never imports domain or identity types: every
     (or after failure closure) refused `mailbox-closed` while the earlier
     answer still replays as duplicate; a human answer to a relay accepted
     to the manager after the origin's closure; refused answers consuming
-    no enqueue sequence number.
+    no enqueue sequence number — the fake's sequence is the adapter's
+    MAX+1 over the stored messages, assigned again at a unit of work's
+    commit, so a directly seeded message counts and a rollback leaves no
+    gap (`TestFakeEnqueueSequenceIsTheAdaptersMaxPlusOne`).
   - `go test ./internal/app -run 'TestFakeSubmitResultTransientReasons|TestFakeSubmitReviewTransientReasons|TestSubmissionTransientReasonContract'` —
     `fakes_transient_test.go`, the fake half of the typed transient
     reason (the sqlite adapter's `transient_reason_test.go` is the real

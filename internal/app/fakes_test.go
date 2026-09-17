@@ -152,9 +152,6 @@ type fakeStore struct {
 	Messages          map[identity.MessageID]run.Message
 	MessageDeliveries map[identity.MessageID][]run.Delivery
 	MessageAcks       map[identity.MessageID]run.Ack
-	// enqueueSeq is the durable per-(run, recipient address) sequence
-	// counter SendMessage/AnswerQuestion assign from.
-	enqueueSeq map[string]int
 
 	// Reviews is the run's accepted verdicts, at most one per attempt.
 	Reviews map[identity.AttemptID]run.Review
@@ -228,7 +225,6 @@ func newFakeStore(clock interface{ Now() time.Time }) *fakeStore {
 		Messages:           map[identity.MessageID]run.Message{},
 		MessageDeliveries:  map[identity.MessageID][]run.Delivery{},
 		MessageAcks:        map[identity.MessageID]run.Ack{},
-		enqueueSeq:         map[string]int{},
 		Reviews:            map[identity.AttemptID]run.Review{},
 		Integrations:       map[identity.IntegrationID]*entityRow[run.Integration]{},
 		RetryRequests:      map[identity.TaskID]app.RetryRequestRecord{},
@@ -248,24 +244,28 @@ func (s *fakeStore) nextTaskSeqLocked(runID identity.RunID) int {
 	return s.taskSeqByRun[runID]
 }
 
-// nextEnqueueSeq assigns the next durable per-(run, recipient address)
-// message sequence number — the FIFO authority (section 7).
-func nextEnqueueSeq(s *fakeStore, runID identity.RunID, address run.Address) int {
-	key := enqueueSeqKey(runID, address)
-	s.enqueueSeq[key]++
-	return s.enqueueSeq[key]
-}
-
-// peekEnqueueSeq returns the number nextEnqueueSeq would assign without
-// consuming it — the adapter's read-only MAX+1, for a decision that may
-// still refuse.
-func peekEnqueueSeq(s *fakeStore, runID identity.RunID, address run.Address) int {
-	return s.enqueueSeq[enqueueSeqKey(runID, address)] + 1
-}
-
-// enqueueSeqKey is the fake's per-(run, recipient address) sequence key.
-func enqueueSeqKey(runID identity.RunID, address run.Address) string {
-	return runID.String() + "|" + app.AddressString(address)
+// nextEnqueueSeq is the next durable per-(run, recipient address) message
+// sequence number — the FIFO authority (section 7) — computed exactly as
+// the adapter does: one more than the highest sequence any stored message
+// to that address carries, or any of staged (a unit of work's own
+// uncommitted messages). Reading it consumes nothing, so a decision that
+// refuses leaves no gap, and a message seeded directly into s.Messages
+// counts like any other. Callers hold s.mu.
+func nextEnqueueSeq(s *fakeStore, runID identity.RunID, address run.Address, staged ...run.Message) int {
+	highest := 0
+	consider := func(m *run.Message) {
+		if m.RunID == runID && m.Recipient.Equal(address) && m.EnqueueSeq > highest {
+			highest = m.EnqueueSeq
+		}
+	}
+	for id := range s.Messages {
+		m := s.Messages[id]
+		consider(&m)
+	}
+	for i := range staged {
+		consider(&staged[i])
+	}
+	return highest + 1
 }
 
 // --- StateStore ---
@@ -1043,9 +1043,11 @@ func (s *fakeStore) submitResultLocked(submission *app.ResultSubmission, onAccep
 		outcome = app.SubmissionOutcome{Kind: app.SubmissionConflicting, ResultID: outcomeVal.Result.ID}
 	case errors.Is(err, run.ErrTransientNotRunning), errors.Is(err, run.ErrMailboxNotClear):
 		reason, _ := app.TransientReasonOf(err)
-		detail := "attempt not yet running; retry"
+		// The real store's details: the drain line itself for a pending
+		// mailbox, the domain error's own text otherwise.
+		detail := err.Error()
 		if reason == app.TransientUndeliveredMessages {
-			detail = "transient: undelivered messages; drain with hop msg next, ack, then resubmit"
+			detail = app.GrammarTransientUndeliveredLine
 		}
 		outcome = app.SubmissionOutcome{Kind: app.SubmissionTransient, Detail: detail, Transient: reason}
 	default:

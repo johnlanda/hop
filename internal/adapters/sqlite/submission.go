@@ -75,10 +75,6 @@ func (s *Store) RecordMalformed(ctx context.Context, claimed app.ClaimedSubmissi
 	return outcome, nil
 }
 
-// undeliveredMessagesDetail is the detail a result refused for a pending
-// task mailbox records on its receipt and returns.
-const undeliveredMessagesDetail = "transient: undelivered messages; drain with hop msg next, ack, then resubmit"
-
 // SubmitResult applies the section 7 validation order atomically inside
 // one write transaction: existence and agreement (step 2, malformed on
 // disagreement), then the domain's AcceptResult over the prior accepted
@@ -170,9 +166,11 @@ func (s *Store) SubmitResult(ctx context.Context, submission app.ResultSubmissio
 			return insertReceipt(ctx, tx, submissionReceipt(&submission, app.SubmissionStale, "", err.Error()), now)
 		case errors.Is(err, run.ErrTransientNotRunning), errors.Is(err, run.ErrMailboxNotClear):
 			reason, _ := app.TransientReasonOf(err)
+			// A pending mailbox records the drain line itself as its
+			// detail; the not-running outcome keeps the domain error's.
 			detail := err.Error()
 			if reason == app.TransientUndeliveredMessages {
-				detail = undeliveredMessagesDetail
+				detail = app.GrammarTransientUndeliveredLine
 			}
 			outcome = app.SubmissionOutcome{Kind: app.SubmissionTransient, Detail: detail, Transient: reason}
 			return insertReceipt(ctx, tx, submissionReceipt(&submission, app.SubmissionTransient, "", detail), now)
