@@ -374,6 +374,48 @@ func ServerContinuityEstablished(recorded, observed string) bool {
 	return recorded != "" && recorded == observed
 }
 
+// ServerLifetimeVerdict classifies a recorded server-lifetime token against
+// a freshly observed one. It is the three-valued reading of the same pair
+// ServerContinuityEstablished answers yes or no about: continuity is one
+// verdict, a CHANGED lifetime is a POSITIVE fact of its own, and unknown is
+// neither.
+type ServerLifetimeVerdict string
+
+// Server-lifetime verdicts.
+const (
+	// LifetimeContinuous: both tokens are non-empty and equal, so the
+	// lifetime that served the placement still serves the socket.
+	LifetimeContinuous ServerLifetimeVerdict = "continuous"
+	// LifetimeChanged: both tokens are non-empty and differ. A socket path
+	// is served by one server at a time and lifetimes are contiguous, so
+	// this is positive evidence that the server behind the placement is
+	// gone — which is also why the placement's own continuity can never be
+	// established again.
+	LifetimeChanged ServerLifetimeVerdict = "changed"
+	// LifetimeUnknown: either token is empty, so the two cannot be
+	// compared at all. It is never evidence, in either direction, and it is
+	// the verdict for EVERY placement on a platform that implements no
+	// lifetime identity.
+	LifetimeUnknown ServerLifetimeVerdict = "unknown"
+)
+
+// ClassifyServerLifetime is the trigger predicate for the restart rules:
+// which of the three verdicts a recorded token and a freshly observed one
+// yield. Continuity licenses concluding a placed pane's absence; a CHANGED
+// lifetime licenses the restart close (section 6), which is a different act
+// with its own conjuncts; unknown licenses neither and keeps the fail-closed
+// behavior both rules had before either existed.
+func ClassifyServerLifetime(recorded, observed string) ServerLifetimeVerdict {
+	switch {
+	case recorded == "" || observed == "":
+		return LifetimeUnknown
+	case recorded == observed:
+		return LifetimeContinuous
+	default:
+		return LifetimeChanged
+	}
+}
+
 // OccupantMatches reports whether an inspected pane's foreground group
 // still contains the recorded occupant: SOME member's pid equals the
 // recorded pid AND that same member's argv or cmdline carries the marker

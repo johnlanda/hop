@@ -81,6 +81,13 @@ const (
 	// closeReasonRetirement retires a positively identified restored
 	// occupant — a foreign process, never the session's own worker.
 	closeReasonRetirement = "positive-evidence retirement"
+	// closeReasonRestart closes a pane whose server lifetime CHANGED: the
+	// recorded occupant died with its server, and the pane is identified as
+	// the session's own by its creation label or by the restored harness on
+	// it, never by the recorded pid — which a restart necessarily makes
+	// unmatchable. ReconcileServerRestart owns it; the ordinary close rule
+	// never acts on one (findOrCreateCloseOperation defers to it).
+	closeReasonRestart = "server-lifetime change"
 )
 
 // paneCloseTarget is the recorded evidence one pane close is authorized
@@ -663,6 +670,15 @@ func (c *Controller) findOrCreateCloseOperation(ctx context.Context, handle RunH
 		}
 		if intent.PaneID != target.PaneID || intent.IncarnationID != target.IncarnationID {
 			continue
+		}
+		if intent.Reason == closeReasonRestart {
+			// A restart close for this very pane is unresolved. Its target
+			// was identified under the restart rule (creation label, or the
+			// restored harness on the pane) and can only be rechecked there,
+			// so this path never adopts it and never journals a second close
+			// for the same pane: ReconcileServerRestart finishes it, and this
+			// round reports it outstanding.
+			return op.ID, nil, fmt.Sprintf("pane.close operation %s is a server-restart close awaiting its observed absence; the restart reconciliation owns it", op.ID), nil
 		}
 		if intent.PID <= 0 || len(intent.ArgvMarkers) == 0 {
 			if markErr := c.markOperationReconciling(ctx, handle, op.ID, "persisted pane.close target is missing its pid or markers; failing closed"); markErr != nil {

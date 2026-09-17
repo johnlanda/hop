@@ -511,7 +511,7 @@ func (c *Controller) reconcileFeatureSession(ctx context.Context, handle RunHand
 		report.Detail = "no native reference recorded; a cold relaunch cannot be rendered"
 		return report, false, nil
 	}
-	if err := c.coldRelaunchFeatureSession(ctx, handle, frozen, req, session, &binding); err != nil {
+	if err := c.coldRelaunchFeatureSession(ctx, handle, frozen, req, session, &binding, resumeAttestedRelaunchCause); err != nil {
 		return report, false, err
 	}
 	report.Disposition = SessionRelaunched
@@ -547,6 +547,11 @@ func (c *Controller) confirmSessionActive(ctx context.Context, handle RunHandle,
 // such path has already read the session's launch claim as SETTLED, which
 // is what makes the reason below a structural fact and not a convention.
 const sessionReconcileResumeAmbiguous = "resume: evidence ambiguous"
+
+// resumeAttestedRelaunchCause is the reason a cold relaunch authorized by a
+// human's `--confirm-absent` attestation records against the predecessor
+// session and its binding.
+const resumeAttestedRelaunchCause = "attested absent with server continuity; cold relaunch authorized"
 
 // markSessionReconciling moves an active or launching session to
 // reconciling with reason as its recorded transition reason, idempotently.
@@ -621,8 +626,11 @@ func (c *Controller) journalAttestation(ctx context.Context, handle RunHandle, s
 // predecessor is terminal, so the predecessor is marked lost in the same
 // transaction); for a child, a successor session on the same attempt.
 // Children keep their historical parent_session_id — provenance is never
-// rewritten.
-func (c *Controller) coldRelaunchFeatureSession(ctx context.Context, handle RunHandle, frozen *FrozenRun, req *ResumeFeatureRequest, prior *run.Session, priorBinding *run.RuntimeBinding) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per relaunch.
+// rewritten. cause is the value-free reason the predecessor's termination
+// and its binding's supersession record, so the journal tells WHY a
+// relaunch happened — a human's attestation, or a server-lifetime change —
+// without either caller having to record a second transition of its own.
+func (c *Controller) coldRelaunchFeatureSession(ctx context.Context, handle RunHandle, frozen *FrozenRun, req *ResumeFeatureRequest, prior *run.Session, priorBinding *run.RuntimeBinding, cause string) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per relaunch.
 	successorID, err := identity.ParseSessionID(c.IDs.NewID())
 	if err != nil {
 		return fmt.Errorf("app: generate successor session id: %w", err)
@@ -675,7 +683,7 @@ func (c *Controller) coldRelaunchFeatureSession(ctx context.Context, handle RunH
 		if _, saveErr := uow.Sessions().Save(ctx, lost, rev); saveErr != nil {
 			return saveErr
 		}
-		if err := recordTransition(ctx, uow, EntitySession, prior.ID.String(), string(sFrom), string(lost.State), "attested absent with server continuity; cold relaunch authorized", generation, now); err != nil {
+		if err := recordTransition(ctx, uow, EntitySession, prior.ID.String(), string(sFrom), string(lost.State), cause, generation, now); err != nil {
 			return err
 		}
 		// The current binding is superseded with the attestation evidence.
@@ -684,7 +692,7 @@ func (c *Controller) coldRelaunchFeatureSession(ctx context.Context, handle RunH
 			return bindErr
 		}
 		if found && current.IncarnationID == priorBinding.IncarnationID {
-			superseded, supErr := current.Supersede("attested absent; cold relaunch", now)
+			superseded, supErr := current.Supersede(cause, now)
 			if supErr != nil {
 				return supErr
 			}
