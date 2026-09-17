@@ -5,8 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
+	goruntime "runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -45,10 +49,11 @@ type vanishingPane struct {
 func openGatedPane(t *testing.T, runtime *herdr.Runtime, server *testServer, gates, workspaceID, name string) vanishingPane {
 	t.Helper()
 	pane := vanishingPane{Label: "hop-spike-vanish-" + name + "-" + newSpikeUUID(t), Gate: filepath.Join(gates, name)}
+	command := []string{"/bin/sh", "-c", gatedPaneScript, "sh", pane.Gate}
 	ctx, cancel := context.WithTimeout(t.Context(), callTimeout)
 	handle, err := runtime.OpenWorkerPane(ctx, app.WorkerPaneRequest{
 		WorkspaceID: workspaceID, Cwd: server.workDir(),
-		Command: []string{"/bin/sh", "-c", gatedPaneScript, "sh", pane.Gate},
+		Command: command,
 		Label:   pane.Label,
 	})
 	cancel()
@@ -89,6 +94,17 @@ func openGatedPane(t *testing.T, runtime *herdr.Runtime, server *testServer, gat
 	}
 	if sid, sidErr := syscall.Getsid(pane.PID); sidErr != nil || sid != pane.PID {
 		t.Errorf("getsid(%d) = %d, %v; want the command to be a session leader", pane.PID, sid, sidErr)
+	}
+	// The pane's own process reports exactly the argv layout.apply ran it
+	// with (resume's in-flight rule compares a pre-claim launcher's argv
+	// with the frozen pane.open command element by element).
+	if !slices.ContainsFunc(observed.Foreground, func(p app.ProcessInfo) bool { return p.PID == pane.PID && slices.Equal(p.Argv, command) }) {
+		t.Errorf("pane %s foreground = %+v, want the member at shell pid %d reporting argv %q exactly", pane.PaneID, observed.Foreground, pane.PID, command)
+	}
+	// The inspection is stamped with the lifetime of the server that
+	// answered it, which is the lifetime ServerInstance reports.
+	if want := requireServerLifetime(t, runtime, server, "while the pane lives"); observed.ServerInstance != want {
+		t.Errorf("pane %s inspection stamped %q, want the answering server's %q", pane.PaneID, observed.ServerInstance, want)
 	}
 	members := listGroupMembers(t, pane.PID)
 	if !slices.ContainsFunc(members, func(m groupMember) bool { return m.PID == pane.PID }) {
@@ -307,7 +323,7 @@ func TestSpikeLabelSurvivesRestart(t *testing.T) {
 		}
 	})
 
-	before := requireServerInstance(t, runtime, "before the restart")
+	before := requireServerLifetime(t, runtime, server, "before the restart")
 
 	server.restart(t)
 
@@ -325,11 +341,11 @@ func TestSpikeLabelSurvivesRestart(t *testing.T) {
 	if ref.PaneID != pane.PaneID {
 		t.Errorf("restored pane id = %s, want the created id %s (public pane ids survive a graceful restart)", ref.PaneID, pane.PaneID)
 	}
-	// The server-process identity changes across the restart, so a
-	// recorded creation-time token never matches the restarted server.
-	after := requireServerInstance(t, runtime, "after the restart")
-	if after == before {
-		t.Errorf("ServerInstance after the restart = %q, the same as before; want a different server identity", after)
+	// The server lifetime changes across the restart, so a recorded
+	// creation-time token never matches the restarted server.
+	after := requireServerLifetime(t, runtime, server, "after the restart")
+	if goruntime.GOOS == "darwin" && after == before {
+		t.Errorf("ServerInstance after the restart = %q, the same as before; want a different server lifetime", after)
 	}
 	t.Logf("server instance before the restart %q, after %q", before, after)
 
@@ -354,6 +370,9 @@ func TestSpikeLabelSurvivesRestart(t *testing.T) {
 	if restored.ShellPID == pane.PID {
 		t.Errorf("restored pane shell pid = %d, the original command's pid; want a fresh process", restored.ShellPID)
 	}
+	if restored.ServerInstance != after {
+		t.Errorf("restored pane inspection stamped %q, want the restarted server's %q", restored.ServerInstance, after)
+	}
 	var members []groupMember
 	gone := waitUntil(func() bool {
 		members = listGroupMembers(t, pane.PID)
@@ -362,15 +381,191 @@ func TestSpikeLabelSurvivesRestart(t *testing.T) {
 	t.Logf("restored pane shell_pid=%d; original command pid %d gone from its group: %t (members %+v)", restored.ShellPID, pane.PID, gone, members)
 }
 
-// requireServerInstance reads the production adapter's server-process
-// identity and requires a non-empty token.
-func requireServerInstance(t *testing.T, runtime *herdr.Runtime, when string) string {
+// lifetimeStabilitySamples is how many back-to-back ServerInstance reads
+// the probe compares within one server lifetime.
+const lifetimeStabilitySamples = 20
+
+// serverLifetimePattern is the production token format on darwin:
+// "herdr-server-lifetime/v1 pid=<pid> start=<sec>.<usec>".
+const serverLifetimePattern = `^herdr-server-lifetime/v1 pid=([1-9][0-9]*) start=([1-9][0-9]*)\.([0-9]{6})$`
+
+// requireServerLifetime reads the production adapter's server-lifetime
+// token and pins it against the server this suite launched: on darwin it
+// names the running server leader's pid and that process's start second as
+// ps independently reports it, and it is identical on every back-to-back
+// read within the lifetime; every other platform implements no lifetime
+// identity, so the token is empty there.
+func requireServerLifetime(t *testing.T, runtime *herdr.Runtime, server *testServer, when string) string {
+	t.Helper()
+	read := func() string {
+		ctx, cancel := context.WithTimeout(t.Context(), callTimeout)
+		defer cancel()
+		instance, err := runtime.ServerInstance(ctx)
+		if err != nil {
+			t.Fatalf("ServerInstance %s: %v", when, err)
+		}
+		return instance
+	}
+	token := read()
+	if goruntime.GOOS != "darwin" {
+		if token != "" {
+			t.Fatalf("ServerInstance %s = %q, want \"\" (no lifetime identity is implemented on %s)", when, token, goruntime.GOOS)
+		}
+		return token
+	}
+	match := regexp.MustCompile(serverLifetimePattern).FindStringSubmatch(token)
+	if match == nil {
+		t.Fatalf("ServerInstance %s = %q, want %s", when, token, serverLifetimePattern)
+	}
+	leader := server.running[len(server.running)-1].leaderCmd.Process.Pid
+	if match[1] != strconv.Itoa(leader) {
+		t.Errorf("ServerInstance %s names pid %s, want the running server leader's pid %d", when, match[1], leader)
+	}
+	if started := psStartSecond(t, leader); match[2] != strconv.FormatInt(started, 10) {
+		t.Errorf("ServerInstance %s start second = %s, ps reports %d for the server leader %d", when, match[2], started, leader)
+	}
+	for i := range lifetimeStabilitySamples {
+		if again := read(); again != token {
+			t.Fatalf("ServerInstance %s sample %d = %q, want the lifetime's one token %q", when, i, again, token)
+		}
+	}
+	return token
+}
+
+// psStartSecond reads pid's start time, to the second, from ps's lstart
+// column: an independent source to the adapter's kinfo_proc read.
+func psStartSecond(t *testing.T, pid int) int64 {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), callTimeout)
 	defer cancel()
-	instance, err := runtime.ServerInstance(ctx)
-	if err != nil || instance == "" {
-		t.Fatalf("ServerInstance %s = %q, %v; want a non-empty token", when, instance, err)
+	out, err := exec.CommandContext(ctx, "ps", "-o", "lstart=", "-p", strconv.Itoa(pid)).Output() //nolint:gosec // G204: the fixed ps binary; the one variable argument is a decimal pid.
+	if err != nil {
+		t.Fatalf("ps -o lstart= -p %d: %v", pid, err)
 	}
-	return instance
+	started, err := time.ParseInLocation("Mon Jan _2 15:04:05 2006", strings.TrimSpace(string(out)), time.Local)
+	if err != nil {
+		t.Fatalf("parse ps lstart %q: %v", out, err)
+	}
+	return started.Unix()
+}
+
+// renamePane relabels paneID through Herdr's own pane.rename, the one live
+// relabelling a human performs (it rewrites the same manual label a
+// layout.apply creation label is).
+func renamePane(t *testing.T, server *testServer, paneID, label string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), callTimeout)
+	defer cancel()
+	params := map[string]string{"pane_id": paneID, "label": label}
+	if err := server.client.Call(ctx, "pane.rename", params, nil); err != nil {
+		t.Fatalf("pane.rename(%s, %s): %v", paneID, label, err)
+	}
+}
+
+// requireLabelAnswersNothing asserts one FindPaneByLabel lookup, through
+// the production adapter, succeeds and finds no pane.
+func requireLabelAnswersNothing(t *testing.T, runtime *herdr.Runtime, label, when string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), callTimeout)
+	defer cancel()
+	ref, found, err := runtime.FindPaneByLabel(ctx, label)
+	if err != nil || found {
+		t.Fatalf("FindPaneByLabel(%s) %s = %+v, found=%t, err=%v; want a successful lookup finding nothing", label, when, ref, found, err)
+	}
+}
+
+// TestSpikeRenamedLabelSurvivesRestart pins the shape behind the launch-
+// ended rows' server-continuity conjunct (docs/plan/phase-3-design.md
+// section 4), against a real, disposable server through the production
+// herdr.Runtime: a human's pane.rename replaces the creation label, so
+// while the pane lives the creation label answers nothing and the new name
+// answers the pane, whose original process still runs; after a graceful
+// restart the MANUAL label survives — the renamed pane is restored under
+// its new name, keeping its public id, with a fresh process — while the
+// creation label still resolves nothing, and the server lifetime has
+// changed. A label that answers nothing after a restart therefore never
+// proves the pane gone; only an unchanged server lifetime does.
+func TestSpikeRenamedLabelSurvivesRestart(t *testing.T) {
+	artifacts := newArtifactDir(t)
+	server := prepareServer(t, artifacts)
+	server.start(t)
+	runtime := herdr.NewRuntime(server.socketPath)
+	gates := artifacts.dir(t, "gates")
+
+	ctx, cancel := context.WithTimeout(t.Context(), callTimeout)
+	workspace, err := runtime.CreateWorkspace(ctx, app.WorkspaceRequest{Cwd: server.workDir(), Label: "hop-spike-rename-" + newSpikeUUID(t)})
+	cancel()
+	if err != nil {
+		t.Fatalf("CreateWorkspace: %v", err)
+	}
+	pane := openGatedPane(t, runtime, server, gates, workspace.WorkspaceID, "rename")
+	t.Cleanup(func() {
+		if gateErr := os.WriteFile(pane.Gate, nil, 0o600); gateErr != nil {
+			t.Errorf("open the gate: %v", gateErr)
+		}
+	})
+	before := requireServerLifetime(t, runtime, server, "before the rename")
+
+	renamed := "human-renamed-" + newSpikeUUID(t)
+	renamePane(t, server, pane.PaneID, renamed)
+
+	// While the pane lives under one server lifetime: the creation label
+	// answers nothing, the new name answers the pane, and the pane keeps
+	// its original process — the process conjunct still observes it.
+	requireLabelAnswersNothing(t, runtime, pane.Label, "after the rename")
+	requireLabelResolves(t, runtime, &vanishingPane{Label: renamed, PaneID: pane.PaneID}, "the renamed label after the rename")
+	ctx, cancel = context.WithTimeout(t.Context(), callTimeout)
+	live, err := runtime.InspectPane(ctx, pane.PaneID)
+	cancel()
+	if err != nil {
+		t.Fatalf("InspectPane(%s) after the rename: %v", pane.PaneID, err)
+	}
+	if live.ShellPID != pane.PID || live.ServerInstance != before {
+		t.Errorf("renamed pane shell pid = %d stamped %q, want the original %d under %q", live.ShellPID, live.ServerInstance, pane.PID, before)
+	}
+	if members := listGroupMembers(t, pane.PID); !slices.ContainsFunc(members, func(m groupMember) bool { return m.PID == pane.PID }) {
+		t.Errorf("group %d members = %+v, want the renamed pane's process still listed", pane.PID, members)
+	}
+
+	server.restart(t)
+
+	// The first lookups the restarted server serves: the manual label
+	// answers the restored pane under its created id; the creation label
+	// answers nothing.
+	ctx, cancel = context.WithTimeout(t.Context(), callTimeout)
+	ref, found, err := runtime.FindPaneByLabel(ctx, renamed)
+	cancel()
+	if err != nil || !found || ref.PaneID != pane.PaneID {
+		t.Fatalf("FindPaneByLabel(%s) after the restart = %+v, found=%t, err=%v; want the renamed pane restored as %s", renamed, ref, found, err, pane.PaneID)
+	}
+	requireLabelAnswersNothing(t, runtime, pane.Label, "after the restart")
+	for i := range labelContinuitySamples {
+		requireLabelAnswersNothing(t, runtime, pane.Label, fmt.Sprintf("sample %d after the restart", i))
+		time.Sleep(pollInterval)
+	}
+
+	after := requireServerLifetime(t, runtime, server, "after the restart")
+	if goruntime.GOOS == "darwin" && after == before {
+		t.Errorf("ServerInstance after the restart = %q, the same as before; want a different server lifetime", after)
+	}
+
+	ctx, cancel = context.WithTimeout(t.Context(), callTimeout)
+	restored, err := runtime.InspectPane(ctx, pane.PaneID)
+	cancel()
+	if err != nil {
+		t.Fatalf("InspectPane(%s) on the restored renamed pane: %v", pane.PaneID, err)
+	}
+	if restored.ShellPID == pane.PID {
+		t.Errorf("restored renamed pane shell pid = %d, the original command's pid; want a fresh process", restored.ShellPID)
+	}
+	if restored.ServerInstance != after {
+		t.Errorf("restored renamed pane inspection stamped %q, want the restarted server's %q", restored.ServerInstance, after)
+	}
+	gone := waitUntil(func() bool {
+		return !slices.ContainsFunc(listGroupMembers(t, pane.PID), func(m groupMember) bool { return m.PID == pane.PID })
+	})
+	if !gone {
+		t.Errorf("original command pid %d still listed in its group after the restart", pane.PID)
+	}
+	t.Logf("renamed pane %s restored under %q with shell pid %d (original %d gone: %t); lifetime before %q, after %q", pane.PaneID, renamed, restored.ShellPID, pane.PID, gone, before, after)
 }

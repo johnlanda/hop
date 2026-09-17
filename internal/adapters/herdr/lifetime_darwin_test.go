@@ -3,9 +3,10 @@ package herdr
 import (
 	"context"
 	"encoding/binary"
-	"fmt"
+	"errors"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -18,7 +19,7 @@ func psStartTime(t *testing.T, pid int) time.Time {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "ps", "-o", "lstart=", "-p", fmt.Sprint(pid)).Output()
+	out, err := exec.CommandContext(ctx, "ps", "-o", "lstart=", "-p", strconv.Itoa(pid)).Output() //nolint:gosec // G204: the fixed ps binary; the one variable argument is a decimal pid.
 	if err != nil {
 		t.Fatalf("ps -o lstart= -p %d: %v", pid, err)
 	}
@@ -39,10 +40,20 @@ func TestProcessStartTimeMatchesTheProcessTable(t *testing.T) {
 		t.Fatalf("start child: %v", err)
 	}
 	childPID := child.Process.Pid
+	reaped := false
+	reap := func() {
+		reaped = true
+		if err := child.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			t.Errorf("kill child: %v", err)
+		}
+		var exitErr *exec.ExitError
+		if err := child.Wait(); err != nil && !errors.As(err, &exitErr) {
+			t.Errorf("reap child: %v", err)
+		}
+	}
 	t.Cleanup(func() {
-		if child.ProcessState == nil {
-			_ = child.Process.Kill()
-			_ = child.Wait()
+		if !reaped {
+			reap()
 		}
 	})
 
@@ -56,10 +67,7 @@ func TestProcessStartTimeMatchesTheProcessTable(t *testing.T) {
 		}
 	}
 
-	if err := child.Process.Kill(); err != nil {
-		t.Fatalf("kill child: %v", err)
-	}
-	_ = child.Wait()
+	reap()
 	if sec, usec, ok := processStartTime(childPID); ok {
 		t.Errorf("processStartTime(%d) = %d.%06d after the child was reaped, want no start time", childPID, sec, usec)
 	}
@@ -71,9 +79,9 @@ func TestParseKinfoProcStartRefusesUnknownLayouts(t *testing.T) {
 	record := func(size, pid int, sec int64, usec int32) []byte {
 		raw := make([]byte, size)
 		if size >= kinfoProcPIDOffset+4 {
-			binary.LittleEndian.PutUint64(raw[kinfoProcStartSecOffset:], uint64(sec))  //nolint:gosec // G115: test fixture writing a signed value's bit pattern.
+			binary.LittleEndian.PutUint64(raw[kinfoProcStartSecOffset:], uint64(sec))   //nolint:gosec // G115: test fixture writing a signed value's bit pattern.
 			binary.LittleEndian.PutUint32(raw[kinfoProcStartUsecOffset:], uint32(usec)) //nolint:gosec // G115: test fixture writing a signed value's bit pattern.
-			binary.LittleEndian.PutUint32(raw[kinfoProcPIDOffset:], uint32(pid))         //nolint:gosec // G115: test fixture writing a pid's bit pattern.
+			binary.LittleEndian.PutUint32(raw[kinfoProcPIDOffset:], uint32(pid))        //nolint:gosec // G115: test fixture writing a pid's bit pattern.
 		}
 		return raw
 	}
