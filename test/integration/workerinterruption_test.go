@@ -86,8 +86,13 @@ func TestRealProcessWorkerInterruption(t *testing.T) {
 
 	// Attempt 1 interrupts, task moves to needs-rework, session terminates
 	// — all in the settlement transaction — and the manager receives the
-	// notice with the EXACT rendered first line.
-	fx.requireTaskState(t, t1, "needs-rework")
+	// notice with the EXACT rendered first line. Asserted as the DURABLE
+	// transition into needs-rework (never a live task-state poll): the
+	// scripted manager reads the notice and requests retry immediately
+	// (fixtureworker_test.go's handleManagerMessage), so the controller
+	// can move the task on to ready/active again before a snapshot poll
+	// ever observes it sitting at needs-rework (Astra review finding).
+	fx.requireTransitionAt(t, "task", t1, "needs-rework")
 	fx.requireSessionState(t, session1ID, "terminated")
 	fx.requireAttemptState(t, attempt1ID, "interrupted")
 	// Exactly one running->interrupted transition — the settlement never
@@ -115,6 +120,11 @@ func TestRealProcessWorkerInterruption(t *testing.T) {
 	if session2ID == session1ID {
 		t.Fatal("the retried attempt's session is the same as the interrupted one's")
 	}
+	// Attempt 2's own launch settles (session active) before anything
+	// else is asserted about it — the same explicit precondition attempt
+	// 1 was held to before its own kill, restated here for the retried
+	// attempt.
+	fx.requireSessionState(t, session2ID, "active")
 	worktree2Path, worktree2Branch, worktree2Base := fx.requireWorktreeForAttempt(t, attempt2ID)
 	if worktree2Path == "" || worktree2Branch == "" {
 		t.Fatalf("attempt 2's worktree row is incomplete: path=%q branch=%q", worktree2Path, worktree2Branch)
