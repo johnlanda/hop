@@ -514,7 +514,7 @@ func TestStartFeatureRun(t *testing.T) {
 		if paneIntent.SessionID != manager.ID.String() || paneIntent.IncarnationID != binding.IncarnationID.String() || paneIntent.Cwd != featureRepo {
 			t.Fatalf("pane.open intent = %+v, want the manager session/incarnation the claim fallback matches", paneIntent)
 		}
-		if binding.PaneID == "" || binding.WorkspaceID != placed.WorkspaceID || binding.CreationLabel != paneOp.ID.String() || binding.ServerInstance != "peer-pid:1" {
+		if binding.PaneID == "" || binding.WorkspaceID != placed.WorkspaceID || binding.CreationLabel != paneOp.ID.String() || binding.ServerInstance != fakeServerToken(1) {
 			t.Fatalf("manager binding = %+v", binding)
 		}
 		if len(f.tc.Store.Tasks) != 0 || len(f.tc.Store.Attempts) != 0 || len(f.tc.Store.Worktrees) != 0 {

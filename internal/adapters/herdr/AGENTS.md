@@ -13,14 +13,15 @@ occupant inspection for the worker-launch use case.
 
 | File | Entities / functions | Responsibility |
 | --- | --- | --- |
-| [client.go](client.go) | `Client`, `NewClient`, `Call`, `Subscribe`, `EventStream`, `EventSubscription`, `RawEvent` | One connection per call and per subscription, mirroring the herdr CLI; correlates the response ID, decodes results into caller structs, streams pushed events in arrival order after the subscribe acknowledgement, and closes the subscription's connection exactly once through a shared `sync.Once` regardless of whether `Close`, context cancellation or the read pump's own exit triggers it first |
+| [client.go](client.go) | `Client`, `NewClient`, `Call`, `lifetimeObserver`, `Subscribe`, `EventStream`, `EventSubscription`, `RawEvent` | One connection per call and per subscription, mirroring the herdr CLI; correlates the response ID, decodes results into caller structs, tells a result implementing `lifetimeObserver` which server lifetime answered it (read on the call's own connection), streams pushed events in arrival order after the subscribe acknowledgement, and closes the subscription's connection exactly once through a shared `sync.Once` regardless of whether `Close`, context cancellation or the read pump's own exit triggers it first |
 | [errors.go](errors.go) | `APIError`, `ProtocolError` | Server error responses keep their code and message; protocol violations (ID mismatch, non-protocol frames, oversized lines) are distinct from transport errors |
 | [probe.go](probe.go) | `InstallationProbe`, `parseSchema` | Implements `app.Probe`: resolves executables, reads `--version` lines, extracts protocol and method constants from `herdr api schema --json`, pings the configured socket |
 | [presentation.go](presentation.go) | `Presentation`, `NewPresentation` | Implements `app.AgentPresentation`: `pane.report_metadata` token patches, `agent.view.set` with a manager-first token sort and `agent.view.clear` — all under HOP's fixed source so its view is owned and clearable. A `pane_not_found` answer to `pane.report_metadata` ("pane <id> not found": an id the server no longer resolves, or a pane with no terminal) wraps both `app.ErrPaneNotFound` and `ErrPaneNotFound`; every other error keeps its own type |
 | [observation.go](observation.go) | `Observer`, `NewObserver`, `statusStream`, `DrainRemaining`, `flushBacklog` | Implements `app.Observer`: one `pane.agent_status_changed` subscription per watched pane, normalized into `app.StatusEvent`, and a `session.snapshot` reduced to `app.PaneObservation`; on stop-intake, the decode pump moves its pending event and the rest of the raw backlog into an overflow slice that `DrainRemaining` exposes |
-| [runtime.go](runtime.go) | `Runtime`, `NewRuntime`, `ErrPaneNotFound`, `ErrWorkspaceIDRequired` | Implements `app.Runtime`: `worktree.create` (cwd/branch/base, plus an S9 creation label sent only when the caller supplies one), `layout.apply` worker-pane creation, pane recovery by creation label via `session.snapshot`, `pane.read` scrollback capture, `pane.process_info` occupant inspection, `pane.close`, and `ServerInstance`'s dial-inspect-close socket-peer-pid lookup |
+| [runtime.go](runtime.go) | `Runtime`, `NewRuntime`, `ErrPaneNotFound`, `ErrWorkspaceIDRequired` | Implements `app.Runtime`: `worktree.create` (cwd/branch/base, plus an S9 creation label sent only when the caller supplies one), `layout.apply` worker-pane creation, pane recovery by creation label via `session.snapshot`, `pane.read` scrollback capture, `pane.process_info` occupant inspection stamped with the answering server lifetime, `pane.close`, and `ServerInstance`'s dial-inspect-close server-lifetime lookup |
 | [workspace.go](workspace.go) | `Runtime.CreateWorkspace`, `Runtime.FindWorkspaceByLabel`, `ErrWorkspaceCwdNotAbsolute`, `ErrWorkspaceLabelRequired` | Implements `app.WorkspaceRuntime` on the same `Runtime` type: `workspace.create` (explicit absolute cwd, additive env, a required unique creation label — an empty or relative cwd and an empty label are refused with the typed errors before any request is sent — focus always false) and its S8 recovery lookup — resolve the labeled workspace via `session.snapshot`, then descend to its sole tab and that tab's sole pane |
-| [runtime_darwin.go](runtime_darwin.go), [runtime_linux.go](runtime_linux.go), [runtime_other.go](runtime_other.go) | `peerPID` | GOOS-selected: `peerPID` reads a dialed connection's socket peer pid — `getsockopt(SOL_LOCAL, LOCAL_PEERPID)` on darwin, `getsockopt(SOL_SOCKET, SO_PEERCRED)` on linux, unconditionally unavailable elsewhere |
+| [lifetime.go](lifetime.go) | `serverLifetimeTag`, `serverLifetime`, `stableLifetime` | The server-lifetime token (`herdr-server-lifetime/v1 pid=<pid> start=<sec>.<usec>`) of the process that accepted a connection, and the before/after agreement rule an observation is stamped under |
+| [lifetime_darwin.go](lifetime_darwin.go), [lifetime_other.go](lifetime_other.go) | `peerPID`, `processLifetime`, `processStartTime`, `parseKinfoProcStart`, `kinfoProc` | GOOS-selected: on darwin `peerPID` reads a dialed connection's socket peer pid (`getsockopt(SOL_LOCAL, LOCAL_PEERPID)`) and `processLifetime` renders that pid with its start time from a raw `sysctl(CTL_KERN, KERN_PROC, KERN_PROC_PID, pid)` kinfo_proc record, read only when the record is exactly 648 bytes and carries the pid at offset 40; on every other platform both are unconditionally unknown (no executed probe pins a lifetime identity there) |
 
 ## Invariants
 
@@ -143,16 +144,32 @@ occupant inspection for the worker-launch use case.
   `FindPaneByLabel`'s own not-found reporting is unrelated and unchanged by
   this: it is `(zero value, false, nil)`, never an error.
 - `ServerInstance` dials the configured socket (no NDJSON frame is sent —
-  a bare connect, `peerPID` lookup, close, reusing `Client.dial`'s existing
+  a bare connect, `serverLifetime`, close, reusing `Client.dial`'s existing
   context handling so a wedged server cannot hang the call) and renders
-  `"peer-pid:<n>"` from the connection's socket peer pid. `peerPID` reports
-  `(0, false)` — never a fabricated pid — when the connection is not backed
-  by a real socket descriptor or the platform lookup fails; `ServerInstance`
-  turns that into `("", nil)`, not an error. Only a dial failure is an
-  error. The token identifies both the configured socket and the server
-  process behind it, so equal non-empty tokens across two calls imply the
-  same socket and the same server process; peer-pid recycling is not
-  detected.
+  the lifetime of the process that accepted the connection:
+  `"herdr-server-lifetime/v1 pid=<peer pid> start=<sec>.<usec>"`, the pid
+  from the socket and the start time from that pid's kinfo_proc record.
+  Herdr has no server-provided lifetime value, never re-execs a running
+  server in place, and starts a new process for every restart and live
+  handoff, so a token names exactly one server lifetime; a later process
+  reusing the pid starts after the earlier holder exited and so carries a
+  later start time (only a backwards wall-clock step landing on the exact
+  microsecond could repeat a token). Any lookup failure, a peer that has
+  exited, a kinfo_proc record of an unexpected size or carrying another
+  pid, and every non-darwin platform yield `("", nil)` — unknown, never a
+  fabricated value, and never equal to a recorded token. Only a dial
+  failure is an error. A token of the earlier `peer-pid:<n>` format never
+  equals a v1 token, so identities recorded by older runs compare as
+  changed.
+- `InspectPane` stamps `app.PaneProcess.ServerInstance` with the lifetime
+  of the server that answered that very request: Herdr serves exactly one
+  request per API connection, so `Client.Call` reads the peer pid once
+  after connecting (the peer is fixed at connect, and Herdr closes the
+  connection after answering) and the pid's lifetime before the request and
+  after the response; the stamp is that lifetime when both reads agree and
+  `""` otherwise (`stableLifetime`). A pid cannot be reused while its
+  process lives, so agreeing reads mean one process served the whole
+  exchange.
 - `Runtime.ClosePane` only issues `pane.close`; there is no
   occupant-conditioned or compare-and-swap close upstream (S2), so the close
   rule (re-inspect and match occupant evidence immediately before closing)
@@ -230,10 +247,11 @@ occupant inspection for the worker-launch use case.
   `ProtocolError`, a wrong-typed field (`argv` as a string) rejected by the
   standard decoder itself before any adapter validation runs, context
   cancellation across every method, `FindPaneByLabel`'s
-  not-found/ambiguous/transport-error cases, `ServerInstance` (the token
-  equals `"peer-pid:" + os.Getpid()` against an in-process temp Unix
-  listener, since listener and dialer are the same test process; a dead
-  socket errors with an empty token) and
+  not-found/ambiguous/transport-error cases, `ServerInstance` and
+  `InspectPane`'s stamp (on darwin the v1 token naming this process's
+  pid, since the in-process temp Unix listener and the dialer are the same
+  process, stable across calls; elsewhere `""`; a dead socket errors with
+  an empty token) and
   `TestRuntimeInspectPaneAppErrPaneNotFoundClassification` (a table proving
   `errors.Is(err, app.ErrPaneNotFound)` holds only for the `pane_not_found`
   case, never for a transport, unrelated-API-code or protocol failure),
@@ -260,12 +278,21 @@ occupant inspection for the worker-launch use case.
   merely SCANS (not necessarily the eventual match), proving those
   schema-required filter fields fail closed rather than silently acting as
   a non-match; both methods are included in `TestRuntimeHonorsCancellation`.
-- [runtime_internal_test.go](runtime_internal_test.go) (`package herdr`,
+- [lifetime_internal_test.go](lifetime_internal_test.go) (`package herdr`,
   same-package per the internal-algorithm testing guidance) —
-  `TestPeerPIDUnavailableForNonSocketConn` proves `peerPID` reports
-  `(0, false)` for a `net.Pipe` connection, which implements no
-  `syscall.Conn` on any platform: portable, no build tag, and exercises
-  every `peerPID` implementation's defensive type check identically.
+  `TestServerLifetimeUnknownForNonSocketConn` proves `serverLifetime`
+  reports `""` for a `net.Pipe` connection, which implements no
+  `syscall.Conn` on any platform, and `TestStableLifetime` pins the
+  before/after agreement rule.
+  [lifetime_darwin_test.go](lifetime_darwin_test.go) pins the kinfo_proc
+  layout: `TestProcessStartTimeMatchesTheProcessTable` compares the start
+  second of this process and of a live child with `ps -o lstart=` (an
+  independent source) and proves a reaped child's pid yields no start
+  time; `TestParseKinfoProcStartRefusesUnknownLayouts` refuses records of
+  another size or pid and out-of-range times. The production transport
+  pins the token itself (test/integration `TestSpikeLabelSurvivesRestart`:
+  the server leader's pid, `ps`'s start time, stable within a lifetime,
+  different across a restart).
 - [callsites_test.go](callsites_test.go) is the herdr-adapter half of the
   no-injection mechanism (docs/plan/phase-3-design.md section 11, part iii).
   `TestProductionCallSitesUseAllowlistedStringLiterals` type-checks every

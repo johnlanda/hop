@@ -689,7 +689,7 @@ func TestResumeAttestation(t *testing.T) {
 			return app.PaneProcess{}, app.ErrPaneNotFound
 		}
 		// The server restarted between the launch and this resume.
-		tc.Runtime.ServerInstanceValue = "peer-pid:2"
+		tc.Runtime.ServerInstanceValue = fakeServerToken(2)
 
 		req := defaultResumeRequest(detail.RunID.String())
 		req.ConfirmAbsent = true
@@ -736,7 +736,7 @@ func TestResumeAttestation(t *testing.T) {
 		nativeRef := tc.Store.Sessions[detail.SessionID].value.NativeSessionRef
 
 		// Round 1: post-restart, pane empty, attestation refused.
-		tc.Runtime.ServerInstanceValue = "peer-pid:2"
+		tc.Runtime.ServerInstanceValue = fakeServerToken(2)
 		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
 			return app.PaneProcess{}, app.ErrPaneNotFound
 		}
@@ -884,13 +884,13 @@ func TestCreationInstanceProvenance(t *testing.T) {
 
 	t.Run("binding lost across a restart: recovery keeps the creation identity and attestation refuses", func(t *testing.T) {
 		tc := newTestController(defaultPolicy())
-		_, detail := startedRun(t, tc) // creation observed peer-pid:1 into the intent
+		_, detail := startedRun(t, tc) // creation observed fakeServerToken(1) into the intent
 		claimLaunch(t, tc, detail, 4242)
 		loseBinding(t, tc)
 
 		// Herdr restarted before the takeover; the restored pane still
 		// carries its creation label.
-		tc.Runtime.ServerInstanceValue = "peer-pid:2"
+		tc.Runtime.ServerInstanceValue = fakeServerToken(2)
 		var label string
 		for id, op := range tc.Store.Operations {
 			if op.Kind == app.OpPaneOpen {
@@ -915,8 +915,8 @@ func TestCreationInstanceProvenance(t *testing.T) {
 		if recovered.Binding == nil {
 			t.Fatalf("the binding was not recovered by label")
 		}
-		if recovered.Binding.ServerInstance != "peer-pid:1" {
-			t.Fatalf("recovered binding ServerInstance = %q, want the creation-time %q, never the recovery-time observation", recovered.Binding.ServerInstance, "peer-pid:1")
+		if recovered.Binding.ServerInstance != fakeServerToken(1) {
+			t.Fatalf("recovered binding ServerInstance = %q, want the creation-time %q, never the recovery-time observation", recovered.Binding.ServerInstance, fakeServerToken(1))
 		}
 
 		// The pane is later positively gone; the attestation must refuse

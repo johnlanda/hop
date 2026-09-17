@@ -35,7 +35,7 @@ func relaunchIntent(t *testing.T, fx *fixture, opN int, session identity.Session
 				"command": []string{"/usr/local/bin/hop", "launch"}, "cwd": "/worktrees/relaunch",
 				"workspace_id": "workspace-r", "label": opID.String(),
 				"incarnation_id": incarnation.String(), "session_id": session.String(),
-				"server_instance": "peer-pid:7",
+				"server_instance": "herdr-server-lifetime/v1 pid=41007 start=1789000000.000007",
 			},
 			CreatedAt: fx.clock.Now(), UpdatedAt: fx.clock.Now(),
 		})
@@ -55,7 +55,7 @@ func relaunchOutcome(t *testing.T, fx *fixture, opID identity.OperationID, sessi
 		if err != nil {
 			t.Fatalf("get relaunch operation: %v", err)
 		}
-		binding := run.NewRuntimeBinding(session, incarnation, "", "peer-pid:7", "workspace-r", "tab-r", "pane-"+opID.String(), opID.String(), run.LaunchResume, fx.clock.Now())
+		binding := run.NewRuntimeBinding(session, incarnation, "", "herdr-server-lifetime/v1 pid=41007 start=1789000000.000007", "workspace-r", "tab-r", "pane-"+opID.String(), opID.String(), run.LaunchResume, fx.clock.Now())
 		if err := uow.Bindings().Create(t.Context(), binding); err != nil {
 			t.Fatalf("create relaunch binding: %v", err)
 		}
@@ -252,7 +252,7 @@ func TestSoloColdRelaunchSuccessorIsCurrent(t *testing.T) {
 				// restored occupant recorded on the OLD session.
 				f.inUOW(t, func(uow app.UnitOfWork) {
 					launch := supersedeCurrentBinding(t, uow, f.spec.SessionID, "observed process argv carries native session reference", f)
-					observed := run.NewRuntimeBinding(f.spec.SessionID, identity.IncarnationID(uid(8301)), launch.ServerSocketPath, "peer-pid:8", launch.WorkspaceID, launch.TabID, launch.PaneID, launch.CreationLabel, run.LaunchRestoredObserved, now)
+					observed := run.NewRuntimeBinding(f.spec.SessionID, identity.IncarnationID(uid(8301)), launch.ServerSocketPath, "herdr-server-lifetime/v1 pid=41008 start=1789000000.000008", launch.WorkspaceID, launch.TabID, launch.PaneID, launch.CreationLabel, run.LaunchRestoredObserved, now)
 					if err := uow.Bindings().Create(t.Context(), observed); err != nil {
 						t.Fatalf("create restored-observed binding: %v", err)
 					}

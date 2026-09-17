@@ -59,7 +59,7 @@ func launchingFeatureRun(t *testing.T, tc *testController) (runID identity.RunID
 	if err != nil {
 		t.Fatalf("parse manager incarnation id: %v", err)
 	}
-	binding := run.NewRuntimeBinding(managerID, managerIncarnation, "", "peer-pid:1", "workspace-mgr", "tab-mgr", "pane-mgr", "label-mgr", run.LaunchInitial, now)
+	binding := run.NewRuntimeBinding(managerID, managerIncarnation, "", fakeServerToken(1), "workspace-mgr", "tab-mgr", "pane-mgr", "label-mgr", run.LaunchInitial, now)
 	tc.Store.Bindings[managerID] = append(tc.Store.Bindings[managerID], binding)
 
 	tc.Store.LaunchClaims[managerIncarnation] = app.LaunchClaim{

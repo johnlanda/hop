@@ -81,11 +81,16 @@ type ProcessInfo struct {
 // (ordinarily one; a forking-wrapper topology reports more than the
 // launched harness alone, which the section 6 corroboration predicate
 // treats as unsupported). An empty Foreground means no foreground process
-// was observed.
+// was observed. ServerInstance is the server lifetime that answered this
+// very observation, in Runtime.ServerInstance's token format, established
+// on the inspection's own connection; "" means it could not be
+// established, and an observation whose ServerInstance does not equal a
+// recorded token is no evidence about the pane that token's server held.
 type PaneProcess struct {
 	ShellPID          int
 	ForegroundGroupID int
 	Foreground        []ProcessInfo
+	ServerInstance    string
 }
 
 // ErrPaneNotFound is the typed result Runtime.InspectPane reports (wrapped
@@ -129,21 +134,25 @@ type Runtime interface {
 	// ErrPaneNotFound: nothing was closed, and the caller's own absence
 	// observation decides what that means.
 	ClosePane(ctx context.Context, paneID string) error
-	// ServerInstance returns an opaque, adapter-formatted identity scoped
-	// to BOTH the configured socket path and the server process behind it:
-	// the adapter derives the token from its own connection to that
-	// socket (for example the socket peer pid), so equality of two
-	// non-empty tokens implies the same socket and the same server
-	// process. An empty string means the identity could not be
-	// established — unknown, never fabricated — and is not an error; the
-	// application compares tokens by equality only and treats unknown as
-	// ambiguous. Peer-pid recycling is not detected (a documented residual
-	// limitation; start-time hardening is a Phase 7 recovery item). The
-	// token is captured immediately before pane creation, frozen into the
-	// pane.open intent and recorded in the creation binding; resume
-	// observes it again to establish server continuity: a deferred native
-	// restore fires only after a server restart, so an unchanged server
-	// process with the pane gone cannot have a restore pending.
+	// ServerInstance returns an opaque, adapter-formatted identity of ONE
+	// server lifetime behind the configured socket: the adapter derives the
+	// token from its own connection to that socket (the accepting process's
+	// pid together with that process's OS start time), so equality of two
+	// non-empty tokens implies the same socket and the same server process
+	// lifetime, and a later server reusing the pid never repeats a token. A
+	// restart and a live handoff each start a new server process, so each
+	// yields a different token. An empty string means the identity could
+	// not be established — unknown, never fabricated — and is not an error;
+	// the application compares tokens by equality only and treats unknown
+	// as ambiguous. A token recorded in an older format never equals a
+	// current one, so it reads as a changed identity. The token is captured
+	// immediately before pane creation, frozen into the pane.open intent and
+	// recorded in the creation binding; resume and the launch-ended rows
+	// observe it again to establish server continuity: a deferred native
+	// restore fires only after a server restart, and a pane keeps its
+	// creation label and its process for its whole life under one server
+	// lifetime, so an unchanged server lifetime with the pane gone cannot
+	// have a restore pending or a renamed pane restored.
 	ServerInstance(ctx context.Context) (string, error)
 }
 

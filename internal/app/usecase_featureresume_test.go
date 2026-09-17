@@ -222,7 +222,7 @@ func TestResumeFeature(t *testing.T) {
 				t.Fatalf("attestation %s = %v, want true", field, outcome)
 			}
 		}
-		if payloadField(t, outcome, "recorded_server_instance") != "peer-pid:1" || payloadField(t, outcome, "observed_server_instance") != "peer-pid:1" {
+		if payloadField(t, outcome, "recorded_server_instance") != fakeServerToken(1) || payloadField(t, outcome, "observed_server_instance") != fakeServerToken(1) {
 			t.Fatalf("attestation continuity evidence = %v, want both instance tokens recorded", outcome)
 		}
 
@@ -289,7 +289,7 @@ func TestResumeFeature(t *testing.T) {
 	t.Run("a changed server instance refuses the relaunch after journaling the attestation", func(t *testing.T) {
 		f := newResumeFixture(t)
 		f.tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) { return app.PaneProcess{}, app.ErrPaneNotFound }
-		f.tc.Runtime.ServerInstanceValue = "peer-pid:2"
+		f.tc.Runtime.ServerInstanceValue = fakeServerToken(2)
 		result, _ := f.resume(t, f.fr.ManagerID.String())
 		mgr := sessionReport(t, &result, f.fr.ManagerID.String())
 		if mgr.Disposition != app.SessionReconciling {

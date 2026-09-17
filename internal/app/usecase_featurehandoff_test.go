@@ -416,7 +416,7 @@ func TestFeatureTerminalFailureResolvesIntegrationInit(t *testing.T) {
 		f.tc.Store.Runs[runID].value.State = run.RunLaunching
 		f.tc.Store.Sessions[manager.ID].value.State = run.SessionLaunching
 		f.tc.Store.Bindings[manager.ID] = append(f.tc.Store.Bindings[manager.ID], run.NewRuntimeBinding(
-			manager.ID, incarnation, "", "peer-pid:1", "workspace-m", "tab-m", "pane-m", "label-m", run.LaunchInitial, f.tc.Clock.Now()))
+			manager.ID, incarnation, "", fakeServerToken(1), "workspace-m", "tab-m", "pane-m", "label-m", run.LaunchInitial, f.tc.Clock.Now()))
 		f.tc.Store.mu.Unlock()
 		f.recordManagerClaim(incarnation, app.LaunchClaimExecFailed)
 		f.tc.Clock.Advance(leaseTTL + time.Second)

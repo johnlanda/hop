@@ -84,7 +84,7 @@ func seedManagerMember(t *testing.T, tc *testController, runID identity.RunID, s
 	if err != nil {
 		t.Fatalf("parse incarnation id: %v", err)
 	}
-	binding := run.NewRuntimeBinding(id, incarnation, "", "peer-pid:1", "workspace-mgr", "tab-mgr", "pane-"+id.String(), "label-"+id.String(), run.LaunchInitial, now)
+	binding := run.NewRuntimeBinding(id, incarnation, "", fakeServerToken(1), "workspace-mgr", "tab-mgr", "pane-"+id.String(), "label-"+id.String(), run.LaunchInitial, now)
 	tc.Store.Bindings[id] = append(tc.Store.Bindings[id], binding)
 	tc.Store.LaunchClaims[incarnation] = app.LaunchClaim{
 		IncarnationID: incarnation, RunID: runID, SessionID: id,
