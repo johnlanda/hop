@@ -346,3 +346,55 @@ func TestCombinedCheckPreSpawnInterruption(t *testing.T) {
 		requireStopTerminates(t, f, merged)
 	})
 }
+
+// noticeBodyPaths lists every artifact written under a run's messages
+// directory — the bodies controller notices carry.
+func noticeBodyPaths(tc *testController, runID identity.RunID) []string {
+	prefix := "/state/runs/" + runID.String() + "/messages/"
+	var paths []string
+	tc.Artifacts.mu.Lock()
+	defer tc.Artifacts.mu.Unlock()
+	for path := range tc.Artifacts.files {
+		if strings.HasPrefix(path, prefix) {
+			paths = append(paths, path)
+		}
+	}
+	slices.Sort(paths)
+	return paths
+}
+
+// TestCombinedCheckUnderAHeldStopWritesNoNoticeBody pins the integrated
+// notice's ordering against the held-stop read. A combined check that
+// PASSES while a stop is held is claimed by the stop path: the integration
+// is left to the stop's reset and the manager notice is never committed.
+// Its body must therefore never be written either — a body written and
+// then discarded leaves a file under the run's messages directory that no
+// message row ever names.
+func TestCombinedCheckUnderAHeldStopWritesNoNoticeBody(t *testing.T) {
+	f, _, _ := newCheckingFixture(t)
+	claimOnCheckExec(f, 7474)
+	// The stop lands after the intent — which refuses a check under a held
+	// stop outright — and before the outcome is settled, so this round
+	// reaches the settlement with a passing check and a held stop.
+	f.git.CheckExecGate = func(context.Context, string) (app.CommandResult, bool, error) {
+		requestRunStop(f.tc, f.fr.RunID)
+		return app.CommandResult{ExitCode: 0}, true, nil
+	}
+
+	report, err := driveIntegrationStep(context.Background(), f.tc.Controller, f.fr.Handle)
+	if err != nil {
+		t.Fatalf("driveIntegrationStep() error = %v", err)
+	}
+	if !report.Interrupted {
+		t.Fatalf("round report = %+v, want interrupted: the held stop claimed the outcome", report)
+	}
+	if integ := f.currentIntegrationRow(t); integ.State == run.IntegrationIntegrated {
+		t.Fatalf("integration state = %s with the ref at %s, want it left to the stop path", integ.State, f.git.ref(integrationRefName))
+	}
+	if got := f.tc.Store.Tasks[f.taskID].value.State; got == run.TaskIntegrated {
+		t.Fatalf("task state = %s, want it not integrated under a held stop", got)
+	}
+	if paths := noticeBodyPaths(f.tc, f.fr.RunID); len(paths) != 0 {
+		t.Fatalf("notice bodies written = %v, want none: the notice was never committed, so no orphan body may be left behind", paths)
+	}
+}

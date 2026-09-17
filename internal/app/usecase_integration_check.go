@@ -231,8 +231,20 @@ func (c *Controller) runIntegrationCheck(ctx context.Context, handle RunHandle, 
 		// this shape can never be adopted as a passing receipt.
 		outcome.Detail = fmt.Sprintf("evidence retention failed: %v", captureErr)
 	}
+	// A held stop is read once here, before the notice body is written.
+	// The settling transaction's own read below is still the authority —
+	// it decides, under the lease, whether the integration happens — and
+	// this one only avoids writing an artifact for a notice that read is
+	// about to discard. Preparing the body first is otherwise harmless
+	// (the mailbox is the store, and only commitControllerNotice makes a
+	// notice a message), but it leaves a file under the run's messages
+	// directory with no row naming it.
+	stopHeld, stopErr := c.runStopRequested(persistCtx, handle)
+	if stopErr != nil {
+		return false, stopErr
+	}
 	var notice controllerNotice
-	if retained && cmdResult.ExitCode == 0 {
+	if retained && cmdResult.ExitCode == 0 && !stopHeld {
 		prepared, noticeErr := c.prepareIntegratedNotice(persistCtx, handle, frozen, integ, fmt.Sprintf("combined check passed (operation %s)", opID))
 		if noticeErr != nil {
 			return false, noticeErr
@@ -271,6 +283,25 @@ func (c *Controller) settleUnspawnedCheck(ctx context.Context, handle RunHandle,
 		return errors.Join(cause, err)
 	}
 	return cause
+}
+
+// runStopRequested reads the run's held-stop flag on its own, outside any
+// settling transaction: a read-only look, never the authority for a
+// decision. Every path that ACTS on a stop re-reads it inside the
+// transaction that commits the act.
+func (c *Controller) runStopRequested(ctx context.Context, handle RunHandle) (bool, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
+	stopRequested := false
+	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		r, _, runErr := uow.Runs().Get(ctx, handle.runID)
+		if runErr != nil {
+			return runErr
+		}
+		stopRequested = r.StopRequested
+		return nil
+	}); err != nil {
+		return false, fmt.Errorf("app: read the run's stop request: %w", err)
+	}
+	return stopRequested, nil
 }
 
 // settleCombinedCheck records a combined-check execution's observed
