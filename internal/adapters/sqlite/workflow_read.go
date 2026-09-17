@@ -377,10 +377,32 @@ func sessionSummaries(ctx context.Context, q querier, runID identity.RunID) ([]a
 		}
 		if hasBinding {
 			summary.Binding = &binding
+			pending, pendingErr := launchCorroborationPending(ctx, q, session.State, binding)
+			if pendingErr != nil {
+				return nil, pendingErr
+			}
+			summary.LaunchCorroborationPending = pending
 		}
 		summaries = append(summaries, summary)
 	}
 	return summaries, nil
+}
+
+// launchCorroborationPending reads the structural fact behind
+// app.SessionSummary.LaunchCorroborationPending: the session is
+// reconciling and the launch claim of its current placement's own
+// incarnation is still exec_pending. binding is a current binding, which
+// currentBinding already selects unsuperseded. An incarnation with no
+// claim row reports false.
+func launchCorroborationPending(ctx context.Context, q querier, state run.SessionState, binding run.RuntimeBinding) (bool, error) { //nolint:gocritic // hugeParam: RuntimeBinding is the read snapshot every sqlite read passes by value.
+	if state != run.SessionReconciling || binding.PaneID == "" {
+		return false, nil
+	}
+	claim, err := getLaunchClaim(ctx, q, binding.IncarnationID)
+	if err != nil {
+		return false, err
+	}
+	return claim != nil && claim.State == app.LaunchClaimExecPending, nil
 }
 
 // latestIntegrationSummary loads the run's most recently CREATED

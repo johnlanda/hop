@@ -1049,3 +1049,26 @@ func SettleManagerLaunch(ctx context.Context, store Store, lease app.Lease, f Fe
 		return activateSession(ctx, uow, f.ManagerID, now)
 	})
 }
+
+// ReconcileSession moves one session to reconciling, as the controller's
+// launch corroboration does when a pane's foreground group holds another
+// process carrying the launch identity. It leaves the session's placement
+// and its launch claim exactly as they are, so a caller decides which
+// claim state the reconciling session carries by choosing when to call
+// this relative to SettleManagerLaunch.
+func ReconcileSession(ctx context.Context, store Store, lease app.Lease, sessionID string, now time.Time) error {
+	return withUOW(ctx, store, lease, func(uow app.UnitOfWork) error {
+		v, rev, err := uow.Sessions().Get(ctx, identity.SessionID(sessionID))
+		if err != nil {
+			return fmt.Errorf("hopfixtures: get session: %w", err)
+		}
+		next, err := v.Reconcile(now)
+		if err != nil {
+			return fmt.Errorf("hopfixtures: reconcile session: %w", err)
+		}
+		if _, err := uow.Sessions().Save(ctx, next, rev); err != nil {
+			return fmt.Errorf("hopfixtures: save session: %w", err)
+		}
+		return nil
+	})
+}

@@ -18,11 +18,21 @@ type SessionLaunchProgress struct {
 	Progress  LaunchProgress
 }
 
+// sessionReconcileLaunchCorroboration is the reason the LIVE launch
+// corroboration records when it fails closed on a foreground group that
+// holds another process carrying the launch identity. It is value-free,
+// and it is deliberately not the resume reason: this reconciliation is
+// re-inspected by every later round, and a later clean observation of the
+// same pane settles it.
+const sessionReconcileLaunchCorroboration = "launch corroboration: another process on the pane carries the launch identity; re-inspected every pass"
+
 // CorroborateSessionLaunches performs one inspection round for every
 // non-terminal session of a feature-mode run currently in SessionLaunching
 // state — manager, implementers and reviewer alike
 // (docs/plan/phase-3-design.md section 6, "corroborate launches" in the
-// extended scheduling pass, L796-798). It is the per-session sibling of
+// extended scheduling pass, L796-798) — and for the one reconciliation
+// this step itself produces, identified structurally by
+// wrapperReconciliation. It is the per-session sibling of
 // Phase 2's CorroborateLaunch: orchestration only, every occupant decision
 // reuses CorroborateSettlement verbatim, and Phase 2's CorroborateLaunch
 // and its RunDetail-bound helpers (driveLaunchDeadline,
@@ -49,7 +59,11 @@ func (c *Controller) CorroborateSessionLaunches(ctx context.Context, handle RunH
 	var reports []SessionLaunchProgress
 	for i := range sessions {
 		session := sessions[i]
-		if session.State != run.SessionLaunching {
+		inspect, inspectErr := c.sessionUnderLaunchCorroboration(ctx, handle, &session)
+		if inspectErr != nil {
+			return reports, inspectErr
+		}
+		if !inspect {
 			continue
 		}
 		progress, corrErr := c.corroborateSessionLaunch(ctx, handle, &frozen, &session)
@@ -62,6 +76,44 @@ func (c *Controller) CorroborateSessionLaunches(ctx context.Context, handle RunH
 		return reports, err
 	}
 	return reports, nil
+}
+
+// sessionUnderLaunchCorroboration reports whether one session is this
+// step's to inspect: every launching session, plus the live wrapper
+// reconciliation this step itself produces (wrapperReconciliation). A
+// reconciling session in any other shape — every resume-marked one, whose
+// claim is settled — is left exactly as it was.
+func (c *Controller) sessionUnderLaunchCorroboration(ctx context.Context, handle RunHandle, session *run.Session) (bool, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per session per scheduling pass.
+	switch session.State {
+	case run.SessionLaunching:
+		return true, nil
+	case run.SessionReconciling:
+		binding, _, claim, claimFound, _, err := c.sessionCloseEvidence(ctx, handle, session)
+		if err != nil {
+			return false, err
+		}
+		return wrapperReconciliation(&binding, claimFound, &claim), nil
+	default:
+		return false, nil
+	}
+}
+
+// wrapperReconciliation is the STRUCTURAL identification of the live
+// wrapper reconciliation, used wherever that state has to be told apart
+// from every other reconciling session: a current, unsuperseded, placed
+// binding whose own incarnation's launch claim is still exec_pending. The
+// caller has already established that the session is reconciling. A
+// binding that was not found is the zero value, whose empty pane id fails
+// the first conjunct.
+//
+// It needs no recorded reason or marker of its own because
+// markSessionReconciling's invariant makes the shape exclusive: every
+// resume path marks a session reconciling only after reading its claim as
+// settled, so an exec_pending claim under a live placement can only be a
+// launch this step is still corroborating.
+func wrapperReconciliation(binding *run.RuntimeBinding, claimFound bool, claim *LaunchClaim) bool {
+	return binding.PaneID != "" && !binding.Superseded &&
+		claimFound && claim.State == LaunchClaimExecPending && claim.IncarnationID == binding.IncarnationID
 }
 
 // driveLaunchingRunFailure drives the feature terminal failure of a
@@ -196,7 +248,7 @@ func (c *Controller) corroborateSessionLaunch(ctx context.Context, handle RunHan
 		}
 		return LaunchSettled, nil
 	case SettlementForkingWrapper:
-		if err := c.markSessionReconciling(ctx, handle, session.ID); err != nil {
+		if err := c.markSessionReconciling(ctx, handle, session.ID, sessionReconcileLaunchCorroboration); err != nil {
 			return "", err
 		}
 		return LaunchNeedsInteraction, nil

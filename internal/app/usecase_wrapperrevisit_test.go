@@ -1,0 +1,369 @@
+package app_test
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"github.com/johnlanda/hop/internal/app"
+	"github.com/johnlanda/hop/internal/domain/identity"
+	"github.com/johnlanda/hop/internal/domain/run"
+)
+
+// The two transition reasons a reconciling feature session can carry,
+// retyped from internal/app's own constants (sessionReconcileResumeAmbiguous
+// and sessionReconcileLaunchCorroboration) rather than derived from them, so
+// either side drifting fails here.
+const (
+	liveCorroborationReason = "launch corroboration: another process on the pane carries the launch identity; re-inspected every pass"
+	resumeAmbiguousReason   = "resume: evidence ambiguous"
+)
+
+// wrapperPane is a foreground group in the shape a same-image child in its
+// fork-before-exec window produces (pinned under the production transport by
+// test/integration/spike_forkwindow_test.go's
+// TestSpikeForkWindowSameImageChild): the pane's own process is the claimed
+// one and matches every conjunct of the predicate itself, and one other
+// member carries the identical executable identity and marker under a
+// different pid.
+func wrapperPane(incarnation identity.IncarnationID) app.PaneProcess {
+	claimed := corroboratingChild(incarnation)
+	forked := claimed
+	forked.PID = childLaunchPID + 1
+	return childPaneWith(childLaunchPID, claimed, forked)
+}
+
+// cleanPane is the same pane one sample later, the forked child having
+// exec'd something that carries neither the executable identity nor a
+// marker.
+func cleanPane(incarnation identity.IncarnationID) app.PaneProcess {
+	standIn := app.ProcessInfo{PID: childLaunchPID + 1, Name: "sleep", Argv0: "mcp-stand-in", Argv: []string{"mcp-stand-in", "600"}}
+	return childPaneWith(childLaunchPID, corroboratingChild(incarnation), standIn)
+}
+
+// wedgeWrappedChildLaunch drives one child launch to the live wrapper
+// reconciliation and returns the fixture, the child's binding and the
+// loop's handle: resume hands the placed launch to the loop, and the
+// loop's first round finds another process carrying the launch identity
+// and fails closed.
+func wedgeWrappedChildLaunch(t *testing.T) (*resumeFixture, run.RuntimeBinding, app.RunHandle) {
+	t.Helper()
+	f := newResumeFixture(t)
+	binding := resumeChildClaim(t, f, app.LaunchClaimExecPending)
+	f.tc.Runtime.InspectPaneFn = withChildPane(f, binding.PaneID, wrapperPane(binding.IncarnationID))
+	_, handle := f.resume(t, "")
+
+	reports, err := f.tc.Controller.CorroborateSessionLaunches(context.Background(), handle)
+	if err != nil {
+		t.Fatalf("CorroborateSessionLaunches() error = %v", err)
+	}
+	if len(reports) != 1 || reports[0].SessionID != f.ChildID.String() || reports[0].Progress != app.LaunchNeedsInteraction {
+		t.Fatalf("first round = %+v, want the child failing closed with needs-interaction", reports)
+	}
+	if got := f.tc.Store.Sessions[f.ChildID].value.State; got != run.SessionReconciling {
+		t.Fatalf("child session state = %s, want reconciling", got)
+	}
+	return f, binding, handle
+}
+
+// sessionTransitions counts the transitions recorded for one session.
+func sessionTransitions(tc *testController, sessionID identity.SessionID) int {
+	n := 0
+	for _, tr := range tc.Store.Transitions {
+		if tr.EntityKind == app.EntitySession && tr.EntityID == sessionID.String() {
+			n++
+		}
+	}
+	return n
+}
+
+// reconcilingSessionReason is the reason of the newest recorded
+// transition INTO reconciling for one session.
+func reconcilingSessionReason(t *testing.T, tc *testController, sessionID identity.SessionID) string {
+	t.Helper()
+	reason, ok := transitionReason(tc, app.EntitySession, sessionID.String(), string(run.SessionReconciling))
+	if !ok {
+		t.Fatalf("no transition into reconciling was recorded for session %s", sessionID)
+	}
+	return reason
+}
+
+// TestLaunchCorroborationRevisitsItsOwnReconciliation proves the live
+// launch corroboration's revisit rule against a child launch whose
+// foreground group holds a same-image child in its fork window: the round
+// fails closed to reconciling under its OWN value-free reason, and every
+// later round re-inspects that session — settling it once one observation
+// is clean, writing nothing while the other process is still there, and
+// taking the launch-ended row once the pane is gone.
+func TestLaunchCorroborationRevisitsItsOwnReconciliation(t *testing.T) {
+	t.Run("the live path records its own value-free reason, never resume's", func(t *testing.T) {
+		f, _, _ := wedgeWrappedChildLaunch(t)
+		if got := reconcilingSessionReason(t, f.tc, f.ChildID); got != liveCorroborationReason {
+			t.Fatalf("reconciling reason = %q, want the live corroboration's own %q", got, liveCorroborationReason)
+		}
+	})
+
+	t.Run("a later clean observation settles the reconciling session", func(t *testing.T) {
+		f, binding, handle := wedgeWrappedChildLaunch(t)
+		f.tc.Runtime.InspectPaneFn = withChildPane(f, binding.PaneID, cleanPane(binding.IncarnationID))
+
+		reports, err := f.tc.Controller.CorroborateSessionLaunches(context.Background(), handle)
+		if err != nil {
+			t.Fatalf("second CorroborateSessionLaunches() error = %v", err)
+		}
+		if len(reports) != 1 || reports[0].Progress != app.LaunchSettled {
+			t.Fatalf("second round = %+v, want the reconciling session settled", reports)
+		}
+		if got := f.tc.Store.LaunchClaims[binding.IncarnationID].State; got != app.LaunchClaimExeced {
+			t.Fatalf("claim state = %s, want execed", got)
+		}
+		if got := f.tc.Store.Sessions[f.ChildID].value.State; got != run.SessionActive {
+			t.Fatalf("child session state = %s, want active", got)
+		}
+		attemptID := f.tc.Store.Sessions[f.ChildID].value.AttemptID
+		if got := f.tc.Store.Attempts[attemptID].value.State; got != run.AttemptRunning {
+			t.Fatalf("attempt state = %s, want running", got)
+		}
+	})
+
+	t.Run("a persistent other process stays reconciling and writes nothing", func(t *testing.T) {
+		f, binding, handle := wedgeWrappedChildLaunch(t)
+		transitions := sessionTransitions(f.tc, f.ChildID)
+
+		for round := range 3 {
+			reports, err := f.tc.Controller.CorroborateSessionLaunches(context.Background(), handle)
+			if err != nil {
+				t.Fatalf("round %d: CorroborateSessionLaunches() error = %v", round, err)
+			}
+			if len(reports) != 1 || reports[0].Progress != app.LaunchNeedsInteraction {
+				t.Fatalf("round %d = %+v, want needs-interaction again", round, reports)
+			}
+		}
+		if got := sessionTransitions(f.tc, f.ChildID); got != transitions {
+			t.Fatalf("session transitions = %d, want the original %d: a persistent wrapper writes nothing", got, transitions)
+		}
+		if got := f.tc.Store.LaunchClaims[binding.IncarnationID].State; got != app.LaunchClaimExecPending {
+			t.Fatalf("claim state = %s, want exec_pending", got)
+		}
+		if got := f.tc.Store.Sessions[f.ChildID].value.State; got != run.SessionReconciling {
+			t.Fatalf("child session state = %s, want reconciling", got)
+		}
+	})
+
+	t.Run("a gone pane takes the launch-ended row and the exec-failure row", func(t *testing.T) {
+		f, binding, handle := wedgeWrappedChildLaunch(t)
+		// The pane is positively gone by id, its creation label answers
+		// nothing, the claimed process is not in its group and the server
+		// lifetime that placed it still answers: the launch ended.
+		f.tc.Runtime.InspectPaneFn = liveManagerPane(f, nil)
+
+		reports, err := f.tc.Controller.CorroborateSessionLaunches(context.Background(), handle)
+		if err != nil {
+			t.Fatalf("CorroborateSessionLaunches() error = %v", err)
+		}
+		if len(reports) != 1 || reports[0].Progress != app.LaunchFailed {
+			t.Fatalf("round = %+v, want the launch settled failed", reports)
+		}
+		if got := f.tc.Store.LaunchClaims[binding.IncarnationID].State; got != app.LaunchClaimExecFailed {
+			t.Fatalf("claim state = %s, want exec_failed", got)
+		}
+		if got := f.tc.Store.Sessions[f.ChildID].value.State; got != run.SessionTerminated {
+			t.Fatalf("child session state = %s, want terminated", got)
+		}
+		attemptID := f.tc.Store.Sessions[f.ChildID].value.AttemptID
+		if got := f.tc.Store.Attempts[attemptID].value.State; got != run.AttemptFailed {
+			t.Fatalf("attempt state = %s, want failed", got)
+		}
+	})
+}
+
+// TestReconcilingSessionWithASettledClaimIsNeverReInspected pins the
+// structural identification from the other side: a session a RESUME path
+// marked reconciling holds a settled claim, so no corroboration round
+// touches it — not its pane, not its row. This is what makes the live
+// reconciliation identifiable without a reason or marker of its own.
+func TestReconcilingSessionWithASettledClaimIsNeverReInspected(t *testing.T) {
+	f := newResumeFixture(t)
+	binding := resumeChildClaim(t, f, app.LaunchClaimExeced)
+	// A settled claim whose occupant does not corroborate: resume fails
+	// closed to reconciling.
+	foreign := app.ProcessInfo{PID: childLaunchPID, Name: "zsh", Argv: []string{"-zsh"}}
+	inspected := map[string]int{}
+	f.tc.Runtime.InspectPaneFn = func(id string) (app.PaneProcess, error) {
+		inspected[id]++
+		if id == binding.PaneID {
+			return childPaneWith(childLaunchPID, foreign), nil
+		}
+		return liveManagerPane(f, nil)(id)
+	}
+
+	result, handle := f.resume(t, "")
+	if report := sessionReport(t, &result, f.ChildID.String()); report.Disposition != app.SessionReconciling {
+		t.Fatalf("child report = %+v, want reconciling on ambiguous evidence", report)
+	}
+	if got := reconcilingSessionReason(t, f.tc, f.ChildID); got != resumeAmbiguousReason {
+		t.Fatalf("reconciling reason = %q, want resume's own %q", got, resumeAmbiguousReason)
+	}
+
+	transitions := sessionTransitions(f.tc, f.ChildID)
+	inspected = map[string]int{}
+	reports, err := f.tc.Controller.CorroborateSessionLaunches(context.Background(), handle)
+	if err != nil {
+		t.Fatalf("CorroborateSessionLaunches() error = %v", err)
+	}
+	if len(reports) != 0 {
+		t.Fatalf("reports = %+v, want none: a resume-marked reconciling session is not the loop's to inspect", reports)
+	}
+	if got := inspected[binding.PaneID]; got != 0 {
+		t.Fatalf("the child's pane was inspected %d times, want none", got)
+	}
+	if got := sessionTransitions(f.tc, f.ChildID); got != transitions {
+		t.Fatalf("session transitions = %d, want the original %d", got, transitions)
+	}
+	if got := f.tc.Store.Sessions[f.ChildID].value.State; got != run.SessionReconciling {
+		t.Fatalf("child session state = %s, want reconciling, exactly as resume left it", got)
+	}
+}
+
+// TestNoResumePathProducesAnUnsettledReconcilingSession is the invariant
+// markSessionReconciling's doc comment states, driven rather than argued:
+// across every resume path that fails closed to reconciling, the session's
+// current placement's launch claim is already SETTLED. A new resume path
+// that could mark a session reconciling while its claim is still
+// exec_pending would make the live reconciliation unidentifiable, and
+// fails here.
+func TestNoResumePathProducesAnUnsettledReconcilingSession(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		confirmAbsent bool
+		arrange       func(f *resumeFixture, binding run.RuntimeBinding)
+	}{
+		{
+			name: "the occupant does not corroborate",
+			arrange: func(f *resumeFixture, binding run.RuntimeBinding) {
+				f.tc.Runtime.InspectPaneFn = withChildPane(f, binding.PaneID,
+					childPaneWith(childLaunchPID, app.ProcessInfo{PID: childLaunchPID, Name: "zsh", Argv: []string{"-zsh"}}))
+			},
+		},
+		{
+			name: "the occupant is a forking wrapper",
+			arrange: func(f *resumeFixture, binding run.RuntimeBinding) {
+				f.tc.Runtime.InspectPaneFn = withChildPane(f, binding.PaneID, wrapperPane(binding.IncarnationID))
+			},
+		},
+		{
+			name: "the pane is gone but its creation label still answers",
+			arrange: func(f *resumeFixture, binding run.RuntimeBinding) {
+				f.tc.Runtime.InspectPaneFn = liveManagerPane(f, nil)
+				f.tc.Runtime.FindPaneByLabelFn = func(label string) (app.PaneRef, bool, error) {
+					if label == binding.CreationLabel {
+						return app.PaneRef{WorkspaceID: binding.WorkspaceID, TabID: "tab-moved", PaneID: "pane-moved"}, true, nil
+					}
+					return app.PaneRef{}, false, nil
+				}
+			},
+		},
+		{
+			name: "the pane is absent and no attestation was given",
+			arrange: func(f *resumeFixture, _ run.RuntimeBinding) {
+				f.tc.Runtime.InspectPaneFn = liveManagerPane(f, nil)
+			},
+		},
+		{
+			name:          "the pane is absent, attested, and the server restarted",
+			confirmAbsent: true,
+			arrange: func(f *resumeFixture, _ run.RuntimeBinding) {
+				f.tc.Runtime.InspectPaneFn = liveManagerPane(f, nil)
+				f.tc.Runtime.ServerInstanceValue = fakeServerToken(2)
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newResumeFixture(t)
+			// A settled claim is what every one of these paths reads; the
+			// assertion below is that none of them can be reached with an
+			// unsettled one.
+			binding := resumeChildClaim(t, f, app.LaunchClaimExeced)
+			tt.arrange(f, binding)
+			confirm := ""
+			if tt.confirmAbsent {
+				confirm = f.ChildID.String()
+			}
+
+			result, _ := f.resume(t, confirm)
+			if report := sessionReport(t, &result, f.ChildID.String()); report.Disposition != app.SessionReconciling {
+				t.Fatalf("child report = %+v, want reconciling", report)
+			}
+			for id, row := range f.tc.Store.Sessions {
+				if row.value.State != run.SessionReconciling {
+					continue
+				}
+				current, ok := f.tc.Store.currentBindingLocked(id)
+				if !ok || current.PaneID == "" {
+					continue
+				}
+				claim, claimFound := f.tc.Store.LaunchClaims[current.IncarnationID]
+				if claimFound && claim.State == app.LaunchClaimExecPending {
+					t.Fatalf("session %s is reconciling with an exec_pending claim under a current placement: a resume path produced the one shape that identifies the LIVE launch corroboration's reconciliation", id)
+				}
+			}
+		})
+	}
+}
+
+// TestColdRelaunchLeavesAReconcilingSessionLost proves the cold-relaunch
+// path is untouched by the revisit rule: a session resume left reconciling
+// is attested absent and goes reconciling -> lost with its binding
+// superseded, and no corroboration round ever re-inspects it — only its
+// successor's fresh launch.
+func TestColdRelaunchLeavesAReconcilingSessionLost(t *testing.T) {
+	f := newResumeFixture(t)
+	inspected := map[string]int{}
+	f.tc.Runtime.InspectPaneFn = func(id string) (app.PaneProcess, error) {
+		inspected[id]++
+		return app.PaneProcess{}, app.ErrPaneNotFound
+	}
+
+	// Round one: absent with no attestation, so the manager stays
+	// reconciling with a settled claim.
+	first, handle := f.resume(t, "")
+	if mgr := sessionReport(t, &first, f.fr.ManagerID.String()); mgr.Disposition != app.SessionReconciling {
+		t.Fatalf("manager report = %+v, want reconciling without an attestation", mgr)
+	}
+	managerPane, ok := f.tc.Store.currentBindingLocked(f.fr.ManagerID)
+	if !ok {
+		t.Fatalf("no binding for the fixture manager %s", f.fr.ManagerID)
+	}
+	inspected = map[string]int{}
+	if _, err := f.tc.Controller.CorroborateSessionLaunches(context.Background(), handle); err != nil {
+		t.Fatalf("CorroborateSessionLaunches() error = %v", err)
+	}
+	if got := inspected[managerPane.PaneID]; got != 0 {
+		t.Fatalf("the reconciling manager's pane was inspected %d times, want none", got)
+	}
+
+	// Round two, a fresh controller: the attestation relaunches the
+	// lineage, and the reconciling predecessor is lost.
+	f.tc.Clock.Advance(leaseTTL + 1)
+	second, _, err := f.tc.Controller.ResumeFeature(context.Background(), app.ResumeFeatureRequest{
+		RunID: f.fr.RunID.String(), ControllerID: "controller-3",
+		ConfirmAbsentSession: f.fr.ManagerID.String(),
+		HOPPath:              "/usr/local/bin/hop", StateRoot: "/state",
+	})
+	if err != nil {
+		t.Fatalf("second ResumeFeature() error = %v", err)
+	}
+	if mgr := sessionReport(t, &second, f.fr.ManagerID.String()); mgr.Disposition != app.SessionRelaunched {
+		t.Fatalf("manager report = %+v, want relaunched", mgr)
+	}
+	if got := f.tc.Store.Sessions[f.fr.ManagerID].value.State; got != run.SessionLost {
+		t.Fatalf("prior manager state = %s, want lost", got)
+	}
+	reason, found := transitionReason(f.tc, app.EntitySession, f.fr.ManagerID.String(), string(run.SessionLost))
+	if !found || !strings.Contains(reason, "cold relaunch authorized") {
+		t.Fatalf("lost transition reason = %q (found %t), want the attested cold relaunch", reason, found)
+	}
+	if current, stillCurrent := f.tc.Store.currentBindingLocked(f.fr.ManagerID); stillCurrent && current.PaneID == managerPane.PaneID {
+		t.Fatalf("the lost manager still has its placement as a current binding (%s); it must be superseded", current.PaneID)
+	}
+}

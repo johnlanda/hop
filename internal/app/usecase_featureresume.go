@@ -454,7 +454,7 @@ func (c *Controller) reconcileFeatureSession(ctx context.Context, handle RunHand
 		}
 		report.Disposition = SessionReconciling
 		report.Detail = fmt.Sprintf("occupant did not corroborate (%s); failing closed", settlement)
-		if err := c.markSessionReconciling(ctx, handle, session.ID); err != nil {
+		if err := c.markSessionReconciling(ctx, handle, session.ID, sessionReconcileResumeAmbiguous); err != nil {
 			return report, false, err
 		}
 		return report, false, nil
@@ -471,7 +471,7 @@ func (c *Controller) reconcileFeatureSession(ctx context.Context, handle RunHand
 	if ambiguous != "" || !absent {
 		report.Disposition = SessionReconciling
 		report.Detail = "absence not established: " + ambiguous
-		if err := c.markSessionReconciling(ctx, handle, session.ID); err != nil {
+		if err := c.markSessionReconciling(ctx, handle, session.ID, sessionReconcileResumeAmbiguous); err != nil {
 			return report, false, err
 		}
 		return report, false, nil
@@ -480,7 +480,7 @@ func (c *Controller) reconcileFeatureSession(ctx context.Context, handle RunHand
 	if req.ConfirmAbsentSession != session.ID.String() {
 		report.Disposition = SessionReconciling
 		report.Detail = "pane absent; cold relaunch requires --confirm-absent " + session.ID.String()
-		if err := c.markSessionReconciling(ctx, handle, session.ID); err != nil {
+		if err := c.markSessionReconciling(ctx, handle, session.ID, sessionReconcileResumeAmbiguous); err != nil {
 			return report, false, err
 		}
 		return report, false, nil
@@ -496,7 +496,7 @@ func (c *Controller) reconcileFeatureSession(ctx context.Context, handle RunHand
 	if !ServerContinuityEstablished(binding.ServerInstance, observedInstance) {
 		report.Disposition = SessionReconciling
 		report.Detail = fmt.Sprintf("attestation recorded, but server continuity is not established (recorded %q, observed %q); a deferred native restore may still fire", binding.ServerInstance, observedInstance)
-		if err := c.markSessionReconciling(ctx, handle, session.ID); err != nil {
+		if err := c.markSessionReconciling(ctx, handle, session.ID, sessionReconcileResumeAmbiguous); err != nil {
 			return report, false, err
 		}
 		return report, false, nil
@@ -542,9 +542,27 @@ func (c *Controller) confirmSessionActive(ctx context.Context, handle RunHandle,
 	})
 }
 
+// sessionReconcileResumeAmbiguous is the reason every RESUME path records
+// when it fails closed on a session whose evidence it cannot resolve. Each
+// such path has already read the session's launch claim as SETTLED, which
+// is what makes the reason below a structural fact and not a convention.
+const sessionReconcileResumeAmbiguous = "resume: evidence ambiguous"
+
 // markSessionReconciling moves an active or launching session to
-// reconciling, idempotently.
-func (c *Controller) markSessionReconciling(ctx context.Context, handle RunHandle, sessionID identity.SessionID) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
+// reconciling with reason as its recorded transition reason, idempotently.
+//
+// INVARIANT, on which the live launch corroboration's re-inspection rests:
+// the only reconciling session whose current placement's launch claim is
+// still exec_pending is the live wrapper reconciliation — the corroboration
+// round's own SettlementForkingWrapper branch. Every resume path reaches
+// this function only after reading that session's claim as settled
+// (execed), so a resume-marked reconciling session always has a settled
+// claim, and the structural identification "reconciling, with a current
+// unsuperseded placed binding whose incarnation's claim is exec_pending"
+// names the live reconciliation alone. A new caller that can mark a
+// session reconciling while its placement's claim is still exec_pending
+// breaks that identification and must be weighed against it.
+func (c *Controller) markSessionReconciling(ctx context.Context, handle RunHandle, sessionID identity.SessionID, reason string) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design.
 	now := c.Clock.Now()
 	return c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 		s, rev, getErr := uow.Sessions().Get(ctx, sessionID)
@@ -565,7 +583,7 @@ func (c *Controller) markSessionReconciling(ctx context.Context, handle RunHandl
 		if _, saveErr := uow.Sessions().Save(ctx, next, rev); saveErr != nil {
 			return saveErr
 		}
-		return recordTransition(ctx, uow, EntitySession, sessionID.String(), string(sFrom), string(next.State), "resume: evidence ambiguous", gen(handle.lease.Generation), now)
+		return recordTransition(ctx, uow, EntitySession, sessionID.String(), string(sFrom), string(next.State), reason, gen(handle.lease.Generation), now)
 	})
 }
 
@@ -870,8 +888,10 @@ func (c *Controller) sessionTaskID(ctx context.Context, handle RunHandle, sessio
 // observation:
 //
 //   - the session is an implementer or reviewer (the manager's launch is
-//     the bootstrap continuation's) and is launching (the loop corroborates
-//     nothing else, so a session left reconciling keeps failing closed);
+//     the bootstrap continuation's) and is either launching or the live
+//     launch corroboration's own reconciliation (wrapperReconciliation) —
+//     the two states that step re-inspects. Every OTHER reconciling
+//     session keeps failing closed, since nothing revisits it;
 //   - its binding is committed, current and not superseded, and its claim
 //     is absent or that placement's own exec_pending claim;
 //   - the pane.open operation that recorded the placement is not failed;
@@ -923,11 +943,15 @@ func (c *Controller) placedLaunchInFlight(ctx context.Context, handle RunHandle,
 	if err != nil {
 		return false, "", err
 	}
+	// The two session states the controller loop's corroboration step
+	// re-inspects, and therefore the two it can finish.
+	corroborated := session.State == run.SessionLaunching ||
+		(session.State == run.SessionReconciling && wrapperReconciliation(binding, claimFound, claim))
 	switch {
 	case session.Role != run.RoleImplementer && session.Role != run.RoleReviewer:
 		return false, "", nil
-	case session.State != run.SessionLaunching:
-		return false, fmt.Sprintf("the session is %s, not launching", session.State), nil
+	case !corroborated:
+		return false, fmt.Sprintf("the session is %s, and not a launch the controller loop still corroborates", session.State), nil
 	case binding.PaneID == "" || binding.Superseded:
 		return false, "the session has no current placement", nil
 	case claimFound && (claim.State != LaunchClaimExecPending || claim.IncarnationID != binding.IncarnationID):
@@ -937,22 +961,32 @@ func (c *Controller) placedLaunchInFlight(ctx context.Context, handle RunHandle,
 	case placed.State == OperationFailed:
 		return false, "the placement's pane.open operation settled failed", nil
 	}
+	observed, detail := c.placedLaunchProcessObserved(ctx, binding, claimFound, claim, placedIntent.Command, handle.runID, sessionID)
+	return observed, detail, nil
+}
+
+// placedLaunchProcessObserved is the positive-observation half of resume's
+// in-flight rule (the last two conjuncts of placedLaunchInFlight's doc
+// comment), shared verbatim by the manager bootstrap's own continuation of
+// a launch the loop still corroborates. pinned is the placement's frozen
+// pane.open command, read only where no claim exists yet.
+func (c *Controller) placedLaunchProcessObserved(ctx context.Context, binding *run.RuntimeBinding, claimFound bool, claim *LaunchClaim, pinned []string, runID identity.RunID, sessionID identity.SessionID) (observed bool, detail string) {
 	pane, inspectErr := c.Runtime.InspectPane(ctx, binding.PaneID)
 	switch {
 	case errors.Is(inspectErr, ErrPaneNotFound):
-		return false, "the recorded pane does not answer by id", nil
+		return false, "the recorded pane does not answer by id"
 	case inspectErr != nil:
-		return false, "the recorded pane could not be inspected; ambiguous, never in flight", nil
+		return false, "the recorded pane could not be inspected; ambiguous, never in flight"
 	case !ServerContinuityEstablished(binding.ServerInstance, pane.ServerInstance):
-		return false, "server continuity since the placement is not established for the inspection (the Herdr server may have restarted), so the recorded pane is no evidence of the launch", nil
+		return false, "server continuity since the placement is not established for the inspection (the Herdr server may have restarted), so the recorded pane is no evidence of the launch"
 	case len(pane.Foreground) == 0:
-		return false, "the recorded pane answers with no foreground occupant", nil
+		return false, "the recorded pane answers with no foreground occupant"
 	case claimFound && pane.ShellPID != claim.PID:
-		return false, fmt.Sprintf("the recorded pane's process (pid %d) is not the claimed launch process (pid %d)", pane.ShellPID, claim.PID), nil
-	case !claimFound && !pinnedLauncherOccupies(&pane, placedIntent.Command, handle.runID, sessionID):
-		return false, "no launch claim yet, and the recorded pane's own process is not this session's hop launch invocation", nil
+		return false, fmt.Sprintf("the recorded pane's process (pid %d) is not the claimed launch process (pid %d)", pane.ShellPID, claim.PID)
+	case !claimFound && !pinnedLauncherOccupies(&pane, pinned, runID, sessionID):
+		return false, "no launch claim yet, and the recorded pane's own process is not this session's hop launch invocation"
 	}
-	return true, "", nil
+	return true, ""
 }
 
 // pinnedLauncherOccupies reports whether the pane's own process is HOP's

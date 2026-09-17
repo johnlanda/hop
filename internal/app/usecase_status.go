@@ -128,6 +128,12 @@ type SessionView struct {
 	TaskID         string
 	AttemptNumber  int
 	BindingSummary string
+	// LaunchCorroborationPending mirrors
+	// SessionSummary.LaunchCorroborationPending: this session is
+	// reconciling because another process on its pane carries the launch
+	// identity, and the controller re-inspects it every pass. It is the
+	// condition the session's own action line is rendered under.
+	LaunchCorroborationPending bool
 }
 
 // WorktreeOperationView is one unresolved per-attempt worktree.create
@@ -333,7 +339,7 @@ func runDetailView(d RunDetail) RunDetailView { //nolint:gocritic // hugeParam: 
 	for _, s := range d.Sessions {
 		sv := SessionView{
 			SessionID: s.SessionID.String(), Role: string(s.Role), State: string(s.State),
-			AttemptNumber: s.AttemptNumber,
+			AttemptNumber: s.AttemptNumber, LaunchCorroborationPending: s.LaunchCorroborationPending,
 		}
 		if s.TaskID != "" {
 			sv.TaskID = s.TaskID.String()

@@ -1622,10 +1622,26 @@ func (s *fakeStore) sessionsLocked(runID identity.RunID) []app.SessionSummary {
 		if binding, ok := s.currentBindingBySessionLocked(id); ok {
 			b := binding
 			summary.Binding = &b
+			summary.LaunchCorroborationPending = s.launchCorroborationPendingLocked(sess.State, &b)
 		}
 		summaries = append(summaries, summary)
 	}
 	return summaries
+}
+
+// launchCorroborationPendingLocked mirrors the real read model's
+// launchCorroborationPending (internal/adapters/sqlite/workflow_read.go):
+// the session is reconciling and the launch claim of its current
+// placement's own incarnation is still exec_pending. binding is a current
+// binding, which currentBindingBySessionLocked already selects
+// unsuperseded; an incarnation with no claim row reports false. Callers
+// hold s.mu.
+func (s *fakeStore) launchCorroborationPendingLocked(state run.SessionState, binding *run.RuntimeBinding) bool {
+	if state != run.SessionReconciling || binding.PaneID == "" {
+		return false
+	}
+	claim, ok := s.LaunchClaims[binding.IncarnationID]
+	return ok && claim.State == app.LaunchClaimExecPending
 }
 
 // currentBindingBySessionLocked returns sessionID's current

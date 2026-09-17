@@ -445,3 +445,13 @@ func GrammarSessionLine(sessionID, role, state, taskLabel string, attemptNumber 
 	return "session " + sessionID + ": role=" + role + " state=" + state +
 		" task=" + taskLabel + " attempt=" + strconv.Itoa(attemptNumber) + " binding=" + binding
 }
+
+// GrammarSessionLaunchCorroborationAction is the named human action for a
+// session reconciling because another process on its pane carries the
+// launch identity (SessionView.LaunchCorroborationPending). It states
+// what the controller is doing about it — re-inspecting every pass, so
+// the state clears itself once one observation is clean — and what the
+// human does when it does not clear. Value-free: the session line above
+// it already names the session and its pane.
+const GrammarSessionLaunchCorroborationAction = "another process on this session's pane carries the launch identity, so the launch is not corroborated yet; " +
+	"the controller re-inspects it every pass and needs nothing, and if this state persists, open that pane and check whether the harness was started through a process that forks it"

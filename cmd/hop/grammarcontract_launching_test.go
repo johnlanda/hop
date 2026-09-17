@@ -23,10 +23,11 @@ const launchingManagerPID = 5151
 // exec_pending, so the run is still launching: the window the controller's
 // next corroboration pass closes.
 type launchingFeature struct {
-	StateRoot string
-	base      hopfixtures.FeatureBase
-	store     hopfixtures.Store
-	lease     app.Lease
+	StateRoot      string
+	RepositoryRoot string
+	base           hopfixtures.FeatureBase
+	store          hopfixtures.Store
+	lease          app.Lease
 }
 
 func newLaunchingFeature(t *testing.T, seed int) *launchingFeature {
@@ -35,10 +36,11 @@ func newLaunchingFeature(t *testing.T, seed int) *launchingFeature {
 	store := openFixtureStore(t, stateRoot)
 	ctx := context.Background()
 	now := time.Now().UTC()
+	repositoryRoot := realDir(t)
 
 	workflow := featureWorkflowSnapshot("", defaultMessageWait)
 	workflow.IntegrationBranch = app.IntegrationBranchName(1)
-	base, lease, err := hopfixtures.InitializeFeature(ctx, store, stateRoot, realDir(t), workflow, seed, now)
+	base, lease, err := hopfixtures.InitializeFeature(ctx, store, stateRoot, repositoryRoot, workflow, seed, now)
 	if err != nil {
 		t.Fatalf("initialize feature run: %v", err)
 	}
@@ -48,7 +50,7 @@ func newLaunchingFeature(t *testing.T, seed int) *launchingFeature {
 	if err := hopfixtures.SeedLaunchClaim(ctx, store, base.RunID, base.ManagerID, "", base.ManagerIncarnation, launchingManagerPID, now); err != nil {
 		t.Fatalf("claim manager launch: %v", err)
 	}
-	return &launchingFeature{StateRoot: stateRoot, base: base, store: store, lease: lease}
+	return &launchingFeature{StateRoot: stateRoot, RepositoryRoot: repositoryRoot, base: base, store: store, lease: lease}
 }
 
 // settle applies the controller's corroboration of the manager's claim.
@@ -57,6 +59,27 @@ func (f *launchingFeature) settle(t *testing.T) {
 	if err := hopfixtures.SettleManagerLaunch(context.Background(), f.store, f.lease, f.base, launchingManagerPID, time.Now().UTC()); err != nil {
 		t.Fatalf("settle manager launch: %v", err)
 	}
+}
+
+// reconcile applies the controller's fail-closed branch for a pane whose
+// foreground group holds another process carrying the launch identity,
+// leaving the manager's placement and its claim untouched.
+func (f *launchingFeature) reconcile(t *testing.T) {
+	t.Helper()
+	if err := hopfixtures.ReconcileSession(context.Background(), f.store, f.lease, f.base.ManagerID, time.Now().UTC()); err != nil {
+		t.Fatalf("reconcile the manager session: %v", err)
+	}
+}
+
+// statusDetail renders `hop status -run` for this run through the built
+// binary.
+func (f *launchingFeature) statusDetail(t *testing.T) string {
+	t.Helper()
+	detail := execHop(t, map[string]string{"HOP_STATE_DIR": f.StateRoot}, f.RepositoryRoot, "status", "-C", f.RepositoryRoot, "-run", f.base.RunID)
+	if detail.ExitCode != exitOK {
+		t.Fatalf("status -run: exit=%d stdout=%q stderr=%q", detail.ExitCode, detail.Stdout, detail.Stderr)
+	}
+	return detail.Stdout
 }
 
 func (f *launchingFeature) env() map[string]string {

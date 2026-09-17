@@ -640,10 +640,15 @@ session, before its disposition is decided:
   label-only launch-ended row (section 4).
 - A child's placed launch left unsettled is IN FLIGHT, and does not hold
   the run in `reconciling`, when every one of these is a positive
-  observation: the session is an implementer or reviewer and is
-  `launching` (the loop corroborates nothing else, so a session already
-  failed closed to `reconciling` — a forking wrapper — stays that way);
-  its binding is committed, current and not superseded; its claim is
+  observation: the session is an implementer or reviewer and is in one of
+  the two states the loop's corroboration re-inspects — `launching`, or
+  the live launch corroboration's OWN reconciliation (section 6: a current
+  unsuperseded placed binding whose incarnation's claim is still
+  `exec_pending`). Every OTHER `reconciling` session stays that way,
+  because nothing revisits it: a resume path marks a session `reconciling`
+  only after reading its claim as SETTLED, which is what makes that shape
+  identify the live reconciliation alone.
+  Its binding is committed, current and not superseded; its claim is
   absent or that placement's own `exec_pending` claim; the `pane.open`
   that recorded the placement is not `failed`; the recorded pane answers
   by id, and THAT inspection was answered by the server lifetime the
@@ -673,6 +678,15 @@ session, before its disposition is decided:
   answering), another process in the pane, any occupant but this
   session's launcher before a claim, an empty foreground or a failed
   placement keep the run `resuming` with the reason named.
+- The manager's own launch is the bootstrap continuation's, and it reads
+  the same two states for the same reason: a `launching` manager, and a
+  manager in the live launch corroboration's own reconciliation, both
+  return the run to `launching` for the loop — the reconciliation only
+  under the same positive observations the child's in-flight rule
+  requires (the inspection's own `ServerInstance` stamp equal to the
+  binding's, and the pane's own process being the claimed one). The
+  launcher-identity conjunct cannot apply there: that state always has
+  the placement's own claim.
 - The existing guards stand: the run never goes to `running` while the
   manager's own launch is unsettled (the bootstrap continuation returns it
   to `launching`, and only the manager's settlement moves it on — never a
@@ -945,6 +959,50 @@ integration step's combined-check execution is the other (section 8).
 - **A stop refusal mid-pass.** When a held stop refuses one of the
   integration step's own dispatches, that pass ends. The next tick
   drives the stop.
+
+### Launch corroboration, revisited
+
+The corroboration step reuses the Phase 2 predicate verbatim, wrapper
+precedence included: any foreground member matching the claim's
+executable identity and marker under a DIFFERENT pid fails the launch
+closed, even when the claim's own pid also matches. That precedence is
+kept, because the observables cannot tell the two topologies apart. S12
+holds a legitimate same-image child in its fork-before-exec window and
+finds it reporting the parent's `argv`, `argv0`, `name` and `cmdline`
+verbatim under a pid of its own, in the same foreground group, with the
+claimed process itself satisfying every conjunct — the exact shape a live
+forking wrapper presents. A settled-first reading would therefore adopt
+the refused topology whenever a wrapper is what is actually there.
+
+What DOES follow from S12 is that such an observation is a fact about one
+SAMPLE, not about the launch: releasing the held child execs it, in the
+same pid, into something carrying neither the identity nor a marker, and
+the very next observation of the same pane settles. So the step's
+fail-closed outcome is a REVISITABLE reconciliation, not a terminal one.
+The step inspects every `launching` session and, in addition, that
+reconciliation — identified structurally, with no reason or marker of its
+own: state `reconciling`, a current unsuperseded placed binding, and that
+binding's own incarnation's claim still `exec_pending`. The shape is
+exclusive because every RESUME path marks a session `reconciling` only
+after reading its claim as settled (section 5). The branches are the
+unchanged ones: a clean observation settles the claim and activates the
+session; another matching process still there writes nothing at all; a
+pane gone takes the launch-ended row (section 4), whose `exec_failed`
+settlement then takes the ordinary exec-failure row. The transition the
+live path records is its own value-free reason, never resume's, and
+`hop status` renders a value-free action under that session's line: the
+controller re-inspects it every pass and needs nothing, and a human looks
+at the pane only if the state persists.
+
+RESIDUAL: one clean observation settles the launch, exactly as a first
+corroboration does. A wrapper that forks the harness and then exits — so
+that a later sample shows only the harness under the claim's pid — is
+settled rather than refused. This is the same trade every first
+corroboration makes (a single sample is the evidence), and the narrower
+alternative, requiring the clean observation to persist across N samples,
+buys nothing against it: the wrapper is gone by then either way. What
+wrapper precedence still protects, unchanged, is the case that matters —
+a wrapper ALIVE alongside the harness is never adopted.
 
 ### Per-attempt session retirement
 
