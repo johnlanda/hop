@@ -1345,6 +1345,29 @@ func TestFixtureManagerNeedsReworkNoticeShapes(t *testing.T) {
 			t.Errorf("manager did not process the notice through the status-check branch; want \"FIXTURE-STATUS-CHECKED matched=[false]\"; stdout:\n%s", stdout)
 		}
 	})
+
+	t.Run("integration state outside the recognized set never retries", func(t *testing.T) {
+		artifacts := newArtifactDir(t)
+		noticePath := filepath.Join(artifacts.dir(t, "notice-bodies"), "notice.txt")
+		// The task line sits at exactly the position renderIntegrationNotice
+		// uses, but "integrated" is not one of integrationNoticeStates's own
+		// two tokens ("conflicted"/"rolled-back") — production never renders
+		// this shape (an integrated candidate carries no needs-rework line),
+		// but the parser must still reject it by the state token, not merely
+		// by line position, or a bug that dropped the state check entirely
+		// would go uncaught.
+		if err := os.WriteFile(noticePath, []byte("integration ffffffff-4444-4fff-8fff-ffffffffffff integrated\ntask t1 needs-rework\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		retried, stdout := runNeedsReworkCase(t, artifacts, noticePath)
+		if retried {
+			t.Errorf("manager retried t1 for an integration state outside the recognized set; want no retry; stdout:\n%s", stdout)
+		}
+		// Same positive-evidence requirement as the sibling subtests above.
+		if !strings.Contains(stdout, "FIXTURE-STATUS-CHECKED matched=[false]") {
+			t.Errorf("manager did not process the notice through the status-check branch; want \"FIXTURE-STATUS-CHECKED matched=[false]\"; stdout:\n%s", stdout)
+		}
+	})
 }
 
 // TestFixtureReviewerRejectOnce drives the compiled fixture principal as a

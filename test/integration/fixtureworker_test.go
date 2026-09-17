@@ -2272,7 +2272,7 @@ func TestFixtureWorkerVanishOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	runAttempt := func(attemptID string) (output string, exitCode int) {
+	runAttempt := func(attemptID, logPath string) (output string, exitCode int) {
 		t.Helper()
 		assignmentPath := filepath.Join(stateDir, "runs", runID, "attempts", attemptID, "assignment.md")
 		if err := os.MkdirAll(filepath.Dir(assignmentPath), 0o700); err != nil {
@@ -2295,6 +2295,7 @@ func TestFixtureWorkerVanishOnce(t *testing.T) {
 			"HOP_SESSION_ID=c4c4c4c4-c4c4-4c4c-8c4c-c4c4c4c4c4c4",
 			"HOP_INCARNATION_ID=c5c5c5c5-c5c5-4c5c-8c5c-c5c5c5c5c5c5",
 			"HOP_ROLE=implementer",
+			"FAKE_HOP_LOG=" + logPath,
 		}
 		var out strings.Builder
 		cmd.Stdout = &out
@@ -2312,7 +2313,9 @@ func TestFixtureWorkerVanishOnce(t *testing.T) {
 		return out.String(), code
 	}
 
-	firstOut, firstCode := runAttempt("c6c6c6c6-c6c6-4c6c-8c6c-c6c6c6c6c601")
+	logDir := artifacts.dir(t, "vanish-log")
+	firstLogPath := filepath.Join(logDir, "first.log")
+	firstOut, firstCode := runAttempt("c6c6c6c6-c6c6-4c6c-8c6c-c6c6c6c6c601", firstLogPath)
 	if firstCode != 0 {
 		t.Fatalf("first (vanishing) attempt exit code = %d, want 0\noutput:\n%s", firstCode, firstOut)
 	}
@@ -2322,8 +2325,12 @@ func TestFixtureWorkerVanishOnce(t *testing.T) {
 	if _, err := os.Stat(vanishOnceMarkerPathForTest(scratchDir, taskID)); err != nil {
 		t.Fatalf("vanish-once marker not written by the first attempt: %v", err)
 	}
+	if log := readFakeHopLog(t, firstLogPath); log != "" {
+		t.Errorf("first (vanishing) attempt invoked hop; want no call at all:\n%s", log)
+	}
 
-	secondOut, secondCode := runAttempt("c7c7c7c7-c7c7-4c7c-8c7c-c7c7c7c7c702")
+	secondLogPath := filepath.Join(logDir, "second.log")
+	secondOut, secondCode := runAttempt("c7c7c7c7-c7c7-4c7c-8c7c-c7c7c7c7c702", secondLogPath)
 	if secondCode != 0 {
 		t.Fatalf("second attempt exit code = %d, want 0\noutput:\n%s", secondCode, secondOut)
 	}
@@ -2339,6 +2346,83 @@ func TestFixtureWorkerVanishOnce(t *testing.T) {
 // so the test can assert the marker file's exact name independently.
 func vanishOnceMarkerPathForTest(scratchDir, taskID string) string {
 	return filepath.Join(scratchDir, "vanish-once-"+taskID)
+}
+
+// TestFixtureWorkerConflict proves the "worker-conflict" behavior:
+// commitConflictingChange writes the task id (never a caller-supplied
+// argument, since the manager's own directive rendering always appends
+// the scratch directory as this behavior's one argument) to one FIXED,
+// shared filename, and the submitted result names that same task id.
+func TestFixtureWorkerConflict(t *testing.T) {
+	artifacts := newArtifactDir(t)
+	worker := buildFixtureWorker(t, artifacts)
+	fakeHop := buildFakeHopStub(t, artifacts)
+	repo := newFixtureRepo(t, artifacts, nil, "repo")
+
+	stateDir := artifacts.dir(t, "state")
+	scratchDir := artifacts.dir(t, "conflict-scratch")
+	const (
+		runID     = "d1d1d1d1-d1d1-4d1d-8d1d-d1d1d1d1d1d1"
+		taskID    = "d2d2d2d2-d2d2-4d2d-8d2d-d2d2d2d2d2d2"
+		attemptID = "d3d3d3d3-d3d3-4d3d-8d3d-d3d3d3d3d3d3"
+	)
+	instructionsPath := filepath.Join(stateDir, "runs", runID, "tasks", taskID+".md")
+	if err := os.MkdirAll(filepath.Dir(instructionsPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(instructionsPath, []byte("FIXTURE-BEHAVIOR: worker-conflict "+scratchDir+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	assignmentPath := filepath.Join(stateDir, "runs", runID, "attempts", attemptID, "assignment.md")
+	if err := os.MkdirAll(filepath.Dir(assignmentPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(assignmentPath, []byte("# HOP Task Assignment\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(artifacts.dir(t, "log"), "log.txt")
+
+	prompt := testAssignmentPrompt(assignmentPath, fakeHop)
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, worker, "--session-id", "d4d4d4d4-d4d4-4d4d-8d4d-d4d4d4d4d4d4", prompt) //nolint:gosec // G204: fixed test-owned binary and arguments.
+	cmd.Dir = repo.Root
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOP_STATE_DIR=" + stateDir,
+		"HOP_RUN_ID=" + runID,
+		"HOP_TASK_ID=" + taskID,
+		"HOP_ATTEMPT_ID=" + attemptID,
+		"HOP_SESSION_ID=d5d5d5d5-d5d5-4d5d-8d5d-d5d5d5d5d5d5",
+		"HOP_INCARNATION_ID=d6d6d6d6-d6d6-4d6d-8d6d-d6d6d6d6d6d6",
+		"HOP_ROLE=implementer",
+		"FAKE_HOP_LOG=" + logPath,
+	}
+	var out strings.Builder
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	cmd.Stdin = strings.NewReader("FIXTURE-QUIT\n")
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("run fixture worker: %v\noutput:\n%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "FIXTURE-WORKER-READY") {
+		t.Fatalf("worker did not report ready; output:\n%s", out.String())
+	}
+
+	conflictFile := filepath.Join(repo.Root, "fixture-conflict.txt")
+	content, err := os.ReadFile(conflictFile) //nolint:gosec // G304: a path this test constructed itself under its own fixture repo.
+	if err != nil {
+		t.Fatalf("read conflict file %s: %v", conflictFile, err)
+	}
+	if got := strings.TrimSpace(string(content)); got != taskID {
+		t.Errorf("conflict file content = %q, want the task id %q", got, taskID)
+	}
+
+	log := readFakeHopLog(t, logPath)
+	wantSummary := "--summary\tfixture implementer result (conflict " + taskID + ")"
+	if !strings.Contains(log, wantSummary) {
+		t.Errorf("hop result submit summary missing %q; log:\n%s", wantSummary, log)
+	}
 }
 
 // TestFixtureWorkerIdleSelfKillOnControlFile proves the "idle-self-kill"
