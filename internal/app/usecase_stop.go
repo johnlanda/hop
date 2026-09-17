@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strconv"
@@ -87,6 +88,15 @@ type paneCloseTarget struct {
 	PID           int
 	Markers       []string
 	Reason        string
+	// requireProcessGone is set by a caller whose target is an unsettled
+	// (exec_pending) launch claim, from the claim's CURRENT state and never
+	// persisted: the pane's observed absence retires the target only
+	// together with the claimed process observed gone
+	// (observeClaimedProcessGone) — the corroborated-absence predicate the
+	// launch-ended row decides by, since docs/plan/phase-2-design.md
+	// section 5 defines exit as pane absence together with the claim's
+	// process being gone.
+	requireProcessGone bool
 }
 
 // closeTargetMismatchDetail is the fail-closed detail for an observed
@@ -490,7 +500,15 @@ const paneScrollbackLines = 500
 // matched target, and stays reconciling on mismatch. retired is true only
 // once the target has been OBSERVED absent; a dispatched close is not
 // termination. On confirmed retirement the target's current binding is
-// superseded with the observed evidence.
+// superseded with the observed evidence. A target flagged
+// requireProcessGone (an unsettled launch claim) is retired only once its
+// claimed process is ALSO observed gone: a pane observed absent while that
+// process still runs, or cannot be observed, stays outstanding — before
+// the close with the operation reconciling and the named human action,
+// after a dispatched close as awaiting. A ClosePane answer that the pane
+// does not exist means the pane vanished between the re-inspection and
+// the close: nothing was closed or dispatched, and the same immediate
+// re-observation decides.
 func (c *Controller) closePaneOperation(ctx context.Context, handle RunHandle, detail RunDetail, target *paneCloseTarget) (retired bool, outstanding string, err error) { //nolint:gocritic // hugeParam: RunHandle and RunDetail are per-call DTOs; this runs once per close round.
 	opID, effective, malformed, err := c.findOrCreateCloseOperation(ctx, handle, detail, target)
 	if err != nil {
@@ -501,7 +519,11 @@ func (c *Controller) closePaneOperation(ctx context.Context, handle RunHandle, d
 	}
 	// The persisted intent's target is authoritative on reuse: an
 	// unresolved close is never retargeted at a newly observed occupant.
+	// The process requirement is the caller's current claim state, never
+	// part of the persisted intent.
+	requireProcessGone := target.requireProcessGone
 	target = effective
+	target.requireProcessGone = requireProcessGone
 
 	if err := c.revalidateForDispatch(ctx, handle, true); err != nil {
 		return false, "", err
@@ -512,6 +534,12 @@ func (c *Controller) closePaneOperation(ctx context.Context, handle RunHandle, d
 		return false, ambiguous, nil
 	}
 	if absent {
+		if still := c.closeTargetProcessStillLive(ctx, target); still != "" {
+			if err := c.markOperationReconciling(ctx, handle, opID, still); err != nil {
+				return false, "", err
+			}
+			return false, still, nil
+		}
 		if err := c.recordCloseOutcome(ctx, handle, opID, target, "pane absent: no foreground occupant and no pane answers for the creation label"); err != nil {
 			return false, "", err
 		}
@@ -548,23 +576,48 @@ func (c *Controller) closePaneOperation(ctx context.Context, handle RunHandle, d
 	actCtx, release := handle.actContext(ctx)
 	closeErr := c.Runtime.ClosePane(actCtx, target.PaneID)
 	release()
-	if closeErr != nil {
+	awaiting := "close dispatched; awaiting observed termination"
+	switch {
+	case errors.Is(closeErr, ErrPaneNotFound):
+		awaiting = "the pane was already gone at close; awaiting observed absence"
+	case closeErr != nil:
 		return false, "", fmt.Errorf("app: close pane %s: %w", target.PaneID, closeErr)
-	}
-	if err := c.recordCloseDispatched(ctx, handle, opID, target); err != nil {
-		return false, "", err
+	default:
+		if err := c.recordCloseDispatched(ctx, handle, opID, target); err != nil {
+			return false, "", err
+		}
 	}
 
 	// One immediate re-observation: the pane may already be gone. The same
 	// absence rule applies — anything short of established absence stays
 	// dispatched-but-unobserved.
 	if _, absentAfter, ambiguousAfter := c.observePaneAbsence(ctx, target.PaneID, target.Label); ambiguousAfter == "" && absentAfter {
+		if still := c.closeTargetProcessStillLive(ctx, target); still != "" {
+			return false, awaiting + ": " + still, nil
+		}
 		if err := c.recordCloseOutcome(ctx, handle, opID, target, "occupant absent after close"); err != nil {
 			return false, "", err
 		}
 		return true, "", nil
 	}
-	return false, "close dispatched; awaiting observed termination", nil
+	return false, awaiting, nil
+}
+
+// closeTargetProcessStillLive returns "" when target's absence may retire
+// it: the target does not require its process gone, or its claimed
+// process is observed gone. Otherwise it returns the outstanding detail.
+func (c *Controller) closeTargetProcessStillLive(ctx context.Context, target *paneCloseTarget) string {
+	if !target.requireProcessGone {
+		return ""
+	}
+	gone, ambiguous := c.observeClaimedProcessGone(ctx, target.PID)
+	switch {
+	case ambiguous != "":
+		return "the pane is absent, but " + ambiguous
+	case !gone:
+		return claimedProcessLiveDetail(target.PID)
+	}
+	return ""
 }
 
 // findOrCreateCloseOperation reuses the unresolved OpPaneClose operation

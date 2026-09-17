@@ -678,12 +678,61 @@ func TestRuntimeClosePane(t *testing.T) {
 }
 
 func TestRuntimeClosePaneMapsPaneNotFound(t *testing.T) {
-	runtime := startFakeRuntimeError(t, "pane_not_found", "pane not found")
+	// pane.close answers pane_not_found with "pane <id> not found", the
+	// shape spike_panevanish pins against a real server.
+	runtime := startFakeRuntimeError(t, "pane_not_found", "pane w1:p1 not found")
 
 	err := runtime.ClosePane(testContext(t), "w1:p1")
 
 	if !errors.Is(err, herdr.ErrPaneNotFound) {
 		t.Fatalf("ClosePane error = %v, want ErrPaneNotFound", err)
+	}
+	if !errors.Is(err, app.ErrPaneNotFound) {
+		t.Fatalf("ClosePane error = %v, want app.ErrPaneNotFound", err)
+	}
+}
+
+// TestRuntimeClosePaneAppErrPaneNotFoundClassification proves ClosePane
+// satisfies app.ErrPaneNotFound — the port's "the server has no such
+// pane" contract — for a pane_not_found API error and only that case.
+func TestRuntimeClosePaneAppErrPaneNotFoundClassification(t *testing.T) {
+	cases := []struct {
+		name            string
+		runtime         func(t *testing.T) *herdr.Runtime
+		wantAppNotFound bool
+	}{
+		{
+			name: "pane_not_found API error",
+			runtime: func(t *testing.T) *herdr.Runtime {
+				return startFakeRuntimeError(t, "pane_not_found", "pane w1:p1 not found")
+			},
+			wantAppNotFound: true,
+		},
+		{
+			name: "confirmation_required API error",
+			runtime: func(t *testing.T) *herdr.Runtime {
+				return startFakeRuntimeError(t, "confirmation_required", "closing this pane would close a worktree group")
+			},
+		},
+		{
+			name:    "transport error (dead socket)",
+			runtime: func(t *testing.T) *herdr.Runtime { return herdr.NewRuntime(deadSocket(t)) },
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.runtime(t).ClosePane(testContext(t), "w1:p1")
+
+			if err == nil {
+				t.Fatalf("ClosePane did not error for %s", tc.name)
+			}
+			if got := errors.Is(err, app.ErrPaneNotFound); got != tc.wantAppNotFound {
+				t.Errorf("errors.Is(err, app.ErrPaneNotFound) = %v, want %v (err = %v)", got, tc.wantAppNotFound, err)
+			}
+			if got := errors.Is(err, herdr.ErrPaneNotFound); got != tc.wantAppNotFound {
+				t.Errorf("errors.Is(err, herdr.ErrPaneNotFound) = %v, want %v (err = %v)", got, tc.wantAppNotFound, err)
+			}
+		})
 	}
 }
 

@@ -163,7 +163,11 @@ type ViewSelection struct {
 // implements it. View selection is server-wide and singleton per owner
 // source, so callers serialize it rather than competing per worker update.
 type AgentPresentation interface {
-	// ReportMetadata applies one pane metadata patch under HOP's source.
+	// ReportMetadata applies one pane metadata patch under HOP's source. A
+	// pane the server does not have, or that has no terminal to carry
+	// metadata, is reported as an error wrapping ErrPaneNotFound; every
+	// other error is an ordinary failure. Callers never read that error as
+	// absence evidence for any lifecycle decision.
 	ReportMetadata(ctx context.Context, metadata PaneMetadata) error
 	// SelectView installs HOP's projection, replacing the previous view.
 	SelectView(ctx context.Context, selection ViewSelection) error

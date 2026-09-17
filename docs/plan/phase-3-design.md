@@ -464,6 +464,7 @@ New operation kinds and their decision-table rows (Phase 2 rows unchanged):
 | `integration.reset` (combined-check failure rollback, section 8; also the stop path's retirement of a published-but-unsettled candidate) | The act is two steps with the identity persisted BETWEEN them: (i) create the ROLLBACK COMMIT R (`git commit-tree <premerge>^{tree} -p <M>` — R carries the pre-merge content and keeps the rejected M reachable as its parent) and record R's object ID in `act_evidence` — a plain store write — BEFORE any ref move; (ii) `git update-ref … <R> <M>`. Recovery is decidable in every window: R recorded and ref == R → adopt; R recorded and ref == M → re-act step (ii) only (idempotent CAS); no R recorded and ref == M → re-act from step (i) (a prior orphaned commit-tree object is unreferenced and harmless); anything else → `reconciling` | same | same |
 | `worktree.create` (now per attempt) | Phase 2 row verbatim; provenance = repository common-directory equality plus the recorded base commit (now the integration head frozen into the intent). Feature mode resolves an unresolved one on every scheduling pass, on resume, and before stop's and the terminal failure's terminal reports — adopted with its attempt link and the workspace its creation label (the operation ID) names, or settled failed after the bounded wait, the attempt then settling as a terminal launch failure with the budgeted task consequence | same | same |
 | `pane.open` (manager, worker, reviewer) | Phase 2 row verbatim — one predicate, one close rule, all roles | same | same |
+| `pane.open` whose `exec_pending` claim outlived its placed pane (the launch ended before corroboration) | Phase 2's claim-state logic keeps an `exec_pending` claim ambiguous until it is corroborated or retired; the retirement can also be OBSERVED. The claim settles `exec_failed` — with the fixed reason "launch ended before corroboration: pane absent by id and label; claimed process gone", and the pane id and claimed pid as evidence — only when all three hold: the claim's own binding is current and not superseded; its pane is positively absent under the one absence rule (`pane_not_found` by id AND a successful creation-label lookup that finds nothing); and the claimed process is gone (a successful listing of the claimed pid's own process group shows no member with that pid — the launcher is a session leader, so a living claimed process is always listed there). From then on the `exec_failed` row decides: a child's attempt fails with the section 5 budgeted task consequence and the manager notice, and the manager lineage's failure cause fails the run. Anything short of that pair stays ambiguous and settles nothing: any other inspection or lookup error, a pane still answering by label, a failed listing, a pid still listed (a zombie or a recycled pid fails closed), no inspector, an uninspectable pid. The shapes and the process relation are pinned by `TestSpikeVanishedPaneShapes` (`test/integration/spike_panevanish_test.go`) | same — the scheduling pass's launch corroboration applies it on every round | same — resume's session reconciliation applies it; stop and the terminal-failure shutdown retire an `exec_pending` session only on the same pair, and a vanished pane whose claimed process still runs stays outstanding with the human action named |
 | `session.close` (completion retirement, section 8) | Phase 2 `pane.close` row verbatim | same | same |
 
 There is no standing integration checkout: each integration operation
@@ -828,7 +829,10 @@ claim, resolved as the session launch context resolves it — through the
 current binding, else the session's unresolved launch intent — so a
 bootstrap whose `pane.open` outcome was never recorded, and whose
 launcher then failed and closed its pane, still fails the run rather
-than leaving it `launching`. The fixture principals deliberately stay
+than leaving it `launching`. A launch that ended before corroboration —
+its placed pane and claimed process both observed gone — is an exec
+failure too, for every role: the section 4 launch-ended row settles its
+claim `exec_failed`, and the same consequences follow. The fixture principals deliberately stay
 alive at a composer-like idle loop after submitting, so the suite proves
 retirement actually terminates them rather than relying on process exit.
 
@@ -1565,7 +1569,14 @@ The Phase 1/2 presentation machinery becomes live run-state publication
   Publication uses the Phase 1 `AgentPresentation` port and its
   full-replacement semantics (unset optionals cleared), keyed to the
   session's current binding; a superseded binding's tokens are cleared or
-  rebound when the occupant changes, per the surface audit.
+  rebound when the occupant changes, per the surface audit. A pane can
+  vanish at any moment (its process exits, or a human closes it), so a
+  publication the server answers with `pane_not_found` skips that pane
+  for the round and records nothing: the session's fate stays with launch
+  corroboration, retirement and resume, under their own evidence rules.
+  Every other publication error still ends the pass. The close rule
+  treats a `pane.close` answered `pane_not_found` the same way: nothing
+  was closed, and the immediate absence re-observation decides.
 - View selection is a deliberate user command, never a controller side
   effect: `hop view set --run <id|r<seq>>` installs the run-scoped filter
   and manager-first sort under source `plugin:hop`; `hop view clear`
@@ -1796,11 +1807,22 @@ Claim-protocol race cases that Phase 2 recorded as inexpressible without a
 production pause/injection hook (launcher killed between claim write and
 exec; suppressed `exec_failed` write; paused pre-exec launcher; stop
 against a specifically pre-exec claim; check death before the claim write)
-remain deferred with the same reasons: Phase 3's exit scenarios do not
-require those windows, their dispositions stay covered by the
-decision-table unit tests, and adding a pause hook to production code is
-not justified by this phase either. If Phase 4's gate work needs one, it
-must be designed explicitly then.
+remain deferred as real-process scenarios, with the same reasons: Phase
+3's exit scenarios do not require those windows, their dispositions stay
+covered by the decision-table unit tests, and adding a pause hook to
+production code is not justified by this phase either. If Phase 4's gate
+work needs one, it must be designed explicitly then. Two of those windows
+no longer leave a run waiting forever: a launcher killed between its claim
+write and exec, and an exec failure whose `exec_failed` write never landed,
+both leave an `exec_pending` claim behind a pane that closes with its
+process, and the section 4 launch-ended row settles that claim once the
+pane and the claimed process are both observed gone
+(`TestLaunchEndedRowResolvesDeferredClaimWindows` drives both observable
+sequences). The real-process proof of the row covers a manager whose
+harness ends right after exec
+(`TestRealProcessManagerLaunchVanishesBeforeCorroboration`); a worker
+dying before settlement is proved by the app tables now and joins the
+fixture-principal scenarios later.
 
 ## 12. Work breakdown
 

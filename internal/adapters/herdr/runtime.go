@@ -416,10 +416,13 @@ type closePaneParams struct {
 
 // ClosePane requests pane closure. Callers apply the close rule (re-inspect
 // and match occupant evidence immediately before calling this) themselves;
-// this method only issues the request.
+// this method only issues the request. Herdr's pane_not_found answer to
+// pane.close means no pane has the id (the handler resolves the id alone,
+// never a runtime), so the returned error wraps both app.ErrPaneNotFound
+// and this adapter's ErrPaneNotFound in that case and only that case.
 func (r *Runtime) ClosePane(ctx context.Context, paneID string) error {
 	err := r.client.Call(ctx, "pane.close", closePaneParams{PaneID: paneID}, nil)
-	return wrapPaneError("close", paneID, err)
+	return wrapAbsentPaneError("close", paneID, err)
 }
 
 // wrapPaneError adds pane-address context to a pane call's error, mapping
@@ -431,8 +434,7 @@ func wrapPaneError(action, paneID string, err error) error {
 	if err == nil {
 		return nil
 	}
-	var apiErr *APIError
-	if errors.As(err, &apiErr) && apiErr.Code == "pane_not_found" {
+	if isPaneNotFound(err) {
 		return fmt.Errorf("%s pane %s: %w", action, paneID, ErrPaneNotFound)
 	}
 	return fmt.Errorf("%s pane %s: %w", action, paneID, err)
@@ -445,14 +447,28 @@ func wrapPaneError(action, paneID string, err error) error {
 // on — and this adapter's own ErrPaneNotFound; every other error keeps its
 // own type under the added context and satisfies neither.
 func wrapInspectPaneError(paneID string, err error) error {
+	return wrapAbsentPaneError("inspect", paneID, err)
+}
+
+// wrapAbsentPaneError is wrapPaneError for a pane call whose port contract
+// reports absence: Herdr's pane_not_found code becomes an error satisfying
+// errors.Is for both app.ErrPaneNotFound and this adapter's
+// ErrPaneNotFound; every other error keeps its own type under the added
+// context and satisfies neither. A nil err returns nil.
+func wrapAbsentPaneError(action, paneID string, err error) error {
 	if err == nil {
 		return nil
 	}
-	var apiErr *APIError
-	if errors.As(err, &apiErr) && apiErr.Code == "pane_not_found" {
-		return fmt.Errorf("inspect pane %s: %w (%w)", paneID, app.ErrPaneNotFound, ErrPaneNotFound)
+	if isPaneNotFound(err) {
+		return fmt.Errorf("%s pane %s: %w (%w)", action, paneID, app.ErrPaneNotFound, ErrPaneNotFound)
 	}
-	return fmt.Errorf("inspect pane %s: %w", paneID, err)
+	return fmt.Errorf("%s pane %s: %w", action, paneID, err)
+}
+
+// isPaneNotFound reports whether err is Herdr's pane_not_found API error.
+func isPaneNotFound(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.Code == "pane_not_found"
 }
 
 // ServerInstance identifies the server process behind the configured
