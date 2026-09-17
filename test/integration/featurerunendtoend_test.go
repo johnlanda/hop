@@ -76,6 +76,18 @@ func TestRealProcessFeatureRunEndToEnd(t *testing.T) {
 	t3AttemptID, _ := fx.currentAttempt(t, t3)
 	t3SessionID := fx.sessionForAttempt(t, t3AttemptID)
 
+	// Deliberate check (LAUNCH-2/PRES-1 triage): does corroboration settle
+	// a live harness blocked in its own idle loop (worker-hold's own
+	// `hop msg wait`), or only one whose foreground has already moved on
+	// by the time it happens to be inspected? Both held workers are still
+	// blocked on their own barrier here — NEITHER has been released yet —
+	// so an observed settlement proves corroboration against exactly that
+	// shape, not a lucky race against a worker that already exited.
+	t1SettleLatency := fx.requireClaimSettled(t, t1SessionID)
+	t.Logf("t1 claim settlement latency: %s", t1SettleLatency)
+	t3SettleLatency := fx.requireClaimSettled(t, t3SessionID)
+	t.Logf("t3 claim settlement latency: %s", t3SettleLatency)
+
 	// Release t1's barrier — matched by ITS OWN relay chain (directive:
 	// never by queue order), since t3's barrier is held concurrently and
 	// both relay through the same manager to the same human address. The

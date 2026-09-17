@@ -717,6 +717,52 @@ func (f *featureRun) claimState(t *testing.T, sessionID string) string {
 	return f.scalar(t, fmt.Sprintf("SELECT state FROM launch_claims WHERE session_id = '%s' ORDER BY claimed_at DESC, rowid DESC LIMIT 1;", sessionID))
 }
 
+// claimTimestamps reads one session's newest launch claim's own recorded
+// claimed_at and settled_at (settled_at "" before settlement).
+func (f *featureRun) claimTimestamps(t *testing.T, sessionID string) (claimedAt, settledAt string) {
+	t.Helper()
+	row := f.scalar(t, fmt.Sprintf("SELECT claimed_at || '|' || ifnull(settled_at,'') FROM launch_claims WHERE session_id = '%s' ORDER BY claimed_at DESC, rowid DESC LIMIT 1;", sessionID))
+	parts := strings.SplitN(row, "|", 2)
+	if len(parts) != 2 || parts[0] == "" {
+		t.Fatalf("no launch claim recorded yet for session %s", sessionID)
+	}
+	return parts[0], parts[1]
+}
+
+// requireClaimSettled polls until sessionID's launch claim reaches
+// "execed" and its session reaches "active", bounded by featureRunTimeout
+// — a deliberate check (LAUNCH-2/PRES-1 triage) of whether corroboration
+// settles a live harness blocked in its own idle loop (a worker-hold
+// worker's `hop msg wait`), not only one whose foreground has already
+// moved on by the time it happens to be inspected. Returns the
+// settlement latency computed from the claim's own recorded
+// claimed_at/settled_at timestamps (this suite's canonical fixed-width
+// UTC format, parsed here rather than compared lexically since an actual
+// duration, not merely an order, is what this check answers) — never
+// wall-clock time this poll happened to notice it in. On timeout, the
+// failure names the session (the claim's own key) and how long it had
+// already been unsettled.
+func (f *featureRun) requireClaimSettled(t *testing.T, sessionID string) time.Duration {
+	t.Helper()
+	reached := waitUntilDeadline(featureRunTimeout, func() bool {
+		return f.claimState(t, sessionID) == "execed" && f.sessionState(t, sessionID) == "active"
+	})
+	claimedAt, settledAt := f.claimTimestamps(t, sessionID)
+	claimedTime, err := time.Parse(time.RFC3339Nano, claimedAt)
+	if err != nil {
+		t.Fatalf("parse launch claim claimed_at %q for session %s: %v", claimedAt, sessionID, err)
+	}
+	if !reached {
+		t.Fatalf("session %s's launch claim never reached execed within %s (claimed at %s, still unsettled after %s)",
+			sessionID, featureRunTimeout, claimedAt, time.Since(claimedTime))
+	}
+	settledTime, err := time.Parse(time.RFC3339Nano, settledAt)
+	if err != nil {
+		t.Fatalf("parse launch claim settled_at %q for session %s: %v", settledAt, sessionID, err)
+	}
+	return settledTime.Sub(claimedTime)
+}
+
 // resultCount counts result rows submitted for one attempt (0 for an
 // attempt that was interrupted before ever submitting).
 func (f *featureRun) resultCount(t *testing.T, attemptID string) int {
