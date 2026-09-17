@@ -28,11 +28,14 @@ type RunSummaryView struct {
 	Reconciling   bool
 	UpdatedAt     time.Time
 	// NeedsAttention is section 7's "blocked, needs attention" condition:
-	// true when at least one of the run's mailboxes is Attention. Populated
-	// only by the `-run` detail render (runDetailView derives it from
-	// Mailboxes); the bare listing (Status with no RunID) has no per-
-	// address message data to compute it from and always leaves it false,
-	// like every other field the underlying store has not populated yet.
+	// true when at least one of the run's mailboxes is Attention. The bare
+	// listing (Status with no RunID) copies it straight from
+	// RunStatus.NeedsAttention (ReadStore.ListRuns computes it there,
+	// Astra F4); the `-run` detail render (runDetailView) instead derives
+	// it by OR-reducing the Mailboxes it already loaded — a second call
+	// site of the same mailboxStatuses threshold rule, not a second
+	// implementation of it — so the listing and the detail can never
+	// disagree about one run.
 	NeedsAttention bool
 }
 
@@ -231,10 +234,16 @@ func (c *Controller) Status(ctx context.Context, req StatusRequest) (StatusResul
 	return StatusResult{Detail: &view}, nil
 }
 
-func runSummaryView(s RunStatus) RunSummaryView {
+func runSummaryView(s RunStatus) RunSummaryView { //nolint:gocritic // hugeParam: RunStatus is a ReadStore DTO rendered at most once per hop status listing row.
 	return RunSummaryView{
 		RunID: s.RunID.String(), Sequence: s.Sequence, State: string(s.State),
 		StopRequested: s.StopRequested, Reconciling: s.Reconciling, UpdatedAt: s.UpdatedAt,
+		// NeedsAttention here is ListRuns' own computation (Astra F4):
+		// always false for a LoadRunStatus-sourced RunStatus, which never
+		// sets it, since runDetailView's own mailbox OR-reduction (below)
+		// is authoritative for the detail view and only ever turns it
+		// true, never back to false.
+		NeedsAttention: s.NeedsAttention,
 	}
 }
 

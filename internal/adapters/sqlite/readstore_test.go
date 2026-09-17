@@ -46,6 +46,9 @@ func TestListRuns(t *testing.T) {
 		if statuses[0].State != run.RunCreated || statuses[0].Reconciling {
 			t.Fatalf("first status = %+v, want created and not reconciling", statuses[0])
 		}
+		if statuses[0].NeedsAttention || statuses[1].NeedsAttention {
+			t.Fatalf("solo runs never need attention: %+v", statuses)
+		}
 	})
 
 	t.Run("reconciling condition surfaces", func(t *testing.T) {

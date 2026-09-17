@@ -421,6 +421,34 @@ func guardShortfalls(ctx context.Context, q querier, runID identity.RunID, tasks
 	return missing, nil
 }
 
+// runNeedsAttentionLocked reports section 7's "blocked, needs attention"
+// listing condition for one run (Astra F4): false for a solo run
+// (Workflow.Feature() false), otherwise the OR-reduction of the SAME
+// mailboxStatuses call featureRunDetail's own Mailboxes population
+// makes — one implementation of the attention threshold rule, reused by
+// both ListRuns (this function) and LoadRunStatus (via
+// featureRunDetail), so the bare listing and the `-run` detail can never
+// disagree about one run.
+func runNeedsAttentionLocked(ctx context.Context, q querier, runID identity.RunID, now time.Time) (bool, error) {
+	snapshot, err := loadSnapshot(ctx, q, runID)
+	if err != nil {
+		return false, err
+	}
+	if !snapshot.Workflow.Feature() {
+		return false, nil
+	}
+	mailboxes, err := mailboxStatuses(ctx, q, runID, snapshot.Workflow.MessageAttention, now)
+	if err != nil {
+		return false, err
+	}
+	for i := range mailboxes {
+		if mailboxes[i].Attention {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // mailboxStatuses assembles section 7's per-address status surface: one
 // entry per address holding a non-empty queue or an unacknowledged
 // in-flight message, addresses in their canonical string order, Attention

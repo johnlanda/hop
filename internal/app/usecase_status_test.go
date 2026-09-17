@@ -416,6 +416,28 @@ func TestStatusMailboxesAndAttention(t *testing.T) {
 		t.Fatalf("OldestQueuedAge = %s, want 65s", mgr.OldestQueuedAge)
 	}
 
+	// The bare listing carries the SAME NeedsAttention the detail render
+	// just computed for this run (Astra F4): ListRuns' own
+	// runNeedsAttentionLocked reuses the identical mailboxStatuses call,
+	// so the two can never disagree.
+	listing, err := tc.Controller.Status(ctx, app.StatusRequest{RepositoryRoot: "/repo"})
+	if err != nil {
+		t.Fatalf("Status(listing) error = %v", err)
+	}
+	found := false
+	for _, r := range listing.Runs {
+		if r.RunID != fr.RunID.String() {
+			continue
+		}
+		found = true
+		if !r.NeedsAttention {
+			t.Fatalf("listing NeedsAttention = false, detail NeedsAttention = %v, want them to agree", view.NeedsAttention)
+		}
+	}
+	if !found {
+		t.Fatalf("listing.Runs = %+v, want the seeded run among them", listing.Runs)
+	}
+
 	// A dead manager session never triggers attention, however stale.
 	mgrRow := tc.Store.Sessions[fr.ManagerID]
 	mgrRow.value.State = run.SessionTerminated

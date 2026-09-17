@@ -382,6 +382,27 @@ func TestRunDetailFeatureExtensions(t *testing.T) {
 		t.Fatalf("human mailbox = %+v", humanBox)
 	}
 
+	// The bare listing carries the SAME attention condition ListRuns just
+	// computed for this run (Astra F4): pinned from the identical aged
+	// mailbox fixture the detail assertions above already used.
+	statuses, err := f.store.ListRuns(t.Context(), "/repos/feature")
+	if err != nil {
+		t.Fatalf("ListRuns() = %v", err)
+	}
+	listingFound := false
+	for _, s := range statuses {
+		if s.RunID != f.spec.RunID {
+			continue
+		}
+		listingFound = true
+		if !s.NeedsAttention {
+			t.Fatalf("listing NeedsAttention = false, want true (both mailboxes are in the Attention condition)")
+		}
+	}
+	if !listingFound {
+		t.Fatalf("ListRuns() = %+v, want the fixture run among them", statuses)
+	}
+
 	if len(detail.PendingQuestions) != 1 || detail.PendingQuestions[0].MessageID != humanQuestion {
 		t.Fatalf("pending questions = %+v, want the unanswered relay", detail.PendingQuestions)
 	}

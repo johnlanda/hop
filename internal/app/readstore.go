@@ -20,6 +20,14 @@ type RunStatus struct {
 	StopRequested bool
 	Reconciling   bool // at least one operation for the run is OperationReconciling
 	UpdatedAt     time.Time
+	// NeedsAttention is section 7's "blocked, needs attention" condition
+	// (Astra F4): true when a feature run has at least one mailbox in the
+	// Attention condition, computed by the SAME mailboxStatuses function
+	// the `-run` detail render's own Mailboxes[].Attention OR-reduction
+	// consumes — one implementation of the threshold rule, two call
+	// sites — so the bare listing and the detail block can never
+	// disagree about one run. Always false for a solo run.
+	NeedsAttention bool
 }
 
 // TaskSummary is one row of RunDetail's feature-mode task table (section
