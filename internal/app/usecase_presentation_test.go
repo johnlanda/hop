@@ -15,6 +15,12 @@ type runStatePresentation struct {
 	mu      sync.Mutex
 	store   *fakeStore
 	Patches []app.PaneMetadata
+	// Vanished names panes the server no longer has: a report to one — or
+	// to an empty pane id, which Herdr resolves to no pane — answers with
+	// the adapter's pinned not-found shape and records nothing.
+	Vanished map[string]bool
+	// Err, when set, answers every other report.
+	Err error
 }
 
 func (p *runStatePresentation) ReportMetadata(_ context.Context, metadata app.PaneMetadata) error {
@@ -23,6 +29,12 @@ func (p *runStatePresentation) ReportMetadata(_ context.Context, metadata app.Pa
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if metadata.PaneID == "" || p.Vanished[metadata.PaneID] {
+		return pinnedPaneNotFound("report metadata for", metadata.PaneID)
+	}
+	if p.Err != nil {
+		return p.Err
+	}
 	p.Patches = append(p.Patches, metadata)
 	return nil
 }

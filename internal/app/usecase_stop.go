@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strconv"
@@ -504,7 +505,10 @@ const paneScrollbackLines = 500
 // claimed process is ALSO observed gone: a pane observed absent while that
 // process still runs, or cannot be observed, stays outstanding — before
 // the close with the operation reconciling and the named human action,
-// after a dispatched close as awaiting.
+// after a dispatched close as awaiting. A ClosePane answer that the pane
+// does not exist means the pane vanished between the re-inspection and
+// the close: nothing was closed or dispatched, and the same immediate
+// re-observation decides.
 func (c *Controller) closePaneOperation(ctx context.Context, handle RunHandle, detail RunDetail, target *paneCloseTarget) (retired bool, outstanding string, err error) { //nolint:gocritic // hugeParam: RunHandle and RunDetail are per-call DTOs; this runs once per close round.
 	opID, effective, malformed, err := c.findOrCreateCloseOperation(ctx, handle, detail, target)
 	if err != nil {
@@ -572,11 +576,16 @@ func (c *Controller) closePaneOperation(ctx context.Context, handle RunHandle, d
 	actCtx, release := handle.actContext(ctx)
 	closeErr := c.Runtime.ClosePane(actCtx, target.PaneID)
 	release()
-	if closeErr != nil {
+	awaiting := "close dispatched; awaiting observed termination"
+	switch {
+	case errors.Is(closeErr, ErrPaneNotFound):
+		awaiting = "the pane was already gone at close; awaiting observed absence"
+	case closeErr != nil:
 		return false, "", fmt.Errorf("app: close pane %s: %w", target.PaneID, closeErr)
-	}
-	if err := c.recordCloseDispatched(ctx, handle, opID, target); err != nil {
-		return false, "", err
+	default:
+		if err := c.recordCloseDispatched(ctx, handle, opID, target); err != nil {
+			return false, "", err
+		}
 	}
 
 	// One immediate re-observation: the pane may already be gone. The same
@@ -584,14 +593,14 @@ func (c *Controller) closePaneOperation(ctx context.Context, handle RunHandle, d
 	// dispatched-but-unobserved.
 	if _, absentAfter, ambiguousAfter := c.observePaneAbsence(ctx, target.PaneID, target.Label); ambiguousAfter == "" && absentAfter {
 		if still := c.closeTargetProcessStillLive(ctx, target); still != "" {
-			return false, "close dispatched; awaiting observed termination: " + still, nil
+			return false, awaiting + ": " + still, nil
 		}
 		if err := c.recordCloseOutcome(ctx, handle, opID, target, "occupant absent after close"); err != nil {
 			return false, "", err
 		}
 		return true, "", nil
 	}
-	return false, "close dispatched; awaiting observed termination", nil
+	return false, awaiting, nil
 }
 
 // closeTargetProcessStillLive returns "" when target's absence may retire

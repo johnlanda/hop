@@ -54,6 +54,8 @@ type fakeRuntime struct {
 	// over mid-capture through it.
 	ReadPaneFn func(paneID string, lines int) (string, error)
 
+	// ClosePaneErr scripts every ClosePane answer; a vanished pane answers
+	// with pinnedPaneNotFound("close", paneID), the adapter's pinned shape.
 	ClosePaneErr error
 	ClosedPanes  []string
 

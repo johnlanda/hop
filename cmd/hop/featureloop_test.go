@@ -589,3 +589,48 @@ func TestFeatureLoopKeepsRunningOverUnresolvedLaunches(t *testing.T) {
 		}
 	})
 }
+
+// TestFeatureLoopContinuesPastAVanishedPane proves the loop keeps running
+// when a pane vanishes: the presentation round reports the pane skipped
+// (the app's tolerance of a pane the server no longer has), later passes
+// run as usual — here the vanished child's launch settles failed — and
+// the loop ends only on the run's own terminal state.
+func TestFeatureLoopContinuesPastAVanishedPane(t *testing.T) {
+	ctrl := &fakeController{runState: runStateRunning}
+	td := newTestDeps(ctrl, map[string]string{"PATH": "/bin"}, t.TempDir())
+	passes := 0
+	ctrl.status = func(app.StatusRequest) (app.StatusResult, error) {
+		if passes >= 3 {
+			ctrl.setRunState("completed")
+		}
+		return detailStep(ctrl.currentRunState(), "", false), nil
+	}
+	ctrl.corroborateSessions = func() ([]app.SessionLaunchProgress, error) {
+		if passes == 2 {
+			return []app.SessionLaunchProgress{{SessionID: "child", Role: "implementer", Progress: app.LaunchFailed}}, nil
+		}
+		return []app.SessionLaunchProgress{{SessionID: "child", Role: "implementer", Progress: app.LaunchPending}}, nil
+	}
+	ctrl.publishPresentation = func() (app.PresentationReport, error) {
+		passes++
+		if passes <= 2 {
+			return app.PresentationReport{Published: []string{"w1:p1"}, Skipped: []string{"w2:p2"}}, nil
+		}
+		return app.PresentationReport{Published: []string{"w1:p1"}}, nil
+	}
+	var stdout bytes.Buffer
+
+	result, err := runFeatureControllerLoop(context.Background(), td.deps, ctrl, app.RunHandle{}, testRunID, "r1", "/opt/hop/bin/hop", &stdout)
+	if err != nil {
+		t.Fatalf("runFeatureControllerLoop: %v", err)
+	}
+	if result.FinalState != "completed" || passes != 3 {
+		t.Fatalf("result = %+v after %d passes, want completed after 3", result, passes)
+	}
+	if got := countCalls(ctrl.recorded(), "PublishRunPresentation"); got != 3 {
+		t.Errorf("PublishRunPresentation calls = %d, want one per pass", got)
+	}
+	if got, want := stdout.String(), "run r1 running\nrun r1 completed\n"; got != want {
+		t.Errorf("stdout = %q, want %q", got, want)
+	}
+}

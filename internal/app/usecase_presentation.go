@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 
@@ -17,6 +18,10 @@ type PresentationReport struct {
 	// Published lists the pane IDs whose metadata was reported, in the
 	// deterministic publish order.
 	Published []string
+	// Skipped lists the pane IDs the server reported as not found this
+	// round, in the same order: nothing was published to them and nothing
+	// else was recorded.
+	Skipped []string
 }
 
 // PublishRunPresentation publishes the run's live state tokens for every
@@ -29,6 +34,13 @@ type PresentationReport struct {
 // resume: token metadata is not cold-restored, so rehydration is simply
 // a fresh full publication against the current bindings. A superseded
 // binding is never published to.
+//
+// A pane can vanish at any moment — its process exits, or a human closes
+// it — so a pane the server reports as not found (ErrPaneNotFound) is
+// skipped for this round: nothing is published to it, nothing is
+// recorded, and the session's fate stays with launch corroboration,
+// retirement and resume, which decide absence under their own evidence
+// rules. Every other publication error is returned.
 func (c *Controller) PublishRunPresentation(ctx context.Context, handle RunHandle) (PresentationReport, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per transition batch.
 	if c.Presentation == nil {
 		return PresentationReport{}, fmt.Errorf("%w: presentation publication", ErrFeatureModeUnsupported)
@@ -41,6 +53,10 @@ func (c *Controller) PublishRunPresentation(ctx context.Context, handle RunHandl
 	report := PresentationReport{}
 	for i := range displays {
 		if err := presenter.Publish(ctx, &displays[i]); err != nil {
+			if errors.Is(err, ErrPaneNotFound) {
+				report.Skipped = append(report.Skipped, displays[i].PaneID)
+				continue
+			}
 			return report, fmt.Errorf("app: publish presentation for pane %s: %w", displays[i].PaneID, err)
 		}
 		report.Published = append(report.Published, displays[i].PaneID)
