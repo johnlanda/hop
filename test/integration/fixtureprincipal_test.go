@@ -1246,6 +1246,119 @@ func runPreForwardBarrierManagerResumed(t *testing.T, fx preForwardBarrierFixtur
 	return out.String()
 }
 
+// TestFixtureManagerPostForwardBarrier proves RelayedQuestion's opt-in
+// post-forward barrier (design section 11 scenario 2's idempotency case)
+// in isolation, mirroring TestFixtureManagerPreForwardBarrier and reusing
+// its same shared fixture: the disabled path (absent, the manager forwards
+// then acks the human answer immediately, unaffected), the enabled path
+// (present, the manager's FIRST incarnation forwards successfully, dumps
+// an observation naming what it forwarded, then blocks before its own ack
+// of the human answer), and the barrier's ONE-SHOT property specifically:
+// EnabledButResumed drives a RESUMED invocation with the control file
+// present and asserts BOTH the forward and the ack still happen — the
+// case RelayedQuestion's PostForwardPreAckKill itself relies on.
+func TestFixtureManagerPostForwardBarrier(t *testing.T) {
+	t.Run("Disabled", testFixtureManagerPostForwardBarrierDisabled)
+	t.Run("Enabled", testFixtureManagerPostForwardBarrierEnabled)
+	t.Run("EnabledButResumed", testFixtureManagerPostForwardBarrierEnabledButResumed)
+}
+
+func testFixtureManagerPostForwardBarrierDisabled(t *testing.T) {
+	artifacts := newArtifactDir(t)
+	fx := buildPreForwardBarrierFixture(t, artifacts)
+	// No control file created: postForwardBarrierEnabled must report
+	// false, and every existing scenario's own behavior (forward, then
+	// ack, immediately) must be unchanged.
+
+	stdout := runPreForwardBarrierManager(t, fx)
+	if !strings.Contains(stdout, "FIXTURE-FORWARDED origin=["+fx.msgHoldQuestionID+"]") {
+		t.Errorf("manager stdout missing the forward with the barrier control file absent; got:\n%s", stdout)
+	}
+	if strings.Contains(stdout, "FIXTURE-POST-FORWARD-BARRIER") {
+		t.Errorf("manager stdout shows the post-forward barrier firing with no control file present; got:\n%s", stdout)
+	}
+	if _, err := os.Stat(filepath.Join(fx.scratchDir, postForwardBarrierObservedFile)); err == nil {
+		t.Error("post-forward barrier observation file exists despite the barrier being disabled")
+	}
+	log := readFakeHopLog(t, fx.logPath)
+	if !strings.Contains(log, "msg\tsend\t--kind\tanswer\t--reply-to\t"+fx.msgHoldQuestionID) {
+		t.Errorf("fake hop invocation log missing the forward call; got:\n%s", log)
+	}
+	if !strings.Contains(log, "msg\tack\t"+fx.msgHumanAnswerID) {
+		t.Errorf("fake hop invocation log missing the ack of the human answer; got:\n%s", log)
+	}
+}
+
+func testFixtureManagerPostForwardBarrierEnabled(t *testing.T) {
+	artifacts := newArtifactDir(t)
+	fx := buildPreForwardBarrierFixture(t, artifacts)
+	if err := os.WriteFile(filepath.Join(fx.scratchDir, postForwardBarrierControlFile), []byte("enable\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout := runPreForwardBarrierManager(t, fx)
+	if !strings.Contains(stdout, "FIXTURE-FORWARDED origin=["+fx.msgHoldQuestionID+"]") {
+		t.Errorf("manager stdout missing the forward: the barrier fires only AFTER it; got:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "FIXTURE-POST-FORWARD-BARRIER answer=["+fx.msgHumanAnswerID+"]") {
+		t.Fatalf("manager stdout missing the post-forward barrier marker; got:\n%s", stdout)
+	}
+	log := readFakeHopLog(t, fx.logPath)
+	if !strings.Contains(log, "msg\tsend\t--kind\tanswer\t--reply-to\t"+fx.msgHoldQuestionID) {
+		t.Errorf("fake hop invocation log missing the forward call; got:\n%s", log)
+	}
+	if strings.Contains(log, "msg\tack\t"+fx.msgHumanAnswerID) {
+		t.Errorf("fake hop invocation log shows the human answer acked despite the barrier blocking before it; got:\n%s", log)
+	}
+
+	obsContent, err := os.ReadFile(filepath.Join(fx.scratchDir, postForwardBarrierObservedFile))
+	if err != nil {
+		t.Fatalf("read post-forward barrier observation file: %v", err)
+	}
+	wantSum := sha256.Sum256([]byte(preForwardBarrierAnswerBody))
+	wantHex := hex.EncodeToString(wantSum[:])
+	if !strings.Contains(string(obsContent), "id="+fx.msgHumanAnswerID+"\n") {
+		t.Errorf("barrier observation missing id=%s; got:\n%s", fx.msgHumanAnswerID, obsContent)
+	}
+	if !strings.Contains(string(obsContent), "sha256="+wantHex+"\n") {
+		t.Errorf("barrier observation missing sha256=%s; got:\n%s", wantHex, obsContent)
+	}
+}
+
+// testFixtureManagerPostForwardBarrierEnabledButResumed proves the
+// barrier's one-shot property: the control file is present (exactly as
+// Enabled above), but this time the invocation is RESUME-shaped -- a real
+// cold-relaunched manager's argv is ALWAYS --resume-shaped, and the
+// barrier is one-shot, keyed to runManager's own resumed flag, so this
+// specific incarnation must forward AND ack immediately, never block, and
+// must never write an observation file at all.
+func testFixtureManagerPostForwardBarrierEnabledButResumed(t *testing.T) {
+	artifacts := newArtifactDir(t)
+	fx := buildPreForwardBarrierFixture(t, artifacts)
+	if err := os.WriteFile(filepath.Join(fx.scratchDir, postForwardBarrierControlFile), []byte("enable\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	const nativeRef = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+	stdout := runPreForwardBarrierManagerResumed(t, fx, nativeRef)
+	if !strings.Contains(stdout, "FIXTURE-FORWARDED origin=["+fx.msgHoldQuestionID+"]") {
+		t.Errorf("resumed manager stdout missing the forward despite the barrier control file being present; got:\n%s", stdout)
+	}
+	if strings.Contains(stdout, "FIXTURE-POST-FORWARD-BARRIER") {
+		t.Errorf("resumed manager stdout shows the post-forward barrier firing on a RESUMED incarnation; the barrier must be one-shot, keyed to the first incarnation only; got:\n%s", stdout)
+	}
+	if _, err := os.Stat(filepath.Join(fx.scratchDir, postForwardBarrierObservedFile)); err == nil {
+		t.Error("post-forward barrier observation file exists despite this incarnation being resumed; the barrier must never engage on resume")
+	}
+	log := readFakeHopLog(t, fx.logPath)
+	if !strings.Contains(log, "msg\tsend\t--kind\tanswer\t--reply-to\t"+fx.msgHoldQuestionID) {
+		t.Errorf("fake hop invocation log missing the forward call on the resumed incarnation; got:\n%s", log)
+	}
+	if !strings.Contains(log, "msg\tack\t"+fx.msgHumanAnswerID) {
+		t.Errorf("fake hop invocation log missing the ack of the human answer on the resumed incarnation; got:\n%s", log)
+	}
+}
+
 // requestIDFromLogLine extracts the value following a "--request-id"
 // token in one fake-hop invocation log line, "" if absent.
 func requestIDFromLogLine(t *testing.T, line string) string {
