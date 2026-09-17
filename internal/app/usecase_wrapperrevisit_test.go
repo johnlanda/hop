@@ -367,3 +367,114 @@ func TestColdRelaunchLeavesAReconcilingSessionLost(t *testing.T) {
 		t.Fatalf("the lost manager still has its placement as a current binding (%s); it must be superseded", current.PaneID)
 	}
 }
+
+// wedgeWrappedManagerLaunch puts the resume fixture's MANAGER into the
+// live wrapper reconciliation — its placement current, its claim that
+// placement's own exec_pending one, the session reconciling — and returns
+// its binding. This is the one reconciling state the controller loop
+// re-inspects, so the bootstrap continuation hands it back to the loop
+// rather than holding the run in reconciliation.
+func wedgeWrappedManagerLaunch(t *testing.T, f *resumeFixture) run.RuntimeBinding {
+	t.Helper()
+	binding, ok := f.tc.Store.currentBindingLocked(f.fr.ManagerID)
+	if !ok {
+		t.Fatalf("no binding for the fixture manager %s", f.fr.ManagerID)
+	}
+	claim := f.tc.Store.LaunchClaims[f.fr.ManagerIncarnation]
+	claim.State = app.LaunchClaimExecPending
+	claim.PID = f.ManagerPID
+	f.tc.Store.LaunchClaims[f.fr.ManagerIncarnation] = claim
+
+	row := f.tc.Store.Sessions[f.fr.ManagerID]
+	reconciling, err := row.value.Reconcile(f.tc.Clock.Now())
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	row.value = reconciling
+	row.revision++
+	return binding
+}
+
+// claimedManagerPane is the manager's pane answering with the claimed
+// process as its own: the launch the loop still corroborates.
+func claimedManagerPane(f *resumeFixture) app.PaneProcess {
+	return app.PaneProcess{
+		ShellPID: f.ManagerPID, ForegroundGroupID: f.ManagerPID,
+		Foreground: []app.ProcessInfo{{PID: f.ManagerPID, Argv: []string{"/usr/local/bin/claude"}, Cmdline: "claude " + f.fr.ManagerIncarnation.String()}},
+	}
+}
+
+// TestManagerBootstrapContinuesTheWrapperReconciliation is the manager arm
+// of resume parity. The bootstrap continuation returns a run to launching
+// for a manager in the live wrapper reconciliation — the same state the
+// loop re-inspects — but ONLY under the positive observations resume's
+// in-flight rule requires of a child's placed launch: the inspection
+// answered by the lifetime the placement recorded, and the pane's own
+// process being the claimed one. Under anything weaker the run stays
+// resuming and nothing is handed back.
+func TestManagerBootstrapContinuesTheWrapperReconciliation(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		// arrange scripts the manager pane's observation.
+		arrange func(f *resumeFixture) app.PaneProcess
+		want    run.RunState
+	}{
+		{
+			name:    "the claimed process answers under the placement's own lifetime",
+			arrange: claimedManagerPane,
+			want:    run.RunLaunching,
+		},
+		{
+			name: "the server restarted, so the inspection is no evidence of the launch",
+			arrange: func(f *resumeFixture) app.PaneProcess {
+				f.tc.Runtime.ServerInstanceValue = fakeServerToken(2)
+				return claimedManagerPane(f)
+			},
+			want: run.RunResuming,
+		},
+		{
+			name: "the pane's own process is not the claimed launch process",
+			arrange: func(f *resumeFixture) app.PaneProcess {
+				return app.PaneProcess{
+					ShellPID: 7777, ForegroundGroupID: 7777,
+					Foreground: []app.ProcessInfo{{PID: 7777, Name: "zsh", Argv: []string{"-zsh"}}},
+				}
+			},
+			want: run.RunResuming,
+		},
+		{
+			name: "the recorded pane answers with no foreground occupant",
+			arrange: func(f *resumeFixture) app.PaneProcess {
+				return app.PaneProcess{ShellPID: f.ManagerPID, ForegroundGroupID: f.ManagerPID}
+			},
+			want: run.RunResuming,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newResumeFixture(t)
+			managerBinding := wedgeWrappedManagerLaunch(t, f)
+			childBinding := resumeChildClaim(t, f, app.LaunchClaimExecPending)
+			managerPane := tt.arrange(f)
+			f.tc.Runtime.InspectPaneFn = func(id string) (app.PaneProcess, error) {
+				switch id {
+				case managerBinding.PaneID:
+					return managerPane, nil
+				case childBinding.PaneID:
+					return childPaneWith(childLaunchPID, corroboratingChild(childBinding.IncarnationID)), nil
+				}
+				return app.PaneProcess{}, app.ErrPaneNotFound
+			}
+
+			f.resume(t, "")
+			requireRunState(t, f, tt.want)
+			// Whatever the observation, resume never settles the manager's
+			// claim itself: that stays the loop's to do.
+			if got := f.tc.Store.LaunchClaims[f.fr.ManagerIncarnation].State; got != app.LaunchClaimExecPending {
+				t.Fatalf("manager claim state = %s, want exec_pending", got)
+			}
+			if got := f.tc.Store.Sessions[f.fr.ManagerID].value.State; got != run.SessionReconciling {
+				t.Fatalf("manager session state = %s, want reconciling", got)
+			}
+		})
+	}
+}
