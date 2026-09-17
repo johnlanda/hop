@@ -92,33 +92,62 @@ func attestationOps(tc *testController, runID identity.RunID) []app.Operation {
 
 func TestResumeFeature(t *testing.T) {
 	t.Run("warm reattach: the occupant corroborates under the one predicate", func(t *testing.T) {
-		f := newResumeFixture(t)
-		f.tc.Runtime.InspectPaneFn = func(paneID string) (app.PaneProcess, error) {
-			switch paneID {
-			case "pane-mgr":
-				return app.PaneProcess{
-					ShellPID: 1, ForegroundGroupID: f.ManagerPID,
-					Foreground: []app.ProcessInfo{{PID: f.ManagerPID, Argv: []string{"/usr/local/bin/claude"}, Cmdline: "claude " + f.fr.ManagerIncarnation.String()}},
-				}, nil
-			default:
-				// The child is still pre-claim: pending, not warm.
-				return app.PaneProcess{}, app.ErrPaneNotFound
-			}
-		}
-		result, _ := f.resume(t, "")
-		mgr := sessionReport(t, &result, f.fr.ManagerID.String())
-		if mgr.Disposition != app.SessionWarm {
-			t.Fatalf("manager disposition = %+v, want warm", mgr)
-		}
-		child := sessionReport(t, &result, f.ChildID.String())
-		if child.Disposition != app.SessionPending {
-			t.Fatalf("child disposition = %+v, want pending (claim not settled)", child)
-		}
-		if result.Outcome != "reconciling" {
-			t.Fatalf("outcome = %s, want reconciling while the child is pending", result.Outcome)
-		}
-		if got := f.tc.Store.Sessions[f.fr.ManagerID].value.State; got != run.SessionActive {
-			t.Fatalf("manager state = %s, want active", got)
+		for _, tt := range []struct {
+			name string
+			// childPane is what the pre-claim child's recorded pane answers.
+			childPane func(f *resumeFixture) (app.PaneProcess, error)
+			outcome   string
+			detail    string
+		}{
+			{
+				// The child is still pre-claim with its launcher in its pane:
+				// its placed launch is in flight, so the run resumes and the
+				// loop's corroboration waits for the claim.
+				name: "a pre-claim child's launcher occupies its pane: resumed",
+				childPane: func(f *resumeFixture) (app.PaneProcess, error) {
+					return app.PaneProcess{ShellPID: 5151, ForegroundGroupID: 5151, Foreground: []app.ProcessInfo{{
+						PID: 5151, Name: "hop", Argv: []string{"/usr/local/bin/hop", "launch", "--run", f.fr.RunID.String(), "--session", f.ChildID.String()},
+					}}}, nil
+				},
+				outcome: "resumed",
+				detail:  "launch claim not settled; the placed launch is in flight, and the controller loop corroborates it",
+			},
+			{
+				// A pre-claim child whose recorded pane no longer answers is
+				// not in flight: the run stays in reconciliation.
+				name:      "a pre-claim child's recorded pane is gone: reconciling",
+				childPane: func(*resumeFixture) (app.PaneProcess, error) { return app.PaneProcess{}, app.ErrPaneNotFound },
+				outcome:   "reconciling",
+				detail:    "launch claim not settled; corroboration continues (the recorded pane does not answer by id)",
+			},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				f := newResumeFixture(t)
+				f.tc.Runtime.InspectPaneFn = func(paneID string) (app.PaneProcess, error) {
+					if paneID == "pane-mgr" {
+						return app.PaneProcess{
+							ShellPID: 1, ForegroundGroupID: f.ManagerPID,
+							Foreground: []app.ProcessInfo{{PID: f.ManagerPID, Argv: []string{"/usr/local/bin/claude"}, Cmdline: "claude " + f.fr.ManagerIncarnation.String()}},
+						}, nil
+					}
+					return tt.childPane(f)
+				}
+				result, _ := f.resume(t, "")
+				mgr := sessionReport(t, &result, f.fr.ManagerID.String())
+				if mgr.Disposition != app.SessionWarm {
+					t.Fatalf("manager disposition = %+v, want warm", mgr)
+				}
+				child := sessionReport(t, &result, f.ChildID.String())
+				if child.Disposition != app.SessionPending || child.Detail != tt.detail {
+					t.Fatalf("child report = %+v, want pending with %q", child, tt.detail)
+				}
+				if result.Outcome != tt.outcome {
+					t.Fatalf("outcome = %s, want %s", result.Outcome, tt.outcome)
+				}
+				if got := f.tc.Store.Sessions[f.fr.ManagerID].value.State; got != run.SessionActive {
+					t.Fatalf("manager state = %s, want active", got)
+				}
+			})
 		}
 	})
 
