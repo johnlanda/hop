@@ -1924,9 +1924,7 @@ func TestFixtureManagerNeedsReworkNoticeShapes(t *testing.T) {
 		// integrationNoticeStates's two retry-worthy tokens
 		// ("conflicted"/"rolled-back"). The parser must reject it by the
 		// state token, not merely accept whatever sits at line 1, or a
-		// bug that dropped the state check entirely would go uncaught —
-		// exactly the class of bug this subtest existed to catch before
-		// it was deleted as apparently obsolete.
+		// bug that dropped the state check entirely would go uncaught.
 		if err := os.WriteFile(noticePath, []byte("task t1 needs-rework\nintegration ffffffff-4444-4fff-8fff-ffffffffffff interrupted\nreason: run terminal failure before a candidate was published\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
