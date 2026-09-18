@@ -75,7 +75,7 @@ func requirePlacementCurrent(t *testing.T, f *featureFixture, sessionID identity
 // message ack cannot be staged against one at all: seeding its delivery
 // needs a live parent session to hang a worker off.
 var endedPrincipalVerbs = []string{ //nolint:gochecknoglobals // the verb subset this rule covers, immutable after init like principalVerbs itself.
-	"task create", "task retry", "plan close", "message send",
+	"task create", "task retry", "plan close", "message send", "review submit",
 }
 
 // TestPrincipalEndedSessionRefused pins the liveness half of the one
