@@ -1973,6 +1973,49 @@ journal of what the manager was told is exact and totally ordered with the
 lifecycle evidence. Nothing about delivery lives only in memory or only in
 a pane.
 
+### The controller notice grammar
+
+A controller info notice's body follows one line order regardless of
+which settlement composed it — a task's own consequence
+(`renderTaskNotice`, usecase_featurecheck.go: worker interruption, a
+per-task check failure) or an integration settlement's
+(`renderIntegrationNotice`, usecase_featuresettle.go: a merge conflict or
+a rolled-back combined check). The task-consequence line —
+`task t<seq> <consequence>`, consequence one of `needs-rework`, `failed`,
+`interrupted` — is ALWAYS first: it is the one fact every notice carries
+and the one the manager decides from (a `needs-rework` notice retries the
+task; a reject verdict's own notice carries no marker at all and is read
+through the status guard-shortfall line instead, per the manager's
+standing verdict-channel instruction above). An integration settlement's
+notice adds its own `integration <id> <state>` line SECOND (state one of
+`conflicted`, `rolled-back`) — supporting evidence for why the task
+consequence follows, never the fact itself — then `reason: <reason>`,
+zero or more `evidence: <path>` lines, and, only for a failing
+consequence, a trailing `orphaned obligations: <ids>` (or `none`) line.
+One order means a reader — human or fixture — never tries two positions
+for the fact it needs.
+
+Line position is meaningful only because every line IS exactly one line,
+by construction rather than by convention: `taskSeq` is an int,
+`integrationID` a uuid, `consequence` and the integration `state` typed
+values, and the obligation ids HOP uuids — none of these can carry a
+newline. `reason` and an evidence `path`, though, are externally sourced
+(a check or git command's own detail text, a filesystem path) and render
+through `RenderExternal` at the grammar boundary, so a newline or control
+byte in either can never inject a second line into the body — a forged
+`task t<seq> <consequence>` line, for instance, which a reader parsing by
+line would otherwise act on as the controller's own. This is the same
+escaping boundary and the same threat ESC-1 named, applied where a line
+grammar's own field can carry the delimiter it is split on: escaping
+decides how the value renders, never what it contains, so a hostile or
+merely multi-line reason still reaches the manager in full, just never
+split across the lines the grammar's positions depend on. The rendering
+constants (`GrammarNoticeTaskLine`, `GrammarNoticeIntegrationLine`,
+`GrammarNoticeReasonLine`, `GrammarNoticeEvidenceLine`,
+`GrammarNoticeObligationsLine`/`GrammarNoticeObligationsNoneLine`) live in
+internal/app/grammar.go beside the rest of this section's grammar, pinned
+byte for byte by `TestGoldenGrammar`.
+
 ### The worker protocol grammar (one source of truth)
 
 Phase 2's third escaped defect was a worker-facing protocol line the real

@@ -1,6 +1,8 @@
 package app_test
 
 import (
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -147,6 +149,29 @@ func TestGoldenGrammar(t *testing.T) {
 		{"attention action human", app.GrammarAttentionActionHuman, "answer pending human questions with hop answer"},
 		{"attention marker", app.GrammarAttentionMarker, "blocked, needs attention"},
 
+		{
+			"notice task line",
+			app.GrammarNoticeTaskLine(1, "needs-rework"),
+			"task t1 needs-rework",
+		},
+		{
+			"notice integration line",
+			app.GrammarNoticeIntegrationLine(msgID, "conflicted"),
+			"integration " + msgID + " conflicted",
+		},
+		{"notice reason line", app.GrammarNoticeReasonLine("merge conflict"), "reason: merge conflict"},
+		{
+			"notice evidence line",
+			app.GrammarNoticeEvidenceLine("/state/runs/r/artifacts/evidence.txt"),
+			"evidence: /state/runs/r/artifacts/evidence.txt",
+		},
+		{"notice obligations none", app.GrammarNoticeObligationsNoneLine, "orphaned obligations: none"},
+		{
+			"notice obligations line",
+			app.GrammarNoticeObligationsLine([]string{otherID, thirdID}),
+			"orphaned obligations: " + otherID + " " + thirdID,
+		},
+
 		{"task label", app.GrammarTaskLabel(4), "t4"},
 		{
 			"task line",
@@ -243,4 +268,100 @@ func TestGoldenGrammar(t *testing.T) {
 	if app.TransientAttemptNotRunning != "attempt-not-running" || app.TransientUndeliveredMessages != "undelivered-messages" {
 		t.Errorf("transient reasons = %q, %q; golden %q, %q", app.TransientAttemptNotRunning, app.TransientUndeliveredMessages, "attempt-not-running", "undelivered-messages")
 	}
+}
+
+// TestNoticeGrammarLineFieldsAreEscaped proves GrammarNoticeReasonLine and
+// GrammarNoticeEvidenceLine escape their externally sourced field: a
+// control character or a quote renders through RenderExternal's quoted
+// form, never raw.
+func TestNoticeGrammarLineFieldsAreEscaped(t *testing.T) {
+	const hostile = "line one\x1b[2J\nline two \"quoted\""
+	want := "\"line one\\x1b[2J\\nline two \\\"quoted\\\"\""
+
+	if got := app.GrammarNoticeReasonLine(hostile); got != "reason: "+want {
+		t.Errorf("GrammarNoticeReasonLine(%q) = %q, want %q", hostile, got, "reason: "+want)
+	}
+	if got := app.GrammarNoticeEvidenceLine(hostile); got != "evidence: "+want {
+		t.Errorf("GrammarNoticeEvidenceLine(%q) = %q, want %q", hostile, got, "evidence: "+want)
+	}
+}
+
+// TestNoticeBodyCannotBeForgedByAHostileReasonOrEvidencePath proves the
+// controller notice grammar's one-line-per-fact property holds against
+// the exact threat ESC-1 named, one layer further out: a reason or an
+// evidence path is externally sourced (a check or git command's own
+// detail text, a filesystem path) and, unescaped, a newline inside either
+// would forge an extra body line a line-oriented reader could mistake for
+// the controller's own — a fake task-consequence line, chosen here
+// because it is exactly the fact a real reader (manager or fixture) acts
+// on. Both renderers must produce exactly the fixed number of lines their
+// shape promises, with the injected text confined, quoted, inside the
+// one line it belongs on.
+func TestNoticeBodyCannotBeForgedByAHostileReasonOrEvidencePath(t *testing.T) {
+	const hostileReason = "worker self-exit\x1b[2J\ntask t9 failed"
+	quotedReason := strconv.Quote(hostileReason)
+
+	t.Run("task notice: a hostile reason forges no second task line", func(t *testing.T) {
+		task := &run.Task{Seq: 1}
+		body := app.RenderTaskNoticeForTest(task, "needs-rework", hostileReason, nil)
+		lines := strings.Split(strings.TrimSuffix(body, "\n"), "\n")
+		if len(lines) != 2 {
+			t.Fatalf("notice body = %q, want exactly 2 lines, got %d: %#v", body, len(lines), lines)
+		}
+		if lines[0] != "task t1 needs-rework" {
+			t.Errorf("line 1 = %q, want the real, unforged task-consequence line", lines[0])
+		}
+		if want := "reason: " + quotedReason; lines[1] != want {
+			t.Errorf("line 2 = %q, want %q", lines[1], want)
+		}
+		for i, line := range lines {
+			if strings.ContainsAny(line, "\x1b\n") {
+				t.Errorf("line %d = %q carries a raw control byte or line break", i, line)
+			}
+		}
+	})
+
+	t.Run("integration notice: a hostile reason forges no second task line", func(t *testing.T) {
+		const integrationID = "cccccccc-1111-4ccc-8ccc-cccccccccccc"
+		body := app.RenderIntegrationNoticeForTest(integrationID, run.IntegrationConflicted, "needs-rework", 1, hostileReason, nil, nil)
+		lines := strings.Split(strings.TrimSuffix(body, "\n"), "\n")
+		if len(lines) != 3 {
+			t.Fatalf("notice body = %q, want exactly 3 lines, got %d: %#v", body, len(lines), lines)
+		}
+		if lines[0] != "task t1 needs-rework" {
+			t.Errorf("line 1 = %q, want the real, unforged task-consequence line", lines[0])
+		}
+		if lines[1] != "integration "+integrationID+" conflicted" {
+			t.Errorf("line 2 = %q, want the real integration-state line", lines[1])
+		}
+		if want := "reason: " + quotedReason; lines[2] != want {
+			t.Errorf("line 3 = %q, want %q", lines[2], want)
+		}
+		for i, line := range lines {
+			if strings.ContainsAny(line, "\x1b\n") {
+				t.Errorf("line %d = %q carries a raw control byte or line break", i, line)
+			}
+		}
+	})
+
+	t.Run("integration notice: a hostile evidence path forges no extra line", func(t *testing.T) {
+		const integrationID = "dddddddd-2222-4ddd-8ddd-dddddddddddd"
+		const hostilePath = "/evidence\x1b[2J\ntask t9 failed"
+		body := app.RenderIntegrationNoticeForTest(integrationID, run.IntegrationRolledBack, "needs-rework", 1, "combined check failed", []string{hostilePath}, nil)
+		lines := strings.Split(strings.TrimSuffix(body, "\n"), "\n")
+		if len(lines) != 4 {
+			t.Fatalf("notice body = %q, want exactly 4 lines, got %d: %#v", body, len(lines), lines)
+		}
+		if lines[0] != "task t1 needs-rework" {
+			t.Errorf("line 1 = %q, want the real, unforged task-consequence line", lines[0])
+		}
+		if want := "evidence: " + strconv.Quote(hostilePath); lines[3] != want {
+			t.Errorf("line 4 = %q, want %q", lines[3], want)
+		}
+		for i, line := range lines {
+			if strings.ContainsAny(line, "\x1b\n") {
+				t.Errorf("line %d = %q carries a raw control byte or line break", i, line)
+			}
+		}
+	})
 }

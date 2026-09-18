@@ -1371,19 +1371,6 @@ func writeTempInstructions(dir, behavior, scratchDir string) string {
 	return path
 }
 
-// integrationNoticeStates are the exact state tokens
-// internal/app/usecase_featuresettle.go's renderIntegrationNotice ever
-// puts on an "integration <id> <state>" line — retyped, never imported
-// (this fixture is a standalone program, never linking internal/app):
-// section 8's outcome table journals a needs-rework consequence through
-// this renderer only for a merge conflict ("conflicted") or a rolled-back
-// candidate (a failing combined check, or the stop path's own retirement
-// of a published-but-unsettled one — "rolled-back").
-var integrationNoticeStates = map[string]bool{
-	"conflicted":  true,
-	"rolled-back": true,
-}
-
 // matchTaskNeedsReworkLine reports whether line is EXACTLY "task t<seq>
 // needs-rework" — three whitespace-separated fields, an anchored full-
 // line match, never a substring search, so a reason or evidence line
@@ -1397,48 +1384,23 @@ func matchTaskNeedsReworkLine(line string) (label string, ok bool) {
 	return "", false
 }
 
-// matchIntegrationLine reports whether line is EXACTLY "integration <id>
-// <state>" with state one of integrationNoticeStates's own tokens — the
-// same anchored, exact three-field shape as matchTaskNeedsReworkLine.
-func matchIntegrationLine(line string) bool {
-	fields := strings.Fields(line)
-	return len(fields) == 3 && fields[0] == "integration" && integrationNoticeStates[fields[2]]
-}
-
 // parseNeedsReworkLabel extracts the task label from a manager notice
-// body naming a needs-rework consequence, recognizing BOTH production
-// renderers' shapes — an anchored, whitespace-normalized field match on
-// each shape's own line (strings.Fields, never a substring search), not
-// pinned to either renderer's line order, since design section 7 only
-// promises "a needs-rework notice", never a fixed line position:
-//   - renderTaskNotice (internal/app/usecase_featurecheck.go, worker
-//     interruption and per-task check failure): the task consequence
-//     line is LINE 1.
-//   - renderIntegrationNotice (internal/app/usecase_featuresettle.go,
-//     merge conflict and combined-check-failure/rollback settlements): an
-//     "integration <id> <state>" line comes FIRST, the task consequence
-//     line SECOND.
-//
-// Both matches are anchored, exact three-field lines (matchTaskNeeds
-// ReworkLine/matchIntegrationLine) checked ONLY at the one position each
-// shape allows — never a substring search over the whole body — so a
-// reason or evidence line naming "needs-rework" in passing, or the task
-// line appearing at any other position, can never trigger a retry. ok is
-// false for any other notice shape (an integrated/dependents-released
-// notice, a failed notice, etc.), which the manager acks without acting
-// on.
+// body naming a needs-rework consequence: the section 7 controller
+// notice grammar puts the task-consequence line FIRST in every notice
+// shape, retyped here, never imported (this fixture is a standalone
+// program, never linking internal/app) — both renderTaskNotice (worker
+// interruption, a per-task check failure) and renderIntegrationNotice (a
+// merge conflict or a rolled-back combined check) put it there, so one
+// anchored line-1 match covers both. The match is exact and
+// whitespace-normalized (matchTaskNeedsReworkLine's strings.Fields), never
+// a substring search over the whole body, so a reason or evidence line
+// merely naming "needs-rework" — or a real task line appearing anywhere
+// but line 1 — can never trigger a retry. ok is false for any other
+// notice shape (an integrated/dependents-released notice, a failed
+// notice, etc.), which the manager acks without acting on.
 func parseNeedsReworkLabel(body string) (label string, ok bool) {
-	lines := strings.SplitN(body, "\n", 3)
-	if len(lines) == 0 {
-		return "", false
-	}
-	if label, ok := matchTaskNeedsReworkLine(lines[0]); ok {
-		return label, true
-	}
-	if len(lines) < 2 || !matchIntegrationLine(lines[0]) {
-		return "", false
-	}
-	return matchTaskNeedsReworkLine(lines[1])
+	line, _, _ := strings.Cut(body, "\n")
+	return matchTaskNeedsReworkLine(line)
 }
 
 // runManager is the manager-feature behavior's entry point: a scripted

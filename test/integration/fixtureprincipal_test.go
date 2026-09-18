@@ -1819,12 +1819,13 @@ func runNeedsReworkCase(t *testing.T, artifacts *artifactDir, noticeBodyPath str
 }
 
 // TestFixtureManagerNeedsReworkNoticeShapes proves parseNeedsReworkLabel
-// recognizes BOTH production notice renderers' shapes with an ANCHORED,
-// exact-line match, never pinned to either renderer's own line position
-// (design section 7 promises only "a needs-rework notice") and never a
-// substring search, so a reason or evidence line merely naming
-// "needs-rework", or the task line appearing at any position other than
-// the one each shape allows, can never trigger a retry.
+// recognizes the section 7 controller notice grammar's ONE task-
+// consequence-first shape — the same line-1 position for both
+// renderTaskNotice (worker interruption, a per-task check failure) and
+// renderIntegrationNotice (a merge conflict or a rolled-back combined
+// check) — with an ANCHORED, exact-line match, never a substring search,
+// so a reason or evidence line merely naming "needs-rework", or a real
+// task line appearing anywhere but line 1, can never trigger a retry.
 func TestFixtureManagerNeedsReworkNoticeShapes(t *testing.T) {
 	t.Run("task line first (renderTaskNotice: worker interruption, per-task check failure)", func(t *testing.T) {
 		artifacts := newArtifactDir(t)
@@ -1838,10 +1839,10 @@ func TestFixtureManagerNeedsReworkNoticeShapes(t *testing.T) {
 		}
 	})
 
-	t.Run("task line second (renderIntegrationNotice: merge conflict)", func(t *testing.T) {
+	t.Run("task line first (renderIntegrationNotice: merge conflict)", func(t *testing.T) {
 		artifacts := newArtifactDir(t)
 		noticePath := filepath.Join(artifacts.dir(t, "notice-bodies"), "notice.txt")
-		if err := os.WriteFile(noticePath, []byte("integration cccccccc-1111-4ccc-8ccc-cccccccccccc conflicted\ntask t1 needs-rework\nreason: merge conflict\n"), 0o600); err != nil {
+		if err := os.WriteFile(noticePath, []byte("task t1 needs-rework\nintegration cccccccc-1111-4ccc-8ccc-cccccccccccc conflicted\nreason: merge conflict\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		retried, stdout := runNeedsReworkCase(t, artifacts, noticePath)
@@ -1850,10 +1851,10 @@ func TestFixtureManagerNeedsReworkNoticeShapes(t *testing.T) {
 		}
 	})
 
-	t.Run("task line second (renderIntegrationNotice: rolled back)", func(t *testing.T) {
+	t.Run("task line first (renderIntegrationNotice: rolled back)", func(t *testing.T) {
 		artifacts := newArtifactDir(t)
 		noticePath := filepath.Join(artifacts.dir(t, "notice-bodies"), "notice.txt")
-		if err := os.WriteFile(noticePath, []byte("integration dddddddd-2222-4ddd-8ddd-dddddddddddd rolled-back\ntask t1 needs-rework\nreason: combined check failed\n"), 0o600); err != nil {
+		if err := os.WriteFile(noticePath, []byte("task t1 needs-rework\nintegration dddddddd-2222-4ddd-8ddd-dddddddddddd rolled-back\nreason: combined check failed\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		retried, stdout := runNeedsReworkCase(t, artifacts, noticePath)
@@ -1865,9 +1866,9 @@ func TestFixtureManagerNeedsReworkNoticeShapes(t *testing.T) {
 	t.Run("task line at any other position never retries", func(t *testing.T) {
 		artifacts := newArtifactDir(t)
 		noticePath := filepath.Join(artifacts.dir(t, "notice-bodies"), "notice.txt")
-		// The task line is real but sits at position 2 behind an
-		// unrecognized first line (not one of renderIntegrationNotice's own
-		// states) — never anchored at a position either shape allows.
+		// The task line is real but sits at position 2, behind an
+		// unrelated first line — never anchored at the one position the
+		// grammar allows.
 		if err := os.WriteFile(noticePath, []byte("some other notice line\ntask t1 needs-rework\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -1889,8 +1890,10 @@ func TestFixtureManagerNeedsReworkNoticeShapes(t *testing.T) {
 		artifacts := newArtifactDir(t)
 		noticePath := filepath.Join(artifacts.dir(t, "notice-bodies"), "notice.txt")
 		// A substring search would wrongly match this: "needs-rework" and
-		// even "task t1" both appear, but never as an anchored, exact line.
-		if err := os.WriteFile(noticePath, []byte("integration eeeeeeee-3333-4eee-8eee-eeeeeeeeeeee conflicted\nreason: see task t1 needs-rework for context\n"), 0o600); err != nil {
+		// even "task t1" both appear, but never as an anchored, exact
+		// line-1 match — the real line 1 here names a DIFFERENT
+		// consequence.
+		if err := os.WriteFile(noticePath, []byte("task t1 failed\nreason: see task t1 needs-rework for context\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		retried, stdout := runNeedsReworkCase(t, artifacts, noticePath)
@@ -1898,29 +1901,6 @@ func TestFixtureManagerNeedsReworkNoticeShapes(t *testing.T) {
 			t.Errorf("manager retried t1 for a reason line merely mentioning needs-rework; want no retry (anchored match only); stdout:\n%s", stdout)
 		}
 		// Same positive-evidence requirement as the sibling subtest above.
-		if !strings.Contains(stdout, "FIXTURE-STATUS-CHECKED matched=[false]") {
-			t.Errorf("manager did not process the notice through the status-check branch; want \"FIXTURE-STATUS-CHECKED matched=[false]\"; stdout:\n%s", stdout)
-		}
-	})
-
-	t.Run("integration state outside the recognized set never retries", func(t *testing.T) {
-		artifacts := newArtifactDir(t)
-		noticePath := filepath.Join(artifacts.dir(t, "notice-bodies"), "notice.txt")
-		// The task line sits at exactly the position renderIntegrationNotice
-		// uses, but "integrated" is not one of integrationNoticeStates's own
-		// two tokens ("conflicted"/"rolled-back") — production never renders
-		// this shape (an integrated candidate carries no needs-rework line),
-		// but the parser must still reject it by the state token, not merely
-		// by line position, or a bug that dropped the state check entirely
-		// would go uncaught.
-		if err := os.WriteFile(noticePath, []byte("integration ffffffff-4444-4fff-8fff-ffffffffffff integrated\ntask t1 needs-rework\n"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		retried, stdout := runNeedsReworkCase(t, artifacts, noticePath)
-		if retried {
-			t.Errorf("manager retried t1 for an integration state outside the recognized set; want no retry; stdout:\n%s", stdout)
-		}
-		// Same positive-evidence requirement as the sibling subtests above.
 		if !strings.Contains(stdout, "FIXTURE-STATUS-CHECKED matched=[false]") {
 			t.Errorf("manager did not process the notice through the status-check branch; want \"FIXTURE-STATUS-CHECKED matched=[false]\"; stdout:\n%s", stdout)
 		}

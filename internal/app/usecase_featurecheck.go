@@ -383,16 +383,18 @@ func describeCheckOutcome(outcome *checkRunOutcome) string {
 	}
 }
 
-// renderTaskNotice renders a task settlement's manager notice body.
+// renderTaskNotice renders a task settlement's manager notice body: the
+// section 7 controller notice grammar's task-consequence-first shape
+// (grammar.go).
 func renderTaskNotice(task *run.Task, consequence taskConsequence, reason string, obligations []string) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "task t%d %s\n", task.Seq, consequence)
-	fmt.Fprintf(&b, "reason: %s\n", reason)
+	b.WriteString(GrammarNoticeTaskLine(task.Seq, string(consequence)) + "\n")
+	b.WriteString(GrammarNoticeReasonLine(reason) + "\n")
 	if consequence == taskConsequenceFailed {
 		if len(obligations) == 0 {
-			b.WriteString("orphaned obligations: none\n")
+			b.WriteString(GrammarNoticeObligationsNoneLine + "\n")
 		} else {
-			fmt.Fprintf(&b, "orphaned obligations: %s\n", strings.Join(obligations, " "))
+			b.WriteString(GrammarNoticeObligationsLine(obligations) + "\n")
 		}
 	}
 	return b.String()

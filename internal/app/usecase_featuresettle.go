@@ -199,22 +199,25 @@ func (c *Controller) predictIntegrationConsequence(ctx context.Context, handle R
 }
 
 // renderIntegrationNotice renders the manager notice body for one
-// terminal integration settlement. The orphaned-obligation IDs appear
-// only on a failing settlement, made true by the snapshot-equality
-// contract.
+// terminal integration settlement: the section 7 controller notice
+// grammar's task-consequence-first shape (grammar.go) — the task line
+// first, since it is the fact the manager acts on, then this settlement's
+// own integration-state line as supporting evidence. The orphaned-
+// obligation IDs appear only on a failing settlement, made true by the
+// snapshot-equality contract.
 func renderIntegrationNotice(integrationID identity.IntegrationID, target run.IntegrationState, consequence taskConsequence, taskSeq int, reason string, evidence, obligations []string) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "integration %s %s\n", integrationID, target)
-	fmt.Fprintf(&b, "task t%d %s\n", taskSeq, consequence)
-	fmt.Fprintf(&b, "reason: %s\n", reason)
+	b.WriteString(GrammarNoticeTaskLine(taskSeq, string(consequence)) + "\n")
+	b.WriteString(GrammarNoticeIntegrationLine(integrationID.String(), string(target)) + "\n")
+	b.WriteString(GrammarNoticeReasonLine(reason) + "\n")
 	for _, path := range evidence {
-		fmt.Fprintf(&b, "evidence: %s\n", path)
+		b.WriteString(GrammarNoticeEvidenceLine(path) + "\n")
 	}
 	if consequence == taskConsequenceFailed {
 		if len(obligations) == 0 {
-			b.WriteString("orphaned obligations: none\n")
+			b.WriteString(GrammarNoticeObligationsNoneLine + "\n")
 		} else {
-			fmt.Fprintf(&b, "orphaned obligations: %s\n", strings.Join(obligations, " "))
+			b.WriteString(GrammarNoticeObligationsLine(obligations) + "\n")
 		}
 	}
 	return b.String()

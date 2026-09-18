@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/johnlanda/hop/internal/domain/identity"
+	"github.com/johnlanda/hop/internal/domain/run"
 )
 
 // NewRunHandleForTest exposes newRunHandle to app_test: scheduler and
@@ -158,3 +159,16 @@ func DecodePaneCloseIntentForTest(intent any) (PaneCloseIntentForTest, bool) {
 
 // CloseReasonRestartForTest is the reason a restart close records.
 const CloseReasonRestartForTest = closeReasonRestart
+
+// RenderTaskNoticeForTest exposes renderTaskNotice to app_test, so a
+// notice-body test can drive the section 7 controller notice grammar
+// directly rather than through a full settlement.
+func RenderTaskNoticeForTest(task *run.Task, consequence, reason string, obligations []string) string {
+	return renderTaskNotice(task, taskConsequence(consequence), reason, obligations)
+}
+
+// RenderIntegrationNoticeForTest exposes renderIntegrationNotice to
+// app_test.
+func RenderIntegrationNoticeForTest(integrationID identity.IntegrationID, target run.IntegrationState, consequence string, taskSeq int, reason string, evidence, obligations []string) string {
+	return renderIntegrationNotice(integrationID, target, taskConsequence(consequence), taskSeq, reason, evidence, obligations)
+}

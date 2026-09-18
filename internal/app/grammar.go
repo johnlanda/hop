@@ -457,6 +457,68 @@ func GrammarSessionRestartNote(disposition string) string {
 	return "restart: " + disposition
 }
 
+// Controller info notices to the manager (design section 7, "the
+// controller notice grammar"): a task settlement's own consequence, or an
+// integration settlement's. ONE line order applies to both notice shapes
+// (renderTaskNotice in usecase_featurecheck.go, renderIntegrationNotice in
+// usecase_featuresettle.go) so a reader — human or fixture — never tries
+// two positions for the fact it acts on: the task consequence line is
+// always FIRST, since it is the one fact every notice carries and the one
+// the manager decides from. Line position is meaningful only because
+// every line is exactly one line BY CONSTRUCTION: taskSeq is an int,
+// integrationID a uuid, consequence and state typed values and obligation
+// ids HOP uuids, none of which can carry a newline, while a reason or an
+// evidence path is externally sourced (a check or git command's own
+// detail text, a filesystem path) and renders through RenderExternal
+// here — the one escaping boundary — so it can never inject a newline
+// that forges a second line (a fake task-consequence line, say) or
+// otherwise break the one-line-per-fact grammar a line-oriented reader
+// depends on.
+
+// GrammarNoticeTaskLine renders a controller notice's task-consequence
+// line: what happened to the task (one of needs-rework, failed,
+// interrupted). Always the notice body's first line, in both the
+// per-task and the integration-settlement notice shapes.
+func GrammarNoticeTaskLine(taskSeq int, consequence string) string {
+	return "task " + GrammarTaskLabel(taskSeq) + " " + consequence
+}
+
+// GrammarNoticeIntegrationLine renders an integration-settlement notice's
+// own line: which integration record settled, and how (one of conflicted,
+// rolled-back). Second in that notice's body, after the task line —
+// supporting evidence for why the task consequence follows, never the
+// fact itself.
+func GrammarNoticeIntegrationLine(integrationID, state string) string {
+	return "integration " + integrationID + " " + state
+}
+
+// GrammarNoticeReasonLine renders a controller notice's reason line.
+// reason is externally sourced (a check or git command's own detail
+// text) and renders through RenderExternal, so this is always exactly
+// one line.
+func GrammarNoticeReasonLine(reason string) string {
+	return "reason: " + RenderExternal(reason)
+}
+
+// GrammarNoticeEvidenceLine renders one evidence-path line of an
+// integration-settlement notice (zero or more, one per path). path
+// renders through RenderExternal, so this is always exactly one line.
+func GrammarNoticeEvidenceLine(path string) string {
+	return "evidence: " + RenderExternal(path)
+}
+
+// GrammarNoticeObligationsNoneLine is a failing task consequence's
+// trailing orphaned-obligations line when there are none.
+const GrammarNoticeObligationsNoneLine = "orphaned obligations: none"
+
+// GrammarNoticeObligationsLine renders a failing task consequence's
+// trailing orphaned-obligations line: the pending message ids left
+// addressed to a task whose mailbox the failure closes, so nothing owed
+// to it goes unnoticed.
+func GrammarNoticeObligationsLine(obligationIDs []string) string {
+	return "orphaned obligations: " + strings.Join(obligationIDs, " ")
+}
+
 // GrammarSessionLaunchCorroborationAction is the named human action for a
 // session reconciling because another process on its pane carries the
 // launch identity (SessionView.LaunchCorroborationPending). It states
