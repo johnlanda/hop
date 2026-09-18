@@ -1590,10 +1590,14 @@ never seen HOP's protocol is not told what to do only after it does
 something wrong (the drain refusal line, or a stale "follow the
 transient line's instruction"). That sentence is not a protocol
 restatement — the crib already carries every verb's refusal shapes — and
-it is the ONE place these verbs are named at all outside the crib and the
-manager's own assignment; the loop's fuller texture (how to phrase a
-question, what else to do while waiting) remains the repository's
-implementer and reviewer role instructions' to state, which HOP freezes
+it is the only place `hop msg send` is named in worker-facing text at
+all, and the only place any of the four is named BEFORE the worker needs
+one: `GrammarTransientUndeliveredLine`, `GrammarAckHintLine` and
+`GrammarMsgWaitNoneLine` already name `next`/`ack`/`wait` elsewhere in
+HOP-rendered worker-facing output, but only in a line the worker sees
+AFTER it has already blocked or been refused; the loop's fuller texture
+(how to phrase a question, what else to do while waiting) remains the
+repository's implementer and reviewer role instructions' to state, which HOP freezes
 verbatim and renders nothing further into. The fixture principals implement exactly this split — the fixture
 worker drains when the drain line tells it to, and before submitting —
 so the deterministic suite proves the rendered instructions are
