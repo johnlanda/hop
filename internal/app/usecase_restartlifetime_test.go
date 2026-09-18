@@ -430,6 +430,78 @@ func TestReconcileServerRestartRetires(t *testing.T) {
 	}
 }
 
+// TestReconcileServerRestartRetiresWhatWasDueForRetirement pins the two
+// retire rows that are not the held stop: a run carrying a durable
+// terminal-failure cause, and a session whose attempt has already reached a
+// retirement boundary. Both close the pane and TERMINATE the session.
+// Relaunching either would start a real agent in the worktree of a run that
+// has already failed, or on an attempt that is already done, for the next
+// retirement round to close again.
+func TestReconcileServerRestartRetiresWhatWasDueForRetirement(t *testing.T) {
+	settledAttempt := func(state run.AttemptState) func(*testing.T, *testController, featureRun, workerFixture) {
+		return func(t *testing.T, controller *testController, _ featureRun, w workerFixture) {
+			t.Helper()
+			controller.Store.Attempts[w.AttemptID].value.State = state
+		}
+	}
+	for _, tc := range []struct {
+		name  string
+		setup func(*testing.T, *testController, featureRun, workerFixture)
+	}{
+		{
+			name: "a failed task is the run's durable terminal-failure cause",
+			setup: func(t *testing.T, controller *testController, fr featureRun, _ workerFixture) {
+				t.Helper()
+				// The run is still running: the retirement pass has not yet
+				// failed it, which is exactly the window a restart lands in.
+				seedImplementTask(t, controller, fr.RunID, 2, "B", false, run.TaskFailed)
+			},
+		},
+		{name: "the attempt's outcome is completed", setup: settledAttempt(run.AttemptCompleted)},
+		{name: "the attempt's outcome is failed", setup: settledAttempt(run.AttemptFailed)},
+		{name: "the attempt's outcome is interrupted", setup: settledAttempt(run.AttemptInterrupted)},
+		{
+			name: "the attempt's result is accepted, before the attempt itself transitions",
+			setup: func(t *testing.T, controller *testController, _ featureRun, w workerFixture) {
+				t.Helper()
+				resultID, err := identity.ParseResultID(controller.IDs.NewID())
+				if err != nil {
+					t.Fatalf("parse result id: %v", err)
+				}
+				controller.Store.Results[w.AttemptID] = run.Result{
+					ID: resultID, AttemptID: w.AttemptID, CommitOID: "c",
+					Accepted: true, SubmittedAt: controller.Clock.Now(),
+				}
+				controller.Store.Attempts[w.AttemptID].value.State = run.AttemptSubmitted
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			controller, fr, w, binding := restartWorker(t)
+			tc.setup(t, controller, fr, w)
+			serverRestarted(controller)
+			identifiedByLabel(controller, binding)
+
+			report, err := controller.Controller.ReconcileServerRestart(context.Background(), fr.Handle, restartOptions())
+			if err != nil {
+				t.Fatalf("ReconcileServerRestart() error = %v", err)
+			}
+			if !slices.Contains(controller.Runtime.ClosedPanes, binding.PaneID) {
+				t.Fatalf("panes closed = %v, want the identified pane %s", controller.Runtime.ClosedPanes, binding.PaneID)
+			}
+			if len(report.Relaunched) != 0 {
+				t.Fatalf("relaunched = %v, want nothing: this session was due for retirement", report.Relaunched)
+			}
+			if !slices.Contains(report.Closed, w.SessionID.String()) {
+				t.Fatalf("report = %+v, want the session reported closed", report)
+			}
+			if got := controller.Store.Sessions[w.SessionID].value.State; got != run.SessionTerminated {
+				t.Fatalf("session state = %s, want terminated", got)
+			}
+		})
+	}
+}
+
 // TestReconcileServerRestartRelaunches pins the follow-through: a running
 // feature run's settled worker, closed after a restart, is cold-relaunched
 // from its RECORDED native session reference through the existing relaunch

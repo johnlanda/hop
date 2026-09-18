@@ -526,17 +526,99 @@ func (c *Controller) finishRestartClose(ctx context.Context, handle RunHandle, f
 	if err := c.recordCloseOutcome(ctx, handle, opID, &target, restartCloseReasonSuffix); err != nil {
 		return "", "", err
 	}
-	disposition := restartDispositionFor(&detail, session, claimFound, claim)
+	facts, err := c.readRestartRetirementFacts(ctx, handle, session)
+	if err != nil {
+		return "", "", err
+	}
+	disposition := restartDispositionFor(&detail, session, claimFound, claim, facts)
 	return disposition, "", c.applyRestartDisposition(ctx, handle, frozen, opts, session, binding, disposition)
 }
 
+// restartRetirementFacts are the two durable facts the disposition reads
+// beside the run status, each the one the settlement machinery itself
+// reads: whether the run carries a terminal-failure cause, and whether
+// this session's attempt has already reached a retirement boundary.
+type restartRetirementFacts struct {
+	// FailureCause: the run holds a durable terminal-failure cause
+	// (featureFailureCauseLocked — a failed task, or the manager lineage's
+	// exec failure), the cause under which the retirement pass fails the
+	// run and nothing new is launched.
+	FailureCause bool
+	// AttemptSettled: the session's attempt is at one of the retirement
+	// pass's own boundaries (restartAttemptSettledLocked).
+	AttemptSettled bool
+}
+
+// readRestartRetirementFacts reads both facts in one transaction, once per
+// closed session. A run whose store has no workflow repositories is a solo
+// run, which the first disposition branch decides without either fact.
+func (c *Controller) readRestartRetirementFacts(ctx context.Context, handle RunHandle, session *run.Session) (restartRetirementFacts, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per closed session.
+	var facts restartRetirementFacts
+	err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
+		wf, wfErr := RequireWorkflowRepositories(uow, "ReconcileServerRestart")
+		if wfErr != nil {
+			return wfErr
+		}
+		cause, causeErr := featureFailureCauseLocked(ctx, uow, wf, handle.runID)
+		if causeErr != nil {
+			return causeErr
+		}
+		settled, settledErr := restartAttemptSettledLocked(ctx, uow, session.AttemptID)
+		if settledErr != nil {
+			return settledErr
+		}
+		facts = restartRetirementFacts{FailureCause: cause, AttemptSettled: settled}
+		return nil
+	})
+	if err != nil && !errors.Is(err, ErrWorkflowRepositoriesUnsupported) {
+		return restartRetirementFacts{}, err
+	}
+	return facts, nil
+}
+
+// restartAttemptSettledLocked reports whether an attempt has reached a
+// retirement boundary, reading the SAME three boundaries retirementCandidates
+// does: a terminal attempt outcome, an implement attempt's accepted result,
+// or a review attempt's accepted verdict (both accepted outcomes are
+// `completed`, and a result accepted while the attempt is still submitted or
+// checking is the boundary before that transition lands). A session with no
+// attempt — a manager — has no boundary of this kind.
+func restartAttemptSettledLocked(ctx context.Context, uow UnitOfWork, attemptID identity.AttemptID) (bool, error) {
+	if attemptID == "" {
+		return false, nil
+	}
+	attempt, _, err := uow.Attempts().Get(ctx, attemptID)
+	if err != nil {
+		return false, err
+	}
+	switch attempt.State {
+	case run.AttemptCompleted, run.AttemptFailed, run.AttemptInterrupted:
+		return true, nil
+	case run.AttemptSubmitted, run.AttemptChecking:
+		result, resultErr := uow.Results().Accepted(ctx, attemptID)
+		if resultErr != nil {
+			return false, resultErr
+		}
+		return result != nil, nil
+	}
+	return false, nil
+}
+
 // restartDispositionFor decides what becomes of a session whose pane the
-// restart rule has closed.
-func restartDispositionFor(detail *RunDetail, session *run.Session, claimFound bool, claim *LaunchClaim) restartDisposition {
+// restart rule has closed. The branches are design section 6's five rows in
+// its own order, so an attempt already due for retirement is retired rather
+// than settled or relaunched under any later row.
+func restartDispositionFor(detail *RunDetail, session *run.Session, claimFound bool, claim *LaunchClaim, facts restartRetirementFacts) restartDisposition { //nolint:gocritic // hugeParam: restartRetirementFacts is a two-field value read once per closed session.
 	switch {
-	case restartStopHeld(detail) || !restartFeatureRun(detail):
-		// A stopping run never relaunches, and a solo run reaches this step
-		// only under a stop.
+	case restartStopHeld(detail) || facts.FailureCause || !restartFeatureRun(detail):
+		// A stopping run and a run carrying a terminal-failure cause never
+		// relaunch — a relaunch is a launch, and the cause that suppresses
+		// every other launch suppresses this one — and a solo run reaches
+		// this step only under a stop.
+		return restartRetire
+	case facts.AttemptSettled:
+		// The attempt is done: it was due for retirement anyway, so the
+		// close IS its retirement and no agent is started on it.
 		return restartRetire
 	case !claimFound || claim.State != LaunchClaimExeced:
 		return restartSettleLaunchFailed
