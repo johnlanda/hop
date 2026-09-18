@@ -443,10 +443,13 @@ func TestRunStatusFeatureDetailBlock(t *testing.T) {
 // TestRunStatusFeatureDetailNeverForgesALine drives a pending question as
 // the ONLY populated field (no GuardShortfalls at all), with its body
 // path carrying a raw ESC sequence plus an embedded newline shaped like a
-// fake shortfall line, and asserts the whole block structurally: zero
-// "shortfall:" occurrences (there are zero real shortfalls), no raw ESC
-// byte, and the question's body path in its quoted (safeRenderExternal
-// fallback) form.
+// fake shortfall line, and asserts the whole block structurally: no
+// forged "shortfall:" LINE (the quoted rendering legitimately contains
+// that text as inert data; GuardShortfalls is empty, so no such line may
+// stand on its own), no raw ESC byte, and the question's body path in
+// its quoted (safeRenderExternal fallback) form. Without the escaping
+// the embedded newline would end the line and start one the renderer
+// never produced.
 func TestRunStatusFeatureDetailNeverForgesALine(t *testing.T) {
 	hostilePath := "/state/\x1b[2J\n  shortfall: verdict-rejected\n/messages/q.md"
 	detail := &app.RunDetailView{
