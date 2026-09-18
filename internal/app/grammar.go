@@ -458,22 +458,28 @@ func GrammarSessionRestartNote(disposition string) string {
 }
 
 // Controller info notices to the manager (design section 7, "the
-// controller notice grammar"): a task settlement's own consequence, or an
-// integration settlement's. ONE line order applies to both notice shapes
-// (renderTaskNotice in usecase_featurecheck.go, renderIntegrationNotice in
-// usecase_featuresettle.go) so a reader — human or fixture — never tries
-// two positions for the fact it acts on: the task consequence line is
-// always FIRST, since it is the one fact every notice carries and the one
-// the manager decides from. Line position is meaningful only because
-// every line is exactly one line BY CONSTRUCTION: taskSeq is an int,
-// integrationID a uuid, consequence and state typed values and obligation
-// ids HOP uuids, none of which can carry a newline, while a reason or an
-// evidence path is externally sourced (a check or git command's own
-// detail text, a filesystem path) and renders through RenderExternal
-// here — the one escaping boundary — so it can never inject a newline
-// that forges a second line (a fake task-consequence line, say) or
-// otherwise break the one-line-per-fact grammar a line-oriented reader
-// depends on.
+// controller notice grammar") that carry a task consequence: a task
+// settlement's own (renderTaskNotice, usecase_featurecheck.go: worker
+// interruption, a per-task check failure), or an integration
+// settlement's (renderIntegrationNotice, usecase_featuresettle.go: a
+// merge conflict, a rolled-back candidate, or a shutdown before a
+// candidate was published). ONE line order applies to both of THESE
+// shapes, so a reader — human or fixture — never tries two positions for
+// the fact it acts on: the task consequence line is always FIRST, the
+// one fact both shapes carry and the one the manager decides from. A
+// third controller-notice producer, prepareIntegratedNotice
+// (usecase_integration.go), reports an integrated candidate through its
+// own fixed first line and carries no task-consequence line at all —
+// this grammar does not govern its shape. Line position is meaningful
+// only because every line is exactly one line BY CONSTRUCTION: taskSeq
+// is an int, integrationID a uuid, consequence and state typed values,
+// and obligation ids HOP uuids, none of which can carry a newline, while
+// a reason or an evidence path is externally sourced (a check or git
+// command's own detail text, a filesystem path) and renders through
+// RenderExternal here — the one escaping boundary — so it can never
+// inject a newline that forges a second line (a fake task-consequence
+// line, say) or otherwise break the one-line-per-fact grammar a
+// line-oriented reader depends on.
 
 // GrammarNoticeTaskLine renders a controller notice's task-consequence
 // line: what happened to the task (one of needs-rework, failed,
@@ -484,10 +490,15 @@ func GrammarNoticeTaskLine(taskSeq int, consequence string) string {
 }
 
 // GrammarNoticeIntegrationLine renders an integration-settlement notice's
-// own line: which integration record settled, and how (one of conflicted,
-// rolled-back). Second in that notice's body, after the task line —
-// supporting evidence for why the task consequence follows, never the
-// fact itself.
+// own line: which integration record settled, and how (one of
+// conflicted, rolled-back, interrupted). Second in that notice's body,
+// after the task line — supporting evidence for why the task consequence
+// follows, never the fact itself. Of the three states, only conflicted
+// and rolled-back are ones the section 7 manager protocol retries a
+// needs-rework consequence for; interrupted arises when a stop or
+// terminal failure settles a still-merging integration with nothing
+// published, against a run that is already ending, where a retry is
+// refused by production anyway.
 func GrammarNoticeIntegrationLine(integrationID, state string) string {
 	return "integration " + integrationID + " " + state
 }

@@ -2007,25 +2007,36 @@ a pane.
 
 ### The controller notice grammar
 
-A controller info notice's body follows one line order regardless of
-which settlement composed it — a task's own consequence
-(`renderTaskNotice`, usecase_featurecheck.go: worker interruption, a
-per-task check failure) or an integration settlement's
-(`renderIntegrationNotice`, usecase_featuresettle.go: a merge conflict or
-a rolled-back combined check). The task-consequence line —
-`task t<seq> <consequence>`, consequence one of `needs-rework`, `failed`,
-`interrupted` — is ALWAYS first: it is the one fact every notice carries
-and the one the manager decides from (a `needs-rework` notice retries the
-task; a reject verdict's own notice carries no marker at all and is read
-through the status guard-shortfall line instead, per the manager's
-standing verdict-channel instruction above). An integration settlement's
-notice adds its own `integration <id> <state>` line SECOND (state one of
-`conflicted`, `rolled-back`) — supporting evidence for why the task
-consequence follows, never the fact itself — then `reason: <reason>`,
-zero or more `evidence: <path>` lines, and, only for a failing
-consequence, a trailing `orphaned obligations: <ids>` (or `none`) line.
-One order means a reader — human or fixture — never tries two positions
-for the fact it needs.
+A controller info notice that carries a task consequence follows one line
+order regardless of which of the two settlement renderers composed it —
+a task's own consequence (`renderTaskNotice`, usecase_featurecheck.go:
+worker interruption, a per-task check failure) or an integration
+settlement's (`renderIntegrationNotice`, usecase_featuresettle.go: a
+merge conflict, a rolled-back candidate, or a shutdown before a candidate
+was published). The task-consequence line — `task t<seq> <consequence>`,
+consequence one of `needs-rework`, `failed`, `interrupted` — is ALWAYS
+first: it is the one fact both of these shapes carry and the one the
+manager decides from (a `needs-rework` notice retries the task, except
+against an integration settled `interrupted`, below; a reject verdict's
+own notice carries no marker at all and is read through the status
+guard-shortfall line instead, per the manager's standing verdict-channel
+instruction above). A third controller-notice producer,
+`prepareIntegratedNotice` (usecase_integration.go), reports an integrated
+candidate through its own fixed first line and carries no task-
+consequence line at all — this grammar does not govern its shape. An
+integration settlement's notice adds its own `integration <id> <state>`
+line SECOND (state one of `conflicted`, `rolled-back`, `interrupted`) —
+supporting evidence for why the task consequence follows, never the fact
+itself — then `reason: <reason>`, zero or more `evidence: <path>` lines,
+and, only for a failing consequence, a trailing
+`orphaned obligations: <ids>` (or `none`) line. Of the three integration
+states, only `conflicted` and `rolled-back` are ones the section 7
+manager protocol retries a `needs-rework` consequence for; `interrupted`
+arises when a stop or terminal failure settles a still-merging
+integration with nothing published, against a run that is already
+ending, where a retry is refused by production anyway. One order means a
+reader — human or fixture — never tries two positions for the fact it
+needs.
 
 Line position is meaningful only because every line IS exactly one line,
 by construction rather than by convention: `taskSeq` is an int,

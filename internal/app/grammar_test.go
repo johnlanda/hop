@@ -155,9 +155,19 @@ func TestGoldenGrammar(t *testing.T) {
 			"task t1 needs-rework",
 		},
 		{
-			"notice integration line",
+			"notice integration line, conflicted",
 			app.GrammarNoticeIntegrationLine(msgID, "conflicted"),
 			"integration " + msgID + " conflicted",
+		},
+		{
+			"notice integration line, rolled-back",
+			app.GrammarNoticeIntegrationLine(msgID, "rolled-back"),
+			"integration " + msgID + " rolled-back",
+		},
+		{
+			"notice integration line, interrupted",
+			app.GrammarNoticeIntegrationLine(msgID, "interrupted"),
+			"integration " + msgID + " interrupted",
 		},
 		{"notice reason line", app.GrammarNoticeReasonLine("merge conflict"), "reason: merge conflict"},
 		{
