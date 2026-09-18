@@ -1114,9 +1114,10 @@ func (s *fakeStore) SubmitReview(_ context.Context, submission app.ReviewSubmiss
 // verdict (duplicate or conflicting, whatever the caller's eligibility),
 // then — for a first acceptance only — the reviewer session, which must be
 // a reviewer of the submission's own run bound to exactly the review
-// attempt being settled (not-reviewer otherwise: a foreign session's
-// binding and launch claim never assemble this attempt's acceptance
-// context), then AcceptVerdict. Every refusal carries the grammar reason
+// attempt being settled and not itself ended (not-reviewer otherwise: a
+// foreign session's binding and launch claim never assemble this
+// attempt's acceptance context, and an ended reviewer's own binding stays
+// current so nothing else would refuse it), then AcceptVerdict. Every refusal carries the grammar reason
 // token the real store sets at the same decision point. onAccept, when
 // non-nil, runs after an acceptance is applied and before the lock is
 // released, as the real store's accepting transaction commits its own
