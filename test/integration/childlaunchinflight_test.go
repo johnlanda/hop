@@ -258,6 +258,9 @@ func TestRealProcessChildLaunchInFlightAcrossResume(t *testing.T) {
 	if state := fx.claimState(t, sessionID); state != "exec_pending" {
 		t.Fatalf("launch claim state after the kill = %q, want it unchanged at exec_pending", state)
 	}
+	if state := fx.sessionState(t, sessionID); state != "launching" {
+		t.Fatalf("session state after the kill = %q, want it unchanged at launching: this scenario's whole point is the launching disjunct", state)
+	}
 	info = fx.server.processInfo(t, paneID)
 	if int(info.ShellPID) != claimPID {
 		t.Fatalf("pane %s shell pid after the kill = %d, want the still-claimed pid %d unchanged", paneID, info.ShellPID, claimPID)
@@ -284,6 +287,9 @@ func TestRealProcessChildLaunchInFlightAcrossResume(t *testing.T) {
 	fx.requireRunState(t, "running")
 	if state := fx.claimState(t, sessionID); state != "exec_pending" {
 		t.Errorf("launch claim state right after resume = %q, want unchanged exec_pending: resume itself never settles it", state)
+	}
+	if state := fx.sessionState(t, sessionID); state != "launching" {
+		t.Errorf("session state right after resume = %q, want unchanged launching: this scenario's whole point is the launching disjunct", state)
 	}
 
 	// Release the held process into the real fixture worker; the resumed
