@@ -268,10 +268,9 @@ func TestProductionCallSitesUseAllowlistedStringLiterals(t *testing.T) {
 // TestCallSiteAllowlistRuleCatchesViolations proves callSiteViolations
 // itself actually catches what it claims to, against a synthetic
 // self-contained package (its own Client type and Call method) rather than
-// this package's real files, including the method-value escape the P1
-// review finding reported: extracting Call as a value defeats a purely
-// syntactic "is this a 4-arg Call(...) with a literal method" walk, but not
-// this type-based one.
+// this package's real files, including the method-value escape:
+// extracting Call as a value defeats a purely syntactic "is this a 4-arg
+// Call(...) with a literal method" walk, but not this type-based one.
 func TestCallSiteAllowlistRuleCatchesViolations(t *testing.T) {
 	const preamble = `package fixture
 

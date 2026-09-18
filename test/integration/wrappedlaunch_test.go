@@ -215,11 +215,16 @@ const wrappedLaunchPersistence = 8 * time.Second
 // the same session, settles its claim, activates it, and the attempt
 // completes the run.
 //
-// Before the fix the live corroboration inspected only `launching`
-// sessions, so the session it had just moved to `reconciling` was never
-// looked at again: the claim stayed `exec_pending`, the worker retried
-// `transient: attempt not yet running` forever, and the run never
-// completed. This scenario fails there at the post-release waits.
+// The live corroboration step inspects every `launching` session AND, in
+// addition, exactly this reconciliation — a session in `reconciling`
+// whose current unsuperseded placed binding's own incarnation's claim is
+// still `exec_pending`, identified structurally with no reason or marker
+// of its own required. Without that second set, the session just moved
+// to `reconciling` would never be looked at again: its claim would stay
+// `exec_pending`, the worker would retry `transient: attempt not yet
+// running` forever, and the run would never complete. This scenario
+// fails there, at the post-release waits, if that inspection is ever
+// narrowed back to `launching` sessions alone.
 func TestRealProcessLaunchCorroborationRevisitsAWrappedLaunch(t *testing.T) {
 	artifacts := newArtifactDir(t)
 	server := prepareServer(t, artifacts)

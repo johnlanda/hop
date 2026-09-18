@@ -468,7 +468,7 @@ func (s *fakeStore) runStatusLocked(runID identity.RunID) app.RunStatus {
 }
 
 // runNeedsAttentionLocked mirrors the real sqlite adapter's
-// runNeedsAttentionLocked (Astra F4): false for a solo run, else the
+// runNeedsAttentionLocked: false for a solo run, else the
 // OR-reduction of the SAME mailboxesLocked call featureRunDetail's own
 // Mailboxes population uses — one implementation of the attention
 // threshold rule, so ListRuns and LoadRunStatus can never disagree

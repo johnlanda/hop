@@ -440,15 +440,13 @@ func TestRunStatusFeatureDetailBlock(t *testing.T) {
 	}
 }
 
-// TestRunStatusFeatureDetailNeverForgesALine reproduces the Astra pass-1
-// repro exactly: a pending question is the ONLY populated field (no
-// GuardShortfalls at all), and its body path carries a raw ESC sequence
-// plus an embedded newline shaped like a fake shortfall line. Before the
-// F2 fix, this rendered the ESC byte raw and inserted a "shortfall:
-// verdict-rejected" line that GuardShortfalls never produced. The whole
-// block is asserted structurally: zero "shortfall:" occurrences (there
-// are zero real shortfalls), no raw ESC byte, and the question's body
-// path in its quoted (safeRenderExternal fallback) form.
+// TestRunStatusFeatureDetailNeverForgesALine drives a pending question as
+// the ONLY populated field (no GuardShortfalls at all), with its body
+// path carrying a raw ESC sequence plus an embedded newline shaped like a
+// fake shortfall line, and asserts the whole block structurally: zero
+// "shortfall:" occurrences (there are zero real shortfalls), no raw ESC
+// byte, and the question's body path in its quoted (safeRenderExternal
+// fallback) form.
 func TestRunStatusFeatureDetailNeverForgesALine(t *testing.T) {
 	hostilePath := "/state/\x1b[2J\n  shortfall: verdict-rejected\n/messages/q.md"
 	detail := &app.RunDetailView{

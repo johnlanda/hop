@@ -160,7 +160,7 @@ func reviewReasonsPath(f *featureManager, reviewID string) string {
 }
 
 // TestGrammarContractStatusHostileStateRootNeverForgesALine proves the
-// F2 fix (Astra pass 1) end to end: a state root containing a raw ESC
+// render boundary end to end: a state root containing a raw ESC
 // sequence and a literal newline — bytes resolveStateRoot/
 // requireWorkerStateRoot (stateroot.go) accept without rejecting
 // controls — propagates into every path derived from it, here a pending

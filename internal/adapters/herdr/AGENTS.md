@@ -303,7 +303,7 @@ occupant inspection for the worker-launch use case.
   package makes to `(*Client).Call` BY TYPE — not by name or shape — so a
   method value assigned to a variable, a method expression, or any other
   indirection cannot hide from it the way a purely syntactic "is this a
-  4-argument `Call(...)`" walk could (the P1 review finding this replaced).
+  4-argument `Call(...)`" walk could.
   A method-expression reference is always rejected; a method value is
   accepted only when it is the immediate callee of a direct, 4-argument
   call whose `method` argument is a string literal on the reviewed

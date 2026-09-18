@@ -30,8 +30,8 @@ type RunSummaryView struct {
 	// NeedsAttention is section 7's "blocked, needs attention" condition:
 	// true when at least one of the run's mailboxes is Attention. The bare
 	// listing (Status with no RunID) copies it straight from
-	// RunStatus.NeedsAttention (ReadStore.ListRuns computes it there,
-	// Astra F4); the `-run` detail render (runDetailView) instead derives
+	// RunStatus.NeedsAttention (ReadStore.ListRuns computes it there);
+	// the `-run` detail render (runDetailView) instead derives
 	// it by OR-reducing the Mailboxes it already loaded — a second call
 	// site of the same mailboxStatuses threshold rule, not a second
 	// implementation of it — so the listing and the detail can never
@@ -252,8 +252,8 @@ func runSummaryView(s RunStatus) RunSummaryView { //nolint:gocritic // hugeParam
 	return RunSummaryView{
 		RunID: s.RunID.String(), Sequence: s.Sequence, State: string(s.State),
 		StopRequested: s.StopRequested, Reconciling: s.Reconciling, UpdatedAt: s.UpdatedAt,
-		// NeedsAttention here is ListRuns' own computation (Astra F4):
-		// always false for a LoadRunStatus-sourced RunStatus, which never
+		// NeedsAttention here is ListRuns' own computation: always false
+		// for a LoadRunStatus-sourced RunStatus, which never
 		// sets it, since runDetailView's own mailbox OR-reduction (below)
 		// is authoritative for the detail view and only ever turns it
 		// true, never back to false.

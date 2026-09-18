@@ -265,16 +265,16 @@ func TestReviewFixGuardHeadIsObservedNotInferred(t *testing.T) {
 	})
 }
 
-// TestReviewFixFenceIdentityIsStable pins the round-2 residual (P2): a
-// transiently failed fence must be recovered through its OWN journal
-// row — never duplicated by the publish it retires. Before the fix,
-// the next round visited the pending publish first and unconditionally
-// allocated a second fence; the second fence moved the head, and the
-// first stayed reconciling forever at a ref equal to neither its
-// recorded head, its persisted OID, nor the publish's candidate — so
-// the quiescence guard refused a terminal commit indefinitely. The fix
-// is idempotence per retired operation ID, dependency-first recovery
-// order, and per-turn re-reads; the quiescence guard itself is kept.
+// TestReviewFixFenceIdentityIsStable proves a transiently failed fence is
+// recovered through its OWN journal row, never duplicated by the publish
+// it retires: recovery is idempotent per retired operation ID, visits
+// dependencies before the operations that depend on them, and re-reads
+// state each turn. Without that ordering, a round visiting the pending
+// publish before its fence would unconditionally allocate a second
+// fence — moving the head while the first stayed reconciling forever at
+// a ref equal to neither its recorded head, its persisted OID, nor the
+// publish's candidate — leaving the quiescence guard refusing a terminal
+// commit indefinitely; the guard itself stays exactly as strict.
 // Three faults — a one-time commit-tree failure, a one-time CAS
 // failure with the head unchanged, and a crash right after the fence
 // intent was journaled — each under both stop and terminal failure:

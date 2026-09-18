@@ -592,8 +592,8 @@ func (f *featureRun) requireManagerFirstAgentTokens(t *testing.T, managerPaneID 
 // killSession ends attemptID's own launched process by asking it to kill
 // ITSELF, then waits for its pane to close (a layout.apply command pane
 // has no shell, S6). This is never a raw OS signal to an externally
-// OBSERVED pid: Astra review finding P1 established that the test does
-// not own that pid's wait/reap lifecycle, so nothing pins it between an
+// OBSERVED pid: the test does not own that pid's wait/reap lifecycle, so
+// nothing pins it between an
 // observation (e.g. via pane.process_info) and a signal — Herdr could
 // reap the process and the OS could recycle its pid before the test's
 // own signal call ran, killing an unrelated process instead. Writing the
@@ -793,8 +793,8 @@ func (f *featureRun) integrationHead(t *testing.T) string {
 // independent of integration.state == "integrated" alone. A production
 // regression that marked an integration integrated without ever
 // persisting this evidence would otherwise satisfy every other check in
-// this suite (Astra review finding: "the end-to-end test infers check
-// evidence from integration state").
+// this suite, which would otherwise infer check evidence from
+// integration state alone.
 func (f *featureRun) requireCombinedCheckPassed(t *testing.T, candidateCommit string) {
 	t.Helper()
 	row := f.scalar(t, fmt.Sprintf(

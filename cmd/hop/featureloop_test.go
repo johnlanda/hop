@@ -170,8 +170,8 @@ func TestRunFeatureControllerLoop(t *testing.T) {
 	})
 }
 
-// TestRunFeatureControllerLoopWhileLaunching proves the reported defect
-// fix: while the run is still launching, the scheduling pass runs only
+// TestRunFeatureControllerLoopWhileLaunching proves that while the run is
+// still launching, the scheduling pass runs only
 // CorroborateSessionLaunches and skips every other step, since none of
 // them has a settled manager session to work from yet.
 func TestRunFeatureControllerLoopWhileLaunching(t *testing.T) {

@@ -73,16 +73,15 @@ func launchingFeatureRun(t *testing.T, tc *testController) (runID identity.RunID
 	return runID, managerID, managerIncarnation, handle
 }
 
-// TestCorroborateSessionLaunchesSettlesManagerRunToRunning is the manager-
-// reported defect regression: settleSessionExeced deliberately omitted
-// the Run-level launching->running transition (design L560), and no step
-// of the feature-mode scheduling pass applied it either — so a launching
-// feature run's manager settling its own launch claim never moved the run
-// to running at all, and every manager verb (hop task create/plan close)
-// stayed refused run-not-accepting forever. This drives the real
-// Controller with the port fakes through exactly that settlement and
-// proves both the transition and that a manager verb the settlement
-// unblocks actually proceeds afterward.
+// TestCorroborateSessionLaunchesSettlesManagerRunToRunning proves
+// settleSessionExeced applies the Run-level launching->running transition
+// when the manager's own launch claim settles (design L560): without it,
+// a launching feature run's manager settling its own launch claim would
+// never move the run to running, and every manager verb (hop task
+// create/plan close) would stay refused run-not-accepting forever. This
+// drives the real Controller with the port fakes through exactly that
+// settlement and proves both the transition and that a manager verb the
+// settlement unblocks actually proceeds afterward.
 func TestCorroborateSessionLaunchesSettlesManagerRunToRunning(t *testing.T) {
 	tc := newTestController(defaultPolicy())
 	runID, managerID, managerIncarnation, handle := launchingFeatureRun(t, tc)

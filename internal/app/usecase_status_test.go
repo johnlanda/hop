@@ -254,7 +254,7 @@ func shortfallOf(t *testing.T, shortfalls []app.GuardShortfallView, kind string)
 }
 
 // TestStatusVerdictRejectedShortfallCorrelation exercises STATUS-1's
-// manager verdict channel end to end at the read-model layer (Astra F3):
+// manager verdict channel end to end at the read-model layer:
 // a real hop review submit --verdict reject through SubmitReviewVerdict
 // writes the controller notice (body = the reasons artifact path) in the
 // same transaction as the review row, and hop status's verdict-rejected

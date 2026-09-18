@@ -9,7 +9,7 @@ import (
 
 // verdictRejectedShortfallToken mirrors the identically named constant
 // inside fixtureWorkerSource (the embedded fixture manager's own
-// hop-status-polling detection, per design section 8/defect STATUS-1):
+// hop-status-polling detection, per design section 8):
 // run.ShortfallVerdictRejected's kind token, "verdict-rejected". Retyped
 // here, never derived, so this scenario's own assertion of hop status's
 // rendering matches literally the same token the fixture manager itself

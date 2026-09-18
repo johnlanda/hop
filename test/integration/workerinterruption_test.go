@@ -91,7 +91,7 @@ func TestRealProcessWorkerInterruption(t *testing.T) {
 	// scripted manager reads the notice and requests retry immediately
 	// (fixtureworker_test.go's handleManagerMessage), so the controller
 	// can move the task on to ready/active again before a snapshot poll
-	// ever observes it sitting at needs-rework (Astra review finding).
+	// ever observes it sitting at needs-rework.
 	fx.requireTransitionAt(t, "task", t1, "needs-rework")
 	fx.requireSessionState(t, session1ID, "terminated")
 	fx.requireAttemptState(t, attempt1ID, "interrupted")
