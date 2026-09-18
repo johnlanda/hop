@@ -101,3 +101,35 @@ func TestPrincipalEndedSessionRefused(t *testing.T) {
 		}
 	}
 }
+
+// TestSessionSummaryBindingOutlivesItsSession pins what the run status's
+// session list reports for a session that has ended: it keeps the
+// placement the session ran under, since ending a session supersedes
+// nothing, and its launch is no longer corroborated. A summary binding is
+// therefore a record of where a session ran, never evidence that anything
+// is live there — a consumer that acts on one establishes liveness from
+// State, which is listed beside it for exactly that reason.
+func TestSessionSummaryBindingOutlivesItsSession(t *testing.T) {
+	f := newFeatureFixture(t)
+	endSession(t, f, f.ManagerID, run.SessionTerminated)
+	requirePlacementCurrent(t, f, f.ManagerID, f.ManagerIncarnation)
+
+	detail, err := f.store.LoadRunStatus(t.Context(), f.spec.RunID)
+	if err != nil {
+		t.Fatalf("LoadRunStatus: %v", err)
+	}
+	idx := slices.IndexFunc(detail.Sessions, func(s app.SessionSummary) bool { return s.SessionID == f.ManagerID })
+	if idx < 0 {
+		t.Fatalf("the run status listed no summary for session %s", f.ManagerID)
+	}
+	switch summary := detail.Sessions[idx]; {
+	case summary.State != run.SessionTerminated:
+		t.Errorf("summary state = %s, want %s", summary.State, run.SessionTerminated)
+	case summary.Binding == nil:
+		t.Error("the ended session's summary carries no binding; the list reports the placement a session ran under, ended or not")
+	case summary.Binding.Superseded:
+		t.Error("the summary's binding is superseded; the only query behind it selects unsuperseded rows")
+	case summary.LaunchCorroborationPending:
+		t.Error("an ended session's launch reads as still corroborated; only a reconciling session's does")
+	}
+}
