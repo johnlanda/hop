@@ -631,6 +631,75 @@ func TestStoreVectors(t *testing.T) {
 			refuse(t, rf, foreignSession, foreignIncarnation)
 		})
 	})
+
+	// The ReviewSubmitEndedReviewer and TaskCreateEndedManager cases are the
+	// fake halves of the sqlite adapter's TestStoreVectorsEndedSession cases
+	// of the same names: the two caller rules that decide liveness from a
+	// session row rather than from an address.
+	t.Run("ReviewSubmitEndedReviewer", func(t *testing.T) {
+		rf := newReviewFixture(t)
+		reviewID, err := identity.ParseReviewID(rf.tc.IDs.NewID())
+		if err != nil {
+			t.Fatalf("parse review id: %v", err)
+		}
+		rf.tc.Store.Sessions[rf.SessionID].value.State = run.SessionTerminated
+		requireFakeBindingCurrent(t, rf.tc, rf.SessionID, rf.IncarnationID)
+		vector := storevectors.ReviewSubmitEndedReviewer(
+			rf.fr.RunID, rf.TaskID, rf.AttemptID, rf.SessionID, rf.IncarnationID,
+			reviewID, rf.SubjectCommit, fakeSubjectTree, "/state/reasons.md", "reasons-digest",
+		)
+		for name, store := range map[string]app.ReviewStore{
+			"featureStore": rf.tc.Controller.Reviews,
+			"fakeStore":    rf.tc.Store,
+		} {
+			got, err := store.SubmitReview(context.Background(), vector)
+			if err != nil {
+				t.Fatalf("%s.SubmitReview() error = %v", name, err)
+			}
+			if got.Kind != app.ReviewStale || got.Reason != storevectors.ReviewSubmitEndedReviewerReason || got.Detail != storevectors.ReviewSubmitEndedReviewerDetail {
+				t.Fatalf("%s.SubmitReview(ended reviewer) = %+v, want stale/%s %q", name, got, storevectors.ReviewSubmitEndedReviewerReason, storevectors.ReviewSubmitEndedReviewerDetail)
+			}
+			if _, exists := rf.tc.Store.Reviews[rf.AttemptID]; exists {
+				t.Fatalf("%s accepted an ended reviewer's verdict: review row exists", name)
+			}
+			if attempt := rf.tc.Store.Attempts[rf.AttemptID]; attempt.value.State != run.AttemptRunning {
+				t.Fatalf("%s moved the attempt to %s; want untouched", name, attempt.value.State)
+			}
+		}
+	})
+
+	t.Run("TaskCreateEndedManager", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		fr := seedFeatureRun(t, tc, 2)
+		endFakeManagerWithSuccessor(t, tc, fr)
+		requireFakeBindingCurrent(t, tc, fr.ManagerID, fr.ManagerIncarnation)
+		taskID, err := identity.ParseTaskID(tc.IDs.NewID())
+		if err != nil {
+			t.Fatalf("parse task id: %v", err)
+		}
+		vector := storevectors.TaskCreateEndedManager(fr.RunID, fr.ManagerID, fr.ManagerIncarnation, taskID)
+		got, err := tc.Store.CreateTask(context.Background(), vector)
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		if got.Outcome != app.WorkflowRefused || got.Reason != storevectors.TaskCreateEndedManagerReason || got.Detail != storevectors.TaskCreateEndedManagerDetail {
+			t.Fatalf("CreateTask(ended manager) = %+v, want refused/%s %q", got, storevectors.TaskCreateEndedManagerReason, storevectors.TaskCreateEndedManagerDetail)
+		}
+		if _, exists := tc.Store.Tasks[taskID]; exists {
+			t.Fatal("the fake accepted a task create from an ended manager: task row exists")
+		}
+		// The same caller rule gates the other two plan verbs.
+		if retry, err := tc.Store.RequestRetry(context.Background(), app.RetryRequest{
+			TaskID: taskID, RunID: fr.RunID, Session: fr.ManagerID, IncarnationID: fr.ManagerIncarnation, Reason: "retry",
+		}); err != nil || retry.Outcome != app.WorkflowRefused || retry.Reason != storevectors.TaskCreateEndedManagerReason {
+			t.Fatalf("RequestRetry(ended manager) = %+v, %v; want refused/%s", retry, err, storevectors.TaskCreateEndedManagerReason)
+		}
+		if closed, err := tc.Store.ClosePlan(context.Background(), app.PlanClose{
+			RunID: fr.RunID, Session: fr.ManagerID, IncarnationID: fr.ManagerIncarnation,
+		}); err != nil || closed.Outcome != app.WorkflowRefused || closed.Reason != storevectors.TaskCreateEndedManagerReason {
+			t.Fatalf("ClosePlan(ended manager) = %+v, %v; want refused/%s", closed, err, storevectors.TaskCreateEndedManagerReason)
+		}
+	})
 	t.Run("TaskRetry", func(t *testing.T) {
 		tc := newTestController(defaultPolicy())
 		fr := seedFeatureRun(t, tc, 2)

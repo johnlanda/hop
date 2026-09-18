@@ -885,6 +885,9 @@ func (s *fakeStore) CreateTask(_ context.Context, req app.TaskCreate) (app.TaskC
 	if !ok || sRow.value.Role != run.RoleManager || sRow.value.RunID != req.RunID {
 		return app.TaskCreated{Outcome: app.WorkflowRefused, Reason: app.GrammarReasonNotManager, Detail: "caller is not the run's manager"}, nil
 	}
+	if fakeSessionEnded(sRow.value.State) {
+		return app.TaskCreated{Outcome: app.WorkflowRefused, Reason: app.GrammarReasonStale, Detail: "session is not the run's current manager session"}, nil
+	}
 	if !s.sessionIncarnationCurrentLocked(req.Session, req.IncarnationID) {
 		return app.TaskCreated{Outcome: app.WorkflowRefused, Reason: app.GrammarReasonStale, Detail: "incarnation is not current"}, nil
 	}
@@ -956,6 +959,9 @@ func (s *fakeStore) RequestRetry(_ context.Context, req app.RetryRequest) (app.R
 	sRow, ok := s.Sessions[req.Session]
 	if !ok || sRow.value.Role != run.RoleManager || sRow.value.RunID != req.RunID {
 		return app.RetryAccepted{Outcome: app.WorkflowRefused, Reason: app.GrammarReasonNotManager, Detail: "caller is not the run's manager"}, nil
+	}
+	if fakeSessionEnded(sRow.value.State) {
+		return app.RetryAccepted{Outcome: app.WorkflowRefused, Reason: app.GrammarReasonStale, Detail: "session is not the run's current manager session"}, nil
 	}
 	if !s.sessionIncarnationCurrentLocked(req.Session, req.IncarnationID) {
 		return app.RetryAccepted{Outcome: app.WorkflowRefused, Reason: app.GrammarReasonStale, Detail: "incarnation is not current"}, nil
@@ -1058,6 +1064,9 @@ func (s *fakeStore) ClosePlan(_ context.Context, req app.PlanClose) (app.PlanClo
 	if !ok || sRow.value.Role != run.RoleManager || sRow.value.RunID != req.RunID {
 		return app.PlanCloseResult{Outcome: app.WorkflowRefused, Reason: app.GrammarReasonNotManager, Detail: "caller is not the run's manager"}, nil
 	}
+	if fakeSessionEnded(sRow.value.State) {
+		return app.PlanCloseResult{Outcome: app.WorkflowRefused, Reason: app.GrammarReasonStale, Detail: "session is not the run's current manager session"}, nil
+	}
 	if !s.sessionIncarnationCurrentLocked(req.Session, req.IncarnationID) {
 		return app.PlanCloseResult{Outcome: app.WorkflowRefused, Reason: app.GrammarReasonStale, Detail: "incarnation is not current"}, nil
 	}
@@ -1129,7 +1138,8 @@ func (s *fakeStore) submitReviewLocked(submission *app.ReviewSubmission, onAccep
 	}
 	if prior == nil {
 		sRow, sessionOK := s.Sessions[submission.Session]
-		if !sessionOK || sRow.value.Role != run.RoleReviewer || tRow.value.Kind != run.TaskKindReview ||
+		if !sessionOK || sRow.value.Role != run.RoleReviewer || fakeSessionEnded(sRow.value.State) ||
+			tRow.value.Kind != run.TaskKindReview ||
 			sRow.value.RunID != submission.RunID || sRow.value.AttemptID != submission.AttemptID {
 			return app.ReviewOutcome{Kind: app.ReviewStale, Reason: app.GrammarReasonNotReviewer, Detail: app.ReviewNotReviewerDetail}
 		}

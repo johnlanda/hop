@@ -502,6 +502,63 @@ func ReviewSubmitForeignReviewer(runID identity.RunID, taskID identity.TaskID, a
 	}
 }
 
+// ReviewSubmitEndedReviewerReason and ReviewSubmitEndedReviewerDetail are
+// ReviewSubmitEndedReviewer's expected refusal reason token and detail:
+// the foreign reviewer's, since a reviewer that has ended is no more the
+// attempt's current reviewer session than one belonging elsewhere.
+const (
+	ReviewSubmitEndedReviewerReason = ReviewSubmitForeignReviewerReason
+	ReviewSubmitEndedReviewerDetail = ReviewSubmitForeignReviewerDetail
+)
+
+// ReviewSubmitEndedReviewer returns a ReviewStore.SubmitReview request
+// from the claimed attempt's OWN reviewer session after that session has
+// ended (terminated or lost) while its binding is still current, so
+// incarnation is still the binding's and the incarnation rule alone would
+// admit the call. Every other conjunct of the reviewer-eligibility rule
+// holds — right role, right run, right attempt, a review task — so only
+// the session's own state can refuse it. Refused app.ReviewStale (reason
+// ReviewSubmitEndedReviewerReason), detail ReviewSubmitEndedReviewerDetail,
+// with NO review row and NO state transition committed. It pairs with
+// TaskCreateEndedManager: the two caller rules that read a session row
+// rather than an address.
+func ReviewSubmitEndedReviewer(runID identity.RunID, taskID identity.TaskID, attemptID identity.AttemptID, endedReviewer identity.SessionID, incarnation identity.IncarnationID, reviewID identity.ReviewID, subjectCommitOID, subjectTreeOID, reasonsPath, reasonsDigest string) app.ReviewSubmission {
+	return app.ReviewSubmission{
+		ID: reviewID, RunID: runID, TaskID: taskID, AttemptID: attemptID,
+		Session: endedReviewer, IncarnationID: incarnation,
+		SubjectCommitOID: subjectCommitOID, SubjectTreeOID: subjectTreeOID,
+		Verdict: run.VerdictApprove, ReasonsPath: reasonsPath, ReasonsDigest: reasonsDigest,
+	}
+}
+
+// TaskCreateEndedManagerReason and TaskCreateEndedManagerDetail are
+// TaskCreateEndedManager's expected refusal reason token and detail: a
+// session no longer its address's current session is stale, carrying the
+// same value-free detail the manager address's messaging refusals use.
+const (
+	TaskCreateEndedManagerReason = app.GrammarReasonStale
+	TaskCreateEndedManagerDetail = MessageFetchEndedManagerDetail
+)
+
+// TaskCreateEndedManager returns a PlanStore.CreateTask request from the
+// run's manager session after that session has ENDED (terminated or lost)
+// while its binding is still current, so incarnation is still the
+// binding's — the state MessageFetchEndedManager describes, reached
+// through a plan verb instead of a message. The caller is the run's
+// manager by role and its incarnation is current, so neither the
+// not-manager check nor the incarnation rule refuses it and only the
+// session's own state can. Refused app.WorkflowRefused (reason
+// TaskCreateEndedManagerReason), detail TaskCreateEndedManagerDetail, with
+// no task row, no dependency edge and the run's plan flag untouched. The
+// same rule gates RequestRetry and ClosePlan, which share CreateTask's
+// caller check; one vector pins the rule those three verbs read.
+func TaskCreateEndedManager(runID identity.RunID, endedManager identity.SessionID, incarnation identity.IncarnationID, taskID identity.TaskID) app.TaskCreate {
+	return app.TaskCreate{
+		ID: taskID, RunID: runID, Session: endedManager, IncarnationID: incarnation,
+		Title: "task from an ended manager", InstructionsPath: "/state/instructions.md", InstructionsDigest: "instructions-digest",
+	}
+}
+
 // Feature-run bootstrap vectors (docs/plan/phase-3-design.md section 9):
 // NewRunSpec values StateStore.InitializeRun must refuse. Each takes the
 // consuming test's own VALID feature-mode spec — the manager session
