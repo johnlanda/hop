@@ -306,8 +306,8 @@ func (c *Controller) reconcileRestartedSession(ctx context.Context, handle RunHa
 	// against its persisted target — never re-identified, since the
 	// identification was made when the intent was committed and the pane
 	// may since have stopped answering precisely because that close worked.
-	if op, intent, found := findRestartClose(&detail, binding.PaneID, binding.IncarnationID); found {
-		return c.finishRestartClose(ctx, handle, frozen, detail, opts, session, &binding, claimFound, &claim, op, intent)
+	if opID, intent, dispatched, found := findRestartClose(&detail, binding.PaneID, binding.IncarnationID); found {
+		return c.redriveRestartClose(ctx, handle, frozen, detail, opts, session, &binding, claimFound, &claim, opID, intent, dispatched)
 	}
 
 	observed := c.observeServerInstance(ctx)
@@ -344,7 +344,41 @@ func (c *Controller) reconcileRestartedSession(ctx context.Context, handle RunHa
 	if err := c.dispatchRestartClose(ctx, handle, detail, opID, &intent); err != nil {
 		return "", "", err
 	}
-	return c.finishRestartClose(ctx, handle, frozen, detail, opts, session, &binding, claimFound, &claim, opID, intent)
+	return c.finishRestartClose(ctx, handle, frozen, detail, opts, session, &binding, claimFound, &claim, opID, intent, true)
+}
+
+// redriveRestartClose finishes a close this rule already journaled. The
+// persisted target is never re-identified — the identification was made
+// when the intent was committed, and the pane may have stopped answering
+// precisely because that close worked — but while the pane is not yet
+// observed absent the close is ACTED AGAIN against that same target. Only
+// the act is repeatable: an act that failed, or a lease fenced between the
+// intent and the act, leaves the pane standing and the agent Herdr restored
+// into it running, with an intent that says a close is under way.
+//
+// The re-act is bounded by the lifetime the intent froze. A recorded pane id
+// is a durable address only WITHIN one server lifetime: across a restart
+// workspace ids are reissued and the composed id can answer for a stranger's
+// pane (test/integration's TestSpikeRecordedPaneIDCanAddressADifferentPane
+// observed exactly that). The absence observation does not bound it, because
+// its continuity conjunct guards only the branch where the pane is observed
+// ABSENT — a pane still answering the recorded id reads as "not absent" with
+// no ambiguity at all, whichever lifetime it belongs to. So a lifetime that
+// no longer matches the intent's acts on nothing and concludes nothing,
+// which is what keeps this path from closing somebody else's pane.
+func (c *Controller) redriveRestartClose(ctx context.Context, handle RunHandle, frozen *FrozenRun, detail RunDetail, opts RestartOptions, session *run.Session, binding *run.RuntimeBinding, claimFound bool, claim *LaunchClaim, opID identity.OperationID, intent paneCloseIntent, dispatched bool) (restartDisposition, string, error) { //nolint:gocritic // hugeParam: RunHandle, RunDetail, RestartOptions and paneCloseIntent are per-call DTOs; called once per unresolved restart close per round.
+	disposition, outstanding, err := c.finishRestartClose(ctx, handle, frozen, detail, opts, session, binding, claimFound, claim, opID, intent, dispatched)
+	if err != nil || outstanding == "" {
+		// Absence was observed and the close settled, or the round failed.
+		return disposition, outstanding, err
+	}
+	if !c.serverContinuityHolds(ctx, intent.ServerInstance) {
+		return "", restartCloseOutstanding(dispatched, "the server lifetime changed again after this close was authorized, so the recorded pane id no longer addresses what it addressed then; the close is not re-driven and nothing is concluded"), nil
+	}
+	if err := c.dispatchRestartClose(ctx, handle, detail, opID, &intent); err != nil {
+		return "", "", err
+	}
+	return c.finishRestartClose(ctx, handle, frozen, detail, opts, session, binding, claimFound, claim, opID, intent, true)
 }
 
 // identifyRestartedPane applies the identification ladder: the pane the
@@ -425,8 +459,14 @@ func restartRecordedPID(claimFound bool, claim *LaunchClaim, binding *run.Runtim
 }
 
 // findRestartClose returns this rule's own unresolved pane.close operation
-// for a pane and incarnation, if one exists.
-func findRestartClose(detail *RunDetail, paneID string, incarnation identity.IncarnationID) (identity.OperationID, paneCloseIntent, bool) {
+// for a pane and incarnation, if one exists. dispatched reports whether the
+// operation carries the act evidence a successful close journals: it is the
+// one durable record that tells a close which was carried out and is
+// awaiting its observed absence from one whose act never landed, which no
+// later round could otherwise distinguish.
+// The results are the operation's id, its persisted intent, whether it was
+// dispatched, and whether one was found at all.
+func findRestartClose(detail *RunDetail, paneID string, incarnation identity.IncarnationID) (identity.OperationID, paneCloseIntent, bool, bool) {
 	for i := range detail.PendingOperations {
 		op := &detail.PendingOperations[i]
 		if op.Kind != OpPaneClose {
@@ -437,10 +477,10 @@ func findRestartClose(detail *RunDetail, paneID string, incarnation identity.Inc
 			continue
 		}
 		if intent.PaneID == paneID && intent.IncarnationID == incarnation {
-			return op.ID, intent, true
+			return op.ID, intent, op.ActEvidence != nil, true
 		}
 	}
-	return "", paneCloseIntent{}, false
+	return "", paneCloseIntent{}, false, false
 }
 
 // openRestartClose commits the close intent, freezing the OBSERVING
@@ -482,6 +522,10 @@ func (c *Controller) openRestartClose(ctx context.Context, handle RunHandle, ses
 // pane), revalidates immediately before the mutation, and closes. A pane
 // that answers pane_not_found at the close vanished between the
 // identification and the act, which the absence confirmation then settles.
+// A close that lands journals its dispatch as the operation's act evidence,
+// so a later round can tell this close was carried out; a pane already gone
+// at the close dispatched nothing and journals nothing, exactly as the
+// ordinary close rule records it.
 func (c *Controller) dispatchRestartClose(ctx context.Context, handle RunHandle, detail RunDetail, opID identity.OperationID, intent *paneCloseIntent) error { //nolint:gocritic // hugeParam: RunHandle and RunDetail are per-call DTOs; called once per restart close.
 	if err := c.capturePaneScrollback(ctx, handle, detail, opID, intent.PaneID); err != nil {
 		return err
@@ -502,27 +546,39 @@ func (c *Controller) dispatchRestartClose(ctx context.Context, handle RunHandle,
 	if closeErr != nil && !errors.Is(closeErr, ErrPaneNotFound) {
 		return fmt.Errorf("app: close pane %s after a server restart: %w", intent.PaneID, closeErr)
 	}
-	return nil
+	if closeErr != nil {
+		// Already gone at the close: this act dispatched nothing, so it
+		// journals nothing and the absence observation decides alone.
+		return nil
+	}
+	target := restartCloseTarget(intent)
+	return c.recordCloseDispatched(ctx, handle, opID, &target)
+}
+
+// restartCloseTarget is the persisted intent read as a close target: the
+// recorded evidence in full, never a value derived from whatever occupies
+// the pane now.
+func restartCloseTarget(intent *paneCloseIntent) paneCloseTarget {
+	return paneCloseTarget{
+		PaneID: intent.PaneID, Label: intent.Label,
+		SessionID: intent.SessionID, IncarnationID: intent.IncarnationID,
+		PID: intent.PID, Markers: intent.ArgvMarkers, Reason: intent.Reason,
+		ServerInstance: intent.ServerInstance,
+	}
 }
 
 // finishRestartClose confirms the close's OBSERVED absence — bracketed
 // against the lifetime that answered the close, never the placement's —
 // and, once absent, records the outcome, supersedes the binding and applies
 // the session's disposition. A dispatched close is never termination.
-func (c *Controller) finishRestartClose(ctx context.Context, handle RunHandle, frozen *FrozenRun, detail RunDetail, opts RestartOptions, session *run.Session, binding *run.RuntimeBinding, claimFound bool, claim *LaunchClaim, opID identity.OperationID, intent paneCloseIntent) (restartDisposition, string, error) { //nolint:gocritic // hugeParam: RunHandle, RunDetail, RestartOptions and paneCloseIntent are per-call DTOs; called once per restart close per round.
+// dispatched is the operation's own act evidence, and only words what the
+// round reports while absence is still outstanding.
+func (c *Controller) finishRestartClose(ctx context.Context, handle RunHandle, frozen *FrozenRun, detail RunDetail, opts RestartOptions, session *run.Session, binding *run.RuntimeBinding, claimFound bool, claim *LaunchClaim, opID identity.OperationID, intent paneCloseIntent, dispatched bool) (restartDisposition, string, error) { //nolint:gocritic // hugeParam: RunHandle, RunDetail, RestartOptions and paneCloseIntent are per-call DTOs; called once per restart close per round.
 	_, absent, ambiguous := c.observePlacedPaneAbsence(ctx, intent.ServerInstance, intent.PaneID, intent.Label)
-	switch {
-	case ambiguous != "":
-		return "", "the recorded pane was closed after the server restart, but its absence is not yet established: " + ambiguous, nil
-	case !absent:
-		return "", "the recorded pane was closed after the server restart; awaiting its observed absence", nil
+	if !absent {
+		return "", restartCloseOutstanding(dispatched, ambiguous), nil
 	}
-	target := paneCloseTarget{
-		PaneID: intent.PaneID, Label: intent.Label,
-		SessionID: intent.SessionID, IncarnationID: intent.IncarnationID,
-		PID: intent.PID, Markers: intent.ArgvMarkers, Reason: intent.Reason,
-		ServerInstance: intent.ServerInstance,
-	}
+	target := restartCloseTarget(&intent)
 	if err := c.recordCloseOutcome(ctx, handle, opID, &target, restartCloseReasonSuffix); err != nil {
 		return "", "", err
 	}
@@ -532,6 +588,28 @@ func (c *Controller) finishRestartClose(ctx context.Context, handle RunHandle, f
 	}
 	disposition := restartDispositionFor(&detail, session, claimFound, claim, facts)
 	return disposition, "", c.applyRestartDisposition(ctx, handle, frozen, opts, session, binding, disposition)
+}
+
+// restartCloseOutstanding words what a round leaves outstanding for a close
+// this rule has journaled, from the operation's own act evidence. The two
+// states are not the same thing to a human: a close that WAS carried out is
+// awaiting its observed absence, while one whose act has not landed leaves
+// the pane standing — and the agent Herdr restored into it running — until
+// a later round re-drives it. Reporting the first wording for the second
+// state tells a human a pane is closed while its agent still edits the
+// worktree. detail names what is still unestablished, "" when the pane
+// simply still answers.
+func restartCloseOutstanding(dispatched bool, detail string) string {
+	if !dispatched {
+		if detail == "" {
+			return "the recorded pane's close after the server restart is journaled but not yet carried out; the close is re-driven against the recorded pane"
+		}
+		return "the recorded pane's close after the server restart is journaled but not yet carried out: " + detail
+	}
+	if detail != "" {
+		return "the recorded pane was closed after the server restart, but its absence is not yet established: " + detail
+	}
+	return "the recorded pane was closed after the server restart; awaiting its observed absence"
 }
 
 // restartRetirementFacts are the two durable facts the disposition reads

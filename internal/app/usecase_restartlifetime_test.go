@@ -799,15 +799,254 @@ func TestReconcileServerRestartJournalsItsAuthorization(t *testing.T) {
 // for paneID, decoded from the operation as a later round would read it.
 func restartCloseIntentFor(t *testing.T, tc *testController, paneID string) app.PaneCloseIntentForTest {
 	t.Helper()
-	var found []app.PaneCloseIntentForTest
+	intent, _ := app.DecodePaneCloseIntentForTest(restartCloseOperationFor(t, tc, paneID).Intent)
+	return intent
+}
+
+// restartCloseOperationFor is the ONE pane.close operation this rule
+// journaled for paneID. One pane never carries two of them: a later round
+// re-drives the operation it finds rather than opening a second.
+func restartCloseOperationFor(t *testing.T, tc *testController, paneID string) app.Operation {
+	t.Helper()
+	var found []app.Operation
 	for id := range tc.Store.Operations {
-		intent, ok := app.DecodePaneCloseIntentForTest(tc.Store.Operations[id].Intent)
+		op := tc.Store.Operations[id]
+		intent, ok := app.DecodePaneCloseIntentForTest(op.Intent)
 		if ok && intent.PaneID == paneID && intent.Reason == app.CloseReasonRestartForTest {
-			found = append(found, intent)
+			found = append(found, op)
 		}
 	}
 	if len(found) != 1 {
-		t.Fatalf("restart close intents for pane %s = %d, want exactly 1", paneID, len(found))
+		t.Fatalf("restart close operations for pane %s = %d, want exactly 1", paneID, len(found))
 	}
 	return found[0]
+}
+
+// labelAnswersOnceThenFails scripts the creation-label lookup answering the
+// recorded pane for the ladder's own lookup and then FAILING: a confirming
+// read that could not be made at all, which is never absence. It is how a
+// DISPATCHED close is held outstanding honestly — after a close that landed
+// a real label resolves nothing (test/integration's
+// TestSpikeVanishedPaneShapes pins that), so a fixture whose label kept
+// answering for a closed pane would reproduce a world that cannot occur.
+func labelAnswersOnceThenFails(tc *testController, binding run.RuntimeBinding) { //nolint:gocritic // hugeParam: the fixture binding is passed once per case.
+	answered := 0
+	tc.Runtime.FindPaneByLabelFn = func(asked string) (app.PaneRef, bool, error) {
+		if asked != binding.CreationLabel {
+			return app.PaneRef{}, false, nil
+		}
+		answered++
+		if answered == 1 {
+			return app.PaneRef{WorkspaceID: "workspace-1", TabID: "tab-1", PaneID: binding.PaneID}, true, nil
+		}
+		return app.PaneRef{}, false, errFakeLookup
+	}
+	tc.Runtime.InspectPaneFn = paneAnswersNothing
+}
+
+// TestReconcileServerRestartFailsTheRoundOnACloseError pins that a close
+// this rule cannot carry out stops the round: the error is reported, no pane
+// is closed, and nothing about the session is concluded. The alternative —
+// letting the act's failure pass — would leave the journal saying a close is
+// under way over a pane that still holds the agent Herdr restored into it.
+func TestReconcileServerRestartFailsTheRoundOnACloseError(t *testing.T) {
+	tc, fr, w, binding := restartWorker(t)
+	serverRestarted(tc)
+	identifiedByLabel(tc, binding)
+	tc.Runtime.ClosePaneErr = errFakeLookup
+
+	report, err := tc.Controller.ReconcileServerRestart(context.Background(), fr.Handle, restartOptions())
+	if err == nil {
+		t.Fatalf("ReconcileServerRestart() = %+v, want the close error", report)
+	}
+	if len(tc.Runtime.ClosedPanes) != 0 {
+		t.Fatalf("panes closed = %v, want none: the close failed", tc.Runtime.ClosedPanes)
+	}
+	if len(report.Closed) != 0 || len(report.Relaunched) != 0 {
+		t.Fatalf("report = %+v, want nothing concluded", report)
+	}
+	if got := tc.Store.Sessions[w.SessionID].value.State; got != run.SessionActive {
+		t.Fatalf("session state = %s, want it untouched", got)
+	}
+	if evidence := restartCloseOperationFor(t, tc, binding.PaneID).ActEvidence; evidence != nil {
+		t.Fatalf("the close records act evidence %v, want none: nothing was dispatched", evidence)
+	}
+}
+
+// TestReconcileServerRestartRedrivesAnUnfinishedClose pins the recovery the
+// journaled intent promises: a close whose ACT did not land is re-driven
+// against its persisted target on the next round, and one pane never carries
+// two close operations. Without it a single failed act — a transport error,
+// which is exactly the state a just-restarted server can be in, or a lease
+// fenced between the intent and the act — would leave the pane, and the agent
+// Herdr restored into it, alive for the rest of the run while every later
+// round reported the pane closed.
+func TestReconcileServerRestartRedrivesAnUnfinishedClose(t *testing.T) {
+	tc, fr, w, binding := restartWorker(t)
+	serverRestarted(tc)
+	identifiedByLabel(tc, binding)
+
+	// Round 1: the close is authorized and journaled; the act fails.
+	tc.Runtime.ClosePaneErr = errFakeLookup
+	if _, err := tc.Controller.ReconcileServerRestart(context.Background(), fr.Handle, restartOptions()); err == nil {
+		t.Fatal("round 1: ReconcileServerRestart() succeeded, want the close error")
+	}
+	opID := restartCloseOperationFor(t, tc, binding.PaneID).ID
+
+	// Round 2: the runtime answers again, and the same operation is acted.
+	tc.Runtime.ClosePaneErr = nil
+	report, err := tc.Controller.ReconcileServerRestart(context.Background(), fr.Handle, restartOptions())
+	if err != nil {
+		t.Fatalf("round 2: ReconcileServerRestart() error = %v", err)
+	}
+	if !slices.Contains(tc.Runtime.ClosedPanes, binding.PaneID) {
+		t.Fatalf("panes closed = %v, want the recorded pane %s re-driven", tc.Runtime.ClosedPanes, binding.PaneID)
+	}
+	if !slices.Contains(report.Closed, w.SessionID.String()) {
+		t.Fatalf("report = %+v, want the session reported closed", report)
+	}
+	if got := restartCloseOperationFor(t, tc, binding.PaneID).ID; got != opID {
+		t.Fatalf("the close settled as operation %s, want the journaled %s: one pane never carries two closes", got, opID)
+	}
+	if got := tc.Store.Sessions[w.SessionID].value.State; got != run.SessionLost {
+		t.Fatalf("session state = %s, want lost: the close concluded and the session was relaunched", got)
+	}
+}
+
+// TestReconcileServerRestartToleratesAPaneGoneAtTheClose pins the SECOND of
+// the two not-founds. A pane that answers pane_not_found at the close went
+// away between the identification and the act — and it went away as ours,
+// because identification already succeeded — so the close is not an error
+// and the absence observation settles it. This is the not-found the ladder's
+// own refusal must never be confused with.
+func TestReconcileServerRestartToleratesAPaneGoneAtTheClose(t *testing.T) {
+	tc, fr, w, binding := restartWorker(t)
+	serverRestarted(tc)
+	tc.Runtime.InspectPaneFn = paneAnswersNothing
+	// The label answers the ladder's lookup and nothing afterwards: the pane
+	// vanished between being identified and being closed.
+	answered := 0
+	tc.Runtime.FindPaneByLabelFn = func(asked string) (app.PaneRef, bool, error) {
+		if asked != binding.CreationLabel {
+			return app.PaneRef{}, false, nil
+		}
+		answered++
+		return app.PaneRef{WorkspaceID: "workspace-1", TabID: "tab-1", PaneID: binding.PaneID}, answered == 1, nil
+	}
+	tc.Runtime.ClosePaneErr = pinnedPaneNotFound("close", binding.PaneID)
+
+	report, err := tc.Controller.ReconcileServerRestart(context.Background(), fr.Handle, restartOptions())
+	if err != nil {
+		t.Fatalf("ReconcileServerRestart() error = %v, want the close's pane_not_found tolerated", err)
+	}
+	if !slices.Contains(report.Closed, w.SessionID.String()) {
+		t.Fatalf("report = %+v, want the session reported closed: its absence was observed", report)
+	}
+	if got := tc.Store.Sessions[w.SessionID].value.State; got != run.SessionLost {
+		t.Fatalf("session state = %s, want lost: the close concluded and the session was relaunched", got)
+	}
+}
+
+// TestReconcileServerRestartAppliesNoDispositionUntilAbsenceIsObserved pins
+// that a DISPATCHED close is never termination: until the pane is observed
+// absent nothing is retired, relaunched or settled, and the operation stays
+// unresolved for a later round — carrying the act evidence that tells that
+// later round this close was carried out.
+func TestReconcileServerRestartAppliesNoDispositionUntilAbsenceIsObserved(t *testing.T) {
+	tc, fr, w, binding := restartWorker(t)
+	serverRestarted(tc)
+	labelAnswersOnceThenFails(tc, binding)
+
+	report, err := tc.Controller.ReconcileServerRestart(context.Background(), fr.Handle, restartOptions())
+	if err != nil {
+		t.Fatalf("ReconcileServerRestart() error = %v", err)
+	}
+	if !slices.Contains(tc.Runtime.ClosedPanes, binding.PaneID) {
+		t.Fatalf("panes closed = %v, want the identified pane %s", tc.Runtime.ClosedPanes, binding.PaneID)
+	}
+	if len(report.Closed) != 0 || len(report.Relaunched) != 0 {
+		t.Fatalf("report = %+v, want nothing concluded from a dispatch alone", report)
+	}
+	if got := tc.Store.Sessions[w.SessionID].value.State; got != run.SessionActive {
+		t.Fatalf("session state = %s, want it untouched until absence is observed", got)
+	}
+	op := restartCloseOperationFor(t, tc, binding.PaneID)
+	if op.State != app.OperationPending {
+		t.Fatalf("the close operation is %s, want it unresolved for a later round", op.State)
+	}
+	if op.ActEvidence == nil {
+		t.Fatal("the dispatched close records no act evidence; a later round cannot tell it was carried out")
+	}
+	if !slices.ContainsFunc(report.Outstanding, func(entry string) bool {
+		return strings.Contains(entry, "the recorded pane was closed after the server restart, but its absence is not yet established")
+	}) {
+		t.Fatalf("outstanding = %q, want the dispatched close awaiting its observed absence", report.Outstanding)
+	}
+}
+
+// TestReconcileServerRestartDoesNotRedriveUnderAnotherLifetime pins the
+// bound on the re-drive. A recorded pane id is a durable address only WITHIN
+// one server lifetime; across a restart workspace ids are reissued and the
+// composed id can answer for a stranger's pane. So once the lifetime that
+// authorized a close no longer serves the socket, the close is not acted
+// again — and the round reports what actually happened to the pane, which is
+// what the act evidence is for.
+func TestReconcileServerRestartDoesNotRedriveUnderAnotherLifetime(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// firstAct scripts the first round's close.
+		firstAct func(*testController, run.RuntimeBinding)
+		// wantClosed is how many closes the pane received in round 1.
+		wantClosed int
+		// wantDetail is what the second round must tell the human about the
+		// pane the close named.
+		wantDetail string
+	}{
+		{
+			name:       "the close landed and is awaiting its observed absence",
+			firstAct:   func(*testController, run.RuntimeBinding) {},
+			wantClosed: 1,
+			wantDetail: "the recorded pane was closed after the server restart",
+		},
+		{
+			name: "the close never landed",
+			firstAct: func(controller *testController, _ run.RuntimeBinding) {
+				controller.Runtime.ClosePaneErr = errFakeLookup
+			},
+			wantClosed: 0,
+			wantDetail: "journaled but not yet carried out",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			controller, fr, _, binding := restartWorker(t)
+			serverRestarted(controller)
+			labelAnswersOnceThenFails(controller, binding)
+			tc.firstAct(controller, binding)
+
+			// Round 1 journals the close; its act lands or does not.
+			_, err := controller.Controller.ReconcileServerRestart(context.Background(), fr.Handle, restartOptions())
+			if (err != nil) != (tc.wantClosed == 0) {
+				t.Fatalf("round 1: ReconcileServerRestart() error = %v", err)
+			}
+			if len(controller.Runtime.ClosedPanes) != tc.wantClosed {
+				t.Fatalf("round 1 closed %v, want %d close(s)", controller.Runtime.ClosedPanes, tc.wantClosed)
+			}
+
+			// A third lifetime now serves the socket.
+			controller.Runtime.ClosePaneErr = nil
+			controller.Runtime.ServerInstanceValue = fakeServerToken(3)
+			report, err := controller.Controller.ReconcileServerRestart(context.Background(), fr.Handle, restartOptions())
+			if err != nil {
+				t.Fatalf("round 2: ReconcileServerRestart() error = %v", err)
+			}
+			if len(controller.Runtime.ClosedPanes) != tc.wantClosed {
+				t.Fatalf("round 2 closed %v, want the recorded pane untouched under a lifetime that did not authorize the close", controller.Runtime.ClosedPanes)
+			}
+			for _, want := range []string{tc.wantDetail, "the server lifetime changed again after this close was authorized"} {
+				if !slices.ContainsFunc(report.Outstanding, func(entry string) bool { return strings.Contains(entry, want) }) {
+					t.Fatalf("outstanding = %q, want an entry carrying %q", report.Outstanding, want)
+				}
+			}
+		})
+	}
 }
