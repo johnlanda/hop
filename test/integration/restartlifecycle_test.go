@@ -113,9 +113,9 @@ func requirePathResolvesClaudeToTheFixture(t *testing.T, server *testServer, art
 // restart because HOP closes the panes it owns and cold-relaunches those
 // sessions from their recorded native session references.
 //
-// Before the fix, every one of those sessions was unreconcilable forever:
-// the placement's server lifetime was gone, so absence could never be
-// concluded, the slot never freed and the run never progressed.
+// Without that act such a session is unreconcilable forever: the
+// placement's server lifetime is gone, so absence can never be concluded,
+// the slot never frees and the run never progresses.
 //
 // The scenario arms Herdr's OWN deferred restore for each orchestrated pane
 // first (pane.report_agent_session), so the thing HOP must prevent is

@@ -153,10 +153,10 @@ const (
 // non-empty one proves the server behind the placement is gone — and with
 // it every pane process it spawned. It is also permanent: the placement's
 // own continuity can never be established again, so without a positive act
-// the session stays outstanding forever. That is the defect this step
-// fixes: today stop, feature stop and the per-attempt retirement never
-// conclude absence after a restart, the run stays stopping, the slot is
-// never freed and observeWorkerExit never fires.
+// the session stays outstanding forever. Without this step stop, feature
+// stop and the per-attempt retirement cannot conclude absence after a
+// restart at all: the run stays stopping, the slot is never freed and
+// observeWorkerExit never fires.
 //
 // What is closed is not a stray process. Herdr rebuilds a restored pane's
 // agent from its own persisted plan about a second and a half after the

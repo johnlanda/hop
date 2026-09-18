@@ -401,8 +401,9 @@ func identifiedByLabel(tc *testController, binding run.RuntimeBinding) { //nolin
 	tc.Runtime.InspectPaneFn = paneAnswersNothing
 }
 
-// TestReconcileServerRestartRetires pins the disposition that fixes the
-// reported defect: under a held stop, an identified pane is closed, its
+// TestReconcileServerRestartRetires pins the disposition a held stop
+// takes, which is the one that frees a run stuck stopping: an identified
+// pane is closed, its
 // absence is observed and the session is TERMINATED — so the slot frees and
 // the run can reach stopped. Nothing is relaunched into a stopping run.
 func TestReconcileServerRestartRetires(t *testing.T) {
