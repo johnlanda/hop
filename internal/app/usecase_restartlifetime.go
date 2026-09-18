@@ -81,11 +81,22 @@ const (
 // step did not act on it. It is the ONE place the journal's reasons are
 // mapped to the status surface, so a reason can never leak into a rendering
 // by accident.
+//
+// The match is by PREFIX, and the relaunch is tested first, because a
+// branch that closes a session may say more about it than the close itself:
+// the relaunch reason and the interrupt's both extend the close reason, and
+// the relaunch's extension is what distinguishes the two renderings. The
+// settlement of a launch this rule ended carries its own launch-ended
+// reason instead, under the settlement machinery's own prefix, so it is
+// matched at its tail. Every branch that closes a pane renders; nothing
+// else does.
 func RestartDispositionFor(reason string) string {
-	switch reason {
-	case restartRelaunchReason:
+	switch {
+	case strings.HasPrefix(reason, restartRelaunchReason):
 		return RestartDispositionRelaunched
-	case restartSessionReason:
+	case strings.HasPrefix(reason, restartSessionReason):
+		return RestartDispositionClosed
+	case strings.HasSuffix(reason, launchEndedRestartReason):
 		return RestartDispositionClosed
 	default:
 		return ""
@@ -548,7 +559,13 @@ func (c *Controller) dispatchRestartClose(ctx context.Context, handle RunHandle,
 	}
 	if closeErr != nil {
 		// Already gone at the close: this act dispatched nothing, so it
-		// journals nothing and the absence observation decides alone.
+		// journals nothing and the absence observation decides alone. A
+		// later round therefore reports this close as not yet carried out,
+		// which UNDER-claims — and that is the direction to under-claim in,
+		// since the harm is telling a human a pane is closed while it
+		// stands, and a close that found nothing left nothing standing. The
+		// re-drive keeps acting until absence is observed, so this state
+		// resolves itself rather than needing an act evidence of its own.
 		return nil
 	}
 	target := restartCloseTarget(intent)

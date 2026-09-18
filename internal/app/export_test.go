@@ -133,6 +133,15 @@ const (
 	RestartRelaunchReasonForTest = restartRelaunchReason
 )
 
+// The session reasons the interrupt and settle branches write, taken from
+// the settlements themselves rather than retyped: each extends one of the
+// two constants above, and it is the whole reason as written that the
+// status surface must reduce.
+var (
+	RestartInterruptReasonForTest   = restartInterruption().sessionReason
+	RestartLaunchEndedReasonForTest = workerLaunchEnded(launchEndedRestartReason).sessionReason
+)
+
 // PaneCloseIntentForTest exposes the persisted pane.close intent to
 // app_test, so a table can assert what a close RECORDED as its
 // authorization exactly as a later round reads it back — decoded from the

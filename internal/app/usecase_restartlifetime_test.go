@@ -616,6 +616,51 @@ func TestReconcileServerRestartSettlesAnUncorroboratedLaunch(t *testing.T) {
 	}
 }
 
+// TestReconcileServerRestartInterruptsAHarnessItCannotResume pins the third
+// branch that does not relaunch: the session's work could continue, but cold
+// resume is Claude-only and needs a recorded native reference, so the
+// attempt is INTERRUPTED and the manager decides whether to retry. Nothing
+// is started in the worktree, and the attempt does not silently stay open.
+func TestReconcileServerRestartInterruptsAHarnessItCannotResume(t *testing.T) {
+	tc, fr, w, binding := restartWorker(t)
+	// No native reference: nothing to resume the conversation from.
+	tc.Store.Sessions[w.SessionID].value.NativeSessionRef = ""
+	serverRestarted(tc)
+	identifiedByLabel(tc, binding)
+
+	report, err := tc.Controller.ReconcileServerRestart(context.Background(), fr.Handle, restartOptions())
+	if err != nil {
+		t.Fatalf("ReconcileServerRestart() error = %v", err)
+	}
+	if !slices.Contains(tc.Runtime.ClosedPanes, binding.PaneID) {
+		t.Fatalf("panes closed = %v, want the identified pane %s", tc.Runtime.ClosedPanes, binding.PaneID)
+	}
+	if len(report.Relaunched) != 0 {
+		t.Fatalf("relaunched = %v, want nothing: there is no native reference to resume", report.Relaunched)
+	}
+	if !slices.Contains(report.Closed, w.SessionID.String()) {
+		t.Fatalf("report = %+v, want the session reported closed", report)
+	}
+	if got := tc.Store.Attempts[w.AttemptID].value.State; got != run.AttemptInterrupted {
+		t.Fatalf("attempt state = %s, want interrupted: the manager decides whether to retry", got)
+	}
+	if got := tc.Store.LaunchClaims[w.IncarnationID].State; got != app.LaunchClaimExeced {
+		t.Fatalf("claim state = %s, want it left settled: this launch WAS corroborated, so it is not an exec failure", got)
+	}
+	notice := controllerNoticesTo(tc, fr.RunID)
+	if len(notice) == 0 {
+		t.Fatal("no manager notice was committed for the interrupted attempt")
+	}
+	body := string(tc.Artifacts.files[notice[len(notice)-1].BodyPath])
+	if !strings.Contains(body, "server restarted") || !strings.Contains(body, "no cold resume") {
+		t.Errorf("the manager's notice reads %q, want it naming the restart and why the attempt could not be resumed", body)
+	}
+	reason := newestSessionTransitionReason(t, tc, w.SessionID)
+	if got := app.RestartDispositionFor(reason); got != app.RestartDispositionClosed {
+		t.Errorf("the interrupted session renders %q from reason %q, want %q", got, reason, app.RestartDispositionClosed)
+	}
+}
+
 // newestSessionTransitionReason is the reason of a session's most recent
 // recorded transition — the same durable record the status surface reduces,
 // read here to assert what a human is told about a settlement.
@@ -683,7 +728,15 @@ func TestRestartDispositionForIsValueFree(t *testing.T) {
 	if closed != app.RestartDispositionClosed {
 		t.Errorf("the close reason maps to %q, want %q", closed, app.RestartDispositionClosed)
 	}
-	for _, other := range []string{"", "stop: termination observed", "cold relaunch authorized", "worker exited without an accepted result"} {
+	// Every branch that closes a pane renders, including the two whose
+	// session reason says more about the session than the close itself.
+	if got := app.RestartDispositionFor(app.RestartInterruptReasonForTest); got != app.RestartDispositionClosed {
+		t.Errorf("the interrupt reason maps to %q, want %q", got, app.RestartDispositionClosed)
+	}
+	if got := app.RestartDispositionFor(app.RestartLaunchEndedReasonForTest); got != app.RestartDispositionClosed {
+		t.Errorf("the settled launch's reason maps to %q, want %q", got, app.RestartDispositionClosed)
+	}
+	for _, other := range []string{"", "stop: termination observed", "cold relaunch authorized", "worker exited without an accepted result", "exec_failed claim; no process"} {
 		if got := app.RestartDispositionFor(other); got != "" {
 			t.Errorf("RestartDispositionFor(%q) = %q, want no disposition: only this rule's own reasons map", other, got)
 		}
@@ -699,23 +752,48 @@ func TestRestartDispositionForIsValueFree(t *testing.T) {
 
 // TestReconcileServerRestartJournalsItsOwnReasons pins that the two
 // dispositions a human sees are actually REACHED by the rule, through the
-// journal rather than through a constant: a retired session's newest
-// transition renders as closed, and a relaunched one's as relaunched. A
-// status surface fed by a reason nothing writes would render nothing.
+// journal rather than through a constant, from EVERY branch that closes a
+// pane: a status surface fed by a reason nothing writes would render
+// nothing, and a branch whose reason the reduction does not recognize
+// renders nothing for a session whose pane this step closed.
 func TestReconcileServerRestartJournalsItsOwnReasons(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		stop bool
-		want string
+		name  string
+		setup func(*testController, featureRun, workerFixture)
+		want  string
 	}{
-		{name: "a stopping run's closed session", stop: true, want: app.RestartDispositionClosed},
-		{name: "a running run's relaunched session", want: app.RestartDispositionRelaunched},
+		{
+			name:  "a stopping run's closed session",
+			setup: func(controller *testController, fr featureRun, _ workerFixture) { requestRunStop(controller, fr.RunID) },
+			want:  app.RestartDispositionClosed,
+		},
+		{
+			name:  "a running run's relaunched session",
+			setup: func(*testController, featureRun, workerFixture) {},
+			want:  app.RestartDispositionRelaunched,
+		},
+		{
+			name: "a session whose launch the restart ended before it was corroborated",
+			setup: func(controller *testController, _ featureRun, w workerFixture) {
+				claim := controller.Store.LaunchClaims[w.IncarnationID]
+				claim.State = app.LaunchClaimExecPending
+				controller.Store.LaunchClaims[w.IncarnationID] = claim
+				controller.Store.Attempts[w.AttemptID].value.State = run.AttemptLaunching
+				controller.Store.Sessions[w.SessionID].value.State = run.SessionLaunching
+			},
+			want: app.RestartDispositionClosed,
+		},
+		{
+			name: "a session whose harness has no cold resume",
+			setup: func(controller *testController, _ featureRun, w workerFixture) {
+				controller.Store.Sessions[w.SessionID].value.NativeSessionRef = ""
+			},
+			want: app.RestartDispositionClosed,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			controller, fr, w, binding := restartWorker(t)
-			if tc.stop {
-				requestRunStop(controller, fr.RunID)
-			}
+			tc.setup(controller, fr, w)
 			serverRestarted(controller)
 			identifiedByLabel(controller, binding)
 
