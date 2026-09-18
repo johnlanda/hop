@@ -232,6 +232,41 @@ func watchForSelfKill(controlPath string) {
 	}
 }
 
+// vanishOnceMarkerPath is the test-owned scratch marker recording that
+// worker-vanish-once has already spent its one vanish for taskID: this
+// process's own claim on that file, not any pane or OS-level identity, is
+// the sole state the behavior consults.
+func vanishOnceMarkerPath(scratchDir, taskID string) string {
+	return filepath.Join(scratchDir, "vanish-once-"+taskID)
+}
+
+// vanishOnceOrProceed ends this process at once, before anything about it
+// is observable — no observation dump, no FIXTURE-WORKER-READY, no hop
+// call — on the first invocation of worker-vanish-once for taskID, then
+// returns normally on every later invocation (the retried attempt), so
+// the caller can fall through into worker-implement's own behavior. This
+// process IS the claimed executable for its whole life: never a shell
+// wrapper that execs a differently-pathed binary, since a foreground
+// member's own mid-exec identity depends on when corroboration happens to
+// sample it and can present a different pid under the SAME recognized
+// executable and marker — precisely the forking-wrapper topology section
+// 6 refuses (fails closed to reconciling, a state no later scheduling
+// pass revisits). The marker file, not any process signal, is the only
+// state this decision consults, created with O_EXCL so exactly one
+// invocation ever observes its own absence.
+func vanishOnceOrProceed(scratchDir, taskID string) {
+	marker := vanishOnceMarkerPath(scratchDir, taskID)
+	f, err := os.OpenFile(marker, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		if os.IsExist(err) {
+			return
+		}
+		fatalf("worker-vanish-once: create marker %s: %v", marker, err)
+	}
+	f.Close()
+	os.Exit(0)
+}
+
 // waitForControlFile blocks until controlPath exists, polling at the same
 // low frequency watchForSelfKill uses, for a control file whose own
 // purpose is not a kill -- worker-fetch-crash's resumed-incarnation
@@ -468,6 +503,23 @@ func commitChange(message string) string {
 	}
 	runGit("add", "-A")
 	runGit("commit", "-m", message)
+	return strings.TrimSpace(runGit("rev-parse", "HEAD^{commit}"))
+}
+
+// commitConflictingChange writes content to a FIXED, shared filename
+// (fixture-conflict.txt) and commits it — unlike commitChange's own
+// unique-per-call filename, this path is deliberately the SAME across
+// every attempt that uses it, so two independent tasks writing DIFFERENT
+// content to it (each from its own worktree, branched from the same
+// integration head) produce a genuine git merge conflict once both reach
+// integration, rather than two disjoint files that merge cleanly no
+// matter the timing.
+func commitConflictingChange(content string) string {
+	if err := os.WriteFile("fixture-conflict.txt", []byte(content+"\n"), 0o644); err != nil {
+		fatalf("write conflicting change: %v", err)
+	}
+	runGit("add", "-A")
+	runGit("commit", "-m", "conflicting change: "+content)
 	return strings.TrimSpace(runGit("rev-parse", "HEAD^{commit}"))
 }
 
@@ -952,6 +1004,9 @@ func runWorker() {
 	// there instead. Phase 2 behaviors are unchanged: they keep writing
 	// beside the assignment file, exactly as they always have.
 	scratchDir := requireScratchDir(behavior, behaviorArgs)
+	if behavior == "worker-vanish-once" {
+		vanishOnceOrProceed(scratchDir, env["HOP_TASK_ID"])
+	}
 	observationPath := filepath.Join(filepath.Dir(assignmentPath), "worker-observed.txt")
 	if scratchDir != "" {
 		observationPath = filepath.Join(scratchDir, "worker-observed-"+env["HOP_ATTEMPT_ID"]+".txt")
@@ -997,11 +1052,28 @@ func runWorker() {
 	case "exec-keep-pid":
 		waitForGo()
 		reexecSelf()
+	case "worker-vanish-once":
+		// vanishOnceOrProceed above already ended the process on its first
+		// invocation for this task; reaching here means the marker already
+		// existed (the retried attempt), so it behaves exactly like
+		// worker-implement.
+		fallthrough
 	case "worker-implement":
 		oid := commitChange("fixture implementer change")
 		drainMailbox(hopPath)
 		submitOnce(hopPath, oid, "fixture implementer result", "")
+	case "worker-conflict":
+		// The manager's own directive rendering always appends the scratch
+		// directory as this behavior's one argument (requireScratchDir), so
+		// there is no room for a second, caller-chosen argument here; the
+		// task's own id is already unique per task and needs no plumbing —
+		// exactly the distinguishing content two independent conflicting
+		// tasks need.
+		oid := commitConflictingChange(env["HOP_TASK_ID"])
+		drainMailbox(hopPath)
+		submitOnce(hopPath, oid, "fixture implementer result (conflict "+env["HOP_TASK_ID"]+")", "")
 	case "worker-hold":
+		waitForWorkerHoldSendGateCleared(scratchDir, env["HOP_ATTEMPT_ID"])
 		oid := commitChange("fixture implementer change (held)")
 		questionPath := filepath.Join(scratchDir, "hold-question-"+env["HOP_ATTEMPT_ID"]+".txt")
 		atomicWriteFile(questionPath, fixtureHoldMarker+"\n")
@@ -1031,6 +1103,14 @@ func runWorker() {
 		}
 		drainMailbox(hopPath)
 		submitOnce(hopPath, oid, "fixture implementer result (released)", "")
+	case "idle-self-kill":
+		// Exactly the unnamed default's own behavior (submit nothing, stay
+		// alive) but named and scratch-dir-registered solely so the self-
+		// kill watcher above gets wired: a solo crash-recovery scenario
+		// (resume_test.go's coldRelaunchAfterCrash and its callers) needs a
+		// safe way to end THIS worker's own process without signaling a pid
+		// it only observed via pane inspection, the same reasoning
+		// scratchDirRequiringBehaviors documents above.
 	case "worker-block":
 		// A purely unresponsive worker: never calls hop msg wait, never
 		// commits, never submits. Its ONLY liveness signal is existing
@@ -1117,7 +1197,10 @@ func cmp(role, fallback string) string {
 // instead. Phase 2 behaviors carry no such argument and are unaffected.
 var scratchDirRequiringBehaviors = map[string]bool{
 	"worker-implement":     true,
+	"worker-vanish-once":   true,
 	"worker-hold":          true,
+	"worker-conflict":      true,
+	"idle-self-kill":       true,
 	"worker-fetch-crash":   true,
 	"worker-block":         true,
 	"submit-valid-held":    true,
@@ -1288,19 +1371,74 @@ func writeTempInstructions(dir, behavior, scratchDir string) string {
 	return path
 }
 
-// parseNeedsReworkLabel extracts the task label from a renderTaskNotice
-// body's first line ("task t<seq> needs-rework\n...",
-// internal/app/usecase_featurecheck.go's renderTaskNotice) when its
-// consequence is needs-rework; ok is false for any other notice shape
-// (an integrated/dependents-released notice, a failed notice, etc.),
-// which the manager acks without acting on.
-func parseNeedsReworkLabel(body string) (label string, ok bool) {
-	first, _, _ := strings.Cut(body, "\n")
-	fields := strings.Fields(first)
+// integrationNoticeStates are the exact state tokens
+// internal/app/usecase_featuresettle.go's renderIntegrationNotice ever
+// puts on an "integration <id> <state>" line — retyped, never imported
+// (this fixture is a standalone program, never linking internal/app):
+// section 8's outcome table journals a needs-rework consequence through
+// this renderer only for a merge conflict ("conflicted") or a rolled-back
+// candidate (a failing combined check, or the stop path's own retirement
+// of a published-but-unsettled one — "rolled-back").
+var integrationNoticeStates = map[string]bool{
+	"conflicted":  true,
+	"rolled-back": true,
+}
+
+// matchTaskNeedsReworkLine reports whether line is EXACTLY "task t<seq>
+// needs-rework" — three whitespace-separated fields, an anchored full-
+// line match, never a substring search, so a reason or evidence line
+// merely mentioning "needs-rework" in passing can never match — and, if
+// so, the task label.
+func matchTaskNeedsReworkLine(line string) (label string, ok bool) {
+	fields := strings.Fields(line)
 	if len(fields) == 3 && fields[0] == "task" && fields[2] == "needs-rework" {
 		return fields[1], true
 	}
 	return "", false
+}
+
+// matchIntegrationLine reports whether line is EXACTLY "integration <id>
+// <state>" with state one of integrationNoticeStates's own tokens — the
+// same anchored, exact three-field shape as matchTaskNeedsReworkLine.
+func matchIntegrationLine(line string) bool {
+	fields := strings.Fields(line)
+	return len(fields) == 3 && fields[0] == "integration" && integrationNoticeStates[fields[2]]
+}
+
+// parseNeedsReworkLabel extracts the task label from a manager notice
+// body naming a needs-rework consequence, recognizing BOTH production
+// renderers' shapes — an anchored, whitespace-normalized field match on
+// each shape's own line (strings.Fields, never a substring search), not
+// pinned to either renderer's line order, since design section 7 only
+// promises "a needs-rework notice", never a fixed line position:
+//   - renderTaskNotice (internal/app/usecase_featurecheck.go, worker
+//     interruption and per-task check failure): the task consequence
+//     line is LINE 1.
+//   - renderIntegrationNotice (internal/app/usecase_featuresettle.go,
+//     merge conflict and combined-check-failure/rollback settlements): an
+//     "integration <id> <state>" line comes FIRST, the task consequence
+//     line SECOND.
+//
+// Both matches are anchored, exact three-field lines (matchTaskNeeds
+// ReworkLine/matchIntegrationLine) checked ONLY at the one position each
+// shape allows — never a substring search over the whole body — so a
+// reason or evidence line naming "needs-rework" in passing, or the task
+// line appearing at any other position, can never trigger a retry. ok is
+// false for any other notice shape (an integrated/dependents-released
+// notice, a failed notice, etc.), which the manager acks without acting
+// on.
+func parseNeedsReworkLabel(body string) (label string, ok bool) {
+	lines := strings.SplitN(body, "\n", 3)
+	if len(lines) == 0 {
+		return "", false
+	}
+	if label, ok := matchTaskNeedsReworkLine(lines[0]); ok {
+		return label, true
+	}
+	if len(lines) < 2 || !matchIntegrationLine(lines[0]) {
+		return "", false
+	}
+	return matchTaskNeedsReworkLine(lines[1])
 }
 
 // runManager is the manager-feature behavior's entry point: a scripted
@@ -1599,6 +1737,43 @@ func postForwardBarrierEnabled(scratchDir string) bool {
 	return err == nil
 }
 
+// workerHoldSendGateControlFile is the fixed name of the opt-in gate file
+// a test creates under a worker-hold attempt's own scratch directory
+// BEFORE starting the run: absent (every existing scenario), worker-hold
+// sends its barrier question immediately, exactly as it always has;
+// present, it blocks until the file is REMOVED, then proceeds — a
+// structural way to hold a worker-hold attempt back from sending its own
+// question until some other event has already happened, rather than
+// racing it.
+const workerHoldSendGateControlFile = "worker-hold-send-gate"
+
+// workerHoldSendGateObservedFile is the fixed PREFIX of where the gate
+// dumps its own observation the instant it starts blocking (empty when
+// the gate was never enabled, since the check below returns before
+// writing it), keyed by attempt id like every sibling dump — the control
+// file itself stays fixed-named, since it gates every worker-hold attempt
+// in the run uniformly, but two concurrent attempts writing the SAME
+// observed-file path would share atomicWriteFile's one fixed ".tmp"
+// sibling, and a rename that lands second would find it already moved.
+const workerHoldSendGateObservedFile = "worker-hold-send-gate-observed"
+
+// waitForWorkerHoldSendGateCleared blocks until workerHoldSendGateControlFile
+// no longer exists under scratchDir, returning immediately if it was
+// never created.
+func waitForWorkerHoldSendGateCleared(scratchDir, attemptID string) {
+	path := filepath.Join(scratchDir, workerHoldSendGateControlFile)
+	if _, err := os.Stat(path); err != nil {
+		return
+	}
+	writeContentDigest(filepath.Join(scratchDir, workerHoldSendGateObservedFile+"-"+attemptID+".txt"), attemptID, "blocked")
+	for {
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			return
+		}
+		time.Sleep(selfKillPollInterval)
+	}
+}
+
 // handleManagerMessage dispatches one delivered message per the section 7
 // manager operating contract, acknowledging it before the next wait in
 // every case. plannedFixReviews tracks every review id this manager has
@@ -1832,8 +2007,10 @@ func requireSelfKilled(t *testing.T, ctxErr, waitErr error) {
 // separate plumbing through the controller's fixed HOP_* env keys. Known
 // solo/implementer behavior names: "submit-valid", "submit-stale",
 // "submit-twice", "exit-without-submitting", "exec-keep-pid",
-// "worker-implement", "worker-hold"; an empty or unrecognized behavior
-// makes the worker idle without ever submitting. A feature-mode
+// "worker-implement", "worker-hold", "worker-conflict",
+// "worker-vanish-once", "idle-self-kill" (solo only); an empty or
+// unrecognized behavior makes the worker idle without ever submitting. A
+// feature-mode
 // implementer's behavior travels through its task's own manager-authored
 // instructions file instead (fixtureManagerScript's TASK lines), never the
 // run's top-level brief.
@@ -2468,6 +2645,299 @@ func TestFixtureWorkerSelfKillOnControlFile(t *testing.T) {
 
 	if !waitUntil(func() bool { return strings.Contains(out.snapshot(), "FIXTURE-HOLD-SENT") }) {
 		t.Fatalf("worker never reported sending its barrier question; output so far:\n%s", out.snapshot())
+	}
+
+	controlPath := filepath.Join(scratchDir, "self-kill-"+attemptID)
+	tmp := controlPath + ".tmp"
+	if err := os.WriteFile(tmp, []byte("FIXTURE-SELF-KILL\n"), 0o600); err != nil {
+		t.Fatalf("write self-kill control file: %v", err)
+	}
+	if err := os.Rename(tmp, controlPath); err != nil {
+		t.Fatalf("rename self-kill control file into place: %v", err)
+	}
+
+	// ctx.Err() == nil at this exact moment proves this SIGKILL is
+	// the fixture's own self-kill channel firing, never the context's own
+	// 30s deadline masking a self-kill that never happened (a bare
+	// non-zero-exit or even a confirmed-SIGKILL check alone cannot tell
+	// the two apart, since exec.CommandContext kills the process the
+	// identical way once its context is done). wait() is called FIRST, on
+	// its own line: Go evaluates call arguments left to right, so
+	// inlining ctx.Err() as an argument would read it BEFORE wait() ever
+	// blocks, defeating the entire check.
+	finalWaitErr := wait()
+	requireSelfKilled(t, ctx.Err(), finalWaitErr)
+}
+
+// TestFixtureWorkerVanishOnce proves the "worker-vanish-once" behavior
+// (TestRealProcessWorkerLaunchEndsBeforeSettlement's own): the first
+// invocation for a given task exits at once — before printing
+// FIXTURE-WORKER-READY or calling hop at all — through the compiled
+// fixture binary's own os.Exit, never an exec chain into a differently
+// pathed binary, and a
+// second invocation for the SAME task (a fresh attempt, as the real
+// retried attempt always is) reaches ready, drains its mailbox and
+// submits exactly like worker-implement.
+func TestFixtureWorkerVanishOnce(t *testing.T) {
+	artifacts := newArtifactDir(t)
+	worker := buildFixtureWorker(t, artifacts)
+	fakeHop := buildFakeHopStub(t, artifacts)
+	repo := newFixtureRepo(t, artifacts, nil, "repo")
+
+	stateDir := artifacts.dir(t, "state")
+	scratchDir := artifacts.dir(t, "vanish-scratch")
+	const (
+		runID  = "c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1"
+		taskID = "c2c2c2c2-c2c2-4c2c-8c2c-c2c2c2c2c2c2"
+	)
+	instructionsPath := filepath.Join(stateDir, "runs", runID, "tasks", taskID+".md")
+	if err := os.MkdirAll(filepath.Dir(instructionsPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(instructionsPath, []byte("FIXTURE-BEHAVIOR: worker-vanish-once "+scratchDir+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	runAttempt := func(attemptID, logPath string) (output string, exitCode int) {
+		t.Helper()
+		assignmentPath := filepath.Join(stateDir, "runs", runID, "attempts", attemptID, "assignment.md")
+		if err := os.MkdirAll(filepath.Dir(assignmentPath), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(assignmentPath, []byte("# HOP Task Assignment\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		prompt := testAssignmentPrompt(assignmentPath, fakeHop)
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, worker, "--session-id", "c3c3c3c3-c3c3-4c3c-8c3c-c3c3c3c3c3c3", prompt) //nolint:gosec // G204: fixed test-owned binary and arguments.
+		cmd.Dir = repo.Root
+		cmd.Env = []string{
+			"PATH=" + os.Getenv("PATH"),
+			"HOP_STATE_DIR=" + stateDir,
+			"HOP_RUN_ID=" + runID,
+			"HOP_TASK_ID=" + taskID,
+			"HOP_ATTEMPT_ID=" + attemptID,
+			"HOP_SESSION_ID=c4c4c4c4-c4c4-4c4c-8c4c-c4c4c4c4c4c4",
+			"HOP_INCARNATION_ID=c5c5c5c5-c5c5-4c5c-8c5c-c5c5c5c5c5c5",
+			"HOP_ROLE=implementer",
+			"FAKE_HOP_LOG=" + logPath,
+		}
+		var out strings.Builder
+		cmd.Stdout = &out
+		cmd.Stderr = &out
+		cmd.Stdin = strings.NewReader("FIXTURE-QUIT\n")
+		err := cmd.Run()
+		code := 0
+		if err != nil {
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) {
+				t.Fatalf("run fixture worker attempt %s: %v\noutput:\n%s", attemptID, err, out.String())
+			}
+			code = exitErr.ExitCode()
+		}
+		return out.String(), code
+	}
+
+	logDir := artifacts.dir(t, "vanish-log")
+	firstLogPath := filepath.Join(logDir, "first.log")
+	firstOut, firstCode := runAttempt("c6c6c6c6-c6c6-4c6c-8c6c-c6c6c6c6c601", firstLogPath)
+	if firstCode != 0 {
+		t.Fatalf("first (vanishing) attempt exit code = %d, want 0\noutput:\n%s", firstCode, firstOut)
+	}
+	if strings.Contains(firstOut, "FIXTURE-WORKER-READY") {
+		t.Errorf("first attempt printed FIXTURE-WORKER-READY; want it to exit before becoming observable:\n%s", firstOut)
+	}
+	if _, err := os.Stat(vanishOnceMarkerPathForTest(scratchDir, taskID)); err != nil {
+		t.Fatalf("vanish-once marker not written by the first attempt: %v", err)
+	}
+	if log := readFakeHopLog(t, firstLogPath); log != "" {
+		t.Errorf("first (vanishing) attempt invoked hop; want no call at all:\n%s", log)
+	}
+
+	secondLogPath := filepath.Join(logDir, "second.log")
+	secondOut, secondCode := runAttempt("c7c7c7c7-c7c7-4c7c-8c7c-c7c7c7c7c702", secondLogPath)
+	if secondCode != 0 {
+		t.Fatalf("second attempt exit code = %d, want 0\noutput:\n%s", secondCode, secondOut)
+	}
+	for _, want := range []string{"FIXTURE-WORKER-READY", "FIXTURE-SUBMIT-RESULT", "FIXTURE-WORKER-IDLE"} {
+		if !strings.Contains(secondOut, want) {
+			t.Errorf("second attempt output missing %q; got:\n%s", want, secondOut)
+		}
+	}
+	// The positive control for the first attempt's empty-log assertion
+	// above: an empty firstLogPath means nothing IFF the log-capture
+	// channel itself is known to be live for this same worker binary and
+	// env shape. The second attempt's own call proves that — it must
+	// actually call hop, so a broken or unwired FAKE_HOP_LOG (which would
+	// also leave firstLogPath looking empty for the wrong reason) fails
+	// here instead of passing silently.
+	if log := readFakeHopLog(t, secondLogPath); !strings.Contains(log, "result\tsubmit\t") {
+		t.Errorf("second attempt's fake hop log missing the result submit call; got:\n%s", log)
+	}
+}
+
+// vanishOnceMarkerPathForTest mirrors the fixture principal's own
+// vanishOnceMarkerPath (embedded source, unreachable from this package)
+// so the test can assert the marker file's exact name independently.
+func vanishOnceMarkerPathForTest(scratchDir, taskID string) string {
+	return filepath.Join(scratchDir, "vanish-once-"+taskID)
+}
+
+// TestFixtureWorkerConflict proves the "worker-conflict" behavior:
+// commitConflictingChange writes the task id (never a caller-supplied
+// argument, since the manager's own directive rendering always appends
+// the scratch directory as this behavior's one argument) to one FIXED,
+// shared filename, and the submitted result names that same task id.
+func TestFixtureWorkerConflict(t *testing.T) {
+	artifacts := newArtifactDir(t)
+	worker := buildFixtureWorker(t, artifacts)
+	fakeHop := buildFakeHopStub(t, artifacts)
+	repo := newFixtureRepo(t, artifacts, nil, "repo")
+
+	stateDir := artifacts.dir(t, "state")
+	scratchDir := artifacts.dir(t, "conflict-scratch")
+	const (
+		runID     = "d1d1d1d1-d1d1-4d1d-8d1d-d1d1d1d1d1d1"
+		taskID    = "d2d2d2d2-d2d2-4d2d-8d2d-d2d2d2d2d2d2"
+		attemptID = "d3d3d3d3-d3d3-4d3d-8d3d-d3d3d3d3d3d3"
+	)
+	instructionsPath := filepath.Join(stateDir, "runs", runID, "tasks", taskID+".md")
+	if err := os.MkdirAll(filepath.Dir(instructionsPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(instructionsPath, []byte("FIXTURE-BEHAVIOR: worker-conflict "+scratchDir+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	assignmentPath := filepath.Join(stateDir, "runs", runID, "attempts", attemptID, "assignment.md")
+	if err := os.MkdirAll(filepath.Dir(assignmentPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(assignmentPath, []byte("# HOP Task Assignment\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(artifacts.dir(t, "log"), "log.txt")
+
+	prompt := testAssignmentPrompt(assignmentPath, fakeHop)
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, worker, "--session-id", "d4d4d4d4-d4d4-4d4d-8d4d-d4d4d4d4d4d4", prompt) //nolint:gosec // G204: fixed test-owned binary and arguments.
+	cmd.Dir = repo.Root
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOP_STATE_DIR=" + stateDir,
+		"HOP_RUN_ID=" + runID,
+		"HOP_TASK_ID=" + taskID,
+		"HOP_ATTEMPT_ID=" + attemptID,
+		"HOP_SESSION_ID=d5d5d5d5-d5d5-4d5d-8d5d-d5d5d5d5d5d5",
+		"HOP_INCARNATION_ID=d6d6d6d6-d6d6-4d6d-8d6d-d6d6d6d6d6d6",
+		"HOP_ROLE=implementer",
+		"FAKE_HOP_LOG=" + logPath,
+	}
+	var out strings.Builder
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	cmd.Stdin = strings.NewReader("FIXTURE-QUIT\n")
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("run fixture worker: %v\noutput:\n%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "FIXTURE-WORKER-READY") {
+		t.Fatalf("worker did not report ready; output:\n%s", out.String())
+	}
+
+	conflictFile := filepath.Join(repo.Root, "fixture-conflict.txt")
+	content, err := os.ReadFile(conflictFile) //nolint:gosec // G304: a path this test constructed itself under its own fixture repo.
+	if err != nil {
+		t.Fatalf("read conflict file %s: %v", conflictFile, err)
+	}
+	if got := strings.TrimSpace(string(content)); got != taskID {
+		t.Errorf("conflict file content = %q, want the task id %q", got, taskID)
+	}
+
+	log := readFakeHopLog(t, logPath)
+	wantSummary := "--summary\tfixture implementer result (conflict " + taskID + ")"
+	if !strings.Contains(log, wantSummary) {
+		t.Errorf("hop result submit summary missing %q; log:\n%s", wantSummary, log)
+	}
+}
+
+// TestFixtureWorkerIdleSelfKillOnControlFile proves the "idle-self-kill"
+// solo behavior: unlike worker-hold, it reaches the shared
+// idle() composer loop immediately (nothing to do first), so this test
+// gives the child an open, never-closed stdin pipe (idle() blocks
+// scanning it; a nil Stdin would give it an already-EOF /dev/null and let
+// it exit 0 on its own before the self-kill control file could ever be
+// written) and waits for FIXTURE-WORKER-IDLE before triggering the kill,
+// mirroring TestFixtureWorkerSelfKillOnControlFile's own assertions
+// otherwise: the process must die by SIGKILL of its own doing, never a
+// signal this test aimed at an externally observed pid.
+func TestFixtureWorkerIdleSelfKillOnControlFile(t *testing.T) {
+	artifacts := newArtifactDir(t)
+	worker := buildFixtureWorker(t, artifacts)
+	repo := newFixtureRepo(t, artifacts, nil, "repo")
+
+	stateDir := artifacts.dir(t, "state")
+	scratchDir := artifacts.dir(t, "scratch")
+	const (
+		runID     = "66666666-6666-4666-8666-666666666666"
+		attemptID = "77777777-7777-4777-8777-777777777777"
+	)
+	runDir := filepath.Join(stateDir, "runs", runID, "artifacts")
+	if err := os.MkdirAll(runDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	assignmentPath := filepath.Join(runDir, "assignment.md")
+	brief := fixtureWorkerBrief("idle-self-kill " + scratchDir)
+	assignmentContent := "# HOP Assignment\n\n## Brief\n\n" + brief + "\n## Instructions\n"
+	if err := os.WriteFile(assignmentPath, []byte(assignmentContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	prompt := testAssignmentPrompt(assignmentPath, filepath.Join(artifacts.path, "hop"))
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, worker, "--session-id", "88888888-8888-4888-8888-888888888888", prompt) //nolint:gosec // G204: fixed test-owned binary and arguments.
+	cmd.Dir = repo.Root
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOP_STATE_DIR=" + stateDir,
+		"HOP_RUN_ID=" + runID,
+		"HOP_TASK_ID=99999999-9999-4999-8999-999999999999",
+		"HOP_ATTEMPT_ID=" + attemptID,
+		"HOP_INCARNATION_ID=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+	}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatalf("open fixture worker stdin pipe: %v", err)
+	}
+	var out syncOutput
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start fixture worker: %v", err)
+	}
+	var (
+		waitOnce sync.Once
+		waitErr  error
+	)
+	wait := func() error {
+		waitOnce.Do(func() { waitErr = cmd.Wait() })
+		return waitErr
+	}
+	t.Cleanup(func() {
+		if err := stdin.Close(); err != nil {
+			t.Logf("cleanup: close fixture worker stdin: %v", err)
+		}
+		if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			t.Logf("cleanup: kill fixture worker: %v", err)
+		}
+		if err := wait(); err != nil {
+			t.Logf("cleanup: reap fixture worker: %v", err)
+		}
+	})
+
+	if !waitUntil(func() bool { return strings.Contains(out.snapshot(), "FIXTURE-WORKER-IDLE") }) {
+		t.Fatalf("worker never reported reaching idle; output so far:\n%s", out.snapshot())
 	}
 
 	controlPath := filepath.Join(scratchDir, "self-kill-"+attemptID)

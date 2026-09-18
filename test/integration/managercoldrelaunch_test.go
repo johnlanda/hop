@@ -1,0 +1,324 @@
+package integration
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// waitForManagerObservation polls the scratch-dir manager-observed.txt dump
+// until it carries env:HOP_INCARNATION_ID=incarnationID, bounded.
+// runManager (fixtureworker_test.go) writes this SAME fixed-name file on
+// every incarnation (unlike the worker's attempt-keyed dump, since the
+// manager has no attempt id), so a relaunched manager overwrites its
+// predecessor's own content; reading it without this wait could observe
+// the retired incarnation's stale content instead of the relaunched
+// manager's.
+func waitForManagerObservation(t *testing.T, path, incarnationID string) workerObservation {
+	t.Helper()
+	want := "env:HOP_INCARNATION_ID=" + incarnationID
+	var obs workerObservation
+	if !waitUntil(func() bool {
+		raw, err := os.ReadFile(path) //nolint:gosec // G304: a path this test constructed itself, under its own scratch directory.
+		if err != nil || !strings.Contains(string(raw), want) {
+			return false
+		}
+		obs = readWorkerObservation(t, path)
+		return true
+	}) {
+		t.Fatalf("manager observation %s never carried %s", path, want)
+	}
+	return obs
+}
+
+// TestRealProcessManagerColdRelaunch proves design section 8's row: the
+// manager is killed together with the controller; hop resume
+// --confirm-absent=<manager-session> cold-relaunches the manager lineage
+// via HOP's one supported --resume argv shape, while the still-live
+// worker warmly reattaches untouched by the same round. Built entirely on
+// 7b's mechanisms — the manager's own self-kill watcher
+// (fixtureworker_test.go's runManager) and its resume-skips-replanning
+// guard — never a raw signal to an observed pid.
+//
+// A single worker-hold task keeps its worker blocked at a barrier for the
+// whole window, held back from sending its own barrier question at all
+// until this scenario removes the fixture's worker-hold send gate — a
+// file created before the run ever starts, so the worker cannot reach the
+// send ahead of it. The ordering the "one live duty" proof below depends
+// on is therefore structural, not a race against how fast the worker
+// happens to run: the gate comes down only after both kills and the
+// manager's own cold relaunch, and both the relay and the answer forward
+// are attributed to the relaunched manager's own session id directly from
+// the message rows — "a manager did its job" is not the claim here, "the
+// RELAUNCHED manager did its job" is.
+func TestRealProcessManagerColdRelaunch(t *testing.T) {
+	artifacts := newArtifactDir(t)
+	server := prepareServer(t, artifacts)
+	worker := buildFixtureWorker(t, artifacts)
+	installFixtureWorkerAsClaudeStub(t, server, worker)
+	server.start(t)
+
+	scratchDir := artifacts.dir(t, "fixture-scratch")
+	// Holds t1's worker back from sending its own barrier question until
+	// this file is removed (fixtureworker_test.go's worker-hold send
+	// gate), created before the run even starts so the worker can never
+	// reach the send ahead of it: the ordering this scenario's own
+	// live-duty proof depends on is therefore structural, not a race
+	// against how fast the worker happens to run.
+	sendGatePath := filepath.Join(scratchDir, workerHoldSendGateControlFile)
+	if err := os.WriteFile(sendGatePath, []byte("FIXTURE-GATE\n"), 0o600); err != nil {
+		t.Fatalf("write worker-hold send gate control file: %v", err)
+	}
+	repo := newFeatureFixtureRepo(t, artifacts, server, "repo", featureFixtureOptions{
+		ScratchDir: scratchDir, ReviewerBehavior: "reviewer-approve",
+		MaxWorkers: 1, RetryLimit: 3, MessageWaitTimeout: "3s", MessageAttentionAfter: "30s",
+	})
+	brief := fixtureManagerBrief(scratchDir,
+		[]fixtureManagerTask{{Label: "t1", Title: "Implement t1", Behavior: "worker-hold"}},
+		[]fixtureManagerAnswer{{Match: fixtureHoldMarker, Action: "relay"}},
+		"",
+	)
+	fx := startFeatureRun(t, artifacts, server, repo, scratchDir, brief)
+
+	t1 := fx.requireTaskBySeq(t, 1)
+	fx.requireTaskState(t, t1, "active")
+	attempt1ID, attempt1Number := fx.currentAttempt(t, t1)
+	if attempt1Number != 1 {
+		t.Fatalf("first attempt number = %d, want 1", attempt1Number)
+	}
+	worker1SessionID := fx.sessionForAttempt(t, attempt1ID)
+	worktreePath, worktreeBranch, worktreeBase := fx.requireWorktreeForAttempt(t, attempt1ID)
+	// The ORIGINAL controller must corroborate the worker's own launch
+	// (its claim settled, session active) before it is killed: killing
+	// too early leaves the worker's placed launch still in flight from
+	// the resumed controller's point of view, which correctly reports it
+	// "pending" rather than "warm" — a different, weaker outcome this
+	// scenario does not exercise, since it is not what a live crash
+	// (worker already running) looks like.
+	fx.requireSessionState(t, worker1SessionID, "active")
+
+	managerSessionID := fx.managerSessionID(t)
+	managerPaneID := fx.requirePane(t, managerSessionID)
+
+	// Snapshot every row a cold relaunch of the MANAGER must never
+	// disturb, taken before either kill: the task and attempt rows (byte
+	// for byte), the run's task count (no duplicate plan) and the plan
+	// flag's own timestamp (no second close). Nothing about t1 or its
+	// attempt can legitimately change while the manager is down — the
+	// worker stays blocked on its own barrier the entire time — so an
+	// exact string comparison after the relaunch is not a race.
+	beforeTaskCount := fx.scalar(t, fmt.Sprintf("SELECT count(*) FROM tasks WHERE run_id = '%s';", fx.runID))
+	beforeTaskRow := fx.scalar(t, fmt.Sprintf("SELECT * FROM tasks WHERE id = '%s';", t1))
+	beforeAttemptRow := fx.scalar(t, fmt.Sprintf("SELECT * FROM attempts WHERE id = '%s';", attempt1ID))
+	beforePlanClosedAt := fx.scalar(t, fmt.Sprintf("SELECT plan_closed_at FROM runs WHERE id = '%s';", fx.runID))
+	if beforePlanClosedAt == "" {
+		t.Fatalf("plan_closed_at is empty before the kill; the manager never closed its plan")
+	}
+
+	// The send gate above already makes it structurally impossible for the
+	// worker to have sent its own barrier question yet; this is the cheap
+	// invariant check confirming that, naming exactly what happened if it
+	// were ever otherwise rather than silently letting the ORIGINAL
+	// manager perform the relay and proving nothing about the relaunched
+	// one.
+	if got := fx.scalar(t, fmt.Sprintf(
+		"SELECT count(*) FROM messages h JOIN messages orig ON h.relayed_from = orig.id WHERE h.run_id = '%s' AND h.recipient_address = 'human' AND orig.sender_session_id = '%s';",
+		fx.runID, worker1SessionID)); got != "0" {
+		t.Fatalf("worker session %s already had its barrier question relayed (%s relayed rows) before the manager was killed; the kill landed too late for this scenario's own live-duty proof to mean anything — tighten the timing rather than relaxing the assertion", worker1SessionID, got)
+	}
+
+	// The manager dies by its own hand through the fixture's self-kill
+	// control channel — never a raw signal to an observed pid — exactly
+	// resume_test.go's endWithSelfKill pattern, keyed by the manager's own
+	// session id (the manager has no attempt id; fixtureworker_test.go's
+	// runManager names its control file self-kill-<HOP_SESSION_ID>, so a
+	// cold-relaunched successor's own watcher is keyed to its OWN, new
+	// session id and never collides with its predecessor's already-
+	// consumed one — unlike a worker's relaunch, which keeps the same
+	// attempt id and therefore the same control-file name across the
+	// kill). Waits for the pane to close itself (a layout.apply command
+	// pane has no shell, S6), giving hop resume's absence observation the
+	// by-id conjunct, then removes the control file: harmless to the
+	// relaunch either way, but removed regardless as the same hygiene
+	// every self-kill caller in this package practices.
+	managerSelfKillControlPath := filepath.Join(scratchDir, "self-kill-"+managerSessionID)
+	tmp := managerSelfKillControlPath + ".tmp"
+	if err := os.WriteFile(tmp, []byte("FIXTURE-SELF-KILL\n"), 0o600); err != nil {
+		t.Fatalf("write manager self-kill control file: %v", err)
+	}
+	if err := os.Rename(tmp, managerSelfKillControlPath); err != nil {
+		t.Fatalf("rename manager self-kill control file into place: %v", err)
+	}
+	if !waitUntil(func() bool { return !fx.server.paneExists(t, managerPaneID) }) {
+		t.Fatalf("manager pane %s still exists after its self-kill control file was written", managerPaneID)
+	}
+	if err := os.Remove(managerSelfKillControlPath); err != nil {
+		t.Fatalf("remove manager self-kill control file: %v", err)
+	}
+
+	killControllerLeader(t, fx.controller)
+	waitForLeaseExpiry(t, fx.dbPath(), fx.runID)
+
+	resumed := fx.server.startHopController(t, fx.stateDir, "resume", "resume", "-C", fx.repo.Root, "--confirm-absent="+managerSessionID, fx.runID)
+	stdout := waitForControllerLog(t, fx.artifacts, "resume", "resume resumed")
+	if !strings.Contains(stdout, "session "+managerSessionID+" (manager): relaunched") {
+		t.Fatalf("hop resume did not report the manager session relaunched; stdout:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "session "+worker1SessionID+" (implementer): warm") {
+		t.Fatalf("hop resume did not report the worker session warm-reattached; stdout:\n%s", stdout)
+	}
+	fx.controller, fx.controllerName = resumed, "resume"
+
+	// Task/attempt state must be exactly what it was before either kill —
+	// no re-plan, no duplicate task, no new attempt — asserted from the
+	// store, never from a log line, and read back BEFORE the worker's own
+	// barrier is released so nothing the worker legitimately does
+	// afterward could be mistaken for something the relaunch itself
+	// added.
+	if got := fx.scalar(t, fmt.Sprintf("SELECT count(*) FROM tasks WHERE run_id = '%s';", fx.runID)); got != beforeTaskCount {
+		t.Errorf("task count for run %s after the manager's cold relaunch = %s, want unchanged %s (no re-plan)", fx.runID, got, beforeTaskCount)
+	}
+	if got := fx.scalar(t, fmt.Sprintf("SELECT * FROM tasks WHERE id = '%s';", t1)); got != beforeTaskRow {
+		t.Errorf("task %s row after the manager's cold relaunch =\n%s\nwant unchanged\n%s", t1, got, beforeTaskRow)
+	}
+	if got := fx.scalar(t, fmt.Sprintf("SELECT * FROM attempts WHERE id = '%s';", attempt1ID)); got != beforeAttemptRow {
+		t.Errorf("attempt %s row after the manager's cold relaunch =\n%s\nwant unchanged\n%s", attempt1ID, got, beforeAttemptRow)
+	}
+	if got := fx.attemptCount(t, t1); got != 1 {
+		t.Errorf("attempt count for task %s after the manager's cold relaunch = %d, want 1 (no new attempt: only the manager was lost, not the worker)", t1, got)
+	}
+	if got := fx.scalar(t, fmt.Sprintf("SELECT plan_closed_at FROM runs WHERE id = '%s';", fx.runID)); got != beforePlanClosedAt {
+		t.Errorf("plan_closed_at for run %s after the manager's cold relaunch = %q, want unchanged %q (no second plan close)", fx.runID, got, beforePlanClosedAt)
+	}
+	if gotPath, gotBranch, gotBase, _ := fx.worktreeForAttempt(t, attempt1ID); gotPath != worktreePath || gotBranch != worktreeBranch || gotBase != worktreeBase {
+		t.Errorf("worktree for attempt %s after the manager's cold relaunch = (%s, %s, %s), want unchanged (%s, %s, %s)", attempt1ID, gotPath, gotBranch, gotBase, worktreePath, worktreeBranch, worktreeBase)
+	}
+
+	// The worker's own session and lineage are untouched: only the
+	// manager was lost, so the worker warmly reattaches (same session,
+	// never a successor) exactly as
+	// TestRealProcessControllerKillResumeWarmReattach proves for a plain
+	// controller kill.
+	if got := fx.sessionForAttempt(t, attempt1ID); got != worker1SessionID {
+		t.Errorf("worker session for attempt %s after the manager's cold relaunch = %s, want unchanged %s (warm reattach, not a relaunch)", attempt1ID, got, worker1SessionID)
+	}
+	if got := fx.scalar(t, fmt.Sprintf("SELECT count(*) FROM sessions WHERE attempt_id = '%s';", attempt1ID)); got != "1" {
+		t.Errorf("session count for attempt %s after the manager's cold relaunch = %s, want 1 (the worker was never relaunched)", attempt1ID, got)
+	}
+
+	// Exactly one predecessor manager session, now lost, plus its
+	// successor: the manager-uniqueness index admits the successor only
+	// once the predecessor is terminal
+	// (usecase_featureresume.go's coldRelaunchFeatureSession).
+	if got := fx.scalar(t, fmt.Sprintf("SELECT count(*) FROM sessions WHERE run_id = '%s' AND role = 'manager';", fx.runID)); got != "2" {
+		t.Errorf("manager session count for run %s after one cold relaunch = %s, want 2 (the original, now lost, plus the relaunch's)", fx.runID, got)
+	}
+	if got := fx.scalar(t, fmt.Sprintf("SELECT count(*) FROM sessions WHERE run_id = '%s' AND role = 'manager' AND state = 'lost';", fx.runID)); got != "1" {
+		t.Errorf("lost manager-session count for run %s = %s, want 1 (the original, retired incarnation)", fx.runID, got)
+	}
+	if got := fx.scalar(t, fmt.Sprintf("SELECT count(*) FROM operations WHERE run_id = '%s' AND kind = 'absence.attested';", fx.runID)); got == "0" {
+		t.Errorf("no absence.attested operation recorded for run %s after --confirm-absent=%s", fx.runID, managerSessionID)
+	}
+
+	newManagerSessionID := fx.managerSessionID(t)
+	if newManagerSessionID == managerSessionID {
+		t.Fatalf("manager session after the cold relaunch = %s, want a new session distinct from the killed %s", newManagerSessionID, managerSessionID)
+	}
+
+	// The relaunched claim's argv carries the manager's continuation
+	// prompt: recompute the claim's canonical hop-argv-v1 digest from
+	// durable facts alone — the claim's own recorded executable, the
+	// adjacent --resume <native-ref> pair, and the byte-for-byte manager
+	// continuation prompt built from the run's frozen assignment, role
+	// and worker-protocol-crib artifact paths and the hop path the
+	// relaunched manager itself observed in that prompt — and require it
+	// to equal the recorded digest, exactly as
+	// TestRealProcessConfirmAbsentColdRelaunchNonRestart does for a
+	// worker. A prompt-less or reshaped relaunch argv fails this equality
+	// (and fails requireResumeShape's own strict validation inside the
+	// fixture before ever reaching this point, shared by every role).
+	newClaimExecutable := fx.scalar(t, fmt.Sprintf("SELECT executable FROM launch_claims WHERE session_id = '%s';", newManagerSessionID))
+	newClaimDigest := fx.scalar(t, fmt.Sprintf("SELECT argv_digest FROM launch_claims WHERE session_id = '%s';", newManagerSessionID))
+	if newClaimExecutable == "" || newClaimDigest == "" {
+		t.Fatalf("no launch claim recorded for the relaunched manager session %s", newManagerSessionID)
+	}
+	nativeRef := fx.scalar(t, fmt.Sprintf("SELECT DISTINCT native_session_ref FROM sessions WHERE run_id = '%s' AND role = 'manager';", fx.runID))
+	if nativeRef == "" || strings.Contains(nativeRef, "\n") {
+		t.Fatalf("the manager lineage for run %s does not carry one shared native session reference; got %q", fx.runID, nativeRef)
+	}
+	newIncarnationID := fx.scalar(t, fmt.Sprintf("SELECT incarnation_id FROM runtime_bindings WHERE session_id = '%s' ORDER BY observed_at DESC LIMIT 1;", newManagerSessionID))
+	if newIncarnationID == "" {
+		t.Fatalf("no runtime binding recorded for the relaunched manager session %s", newManagerSessionID)
+	}
+
+	managerObs := waitForManagerObservation(t, filepath.Join(scratchDir, "manager-observed.txt"), newIncarnationID)
+	hopPath := managerObs.Fields["hop_path"]
+	if hopPath == "" {
+		t.Fatalf("the relaunched manager's observation dump records no hop_path (parsed from the continuation prompt)")
+	}
+	assignmentPath := filepath.Join(fx.stateDir, "runs", fx.runID, "artifacts", "assignment.md")
+	rolePath := filepath.Join(fx.stateDir, "runs", fx.runID, "artifacts", "roles", "manager.md")
+	cribPath := filepath.Join(fx.stateDir, "runs", fx.runID, "artifacts", "worker-protocol.md")
+	wantArgv := []string{newClaimExecutable, "--resume", nativeRef, testManagerContinuationPrompt(assignmentPath, rolePath, cribPath, hopPath)}
+	if got := testLaunchArgvDigest(wantArgv); got != newClaimDigest {
+		t.Errorf("relaunched manager claim argv digest = %s, want %s for %q — the claim's argv must be exactly `<claude> --resume <native-ref> <continuation prompt>`", newClaimDigest, got, wantArgv)
+	}
+
+	// Only now — after both kills and the manager's own cold relaunch —
+	// does the worker's send gate come down, so its barrier question is
+	// sent into a world where the relaunched manager is the only live
+	// one.
+	if err := os.Remove(sendGatePath); err != nil {
+		t.Fatalf("remove worker-hold send gate control file: %v", err)
+	}
+
+	// The relaunched manager resumes its section 7 duties: it relays the
+	// worker's own barrier question — sent only after the gate above came
+	// down, so the ORIGINAL manager never had a chance to see it — to the
+	// human, and, once answered, forwards the answer back so the worker
+	// releases and submits. Both acts are attributed to newManagerSessionID
+	// directly from the message rows, not merely inferred from the run
+	// completing: a manager that comes back mute would leave the relayed
+	// question, and therefore the whole run, stuck here forever, failing
+	// this wait rather than any later one, and a run that somehow
+	// completed without the relaunched manager's own hand in it would
+	// fail these two identity checks instead of passing for the wrong
+	// reason.
+	fx.requireTaskStateNeverReconciling(t, t1, "active", "checking", "completed", "integrating", "integrated")
+	question := fx.relayedQuestionFor(t, worker1SessionID)
+	if got := fx.messageBodyContent(t, question); got != fixtureHoldMarker+"\n" {
+		t.Errorf("relayed question %s body = %q, want the barrier marker unchanged", question, got)
+	}
+	if got := fx.scalar(t, fmt.Sprintf("SELECT sender_session_id FROM messages WHERE id = '%s';", question)); got != newManagerSessionID {
+		t.Errorf("relayed question %s sender_session_id = %s, want the relaunched manager session %s (the ORIGINAL manager was already dead by the precondition check above)", question, got, newManagerSessionID)
+	}
+	workerQuestionID := fx.scalar(t, fmt.Sprintf("SELECT relayed_from FROM messages WHERE id = '%s';", question))
+	if workerQuestionID == "" {
+		t.Fatalf("relayed question %s carries no relayed_from back to the worker's own original question", question)
+	}
+	fx.answerHuman(t, question, "released")
+
+	var forwardID string
+	if !waitUntil(func() bool {
+		forwardID = fx.scalar(t, fmt.Sprintf("SELECT id FROM messages WHERE kind = 'answer' AND reply_to = '%s';", workerQuestionID))
+		return forwardID != ""
+	}) {
+		t.Fatalf("no answer ever forwarded to the worker's own barrier question %s", workerQuestionID)
+	}
+	if got := fx.scalar(t, fmt.Sprintf("SELECT sender_session_id FROM messages WHERE id = '%s';", forwardID)); got != newManagerSessionID {
+		t.Errorf("forwarded answer %s sender_session_id = %s, want the relaunched manager session %s", forwardID, got, newManagerSessionID)
+	}
+
+	fx.requireTaskStateNeverReconciling(t, t1, "completed", "integrating", "integrated")
+	fx.requireIntegrationState(t, t1, "integrated")
+	reviewTask := fx.requireReviewTask(t)
+	fx.requireTaskState(t, reviewTask, "completed")
+	if verdict, ok := fx.reviewVerdict(t, reviewTask); !ok || verdict != "approve" {
+		t.Errorf("review verdict for task %s = %q (ok=%v), want \"approve\"", reviewTask, verdict, ok)
+	}
+
+	fx.requireRunState(t, "completed")
+	fx.requireSessionState(t, newManagerSessionID, "terminated")
+}

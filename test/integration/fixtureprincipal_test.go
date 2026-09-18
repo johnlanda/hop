@@ -63,6 +63,19 @@ const (
 	postForwardBarrierObservedFile = "manager-post-forward-observed.txt"
 )
 
+// workerHoldSendGateControlFile and workerHoldSendGateObservedFile mirror
+// the identically named constants inside fixtureWorkerSource: the opt-in
+// gate file a test creates under a worker-hold attempt's own scratch
+// directory before starting the run, held until the file is removed, and
+// the fixed PREFIX of the observation the gate dumps before blocking
+// (suffixed "-<attempt id>.txt" like every sibling dump, since the
+// control file itself gates every worker-hold attempt in the run
+// uniformly while each attempt's own observation must not collide).
+const (
+	workerHoldSendGateControlFile  = "worker-hold-send-gate"
+	workerHoldSendGateObservedFile = "worker-hold-send-gate-observed"
+)
+
 // fakeHopSource is a minimal, scriptable stand-in for the real hop binary
 // — the handwritten-fake law (design's review brief): it validates each
 // supported verb's real argv/context contract before ever returning a
@@ -1763,6 +1776,157 @@ func TestFixtureManagerVerdictRejectedCorrelation(t *testing.T) {
 	})
 }
 
+// runNeedsReworkCase drives the compiled fixture principal as a manager
+// against ONE scripted info notice at noticeBodyPath, reporting whether it
+// retried task t1 (parseNeedsReworkLabel matched and hop task retry ran)
+// and its stdout for further assertions. A harmless evidence-inconsistent
+// status shortfall is scripted so a non-matching notice's fallback path
+// (statusOutcomeForNotice, hop status) has something safe to correlate
+// against rather than an unset fake-hop default.
+func runNeedsReworkCase(t *testing.T, artifacts *artifactDir, noticeBodyPath string) (retried bool, stdout string) {
+	t.Helper()
+	fx := buildManagerScriptDispatchFixture(t, artifacts)
+	scriptDir := filepath.Dir(fx.counterPath)
+	block := fakeMessageBlock("cccccccc-0000-4000-8000-000000000001", "info", "controller", "", "", noticeBodyPath)
+	scriptPath, indexPath := writeFakeHopMsgScript(t, scriptDir, []string{block})
+
+	const rolePath, cribPath = "/state/runs/a1/artifacts/roles/manager.md", "/state/runs/a1/artifacts/worker-protocol.md"
+	prompt := testManagerInitialPrompt(fx.assignmentPath, rolePath, cribPath, fx.fakeHop)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, fx.principal, "--session-id", "22222222-2222-2222-2222-222222222222", prompt) //nolint:gosec // G204: fixed test-owned binary and arguments.
+	cmd.Dir = fx.cwd
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOP_STATE_DIR=" + fx.stateDir,
+		"HOP_RUN_ID=" + fx.runID,
+		"HOP_SESSION_ID=33333333-3333-3333-3333-333333333333",
+		"HOP_INCARNATION_ID=44444444-4444-4444-4444-444444444444",
+		"HOP_ROLE=manager",
+		"FAKE_HOP_MSG_SCRIPT=" + scriptPath,
+		"FAKE_HOP_MSG_INDEX=" + indexPath,
+		"FAKE_HOP_TASK_COUNTER_FILE=" + fx.counterPath,
+		"FAKE_HOP_LOG=" + fx.logPath,
+		"FAKE_HOP_STATUS_SHORTFALL=evidence-inconsistent",
+	}
+	var out strings.Builder
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	_ = cmd.Run() //nolint:errcheck // the context deadline killing this intentionally endless manager is the expected outcome once its scripted notice is exhausted, asserted on its captured stdout below, never on this error.
+	stdout = out.String()
+	return strings.Contains(stdout, "FIXTURE-RETRIED label=[t1]"), stdout
+}
+
+// TestFixtureManagerNeedsReworkNoticeShapes proves parseNeedsReworkLabel
+// recognizes BOTH production notice renderers' shapes with an ANCHORED,
+// exact-line match, never pinned to either renderer's own line position
+// (design section 7 promises only "a needs-rework notice") and never a
+// substring search, so a reason or evidence line merely naming
+// "needs-rework", or the task line appearing at any position other than
+// the one each shape allows, can never trigger a retry.
+func TestFixtureManagerNeedsReworkNoticeShapes(t *testing.T) {
+	t.Run("task line first (renderTaskNotice: worker interruption, per-task check failure)", func(t *testing.T) {
+		artifacts := newArtifactDir(t)
+		noticePath := filepath.Join(artifacts.dir(t, "notice-bodies"), "notice.txt")
+		if err := os.WriteFile(noticePath, []byte("task t1 needs-rework\nreason: worker self-exit\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		retried, stdout := runNeedsReworkCase(t, artifacts, noticePath)
+		if !retried {
+			t.Errorf("manager did not retry t1 for a renderTaskNotice-shaped body; stdout:\n%s", stdout)
+		}
+	})
+
+	t.Run("task line second (renderIntegrationNotice: merge conflict)", func(t *testing.T) {
+		artifacts := newArtifactDir(t)
+		noticePath := filepath.Join(artifacts.dir(t, "notice-bodies"), "notice.txt")
+		if err := os.WriteFile(noticePath, []byte("integration cccccccc-1111-4ccc-8ccc-cccccccccccc conflicted\ntask t1 needs-rework\nreason: merge conflict\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		retried, stdout := runNeedsReworkCase(t, artifacts, noticePath)
+		if !retried {
+			t.Errorf("manager did not retry t1 for a renderIntegrationNotice-shaped (conflicted) body; stdout:\n%s", stdout)
+		}
+	})
+
+	t.Run("task line second (renderIntegrationNotice: rolled back)", func(t *testing.T) {
+		artifacts := newArtifactDir(t)
+		noticePath := filepath.Join(artifacts.dir(t, "notice-bodies"), "notice.txt")
+		if err := os.WriteFile(noticePath, []byte("integration dddddddd-2222-4ddd-8ddd-dddddddddddd rolled-back\ntask t1 needs-rework\nreason: combined check failed\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		retried, stdout := runNeedsReworkCase(t, artifacts, noticePath)
+		if !retried {
+			t.Errorf("manager did not retry t1 for a renderIntegrationNotice-shaped (rolled-back) body; stdout:\n%s", stdout)
+		}
+	})
+
+	t.Run("task line at any other position never retries", func(t *testing.T) {
+		artifacts := newArtifactDir(t)
+		noticePath := filepath.Join(artifacts.dir(t, "notice-bodies"), "notice.txt")
+		// The task line is real but sits at position 2 behind an
+		// unrecognized first line (not one of renderIntegrationNotice's own
+		// states) — never anchored at a position either shape allows.
+		if err := os.WriteFile(noticePath, []byte("some other notice line\ntask t1 needs-rework\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		retried, stdout := runNeedsReworkCase(t, artifacts, noticePath)
+		if retried {
+			t.Errorf("manager retried t1 for a task line at an unrecognized position; want no retry; stdout:\n%s", stdout)
+		}
+		// A crashed, hung or otherwise notice-dropping manager would ALSO
+		// never print FIXTURE-RETRIED, so the absence above alone proves
+		// nothing: this requires positive evidence the notice was actually
+		// classified and handled as a non-needs-rework notice (the status-
+		// check branch ran and correctly found no match).
+		if !strings.Contains(stdout, "FIXTURE-STATUS-CHECKED matched=[false]") {
+			t.Errorf("manager did not process the notice through the status-check branch; want \"FIXTURE-STATUS-CHECKED matched=[false]\"; stdout:\n%s", stdout)
+		}
+	})
+
+	t.Run("reason line merely naming needs-rework never retries", func(t *testing.T) {
+		artifacts := newArtifactDir(t)
+		noticePath := filepath.Join(artifacts.dir(t, "notice-bodies"), "notice.txt")
+		// A substring search would wrongly match this: "needs-rework" and
+		// even "task t1" both appear, but never as an anchored, exact line.
+		if err := os.WriteFile(noticePath, []byte("integration eeeeeeee-3333-4eee-8eee-eeeeeeeeeeee conflicted\nreason: see task t1 needs-rework for context\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		retried, stdout := runNeedsReworkCase(t, artifacts, noticePath)
+		if retried {
+			t.Errorf("manager retried t1 for a reason line merely mentioning needs-rework; want no retry (anchored match only); stdout:\n%s", stdout)
+		}
+		// Same positive-evidence requirement as the sibling subtest above.
+		if !strings.Contains(stdout, "FIXTURE-STATUS-CHECKED matched=[false]") {
+			t.Errorf("manager did not process the notice through the status-check branch; want \"FIXTURE-STATUS-CHECKED matched=[false]\"; stdout:\n%s", stdout)
+		}
+	})
+
+	t.Run("integration state outside the recognized set never retries", func(t *testing.T) {
+		artifacts := newArtifactDir(t)
+		noticePath := filepath.Join(artifacts.dir(t, "notice-bodies"), "notice.txt")
+		// The task line sits at exactly the position renderIntegrationNotice
+		// uses, but "integrated" is not one of integrationNoticeStates's own
+		// two tokens ("conflicted"/"rolled-back") — production never renders
+		// this shape (an integrated candidate carries no needs-rework line),
+		// but the parser must still reject it by the state token, not merely
+		// by line position, or a bug that dropped the state check entirely
+		// would go uncaught.
+		if err := os.WriteFile(noticePath, []byte("integration ffffffff-4444-4fff-8fff-ffffffffffff integrated\ntask t1 needs-rework\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		retried, stdout := runNeedsReworkCase(t, artifacts, noticePath)
+		if retried {
+			t.Errorf("manager retried t1 for an integration state outside the recognized set; want no retry; stdout:\n%s", stdout)
+		}
+		// Same positive-evidence requirement as the sibling subtests above.
+		if !strings.Contains(stdout, "FIXTURE-STATUS-CHECKED matched=[false]") {
+			t.Errorf("manager did not process the notice through the status-check branch; want \"FIXTURE-STATUS-CHECKED matched=[false]\"; stdout:\n%s", stdout)
+		}
+	})
+}
+
 // TestFixtureReviewerRejectOnce drives the compiled fixture principal as a
 // reviewer-reject-once reviewer (HOP_ROLE=reviewer) TWICE against the fake
 // hop stub, sharing the same HOP_STATE_DIR/HOP_RUN_ID across both
@@ -1977,6 +2141,177 @@ func TestFixtureWorkerHoldBarrier(t *testing.T) {
 	}
 	if want := fmt.Sprintf("%d", len(answerContent)); answerObs.Fields["bytes"] != want {
 		t.Errorf("answer observation bytes = %q, want %q", answerObs.Fields["bytes"], want)
+	}
+}
+
+// workerHoldSendGateFixture is the shared setup for
+// TestFixtureWorkerHoldSendGate's disabled/enabled subtests: a
+// worker-hold implementer whose barrier release is already scripted,
+// ready to drive the compiled fixture worker directly (no herdr) against
+// a fake hop stub.
+type workerHoldSendGateFixture struct {
+	worker, cwd, scratchDir, logPath, attemptID string
+	prompt                                      string
+	env                                         []string
+}
+
+func buildWorkerHoldSendGateFixture(t *testing.T, artifacts *artifactDir) workerHoldSendGateFixture {
+	t.Helper()
+	worker := buildFixtureWorker(t, artifacts)
+	fakeHop := buildFakeHopStub(t, artifacts)
+	repo := newFixtureRepo(t, artifacts, nil, "repo")
+
+	stateDir := artifacts.dir(t, "state")
+	scratchDir := artifacts.dir(t, "worker-hold-send-gate-scratch")
+	const (
+		runID     = "c8c8c8c8-c8c8-4c8c-8c8c-c8c8c8c8c8c8"
+		taskID    = "d9d9d9d9-d9d9-4d9d-8d9d-d9d9d9d9d9d9"
+		attemptID = "eaeaeaea-eaea-4aea-8aea-eaeaeaeaeaea"
+	)
+	assignmentPath := filepath.Join(stateDir, "runs", runID, "attempts", attemptID, "assignment.md")
+	if err := os.MkdirAll(filepath.Dir(assignmentPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(assignmentPath, []byte("# HOP Task Assignment\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	instructionsPath := filepath.Join(stateDir, "runs", runID, "tasks", taskID+".md")
+	if err := os.MkdirAll(filepath.Dir(instructionsPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(instructionsPath, []byte("FIXTURE-BEHAVIOR: worker-hold "+scratchDir+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	scriptDir := artifacts.dir(t, "worker-hold-send-gate-script")
+	answerBody := filepath.Join(scriptDir, "answer-body.txt")
+	if err := os.WriteFile(answerBody, []byte("released\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const msgAnswerID = "fbfbfbfb-2222-4fbf-8222-222222222222"
+	blocks := []string{fakeMessageBlock(msgAnswerID, "answer", "manager-session", "99999999-9999-4999-8999-999999999999", "", answerBody)}
+	scriptPath, indexPath := writeFakeHopMsgScript(t, scriptDir, blocks)
+	logPath := filepath.Join(scriptDir, "log.txt")
+
+	return workerHoldSendGateFixture{
+		worker: worker, cwd: repo.Root, scratchDir: scratchDir, logPath: logPath, attemptID: attemptID,
+		prompt: testAssignmentPrompt(assignmentPath, fakeHop),
+		env: []string{
+			"PATH=" + os.Getenv("PATH"),
+			"HOP_STATE_DIR=" + stateDir,
+			"HOP_RUN_ID=" + runID,
+			"HOP_TASK_ID=" + taskID,
+			"HOP_ATTEMPT_ID=" + attemptID,
+			"HOP_SESSION_ID=fcfcfcfc-8888-4fcf-8666-555555555555",
+			"HOP_INCARNATION_ID=fdfdfdfd-cccc-4fdf-8ccc-cccccccccccc",
+			"HOP_ROLE=implementer",
+			"FAKE_HOP_MSG_SCRIPT=" + scriptPath,
+			"FAKE_HOP_MSG_INDEX=" + indexPath,
+			"FAKE_HOP_LOG=" + logPath,
+		},
+	}
+}
+
+// TestFixtureWorkerHoldSendGate proves the worker-hold send gate
+// (fixtureworker_test.go's workerHoldSendGateControlFile) in isolation:
+// disabled (the gate file absent — every existing scenario's own shape)
+// sends the barrier question immediately and never engages the gate at
+// all, while enabled (the gate file present) blocks until it is removed,
+// proven across a bounded negative window rather than a single snapshot,
+// since a gate that returns instantly instead of actually holding still
+// leaves a real race window a lucky snapshot could win.
+func TestFixtureWorkerHoldSendGate(t *testing.T) {
+	t.Run("Disabled", testFixtureWorkerHoldSendGateDisabled)
+	t.Run("Enabled", testFixtureWorkerHoldSendGateEnabled)
+}
+
+func testFixtureWorkerHoldSendGateDisabled(t *testing.T) {
+	artifacts := newArtifactDir(t)
+	fx := buildWorkerHoldSendGateFixture(t, artifacts)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, fx.worker, "--session-id", "fcfcfcfc-8888-4fcf-8666-555555555555", fx.prompt) //nolint:gosec // G204: fixed test-owned binary and arguments.
+	cmd.Dir = fx.cwd
+	cmd.Env = fx.env
+	var out strings.Builder
+	cmd.Stdout, cmd.Stderr = &out, &out
+	cmd.Stdin = strings.NewReader("FIXTURE-QUIT\n")
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("run fixture worker-hold: %v\nstdout/stderr:\n%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "FIXTURE-HOLD-SENT") {
+		t.Errorf("worker-hold stdout missing FIXTURE-HOLD-SENT with the gate file absent; got:\n%s", out.String())
+	}
+	if _, err := os.Stat(filepath.Join(fx.scratchDir, workerHoldSendGateObservedFile+"-"+fx.attemptID+".txt")); err == nil {
+		t.Error("the send-gate observation file exists with the gate file never created; the gate must never engage when disabled")
+	}
+}
+
+func testFixtureWorkerHoldSendGateEnabled(t *testing.T) {
+	artifacts := newArtifactDir(t)
+	fx := buildWorkerHoldSendGateFixture(t, artifacts)
+
+	gatePath := filepath.Join(fx.scratchDir, workerHoldSendGateControlFile)
+	if err := os.WriteFile(gatePath, []byte("FIXTURE-GATE\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, fx.worker, "--session-id", "fcfcfcfc-8888-4fcf-8666-555555555555", fx.prompt) //nolint:gosec // G204: fixed test-owned binary and arguments.
+	cmd.Dir = fx.cwd
+	cmd.Env = fx.env
+	var out syncOutput
+	cmd.Stdout, cmd.Stderr = &out, &out
+	cmd.Stdin = strings.NewReader("FIXTURE-QUIT\n")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start fixture worker-hold: %v", err)
+	}
+	var (
+		waitOnce sync.Once
+		waitErr  error
+	)
+	wait := func() error {
+		waitOnce.Do(func() { waitErr = cmd.Wait() })
+		return waitErr
+	}
+	t.Cleanup(func() {
+		if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			t.Logf("cleanup: kill fixture worker: %v", err)
+		}
+		if err := wait(); err != nil {
+			t.Logf("cleanup: reap fixture worker: %v", err)
+		}
+	})
+
+	if !waitUntil(func() bool {
+		_, err := os.Stat(filepath.Join(fx.scratchDir, workerHoldSendGateObservedFile+"-"+fx.attemptID+".txt"))
+		return err == nil
+	}) {
+		t.Fatalf("worker-hold never observed the send gate; output so far:\n%s", out.snapshot())
+	}
+	// A single snapshot taken right after the observed marker cannot
+	// reliably detect a gate that returns instantly instead of actually
+	// holding -- there is still a real race window before an
+	// already-in-flight send. Polling repeatedly across a bounded,
+	// generous negative window proves the gate actually held.
+	const negativeWindow = 2 * time.Second
+	const negativePoll = 50 * time.Millisecond
+	for deadline := time.Now().Add(negativeWindow); time.Now().Before(deadline); time.Sleep(negativePoll) {
+		if strings.Contains(out.snapshot(), "FIXTURE-HOLD-SENT") {
+			t.Fatalf("worker-hold sent its barrier question before the gate file was ever removed; output:\n%s", out.snapshot())
+		}
+	}
+
+	if err := os.Remove(gatePath); err != nil {
+		t.Fatalf("remove send gate control file: %v", err)
+	}
+	if !waitUntil(func() bool { return strings.Contains(out.snapshot(), "FIXTURE-HOLD-SENT") }) {
+		t.Fatalf("worker-hold never sent its barrier question after the gate file was removed; output so far:\n%s", out.snapshot())
+	}
+	if err := wait(); err != nil {
+		t.Fatalf("worker-hold did not exit cleanly after FIXTURE-QUIT: %v; output:\n%s", err, out.snapshot())
 	}
 }
 

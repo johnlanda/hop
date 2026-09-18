@@ -175,6 +175,277 @@ func (f *featureRun) requireTaskState(t *testing.T, taskID string, want ...strin
 	}
 }
 
+// reconciledSessionID returns the id of the first session belonging to
+// this run that the transitions journal has ever recorded going to
+// "reconciling", or "" if none has, regardless of the transition's own
+// recorded reason. The journal is append-only, so one query answers this
+// regardless of when it is asked. Since docs/plan/phase-3-design.md
+// section 6's live launch corroboration, a session that reconciles under
+// the live launch-corroboration reason IS later revisited by
+// CorroborateSessionLaunches and may settle on its own — see
+// evaluateReconcilingGuard, which applies that distinction; every OTHER
+// reconciling transition remains a durable, silent wedge, since nothing
+// ever revisits it. A caller that wants the reason-aware, bounded rule
+// should use requireTaskStateNeverReconciling instead: this raw check
+// stays useful only where ANY reconciling transition at all, legitimate
+// or not, would already indict the narrower window the caller is
+// independently proving (workerlaunchvanish_test.go's own use, ahead of
+// the point that window is even meant to close).
+func (f *featureRun) reconciledSessionID(t *testing.T) string {
+	t.Helper()
+	return f.scalar(t, fmt.Sprintf(
+		"SELECT entity_id FROM transitions WHERE entity_kind = 'session' AND to_state = 'reconciling' "+
+			"AND entity_id IN (SELECT id FROM sessions WHERE run_id = '%s') ORDER BY at LIMIT 1;",
+		f.runID))
+}
+
+// reconcilingLiveLaunchCorroborationReason is RETYPED from
+// internal/app/usecase_sessioncorroborate.go's own exported
+// TransitionReasonLaunchCorroboration literal — deliberately never
+// imported (this package's own AGENTS.md: expected values are retyped,
+// never derived, and its principals cannot import internal/app in the
+// first place). This guard is an INDEPENDENT check on production's own
+// reason text: retyped, a drift in production's literal fails this guard
+// instead of silently following it.
+const reconcilingLiveLaunchCorroborationReason = "launch corroboration: another process on the pane carries the launch identity; re-inspected every pass"
+
+// reconcilingLiveBound is how long a session may stay "reconciling" under
+// the live launch-corroboration reason (docs/plan/phase-3-design.md
+// section 6: a transient fork-window classification a later clean
+// observation settles on its own) before this guard treats it as a wedge
+// instead.
+const reconcilingLiveBound = 30 * time.Second
+
+// reconcileTransition is one recorded transition either into or out of
+// "reconciling" for one session, as read from the transitions journal.
+// Reason is populated only for an entry (a transition INTO reconciling);
+// an exit's own to_state carries no rule this guard cares about.
+type reconcileTransition struct {
+	SessionID, At, Reason string
+}
+
+// parseReconcileTransitions parses rows of "|"-joined fields ("session_id
+// | at" for an exit list, "session_id | at | reason" for an entry list)
+// as f.scalar renders a multi-row SELECT (one row per line), in the
+// journal's own oldest-first order.
+func parseReconcileTransitions(t *testing.T, rows string, withReason bool) []reconcileTransition {
+	t.Helper()
+	fields := 2
+	if withReason {
+		fields = 3
+	}
+	var out []reconcileTransition
+	for _, row := range strings.Split(rows, "\n") {
+		if row == "" {
+			continue
+		}
+		parts := strings.SplitN(row, "|", fields)
+		if len(parts) != fields {
+			t.Fatalf("unparseable reconciling transition row %q (want %d fields)", row, fields)
+		}
+		entry := reconcileTransition{SessionID: parts[0], At: parts[1]}
+		if withReason {
+			entry.Reason = parts[2]
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+// sessionReconcileEntries lists, oldest first, every transition any
+// session of this run has ever made INTO "reconciling", with the reason
+// each one was recorded under.
+func (f *featureRun) sessionReconcileEntries(t *testing.T) []reconcileTransition {
+	t.Helper()
+	rows := f.scalar(t, fmt.Sprintf(
+		"SELECT entity_id || '|' || at || '|' || reason FROM transitions WHERE entity_kind = 'session' AND to_state = 'reconciling' "+
+			"AND entity_id IN (SELECT id FROM sessions WHERE run_id = '%s') ORDER BY at, rowid;",
+		f.runID))
+	return parseReconcileTransitions(t, rows, true)
+}
+
+// sessionReconcileExits lists, oldest first, every transition any session
+// of this run has ever made OUT of "reconciling" (to whatever state:
+// active via settlement, or terminated via a stop or a failure sweep —
+// this guard only cares that the session left, not where it went).
+func (f *featureRun) sessionReconcileExits(t *testing.T) []reconcileTransition {
+	t.Helper()
+	rows := f.scalar(t, fmt.Sprintf(
+		"SELECT entity_id || '|' || at FROM transitions WHERE entity_kind = 'session' AND from_state = 'reconciling' "+
+			"AND entity_id IN (SELECT id FROM sessions WHERE run_id = '%s') ORDER BY at, rowid;",
+		f.runID))
+	return parseReconcileTransitions(t, rows, false)
+}
+
+// evaluateReconcilingGuard applies docs/plan/phase-3-design.md section 6's
+// live launch-corroboration rule to entries (every transition a run's
+// sessions have ever made into "reconciling", oldest first) and exits
+// (every transition out of it, oldest first), evaluated fresh against the
+// journal rather than a state snapshot — the journal alone can tell a
+// session that already resolved from one still open, which a single
+// sessions.state read cannot. now is the caller's own wall-clock read,
+// compared against the journal's canonical RFC3339Nano timestamps.
+//
+// Pairs each entry with the next unconsumed exit for the SAME session at
+// or after that entry's own timestamp (FIFO, since neither list can
+// interleave two entries for one session without an intervening exit —
+// markSessionReconciling is idempotent while a session stays reconciling,
+// and the entry that mismatches its allowed reason is caught, and this
+// function stops, before a second entry for that session is ever
+// examined).
+//
+// Returns violation naming the first rule broken, if any: an entry
+// recorded under any reason but reconcilingLiveLaunchCorroborationReason
+// is a wedge at once, whether or not it ever left; a legitimate entry
+// that stays reconciling past reconcilingLiveBound is a wedge too,
+// whether it exceeded the bound before leaving or is still open past it
+// now — the run itself completing first proves nothing on its own (a
+// session that stayed reconciling for the run's entire remaining life is
+// exactly the wedge this guard exists to catch, not an exemption from it).
+//
+// Otherwise, pending reports whether any legitimate entry is still open
+// AND still inside its bound: NOT a pass (a still-open episode could yet
+// become a permanent wedge, or run out its own clock, before its next
+// observation) and NOT a failure (a legitimate transient reconciliation
+// in progress) — the caller must wait out the remainder of the bound and
+// re-evaluate rather than deciding either way from this one read.
+func evaluateReconcilingGuard(entries, exits []reconcileTransition, now time.Time) (violation string, pending bool, err error) {
+	exitsBySession := make(map[string][]string, len(exits))
+	for _, exit := range exits {
+		exitsBySession[exit.SessionID] = append(exitsBySession[exit.SessionID], exit.At)
+	}
+	consumed := make(map[string]int, len(entries))
+	for _, entry := range entries {
+		if entry.Reason != reconcilingLiveLaunchCorroborationReason {
+			return fmt.Sprintf("session %s entered reconciling with reason %q, not the live launch-corroboration reason %q; any other reconciling transition is a wedge",
+				entry.SessionID, entry.Reason, reconcilingLiveLaunchCorroborationReason), false, nil
+		}
+		enteredAt, parseErr := time.Parse(time.RFC3339Nano, entry.At)
+		if parseErr != nil {
+			return "", false, fmt.Errorf("parse session %s reconciling entry timestamp %q: %w", entry.SessionID, entry.At, parseErr)
+		}
+
+		var leftAt string
+		var leftTime time.Time
+		found := false
+		candidates := exitsBySession[entry.SessionID]
+		for i := consumed[entry.SessionID]; i < len(candidates); i++ {
+			consumed[entry.SessionID] = i + 1
+			exitTime, parseErr := time.Parse(time.RFC3339Nano, candidates[i])
+			if parseErr != nil {
+				return "", false, fmt.Errorf("parse session %s reconciling exit timestamp %q: %w", entry.SessionID, candidates[i], parseErr)
+			}
+			// Defensive: production's markSessionReconciling is idempotent
+			// while a session stays reconciling, so entries and exits for
+			// one session strictly alternate and an exit can never precede
+			// its own entry — this comparison holds on every real exit the
+			// journal can produce. Kept as a guard against clock skew
+			// rather than assumed: if it ever failed, treating the entry
+			// as still open (never matched) is the safe direction, a false
+			// failure rather than a false pass.
+			if !exitTime.Before(enteredAt) {
+				leftAt, leftTime, found = candidates[i], exitTime, true
+				break
+			}
+		}
+
+		if found {
+			if leftTime.Sub(enteredAt) > reconcilingLiveBound {
+				return fmt.Sprintf("session %s stayed reconciling for %s (entered %s, left %s), exceeding the %s bound",
+					entry.SessionID, leftTime.Sub(enteredAt), entry.At, leftAt, reconcilingLiveBound), false, nil
+			}
+			continue
+		}
+
+		elapsed := now.Sub(enteredAt)
+		if elapsed > reconcilingLiveBound {
+			return fmt.Sprintf("session %s has been reconciling since %s (%s ago) with no transition out of it yet, exceeding the %s bound",
+				entry.SessionID, entry.At, elapsed, reconcilingLiveBound), false, nil
+		}
+		pending = true
+	}
+	return "", pending, nil
+}
+
+// reconcilingGuard reads this run's own transitions journal and applies
+// evaluateReconcilingGuard against the current wall clock.
+func (f *featureRun) reconcilingGuard(t *testing.T) (violation string, pending bool) {
+	t.Helper()
+	entries := f.sessionReconcileEntries(t)
+	if len(entries) == 0 {
+		return "", false
+	}
+	exits := f.sessionReconcileExits(t)
+	violation, pending, err := evaluateReconcilingGuard(entries, exits, time.Now())
+	if err != nil {
+		t.Fatalf("evaluate reconciling guard for run %s: %v", f.runID, err)
+	}
+	return violation, pending
+}
+
+// requireTaskStateNeverReconciling is requireTaskState, additionally
+// enforcing docs/plan/phase-3-design.md section 6's reconciling rule while
+// it waits: a session may enter "reconciling" only under the live
+// launch-corroboration reason, and must leave it within reconcilingLiveBound
+// — any other reconciling transition, or one that overruns the bound,
+// fails at once rather than only after the full featureRunTimeout. A
+// still-open, still-in-bound reconciliation is neither a pass nor a
+// failure (evaluateReconcilingGuard's pending result): reaching one of
+// want while such an episode is open does NOT end the wait, since letting
+// the task's own state decide it would pass a run that completes while a
+// session is still silently wedged — the exact failure mode this guard
+// exists to catch. sawWant LATCHES the instant want is observed rather
+// than re-testing taskState only once no episode is pending: want may be
+// a state the task only passes through (never rests in), and a pending
+// episode can span exactly the polls that would have observed it, so
+// re-deriving "reached want" from a LATER poll's state would silently
+// miss it — the wait would then burn the full featureRunTimeout and fail
+// naming whatever state the task moved on to, not the reconciliation that
+// actually caused the miss.
+func (f *featureRun) requireTaskStateNeverReconciling(t *testing.T, taskID string, want ...string) {
+	t.Helper()
+	var state, violation string
+	sawWant := false
+	reached := waitUntilDeadline(featureRunTimeout, func() bool {
+		var pending bool
+		violation, pending = f.reconcilingGuard(t)
+		if violation == "" {
+			state = f.taskState(t, taskID)
+			sawWant = sawWant || slices.Contains(want, state)
+		}
+		return reconcilingWaitStop(violation, pending, sawWant)
+	})
+	if violation != "" {
+		t.Fatalf("task %s: %s", taskID, violation)
+	}
+	if !reached {
+		t.Fatalf("task %s ended %q, want one of %v after %s", taskID, state, want, featureRunTimeout)
+	}
+}
+
+// reconcilingWaitStop is requireTaskStateNeverReconciling's own per-poll
+// decision, pulled out as a pure function so the poll loop itself — never
+// exercised by evaluateReconcilingGuard's own tests, which drive the
+// guard directly rather than the loop wrapped around it — has something
+// to test directly (TestReconcilingWaitStop): violation (from
+// reconcilingGuard) ends the wait at once, before sawWant is ever
+// consulted, since a wedge must fail regardless of whatever want state
+// happened to be observed already; a still-open pending episode never
+// ends the wait, whatever sawWant holds; otherwise the wait ends once
+// sawWant is true — sawWant, not the CURRENT state, since want may be a
+// state the caller's task only passes through rather than rests in, and
+// a pending episode can span exactly the polls that would have observed
+// it.
+func reconcilingWaitStop(violation string, pending, sawWant bool) bool {
+	if violation != "" {
+		return true
+	}
+	if pending {
+		return false
+	}
+	return sawWant
+}
+
 // currentAttempt returns taskID's most recent (highest-numbered) attempt.
 func (f *featureRun) currentAttempt(t *testing.T, taskID string) (attemptID string, number int) {
 	t.Helper()
@@ -538,6 +809,26 @@ func (f *featureRun) requireCombinedCheckPassed(t *testing.T, candidateCommit st
 	}
 }
 
+// requireCombinedCheckFailed is requireCombinedCheckPassed's negative
+// sibling: asserts a PERSISTED, failed combined check (kind=check.run,
+// state=failed) whose subject commit is exactly candidateCommit and
+// whose outcome records exitCode — the actual guard evidence a scenario
+// proving a combined-check failure needs, rather than inferring the
+// failure from task/integration states and the check script alone.
+func (f *featureRun) requireCombinedCheckFailed(t *testing.T, candidateCommit string, exitCode int) {
+	t.Helper()
+	row := f.scalar(t, fmt.Sprintf(
+		`SELECT count(*) FROM operations WHERE run_id = '%s' AND kind = 'check.run' AND state = 'failed' AND intent LIKE '%%"subject_commit_oid":%q%%' AND outcome LIKE '%%"exit_code":%d%%';`,
+		f.runID, candidateCommit, exitCode))
+	n, err := strconv.Atoi(row)
+	if err != nil {
+		t.Fatalf("combined-check failure evidence count %q for candidate %s does not parse: %v", row, candidateCommit, err)
+	}
+	if n == 0 {
+		t.Errorf("no persisted failed combined-check operation (kind=check.run, state=failed, exit_code=%d) found for candidate commit %s (run %s)", exitCode, candidateCommit, f.runID)
+	}
+}
+
 // reviewVerdict reads reviewTaskID's accepted verdict, if any.
 func (f *featureRun) reviewVerdict(t *testing.T, reviewTaskID string) (verdict string, ok bool) {
 	t.Helper()
@@ -829,4 +1120,220 @@ func (f *featureRun) requireSerialIntegrationOrder(t *testing.T) {
 				windows[i-1].TaskID, windows[i-1].UpdatedAt, windows[i].TaskID, windows[i].CreatedAt, windows)
 		}
 	}
+}
+
+// TestReconcilingGuardBounds proves evaluateReconcilingGuard's own rule in
+// isolation, against synthetic transitions-journal rows: no herdr binary,
+// no fixture principal, no real controller — only the rule's own
+// arithmetic over the journal's canonical RFC3339Nano timestamps.
+func TestReconcilingGuardBounds(t *testing.T) {
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	at := func(d time.Duration) string { return base.Add(d).Format(time.RFC3339Nano) }
+	const otherReason = "resume: evidence ambiguous"
+
+	cases := []struct {
+		name          string
+		entries       []reconcileTransition
+		exits         []reconcileTransition
+		now           time.Time
+		wantViolation bool
+		wantPending   bool
+	}{
+		{
+			name: "no entries: neither a violation nor pending",
+			now:  base,
+		},
+		{
+			name:          "wrong reason fails at once, before any bound is even considered",
+			entries:       []reconcileTransition{{SessionID: "s1", At: at(0), Reason: otherReason}},
+			now:           base,
+			wantViolation: true,
+		},
+		{
+			name:    "left within the bound: no violation, not pending",
+			entries: []reconcileTransition{{SessionID: "s1", At: at(0), Reason: reconcilingLiveLaunchCorroborationReason}},
+			exits:   []reconcileTransition{{SessionID: "s1", At: at(10 * time.Second)}},
+			now:     base.Add(20 * time.Second),
+		},
+		{
+			name:          "left, but only after exceeding the bound: a violation",
+			entries:       []reconcileTransition{{SessionID: "s1", At: at(0), Reason: reconcilingLiveLaunchCorroborationReason}},
+			exits:         []reconcileTransition{{SessionID: "s1", At: at(31 * time.Second)}},
+			now:           base.Add(40 * time.Second),
+			wantViolation: true,
+		},
+		{
+			name:        "still open, 5s elapsed: pending, not yet decidable",
+			entries:     []reconcileTransition{{SessionID: "s1", At: at(0), Reason: reconcilingLiveLaunchCorroborationReason}},
+			now:         base.Add(5 * time.Second),
+			wantPending: true,
+		},
+		{
+			name:          "still open, clock advanced past the bound with no exit yet: a violation",
+			entries:       []reconcileTransition{{SessionID: "s1", At: at(0), Reason: reconcilingLiveLaunchCorroborationReason}},
+			now:           base.Add(31 * time.Second),
+			wantViolation: true,
+		},
+		{
+			name: "a second session's wrong reason is still caught after the first resolved cleanly",
+			entries: []reconcileTransition{
+				{SessionID: "s1", At: at(0), Reason: reconcilingLiveLaunchCorroborationReason},
+				{SessionID: "s2", At: at(1 * time.Second), Reason: otherReason},
+			},
+			exits:         []reconcileTransition{{SessionID: "s1", At: at(2 * time.Second)}},
+			now:           base.Add(3 * time.Second),
+			wantViolation: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			violation, pending, err := evaluateReconcilingGuard(tc.entries, tc.exits, tc.now)
+			if err != nil {
+				t.Fatalf("evaluateReconcilingGuard: %v", err)
+			}
+			if (violation != "") != tc.wantViolation {
+				t.Fatalf("violation = %q, want non-empty=%v", violation, tc.wantViolation)
+			}
+			if pending != tc.wantPending {
+				t.Fatalf("pending = %v, want %v", pending, tc.wantPending)
+			}
+		})
+	}
+
+	t.Run("still open at 5s (pending), then leaves at 12s: the SAME episode ends up a pass", func(t *testing.T) {
+		entries := []reconcileTransition{{SessionID: "s1", At: at(0), Reason: reconcilingLiveLaunchCorroborationReason}}
+
+		violation, pending, err := evaluateReconcilingGuard(entries, nil, base.Add(5*time.Second))
+		if err != nil {
+			t.Fatalf("evaluateReconcilingGuard (still open): %v", err)
+		}
+		if violation != "" || !pending {
+			t.Fatalf("at 5s: violation = %q, pending = %v, want empty violation and pending=true", violation, pending)
+		}
+
+		exits := []reconcileTransition{{SessionID: "s1", At: at(12 * time.Second)}}
+		violation, pending, err = evaluateReconcilingGuard(entries, exits, base.Add(13*time.Second))
+		if err != nil {
+			t.Fatalf("evaluateReconcilingGuard (left at 12s): %v", err)
+		}
+		if violation != "" || pending {
+			t.Fatalf("after leaving at 12s: violation = %q, pending = %v, want empty violation and pending=false", violation, pending)
+		}
+	})
+}
+
+// TestReconcilingWaitStop proves requireTaskStateNeverReconciling's own
+// poll-loop decision (reconcilingWaitStop) directly, over scripted poll
+// sequences — evaluateReconcilingGuard's own tests (above) call the
+// guard, never the loop built around it, so the loop's own sequencing
+// (whether a want state observed while an episode is pending is
+// remembered once the episode clears) needs its own coverage. No herdr
+// needed.
+func TestReconcilingWaitStop(t *testing.T) {
+	want := []string{"active"}
+
+	// poll is one scripted reconcilingGuard/taskState observation. drive
+	// replays requireTaskStateNeverReconciling's own loop shape over a
+	// sequence of polls: violation short-circuits before state or sawWant
+	// are touched (mirroring the real loop skipping the taskState read on
+	// a violation); otherwise state updates and sawWant latches whether
+	// want has EVER been seen; reconcilingWaitStop decides whether to
+	// stop, and drive stops iterating the instant it does, exactly as
+	// waitUntilDeadline's own predicate loop would (a real poll loop
+	// never calls the predicate again after it returns true).
+	type poll struct {
+		violation string
+		pending   bool
+		state     string
+	}
+	drive := func(polls []poll) (stopped bool) {
+		sawWant := false
+		for _, p := range polls {
+			violation := p.violation
+			state := ""
+			if violation == "" {
+				state = p.state
+				sawWant = sawWant || slices.Contains(want, state)
+			}
+			if reconcilingWaitStop(violation, p.pending, sawWant) {
+				return true
+			}
+		}
+		return false
+	}
+
+	cases := []struct {
+		name        string
+		polls       []poll
+		wantStopped bool
+	}{
+		{
+			name: "want observed while pending, then the task leaves want and the episode closes: stops",
+			polls: []poll{
+				{pending: true, state: "active"},
+				{pending: true, state: "active"},
+				{state: "completed"},
+				{state: "integrated"},
+			},
+			wantStopped: true,
+		},
+		{
+			name: "want never observed, episode closes: keeps waiting",
+			polls: []poll{
+				{pending: true, state: "ready"},
+				{state: "ready"},
+			},
+			wantStopped: false,
+		},
+		{
+			name: "violation stops immediately, regardless of sawWant",
+			polls: []poll{
+				{violation: "resume: evidence ambiguous", state: "ready"},
+			},
+			wantStopped: true,
+		},
+		{
+			name: "pending with want observed: does not stop while the episode is open",
+			polls: []poll{
+				{pending: true, state: "active"},
+			},
+			wantStopped: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if stopped := drive(tc.polls); stopped != tc.wantStopped {
+				t.Fatalf("stopped = %v, want %v", stopped, tc.wantStopped)
+			}
+		})
+	}
+
+	// The first case above stops only because sawWant LATCHES "active"
+	// across the two pending polls. stateOnlyStop decides from the
+	// CURRENT poll's own state instead of a latched observation — the
+	// shape requireTaskStateNeverReconciling's loop would take without
+	// the latch — and driving the identical sequence through it must NOT
+	// stop, or this table is not actually covering what the latch is for.
+	t.Run("without latching sawWant, the first case above never stops", func(t *testing.T) {
+		polls := []poll{
+			{pending: true, state: "active"},
+			{pending: true, state: "active"},
+			{state: "completed"},
+			{state: "integrated"},
+		}
+		stateOnlyStop := func(violation string, pending bool, state string) bool {
+			if violation != "" {
+				return true
+			}
+			if pending {
+				return false
+			}
+			return slices.Contains(want, state)
+		}
+		for _, p := range polls {
+			if stateOnlyStop(p.violation, p.pending, p.state) {
+				t.Fatal("the state-only decision unexpectedly stopped; this sequence no longer demonstrates what latching sawWant is for")
+			}
+		}
+	})
 }

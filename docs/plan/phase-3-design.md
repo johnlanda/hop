@@ -2585,8 +2585,39 @@ pane and the claimed process are both observed gone
 sequences). The real-process proof of the row covers a manager whose
 harness ends right after exec
 (`TestRealProcessManagerLaunchVanishesBeforeCorroboration`); a worker
-dying before settlement is proved by the app tables now and joins the
-fixture-principal scenarios later.
+dying before settlement is proved by the app tables and by the real-
+process fixture-principal scenario
+`TestRealProcessWorkerLaunchEndsBeforeSettlement`.
+
+A placed-but-uncorroborated child launch across a controller kill
+(`ChildLaunchInFlightAcrossResume`, LAUNCH-5) is deferred as a real-
+process scenario. Two separate windows are both closed to a fixture-only
+barrier, for two different reasons: the FIRST — before a child pane's
+own `hop launch` invocation has execed into its harness at all — cannot
+be held because the pane's placed command there is the controller's own
+executable, resolved once per `hop run`/`hop resume` invocation
+(`cmd/hop/runcmd.go`'s `hopExecutablePath`, called from `runRun`/
+`runResume`) rather than looked up on PATH, so no test-owned stand-in
+can be substituted for it. The SECOND — after that exec, once the
+process is already claude-identified — could in principle be held (a
+gated `claude` PATH stub can hold a claim unsettleable for its whole
+life, as `launchvanish_test.go`'s own vanishing stub shows for the
+manager's launch), but not safely here: the one `claude` stub serves
+EVERY role in this suite, so gating it would force the manager and
+reviewer sessions through the same exec-chain topology that exposes
+WEDGE-1, a forking-wrapper false classification a worker launch can trip
+by accident — unfixed in production, owned by a separate slice.
+`workerlaunchvanish_test.go`'s own scenario avoids tripping it by
+installing the fixture worker directly as `claude` with no exec chain,
+never by gating it. An IN-fixture gate avoids that topology, but
+corroborates within the SAME scheduling pass that placed it regardless
+(`runFeatureSchedulingPass`: `AssignReadyTasks` then
+`CorroborateSessionLaunches`), closing the window before an external
+observer could react — for a reason unrelated to WEDGE-1. This scenario
+stays deferred until WEDGE-1 is fixed in production; a controller-fix
+slice may then make a gated `claude` stub usable for the second window.
+The rule is covered by the app tables for resume's in-flight rule
+(`TestResumeFeatureChildLaunchInFlight` and its siblings).
 
 ## 12. Work breakdown
 
