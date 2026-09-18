@@ -918,8 +918,12 @@ per the decision table (section 4) before any new act.
    only after a server restart, so an unchanged server process with the
    pane gone (positively absent by pane id AND by creation label, each a
    successful observation — an inspection error or an empty-foreground
-   pane that still answers is never absence) cannot have a restore
-   pending; a restart or live handoff changes the identity and fails
+   pane that still answers is never absence) has no restore pending
+   against the session state that process has already persisted — not
+   against a later restart drawing on a stale snapshot inside Herdr's own
+   debounce window, which is a known residual and not this attestation's
+   concern (docs/plan/phase-3-design.md section 4's RESIDUAL (LAUNCH-8));
+   a restart or live handoff changes the identity and fails
    closed. With continuity
    established, HOP's own pending launch claims/intents are retired by
    the relaunch itself. Unknown continuity, inspection errors and any
