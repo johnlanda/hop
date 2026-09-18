@@ -68,10 +68,7 @@ func newVanishFeatureFixtureRepo(t *testing.T, artifacts *artifactDir, server *t
 func TestRealProcessManagerLaunchVanishesBeforeCorroboration(t *testing.T) {
 	artifacts := newArtifactDir(t)
 	server := prepareServer(t, artifacts)
-	stub := filepath.Join(server.base, "bin", "claude")
-	if err := os.WriteFile(stub, []byte(vanishingClaudeStub), 0o755); err != nil { //nolint:gosec // G306: the stub must be executable to reach the exec boundary.
-		t.Fatalf("install vanishing claude stub: %v", err)
-	}
+	writeHarnessStub(t, filepath.Join(server.base, "bin", "claude"), []byte(vanishingClaudeStub))
 	server.start(t)
 	repo := newVanishFeatureFixtureRepo(t, artifacts, server)
 

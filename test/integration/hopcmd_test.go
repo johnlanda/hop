@@ -23,8 +23,29 @@ import (
 // a fresh plugin-shaped staging directory every time.
 func TestMain(m *testing.M) {
 	code := m.Run()
-	if hopBinary.dir != "" {
-		_ = os.RemoveAll(hopBinary.dir) //nolint:errcheck // best-effort process-exit cleanup; a leftover temp dir is not a test failure.
+	// Checked before the cleanup below, which would destroy the evidence: a
+	// shared binary that changed size was written through a stub path that
+	// links to it, and the alternative symptom is an exec failure in some
+	// unrelated, order-dependent test.
+	for _, violation := range []string{
+		checkSharedBinaryIntact("fixture worker", fixtureWorkerBinary.path, fixtureWorkerBinary.fingerprint),
+		checkSharedBinaryIntact("fake hop", fakeHopBinary.path, fakeHopBinary.fingerprint),
+	} {
+		if violation == "" {
+			continue
+		}
+		fmt.Fprintln(os.Stderr, violation)
+		if code == 0 {
+			code = 1
+		}
+	}
+	// Removing these process-scoped MkdirTemp directories is this process
+	// tidying up after itself; it is not, and must never become, a precedent
+	// for removing a retained failure artifact.
+	for _, dir := range []string{hopBinary.dir, fixtureWorkerBinary.dir, fakeHopBinary.dir} {
+		if dir != "" {
+			_ = os.RemoveAll(dir) //nolint:errcheck // best-effort process-exit cleanup; a leftover temp dir is not a test failure.
+		}
 	}
 	os.Exit(code)
 }
@@ -410,7 +431,7 @@ func waitUntilDeadline(deadline time.Duration, condition func() bool) bool {
 // resolution happens at each launch, not once at server start.
 func installFixtureWorkerAsClaudeStub(t *testing.T, server *testServer, workerPath string) {
 	t.Helper()
-	copyExecutable(t, workerPath, filepath.Join(server.base, "bin", "claude"))
+	linkHarnessStub(t, filepath.Join(server.base, "bin", "claude"), workerPath)
 }
 
 // extractRunID parses a controller's captured stdout for its first

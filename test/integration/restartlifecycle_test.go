@@ -137,7 +137,7 @@ func requirePathResolvesClaudeToTheFixture(t *testing.T, server *testServer, art
 func TestRealProcessRestartClosesAndRelaunchesSessions(t *testing.T) {
 	artifacts := newArtifactDir(t)
 	server := prepareServer(t, artifacts)
-	worker := buildFixtureWorker(t, artifacts)
+	worker := buildFixtureWorker(t)
 	installFixtureWorkerAsClaudeStub(t, server, worker)
 	// A restored pane's login shell runs path_helper, which puts the
 	// system directories ahead of the inherited hermetic PATH, so the

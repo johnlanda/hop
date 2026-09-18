@@ -56,7 +56,7 @@ func waitForManagerObservation(t *testing.T, path, incarnationID string) workerO
 func TestRealProcessManagerColdRelaunch(t *testing.T) {
 	artifacts := newArtifactDir(t)
 	server := prepareServer(t, artifacts)
-	worker := buildFixtureWorker(t, artifacts)
+	worker := buildFixtureWorker(t)
 	installFixtureWorkerAsClaudeStub(t, server, worker)
 	server.start(t)
 

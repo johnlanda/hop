@@ -2,7 +2,6 @@ package integration
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -18,10 +17,7 @@ import (
 // scenarios.
 func installBrokenClaudeStub(t *testing.T, server *testServer) {
 	t.Helper()
-	path := filepath.Join(server.base, "bin", "claude")
-	if err := os.WriteFile(path, []byte("this is not a valid executable format\n"), 0o755); err != nil { //nolint:gosec // G306: a deliberately broken stub, exec-bit required to reach the exec boundary at all.
-		t.Fatalf("install broken claude stub: %v", err)
-	}
+	writeHarnessStub(t, filepath.Join(server.base, "bin", "claude"), []byte("this is not a valid executable format\n"))
 }
 
 // TestRealProcessExecFailureSettlesExecFailed proves design section 6 step 7

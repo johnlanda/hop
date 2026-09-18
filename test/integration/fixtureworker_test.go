@@ -2103,33 +2103,79 @@ func fixtureManagerBrief(scratchDir string, tasks []fixtureManagerTask, answers 
 // it under the name "claude" — never anywhere on the real system — so hop
 // launch's PATH-based harness resolution (section 6) finds it exactly as it
 // would the real Claude Code binary.
-func buildFixtureWorker(t *testing.T, artifacts *artifactDir) string {
+// fixtureWorkerBinary caches the single fixture-worker build every test in
+// one `go test` process shares, exactly as hopBinary caches the one
+// ./cmd/hop build. Sharing it saves more than the build: the file is
+// executed once when it is built, and executing that SAME file again costs a
+// small fraction of executing a newly written one, so a per-test build would
+// pay a first execution per test and spend it wherever that test first runs
+// the binary. It is a narrow, process-lifetime mutable global guarded by
+// sync.Once and cleaned up by TestMain; there is no other way to share build
+// state across independent Test functions.
+var fixtureWorkerBinary struct { //nolint:gochecknoglobals // process-lifetime build cache guarded by sync.Once; see comment above.
+	once        sync.Once
+	dir         string
+	path        string
+	err         error
+	fingerprint sharedBinaryFingerprint
+}
+
+func buildFixtureWorker(t *testing.T) string {
 	t.Helper()
-	src := artifacts.dir(t, "fixture-worker-src")
-	if err := os.WriteFile(filepath.Join(src, "go.mod"), []byte("module fixtureworker\n\ngo 1.21\n"), 0o600); err != nil {
-		t.Fatal(err)
+	fixtureWorkerBinary.once.Do(func() {
+		if !strings.Contains(fixtureWorkerSource, strconv.Quote(fixtureWorkerWarmupArgv)) {
+			fixtureWorkerBinary.err = fmt.Errorf("fixtureWorkerWarmupArgv (%q) names no mode in fixtureWorkerSource; warming would fall through to the role dispatch, which spawns a stand-in child this suite would then leak", fixtureWorkerWarmupArgv)
+			return
+		}
+		dir, err := os.MkdirTemp("", "hop-fixture-worker")
+		if err != nil {
+			fixtureWorkerBinary.err = err
+			return
+		}
+		fixtureWorkerBinary.dir = dir
+		src := filepath.Join(dir, "src")
+		if mkErr := os.MkdirAll(src, 0o700); mkErr != nil {
+			fixtureWorkerBinary.err = mkErr
+			return
+		}
+		if writeErr := os.WriteFile(filepath.Join(src, "go.mod"), []byte("module fixtureworker\n\ngo 1.21\n"), 0o600); writeErr != nil {
+			fixtureWorkerBinary.err = writeErr
+			return
+		}
+		if writeErr := os.WriteFile(filepath.Join(src, "main.go"), []byte(fixtureWorkerSource), 0o600); writeErr != nil {
+			fixtureWorkerBinary.err = writeErr
+			return
+		}
+		goBin, err := exec.LookPath("go")
+		if err != nil {
+			fixtureWorkerBinary.err = fmt.Errorf("the go tool is required to build the fixture worker: %w", err)
+			return
+		}
+		out := filepath.Join(dir, "claude")
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		build := exec.CommandContext(ctx, goBin, "build", "-o", out, ".") //nolint:gosec // G204: the go tool builds this test's own generated fixture module.
+		build.Dir = src
+		if combined, buildErr := build.CombinedOutput(); buildErr != nil {
+			fixtureWorkerBinary.err = fmt.Errorf("go build fixture worker: %w\n%s", buildErr, combined)
+			return
+		}
+		// Warmed here, with the build, so the cost is paid once for the
+		// whole process rather than once per test — and paid here, where no
+		// deadline is running.
+		warmExecutable(t, out, fixtureWorkerWarmupArgv)
+		fingerprint, statErr := fingerprintSharedBinary(out)
+		if statErr != nil {
+			fixtureWorkerBinary.err = statErr
+			return
+		}
+		fixtureWorkerBinary.fingerprint = fingerprint
+		fixtureWorkerBinary.path = out
+	})
+	if fixtureWorkerBinary.err != nil {
+		t.Fatalf("build fixture worker: %v", fixtureWorkerBinary.err)
 	}
-	if err := os.WriteFile(filepath.Join(src, "main.go"), []byte(fixtureWorkerSource), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	goBin, err := exec.LookPath("go")
-	if err != nil {
-		t.Fatalf("the go tool is required to build the fixture worker: %v", err)
-	}
-	binDir := artifacts.dir(t, "fixture-worker-bin")
-	out := filepath.Join(binDir, "claude")
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
-	defer cancel()
-	build := exec.CommandContext(ctx, goBin, "build", "-o", out, ".") //nolint:gosec // G204: the go tool builds this test's own generated fixture module.
-	build.Dir = src
-	if combined, buildErr := build.CombinedOutput(); buildErr != nil {
-		t.Fatalf("go build fixture worker: %v\n%s", buildErr, combined)
-	}
-	if !strings.Contains(fixtureWorkerSource, strconv.Quote(fixtureWorkerWarmupArgv)) {
-		t.Fatalf("fixtureWorkerWarmupArgv (%q) names no mode in fixtureWorkerSource; warming would fall through to the role dispatch, which spawns a stand-in child this suite would then leak", fixtureWorkerWarmupArgv)
-	}
-	warmExecutable(t, out, fixtureWorkerWarmupArgv)
-	return out
+	return fixtureWorkerBinary.path
 }
 
 // fixtureWorkerWarmupArgv reaches the first branch of fixtureWorkerSource's
@@ -2158,7 +2204,7 @@ const fixtureWorkerWarmupArgv = "fixture-mcp-stand-in"
 // opencode launch is composed anywhere in this suite.
 func TestFixtureWorkerWarmupArgvIsInert(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	worker := buildFixtureWorker(t, artifacts)
+	worker := buildFixtureWorker(t)
 
 	for _, claudeLaunchFlag := range []string{"--session-id", "--resume"} {
 		if fixtureWorkerWarmupArgv == claudeLaunchFlag {
@@ -2227,7 +2273,7 @@ func testContinuationPrompt(assignmentPath, hopPath string) string {
 // identity, transient-retry, and graceful idle-then-quit.
 func TestFixtureWorkerSubmitValid(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	worker := buildFixtureWorker(t, artifacts)
+	worker := buildFixtureWorker(t)
 	repo := newFixtureRepo(t, artifacts, nil, "repo")
 
 	stateDir := artifacts.dir(t, "state")
@@ -2365,7 +2411,7 @@ func writeTransientOnceHopStub(t *testing.T, artifacts *artifactDir) (hopPath, c
 // is treated as an immediate go-ahead.
 func TestFixtureWorkerExitWithoutSubmitting(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	worker := buildFixtureWorker(t, artifacts)
+	worker := buildFixtureWorker(t)
 	repo := newFixtureRepo(t, artifacts, nil, "repo")
 
 	stateDir := artifacts.dir(t, "state")
@@ -2423,7 +2469,7 @@ func TestFixtureWorkerExitWithoutSubmitting(t *testing.T) {
 // through the prompt-named hop path exactly as a first launch would.
 func TestFixtureWorkerResumeContinuation(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	worker := buildFixtureWorker(t, artifacts)
+	worker := buildFixtureWorker(t)
 	repo := newFixtureRepo(t, artifacts, nil, "repo")
 
 	stateDir := artifacts.dir(t, "state")
@@ -2495,7 +2541,7 @@ func TestFixtureWorkerResumeContinuation(t *testing.T) {
 // resume shape on stderr, and never invoke hop.
 func TestFixtureWorkerResumeShapeRejections(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	worker := buildFixtureWorker(t, artifacts)
+	worker := buildFixtureWorker(t)
 	repo := newFixtureRepo(t, artifacts, nil, "repo")
 
 	stateDir := artifacts.dir(t, "state")
@@ -2657,8 +2703,8 @@ func (o *syncOutput) snapshot() string {
 // OWN doing, never a signal this test aimed at an externally observed pid.
 func TestFixtureWorkerSelfKillOnControlFile(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	worker := buildFixtureWorker(t, artifacts)
-	fakeHop := buildFakeHopStub(t, artifacts)
+	worker := buildFixtureWorker(t)
+	fakeHop := buildFakeHopStub(t)
 	repo := newFixtureRepo(t, artifacts, nil, "repo")
 
 	stateDir := artifacts.dir(t, "state")
@@ -2768,8 +2814,8 @@ func TestFixtureWorkerSelfKillOnControlFile(t *testing.T) {
 // submits exactly like worker-implement.
 func TestFixtureWorkerVanishOnce(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	worker := buildFixtureWorker(t, artifacts)
-	fakeHop := buildFakeHopStub(t, artifacts)
+	worker := buildFixtureWorker(t)
+	fakeHop := buildFakeHopStub(t)
 	repo := newFixtureRepo(t, artifacts, nil, "repo")
 
 	stateDir := artifacts.dir(t, "state")
@@ -2879,8 +2925,8 @@ func vanishOnceMarkerPathForTest(scratchDir, taskID string) string {
 // shared filename, and the submitted result names that same task id.
 func TestFixtureWorkerConflict(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	worker := buildFixtureWorker(t, artifacts)
-	fakeHop := buildFakeHopStub(t, artifacts)
+	worker := buildFixtureWorker(t)
+	fakeHop := buildFakeHopStub(t)
 	repo := newFixtureRepo(t, artifacts, nil, "repo")
 
 	stateDir := artifacts.dir(t, "state")
@@ -2961,7 +3007,7 @@ func TestFixtureWorkerConflict(t *testing.T) {
 // signal this test aimed at an externally observed pid.
 func TestFixtureWorkerIdleSelfKillOnControlFile(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	worker := buildFixtureWorker(t, artifacts)
+	worker := buildFixtureWorker(t)
 	repo := newFixtureRepo(t, artifacts, nil, "repo")
 
 	stateDir := artifacts.dir(t, "state")

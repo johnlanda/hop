@@ -631,34 +631,74 @@ func printScripted() bool {
 // buildFakeHopStub compiles fakeHopSource once for the calling test into a
 // temporary module under the test's artifact directory, mirroring
 // buildFixtureWorker's own build shape.
-func buildFakeHopStub(t *testing.T, artifacts *artifactDir) string {
+// fakeHopBinary caches the single fake-hop build every test in one `go test`
+// process shares, for the same two reasons as fixtureWorkerBinary: one build
+// instead of one per test, and one first execution instead of one per test.
+// It is a narrow, process-lifetime mutable global guarded by sync.Once and
+// cleaned up by TestMain.
+var fakeHopBinary struct { //nolint:gochecknoglobals // process-lifetime build cache guarded by sync.Once; see comment above.
+	once        sync.Once
+	dir         string
+	path        string
+	err         error
+	fingerprint sharedBinaryFingerprint
+}
+
+func buildFakeHopStub(t *testing.T) string {
 	t.Helper()
-	src := artifacts.dir(t, "fake-hop-src")
-	if err := os.WriteFile(filepath.Join(src, "go.mod"), []byte("module fakehop\n\ngo 1.21\n"), 0o600); err != nil {
-		t.Fatal(err)
+	fakeHopBinary.once.Do(func() {
+		dir, err := os.MkdirTemp("", "hop-fake-hop")
+		if err != nil {
+			fakeHopBinary.err = err
+			return
+		}
+		fakeHopBinary.dir = dir
+		src := filepath.Join(dir, "src")
+		if mkErr := os.MkdirAll(src, 0o700); mkErr != nil {
+			fakeHopBinary.err = mkErr
+			return
+		}
+		if writeErr := os.WriteFile(filepath.Join(src, "go.mod"), []byte("module fakehop\n\ngo 1.21\n"), 0o600); writeErr != nil {
+			fakeHopBinary.err = writeErr
+			return
+		}
+		if writeErr := os.WriteFile(filepath.Join(src, "main.go"), []byte(fakeHopSource), 0o600); writeErr != nil {
+			fakeHopBinary.err = writeErr
+			return
+		}
+		goBin, err := exec.LookPath("go")
+		if err != nil {
+			fakeHopBinary.err = fmt.Errorf("the go tool is required to build the fake hop stub: %w", err)
+			return
+		}
+		out := filepath.Join(dir, "fakehop")
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		build := exec.CommandContext(ctx, goBin, "build", "-o", out, ".") //nolint:gosec // G204: the go tool builds this test's own generated fixture module.
+		build.Dir = src
+		if combined, buildErr := build.CombinedOutput(); buildErr != nil {
+			fakeHopBinary.err = fmt.Errorf("go build fake hop stub: %w\n%s", buildErr, combined)
+			return
+		}
+		// An empty argv reaches this stub's default branch, which refuses
+		// and returns at once, spawning nothing; with the environment
+		// emptied its invocation log is unset, so the warm-up leaves no
+		// trace a test could observe. Warmed here, with the build, so the
+		// cost is paid once for the whole process and outside every
+		// deadline.
+		warmExecutable(t, out)
+		fingerprint, statErr := fingerprintSharedBinary(out)
+		if statErr != nil {
+			fakeHopBinary.err = statErr
+			return
+		}
+		fakeHopBinary.fingerprint = fingerprint
+		fakeHopBinary.path = out
+	})
+	if fakeHopBinary.err != nil {
+		t.Fatalf("build fake hop stub: %v", fakeHopBinary.err)
 	}
-	if err := os.WriteFile(filepath.Join(src, "main.go"), []byte(fakeHopSource), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	goBin, err := exec.LookPath("go")
-	if err != nil {
-		t.Fatalf("the go tool is required to build the fake hop stub: %v", err)
-	}
-	binDir := artifacts.dir(t, "fake-hop-bin")
-	out := filepath.Join(binDir, "fakehop")
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
-	defer cancel()
-	build := exec.CommandContext(ctx, goBin, "build", "-o", out, ".") //nolint:gosec // G204: the go tool builds this test's own generated fixture module.
-	build.Dir = src
-	if combined, buildErr := build.CombinedOutput(); buildErr != nil {
-		t.Fatalf("go build fake hop stub: %v\n%s", buildErr, combined)
-	}
-	// An empty argv reaches this stub's default branch, which refuses and
-	// returns at once, spawning nothing; with the environment emptied its
-	// invocation log is unset, so the warm-up leaves no trace a test could
-	// observe.
-	warmExecutable(t, out)
-	return out
+	return fakeHopBinary.path
 }
 
 // fixturePrincipalBudget bounds one fixture-principal invocation driven
@@ -924,8 +964,8 @@ func countLogLinesWithPrefix(log, prefix string) int {
 // fix task and a second plan close.
 func TestFixtureManagerScriptDispatch(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	principal := buildFixtureWorker(t, artifacts)
-	fakeHop := buildFakeHopStub(t, artifacts)
+	principal := buildFixtureWorker(t)
+	fakeHop := buildFakeHopStub(t)
 
 	stateDir := artifacts.dir(t, "state")
 	scratchDir := artifacts.dir(t, "manager-scratch")
@@ -1106,8 +1146,8 @@ func TestFixtureManagerScriptDispatch(t *testing.T) {
 // must add neither.
 func TestFixtureManagerResumeSkipsReplanning(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	principal := buildFixtureWorker(t, artifacts)
-	fakeHop := buildFakeHopStub(t, artifacts)
+	principal := buildFixtureWorker(t)
+	fakeHop := buildFakeHopStub(t)
 
 	stateDir := artifacts.dir(t, "state")
 	scratchDir := artifacts.dir(t, "manager-scratch")
@@ -1211,8 +1251,8 @@ type preForwardBarrierFixture struct {
 
 func buildPreForwardBarrierFixture(t *testing.T, artifacts *artifactDir) preForwardBarrierFixture {
 	t.Helper()
-	principal := buildFixtureWorker(t, artifacts)
-	fakeHop := buildFakeHopStub(t, artifacts)
+	principal := buildFixtureWorker(t)
+	fakeHop := buildFakeHopStub(t)
 
 	stateDir := artifacts.dir(t, "state")
 	scratchDir := artifacts.dir(t, "manager-scratch")
@@ -1568,8 +1608,8 @@ type managerScriptDispatchFixture struct {
 func buildManagerScriptDispatchFixture(t *testing.T, artifacts *artifactDir) managerScriptDispatchFixture {
 	t.Helper()
 	fx := managerScriptDispatchFixture{
-		principal: buildFixtureWorker(t, artifacts),
-		fakeHop:   buildFakeHopStub(t, artifacts),
+		principal: buildFixtureWorker(t),
+		fakeHop:   buildFakeHopStub(t),
 		stateDir:  artifacts.dir(t, "state"),
 		runID:     "a1a1a1a1-a1a1-4a1a-8a1a-a1a1a1a1a1a1",
 	}
@@ -2148,8 +2188,8 @@ func TestFixtureManagerNeedsReworkNoticeShapes(t *testing.T) {
 // reviewer session always is — must find the marker and approve.
 func TestFixtureReviewerRejectOnce(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	principal := buildFixtureWorker(t, artifacts)
-	fakeHop := buildFakeHopStub(t, artifacts)
+	principal := buildFixtureWorker(t)
+	fakeHop := buildFakeHopStub(t)
 
 	stateDir := artifacts.dir(t, "state")
 	scratchDir := artifacts.dir(t, "reviewer-scratch")
@@ -2230,8 +2270,8 @@ func TestFixtureReviewerRejectOnce(t *testing.T) {
 // from any real messaging store.
 func TestFixtureWorkerHoldBarrier(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	worker := buildFixtureWorker(t, artifacts)
-	fakeHop := buildFakeHopStub(t, artifacts)
+	worker := buildFixtureWorker(t)
+	fakeHop := buildFakeHopStub(t)
 	repo := newFixtureRepo(t, artifacts, nil, "repo")
 
 	stateDir := artifacts.dir(t, "state")
@@ -2369,8 +2409,8 @@ type workerHoldSendGateFixture struct {
 
 func buildWorkerHoldSendGateFixture(t *testing.T, artifacts *artifactDir) workerHoldSendGateFixture {
 	t.Helper()
-	worker := buildFixtureWorker(t, artifacts)
-	fakeHop := buildFakeHopStub(t, artifacts)
+	worker := buildFixtureWorker(t)
+	fakeHop := buildFakeHopStub(t)
 	repo := newFixtureRepo(t, artifacts, nil, "repo")
 
 	stateDir := artifacts.dir(t, "state")
@@ -2561,8 +2601,8 @@ func TestFixtureWorkerHoldFetchLoopFatalsOnUnexpectedRefusal(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			artifacts := newArtifactDir(t)
-			worker := buildFixtureWorker(t, artifacts)
-			fakeHop := buildFakeHopStub(t, artifacts)
+			worker := buildFixtureWorker(t)
+			fakeHop := buildFakeHopStub(t)
 			repo := newFixtureRepo(t, artifacts, nil, "repo")
 
 			stateDir := artifacts.dir(t, "state")
@@ -2649,8 +2689,8 @@ func TestFixtureWorkerFetchCrash(t *testing.T) {
 
 func testFixtureWorkerFetchCrashBlocksBeforeAck(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	worker := buildFixtureWorker(t, artifacts)
-	fakeHop := buildFakeHopStub(t, artifacts)
+	worker := buildFixtureWorker(t)
+	fakeHop := buildFakeHopStub(t)
 	repo := newFixtureRepo(t, artifacts, nil, "fetch-crash-repo")
 
 	stateDir := artifacts.dir(t, "state")
@@ -2773,8 +2813,8 @@ func testFixtureWorkerFetchCrashBlocksBeforeAck(t *testing.T) {
 
 func testFixtureWorkerFetchCrashResumedWaitsForReleaseThenAcks(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	worker := buildFixtureWorker(t, artifacts)
-	fakeHop := buildFakeHopStub(t, artifacts)
+	worker := buildFixtureWorker(t)
+	fakeHop := buildFakeHopStub(t)
 	repo := newFixtureRepo(t, artifacts, nil, "fetch-crash-resumed-repo")
 
 	stateDir := artifacts.dir(t, "state")
@@ -2948,8 +2988,8 @@ func testFixtureWorkerFetchCrashResumedWaitsForReleaseThenAcks(t *testing.T) {
 // an envelope it never actually read.
 func TestFixtureWorkerHoldMissingBodyFailsLoudly(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	worker := buildFixtureWorker(t, artifacts)
-	fakeHop := buildFakeHopStub(t, artifacts)
+	worker := buildFixtureWorker(t)
+	fakeHop := buildFakeHopStub(t)
 	repo := newFixtureRepo(t, artifacts, nil, "repo")
 
 	stateDir := artifacts.dir(t, "state")
@@ -3037,8 +3077,8 @@ func TestFixtureWorkerHoldMissingBodyFailsLoudly(t *testing.T) {
 // the drain fires from the retry path itself, not some earlier one.
 func TestFixtureWorkerDrainsOnUndeliveredResultTransient(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	worker := buildFixtureWorker(t, artifacts)
-	fakeHop := buildFakeHopStub(t, artifacts)
+	worker := buildFixtureWorker(t)
+	fakeHop := buildFakeHopStub(t)
 	repo := newFixtureRepo(t, artifacts, nil, "repo")
 
 	stateDir := artifacts.dir(t, "state")
@@ -3148,7 +3188,7 @@ func fakeHopValidEnv(t *testing.T, artifacts *artifactDir, overrides map[string]
 // real hop invocation ever could.
 func TestFakeHopRejectsInvalidInvocations(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	fakeHop := buildFakeHopStub(t, artifacts)
+	fakeHop := buildFakeHopStub(t)
 
 	const validMessageID = "40404040-4040-4404-8404-404040404040"
 	tests := []struct {

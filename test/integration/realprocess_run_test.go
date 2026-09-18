@@ -63,7 +63,7 @@ func assertExecutableIsFixtureStub(t *testing.T, server *testServer, observed *w
 func TestRealProcessRunEndToEnd(t *testing.T) {
 	artifacts := newArtifactDir(t)
 	server := prepareServer(t, artifacts)
-	worker := buildFixtureWorker(t, artifacts)
+	worker := buildFixtureWorker(t)
 	installFixtureWorkerAsClaudeStub(t, server, worker)
 	server.start(t)
 
@@ -237,7 +237,7 @@ func TestRealProcessRunEndToEnd(t *testing.T) {
 func TestRealProcessSanitizedLaunchExec(t *testing.T) {
 	artifacts := newArtifactDir(t)
 	server := prepareServer(t, artifacts)
-	worker := buildFixtureWorker(t, artifacts)
+	worker := buildFixtureWorker(t)
 	installFixtureWorkerAsClaudeStub(t, server, worker)
 	for _, name := range forbiddenCredentialVars {
 		// A plainly fake value, never shaped like a real provider token (no

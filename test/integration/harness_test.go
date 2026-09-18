@@ -318,10 +318,101 @@ func writeHarnessStubs(t *testing.T, binDir string) {
 	t.Helper()
 	for _, name := range []string{"claude", "codex", "opencode"} {
 		script := "#!/bin/sh\necho \"" + name + " 0.0.0-stub\"\n"
-		if err := os.WriteFile(filepath.Join(binDir, name), []byte(script), 0o755); err != nil { //nolint:gosec // G306: a stub must be executable; it lives in this test's private roots.
-			t.Fatal(err)
-		}
+		writeHarnessStub(t, filepath.Join(binDir, name), []byte(script))
 	}
+}
+
+// replaceHarnessStub removes whatever currently occupies a harness stub path,
+// so its caller can create the path afresh rather than write into it.
+//
+// Every writer of a stub path in this package goes through here, and the
+// invariant that requires it is this: NO PATH THAT LINKS TO A SHARED BINARY
+// IS EVER WRITTEN IN PLACE. A stub path may be a hard link to a binary shared
+// by every test in the process — linkHarnessStub installs the fixture worker
+// that way, because a link shares the target's image and costs what running
+// the target again costs, while a copy is a new image and pays a full first
+// execution. Writing such a path in place writes THROUGH the link to the
+// shared file, and every later test in the process then executes whatever the
+// writer left behind. Removing the name first breaks the link, never the
+// file; installRealClaudeStub's symlink relies on the same property.
+func replaceHarnessStub(t *testing.T, path string) {
+	t.Helper()
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		t.Fatalf("remove existing %s stub: %v", filepath.Base(path), err)
+	}
+}
+
+// writeHarnessStub installs content as an executable stub, replacing whatever
+// occupied the path.
+func writeHarnessStub(t *testing.T, path string, content []byte) {
+	t.Helper()
+	replaceHarnessStub(t, path)
+	if err := os.WriteFile(path, content, 0o755); err != nil { //nolint:gosec // G306: a stub must be executable; it lives in this test's private roots.
+		t.Fatalf("install %s stub: %v", filepath.Base(path), err)
+	}
+}
+
+// linkHarnessStub points a stub path at target, sharing target's image
+// instead of duplicating it.
+//
+// It falls back to a copy for one expected reason only — target living on
+// another filesystem, where no hard link can exist — and fails on anything
+// else. A copy is correct but pays a full first execution, so a blanket
+// fallback would quietly restore the per-test cost this linking exists to
+// remove and leave no signal that the mechanism had stopped working. A link
+// this machine cannot make is worth learning about once, loudly.
+func linkHarnessStub(t *testing.T, path, target string) {
+	t.Helper()
+	replaceHarnessStub(t, path)
+	err := os.Link(target, path)
+	switch {
+	case err == nil:
+		return
+	case errors.Is(err, syscall.EXDEV):
+		copyExecutable(t, target, path)
+	default:
+		t.Fatalf("link %s stub to the shared binary: %v", filepath.Base(path), err)
+	}
+}
+
+// sharedBinaryFingerprint is what a shared binary looked like the instant it
+// was built and warmed.
+type sharedBinaryFingerprint struct {
+	size    int64
+	modTime time.Time
+}
+
+// fingerprintSharedBinary records path's current size and modification time.
+func fingerprintSharedBinary(path string) (sharedBinaryFingerprint, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return sharedBinaryFingerprint{}, err
+	}
+	return sharedBinaryFingerprint{size: info.Size(), modTime: info.ModTime()}, nil
+}
+
+// checkSharedBinaryIntact returns a description of a violated invariant, or
+// the empty string. The invariant is the one every stub writer depends on: no
+// path that links to a shared binary is ever written in place. A stub path may
+// be a hard link to this file, so a writer that truncated its own path instead
+// of unlinking it first would have rewritten THIS file, and the symptom would
+// otherwise be an exec failure in whichever unrelated test happened to run
+// afterwards — an order-dependent mystery rather than a diagnosis.
+//
+// It must run before the shared directories are removed, since removing them
+// destroys the one piece of evidence worth having.
+func checkSharedBinaryIntact(name, path string, want sharedBinaryFingerprint) string {
+	if path == "" {
+		return ""
+	}
+	got, err := fingerprintSharedBinary(path)
+	if err != nil {
+		return fmt.Sprintf("the shared %s binary can no longer be read (%v); a stub path linking to it was replaced in place. The invariant: no path that links to a shared binary is ever written in place — stub writers must go through replaceHarnessStub", name, err)
+	}
+	if got.size != want.size || !got.modTime.Equal(want.modTime) {
+		return fmt.Sprintf("the shared %s binary changed after it was built (size %d then %d): a stub path linking to it was written in place. The invariant: no path that links to a shared binary is ever written in place — stub writers must go through replaceHarnessStub", name, want.size, got.size)
+	}
+	return ""
 }
 
 // environ builds the hermetic environment for one subprocess: temporary
