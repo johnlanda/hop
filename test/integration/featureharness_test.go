@@ -408,15 +408,12 @@ func (f *featureRun) requireTaskStateNeverReconciling(t *testing.T, taskID strin
 	sawWant := false
 	reached := waitUntilDeadline(featureRunTimeout, func() bool {
 		var pending bool
-		if violation, pending = f.reconcilingGuard(t); violation != "" {
-			return true
+		violation, pending = f.reconcilingGuard(t)
+		if violation == "" {
+			state = f.taskState(t, taskID)
+			sawWant = sawWant || slices.Contains(want, state)
 		}
-		state = f.taskState(t, taskID)
-		sawWant = sawWant || slices.Contains(want, state)
-		if pending {
-			return false
-		}
-		return sawWant
+		return reconcilingWaitStop(violation, pending, sawWant)
 	})
 	if violation != "" {
 		t.Fatalf("task %s: %s", taskID, violation)
@@ -424,6 +421,29 @@ func (f *featureRun) requireTaskStateNeverReconciling(t *testing.T, taskID strin
 	if !reached {
 		t.Fatalf("task %s ended %q, want one of %v after %s", taskID, state, want, featureRunTimeout)
 	}
+}
+
+// reconcilingWaitStop is requireTaskStateNeverReconciling's own per-poll
+// decision, pulled out as a pure function so the poll loop itself — never
+// exercised by evaluateReconcilingGuard's own tests, which drive the
+// guard directly rather than the loop wrapped around it — has something
+// to test directly (TestReconcilingWaitStop): violation (from
+// reconcilingGuard) ends the wait at once, before sawWant is ever
+// consulted, since a wedge must fail regardless of whatever want state
+// happened to be observed already; a still-open pending episode never
+// ends the wait, whatever sawWant holds; otherwise the wait ends once
+// sawWant is true — sawWant, not the CURRENT state, since want may be a
+// state the caller's task only passes through rather than rests in, and
+// a pending episode can span exactly the polls that would have observed
+// it.
+func reconcilingWaitStop(violation string, pending, sawWant bool) bool {
+	if violation != "" {
+		return true
+	}
+	if pending {
+		return false
+	}
+	return sawWant
 }
 
 // currentAttempt returns taskID's most recent (highest-numbered) attempt.
@@ -1198,6 +1218,122 @@ func TestReconcilingGuardBounds(t *testing.T) {
 		}
 		if violation != "" || pending {
 			t.Fatalf("after leaving at 12s: violation = %q, pending = %v, want empty violation and pending=false", violation, pending)
+		}
+	})
+}
+
+// TestReconcilingWaitStop proves requireTaskStateNeverReconciling's own
+// poll-loop decision (reconcilingWaitStop) directly, over scripted poll
+// sequences — evaluateReconcilingGuard's own tests (above) call the
+// guard, never the loop built around it, so the loop's own sequencing
+// (whether a want state observed while an episode is pending is
+// remembered once the episode clears) needs its own coverage. No herdr
+// needed.
+func TestReconcilingWaitStop(t *testing.T) {
+	want := []string{"active"}
+
+	// poll is one scripted reconcilingGuard/taskState observation. drive
+	// replays requireTaskStateNeverReconciling's own loop shape over a
+	// sequence of polls: violation short-circuits before state or sawWant
+	// are touched (mirroring the real loop skipping the taskState read on
+	// a violation); otherwise state updates and sawWant latches whether
+	// want has EVER been seen; reconcilingWaitStop decides whether to
+	// stop, and drive stops iterating the instant it does, exactly as
+	// waitUntilDeadline's own predicate loop would (a real poll loop
+	// never calls the predicate again after it returns true).
+	type poll struct {
+		violation string
+		pending   bool
+		state     string
+	}
+	drive := func(polls []poll) (stopped bool) {
+		sawWant := false
+		for _, p := range polls {
+			violation := p.violation
+			state := ""
+			if violation == "" {
+				state = p.state
+				sawWant = sawWant || slices.Contains(want, state)
+			}
+			if reconcilingWaitStop(violation, p.pending, sawWant) {
+				return true
+			}
+		}
+		return false
+	}
+
+	cases := []struct {
+		name        string
+		polls       []poll
+		wantStopped bool
+	}{
+		{
+			name: "want observed while pending, then the task leaves want and the episode closes: stops",
+			polls: []poll{
+				{pending: true, state: "active"},
+				{pending: true, state: "active"},
+				{state: "completed"},
+				{state: "integrated"},
+			},
+			wantStopped: true,
+		},
+		{
+			name: "want never observed, episode closes: keeps waiting",
+			polls: []poll{
+				{pending: true, state: "ready"},
+				{state: "ready"},
+			},
+			wantStopped: false,
+		},
+		{
+			name: "violation stops immediately, regardless of sawWant",
+			polls: []poll{
+				{violation: "resume: evidence ambiguous", state: "ready"},
+			},
+			wantStopped: true,
+		},
+		{
+			name: "pending with want observed: does not stop while the episode is open",
+			polls: []poll{
+				{pending: true, state: "active"},
+			},
+			wantStopped: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if stopped := drive(tc.polls); stopped != tc.wantStopped {
+				t.Fatalf("stopped = %v, want %v", stopped, tc.wantStopped)
+			}
+		})
+	}
+
+	// The first case above stops only because sawWant LATCHES "active"
+	// across the two pending polls. stateOnlyStop decides from the
+	// CURRENT poll's own state instead of a latched observation — the
+	// shape requireTaskStateNeverReconciling's loop would take without
+	// the latch — and driving the identical sequence through it must NOT
+	// stop, or this table is not actually covering what the latch is for.
+	t.Run("without latching sawWant, the first case above never stops", func(t *testing.T) {
+		polls := []poll{
+			{pending: true, state: "active"},
+			{pending: true, state: "active"},
+			{state: "completed"},
+			{state: "integrated"},
+		}
+		stateOnlyStop := func(violation string, pending bool, state string) bool {
+			if violation != "" {
+				return true
+			}
+			if pending {
+				return false
+			}
+			return slices.Contains(want, state)
+		}
+		for _, p := range polls {
+			if stateOnlyStop(p.violation, p.pending, p.state) {
+				t.Fatal("the state-only decision unexpectedly stopped; this sequence no longer demonstrates what latching sawWant is for")
+			}
 		}
 	})
 }
