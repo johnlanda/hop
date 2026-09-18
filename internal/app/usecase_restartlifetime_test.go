@@ -676,6 +676,55 @@ func newestSessionTransitionReason(t *testing.T, tc *testController, sessionID i
 	return reason
 }
 
+// TestReconcileServerRestartAndASoloRun pins this step's scope on a run
+// that has no session index of its own. A solo run takes it ONLY under a
+// held stop, where the whole action is to close the pane and conclude
+// absence so the run can reach stopped; a running one keeps its existing
+// fail-closed exit untouched, because solo cold relaunch is exclusively a
+// `hop resume` recovery action and this step does not amend that.
+func TestReconcileServerRestartAndASoloRun(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		stop       bool
+		wantClosed bool
+		wantState  run.SessionState
+	}{
+		{name: "a held stop closes the pane and terminates the session", stop: true, wantClosed: true, wantState: run.SessionTerminated},
+		{name: "a running solo run is left to its existing exit", wantState: run.SessionActive},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			controller := newTestController(defaultPolicy())
+			handle, detail := runningRun(t, controller)
+			if tc.stop {
+				requestRunStop(controller, detail.RunID)
+			}
+			binding, ok := controller.Store.currentBindingLocked(detail.SessionID)
+			if !ok {
+				t.Fatalf("no binding for the solo session %s", detail.SessionID)
+			}
+			// The recorded process is gone from its own group: a successful
+			// listing that finds nothing, never an error.
+			controller.Groups.Processes[detail.Claim.PID] = nil
+			serverRestarted(controller)
+			identifiedByLabel(controller, binding)
+
+			report, err := controller.Controller.ReconcileServerRestart(context.Background(), handle, restartOptions())
+			if err != nil {
+				t.Fatalf("ReconcileServerRestart() error = %v", err)
+			}
+			if closed := slices.Contains(controller.Runtime.ClosedPanes, binding.PaneID); closed != tc.wantClosed {
+				t.Fatalf("closed = %t (panes %v), want %t; report %+v", closed, controller.Runtime.ClosedPanes, tc.wantClosed, report)
+			}
+			if len(report.Relaunched) != 0 {
+				t.Fatalf("relaunched = %v, want nothing: a solo run never relaunches here", report.Relaunched)
+			}
+			if got := controller.Store.Sessions[detail.SessionID].value.State; got != tc.wantState {
+				t.Fatalf("solo session state = %s, want %s", got, tc.wantState)
+			}
+		})
+	}
+}
+
 // TestReconcileServerRestartOrdersTheManagerLast pins the ordering the
 // manager relaunch requires: every child session is reconciled BEFORE the
 // manager, so a round that fails partway has not moved the run's manager

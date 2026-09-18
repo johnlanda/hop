@@ -225,10 +225,10 @@ func runFeatureControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, 
 			// a placed session's absence: on a changed server lifetime it
 			// closes the panes this run owns and relaunches what it can, so
 			// every step below sees either a settled session or a named
-			// reason, never the permanent ambiguity a restart used to
-			// leave. A STOPPING tick does not come through here: DriveStop
-			// and DriveFeatureStop run the step themselves, so a stop round
-			// is self-sufficient however it was entered.
+			// reason, never the permanent ambiguity a restart leaves
+			// without it. A STOPPING tick does not come through here:
+			// DriveStop and DriveFeatureStop run the step themselves, so a
+			// stop round is self-sufficient however it was entered.
 			if restart, restartErr := ctrl.ReconcileServerRestart(ctx, handle, app.RestartOptions{HOPPath: hopPath}); restartErr != nil {
 				return loopResult{}, errors.Join(fmt.Errorf("reconcile server restart: %w", restartErr), drainChecks())
 			} else if lineErr := printRestartLines(stdout, label, restart); lineErr != nil {
