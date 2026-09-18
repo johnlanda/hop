@@ -63,6 +63,35 @@ const (
 	launchEndedRestartReason = "launch ended at a server restart: the server lifetime changed before the launch was corroborated; the recorded pane was closed"
 )
 
+// The fixed, value-free dispositions `hop status` renders for a session
+// the restart-lifecycle step acted on. They are DERIVED from the session's
+// recorded transition reason rather than stored a second time, so the
+// journal stays the single record of what happened.
+const (
+	// RestartDispositionClosed: the session's pane was closed after a
+	// server restart and the session was not relaunched.
+	RestartDispositionClosed = "closed after a server restart"
+	// RestartDispositionRelaunched: closed, and relaunched from its
+	// recorded native session reference.
+	RestartDispositionRelaunched = "relaunched after a server restart"
+)
+
+// RestartDispositionFor reduces a session's newest recorded transition
+// reason to one of the fixed dispositions above, or "" when the restart
+// step did not act on it. It is the ONE place the journal's reasons are
+// mapped to the status surface, so a reason can never leak into a rendering
+// by accident.
+func RestartDispositionFor(reason string) string {
+	switch reason {
+	case restartRelaunchReason:
+		return RestartDispositionRelaunched
+	case restartSessionReason:
+		return RestartDispositionClosed
+	default:
+		return ""
+	}
+}
+
 // restartIdentity is how a pane answering a recorded id was identified as
 // the session's OWN after a restart. A recorded pane id is not a durable
 // address across a restart — a workspace closed before one leaves its id

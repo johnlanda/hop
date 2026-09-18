@@ -371,6 +371,11 @@ func sessionSummaries(ctx context.Context, q querier, runID identity.RunID) ([]a
 			summary.TaskID = attempt.TaskID
 			summary.AttemptNumber = attempt.Number
 		}
+		reason, reasonErr := newestTransitionReason(ctx, q, id)
+		if reasonErr != nil {
+			return nil, reasonErr
+		}
+		summary.RestartDisposition = app.RestartDispositionFor(reason)
 		binding, hasBinding, bindingErr := currentBinding(ctx, q, id)
 		if bindingErr != nil {
 			return nil, bindingErr
@@ -386,6 +391,28 @@ func sessionSummaries(ctx context.Context, q querier, runID identity.RunID) ([]a
 		summaries = append(summaries, summary)
 	}
 	return summaries, nil
+}
+
+// newestTransitionReason reads the reason of a session's most recent
+// recorded transition, or "" when it has none. It is the durable record
+// app.RestartDispositionFor reduces to a status disposition: the reason
+// text stays in the journal and only the reduced value is ever rendered.
+// Ties on the recorded instant are broken by the row id so the read is
+// deterministic, since a session can take more than one transition inside
+// one transaction at a single clock reading.
+func newestTransitionReason(ctx context.Context, q querier, id identity.SessionID) (string, error) {
+	var reason string
+	err := q.QueryRowContext(ctx,
+		`SELECT reason FROM transitions WHERE entity_kind = ? AND entity_id = ? ORDER BY at DESC, id DESC LIMIT 1`,
+		string(app.EntitySession), id.String(),
+	).Scan(&reason)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("sqlite: newest transition of session %s: %w", id, err)
+	}
+	return reason, nil
 }
 
 // launchCorroborationPending reads the structural fact behind

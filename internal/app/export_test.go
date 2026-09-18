@@ -123,3 +123,12 @@ func RecoverRetirementForTest(ctx context.Context, c *Controller, handle RunHand
 	}
 	return c.recoverRetirementOperations(ctx, handle, &frozen, &retirementPassOptions{HOPPath: hopPath, InspectPath: inspect})
 }
+
+// The restart-lifecycle step's own journaled reasons, exposed to app_test
+// so the status-disposition table maps the REAL reasons rather than
+// retyped copies: the point of that table is that the reason a human sees
+// rendered is the reason the rule actually writes.
+const (
+	RestartSessionReasonForTest  = restartSessionReason
+	RestartRelaunchReasonForTest = restartRelaunchReason
+)

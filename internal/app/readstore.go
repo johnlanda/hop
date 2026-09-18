@@ -117,6 +117,15 @@ type SessionSummary struct {
 	TaskID        identity.TaskID // "" for the manager
 	AttemptNumber int             // 0 for the manager
 	Binding       *run.RuntimeBinding
+	// RestartDisposition is what the restart-lifecycle step did to this
+	// session, read from its own newest transition's recorded reason and
+	// reduced to one of the fixed RestartDisposition* values below: this is
+	// how `hop status` can say, after the fact, that a session was closed
+	// because the Herdr server restarted, and whether it was relaunched.
+	// Empty for every session the step never touched. The REASON itself is
+	// never rendered — only which of the fixed dispositions it names — so
+	// the journal keeps the detail and the surface stays value-free.
+	RestartDisposition string
 	// LaunchCorroborationPending is the structural fact that this session
 	// is reconciling with a current unsuperseded placed binding whose own
 	// incarnation's launch claim is still exec_pending: the one reconciling

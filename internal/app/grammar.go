@@ -446,6 +446,17 @@ func GrammarSessionLine(sessionID, role, state, taskLabel string, attemptNumber 
 		" task=" + taskLabel + " attempt=" + strconv.Itoa(attemptNumber) + " binding=" + binding
 }
 
+// GrammarSessionRestartNote renders what the restart-lifecycle step did to
+// one session, under that session's own line. disposition is one of the
+// fixed RestartDisposition* values and nothing else, so no journal reason,
+// lifetime token, pid, label or path can reach this surface. A manager's
+// note renders on the manager's own session line, which is what makes a
+// manager relaunch — the one that moves the run's lineage — separately
+// visible from a worker's.
+func GrammarSessionRestartNote(disposition string) string {
+	return "restart: " + disposition
+}
+
 // GrammarSessionLaunchCorroborationAction is the named human action for a
 // session reconciling because another process on its pane carries the
 // launch identity (SessionView.LaunchCorroborationPending). It states

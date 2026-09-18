@@ -560,3 +560,73 @@ func TestReconcileServerRestartOrdersTheManagerLast(t *testing.T) {
 	}
 	_ = w
 }
+
+// TestRestartDispositionForIsValueFree pins the ONE mapping from a
+// journaled reason to the status surface. Only the two reasons this rule
+// writes map to anything, every other reason maps to nothing, and the
+// rendered values carry no lifetime token, pid, label or path — the
+// journal keeps the detail and the surface says what happened.
+func TestRestartDispositionForIsValueFree(t *testing.T) {
+	relaunched := app.RestartDispositionFor(app.RestartRelaunchReasonForTest)
+	closed := app.RestartDispositionFor(app.RestartSessionReasonForTest)
+	if relaunched != app.RestartDispositionRelaunched {
+		t.Errorf("the relaunch reason maps to %q, want %q", relaunched, app.RestartDispositionRelaunched)
+	}
+	if closed != app.RestartDispositionClosed {
+		t.Errorf("the close reason maps to %q, want %q", closed, app.RestartDispositionClosed)
+	}
+	for _, other := range []string{"", "stop: termination observed", "cold relaunch authorized", "worker exited without an accepted result"} {
+		if got := app.RestartDispositionFor(other); got != "" {
+			t.Errorf("RestartDispositionFor(%q) = %q, want no disposition: only this rule's own reasons map", other, got)
+		}
+	}
+	for _, rendered := range []string{app.RestartDispositionClosed, app.RestartDispositionRelaunched} {
+		for _, forbidden := range []string{"pid", "herdr-server-lifetime", "/", "pane-"} {
+			if strings.Contains(rendered, forbidden) {
+				t.Errorf("the rendered disposition %q carries %q; this surface is value-free", rendered, forbidden)
+			}
+		}
+	}
+}
+
+// TestReconcileServerRestartJournalsItsOwnReasons pins that the two
+// dispositions a human sees are actually REACHED by the rule, through the
+// journal rather than through a constant: a retired session's newest
+// transition renders as closed, and a relaunched one's as relaunched. A
+// status surface fed by a reason nothing writes would render nothing.
+func TestReconcileServerRestartJournalsItsOwnReasons(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		stop bool
+		want string
+	}{
+		{name: "a stopping run's closed session", stop: true, want: app.RestartDispositionClosed},
+		{name: "a running run's relaunched session", want: app.RestartDispositionRelaunched},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			controller, fr, w, binding := restartWorker(t)
+			if tc.stop {
+				requestRunStop(controller, fr.RunID)
+			}
+			serverRestarted(controller)
+			identifiedByLabel(controller, binding)
+
+			if _, err := controller.Controller.ReconcileServerRestart(context.Background(), fr.Handle, restartOptions()); err != nil {
+				t.Fatalf("ReconcileServerRestart() error = %v", err)
+			}
+			detail, err := controller.Controller.Status(context.Background(), app.StatusRequest{RunID: fr.RunID.String()})
+			if err != nil {
+				t.Fatalf("Status() error = %v", err)
+			}
+			var rendered string
+			for _, session := range detail.Detail.Sessions {
+				if session.SessionID == w.SessionID.String() {
+					rendered = session.RestartDisposition
+				}
+			}
+			if rendered != tc.want {
+				t.Fatalf("the session's rendered restart disposition = %q, want %q", rendered, tc.want)
+			}
+		})
+	}
+}

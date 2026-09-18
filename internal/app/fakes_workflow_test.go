@@ -1619,6 +1619,7 @@ func (s *fakeStore) sessionsLocked(runID identity.RunID) []app.SessionSummary {
 				summary.AttemptNumber = a.value.Number
 			}
 		}
+		summary.RestartDisposition = app.RestartDispositionFor(s.newestSessionTransitionReasonLocked(id))
 		if binding, ok := s.currentBindingBySessionLocked(id); ok {
 			b := binding
 			summary.Binding = &b
@@ -1627,6 +1628,23 @@ func (s *fakeStore) sessionsLocked(runID identity.RunID) []app.SessionSummary {
 		summaries = append(summaries, summary)
 	}
 	return summaries
+}
+
+// newestSessionTransitionReasonLocked mirrors the real read model's
+// newestTransitionReason (internal/adapters/sqlite/workflow_read.go): the
+// reason of the session's most recent recorded transition, "" when it has
+// none. The real read orders by the recorded instant and breaks ties on the
+// row id; this store appends in commit order, which is the same order, so
+// the LAST matching entry is the newest. Callers hold s.mu.
+func (s *fakeStore) newestSessionTransitionReasonLocked(id identity.SessionID) string {
+	reason := ""
+	for i := range s.Transitions {
+		t := &s.Transitions[i]
+		if t.EntityKind == app.EntitySession && t.EntityID == id.String() {
+			reason = t.Reason
+		}
+	}
+	return reason
 }
 
 // launchCorroborationPendingLocked mirrors the real read model's

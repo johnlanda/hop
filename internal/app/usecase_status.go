@@ -128,6 +128,14 @@ type SessionView struct {
 	TaskID         string
 	AttemptNumber  int
 	BindingSummary string
+	// RestartDisposition is the fixed, value-free text naming what the
+	// restart-lifecycle step did to this session — closed after a server
+	// restart, or closed and relaunched — and "" for every session it never
+	// touched. The MANAGER's is rendered on the manager's own session line,
+	// which is what makes a manager relaunch separately visible from a
+	// worker's: it moves the run's manager lineage, and is the one a human
+	// most needs to know happened.
+	RestartDisposition string
 	// LaunchCorroborationPending mirrors
 	// SessionSummary.LaunchCorroborationPending: this session is
 	// reconciling because another process on its pane carries the launch
@@ -340,6 +348,7 @@ func runDetailView(d RunDetail) RunDetailView { //nolint:gocritic // hugeParam: 
 		sv := SessionView{
 			SessionID: s.SessionID.String(), Role: string(s.Role), State: string(s.State),
 			AttemptNumber: s.AttemptNumber, LaunchCorroborationPending: s.LaunchCorroborationPending,
+			RestartDisposition: s.RestartDisposition,
 		}
 		if s.TaskID != "" {
 			sv.TaskID = s.TaskID.String()
