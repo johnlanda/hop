@@ -171,17 +171,20 @@ func requireChildLaunchTarget(t *testing.T, fx *featureRun, taskID string) (atte
 // rule for a child session still `launching` (docs/plan/phase-3-design.md
 // section 5, placedLaunchInFlight's `session.State == run.SessionLaunching`
 // admission) against a real Herdr server and a real pane process: a launch
-// claim written exec_pending, its controller then hard-killed before its
-// own corroboration loop ever inspects the pane, and the pane still holding
-// exactly the claimed process throughout. Without resume corroborating a
-// placed-but-unsettled launch through its own pane inspection, nothing ever
-// revisits this session again — its claim cannot advance on its own, and
-// only a fresh hop resume round re-inspects the pane. hop resume must admit
-// the run as resumed and running, reporting the child pending under its own
-// in-flight detail, rather than failing the session (and so the run) closed
-// to reconciling. The pane, the claimed pid and the controller loop that
-// finishes the launch afterward are all real throughout; nothing here is a
-// fake or a table.
+// claim written exec_pending, its controller then hard-killed while every
+// inspection of its pane still reads unresolved — the stub's own argv
+// carries no launch marker, so no pass can settle or reclassify it — with
+// the pane still holding exactly the claimed process throughout. Without
+// resume corroborating a placed-but-unsettled launch through its own pane
+// inspection, nothing ever revisits this session again — its claim cannot
+// advance on its own, and only a fresh hop resume round re-inspects the
+// pane. hop resume must admit the run as resumed and running, reporting
+// the child pending under its own in-flight detail, rather than leaving
+// the round `reconciling` — the run left in `resuming`, the lease
+// released, and hop resume exiting 1 without ever becoming a running
+// controller. The pane, the claimed pid and the controller loop that
+// finishes the launch afterward are all real throughout; nothing here is
+// a fake or a table.
 func TestRealProcessChildLaunchInFlightAcrossResume(t *testing.T) {
 	artifacts := newArtifactDir(t)
 	server := prepareServer(t, artifacts)
@@ -251,8 +254,9 @@ func TestRealProcessChildLaunchInFlightAcrossResume(t *testing.T) {
 	}
 
 	// The crash: the controller dies with the claim still exec_pending and
-	// the pane still holding that very process, having never run its own
-	// corroboration against it.
+	// the pane still holding that very process — every inspection of it,
+	// live or resumed, reads unresolved (no launch marker in its argv or
+	// cmdline), so no pass could ever have settled or reclassified it.
 	killControllerLeader(t, fx.controller)
 	waitForLeaseExpiry(t, fx.dbPath(), fx.runID)
 	if state := fx.claimState(t, sessionID); state != "exec_pending" {
@@ -271,10 +275,11 @@ func TestRealProcessChildLaunchInFlightAcrossResume(t *testing.T) {
 
 	// THE DECISIVE ASSERTION: hop resume admits the placed-but-unsettled
 	// launch as in flight and hands the run back to a running controller
-	// loop, rather than failing the session closed to reconciling. Without
-	// that admission this exact wait times out: resume instead fails the
-	// session closed, releases the lease and exits 1 immediately, never
-	// becoming a running controller at all.
+	// loop, rather than reporting the same session pending under a
+	// different, uncorroborated detail while the round itself ends
+	// reconciling. Without that admission this exact wait times out: resume
+	// instead leaves the run in resuming, releases the lease and exits 1
+	// immediately, never becoming a running controller at all.
 	stdout := waitForControllerLog(t, artifacts, "resume", childLaunchInFlightDetail)
 	if !strings.Contains(stdout, "resume resumed:") {
 		t.Errorf("resume stdout never reports \"resumed\"; got:\n%s", stdout)
