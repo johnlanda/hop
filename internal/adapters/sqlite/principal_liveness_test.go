@@ -62,6 +62,10 @@ func requirePlacementCurrent(t *testing.T, f *featureFixture, sessionID identity
 		case !ok:
 			t.Fatalf("session %s has no current binding; the liveness test needs a live placement", sessionID)
 		case binding.Superseded:
+			// Unreachable while currentBinding is the only query returning a
+			// binding and it selects superseded = 0; stated rather than
+			// relied on, so this premise is checked here if that ever stops
+			// being true.
 			t.Fatalf("session %s's binding is superseded; the liveness test needs a live placement", sessionID)
 		case binding.IncarnationID != incarnation:
 			t.Fatalf("session %s's binding carries incarnation %s, want %s", sessionID, binding.IncarnationID, incarnation)
@@ -74,8 +78,8 @@ func requirePlacementCurrent(t *testing.T, f *featureFixture, sessionID identity
 // but each recognizes only its own incarnation-refusal wording, and
 // message ack cannot be staged against one at all: seeding its delivery
 // needs a live parent session to hang a worker off.
-var endedPrincipalVerbs = []string{ //nolint:gochecknoglobals // the verb subset this rule covers, immutable after init like principalVerbs itself.
-	"task create", "task retry", "plan close", "message send", "review submit",
+func endedPrincipalVerbs() []string {
+	return []string{"task create", "task retry", "plan close", "message send", "review submit"}
 }
 
 // TestPrincipalEndedSessionRefused pins the liveness half of the one
@@ -86,7 +90,7 @@ var endedPrincipalVerbs = []string{ //nolint:gochecknoglobals // the verb subset
 // every one of these calls, and only the session's state can refuse them.
 func TestPrincipalEndedSessionRefused(t *testing.T) {
 	for _, verb := range principalVerbs() {
-		if !slices.Contains(endedPrincipalVerbs, verb.name) {
+		if !slices.Contains(endedPrincipalVerbs(), verb.name) {
 			continue
 		}
 		for _, state := range []run.SessionState{run.SessionTerminated, run.SessionLost} {
@@ -103,9 +107,10 @@ func TestPrincipalEndedSessionRefused(t *testing.T) {
 }
 
 // TestSessionSummaryBindingOutlivesItsSession pins what the run status's
-// session list reports for a session that has ended: it keeps the
-// placement the session ran under, since ending a session supersedes
-// nothing, and its launch is no longer corroborated. A summary binding is
+// session list reports for a session that ended without its pane being
+// observed absent: it keeps the placement the session ran under, since
+// ending a session does not itself supersede the binding, and its launch
+// is no longer corroborated. A summary binding is
 // therefore a record of where a session ran, never evidence that anything
 // is live there — a consumer that acts on one establishes liveness from
 // State, which is listed beside it for exactly that reason.
@@ -135,6 +140,9 @@ func TestSessionSummaryBindingOutlivesItsSession(t *testing.T) {
 	case summary.Binding == nil:
 		t.Error("the ended session's summary carries no binding; the list reports the placement a session ran under, ended or not")
 	case summary.Binding.Superseded:
+		// Unreachable for the same reason as requirePlacementCurrent's twin,
+		// and kept for the same one: the summary's own premise, checked
+		// rather than assumed.
 		t.Error("the summary's binding is superseded; the only query behind it selects unsuperseded rows")
 	case summary.LaunchCorroborationPending:
 		t.Error("an ended session's launch reads as still corroborated; only a reconciling session's does")
