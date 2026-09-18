@@ -1116,9 +1116,10 @@ func (s *fakeStore) SubmitReview(_ context.Context, submission app.ReviewSubmiss
 // a reviewer of the submission's own run bound to exactly the review
 // attempt being settled and not itself ended (not-reviewer otherwise: a
 // foreign session's binding and launch claim never assemble this
-// attempt's acceptance context, and an ended reviewer's own binding stays
-// current so nothing else would refuse it), then AcceptVerdict. Every refusal carries the grammar reason
-// token the real store sets at the same decision point. onAccept, when
+// attempt's acceptance context, and an ended reviewer's own binding may
+// still be current, so nothing else would necessarily refuse it), then
+// AcceptVerdict. Every refusal carries the grammar reason token the real
+// store sets at the same decision point. onAccept, when
 // non-nil, runs after an acceptance is applied and before the lock is
 // released, as the real store's accepting transaction commits its own
 // side effects. Callers hold s.mu.

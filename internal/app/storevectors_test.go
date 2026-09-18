@@ -700,6 +700,7 @@ func TestStoreVectors(t *testing.T) {
 			t.Fatalf("ClosePlan(ended manager) = %+v, %v; want refused/%s", closed, err, storevectors.TaskCreateEndedManagerReason)
 		}
 	})
+
 	t.Run("TaskRetry", func(t *testing.T) {
 		tc := newTestController(defaultPolicy())
 		fr := seedFeatureRun(t, tc, 2)

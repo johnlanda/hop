@@ -28,10 +28,11 @@ const terminalSessionStates = `('lost', 'terminated')`
 // sessionEnded is terminalSessionStates as a predicate over a loaded row,
 // for the caller rules that decide whether a principal may still act. A
 // session's runtime binding can outlive it: ending a session does not
-// itself supersede the binding — only observed absence or an absence
-// attestation does — so its placement can stay current and unsuperseded,
-// and a rule that reads only the binding cannot tell that the principal
-// is gone.
+// itself supersede the binding — a binding is superseded by a confirmed
+// close, a resume's adoption or a feature cold relaunch, and by nothing
+// else, one cause per Supersede call site — so its placement can stay
+// current and unsuperseded, and a rule that reads only the binding cannot
+// tell that the principal is gone.
 func sessionEnded(state run.SessionState) bool {
 	return state == run.SessionLost || state == run.SessionTerminated
 }

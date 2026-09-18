@@ -177,8 +177,8 @@ func (s *Store) SubmitReview(ctx context.Context, submission app.ReviewSubmissio
 // binding or launch claim ever reaches the acceptance context (a foreign
 // session's currency must never vouch for this attempt's verdict). The
 // liveness conjunct is what the acceptance context cannot supply: a
-// reviewer that has ended keeps a current, unsuperseded binding, so its
-// incarnation still reads as current. A caller it reports ineligible is
+// reviewer that has ended can keep a current, unsuperseded binding, so
+// its incarnation still reads as current. A caller it reports ineligible is
 // refused not-reviewer.
 func reviewerSessionEligible(ctx context.Context, q querier, submission *app.ReviewSubmission, task *run.Task) (bool, error) {
 	session, _, err := getSession(ctx, q, submission.Session)
