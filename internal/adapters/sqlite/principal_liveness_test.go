@@ -111,6 +111,13 @@ func TestPrincipalEndedSessionRefused(t *testing.T) {
 // State, which is listed beside it for exactly that reason.
 func TestSessionSummaryBindingOutlivesItsSession(t *testing.T) {
 	f := newFeatureFixture(t)
+	// The placement's own unsettled launch claim, seeded while the session
+	// can still carry one: it satisfies every conjunct of the corroboration
+	// fact except the state, so that assertion below turns on the state
+	// alone rather than on a claim the fixture never made.
+	if err := f.store.ClaimLaunch(t.Context(), claimFor(f, f.ManagerIncarnation, f.ManagerID, "", 4242)); err != nil {
+		t.Fatalf("seed the manager's exec-pending launch claim: %v", err)
+	}
 	endSession(t, f, f.ManagerID, run.SessionTerminated)
 	requirePlacementCurrent(t, f, f.ManagerID, f.ManagerIncarnation)
 
