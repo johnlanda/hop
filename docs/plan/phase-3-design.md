@@ -1575,10 +1575,19 @@ briefly and rerun the exact same command, so the drain line is drained
 before the resubmission — and their assignment artifacts state the
 exits: an accepted or duplicate submission means the work is done and
 the turn ends without polling; a stale line means stop without
-retrying. The worker's question-and-wait loop and its drain before
-submitting are in no HOP-rendered worker text: they are the repository's
+retrying. The implementer's and reviewer's assignment artifacts each
+name, by verb, the question-and-wait loop and the drain before
+submitting in one sentence (`renderTaskAssignment`/`renderReviewAssignment`,
+templates.go) — `hop msg send`/`wait`/`ack`/`next`, so a worker that has
+never seen HOP's protocol is not told what to do only after it does
+something wrong (the drain refusal line, or a stale "follow the
+transient line's instruction"). That sentence is not a protocol
+restatement — the crib already carries every verb's refusal shapes — and
+it is the ONE place these verbs are named at all outside the crib and the
+manager's own assignment; the loop's fuller texture (how to phrase a
+question, what else to do while waiting) remains the repository's
 implementer and reviewer role instructions' to state, which HOP freezes
-verbatim and renders nothing into. The fixture principals implement exactly this split — the fixture
+verbatim and renders nothing further into. The fixture principals implement exactly this split — the fixture
 worker drains when the drain line tells it to, and before submitting —
 so the deterministic suite proves the rendered instructions are
 followable as written.

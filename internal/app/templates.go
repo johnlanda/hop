@@ -268,7 +268,10 @@ type taskAssignmentFields struct {
 // instructions and acceptance criteria by absolute path, the frozen
 // implementer role reference, the submit instruction quoted from the
 // grammar constants, and — on retry — the prior attempt's feedback
-// paths.
+// paths. It also states, by name, the mailbox verbs the worker's own
+// repository-supplied role instructions do not: how to ask its manager a
+// question and wait for the reply, and to drain its mailbox before
+// submitting.
 func renderTaskAssignment(f *taskAssignmentFields) []byte {
 	var b strings.Builder
 	fmt.Fprintf(&b, `# HOP Task Assignment
@@ -290,7 +293,12 @@ Your role instructions are at:
     %s
 
 Work in this directory (your attempt's worktree) and commit your work
-here. When your work is complete and committed, submit it by running:
+here. If you need a decision before you can continue, send your manager
+a question with %s msg send --kind question --to manager --file <path>,
+then loop %s msg wait until the reply arrives and acknowledge it with
+%s msg ack <message-uuid>; before you submit, drain anything else queued
+with %s msg next and acknowledge each the same way. When your work is
+complete and committed, submit it by running:
 
     %s result submit --summary "<one-line summary>" --commit <commit-oid>
 
@@ -305,7 +313,8 @@ is no longer current: stop, and do not retry. Any other refusal prints
 acting.
 `,
 		f.RunID, f.TaskID, f.TaskSeq, f.AttemptID, f.AttemptNumber, f.Title,
-		f.AssignmentPath, f.InstructionsPath, f.RolePath, f.HOPPath,
+		f.AssignmentPath, f.InstructionsPath, f.RolePath,
+		f.HOPPath, f.HOPPath, f.HOPPath, f.HOPPath, f.HOPPath,
 		GrammarResultAcceptedLine("<result-uuid>"), GrammarResultDuplicateLine("<result-uuid>"),
 		GrammarResultRefusalLine(GrammarReasonStale, "<detail>"), GrammarRefusalLine(GrammarReasonStale),
 		GrammarResultRefusalLine(GrammarReasonConflicting, "<detail>"), GrammarResultRefusalLine(GrammarReasonMalformed, "<detail>"),
@@ -347,7 +356,12 @@ type reviewAssignmentFields struct {
 // tree object IDs), the diff scope base..head, the reviewer role
 // reference and the verdict submission instruction with the frozen
 // subject embedded — the guard compares object IDs, so reviewing any
-// other candidate is refused.
+// other candidate is refused. Names, by verb, how to ask the manager a
+// question and wait for the reply, and to drain the mailbox before
+// submitting a verdict — the same mailbox instruction
+// renderTaskAssignment gives an implementer, since hop review submit
+// shares its undelivered-messages transient line and section 7 extends
+// the wait-loop rule to reviewers verbatim.
 func renderReviewAssignment(f *reviewAssignmentFields) []byte {
 	return fmt.Appendf(nil, `# HOP Review Assignment
 
@@ -373,6 +387,12 @@ Your role instructions are at:
 
     %s
 
+If you need a decision before you can continue, send your manager a
+question with %s msg send --kind question --to manager --file <path>,
+then loop %s msg wait until the reply arrives and acknowledge it with
+%s msg ack <message-uuid>; before you submit, drain anything else queued
+with %s msg next and acknowledge each the same way.
+
 Write your reasons to a file, then submit your verdict by running:
 
     %s review submit --verdict <approve|reject> --subject %s --reasons-file <absolute path>
@@ -391,7 +411,9 @@ with other content: stop, and do not retry.
 		f.RunID, f.TaskID, f.TaskSeq, f.AttemptID, f.AttemptNumber,
 		f.SubjectCommitOID, f.SubjectTreeOID, f.DiffBaseOID, f.SubjectCommitOID,
 		GrammarReasonSubjectMismatch,
-		f.AssignmentPath, f.RolePath, f.HOPPath, f.SubjectCommitOID,
+		f.AssignmentPath, f.RolePath,
+		f.HOPPath, f.HOPPath, f.HOPPath, f.HOPPath,
+		f.HOPPath, f.SubjectCommitOID,
 		GrammarVerdictAcceptedLine("<review-uuid>"), GrammarVerdictDuplicateLine("<review-uuid>"),
 		GrammarRefusalLine(GrammarReasonStale), GrammarRefusalLine(GrammarReasonNotReviewer),
 		GrammarRefusalLine(GrammarReasonMalformed), GrammarRefusalLine(GrammarReasonConflicting))
