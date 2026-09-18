@@ -349,11 +349,17 @@ func (c *Controller) identifyRestartedPane(ctx context.Context, binding *run.Run
 	pane, err := c.Runtime.InspectPane(ctx, binding.PaneID)
 	switch {
 	case errors.Is(err, ErrPaneNotFound):
-		// The id answers nothing and the label found nothing. That is NOT
-		// absence after a restart: a pane awaiting its deferred restore
-		// answers no inspection, and a renamed one answers no label, so a
-		// pane that still exists presents exactly this pair. It resolves
-		// itself once the restore fires and the harness rung can speak.
+		// THE FIRST OF TWO NOT-FOUNDS, and the one that is never absence.
+		// Nothing has vouched for this pane being ours: the id answers
+		// nothing and the label found nothing, which is exactly what a pane
+		// AWAITING ITS DEFERRED RESTORE looks like — it has no terminal
+		// runtime for about a second and a half after a restart — and
+		// equally what a renamed one looks like, since the rename took its
+		// label. A pane that still exists, and will resume an agent
+		// shortly, presents this pair. Concluding absence here is precisely
+		// the mistake the continuity conjunct existed to prevent, so this
+		// rung identifies nothing and the round ends; once the restore
+		// fires, the harness rung speaks and the close proceeds.
 		return restartUnidentified, "the server lifetime changed, and neither this session's creation label nor its recorded pane id answers; a pane awaiting its deferred restore answers neither, so nothing is concluded yet — if a pane of this run was renamed, rename it back to " + RenderExternal(binding.CreationLabel)
 	case err != nil:
 		return restartUnidentified, "the server lifetime changed, but the recorded pane could not be inspected; absence is never assumed from an inspection error"
@@ -470,6 +476,13 @@ func (c *Controller) dispatchRestartClose(ctx context.Context, handle RunHandle,
 	actCtx, release := handle.actContext(ctx)
 	closeErr := c.Runtime.ClosePane(actCtx, intent.PaneID)
 	release()
+	// THE SECOND OF TWO NOT-FOUNDS, and this one is tolerated — for one
+	// reason only: IDENTIFICATION ALREADY SUCCEEDED. Something vouched for
+	// this pane being this session's before the intent was committed, so a
+	// pane that has gone away between then and now went away as ours. That
+	// is what makes it different from the not-found the ladder refuses,
+	// where nothing had vouched for the pane at all. Absence is still not
+	// assumed from it: the confirmation below observes it.
 	if closeErr != nil && !errors.Is(closeErr, ErrPaneNotFound) {
 		return fmt.Errorf("app: close pane %s after a server restart: %w", intent.PaneID, closeErr)
 	}
