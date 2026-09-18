@@ -25,10 +25,16 @@ type SessionLaunchProgress struct {
 // re-inspected by every later round, and a later clean observation of the
 // same pane settles it.
 //
-// Exported because the transition journal is read outside this package:
-// a fixture that reproduces this state has to write the SAME reason the
-// live path writes, and a guard over reconciling transitions tells this
-// one from every other by it.
+// Exported for internal/testsupport/hopfixtures's in-repo fake
+// (ReconcileSession), whose contract IS agreement with this live path: it
+// journals a session into reconciling under this same constant, so a
+// scenario seeded through it is indistinguishable from one the real
+// corroboration step produced. Guards outside internal/app that need to
+// tell this reconciling transition from every other — test/integration's
+// included — retype the reason string instead of importing this constant
+// (test/integration/AGENTS.md: "retyped, never derived"), precisely so a
+// changed reason here is caught by their own drift rather than followed
+// silently.
 const TransitionReasonLaunchCorroboration = "launch corroboration: another process on the pane carries the launch identity; re-inspected every pass"
 
 // CorroborateSessionLaunches performs one inspection round for every
