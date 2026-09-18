@@ -703,7 +703,7 @@ func restartAttemptSettledLocked(ctx context.Context, uow UnitOfWork, attemptID 
 // restart rule has closed. The branches are design section 6's five rows in
 // its own order, so an attempt already due for retirement is retired rather
 // than settled or relaunched under any later row.
-func restartDispositionFor(detail *RunDetail, session *run.Session, claimFound bool, claim *LaunchClaim, facts restartRetirementFacts) restartDisposition { //nolint:gocritic // hugeParam: restartRetirementFacts is a two-field value read once per closed session.
+func restartDispositionFor(detail *RunDetail, session *run.Session, claimFound bool, claim *LaunchClaim, facts restartRetirementFacts) restartDisposition {
 	switch {
 	case restartStopHeld(detail) || facts.FailureCause || !restartFeatureRun(detail):
 		// A stopping run and a run carrying a terminal-failure cause never

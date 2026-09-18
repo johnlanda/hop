@@ -836,10 +836,10 @@ func TestRestartDispositionForIsValueFree(t *testing.T) {
 	}
 	// Every branch that closes a pane renders, including the two whose
 	// session reason says more about the session than the close itself.
-	if got := app.RestartDispositionFor(app.RestartInterruptReasonForTest); got != app.RestartDispositionClosed {
+	if got := app.RestartDispositionFor(app.RestartInterruptReasonForTest()); got != app.RestartDispositionClosed {
 		t.Errorf("the interrupt reason maps to %q, want %q", got, app.RestartDispositionClosed)
 	}
-	if got := app.RestartDispositionFor(app.RestartLaunchEndedReasonForTest); got != app.RestartDispositionClosed {
+	if got := app.RestartDispositionFor(app.RestartLaunchEndedReasonForTest()); got != app.RestartDispositionClosed {
 		t.Errorf("the settled launch's reason maps to %q, want %q", got, app.RestartDispositionClosed)
 	}
 	for _, other := range []string{"", "stop: termination observed", "cold relaunch authorized", "worker exited without an accepted result", "exec_failed claim; no process"} {
