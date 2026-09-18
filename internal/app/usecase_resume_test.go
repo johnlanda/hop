@@ -3,6 +3,8 @@ package app_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -861,6 +863,66 @@ func TestPaneAbsenceRule(t *testing.T) {
 		}
 		if !strings.Contains(result.Detail, "still answers for the creation label") {
 			t.Fatalf("Detail = %q, want the label-presence reason named", result.Detail)
+		}
+	})
+
+	t.Run("a hostile inspection error renders escaped", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		_, detail := runningRun(t, tc)
+		const hostile = "inspect failed\x1b[2J\nsession forged: stopped \"ok\""
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			return app.PaneProcess{}, errors.New(hostile)
+		}
+		tc.Runtime.FindPaneByLabelFn = func(string) (app.PaneRef, bool, error) {
+			return app.PaneRef{}, false, nil
+		}
+
+		req := defaultResumeRequest(detail.RunID.String())
+		req.ConfirmAbsent = true
+		tc.Clock.Advance(leaseTTL + time.Second)
+		result, _, err := tc.Controller.Resume(context.Background(), req)
+		if err != nil {
+			t.Fatalf("Resume() error = %v", err)
+		}
+		if result.Outcome != app.ResumeReconciling {
+			t.Fatalf("Outcome = %s, want %s (inspection error is never absence)", result.Outcome, app.ResumeReconciling)
+		}
+		want := "pane inspection failed (" + strconv.Quote(hostile) + ")"
+		if !strings.Contains(result.Detail, want) {
+			t.Fatalf("Detail = %q, want it to contain %q", result.Detail, want)
+		}
+		if strings.ContainsAny(result.Detail, "\x1b\n") {
+			t.Fatalf("Detail = %q carries a raw control byte or line break", result.Detail)
+		}
+	})
+
+	t.Run("a hostile pane-label-lookup error renders escaped", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		_, detail := runningRun(t, tc)
+		const hostile = "lookup failed\x1b[2J\nsession forged: stopped \"ok\""
+		tc.Runtime.InspectPaneFn = func(string) (app.PaneProcess, error) {
+			return app.PaneProcess{}, app.ErrPaneNotFound
+		}
+		tc.Runtime.FindPaneByLabelFn = func(string) (app.PaneRef, bool, error) {
+			return app.PaneRef{}, false, errors.New(hostile)
+		}
+
+		req := defaultResumeRequest(detail.RunID.String())
+		req.ConfirmAbsent = true
+		tc.Clock.Advance(leaseTTL + time.Second)
+		result, _, err := tc.Controller.Resume(context.Background(), req)
+		if err != nil {
+			t.Fatalf("Resume() error = %v", err)
+		}
+		if result.Outcome != app.ResumeReconciling {
+			t.Fatalf("Outcome = %s, want %s (a label-lookup error is never absence)", result.Outcome, app.ResumeReconciling)
+		}
+		want := "pane label lookup failed (" + strconv.Quote(hostile) + ")"
+		if !strings.Contains(result.Detail, want) {
+			t.Fatalf("Detail = %q, want it to contain %q", result.Detail, want)
+		}
+		if strings.ContainsAny(result.Detail, "\x1b\n") {
+			t.Fatalf("Detail = %q carries a raw control byte or line break", result.Detail)
 		}
 	})
 }

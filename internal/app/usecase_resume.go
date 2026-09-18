@@ -966,13 +966,13 @@ func (c *Controller) observePaneAbsence(ctx context.Context, paneID, label strin
 	case errors.Is(err, ErrPaneNotFound):
 		// Positively absent by id; the label conjunct decides below.
 	default:
-		return PaneProcess{}, false, fmt.Sprintf("pane inspection failed (%v); absence is never assumed from an inspection error", err)
+		return PaneProcess{}, false, fmt.Sprintf("pane inspection failed (%s); absence is never assumed from an inspection error", RenderExternal(err.Error()))
 	}
 	if label == "" {
 		return PaneProcess{}, false, "pane absent by id, but the binding has no creation label to confirm absence independently"
 	}
 	if _, found, findErr := c.Runtime.FindPaneByLabel(ctx, label); findErr != nil {
-		return PaneProcess{}, false, fmt.Sprintf("pane label lookup failed (%v); absence is never assumed from an inspection error", findErr)
+		return PaneProcess{}, false, fmt.Sprintf("pane label lookup failed (%s); absence is never assumed from an inspection error", RenderExternal(findErr.Error()))
 	} else if found {
 		return PaneProcess{}, false, "pane absent by id, but a pane still answers for the creation label; absence not established"
 	}

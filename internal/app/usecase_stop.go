@@ -518,10 +518,10 @@ func (c *Controller) retireUnboundLaunch(ctx context.Context, handle RunHandle, 
 
 	ref, foundPane, err := c.Runtime.FindPaneByLabel(ctx, intent.Label)
 	if err != nil {
-		return fmt.Sprintf("pane label lookup failed (%v); failing closed", err), nil
+		return fmt.Sprintf("pane label lookup failed (%s); failing closed", RenderExternal(err.Error())), nil
 	}
 	if !foundPane {
-		return fmt.Sprintf("no pane answers for launch label %s while claim pid %d is unobserved; failing closed", intent.Label, detail.Claim.PID), nil
+		return fmt.Sprintf("no pane answers for launch label %s while claim pid %d is unobserved; failing closed", RenderExternal(intent.Label), detail.Claim.PID), nil
 	}
 	markers, err := c.launchMarkers(ctx, handle, detail)
 	if err != nil {

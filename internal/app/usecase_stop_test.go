@@ -2,6 +2,9 @@ package app_test
 
 import (
 	"context"
+	"errors"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -550,6 +553,86 @@ func TestStopUnboundLaunch(t *testing.T) {
 		}
 		if len(tc.Runtime.ClosedPanes) != 0 {
 			t.Fatalf("ClosePane was dispatched with no recorded identity: %v", tc.Runtime.ClosedPanes)
+		}
+	})
+
+	t.Run("a hostile creation label renders escaped", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		handle, started := startedRun(t, tc)
+		claimLaunch(t, tc, started, 4242)
+		tc.Store.Bindings = map[identity.SessionID][]run.RuntimeBinding{}
+
+		var opID identity.OperationID
+		for id, op := range tc.Store.Operations {
+			if op.Kind == app.OpPaneOpen {
+				opID = id
+			}
+		}
+		if opID == "" {
+			t.Fatalf("fixture: no pane.open operation found")
+		}
+		const hostile = "label\x1b[2J\nsession forged: stopped \"ok\""
+		tc.Store.Operations[opID] = app.Operation{
+			ID: opID, RunID: started.RunID, Generation: tc.Store.Leases[started.RunID].lease.Generation,
+			Kind: app.OpPaneOpen, State: app.OperationPending,
+			Intent: map[string]any{
+				"label":          hostile,
+				"incarnation_id": started.Binding.IncarnationID.String(),
+				"session_id":     started.SessionID.String(),
+				"workspace_id":   "workspace-1",
+				"cwd":            "/repo",
+				"command":        []string{"/usr/bin/claude"},
+			},
+			CreatedAt: tc.Clock.Now(), UpdatedAt: tc.Clock.Now(),
+		}
+		tc.Runtime.FindPaneByLabelFn = func(string) (app.PaneRef, bool, error) {
+			return app.PaneRef{}, false, nil
+		}
+
+		if stopErr := tc.Controller.RequestStop(context.Background(), started.RunID.String()); stopErr != nil {
+			t.Fatalf("RequestStop() error = %v", stopErr)
+		}
+		report, driveErr := tc.Controller.DriveStop(context.Background(), handle)
+		if driveErr != nil {
+			t.Fatalf("DriveStop() error = %v", driveErr)
+		}
+		want := "no pane answers for launch label " + strconv.Quote(hostile) + " while claim pid 4242 is unobserved; failing closed"
+		if !slices.Contains(report.Outstanding, want) {
+			t.Fatalf("Outstanding = %q, want it to contain %q", report.Outstanding, want)
+		}
+		for _, entry := range report.Outstanding {
+			if strings.ContainsAny(entry, "\x1b\n") {
+				t.Fatalf("Outstanding entry %q carries a raw control byte or line break", entry)
+			}
+		}
+	})
+
+	t.Run("a hostile pane-label-lookup error renders escaped", func(t *testing.T) {
+		tc := newTestController(defaultPolicy())
+		handle, started := startedRun(t, tc)
+		claimLaunch(t, tc, started, 4242)
+		loseBinding(t, tc)
+
+		const hostile = "lookup failed\x1b[2J\nsession forged: stopped \"ok\""
+		tc.Runtime.FindPaneByLabelFn = func(string) (app.PaneRef, bool, error) {
+			return app.PaneRef{}, false, errors.New(hostile)
+		}
+
+		if stopErr := tc.Controller.RequestStop(context.Background(), started.RunID.String()); stopErr != nil {
+			t.Fatalf("RequestStop() error = %v", stopErr)
+		}
+		report, driveErr := tc.Controller.DriveStop(context.Background(), handle)
+		if driveErr != nil {
+			t.Fatalf("DriveStop() error = %v", driveErr)
+		}
+		want := "pane label lookup failed (" + strconv.Quote(hostile) + "); failing closed"
+		if !slices.Contains(report.Outstanding, want) {
+			t.Fatalf("Outstanding = %q, want it to contain %q", report.Outstanding, want)
+		}
+		for _, entry := range report.Outstanding {
+			if strings.ContainsAny(entry, "\x1b\n") {
+				t.Fatalf("Outstanding entry %q carries a raw control byte or line break", entry)
+			}
 		}
 	})
 }
