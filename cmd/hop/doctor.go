@@ -85,11 +85,11 @@ func renderStateRoot(w io.Writer, getenv func(string) string) (healthy bool, err
 // check that carries one, and a closing summary.
 func renderReport(w io.Writer, report app.Report) error {
 	for _, check := range report.Checks {
-		if _, err := fmt.Fprintf(w, "%-12s %s: %s\n", check.Status, check.Name, check.Detail); err != nil {
+		if _, err := fmt.Fprintf(w, "%-12s %s: %s\n", check.Status, check.Name, safeRenderExternal(check.Detail)); err != nil {
 			return err
 		}
 		if check.Advice != "" {
-			if _, err := fmt.Fprintf(w, "%-12s   advice: %s\n", "", check.Advice); err != nil {
+			if _, err := fmt.Fprintf(w, "%-12s   advice: %s\n", "", safeRenderExternal(check.Advice)); err != nil {
 				return err
 			}
 		}

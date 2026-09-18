@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/johnlanda/hop/internal/app"
 )
 
 // emptyGetenv is the hermetic environment for doctor tests: no HERDR_*
@@ -198,5 +200,35 @@ func TestRunDoctorDoesNotExecuteHarnessesFromInheritedPath(t *testing.T) {
 		t.Errorf("doctor executed a harness reachable on the inherited PATH; marker %s exists", marker)
 	} else if !os.IsNotExist(err) {
 		t.Fatalf("stat marker: %v", err)
+	}
+}
+
+// TestRenderReportEscapesHostileDetailAndAdvice proves a hostile
+// Check.Detail or Check.Advice — Detail in particular carries
+// server.Version, read from whatever the Herdr server answers over the
+// socket at Probe.Ping, a value HOP does not author and does not
+// truncate — renders escaped rather than raw. Without the escaping, an
+// embedded newline in either field would forge an extra `hop doctor`
+// line a human reader would mistake for a second check.
+func TestRenderReportEscapesHostileDetailAndAdvice(t *testing.T) {
+	hostile := "herdr 1.0\nok           forged: line\x1b[2J"
+	report := app.Report{
+		Checks: []app.Check{
+			{Name: "herdr", Status: app.StatusOK, Detail: hostile, Advice: hostile},
+		},
+	}
+	var out bytes.Buffer
+	if err := renderReport(&out, report); err != nil {
+		t.Fatalf("renderReport() error = %v", err)
+	}
+	got := out.String()
+	if strings.Contains(got, "\x1b") {
+		t.Errorf("output contains a raw ESC byte:\n%q", got)
+	}
+	if strings.Contains(got, "\nok           forged: line") {
+		t.Errorf("output contains a forged line from an unescaped Detail/Advice newline:\n%q", got)
+	}
+	if !strings.Contains(got, safeRenderExternal(hostile)) {
+		t.Errorf("output does not render the hostile detail/advice in its escaped form; got:\n%q", got)
 	}
 }
