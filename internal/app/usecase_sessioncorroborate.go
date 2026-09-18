@@ -29,11 +29,12 @@ type SessionLaunchProgress struct {
 // (ReconcileSession), whose contract IS agreement with this live path: it
 // journals a session into reconciling under this same constant, so a
 // scenario seeded through it is indistinguishable from one the real
-// corroboration step produced. Guards outside internal/app that need to
-// tell this reconciling transition from every other — test/integration's
-// included — retype the reason string instead of importing this constant
+// corroboration step produced — and for cmd/hop's own real-binary
+// transition guard (grammarcontract_statusaction_test.go), which imports
+// this constant directly to tell this reconciling transition from every
+// other. test/integration retypes the reason string instead
 // (test/integration/AGENTS.md: "retyped, never derived"), precisely so a
-// changed reason here is caught by their own drift rather than followed
+// changed reason here is caught by its own drift rather than followed
 // silently.
 const TransitionReasonLaunchCorroboration = "launch corroboration: another process on the pane carries the launch identity; re-inspected every pass"
 
