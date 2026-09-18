@@ -1822,10 +1822,14 @@ func runNeedsReworkCase(t *testing.T, artifacts *artifactDir, noticeBodyPath str
 // recognizes the section 7 controller notice grammar's ONE task-
 // consequence-first shape — the same line-1 position for both
 // renderTaskNotice (worker interruption, a per-task check failure) and
-// renderIntegrationNotice (a merge conflict or a rolled-back combined
-// check) — with an ANCHORED, exact-line match, never a substring search,
-// so a reason or evidence line merely naming "needs-rework", or a real
-// task line appearing anywhere but line 1, can never trigger a retry.
+// renderIntegrationNotice (a merge conflict, a rolled-back candidate, or
+// a shutdown before a candidate was published) — with an ANCHORED,
+// exact-line match, never a substring search, so a reason or evidence
+// line merely naming "needs-rework", or a real task line appearing
+// anywhere but line 1, can never trigger a retry. This does NOT
+// reintroduce two-shape tolerance: the task line is always line 1; what
+// varies is only whether a state token on a following integration line
+// is one this fixture treats as retry-worthy.
 func TestFixtureManagerNeedsReworkNoticeShapes(t *testing.T) {
 	t.Run("task line first (renderTaskNotice: worker interruption, per-task check failure)", func(t *testing.T) {
 		artifacts := newArtifactDir(t)
@@ -1901,6 +1905,36 @@ func TestFixtureManagerNeedsReworkNoticeShapes(t *testing.T) {
 			t.Errorf("manager retried t1 for a reason line merely mentioning needs-rework; want no retry (anchored match only); stdout:\n%s", stdout)
 		}
 		// Same positive-evidence requirement as the sibling subtest above.
+		if !strings.Contains(stdout, "FIXTURE-STATUS-CHECKED matched=[false]") {
+			t.Errorf("manager did not process the notice through the status-check branch; want \"FIXTURE-STATUS-CHECKED matched=[false]\"; stdout:\n%s", stdout)
+		}
+	})
+
+	t.Run("integration state outside the recognized set never retries", func(t *testing.T) {
+		artifacts := newArtifactDir(t)
+		noticePath := filepath.Join(artifacts.dir(t, "notice-bodies"), "notice.txt")
+		// The task line sits at line 1, exactly where the grammar always
+		// puts it — this is NOT an alternate line order — and an
+		// integration line follows at line 2 naming "interrupted": a
+		// REAL, reachable state (a terminal failure or stop settling a
+		// still-merging integration with nothing published; see
+		// usecase_featurestop.go's settleIntegrationForStop and
+		// usecase_retirement.go's driveFeatureTerminalFailure, both of
+		// which reach it through settleIntegrationTerminal), not one of
+		// integrationNoticeStates's two retry-worthy tokens
+		// ("conflicted"/"rolled-back"). The parser must reject it by the
+		// state token, not merely accept whatever sits at line 1, or a
+		// bug that dropped the state check entirely would go uncaught —
+		// exactly the class of bug this subtest existed to catch before
+		// it was deleted as apparently obsolete.
+		if err := os.WriteFile(noticePath, []byte("task t1 needs-rework\nintegration ffffffff-4444-4fff-8fff-ffffffffffff interrupted\nreason: run terminal failure before a candidate was published\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		retried, stdout := runNeedsReworkCase(t, artifacts, noticePath)
+		if retried {
+			t.Errorf("manager retried t1 for an integration state outside the recognized set; want no retry; stdout:\n%s", stdout)
+		}
+		// Same positive-evidence requirement as the sibling subtests above.
 		if !strings.Contains(stdout, "FIXTURE-STATUS-CHECKED matched=[false]") {
 			t.Errorf("manager did not process the notice through the status-check branch; want \"FIXTURE-STATUS-CHECKED matched=[false]\"; stdout:\n%s", stdout)
 		}

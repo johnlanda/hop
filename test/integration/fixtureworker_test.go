@@ -1384,23 +1384,73 @@ func matchTaskNeedsReworkLine(line string) (label string, ok bool) {
 	return "", false
 }
 
+// integrationNoticeStates are the exact state tokens
+// internal/app/usecase_featuresettle.go's renderIntegrationNotice puts on
+// an "integration <id> <state>" line that this fixture treats as
+// retry-worthy — retyped, never imported (this fixture is a standalone
+// program, never linking internal/app). renderIntegrationNotice also
+// renders "interrupted" (a stop or terminal failure settling a
+// still-merging integration with nothing published) — a REAL, reachable
+// state — but it is deliberately excluded here: a needs-rework
+// consequence on an interrupted integration is against a run that is
+// already terminally failing or stopping, and hop task retry against it
+// is refused by production anyway, so retrying it here would be pure
+// noise.
+var integrationNoticeStates = map[string]bool{
+	"conflicted":  true,
+	"rolled-back": true,
+}
+
+// matchIntegrationLine reports whether line is EXACTLY "integration <id>
+// <state>" — the same anchored, exact three-field shape as
+// matchTaskNeedsReworkLine — and, if so, the state token.
+func matchIntegrationLine(line string) (state string, ok bool) {
+	fields := strings.Fields(line)
+	if len(fields) == 3 && fields[0] == "integration" {
+		return fields[2], true
+	}
+	return "", false
+}
+
 // parseNeedsReworkLabel extracts the task label from a manager notice
-// body naming a needs-rework consequence: the section 7 controller
+// body naming a needs-rework consequence. The section 7 controller
 // notice grammar puts the task-consequence line FIRST in every notice
 // shape, retyped here, never imported (this fixture is a standalone
 // program, never linking internal/app) — both renderTaskNotice (worker
 // interruption, a per-task check failure) and renderIntegrationNotice (a
-// merge conflict or a rolled-back combined check) put it there, so one
-// anchored line-1 match covers both. The match is exact and
-// whitespace-normalized (matchTaskNeedsReworkLine's strings.Fields), never
-// a substring search over the whole body, so a reason or evidence line
-// merely naming "needs-rework" — or a real task line appearing anywhere
-// but line 1 — can never trigger a retry. ok is false for any other
-// notice shape (an integrated/dependents-released notice, a failed
-// notice, etc.), which the manager acks without acting on.
+// merge conflict, a rolled-back candidate, or a shutdown before a
+// candidate was published) put it there, so one anchored line-1 match
+// covers both shapes. This does NOT tolerate an alternate line order —
+// the grammar has exactly one, task line first, always. The match is
+// exact and whitespace-normalized (matchTaskNeedsReworkLine's
+// strings.Fields), never a substring search over the whole body, so a
+// reason or evidence line merely naming "needs-rework" — or a real task
+// line appearing anywhere but line 1 — can never trigger a retry. When
+// line 2 is an "integration <id> <state>" line (renderIntegrationNotice's
+// shape), its state token is additionally validated against
+// integrationNoticeStates: a state outside that set (interrupted) means
+// this is not a retry-worthy shape and the notice is refused, just like
+// any other unrecognized one — so a bug that dropped this state check
+// entirely, retrying regardless of which integration state produced the
+// notice, would be caught here rather than reaching production unnoticed.
+// ok is false for any other notice shape (an integrated/dependents-
+// released notice, a failed notice, etc.), which the manager acks
+// without acting on.
 func parseNeedsReworkLabel(body string) (label string, ok bool) {
-	line, _, _ := strings.Cut(body, "\n")
-	return matchTaskNeedsReworkLine(line)
+	lines := strings.SplitN(body, "\n", 3)
+	if len(lines) == 0 {
+		return "", false
+	}
+	label, ok = matchTaskNeedsReworkLine(lines[0])
+	if !ok {
+		return "", false
+	}
+	if len(lines) >= 2 {
+		if state, isIntegrationLine := matchIntegrationLine(lines[1]); isIntegrationLine && !integrationNoticeStates[state] {
+			return "", false
+		}
+	}
+	return label, true
 }
 
 // runManager is the manager-feature behavior's entry point: a scripted
