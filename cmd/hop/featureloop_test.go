@@ -387,7 +387,10 @@ func TestFeatureLoopHonorsRetirementAndCompletionReports(t *testing.T) {
 		if !ok {
 			t.Fatalf("DriveCompletion never ran; calls = %v", calls)
 		}
-		requireOnlyCalls(t, after, "Status", "DriveCompletion", "Heartbeat", "Detach")
+		// ReconcileServerRestart runs on EVERY non-terminal tick, before the
+		// stop branch and the pass: a Herdr restart is equally possible while
+		// a run is completing.
+		requireOnlyCalls(t, after, "Status", "ReconcileServerRestart", "DriveCompletion", "Heartbeat", "Detach")
 		if countCalls(calls, "DriveFeatureChecks") != 0 {
 			t.Errorf("a check round was dispatched after the run left running; calls = %v", calls)
 		}
@@ -479,7 +482,7 @@ func TestFeatureLoopHonorsRetirementAndCompletionReports(t *testing.T) {
 		if rounds != 3 {
 			t.Errorf("retirement rounds = %d, want 3 (two blocked, one settling)", rounds)
 		}
-		requireOnlyCalls(t, ctrl.recorded(), "Status", "CheckSpawnEnvironment", "RetireSettledSessions", "Heartbeat", "Detach")
+		requireOnlyCalls(t, ctrl.recorded(), "Status", "ReconcileServerRestart", "CheckSpawnEnvironment", "RetireSettledSessions", "Heartbeat", "Detach")
 	})
 }
 

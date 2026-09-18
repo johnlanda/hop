@@ -24,26 +24,27 @@ type fakeController struct {
 	// command created (the fake signature itself carries no context).
 	lastStatusCtx context.Context //nolint:containedctx // test-only capture of the call's context for deterministic cancellation scripting.
 
-	startRun             func(req app.StartRunRequest) (app.StartRunResult, app.RunHandle, error)
-	startFeatureRun      func(req app.StartRunRequest) (app.StartRunResult, app.RunHandle, error)
-	resolveRunWorkflow   func(repositoryRoot, override string) (string, error)
-	resume               func(req app.ResumeRequest) (app.ResumeResult, app.RunHandle, error)
-	resumeFeature        func(req app.ResumeFeatureRequest) (app.ResumeFeatureResult, app.RunHandle, error)
-	status               func(req app.StatusRequest) (app.StatusResult, error)
-	requestStop          func(runID string) error
-	driveStop            func() (app.StopReport, error)
-	driveFeatureStop     func() (app.StopReport, error)
-	heartbeat            func() error
-	detach               func() error
-	corroborate          func() (app.LaunchProgress, error)
-	corroborateSessions  func() ([]app.SessionLaunchProgress, error)
-	claimAndRunCheck     func(ctx context.Context, hopPath string, spawnEnv []string) (app.CheckReport, error)
-	driveFeatureChecks   func(ctx context.Context, hopPath string, spawnEnv []string) (app.FeatureCheckReport, error)
-	checkSpawnEnv        func(environ []string) ([]string, error)
-	submitResult         func(req app.SubmitResultRequest) (app.SubmitResultResult, error)
-	prepareSessionLaunch func(req app.SessionLaunchExecRequest) (app.LaunchExecPlan, error)
-	failLaunch           func(incarnationID, reason string) error
-	prepareCheck         func(req app.CheckExecRequest) (app.CheckExecPlan, error)
+	startRun               func(req app.StartRunRequest) (app.StartRunResult, app.RunHandle, error)
+	startFeatureRun        func(req app.StartRunRequest) (app.StartRunResult, app.RunHandle, error)
+	resolveRunWorkflow     func(repositoryRoot, override string) (string, error)
+	resume                 func(req app.ResumeRequest) (app.ResumeResult, app.RunHandle, error)
+	resumeFeature          func(req app.ResumeFeatureRequest) (app.ResumeFeatureResult, app.RunHandle, error)
+	status                 func(req app.StatusRequest) (app.StatusResult, error)
+	requestStop            func(runID string) error
+	driveStop              func() (app.StopReport, error)
+	reconcileServerRestart func(app.RestartOptions) (app.RestartReport, error)
+	driveFeatureStop       func() (app.StopReport, error)
+	heartbeat              func() error
+	detach                 func() error
+	corroborate            func() (app.LaunchProgress, error)
+	corroborateSessions    func() ([]app.SessionLaunchProgress, error)
+	claimAndRunCheck       func(ctx context.Context, hopPath string, spawnEnv []string) (app.CheckReport, error)
+	driveFeatureChecks     func(ctx context.Context, hopPath string, spawnEnv []string) (app.FeatureCheckReport, error)
+	checkSpawnEnv          func(environ []string) ([]string, error)
+	submitResult           func(req app.SubmitResultRequest) (app.SubmitResultResult, error)
+	prepareSessionLaunch   func(req app.SessionLaunchExecRequest) (app.LaunchExecPlan, error)
+	failLaunch             func(incarnationID, reason string) error
+	prepareCheck           func(req app.CheckExecRequest) (app.CheckExecPlan, error)
 
 	retireSettledSessions  func() (app.RetirementReport, error)
 	recomputeReleases      func() (app.ReleaseReport, error)
@@ -219,6 +220,22 @@ func (f *fakeController) RequestStop(_ context.Context, runID string) error {
 		return errors.New("unexpected RequestStop")
 	}
 	return f.requestStop(runID)
+}
+
+// ReconcileServerRestart enforces the real step's argument contract: the
+// loop must supply the ABSOLUTE path of the running hop binary, since a
+// relaunch composes a pane argv from it and a relative path would open a
+// pane that cannot launch. The state root may be empty — the step resolves
+// the run's frozen one — which is exactly what the loop passes.
+func (f *fakeController) ReconcileServerRestart(_ context.Context, _ app.RunHandle, opts app.RestartOptions) (app.RestartReport, error) { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.
+	f.record("ReconcileServerRestart")
+	if !filepath.IsAbs(opts.HOPPath) {
+		return app.RestartReport{}, fmt.Errorf("cmd_test: ReconcileServerRestart hop path %q is not absolute", opts.HOPPath)
+	}
+	if f.reconcileServerRestart == nil {
+		return app.RestartReport{}, nil
+	}
+	return f.reconcileServerRestart(opts)
 }
 
 func (f *fakeController) DriveStop(_ context.Context, _ app.RunHandle) (app.StopReport, error) { //nolint:gocritic // hugeParam: the fake mirrors the controllerAPI signature.

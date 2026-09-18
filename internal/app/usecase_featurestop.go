@@ -81,6 +81,27 @@ func (c *Controller) DriveFeatureStop(ctx context.Context, handle RunHandle) (St
 		}
 	}
 
+	// A stop that began before a Herdr restart, or spanned one, can never
+	// conclude a session's absence on its own: the placement's lifetime is
+	// gone and no recorded occupant can be matched again. The
+	// restart-lifecycle step closes what HOP owns first — retire-only here,
+	// since a stopping run never relaunches — so the retirement below
+	// decides against panes that are provably gone. No launch parameters
+	// are supplied for that reason.
+	restart, err := c.ReconcileServerRestart(ctx, handle, RestartOptions{})
+	if err != nil {
+		return StopReport{RunState: string(run.RunStopping)}, err
+	}
+	for _, still := range restart.Outstanding {
+		note(still)
+	}
+	if len(restart.Closed) > 0 {
+		// The closes changed what the run owns; re-read before retiring.
+		if detail, err = c.Read.LoadRunStatus(ctx, handle.runID); err != nil {
+			return StopReport{RunState: string(run.RunStopping)}, fmt.Errorf("app: load run status: %w", err)
+		}
+	}
+
 	// Check and merge executions: retire each claimed group; ambiguity is
 	// never absence.
 	for i := range detail.PendingOperations {

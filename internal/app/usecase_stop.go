@@ -197,10 +197,34 @@ func (c *Controller) DriveStop(ctx context.Context, handle RunHandle) (StopRepor
 		return c.stopReserved(ctx, handle, detail)
 	}
 
+	// A stop that began before a Herdr restart, or spanned one, can never
+	// conclude the worker's absence on its own: the placement's lifetime is
+	// gone and the recorded occupant can no longer be matched. The
+	// restart-lifecycle step closes what HOP owns first, so the retirement
+	// below decides against a pane that is provably gone rather than
+	// against evidence a restart made permanently ambiguous.
+	// No launch parameters: a stopping run never relaunches anything, so
+	// the step's retire-only branch is the only one it can take here.
+	restart, err := c.ReconcileServerRestart(ctx, handle, RestartOptions{})
+	if err != nil {
+		return StopReport{RunState: string(run.RunStopping)}, err
+	}
+	if len(restart.Closed) > 0 {
+		// The closes changed what the run owns; re-read before retiring.
+		if detail, err = c.Read.LoadRunStatus(ctx, handle.runID); err != nil {
+			return StopReport{RunState: string(run.RunStopping)}, fmt.Errorf("app: load run status: %w", err)
+		}
+	}
+
+	// The step's own unresolved sessions are ADDED to the round's report,
+	// never substituted for it: a round reports everything still
+	// outstanding, and one session the restart rule could not identify must
+	// not hide another session's ordinary unfinished close.
 	outstanding, err := c.retireOwnedWork(ctx, handle, detail)
 	if err != nil {
 		return StopReport{RunState: string(run.RunStopping)}, err
 	}
+	outstanding = append(restart.Outstanding, outstanding...)
 	if len(outstanding) > 0 {
 		return StopReport{RunState: string(run.RunStopping), Outstanding: outstanding}, nil
 	}

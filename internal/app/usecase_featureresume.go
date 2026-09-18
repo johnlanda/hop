@@ -136,6 +136,17 @@ func (c *Controller) ResumeFeature(ctx context.Context, req ResumeFeatureRequest
 		return result, handle, nil
 	}
 
+	// A takeover is exactly when a Herdr restart is most likely to have
+	// happened unobserved, so the restart-lifetime step runs before any
+	// session is reconciled: every conjunct below reads a placed session's
+	// evidence, and after a restart that evidence is permanently ambiguous
+	// until this step has closed what HOP owns.
+	restart, err := c.ReconcileServerRestart(ctx, handle, RestartOptions{HOPPath: req.HOPPath, StateRoot: req.StateRoot})
+	if err != nil {
+		return result, handle, err
+	}
+	result.Blocked = append(result.Blocked, restart.Outstanding...)
+
 	blocked, err := c.recoverIntegrationOperations(ctx, handle, &frozen, req.HOPPath, nil)
 	if err != nil {
 		return result, handle, err

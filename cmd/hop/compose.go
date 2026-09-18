@@ -38,6 +38,13 @@ type controllerAPI interface {
 	ResumeFeature(ctx context.Context, req app.ResumeFeatureRequest) (app.ResumeFeatureResult, app.RunHandle, error)
 	Status(ctx context.Context, req app.StatusRequest) (app.StatusResult, error)
 	RequestStop(ctx context.Context, runID string) error
+	// ReconcileServerRestart is the restart-lifecycle step
+	// (docs/plan/phase-3-design.md section 6). The loop calls it once per
+	// tick, BEFORE the stop branch and before the scheduling pass, in every
+	// non-terminal run state: a Herdr restart is equally possible while a
+	// run is launching, running, resuming or stopping, and every path that
+	// decides a placed session's absence reads what this step leaves.
+	ReconcileServerRestart(ctx context.Context, handle app.RunHandle, opts app.RestartOptions) (app.RestartReport, error)
 	DriveStop(ctx context.Context, handle app.RunHandle) (app.StopReport, error)
 	DriveFeatureStop(ctx context.Context, handle app.RunHandle) (app.StopReport, error)
 	Heartbeat(ctx context.Context, handle app.RunHandle) error

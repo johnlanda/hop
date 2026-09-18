@@ -221,6 +221,19 @@ func runFeatureControllerLoop(ctx context.Context, d *deps, ctrl controllerAPI, 
 				return loopResult{FinalState: report.RunState}, nil
 			}
 		} else {
+			// The restart-lifecycle step, before anything in the pass reads
+			// a placed session's absence: on a changed server lifetime it
+			// closes the panes this run owns and relaunches what it can, so
+			// every step below sees either a settled session or a named
+			// reason, never the permanent ambiguity a restart used to
+			// leave. A STOPPING tick does not come through here: DriveStop
+			// and DriveFeatureStop run the step themselves, so a stop round
+			// is self-sufficient however it was entered.
+			if restart, restartErr := ctrl.ReconcileServerRestart(ctx, handle, app.RestartOptions{HOPPath: hopPath}); restartErr != nil {
+				return loopResult{}, errors.Join(fmt.Errorf("reconcile server restart: %w", restartErr), drainChecks())
+			} else if lineErr := printRestartLines(stdout, label, restart); lineErr != nil {
+				return loopResult{}, errors.Join(lineErr, drainChecks())
+			}
 			if spawnEnv == nil {
 				spawnEnv, err = ctrl.CheckSpawnEnvironment(ctx, handle, d.environ())
 				if err != nil {
@@ -294,6 +307,42 @@ const roleManager = "manager"
 // the terminal-failure path, and this line is the reason the loop shows
 // before it observes the failed run. Only the fixed category text is
 // printed.
+// printRestartLines reports what the restart-lifecycle step did this tick,
+// value-free: no lifetime token, pid, label or path, only what a human
+// needs in order to know that their agents were replaced and which ones.
+// The MANAGER's relaunch is named separately from the workers', because it
+// moves the run's manager lineage and is the one a human most needs to
+// know happened. A tick where the step did nothing prints nothing.
+func printRestartLines(stdout io.Writer, label string, report app.RestartReport) error { //nolint:gocritic // hugeParam: RestartReport is a per-tick DTO, printed once.
+	for _, line := range restartLines(label, &report) {
+		if _, err := fmt.Fprintln(stdout, line); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// restartLines is printRestartLines' pure rendering.
+func restartLines(label string, report *app.RestartReport) []string {
+	var lines []string
+	if n := len(report.Closed); n > 0 {
+		lines = append(lines, fmt.Sprintf("run %s server restarted: %d session(s) closed", label, n))
+	}
+	if workers := len(report.Relaunched); workers > 0 {
+		if report.ManagerRelaunched {
+			workers--
+			lines = append(lines, fmt.Sprintf("run %s manager relaunched from its recorded session", label))
+		}
+		if workers > 0 {
+			lines = append(lines, fmt.Sprintf("run %s %d worker session(s) relaunched from their recorded sessions", label, workers))
+		}
+	}
+	for _, outstanding := range report.Outstanding {
+		lines = append(lines, fmt.Sprintf("run %s server restarted, unresolved: %s", label, outstanding))
+	}
+	return lines
+}
+
 func managerLaunchLines(reports []app.SessionLaunchProgress) []string {
 	var lines []string
 	for _, report := range reports {

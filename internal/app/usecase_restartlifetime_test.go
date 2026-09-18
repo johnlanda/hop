@@ -92,13 +92,19 @@ func paneAnswersNothing(id string) (app.PaneProcess, error) {
 }
 
 // labelResolvesTo scripts the creation-label lookup answering exactly
-// paneID for label, and nothing for any other label.
+// paneID for label — and answering NOTHING for it once that pane has been
+// closed. The second half is not a convenience: Herdr drops a pane's label
+// with the pane, so a lookup that kept answering for a closed pane would
+// reproduce a world that cannot occur (pinned by test/integration's
+// TestSpikeVanishedPaneShapes: after a close the creation label resolves
+// nothing). A fixture that got this wrong would let a close appear never to
+// take effect.
 func labelResolvesTo(tc *testController, label, paneID string) {
 	tc.Runtime.FindPaneByLabelFn = func(asked string) (app.PaneRef, bool, error) {
-		if asked == label {
-			return app.PaneRef{WorkspaceID: "workspace-1", TabID: "tab-1", PaneID: paneID}, true, nil
+		if asked != label || slices.Contains(tc.Runtime.ClosedPanes, paneID) {
+			return app.PaneRef{}, false, nil
 		}
-		return app.PaneRef{}, false, nil
+		return app.PaneRef{WorkspaceID: "workspace-1", TabID: "tab-1", PaneID: paneID}, true, nil
 	}
 }
 
@@ -383,4 +389,174 @@ func TestReconcileServerRestartBracket(t *testing.T) {
 	if !slices.ContainsFunc(report.Outstanding, func(entry string) bool { return strings.Contains(entry, "span a restart") }) {
 		t.Fatalf("outstanding = %q, want the spanning-restart reason", report.Outstanding)
 	}
+}
+
+// identifiedByLabel scripts the identification rung that speaks in BOTH
+// restore windows: the session's creation label resolves to exactly its
+// recorded pane id, and the pane itself answers nothing (its deferred
+// restore has not fired).
+func identifiedByLabel(tc *testController, binding run.RuntimeBinding) { //nolint:gocritic // hugeParam: the fixture binding is passed once per case.
+	labelResolvesTo(tc, binding.CreationLabel, binding.PaneID)
+	tc.Runtime.InspectPaneFn = paneAnswersNothing
+}
+
+// TestReconcileServerRestartRetires pins the disposition that fixes the
+// reported defect: under a held stop, an identified pane is closed, its
+// absence is observed and the session is TERMINATED — so the slot frees and
+// the run can reach stopped. Nothing is relaunched into a stopping run.
+func TestReconcileServerRestartRetires(t *testing.T) {
+	tc, fr, w, binding := restartWorker(t)
+	requestRunStop(tc, fr.RunID)
+	serverRestarted(tc)
+	identifiedByLabel(tc, binding)
+
+	report, err := tc.Controller.ReconcileServerRestart(context.Background(), fr.Handle, restartOptions())
+	if err != nil {
+		t.Fatalf("ReconcileServerRestart() error = %v", err)
+	}
+	if !slices.Contains(tc.Runtime.ClosedPanes, binding.PaneID) {
+		t.Fatalf("panes closed = %v, want the identified pane %s", tc.Runtime.ClosedPanes, binding.PaneID)
+	}
+	if !slices.Contains(report.Closed, w.SessionID.String()) {
+		t.Fatalf("report = %+v, want the session reported closed", report)
+	}
+	if len(report.Relaunched) != 0 {
+		t.Fatalf("relaunched = %v, want nothing: a stopping run never relaunches", report.Relaunched)
+	}
+	if got := tc.Store.Sessions[w.SessionID].value.State; got != run.SessionTerminated {
+		t.Fatalf("session state = %s, want terminated so the slot frees", got)
+	}
+}
+
+// TestReconcileServerRestartRelaunches pins the follow-through: a running
+// feature run's settled worker, closed after a restart, is cold-relaunched
+// from its RECORDED native session reference through the existing relaunch
+// path — a successor session bound to the same reference, its predecessor
+// marked lost with this cause's own reason, and a new pane opened.
+func TestReconcileServerRestartRelaunches(t *testing.T) {
+	tc, fr, w, binding := restartWorker(t)
+	serverRestarted(tc)
+	identifiedByLabel(tc, binding)
+	priorRef := nativeRefFor(tc, w)
+	if priorRef == "" {
+		t.Fatal("the seeded worker has no native session reference; the relaunch branch cannot be reached")
+	}
+
+	report, err := tc.Controller.ReconcileServerRestart(context.Background(), fr.Handle, restartOptions())
+	if err != nil {
+		t.Fatalf("ReconcileServerRestart() error = %v", err)
+	}
+	if !slices.Contains(report.Relaunched, w.SessionID.String()) {
+		t.Fatalf("report = %+v, want the session relaunched", report)
+	}
+	if got := tc.Store.Sessions[w.SessionID].value.State; got != run.SessionLost {
+		t.Fatalf("predecessor session state = %s, want lost", got)
+	}
+	successor := successorSessionFor(t, tc, w)
+	if successor.NativeSessionRef != priorRef {
+		t.Fatalf("successor native reference = %q, want the predecessor's %q: the conversation continues", successor.NativeSessionRef, priorRef)
+	}
+	if successor.AttemptID != w.AttemptID {
+		t.Fatalf("successor attempt = %s, want the SAME attempt %s", successor.AttemptID, w.AttemptID)
+	}
+	if successor.State != run.SessionLaunching {
+		t.Fatalf("successor state = %s, want launching", successor.State)
+	}
+}
+
+// successorSessionFor is the session the relaunch created for the same
+// attempt: the one non-terminal session of that attempt other than prior.
+func successorSessionFor(t *testing.T, tc *testController, prior workerFixture) run.Session {
+	t.Helper()
+	var found []run.Session
+	for id, row := range tc.Store.Sessions {
+		if id == prior.SessionID || row.value.AttemptID != prior.AttemptID {
+			continue
+		}
+		if row.value.State == run.SessionTerminated || row.value.State == run.SessionLost {
+			continue
+		}
+		found = append(found, row.value)
+	}
+	if len(found) != 1 {
+		t.Fatalf("sessions succeeding %s on attempt %s = %d, want exactly 1", prior.SessionID, prior.AttemptID, len(found))
+	}
+	return found[0]
+}
+
+// TestReconcileServerRestartSettlesAnUncorroboratedLaunch pins the branch
+// that must NOT relaunch: a launch the restart ended before it was ever
+// corroborated. Its native session reference is PRE-ASSIGNED, so no
+// transcript exists to resume and `--resume` of it would fail at the
+// harness; the claim settles exec_failed under this cause's own distinct
+// reason and the ordinary exec-failure consequences follow.
+func TestReconcileServerRestartSettlesAnUncorroboratedLaunch(t *testing.T) {
+	tc, fr, w, binding := restartWorker(t)
+	// The real shape of a launch the restart ended before corroboration:
+	// an exec_pending claim, with the attempt and session still LAUNCHING.
+	// A running attempt would mean the launch HAD been corroborated, which
+	// is a fixture that cannot occur.
+	claim := tc.Store.LaunchClaims[w.IncarnationID]
+	claim.State = app.LaunchClaimExecPending
+	tc.Store.LaunchClaims[w.IncarnationID] = claim
+	tc.Store.Attempts[w.AttemptID].value.State = run.AttemptLaunching
+	tc.Store.Sessions[w.SessionID].value.State = run.SessionLaunching
+	serverRestarted(tc)
+	identifiedByLabel(tc, binding)
+
+	report, err := tc.Controller.ReconcileServerRestart(context.Background(), fr.Handle, restartOptions())
+	if err != nil {
+		t.Fatalf("ReconcileServerRestart() error = %v", err)
+	}
+	if len(report.Relaunched) != 0 {
+		t.Fatalf("relaunched = %v, want nothing: a harness that never started has no transcript to resume", report.Relaunched)
+	}
+	settled := tc.Store.LaunchClaims[w.IncarnationID]
+	if settled.State != app.LaunchClaimExecFailed {
+		t.Fatalf("claim state = %s, want exec_failed", settled.State)
+	}
+	if !strings.Contains(settled.Error, "server restart") {
+		t.Fatalf("claim error = %q, want this cause's own distinct reason", settled.Error)
+	}
+	if got := tc.Store.Attempts[w.AttemptID].value.State; got != run.AttemptFailed {
+		t.Fatalf("attempt state = %s, want failed: an exec failure is a terminal attempt outcome", got)
+	}
+}
+
+// TestReconcileServerRestartOrdersTheManagerLast pins the ordering the
+// manager relaunch requires: every child session is reconciled BEFORE the
+// manager, so a round that fails partway has not moved the run's manager
+// lineage. The order is asserted from the closes themselves, not from the
+// report, since the closes are what actually happened.
+func TestReconcileServerRestartOrdersTheManagerLast(t *testing.T) {
+	tc, fr, w, binding := restartWorker(t)
+	managerBinding, ok := tc.Store.currentBindingLocked(fr.ManagerID)
+	if !ok {
+		t.Fatalf("no binding for the manager session %s", fr.ManagerID)
+	}
+	serverRestarted(tc)
+	tc.Runtime.InspectPaneFn = paneAnswersNothing
+	// Both panes are identified by their own creation labels, and each
+	// stops answering once closed, as a real one does.
+	tc.Runtime.FindPaneByLabelFn = func(asked string) (app.PaneRef, bool, error) {
+		for _, known := range []run.RuntimeBinding{binding, managerBinding} {
+			if asked == known.CreationLabel && !slices.Contains(tc.Runtime.ClosedPanes, known.PaneID) {
+				return app.PaneRef{PaneID: known.PaneID}, true, nil
+			}
+		}
+		return app.PaneRef{}, false, nil
+	}
+
+	if _, err := tc.Controller.ReconcileServerRestart(context.Background(), fr.Handle, restartOptions()); err != nil {
+		t.Fatalf("ReconcileServerRestart() error = %v", err)
+	}
+	worker := slices.Index(tc.Runtime.ClosedPanes, binding.PaneID)
+	manager := slices.Index(tc.Runtime.ClosedPanes, managerBinding.PaneID)
+	if worker < 0 || manager < 0 {
+		t.Fatalf("closed panes = %v, want both the worker's %s and the manager's %s", tc.Runtime.ClosedPanes, binding.PaneID, managerBinding.PaneID)
+	}
+	if manager < worker {
+		t.Fatalf("closed panes = %v: the manager's pane was closed before the worker's; the manager is reconciled LAST", tc.Runtime.ClosedPanes)
+	}
+	_ = w
 }
