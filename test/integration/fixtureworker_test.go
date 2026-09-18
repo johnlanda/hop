@@ -1389,13 +1389,13 @@ func matchTaskNeedsReworkLine(line string) (label string, ok bool) {
 // an "integration <id> <state>" line that this fixture treats as
 // retry-worthy — retyped, never imported (this fixture is a standalone
 // program, never linking internal/app). renderIntegrationNotice also
-// renders "interrupted" (a stop or terminal failure settling a
-// still-merging integration with nothing published) — a REAL, reachable
-// state — but it is deliberately excluded here: a needs-rework
-// consequence on an interrupted integration is against a run that is
-// already terminally failing or stopping, and hop task retry against it
-// is refused by production anyway, so retrying it here would be pure
-// noise.
+// renders "interrupted": a stop or terminal failure settling a
+// still-merging integration with nothing published. The run is ending,
+// so a retry would reserve an attempt that the shutdown immediately
+// abandons — and it is NOT refused: the run is still running and the
+// task is genuinely needs-rework when the notice commits, so hop task
+// retry would be accepted. Excluding it here is what keeps the fixture
+// from issuing that retry.
 var integrationNoticeStates = map[string]bool{
 	"conflicted":  true,
 	"rolled-back": true,

@@ -495,10 +495,13 @@ func GrammarNoticeTaskLine(taskSeq int, consequence string) string {
 // after the task line — supporting evidence for why the task consequence
 // follows, never the fact itself. Of the three states, only conflicted
 // and rolled-back are ones the section 7 manager protocol retries a
-// needs-rework consequence for; interrupted arises when a stop or
+// needs-rework consequence for. interrupted arises when a stop or
 // terminal failure settles a still-merging integration with nothing
-// published, against a run that is already ending, where a retry is
-// refused by production anyway.
+// published. The run is ending, so a retry would reserve an attempt
+// that the shutdown immediately abandons — and it is NOT refused: the
+// run is still running and the task is genuinely needs-rework when the
+// notice commits, so hop task retry would be accepted. Excluding it
+// here is what keeps the manager protocol from issuing that retry.
 func GrammarNoticeIntegrationLine(integrationID, state string) string {
 	return "integration " + integrationID + " " + state
 }

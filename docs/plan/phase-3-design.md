@@ -2035,11 +2035,15 @@ itself — then `reason: <reason>`, zero or more `evidence: <path>` lines,
 and, only for a failing consequence, a trailing
 `orphaned obligations: <ids>` (or `none`) line. Of the three integration
 states, only `conflicted` and `rolled-back` are ones the section 7
-manager protocol retries a `needs-rework` consequence for; `interrupted`
+manager protocol retries a `needs-rework` consequence for. `interrupted`
 arises when a stop or terminal failure settles a still-merging
-integration with nothing published, against a run that is already
-ending, where a retry is refused by production anyway. One order means a
-reader — human or fixture — never tries two positions for the fact it
+integration with nothing published. The run is ending, so a retry would
+reserve an attempt that the shutdown immediately abandons — and it is
+NOT refused: the run is still `running` and the task is genuinely
+`needs-rework` when the notice commits, so `hop task retry` would be
+accepted. Excluding it here is what keeps the manager protocol from
+issuing that retry. One order means a reader — human or fixture — never
+tries two positions for the fact it
 needs.
 
 Line position is meaningful only because every line IS exactly one line,
