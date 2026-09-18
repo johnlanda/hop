@@ -352,10 +352,20 @@ func writeHarnessStub(t *testing.T, path string, content []byte) {
 	}
 }
 
-// linkSharedBinary points path at an already-built, already-warmed binary,
-// sharing that binary's image instead of duplicating it, so executing path
-// costs what executing the shared binary again costs rather than a full
-// first execution. It replaces whatever occupied path.
+// linkSharedBinary makes path another name for target's image rather than a
+// duplicate of it, replacing whatever occupied path.
+//
+// What the link buys depends on the target, not on this call. Where target is
+// one of the binaries built and warmed once per process, every name linked to
+// it executes that already-evaluated image and costs a small fraction of a
+// first execution. Where target is a per-test build — a caller staging its own
+// wrapper as the harness — there is no warmth to inherit and the first
+// execution is paid once regardless; linking there only avoids copying the
+// image.
+//
+// Either way the name becomes another entry for one file, which is why
+// replaceHarnessStub exists: a later writer must unlink such a path, never
+// write through it.
 //
 // It falls back to a copy for one expected reason only — target living on
 // another filesystem, where no hard link can exist — and fails on anything
@@ -373,7 +383,7 @@ func linkSharedBinary(t *testing.T, path, target string) {
 	case errors.Is(err, syscall.EXDEV):
 		copyExecutable(t, target, path)
 	default:
-		t.Fatalf("link %s to the shared binary: %v", filepath.Base(path), err)
+		t.Fatalf("link %s to %s: %v", filepath.Base(path), filepath.Base(target), err)
 	}
 }
 
