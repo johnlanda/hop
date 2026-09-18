@@ -31,7 +31,7 @@ func TestRealProcessReconcilingChildLaunchAcrossResume(t *testing.T) {
 	artifacts := newArtifactDir(t)
 	server := prepareServer(t, artifacts)
 
-	worker := buildFixtureWorker(t, artifacts)
+	worker := buildFixtureWorker(t)
 	realWorkerPath := filepath.Join(artifacts.dir(t, "real-worker-bin"), "claude-real")
 	copyExecutable(t, worker, realWorkerPath)
 	installFixtureWorkerAsClaudeStub(t, server, buildWrappedLaunchStub(t, artifacts))
