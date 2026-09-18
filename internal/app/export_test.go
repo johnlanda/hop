@@ -132,3 +132,18 @@ const (
 	RestartSessionReasonForTest  = restartSessionReason
 	RestartRelaunchReasonForTest = restartRelaunchReason
 )
+
+// PaneCloseIntentForTest exposes the persisted pane.close intent to
+// app_test, so a table can assert what a close RECORDED as its
+// authorization exactly as a later round reads it back — decoded from the
+// operation, never from the value the caller happened to hold.
+type PaneCloseIntentForTest = paneCloseIntent
+
+// DecodePaneCloseIntentForTest decodes an operation's persisted intent as a
+// pane.close intent.
+func DecodePaneCloseIntentForTest(intent any) (PaneCloseIntentForTest, bool) {
+	return decodeOperationPayload[paneCloseIntent](intent)
+}
+
+// CloseReasonRestartForTest is the reason a restart close records.
+const CloseReasonRestartForTest = closeReasonRestart

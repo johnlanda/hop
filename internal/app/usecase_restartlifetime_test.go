@@ -630,3 +630,76 @@ func TestReconcileServerRestartJournalsItsOwnReasons(t *testing.T) {
 		})
 	}
 }
+
+// TestReconcileServerRestartJournalsItsAuthorization pins what the close
+// intent records: the rung that identified the pane, and BOTH lifetime
+// tokens — the placement's recorded one and the observing one it differs
+// from, which together are the evidence that licensed the close. They live
+// in the journal, never on any human-facing surface, and they are in the
+// INTENT because the intent is the record of what a close was authorized
+// against and because a later round re-drives this close from the
+// persisted target rather than re-identifying it.
+func TestReconcileServerRestartJournalsItsAuthorization(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(*testController, run.RuntimeBinding, workerFixture)
+		want  string
+	}{
+		{
+			name: "identified by the creation label",
+			setup: func(controller *testController, binding run.RuntimeBinding, _ workerFixture) {
+				identifiedByLabel(controller, binding)
+			},
+			want: "creation label",
+		},
+		{
+			name: "identified by the restored harness occupant",
+			setup: func(controller *testController, binding run.RuntimeBinding, w workerFixture) {
+				controller.Runtime.InspectPaneFn = func(paneID string) (app.PaneProcess, error) {
+					if paneID == binding.PaneID && !slices.Contains(controller.Runtime.ClosedPanes, paneID) {
+						return restoredHarnessPane(w.PID+900, nativeRefFor(controller, w)), nil
+					}
+					return app.PaneProcess{}, pinnedPaneNotFound("inspect", paneID)
+				}
+			},
+			want: "restored harness occupant",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			controller, fr, w, binding := restartWorker(t)
+			serverRestarted(controller)
+			tc.setup(controller, binding, w)
+
+			if _, err := controller.Controller.ReconcileServerRestart(context.Background(), fr.Handle, restartOptions()); err != nil {
+				t.Fatalf("ReconcileServerRestart() error = %v", err)
+			}
+			intent := restartCloseIntentFor(t, controller, binding.PaneID)
+			if intent.IdentifiedBy != tc.want {
+				t.Errorf("the close intent records identification %q, want %q", intent.IdentifiedBy, tc.want)
+			}
+			if intent.RecordedServerInstance != binding.ServerInstance {
+				t.Errorf("the close intent records the placement's lifetime %q, want %q", intent.RecordedServerInstance, binding.ServerInstance)
+			}
+			if intent.ServerInstance == "" || intent.ServerInstance == binding.ServerInstance {
+				t.Errorf("the close intent's observing lifetime = %q, want a non-empty one DIFFERING from the placement's %q", intent.ServerInstance, binding.ServerInstance)
+			}
+		})
+	}
+}
+
+// restartCloseIntentFor reads the single restart close this run journaled
+// for paneID, decoded from the operation as a later round would read it.
+func restartCloseIntentFor(t *testing.T, tc *testController, paneID string) app.PaneCloseIntentForTest {
+	t.Helper()
+	var found []app.PaneCloseIntentForTest
+	for id := range tc.Store.Operations {
+		intent, ok := app.DecodePaneCloseIntentForTest(tc.Store.Operations[id].Intent)
+		if ok && intent.PaneID == paneID && intent.Reason == app.CloseReasonRestartForTest {
+			found = append(found, intent)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("restart close intents for pane %s = %d, want exactly 1", paneID, len(found))
+	}
+	return found[0]
+}

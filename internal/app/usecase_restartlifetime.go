@@ -454,41 +454,28 @@ func (c *Controller) openRestartClose(ctx context.Context, handle RunHandle, ses
 		return "", paneCloseIntent{}, err
 	}
 	intent := paneCloseIntent{
-		PaneID:         binding.PaneID,
-		Label:          binding.CreationLabel,
-		SessionID:      session.ID,
-		IncarnationID:  binding.IncarnationID,
-		PID:            restartRecordedPID(claimFound, claim, binding),
-		ArgvMarkers:    markers,
-		Reason:         closeReasonRestart,
-		ServerInstance: observed,
+		PaneID:                 binding.PaneID,
+		Label:                  binding.CreationLabel,
+		SessionID:              session.ID,
+		IncarnationID:          binding.IncarnationID,
+		PID:                    restartRecordedPID(claimFound, claim, binding),
+		ArgvMarkers:            markers,
+		Reason:                 closeReasonRestart,
+		ServerInstance:         observed,
+		RecordedServerInstance: binding.ServerInstance,
+		IdentifiedBy:           string(by),
 	}
 	now := c.Clock.Now()
 	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 		return uow.Operations().Create(ctx, Operation{
 			ID: opID, RunID: handle.runID, Generation: handle.lease.Generation,
-			Kind: OpPaneClose, State: OperationPending,
-			Intent: intent, ActEvidence: restartCloseEvidence{
-				IdentifiedBy:           string(by),
-				RecordedServerInstance: binding.ServerInstance,
-				ObservedServerInstance: observed,
-			},
+			Kind: OpPaneClose, State: OperationPending, Intent: intent,
 			CreatedAt: now, UpdatedAt: now,
 		})
 	}); err != nil {
 		return "", paneCloseIntent{}, fmt.Errorf("app: record restart pane.close intent: %w", err)
 	}
 	return opID, intent, nil
-}
-
-// restartCloseEvidence is the act evidence a restart close records: how the
-// pane was identified as this session's, and both lifetime tokens. The
-// tokens live in the journal only; every human-facing detail stays
-// value-free.
-type restartCloseEvidence struct {
-	IdentifiedBy           string `json:"identified_by"`
-	RecordedServerInstance string `json:"recorded_server_instance"`
-	ObservedServerInstance string `json:"observed_server_instance"`
 }
 
 // dispatchRestartClose captures the pane's scrollback (it vanishes with the

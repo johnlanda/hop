@@ -61,8 +61,19 @@ type paneCloseIntent struct {
 	// ServerInstance is the server lifetime the target's absence is
 	// decided against (observePlacedPaneAbsence). A close journaled
 	// without it is decided against its caller's target, which names the
-	// same pane and incarnation.
+	// same pane and incarnation. For a restart close it is the OBSERVING
+	// lifetime, since the placement's is gone.
 	ServerInstance string `json:"server_instance"`
+	// RecordedServerInstance and IdentifiedBy are a restart close's own
+	// authorization, empty for every other close: the lifetime the
+	// PLACEMENT recorded (which, differing from ServerInstance above, is
+	// the positive evidence that licensed the close) and which rung
+	// identified the pane as this session's. They belong in the intent
+	// because the intent is the record of what a close was authorized
+	// against, and because a later round re-drives this close from the
+	// persisted target rather than re-identifying it.
+	RecordedServerInstance string `json:"recorded_server_instance,omitempty"`
+	IdentifiedBy           string `json:"identified_by,omitempty"`
 }
 
 // paneCloseOutcome is the OpPaneClose operation's outcome payload.

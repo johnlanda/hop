@@ -1129,6 +1129,20 @@ variable, so it can never act through HOP's CLIs, but it carries the
 complete `HERDR_*` identity including the socket path, so it can act as a
 Herdr pane client and rename its own pane.
 
+HOP DOES NOT RACE IT, AND THE RULE DOES NOT PRETEND TO. HOP cannot win a
+sub-second race it does not start in, and does not try to: the orphan may
+START; the close ENDS it and prevents every later one. That is an
+observation rather than a prediction. In the real-process scenario's own
+evidence, the scrollback HOP captured before closing the MANAGER's pane
+already held Herdr's restored invocation, while the worker's pane in the
+same run had not yet been given one — both restore windows, in one
+restart. The orphan there self-terminated only because the fixture
+principal refuses to run without HOP's environment; a real harness would
+have resumed its conversation and kept working on the repository until
+the close killed its pane. This is the argument for closing rather than
+waiting: waiting cannot be made short enough, and the close is what
+actually ends the agent.
+
 WHY THE ORDINARY CLOSE RULE CANNOT DO THIS. The close rule matches a
 foreground member at the RECORDED PID carrying a recorded marker. After a
 restart that process is gone, and the pane holds either nothing at all

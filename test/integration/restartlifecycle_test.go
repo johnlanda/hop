@@ -172,6 +172,15 @@ func TestRealProcessRestartClosesAndRelaunchesSessions(t *testing.T) {
 	attemptID, _ := fx.currentAttempt(t, t1)
 	workerSession := fx.sessionForAttempt(t, attemptID)
 	managerSession := fx.managerSessionID(t)
+	// The restart waits for the worker's SESSION to be active, not merely
+	// its task: a task is active the moment it is ASSIGNED, while the
+	// session stays launching until its launch claim is corroborated. A
+	// restart in that window is a real case — the rule settles such a launch
+	// rather than resuming it, since a pre-assigned native reference names
+	// no transcript — but it is NOT this scenario's case, which is the
+	// relaunch of a corroborated agent.
+	fx.requireSessionState(t, workerSession, "active")
+	fx.requireSessionState(t, managerSession, "active")
 	fx.requirePane(t, workerSession)
 	fx.requirePane(t, managerSession)
 
@@ -228,6 +237,39 @@ func TestRealProcessRestartClosesAndRelaunchesSessions(t *testing.T) {
 		}
 	}
 
+	// WHAT THE CLOSED PANE HELD, from the scrollback HOP itself captured
+	// before each close. This is OBSERVED and logged, never asserted:
+	// whether Herdr's restore wins the sub-second race before HOP's close
+	// is genuinely racy, and a run where it does and a run where it does
+	// not are both correct. What it establishes is that the hazard was
+	// really armed rather than hypothetical — and it is the durable
+	// evidence a process scan cannot give, since an orphan that has already
+	// exited leaves nothing for `ps` to find.
+	for i := range placed {
+		if scrollback := restartCloseScrollback(t, fx, placed[i].PaneID); strings.Contains(scrollback, orphanResumeRef) {
+			t.Logf("the %s session's pane had ALREADY been given Herdr's restored agent when HOP closed it: the close is what ended it", placed[i].Role)
+		} else {
+			t.Logf("the %s session's pane had not yet been given Herdr's restored agent when HOP closed it: the close prevented it", placed[i].Role)
+		}
+	}
+
+	// WHICH RUNG carried each close, read from the journal the closes
+	// themselves wrote: the scenario names the mechanism, not only the
+	// outcome. Every restart close must record one of the two
+	// identifications, and a close recording neither would mean a pane was
+	// closed on its id alone.
+	for i := range placed {
+		rung := restartCloseIdentification(t, fx, placed[i].PaneID)
+		if rung != "creation label" && rung != "restored harness occupant" {
+			t.Errorf("the %s session's pane %s was closed with identification %q, want one of the two rungs", placed[i].Role, placed[i].PaneID, rung)
+		}
+		t.Logf("the %s session's pane %s was closed, identified by its %s", placed[i].Role, placed[i].PaneID, rung)
+	}
+
+	// MANAGER LAST, as OBSERVED: the journal's own ordering of the closes,
+	// not the order the code intends.
+	requireManagerClosedLast(t, fx, placed)
+
 	requireNoOrphanResume(t, "after the restart and the relaunch")
 
 	// The run continues rather than stalling: the relaunched worker sends
@@ -257,6 +299,80 @@ func TestRealProcessRestartClosesAndRelaunchesSessions(t *testing.T) {
 	if got := fx.scalar(t, fmt.Sprintf("SELECT COUNT(*) FROM tasks WHERE run_id = '%s' AND kind = 'implement';", fx.runID)); got != "1" {
 		t.Errorf("implement tasks at completion = %s, want exactly 1: no duplicate task survived the relaunch", got)
 	}
+}
+
+// restartCloseIdentification reads, from the run's own operation journal,
+// which rung identified a pane before the restart rule closed it. The
+// intent is stored as JSON, so this scrapes the one field rather than
+// decoding a shape this package cannot import.
+func restartCloseIdentification(t *testing.T, fx *featureRun, paneID string) string {
+	t.Helper()
+	var rung string
+	if !waitUntilDeadline(featureRunTimeout, func() bool {
+		rung = strings.TrimSpace(fx.scalar(t, fmt.Sprintf(
+			"SELECT json_extract(intent, '$.identified_by') FROM operations "+
+				"WHERE kind = 'pane.close' AND json_extract(intent, '$.pane_id') = '%s' "+
+				"AND json_extract(intent, '$.reason') = 'server-lifetime change';", paneID)))
+		return rung != "" && rung != "NULL"
+	}) {
+		t.Fatalf("no server-restart close was journaled for pane %s (last answer %q)", paneID, rung)
+	}
+	return rung
+}
+
+// restartCloseScrollback reads the pane scrollback HOP captured before it
+// closed a pane under the restart rule — the close procedure's own evidence
+// capture, written to the run's artifact directory. Empty when the artifact
+// is missing, which a caller must treat as "nothing observed" rather than
+// as evidence of absence.
+func restartCloseScrollback(t *testing.T, fx *featureRun, paneID string) string {
+	t.Helper()
+	opID := strings.TrimSpace(fx.scalar(t, fmt.Sprintf(
+		"SELECT id FROM operations WHERE kind = 'pane.close' "+
+			"AND json_extract(intent, '$.pane_id') = '%s' "+
+			"AND json_extract(intent, '$.reason') = 'server-lifetime change';", paneID)))
+	if opID == "" {
+		return ""
+	}
+	content, err := os.ReadFile(filepath.Join(fx.stateDir, "runs", fx.runID, "artifacts", "pane-scrollback-"+opID+".txt")) //nolint:gosec // G304: the path is inside this test's own state directory.
+	if err != nil {
+		return ""
+	}
+	return string(content)
+}
+
+// requireManagerClosedLast asserts the OBSERVED ordering: every child
+// session's restart close was journaled before the manager's, so a round
+// that failed partway could not have moved the run's manager lineage
+// first. The comparison is on the operations' own recorded instants, with
+// the row id breaking a tie, exactly as the store orders them.
+func requireManagerClosedLast(t *testing.T, fx *featureRun, placed []orchestratedSession) {
+	t.Helper()
+	closedAt := func(paneID string) string {
+		return strings.TrimSpace(fx.scalar(t, fmt.Sprintf(
+			"SELECT created_at || '|' || id FROM operations WHERE kind = 'pane.close' "+
+				"AND json_extract(intent, '$.pane_id') = '%s' "+
+				"AND json_extract(intent, '$.reason') = 'server-lifetime change';", paneID)))
+	}
+	var manager string
+	for i := range placed {
+		if placed[i].Role == roleManagerRow {
+			manager = closedAt(placed[i].PaneID)
+		}
+	}
+	if manager == "" {
+		t.Fatal("no server-restart close was journaled for the manager's pane")
+	}
+	for i := range placed {
+		if placed[i].Role == roleManagerRow {
+			continue
+		}
+		child := closedAt(placed[i].PaneID)
+		if child == "" || child >= manager {
+			t.Errorf("the %s session's close (%s) was not journaled before the manager's (%s); the manager is reconciled LAST", placed[i].Role, child, manager)
+		}
+	}
+	t.Logf("the manager's restart close was journaled last, at %s", manager)
 }
 
 // planCloseQuery counts the run's ACCEPTED plan closes — the authoritative
