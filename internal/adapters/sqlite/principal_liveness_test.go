@@ -10,10 +10,10 @@ import (
 )
 
 // endSession drives one session to a terminal state through the domain's
-// own transitions, leaving its binding row untouched. Nothing supersedes a
-// binding on the way to lost or terminated, so a session that has ended
-// keeps the current, unsuperseded binding it was placed under: only the
-// session's own state tells a caller rule that the principal is gone.
+// own transitions, leaving its binding row untouched — as the retirement
+// paths that end a session without observing its pane do. The session
+// then keeps the current, unsuperseded binding it was placed under, so
+// only its own state tells a caller rule that the principal is gone.
 func endSession(t *testing.T, f *featureFixture, sessionID identity.SessionID, state run.SessionState) {
 	t.Helper()
 	f.inUOW(t, func(uow app.UnitOfWork) {

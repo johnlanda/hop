@@ -320,17 +320,26 @@ sides together. `cmd/hop` never imports domain or identity types: every
   binding in hand is never superseded, and the `!binding.Superseded`
   conjuncts written beside those reads are defense in depth rather than
   what establishes it. Liveness is the separate question, because ending a
-  session supersedes nothing: a lost or terminated session keeps the
-  placement it ran under, so a reader that needs a LIVE session
-  establishes that from the session row. `RunDetail.Binding` has it by
+  session does not ITSELF supersede its binding: only observed absence or
+  an absence attestation does, so a lost or terminated session CAN still
+  hold the placement it ran under — the ordinary stop supersedes and then
+  terminates, while a retirement that never observed the pane terminates
+  and leaves the binding current. A reader must assume neither, and
+  establishes liveness from the session row. `RunDetail.Binding` has it by
   construction — `attachSessionBinding` is reached only through
   `currentSession` or `managerSession`, both of which exclude terminal
   states in SQL — and so never describes a terminal session; a session
   summary's binding can, since that list covers every session the run has
-  created. `stopping` is not a state a binding outlives: `terminated` and
-  `lost` are the whole terminal set, and a session sits in `stopping` only
-  while the close procedure that supersedes its binding on observed
-  absence is still running.
+  created. `stopping` is outside the terminal set (`terminated` and `lost`
+  are the whole of it) and a binding does outlive it: a session parked
+  there by a dispatched close keeps a current binding until a later round
+  observes the pane absent. No caller rule is reachable from there, by
+  role or by run state rather than by that binding —
+  `recordCloseDispatched` parks a session in `stopping` only for a
+  `stop`-reason close, which is driven either by a stop of the run, where
+  `CanAcceptManagerVerb` and `AcceptVerdict` already refuse every manager
+  verb and verdict, or by a solo run's post-check retirement, whose
+  session is a `worker`: a role no caller rule admits.
 - A pane can vanish at any moment: `PublishRunPresentation` skips a pane
   the server reports not found and records nothing, leaving the
   session's fate to corroboration, retirement and resume.
