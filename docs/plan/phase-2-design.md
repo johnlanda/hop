@@ -919,10 +919,11 @@ per the decision table (section 4) before any new act.
    pane gone (positively absent by pane id AND by creation label, each a
    successful observation — an inspection error or an empty-foreground
    pane that still answers is never absence) has no restore pending
-   against the session state that process has already persisted — not
-   against a later restart, which can still restore a pane closed
-   shortly before it, a known residual and not this attestation's
-   concern (docs/plan/phase-3-design.md section 4's RESIDUAL (LAUNCH-8));
+   within this server lifetime — a deferred native restore arises only
+   at a restart — not against a later restart, which can still restore a
+   pane closed shortly before it, a known residual and not this
+   attestation's concern (docs/plan/phase-3-design.md section 4's
+   RESIDUAL (LAUNCH-8));
    a restart or live handoff changes the identity and fails
    closed. With continuity
    established, HOP's own pending launch claims/intents are retired by
