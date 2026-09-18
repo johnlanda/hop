@@ -215,10 +215,18 @@ func TestRealProcessChildLaunchInFlightAcrossResume(t *testing.T) {
 	server.start(t)
 	// Registered after the server starts: LIFO teardown then retires the
 	// controller before it stops the server, so the pane — and with it the
-	// FIFO's only reader — is still alive when this cleanup runs on any
-	// failure path that never reaches the test's own release() call. No pid
+	// FIFO's only reader — is still alive when this cleanup runs on every
+	// failure path after the stub is held (has written ready and is
+	// blocked on its own gate open) that never reaches the test's own
+	// release() call. Gated on that same ready marker so a failure BEFORE
+	// the stub ever reaches its gate open — nothing yet to rendezvous
+	// with — never blocks this cleanup on an unreachable FIFO open. No pid
 	// is ever signaled.
-	t.Cleanup(release)
+	t.Cleanup(func() {
+		if pathExists(t, ready) {
+			release()
+		}
+	})
 
 	scratchDir := artifacts.dir(t, "fixture-scratch")
 	repo := newFeatureFixtureRepo(t, artifacts, server, "child-launch-inflight-repo", featureFixtureOptions{
