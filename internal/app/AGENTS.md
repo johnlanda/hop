@@ -313,6 +313,24 @@ sides together. `cmd/hop` never imports domain or identity types: every
   listing, a pid still listed, a label still answering and any other
   inspection error all stay ambiguous and settle nothing; no detail
   echoes the inspector's error text.
+- What reading a binding establishes, and what it does not.
+  `currentBinding` is the only query that returns a `runtime_bindings`
+  row, and it selects `superseded = 0`; every reader goes through it — the
+  `Bindings()` repository, `RunDetail.Binding`, a session summary — so a
+  binding in hand is never superseded, and the `!binding.Superseded`
+  conjuncts written beside those reads are defense in depth rather than
+  what establishes it. Liveness is the separate question, because ending a
+  session supersedes nothing: a lost or terminated session keeps the
+  placement it ran under, so a reader that needs a LIVE session
+  establishes that from the session row. `RunDetail.Binding` has it by
+  construction — `attachSessionBinding` is reached only through
+  `currentSession` or `managerSession`, both of which exclude terminal
+  states in SQL — and so never describes a terminal session; a session
+  summary's binding can, since that list covers every session the run has
+  created. `stopping` is not a state a binding outlives: `terminated` and
+  `lost` are the whole terminal set, and a session sits in `stopping` only
+  while the close procedure that supersedes its binding on observed
+  absence is still running.
 - A pane can vanish at any moment: `PublishRunPresentation` skips a pane
   the server reports not found and records nothing, leaving the
   session's fate to corroboration, retirement and resume.
