@@ -16,11 +16,18 @@ import (
 	"time"
 )
 
-// TestMain lets this package share process-lifetime state across tests
-// (buildHopBinary's single ./cmd/hop build, cached below) and clean it up
-// once every test in this binary run has finished, instead of rebuilding it
-// per test the way stagePlugin does for the plugin-linking tests, which need
-// a fresh plugin-shaped staging directory every time.
+// TestMain lets this package share process-lifetime state across tests — the
+// single ./cmd/hop build cached below, and the fixture builds cached in their
+// own files — and cleans all three up once every test in this binary run has
+// finished. The plugin-linking tests still get a fresh plugin-shaped staging
+// directory each, but the executable inside it is a link to the shared build
+// rather than a build of its own (stagePlugin).
+//
+// Before that cleanup it checks that no shared binary changed after it was
+// built: each one is reachable through paths that link to it, so a writer
+// that replaced such a path in place rather than unlinking it first would
+// have rewritten the shared file, and the cleanup would then destroy the
+// evidence. See replaceHarnessStub for the invariant itself.
 func TestMain(m *testing.M) {
 	code := m.Run()
 	// Checked before the cleanup below, which would destroy the evidence: a
@@ -30,6 +37,7 @@ func TestMain(m *testing.M) {
 	for _, violation := range []string{
 		checkSharedBinaryIntact("fixture worker", fixtureWorkerBinary.path, fixtureWorkerBinary.fingerprint),
 		checkSharedBinaryIntact("fake hop", fakeHopBinary.path, fakeHopBinary.fingerprint),
+		checkSharedBinaryIntact("hop command", hopBinary.path, hopBinary.fingerprint),
 	} {
 		if violation == "" {
 			continue
@@ -56,11 +64,12 @@ func TestMain(m *testing.M) {
 // process-lifetime mutable global guarded by sync.Once and cleaned up by
 // TestMain; there is no other way to share build state across independent
 // Test functions.
-var hopBinary struct { //nolint:gochecknoglobals // process-lifetime build cache guarded by sync.Once; see comment above.
-	once sync.Once
-	dir  string
-	path string
-	err  error
+var hopBinary struct { //nolint:gochecknoglobals // process-lifetime build cache guarded by sync.Once; see hopBinary's own doc comment.
+	once        sync.Once
+	dir         string
+	path        string
+	err         error
+	fingerprint sharedBinaryFingerprint
 }
 
 // buildHopBinary builds ./cmd/hop once for every test in this binary run and
@@ -92,6 +101,18 @@ func buildHopBinary(t *testing.T) string {
 			hopBinary.err = fmt.Errorf("go build ./cmd/hop: %w\n%s", buildErr, combined)
 			return
 		}
+		// An empty argv reaches dispatch's usage branch, which writes to
+		// stderr and returns at once, touching no state and spawning
+		// nothing. Warmed here, with the build, so the first execution is
+		// paid once for the process and outside every deadline — the same
+		// reason the fixture binaries are warmed where they are built.
+		warmExecutable(t, out)
+		fingerprint, statErr := fingerprintSharedBinary(out)
+		if statErr != nil {
+			hopBinary.err = statErr
+			return
+		}
+		hopBinary.fingerprint = fingerprint
 		hopBinary.path = out
 	})
 	if hopBinary.err != nil {

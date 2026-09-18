@@ -628,15 +628,12 @@ func printScripted() bool {
 }
 `
 
-// buildFakeHopStub compiles fakeHopSource once for the calling test into a
-// temporary module under the test's artifact directory, mirroring
-// buildFixtureWorker's own build shape.
 // fakeHopBinary caches the single fake-hop build every test in one `go test`
 // process shares, for the same two reasons as fixtureWorkerBinary: one build
 // instead of one per test, and one first execution instead of one per test.
 // It is a narrow, process-lifetime mutable global guarded by sync.Once and
 // cleaned up by TestMain.
-var fakeHopBinary struct { //nolint:gochecknoglobals // process-lifetime build cache guarded by sync.Once; see comment above.
+var fakeHopBinary struct { //nolint:gochecknoglobals // process-lifetime build cache guarded by sync.Once; see fakeHopBinary's own doc comment.
 	once        sync.Once
 	dir         string
 	path        string
@@ -644,6 +641,9 @@ var fakeHopBinary struct { //nolint:gochecknoglobals // process-lifetime build c
 	fingerprint sharedBinaryFingerprint
 }
 
+// buildFakeHopStub compiles fakeHopSource once per `go test` process into a
+// temporary module of its own, mirroring buildFixtureWorker's build shape,
+// and returns the built executable every test in the process shares.
 func buildFakeHopStub(t *testing.T) string {
 	t.Helper()
 	fakeHopBinary.once.Do(func() {
@@ -711,6 +711,14 @@ func buildFakeHopStub(t *testing.T) string {
 // warmed where they are built (warmExecutable), so no first-execution cost
 // falls inside it.
 const fixturePrincipalBudget = 3 * time.Second
+
+// fixtureManagerReplanBudget bounds the two short manager invocations
+// TestFixtureManagerResumeSkipsReplanning drives. It is smaller than
+// fixturePrincipalBudget because the second invocation proves an absence —
+// no task created, no plan closed — and a run whose whole purpose is to
+// elapse should elapse briefly. Both invocations exec the shared, warmed
+// binaries, so the work inside it is milliseconds.
+const fixtureManagerReplanBudget = 1 * time.Second
 
 // principalOutcome is what one fixture-principal invocation revealed: its
 // combined output, when each awaited marker first appeared, and how long the
@@ -799,9 +807,9 @@ const fixtureManagerReady = "FIXTURE-MANAGER-READY"
 
 // runFixtureManager starts cmd, watches its combined output, and stops it as
 // soon as the manager reports ready and then reaches any one of the settling
-// markers — or when fixturePrincipalBudget expires, whichever comes first.
-// Naming no settling marker runs the full budget, for a scenario whose end is
-// exhausting a script rather than reaching a marker.
+// markers — or when budget expires, whichever comes first. Naming no settling
+// marker runs the full budget, for a scenario whose end is exhausting a
+// script rather than reaching a marker.
 // stop must be the cancel function of the context cmd was built with:
 // canceling its own context is how an idling principal is ended here, and it
 // names no pid.
@@ -811,7 +819,7 @@ const fixtureManagerReady = "FIXTURE-MANAGER-READY"
 // waited, and whether any output arrived at all — instead of reaching the
 // caller as a missing-marker assertion, which cannot tell a principal that
 // never started from one that started and decided otherwise.
-func runFixtureManager(t *testing.T, cmd *exec.Cmd, stop context.CancelFunc, settling ...string) principalOutcome {
+func runFixtureManager(t *testing.T, cmd *exec.Cmd, stop context.CancelFunc, budget time.Duration, settling ...string) principalOutcome {
 	t.Helper()
 	watcher := &markerWatcher{
 		start:    time.Now(),
@@ -828,11 +836,11 @@ func runFixtureManager(t *testing.T, cmd *exec.Cmd, stop context.CancelFunc, set
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start fixture principal: %v", err)
 	}
-	budget := time.NewTimer(fixturePrincipalBudget)
-	defer budget.Stop()
+	expiry := time.NewTimer(budget)
+	defer expiry.Stop()
 	select {
 	case <-watcher.settled:
-	case <-budget.C:
+	case <-expiry.C:
 	}
 	stop()
 	_ = cmd.Wait() //nolint:errcheck // this principal idles until it is stopped, so being killed is the expected outcome; what it wrote beforehand is the assertion material.
@@ -846,7 +854,7 @@ func runFixtureManager(t *testing.T, cmd *exec.Cmd, stop context.CancelFunc, set
 	}
 	if _, ok := outcome.arrived[fixtureManagerReady]; !ok {
 		t.Fatalf("fixture manager never reported %q within %s (waited %s): %s\noutput:\n%s",
-			fixtureManagerReady, fixturePrincipalBudget, outcome.elapsed.Round(time.Millisecond), describeSilence(outcome.stdout), outcome.stdout)
+			fixtureManagerReady, budget, outcome.elapsed.Round(time.Millisecond), describeSilence(outcome.stdout), outcome.stdout)
 	}
 	return outcome
 }
@@ -1073,7 +1081,7 @@ func TestFixtureManagerScriptDispatch(t *testing.T) {
 	// everything it did. It names no settling marker because the last things
 	// it asserts — the closing ack and the reclose of the plan — leave no
 	// mark on stdout, so no marker can stand for "finished".
-	run := runFixtureManager(t, cmd, cancel)
+	run := runFixtureManager(t, cmd, cancel, fixturePrincipalBudget)
 
 	stdout := run.stdout
 	for _, want := range []string{
@@ -1186,21 +1194,19 @@ func TestFixtureManagerResumeSkipsReplanning(t *testing.T) {
 		"FAKE_HOP_TASK_COUNTER_FILE=" + counterPath,
 		"FAKE_HOP_LOG=" + logPath,
 	}
-	run := func(args ...string) string {
-		ctx, cancel := context.WithTimeout(t.Context(), 1*time.Second)
+	run := func(settling []string, args ...string) string {
+		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
 		cmd := exec.CommandContext(ctx, principal, args...) //nolint:gosec // G204: fixed test-owned binary and arguments.
 		cmd.Dir = cwd
 		cmd.Env = baseEnv
-		var out strings.Builder
-		cmd.Stdout = &out
-		cmd.Stderr = &out
-		_ = cmd.Run() //nolint:errcheck // bounded by the context deadline; the manager never exits on its own (per-attempt retirement is what a real scenario proves terminates it).
-		return out.String()
+		return runFixtureManager(t, cmd, cancel, fixtureManagerReplanBudget, settling...).stdout
 	}
 
 	firstPrompt := testManagerInitialPrompt(assignmentPath, rolePath, cribPath, fakeHop)
-	firstStdout := run("--session-id", "22222222-2222-2222-2222-222222222222", firstPrompt)
+	// Closing the plan is the last step the first launch drives, and both log
+	// counts asserted below are written before it.
+	firstStdout := run([]string{"FIXTURE-PLAN-CLOSED"}, "--session-id", "22222222-2222-2222-2222-222222222222", firstPrompt)
 	if !strings.Contains(firstStdout, "FIXTURE-TASK-CREATED label=[t1]") || !strings.Contains(firstStdout, "FIXTURE-PLAN-CLOSED") {
 		t.Fatalf("first (non-resumed) launch did not plan; stdout:\n%s", firstStdout)
 	}
@@ -1214,7 +1220,10 @@ func TestFixtureManagerResumeSkipsReplanning(t *testing.T) {
 
 	const nativeRef = "88888888-8888-4888-8888-888888888888"
 	continuationPrompt := testManagerContinuationPrompt(assignmentPath, rolePath, cribPath, fakeHop)
-	secondStdout := run("--resume", nativeRef, continuationPrompt)
+	// No settling marker: what this half proves is an ABSENCE — that the
+	// resumed manager creates no task and closes no plan — and no marker
+	// stands for a step not taken, so the budget has to elapse.
+	secondStdout := run(nil, "--resume", nativeRef, continuationPrompt)
 	if strings.Contains(secondStdout, "FIXTURE-TASK-CREATED") || strings.Contains(secondStdout, "FIXTURE-PLAN-CLOSED") {
 		t.Errorf("resumed launch re-planned; stdout:\n%s", secondStdout)
 	}
@@ -1340,7 +1349,7 @@ func runPreForwardBarrierManager(t *testing.T, fx preForwardBarrierFixture) stri
 	// fires only once the forward is done, and every subtest asserts the ack
 	// that follows it, which stdout never shows. Stopping at a marker here
 	// would cut the run before the behavior under test.
-	run := runFixtureManager(t, cmd, cancel)
+	run := runFixtureManager(t, cmd, cancel, fixturePrincipalBudget)
 	return run.stdout
 }
 
@@ -1463,7 +1472,7 @@ func runPreForwardBarrierManagerResumed(t *testing.T, fx preForwardBarrierFixtur
 	cmd.Env = fx.env
 	// No settling marker, for the same reason as the first-launch helper:
 	// the ack this run is driven to prove leaves no mark on stdout.
-	run := runFixtureManager(t, cmd, cancel)
+	run := runFixtureManager(t, cmd, cancel, fixturePrincipalBudget)
 	return run.stdout
 }
 
@@ -1677,7 +1686,7 @@ func TestFixtureManagerRetriesTransientTaskCreate(t *testing.T) {
 	// Settling here is safe because everything asserted below happens before
 	// it: closing the plan is the last step this one-task script drives, and
 	// both task create attempts are already logged by the time it prints.
-	run := runFixtureManager(t, cmd, cancel, "FIXTURE-PLAN-CLOSED")
+	run := runFixtureManager(t, cmd, cancel, fixturePrincipalBudget, "FIXTURE-PLAN-CLOSED")
 
 	stdout := run.stdout
 	for _, want := range []string{
@@ -1874,7 +1883,7 @@ func runVerdictCorrelationCase(t *testing.T, artifacts *artifactDir, noticeBodyP
 	}, statusEnv...)
 	// This scenario ends by exhausting its scripted notices rather than at
 	// any one marker, so it names none and runs the whole budget.
-	run := runFixtureManager(t, cmd, cancel)
+	run := runFixtureManager(t, cmd, cancel, fixturePrincipalBudget)
 
 	log = readFakeHopLog(t, fx.logPath)
 	return countLogLinesWithPrefix(log, "task\tcreate\t--title\tfix from reject\t"), run.stdout, log
@@ -2024,7 +2033,7 @@ func runNeedsReworkCase(t *testing.T, artifacts *artifactDir, noticeBodyPath str
 	// the notice and declined, rather than passing because it never ran.
 	// Settling here is safe because callers assert only on stdout, all of
 	// which is written by the time either marker appears.
-	run := runFixtureManager(t, cmd, cancel, "FIXTURE-RETRIED label=[t1]", "FIXTURE-STATUS-CHECKED")
+	run := runFixtureManager(t, cmd, cancel, fixturePrincipalBudget, "FIXTURE-RETRIED label=[t1]", "FIXTURE-STATUS-CHECKED")
 	if !run.saw("FIXTURE-RETRIED label=[t1]") && !run.saw("FIXTURE-STATUS-CHECKED") {
 		t.Fatalf("manager reached no decision on the notice within %s (%s): it neither retried t1 nor fell through to the status correlation, so a caller asserting that it did NOT retry would be proving nothing; stdout:\n%s",
 			fixturePrincipalBudget, run.timeline(), run.stdout)

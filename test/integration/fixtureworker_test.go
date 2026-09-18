@@ -2098,11 +2098,6 @@ func fixtureManagerBrief(scratchDir string, tasks []fixtureManagerTask, answers 
 	return b.String()
 }
 
-// buildFixtureWorker compiles fixtureWorkerSource once for the calling test
-// into a temporary module under the test's artifact directory and installs
-// it under the name "claude" — never anywhere on the real system — so hop
-// launch's PATH-based harness resolution (section 6) finds it exactly as it
-// would the real Claude Code binary.
 // fixtureWorkerBinary caches the single fixture-worker build every test in
 // one `go test` process shares, exactly as hopBinary caches the one
 // ./cmd/hop build. Sharing it saves more than the build: the file is
@@ -2112,7 +2107,7 @@ func fixtureManagerBrief(scratchDir string, tasks []fixtureManagerTask, answers 
 // the binary. It is a narrow, process-lifetime mutable global guarded by
 // sync.Once and cleaned up by TestMain; there is no other way to share build
 // state across independent Test functions.
-var fixtureWorkerBinary struct { //nolint:gochecknoglobals // process-lifetime build cache guarded by sync.Once; see comment above.
+var fixtureWorkerBinary struct { //nolint:gochecknoglobals // process-lifetime build cache guarded by sync.Once; see fixtureWorkerBinary's own doc comment.
 	once        sync.Once
 	dir         string
 	path        string
@@ -2120,6 +2115,12 @@ var fixtureWorkerBinary struct { //nolint:gochecknoglobals // process-lifetime b
 	fingerprint sharedBinaryFingerprint
 }
 
+// buildFixtureWorker compiles fixtureWorkerSource once per `go test` process
+// into a temporary module of its own — never anywhere on the real system —
+// and returns the built executable, named "claude" so hop launch's PATH-based
+// harness resolution (section 6) finds it exactly as it would the real Claude
+// Code binary. Every test in the process receives that same file; a stub path
+// installed from it is a link to it, which is why replaceHarnessStub exists.
 func buildFixtureWorker(t *testing.T) string {
 	t.Helper()
 	fixtureWorkerBinary.once.Do(func() {

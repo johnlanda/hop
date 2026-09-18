@@ -352,8 +352,10 @@ func writeHarnessStub(t *testing.T, path string, content []byte) {
 	}
 }
 
-// linkHarnessStub points a stub path at target, sharing target's image
-// instead of duplicating it.
+// linkSharedBinary points path at an already-built, already-warmed binary,
+// sharing that binary's image instead of duplicating it, so executing path
+// costs what executing the shared binary again costs rather than a full
+// first execution. It replaces whatever occupied path.
 //
 // It falls back to a copy for one expected reason only — target living on
 // another filesystem, where no hard link can exist — and fails on anything
@@ -361,7 +363,7 @@ func writeHarnessStub(t *testing.T, path string, content []byte) {
 // fallback would quietly restore the per-test cost this linking exists to
 // remove and leave no signal that the mechanism had stopped working. A link
 // this machine cannot make is worth learning about once, loudly.
-func linkHarnessStub(t *testing.T, path, target string) {
+func linkSharedBinary(t *testing.T, path, target string) {
 	t.Helper()
 	replaceHarnessStub(t, path)
 	err := os.Link(target, path)
@@ -371,8 +373,14 @@ func linkHarnessStub(t *testing.T, path, target string) {
 	case errors.Is(err, syscall.EXDEV):
 		copyExecutable(t, target, path)
 	default:
-		t.Fatalf("link %s stub to the shared binary: %v", filepath.Base(path), err)
+		t.Fatalf("link %s to the shared binary: %v", filepath.Base(path), err)
 	}
+}
+
+// linkHarnessStub points a harness stub path at target, sharing its image.
+func linkHarnessStub(t *testing.T, path, target string) {
+	t.Helper()
+	linkSharedBinary(t, path, target)
 }
 
 // sharedBinaryFingerprint is what a shared binary looked like the instant it
@@ -842,17 +850,18 @@ func stagePlugin(t *testing.T) string {
 			t.Logf("remove staged plugin: %v", removeErr)
 		}
 	})
-	goBin, err := exec.LookPath("go")
-	if err != nil {
-		t.Fatalf("the go tool is required to build the plugin binary: %v", err)
+	// The staging directory must be fresh per test — that is the shape these
+	// scenarios register with herdr — but the executable inside it need not
+	// be: it is byte-for-byte the build buildHopBinary already made and
+	// warmed, so linking shares that image instead of producing a new one
+	// herdr would then execute for the first time. Nothing writes to this
+	// path afterwards, and the per-test cleanup below unlinks the name
+	// without touching the shared file.
+	binDir := filepath.Join(stage, ".bin")
+	if err := os.MkdirAll(binDir, 0o700); err != nil {
+		t.Fatal(err)
 	}
-	buildCtx, cancelBuild := context.WithTimeout(t.Context(), 2*time.Minute)
-	defer cancelBuild()
-	build := exec.CommandContext(buildCtx, goBin, "build", "-o", filepath.Join(stage, ".bin", "hop"), "./cmd/hop") //nolint:gosec // G204: the go tool builds this repository's own command.
-	build.Dir = root
-	if out, buildErr := build.CombinedOutput(); buildErr != nil {
-		t.Fatalf("go build ./cmd/hop: %v\n%s", buildErr, out)
-	}
+	linkSharedBinary(t, filepath.Join(binDir, "hop"), buildHopBinary(t))
 	copyFile(t, filepath.Join(root, "herdr-plugin.toml"), filepath.Join(stage, "herdr-plugin.toml"))
 	return stage
 }
