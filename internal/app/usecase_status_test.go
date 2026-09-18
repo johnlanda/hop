@@ -266,12 +266,13 @@ func shortfallOf(t *testing.T, shortfalls []app.GuardShortfallView, kind string)
 // unrelated notice, which is never shaped like this review's own
 // reasons path — can never collide with it (the "no second fix"
 // guarantee). Once a fix integrates a new head, the same review becomes
-// stale-subject, not rejected, clearing the correlation fields (F3(a)'s
-// reordering, proven end to end through the read model this time, not
-// just the domain function in isolation). The review task's frozen
-// subject and the fake git's tree resolution carry a tree id distinct
-// from the commit id, as real git objects do: the status head's tree is
-// the one recorded for exactly its commit, never the commit id itself.
+// stale-subject, not rejected, clearing the correlation fields
+// (exercising the subject-currency-before-the-verdict-value ordering at
+// the read-model layer, not just the domain function in isolation). The
+// review task's frozen subject and the fake git's tree resolution carry
+// a tree id distinct from the commit id, as real git objects do: the
+// status head's tree is the one recorded for exactly its commit, never
+// the commit id itself.
 func TestStatusVerdictRejectedShortfallCorrelation(t *testing.T) {
 	rf := newReviewFixture(t)
 	now := rf.tc.Clock.Now()
@@ -447,7 +448,7 @@ func TestStatusMailboxesAndAttention(t *testing.T) {
 	}
 
 	// The bare listing carries the SAME NeedsAttention the detail render
-	// just computed for this run (Astra F4): ListRuns' own
+	// just computed for this run: ListRuns' own
 	// runNeedsAttentionLocked reuses the identical mailboxStatuses call,
 	// so the two can never disagree.
 	listing, err := tc.Controller.Status(ctx, app.StatusRequest{RepositoryRoot: "/repo"})

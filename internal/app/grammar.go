@@ -9,15 +9,15 @@ import (
 // This file is the section 7 worker-protocol grammar's ONE source of truth
 // (docs/plan/phase-3-design.md, "The worker protocol grammar"): the verb
 // spellings, every worker-facing first line, the fixed follow-on lines and
-// the enumerated refusal reason tokens. Phase 2's third escaped defect was
-// a worker-facing protocol line the real CLI never rendered; the fix is
-// the class, not the instance — templates, cmd/hop and the test fixtures
-// all QUOTE these constants (the fixture worker's standalone source cannot
-// import this package and mirrors them byte for byte, citing this file),
-// and TestGoldenGrammar pins every constant and rendered line byte-exactly
-// so any drift fails there first. cmd/hop's real-binary grammar contract
-// tests (slice 6, design section 11 L1569) execute each verb against the
-// built binary and assert its first line against these same constants.
+// the enumerated refusal reason tokens. Every worker-facing first line is
+// specified here once, never re-derived — templates, cmd/hop and the test
+// fixtures all QUOTE these constants (the fixture worker's standalone
+// source cannot import this package and mirrors them byte for byte,
+// citing this file), and TestGoldenGrammar pins every constant and
+// rendered line byte-exactly so any drift fails there first. cmd/hop's
+// real-binary grammar contract tests (slice 6, design section 11 L1569)
+// execute each verb against the built binary and assert its first line
+// against these same constants.
 //
 // Rendering conventions, fixed here so every consumer agrees byte for
 // byte: a principal renders as the sender session's UUID, or the literal
@@ -409,7 +409,7 @@ func GrammarShortfallLine(kind, taskLabel, taskID string) string {
 // then — last, since a path may contain spaces — its reasons artifact
 // path, already resolved by the caller to the exact path the accepting
 // transaction used as the controller notice's own body (templates.go's
-// reviewReasonsPath) and already rendered safe by the caller's F2
+// reviewReasonsPath) and already rendered safe by the caller's
 // rendering boundary. A caller correlates this shortfall to a fetched
 // controller notice by comparing reasonsPath against the notice's own
 // body path (STATUS-1's manager verdict channel): the notice names no

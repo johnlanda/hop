@@ -195,8 +195,8 @@ func TestSubmitReviewRefusals(t *testing.T) {
 	})
 }
 
-// TestSubmitReviewForeignReviewerRefused drives Terra finding 1's two
-// shapes through the shared storevectors vector: a live, currently-bound
+// TestSubmitReviewForeignReviewerRefused drives two shapes through the
+// shared storevectors vector: a live, currently-bound
 // reviewer of ANOTHER RUN, and one assigned to a DIFFERENT review attempt
 // of the same run, are each refused as not the review task's reviewer
 // session — with no review row and no state transition committed, and the

@@ -725,9 +725,9 @@ func TestWorkerPromptsFollowTheTransientLine(t *testing.T) {
 	}
 }
 
-// TestPrepareSessionLaunchExecCrossHarnessProfile is the security
-// regression table for the pass-1 review's HIGH finding (the ported
-// overlay probe plus the reverse and opencode pairs): the frozen
+// TestPrepareSessionLaunchExecCrossHarnessProfile is the cross-harness
+// security regression table (the overlay probe plus the reverse and
+// opencode pairs): the frozen
 // policy's harness names the WORKER, but the session's own harness is
 // what execs, and the configured profile directory must govern THAT
 // binary — the profile assignment and the trust seed both follow the
@@ -820,8 +820,8 @@ func TestPrepareSessionLaunchExecCrossHarnessProfile(t *testing.T) {
 	})
 }
 
-// TestSessionLaunchEnvironmentPresentButEmpty pins the review's F3
-// tightening: presence is the entry existing at all, so an explicitly
+// TestSessionLaunchEnvironmentPresentButEmpty proves presence is the
+// entry existing at all, so an explicitly
 // empty variable fails the agreement check (or the manager's no-attempt
 // refusal) instead of passing as absent.
 func TestSessionLaunchEnvironmentPresentButEmpty(t *testing.T) {

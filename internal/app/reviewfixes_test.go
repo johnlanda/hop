@@ -13,11 +13,11 @@ import (
 	"github.com/johnlanda/hop/internal/domain/run"
 )
 
-// Tracked ports of the pass-1 security review's regression cases
-// (.bin/review/REPORT.md). Each subtest pins the unsafe outcome the
-// review reproduced, against the fixed behavior.
+// Each subtest below pins one integration or settlement safety
+// invariant against a concrete regression scenario: the exact fault or
+// ordering that would violate the invariant if it did not hold.
 
-// TestReviewFixReadPortsStayOutsideTransactions pins finding 6: the
+// TestReviewFixReadPortsStayOutsideTransactions proves the
 // settlement path assembles its obligation snapshot and equality check
 // through the transaction's own repositories, and the fakes enforce the
 // no-port-calls-in-transaction law on the lease-free reads — so an
@@ -50,7 +50,7 @@ func TestReviewFixReadPortsStayOutsideTransactions(t *testing.T) {
 	}
 }
 
-// TestReviewFixFenceRaceLosingCAS pins finding 1: a fence whose CAS
+// TestReviewFixFenceRaceLosingCAS proves a fence whose CAS
 // loses to a zombie publish landing on the integration ref journals
 // reconciling and reports OUTSTANDING work — the stop round never
 // commits stopped over the moved ref. The follow-through rounds resolve
@@ -122,7 +122,7 @@ func TestReviewFixFenceRaceLosingCAS(t *testing.T) {
 	}
 }
 
-// TestReviewFixTerminalFailureRetiresCandidate pins finding 3: a
+// TestReviewFixTerminalFailureRetiresCandidate proves a
 // feature run's terminal failure mirrors stop — the current
 // integration's published-but-unsettled candidate is rolled back
 // through the shared shutdown procedure BEFORE the run marks failed,
@@ -158,7 +158,7 @@ func TestReviewFixTerminalFailureRetiresCandidate(t *testing.T) {
 	}
 }
 
-// TestReviewFixHistoricalManagerNeverShadows pins finding 4: the
+// TestReviewFixHistoricalManagerNeverShadows proves the
 // current manager resolves through the ManagerSession port, so a
 // historical lost manager row (a cold relaunch's retired predecessor)
 // can never shadow the live manager in map order and let the run fail
@@ -204,7 +204,7 @@ func TestReviewFixHistoricalManagerNeverShadows(t *testing.T) {
 	}
 }
 
-// TestReviewFixGuardHeadIsObservedNotInferred pins finding 5: the guard
+// TestReviewFixGuardHeadIsObservedNotInferred proves the guard
 // head is OBSERVED from the live integration ref and validated against
 // integrated rows — never inferred from the recorded chain, which
 // repeated no-op merges at one head break (each no-op row records the
@@ -397,7 +397,7 @@ func TestReviewFixFenceIdentityIsStable(t *testing.T) {
 	}
 }
 
-// TestReviewFixRetentionFailure pins finding 2: a zero-exit check whose
+// TestReviewFixRetentionFailure proves a zero-exit check whose
 // output retention failed is never adopted as passing evidence — the
 // combined check settles the integration check-failed (the reset
 // retires the candidate), and a feature result check settles the

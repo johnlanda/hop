@@ -524,7 +524,7 @@ func recordedSubjects(ctx context.Context, q querier, runID identity.RunID, comm
 }
 
 // runNeedsAttentionLocked reports section 7's "blocked, needs attention"
-// listing condition for one run (Astra F4): false for a solo run
+// listing condition for one run: false for a solo run
 // (Workflow.Feature() false), otherwise the OR-reduction of the SAME
 // mailboxStatuses call featureRunDetail's own Mailboxes population
 // makes — one implementation of the attention threshold rule, reused by

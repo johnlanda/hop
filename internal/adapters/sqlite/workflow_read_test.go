@@ -383,7 +383,7 @@ func TestRunDetailFeatureExtensions(t *testing.T) {
 	}
 
 	// The bare listing carries the SAME attention condition ListRuns just
-	// computed for this run (Astra F4): pinned from the identical aged
+	// computed for this run: pinned from the identical aged
 	// mailbox fixture the detail assertions above already used.
 	statuses, err := f.store.ListRuns(t.Context(), "/repos/feature")
 	if err != nil {

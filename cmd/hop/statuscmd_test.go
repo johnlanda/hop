@@ -339,7 +339,7 @@ func TestRunStatusDetail(t *testing.T) {
 // detail line renderRunDetail renders: the task table (with dependencies,
 // attempt count and worktree), the latest integration, guard shortfalls
 // (one naming a task, one — verdict-rejected — naming a review's own id,
-// subject and reasons path instead, per Astra F3), the
+// subject and reasons path instead), the
 // section 7 per-mailbox attention lines (in-flight-only, queued-only, a
 // task and a human address, attention with a known live-session binding,
 // attention with a live address but no known binding, and one mailbox
@@ -477,8 +477,8 @@ func TestRunStatusFeatureDetailNeverForgesALine(t *testing.T) {
 }
 
 // TestRunStatusVerdictRejectedHostileReasonsPathNeverForgesALine proves
-// F2's escaping composes with F3's review-carrying shortfall line: a
-// hostile reasons path (the one field a manager-authored reasons file's
+// the rendering boundary's escaping composes with the review-carrying
+// shortfall line: a hostile reasons path (the one field a manager-authored reasons file's
 // own storage location could carry unescaped bytes through) renders
 // quoted, never raw, in the shortfall line itself.
 func TestRunStatusVerdictRejectedHostileReasonsPathNeverForgesALine(t *testing.T) {
@@ -693,7 +693,7 @@ func TestRunStatusDetailOrdinaryValuesRenderRaw(t *testing.T) {
 	}
 }
 
-// TestSafeRenderExternal pins the F2 rendering boundary directly: raw
+// TestSafeRenderExternal pins the rendering boundary directly: raw
 // only for valid UTF-8 with no C0/DEL/C1 control byte, no double quote
 // and no backslash; strconv.Quote's escaped form otherwise, which always
 // starts with a double quote a raw rendering never can.
