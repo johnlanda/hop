@@ -155,9 +155,9 @@ type Runtime interface {
 	// restore is pending within this server lifetime — a deferred native
 	// restore arises only at a restart — and no rename has been restored;
 	// it does not guarantee the identity can never be revived by a LATER
-	// restart. Herdr persists its session snapshot on its own debounce, so
-	// a pane closed within that window can still be recorded in it; a
-	// later server restart can then restore that stale entry as a fresh
+	// restart. A pane closed shortly before a restart can still be
+	// present in Herdr's restored session snapshot; a later server
+	// restart can then restore that stale entry as a fresh
 	// shell or a deferred native resume, an orphan carrying no HOP
 	// environment and a stale incarnation, unable to act through HOP but
 	// otherwise free to run (docs/plan/phase-3-design.md section 4's

@@ -371,12 +371,11 @@ func isLauncherInvocation(argv []string) bool {
 // pane gone has no restore pending within this server lifetime — a
 // deferred native restore arises only at a restart; a restart or live
 // handoff changes the identity and fails closed here. It does not
-// guarantee the identity can never be revived by a LATER restart: Herdr
-// saves its session snapshot on its own debounce, so a pane closed
-// within that window can still be recorded as present, and the NEXT
-// restart may restore it — an orphan with no HOP environment and a
-// stale incarnation, unable to act through HOP (docs/plan/phase-3-design.md
-// section 4's residual).
+// guarantee the identity can never be revived by a LATER restart: a
+// pane closed shortly before a restart can still be present in Herdr's
+// restored session snapshot, and the NEXT restart may restore it — an
+// orphan with no HOP environment and a stale incarnation, unable to act
+// through HOP (docs/plan/phase-3-design.md section 4's residual).
 func ServerContinuityEstablished(recorded, observed string) bool {
 	return recorded != "" && recorded == observed
 }

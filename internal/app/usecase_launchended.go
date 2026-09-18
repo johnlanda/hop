@@ -175,10 +175,10 @@ func (c *Controller) observePlacedPaneAbsence(ctx context.Context, recorded, pan
 // restart Herdr answers pane_not_found for a restored pane whose deferred
 // native restore has not fired and restores a renamed pane under its new
 // name. It does not guarantee the identity can never be revived by a
-// LATER restart: Herdr persists its session snapshot on its own debounce,
-// so a pane closed within that window can still be recorded as present
-// in it, and that stale entry can still be restored — a fresh shell or a
-// deferred native resume, carrying no HOP environment and a stale
+// LATER restart: a pane closed shortly before a restart can still be
+// present in Herdr's restored session snapshot, and that stale entry
+// can still be restored — a fresh shell or a deferred native resume,
+// carrying no HOP environment and a stale
 // incarnation, unable to act through HOP but free to run as an orphan
 // (docs/plan/phase-3-design.md section 4's residual). ended is false
 // whenever any conjunct fails, and no conjunct's failure is ever absence;
