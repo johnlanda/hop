@@ -22,9 +22,24 @@ const launchEndedUnplacedReason = "launch ended before its placement was recorde
 
 // launchEndedByController reports whether claim is exec_failed through
 // one of the controller's launch-ended settlements rather than the
-// launcher's own error path.
+// launcher's own error path. There are THREE such settlements, and every
+// reader of this predicate must know all of them: the placed and the
+// label-only launch-ended rows, both of which conclude absence within one
+// server lifetime, and the restart rule's own settlement, whose evidence
+// is the lifetime having CHANGED. A settlement this predicate does not
+// recognize is reported to the human with the launcher's generic
+// exec-failure wording instead of its own cause, which is exactly what the
+// journal must not do.
 func launchEndedByController(claim *LaunchClaim) bool {
-	return claim.State == LaunchClaimExecFailed && (claim.Error == launchEndedReason || claim.Error == launchEndedUnplacedReason)
+	if claim.State != LaunchClaimExecFailed {
+		return false
+	}
+	switch claim.Error {
+	case launchEndedReason, launchEndedUnplacedReason, launchEndedRestartReason:
+		return true
+	default:
+		return false
+	}
 }
 
 // observeClaimedProcessGone is the process half of the corroborated-absence

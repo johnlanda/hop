@@ -246,11 +246,16 @@ func TestRealProcessRestartClosesAndRelaunchesSessions(t *testing.T) {
 	// evidence a process scan cannot give, since an orphan that has already
 	// exited leaves nothing for `ps` to find.
 	for i := range placed {
-		if scrollback := restartCloseScrollback(t, fx, placed[i].PaneID); strings.Contains(scrollback, orphanResumeRef) {
-			t.Logf("the %s session's pane had ALREADY been given Herdr's restored agent when HOP closed it: the close is what ended it", placed[i].Role)
-		} else {
-			t.Logf("the %s session's pane had not yet been given Herdr's restored agent when HOP closed it: the close prevented it", placed[i].Role)
+		scrollback := restartCloseScrollback(t, fx, placed[i].PaneID)
+		verdict := "had not yet been given Herdr's restored agent when HOP closed it: the close prevented it"
+		if strings.Contains(scrollback, orphanResumeRef) {
+			verdict = "had ALREADY been given Herdr's restored agent when HOP closed it: the close is what ended it"
 		}
+		// The captured text itself, not only the verdict. The artifact
+		// directory is removed on SUCCESS, so evidence left only there can
+		// be read only when the test fails — exactly backwards for the one
+		// observation this scenario exists to make.
+		t.Logf("the %s session's pane %s\n%s", placed[i].Role, verdict, indentScrollback(scrollback))
 	}
 
 	// WHICH RUNG carried each close, read from the journal the closes
@@ -340,6 +345,29 @@ func restartCloseScrollback(t *testing.T, fx *featureRun, paneID string) string 
 	}
 	return string(content)
 }
+
+// indentScrollback renders the last lines of a captured pane scrollback
+// for the test log: indented, blank lines dropped, bounded so a long
+// capture cannot bury the run's other output.
+func indentScrollback(scrollback string) string {
+	var kept []string
+	for _, line := range strings.Split(scrollback, "\n") {
+		if strings.TrimSpace(line) != "" {
+			kept = append(kept, "      | "+strings.TrimRight(line, " \t"))
+		}
+	}
+	if len(kept) == 0 {
+		return "      | (no scrollback was captured)"
+	}
+	if len(kept) > scrollbackLogLines {
+		kept = kept[len(kept)-scrollbackLogLines:]
+	}
+	return strings.Join(kept, "\n")
+}
+
+// scrollbackLogLines bounds how much of a captured pane scrollback the
+// scenario prints: enough to show what the pane held at its close.
+const scrollbackLogLines = 6
 
 // requireManagerClosedLast asserts the OBSERVED ordering: every child
 // session's restart close was journaled before the manager's, so a round

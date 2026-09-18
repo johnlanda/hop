@@ -287,7 +287,7 @@ func (c *Controller) corroborateSessionLaunch(ctx context.Context, handle RunHan
 // exec_failed claim, fails the run.
 func (c *Controller) settleSessionExecFailure(ctx context.Context, handle RunHandle, frozen *FrozenRun, session *run.Session, claim *LaunchClaim) (LaunchProgress, error) { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per exec-failed session per round.
 	if session.Role != run.RoleManager {
-		if err := c.settleChildExecFailure(ctx, handle, frozen, session); err != nil {
+		if err := c.settleChildExecFailure(ctx, handle, frozen, session, nil); err != nil {
 			return "", err
 		}
 		return LaunchFailed, nil

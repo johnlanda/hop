@@ -561,7 +561,11 @@ func (c *Controller) applyRestartDisposition(ctx context.Context, handle RunHand
 		if session.Role == run.RoleManager {
 			return c.terminateRetiredSession(ctx, handle, session.ID, restartSessionReason)
 		}
-		return c.settleChildExecFailure(ctx, handle, frozen, session)
+		// The cause is passed rather than rediscovered: this rule settled
+		// the claim itself and has already superseded the binding the
+		// rediscovery would read it through.
+		ended := workerLaunchEnded(launchEndedRestartReason)
+		return c.settleChildExecFailure(ctx, handle, frozen, session, &ended)
 	case restartInterrupt:
 		if session.Role == run.RoleManager {
 			return c.terminateRetiredSession(ctx, handle, session.ID, restartSessionReason)

@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/johnlanda/hop/internal/app"
+	"github.com/johnlanda/hop/internal/domain/identity"
 	"github.com/johnlanda/hop/internal/domain/run"
 )
 
@@ -521,6 +522,40 @@ func TestReconcileServerRestartSettlesAnUncorroboratedLaunch(t *testing.T) {
 	if got := tc.Store.Attempts[w.AttemptID].value.State; got != run.AttemptFailed {
 		t.Fatalf("attempt state = %s, want failed: an exec failure is a terminal attempt outcome", got)
 	}
+
+	// The settlement must be REPORTED as this cause, not as the launcher's
+	// own generic exec failure. The whole claim of this rule is that the
+	// journal tells a restart from every other close, and the session's own
+	// transition is where a human looks: a reason the launch-ended
+	// recogniser does not know is rendered with the generic wording, which
+	// silently contradicts that claim.
+	reason := newestSessionTransitionReason(t, tc, w.SessionID)
+	if !strings.Contains(reason, "server restart") {
+		t.Errorf("the settled session's transition reads %q, want it naming the server restart as the cause", reason)
+	}
+	notice := controllerNoticesTo(tc, fr.RunID)
+	if len(notice) == 0 {
+		t.Fatal("no manager notice was committed for the settled attempt")
+	}
+	body := string(tc.Artifacts.files[notice[len(notice)-1].BodyPath])
+	if !strings.Contains(body, "server restart") {
+		t.Errorf("the manager's notice reads %q, want it naming the server restart as the cause", body)
+	}
+}
+
+// newestSessionTransitionReason is the reason of a session's most recent
+// recorded transition — the same durable record the status surface reduces,
+// read here to assert what a human is told about a settlement.
+func newestSessionTransitionReason(t *testing.T, tc *testController, sessionID identity.SessionID) string {
+	t.Helper()
+	reason := ""
+	for i := range tc.Store.Transitions {
+		entry := &tc.Store.Transitions[i]
+		if entry.EntityKind == app.EntitySession && entry.EntityID == sessionID.String() {
+			reason = entry.Reason
+		}
+	}
+	return reason
 }
 
 // TestReconcileServerRestartOrdersTheManagerLast pins the ordering the

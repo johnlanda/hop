@@ -374,9 +374,13 @@ func workerExecFailure() workerTermination {
 func workerLaunchEnded(reason string) workerTermination {
 	observed := "its pane and launched process were observed gone"
 	ended := "the attempt's launch ended before it was corroborated"
-	if reason == launchEndedUnplacedReason {
+	switch reason {
+	case launchEndedUnplacedReason:
 		observed = "no pane answered for its creation label and its launched process was observed gone"
 		ended = "the attempt's launch ended before its placement was recorded"
+	case launchEndedRestartReason:
+		observed = "the Herdr server restarted, and the pane HOP recorded was closed"
+		ended = "the attempt's launch ended at a server restart, before it was corroborated"
 	}
 	return workerTermination{
 		kind:          "exec failure",
@@ -411,7 +415,7 @@ func (c *Controller) settleWorkerInterruption(ctx context.Context, handle RunHan
 // corroboration settles identically, under workerLaunchEnded's reasons —
 // chosen from the claim's recorded error, so every round reads the same
 // durable evidence.
-func (c *Controller) settleChildExecFailure(ctx context.Context, handle RunHandle, frozen *FrozenRun, session *run.Session) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per exec-failed child session.
+func (c *Controller) settleChildExecFailure(ctx context.Context, handle RunHandle, frozen *FrozenRun, session *run.Session, known *workerTermination) error { //nolint:gocritic // hugeParam: RunHandle carries a Lease value by design; called once per exec-failed child session.
 	if session.AttemptID == "" {
 		return fmt.Errorf("app: session %s has no attempt; an exec-failed manager fails the run instead", session.ID)
 	}
@@ -419,6 +423,16 @@ func (c *Controller) settleChildExecFailure(ctx context.Context, handle RunHandl
 		attemptState run.AttemptState
 		outcome      = workerExecFailure()
 	)
+	if known != nil {
+		// A caller that settled the claim ITSELF passes the cause rather
+		// than letting it be rediscovered below. The rediscovery reads the
+		// claim through the session's CURRENT binding, and a caller that
+		// has already superseded that binding — the restart rule does,
+		// because superseding is how a confirmed close records itself —
+		// would otherwise find no claim and report the launcher's generic
+		// exec failure in place of its own cause.
+		outcome = *known
+	}
 	if err := c.withUnitOfWork(ctx, handle.lease, func(uow UnitOfWork) error {
 		a, _, err := uow.Attempts().Get(ctx, session.AttemptID)
 		if err != nil {
@@ -433,7 +447,7 @@ func (c *Controller) settleChildExecFailure(ctx context.Context, handle RunHandl
 		if err != nil {
 			return err
 		}
-		if claimFound && launchEndedByController(&claim) {
+		if known == nil && claimFound && launchEndedByController(&claim) {
 			outcome = workerLaunchEnded(claim.Error)
 		}
 		return nil

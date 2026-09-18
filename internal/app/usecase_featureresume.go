@@ -417,7 +417,7 @@ func (c *Controller) reconcileFeatureSession(ctx context.Context, handle RunHand
 			managerReason = "resume: " + workerLaunchEnded(claim.Error).sessionReason
 		}
 		if session.Role != run.RoleManager {
-			if err := c.settleChildExecFailure(ctx, handle, frozen, session); err != nil {
+			if err := c.settleChildExecFailure(ctx, handle, frozen, session, nil); err != nil {
 				return report, false, err
 			}
 		} else if err := c.terminateRetiredSession(ctx, handle, session.ID, managerReason); err != nil {
