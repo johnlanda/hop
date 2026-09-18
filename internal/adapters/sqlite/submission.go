@@ -337,7 +337,7 @@ func (s *Store) ClaimLaunch(ctx context.Context, claim app.LaunchClaim) error { 
 			if claim.AttemptID != "" && sessionV.AttemptID != claim.AttemptID {
 				return fmt.Errorf("sqlite: attempt %s is not session %s's attempt; launch claim refused", claim.AttemptID, claim.SessionID)
 			}
-			if sessionV.State == run.SessionLost || sessionV.State == run.SessionTerminated {
+			if sessionEnded(sessionV.State) {
 				return fmt.Errorf("sqlite: session %s is terminal (%s); launch claim refused", claim.SessionID, sessionV.State)
 			}
 			session = sessionV

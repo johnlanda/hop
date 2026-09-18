@@ -25,6 +25,15 @@ type querier interface {
 // session in any other state is the attempt's current session.
 const terminalSessionStates = `('lost', 'terminated')`
 
+// sessionEnded is terminalSessionStates as a predicate over a loaded row,
+// for the caller rules that decide whether a principal may still act. A
+// session's runtime binding outlives it: ending a session supersedes
+// nothing, so its placement stays current and unsuperseded, and a rule
+// that reads only the binding cannot tell that the principal is gone.
+func sessionEnded(state run.SessionState) bool {
+	return state == run.SessionLost || state == run.SessionTerminated
+}
+
 // getRun loads one run and its revision.
 func getRun(ctx context.Context, q querier, id identity.RunID) (run.Run, int64, error) {
 	var (
