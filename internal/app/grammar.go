@@ -114,7 +114,7 @@ const (
 	GrammarReasonNotManager = "not-manager"
 	// GrammarReasonNotReviewer: a first review submission from a session
 	// that is not the review attempt's own reviewer session (another role,
-	// another run, or another attempt).
+	// another run, another attempt, or one that has ended).
 	GrammarReasonNotReviewer = "not-reviewer"
 	// GrammarReasonDependencyCycle: a task create whose dependency edges
 	// would close a cycle.

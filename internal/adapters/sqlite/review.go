@@ -171,12 +171,15 @@ func (s *Store) SubmitReview(ctx context.Context, submission app.ReviewSubmissio
 // reviewerSessionEligible reports the section 8 caller check for a first
 // acceptance: the submitting session must be THE reviewer session of the
 // claimed attempt — a reviewer-role session of the submission's own run,
-// bound to exactly the review attempt being settled, of a review task. A
-// live reviewer from another run, or one assigned to a different review
-// attempt of this run, is refused before any of ITS binding or launch
-// claim ever reaches the acceptance context (a foreign session's currency
-// must never vouch for this attempt's verdict). A caller it reports
-// ineligible is refused not-reviewer.
+// bound to exactly the review attempt being settled, of a review task,
+// and not itself ended. A live reviewer from another run, or one assigned
+// to a different review attempt of this run, is refused before any of ITS
+// binding or launch claim ever reaches the acceptance context (a foreign
+// session's currency must never vouch for this attempt's verdict). The
+// liveness conjunct is what the acceptance context cannot supply: a
+// reviewer that has ended can keep a current, unsuperseded binding, so
+// its incarnation still reads as current. A caller it reports ineligible is
+// refused not-reviewer.
 func reviewerSessionEligible(ctx context.Context, q querier, submission *app.ReviewSubmission, task *run.Task) (bool, error) {
 	session, _, err := getSession(ctx, q, submission.Session)
 	if errors.Is(err, app.ErrNotFound) {
@@ -185,7 +188,7 @@ func reviewerSessionEligible(ctx context.Context, q querier, submission *app.Rev
 	if err != nil {
 		return false, err
 	}
-	return session.Role == run.RoleReviewer && task.Kind == run.TaskKindReview &&
+	return session.Role == run.RoleReviewer && !sessionEnded(session.State) && task.Kind == run.TaskKindReview &&
 		session.RunID == submission.RunID && session.AttemptID == submission.AttemptID, nil
 }
 

@@ -313,6 +313,39 @@ sides together. `cmd/hop` never imports domain or identity types: every
   listing, a pid still listed, a label still answering and any other
   inspection error all stay ambiguous and settle nothing; no detail
   echoes the inspector's error text.
+- What reading a binding establishes, and what it does not.
+  `currentBinding` is the only query that returns a `runtime_bindings`
+  row, and it selects `superseded = 0`; every reader goes through it — the
+  `Bindings()` repository, `RunDetail.Binding`, a session summary — so a
+  binding in hand is never superseded, and the `!binding.Superseded`
+  conjuncts written beside those reads are defense in depth rather than
+  what establishes it. Liveness is the separate question, because ending a
+  session does not ITSELF supersede its binding: a binding is superseded
+  by a confirmed close, a resume's adoption or a feature cold relaunch,
+  and by nothing else — one cause per `Supersede` call site, so the set is
+  checkable by grepping for `Supersede(`. A lost or terminated session CAN
+  therefore still hold the placement it ran under: the ordinary stop
+  settles a `pane.close` operation, which supersedes, and then terminates,
+  while a retirement that terminates the session without a close operation
+  leaves the binding current, pane observed or not. A reader must assume
+  neither, and establishes liveness from the session row.
+  `RunDetail.Binding` has it by construction — `attachSessionBinding` is
+  reached only through `currentSession` or `managerSession`, both of which
+  exclude terminal states in SQL — and so never describes a terminal
+  session; a session summary's binding can, since that list covers every
+  session the run has created. `stopping` is outside the terminal set
+  (`terminated` and `lost` are the whole of it) and a binding does outlive
+  it: a session parked there by a dispatched close keeps a current binding
+  until a later round settles the close. No manager verb and no verdict is
+  reachable from there — `recordCloseDispatched` parks a session in
+  `stopping` only for a `stop`-reason close, which is driven either by a
+  stop of the run, where `CanAcceptManagerVerb` and `AcceptVerdict`
+  already refuse both, or by a solo run's post-check retirement, where the
+  session is a `worker` and neither rule admits that role. A launch claim
+  reads neither role nor session state beyond `sessionEnded`, and
+  deliberately admits any session that has not ended: the claim is how a
+  process becomes visible to the close machinery, and a run under a stop
+  refuses every claim at the run level instead.
 - A pane can vanish at any moment: `PublishRunPresentation` skips a pane
   the server reports not found and records nothing, leaving the
   session's fate to corroboration, retirement and resume.

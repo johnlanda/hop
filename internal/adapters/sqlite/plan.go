@@ -77,8 +77,10 @@ func acceptedWorkflowReceipt(ctx context.Context, q querier, runID, op, requestI
 }
 
 // requireManagerCaller resolves the manager-verb caller checks shared by
-// every PlanStore method: the caller session must be the run's manager and
-// its claimed incarnation must be current under the one
+// every PlanStore method: the caller session must be the run's manager, it
+// must not have ended (sessionEnded — its binding can stay current when
+// it does, so the incarnation rule below would still admit it), and its
+// claimed incarnation must be current under the one
 // principal-incarnation rule (sessionIncarnationCurrent). It returns the
 // refusal's grammar reason token and detail ("", "" when the caller is
 // legitimate) — set directly at each decision point, never derived from
@@ -90,6 +92,9 @@ func requireManagerCaller(ctx context.Context, q querier, runID identity.RunID, 
 	}
 	if err != nil {
 		return "", "", err
+	}
+	if sessionEnded(session.State) {
+		return app.GrammarReasonStale, "session is not the run's current manager session", nil
 	}
 	current, err := sessionIncarnationCurrent(ctx, q, sessionID, incarnationID)
 	if err != nil {

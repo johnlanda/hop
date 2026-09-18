@@ -237,6 +237,21 @@ func TestFakeAckRequiresTheTaskCurrentAttemptSession(t *testing.T) {
 	}
 }
 
+// requireFakeBindingCurrent fails unless sessionID still holds a current,
+// unsuperseded binding carrying incarnation. It guards the premise of
+// every ended-session vector: a refusal that came from a retired
+// placement would prove nothing about the session's own state.
+func requireFakeBindingCurrent(t *testing.T, tc *testController, sessionID identity.SessionID, incarnation identity.IncarnationID) {
+	t.Helper()
+	binding, ok := tc.Store.currentBindingLocked(sessionID)
+	switch {
+	case !ok:
+		t.Fatalf("session %s has no current binding; the vector needs a live placement", sessionID)
+	case binding.IncarnationID != incarnation:
+		t.Fatalf("session %s's binding carries incarnation %s, want %s", sessionID, binding.IncarnationID, incarnation)
+	}
+}
+
 // endFakeManagerWithSuccessor terminates the fixture manager with its
 // binding still current and seeds an active, bound successor manager.
 func endFakeManagerWithSuccessor(t *testing.T, tc *testController, fr featureRun) fakeChild { //nolint:gocritic // hugeParam: featureRun is a small test fixture value passed once per call.

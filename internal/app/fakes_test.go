@@ -790,6 +790,14 @@ func (s *fakeStore) sessionIncarnationCurrentLocked(sessionID identity.SessionID
 	return hasIntent && intent == incarnation
 }
 
+// fakeSessionEnded mirrors the real store's sessionEnded: the two states
+// that end a session. It is a separate question from the incarnation rule
+// above, which a session that has ended can still satisfy — ending a
+// session does not itself supersede its binding.
+func fakeSessionEnded(state run.SessionState) bool {
+	return state == run.SessionLost || state == run.SessionTerminated
+}
+
 // pendingSessionIntentDisagreesLocked mirrors the real store's
 // pendingLaunchIntentDisagrees: whether ANY pending pane.open/launch.send
 // operation whose intent's session_id is the session fails to carry

@@ -127,11 +127,12 @@ type PlanCloseResult struct {
 }
 
 // PlanStore holds the section 8 worker-authority plan writes: manager-only
-// verbs, validated by session role and current incarnation inside each
-// method's own transaction (never a controller lease), which then applies
-// run.Run.CanAcceptManagerVerb so a create can never race completion:
-// WorkflowTransient for a run that can still reach running, WorkflowRefused
-// with GrammarReasonRunNotAccepting for one that never will. Every method accepts an optional
+// verbs, validated by session role, that the session has not ended, and
+// current incarnation inside each method's own transaction (never a
+// controller lease), which then applies run.Run.CanAcceptManagerVerb so a
+// create can never race completion: WorkflowTransient for a run that can
+// still reach running, WorkflowRefused with GrammarReasonRunNotAccepting
+// for one that never will. Every method accepts an optional
 // caller-stable RequestID: an identical retry returns the original
 // outcome and entity, surviving consumption, relaunch, retirement and
 // manager succession; a reused ID with different content is refused.

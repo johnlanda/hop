@@ -580,6 +580,68 @@ func TestStoreVectors(t *testing.T) {
 	})
 }
 
+// TestStoreVectorsEndedSession is the real-store half of internal/app's
+// TestStoreVectors subtests of the same names: the two caller rules that
+// decide liveness from a session row rather than from an address. Each
+// case asserts the placement is still current first, so only the
+// session's own state can be the refusal's cause.
+func TestStoreVectorsEndedSession(t *testing.T) {
+	t.Run("TaskCreateEndedManager", func(t *testing.T) {
+		f := newFeatureFixture(t)
+		endManagerWithSuccessor(t, f, 8301)
+		requirePlacementCurrent(t, f, f.ManagerID, f.ManagerIncarnation)
+		taskID := identity.TaskID(uid(8302))
+
+		got, err := f.store.CreateTask(t.Context(), storevectors.TaskCreateEndedManager(f.spec.RunID, f.ManagerID, f.ManagerIncarnation, taskID))
+		if err != nil {
+			t.Fatalf("CreateTask() error = %v", err)
+		}
+		if got.Outcome != app.WorkflowRefused || got.Reason != storevectors.TaskCreateEndedManagerReason || got.Detail != storevectors.TaskCreateEndedManagerDetail {
+			t.Fatalf("CreateTask(ended manager) = %+v, want refused/%s %q", got, storevectors.TaskCreateEndedManagerReason, storevectors.TaskCreateEndedManagerDetail)
+		}
+		if n := countRows(t, f.store, `SELECT COUNT(*) FROM tasks WHERE id = ?`, taskID.String()); n != 0 {
+			t.Fatalf("task rows after the refusal = %d, want none", n)
+		}
+		// The same caller rule gates the other two plan verbs.
+		if retry, err := f.store.RequestRetry(t.Context(), app.RetryRequest{
+			TaskID: taskID, RunID: f.spec.RunID, Session: f.ManagerID, IncarnationID: f.ManagerIncarnation, Reason: "retry",
+		}); err != nil || retry.Outcome != app.WorkflowRefused || retry.Reason != storevectors.TaskCreateEndedManagerReason {
+			t.Fatalf("RequestRetry(ended manager) = %+v, %v; want refused/%s", retry, err, storevectors.TaskCreateEndedManagerReason)
+		}
+		if closed, err := f.store.ClosePlan(t.Context(), app.PlanClose{
+			RunID: f.spec.RunID, Session: f.ManagerID, IncarnationID: f.ManagerIncarnation,
+		}); err != nil || closed.Outcome != app.WorkflowRefused || closed.Reason != storevectors.TaskCreateEndedManagerReason {
+			t.Fatalf("ClosePlan(ended manager) = %+v, %v; want refused/%s", closed, err, storevectors.TaskCreateEndedManagerReason)
+		}
+	})
+
+	t.Run("ReviewSubmitEndedReviewer", func(t *testing.T) {
+		f := newReviewFixture(t)
+		endSession(t, f.featureFixture, f.ReviewerID, run.SessionTerminated)
+		requirePlacementCurrent(t, f.featureFixture, f.ReviewerID, f.ReviewerIncarnation)
+
+		got, err := f.store.SubmitReview(t.Context(), storevectors.ReviewSubmitEndedReviewer(
+			f.spec.RunID, f.ReviewTask, f.AttemptID, f.ReviewerID, f.ReviewerIncarnation,
+			identity.ReviewID(uid(8311)), "commit-head", "tree-head", "/state/reasons/8311.md", "reasons-8311",
+		))
+		if err != nil {
+			t.Fatalf("SubmitReview() error = %v", err)
+		}
+		if got.Kind != app.ReviewStale || got.Reason != storevectors.ReviewSubmitEndedReviewerReason || got.Detail != storevectors.ReviewSubmitEndedReviewerDetail {
+			t.Fatalf("SubmitReview(ended reviewer) = %+v, want stale/%s %q", got, storevectors.ReviewSubmitEndedReviewerReason, storevectors.ReviewSubmitEndedReviewerDetail)
+		}
+		if n := countRows(t, f.store, `SELECT COUNT(*) FROM reviews`); n != 0 {
+			t.Fatalf("review rows after the refusal = %d, want none", n)
+		}
+		f.inUOW(t, func(uow app.UnitOfWork) {
+			attempt, _, attErr := uow.Attempts().Get(t.Context(), f.AttemptID)
+			if attErr != nil || attempt.State != run.AttemptRunning {
+				t.Fatalf("attempt after the refusal = %+v, %v; want still running", attempt, attErr)
+			}
+		})
+	})
+}
+
 // assertWorktreeVectorRefused drives one worktree vector through a unit of
 // work under the fixture's own lease: Create refuses with want, and
 // committing the same unit of work afterwards writes no row.
