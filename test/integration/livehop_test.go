@@ -72,9 +72,7 @@ func requireLiveHarness(t *testing.T) (claudePath, home string) {
 func installRealClaudeStub(t *testing.T, server *testServer, claudePath string) {
 	t.Helper()
 	target := filepath.Join(server.base, "bin", "claude")
-	if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
-		t.Fatalf("remove existing claude stub: %v", err)
-	}
+	replaceHarnessStub(t, target)
 	if err := os.Symlink(claudePath, target); err != nil {
 		t.Fatalf("symlink real claude as the claude stub: %v", err)
 	}

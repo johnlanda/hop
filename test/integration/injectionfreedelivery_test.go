@@ -121,7 +121,7 @@ func TestRealProcessInjectionFreeDelivery(t *testing.T) {
 	// successful pane.* call is invisible, so a zero count there would
 	// prove nothing.
 	server.extraEnv = append(server.extraEnv, "HERDR_LOG=herdr=debug")
-	worker := buildFixtureWorker(t, artifacts)
+	worker := buildFixtureWorker(t)
 	installFixtureWorkerAsClaudeStub(t, server, worker)
 	server.start(t)
 

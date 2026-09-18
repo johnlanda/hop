@@ -42,7 +42,7 @@ func newFixtureRunEnv(t *testing.T) (*artifactDir, *testServer) {
 	t.Helper()
 	artifacts := newArtifactDir(t)
 	server := prepareServer(t, artifacts)
-	worker := buildFixtureWorker(t, artifacts)
+	worker := buildFixtureWorker(t)
 	installFixtureWorkerAsClaudeStub(t, server, worker)
 	server.start(t)
 	return artifacts, server

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -627,32 +628,246 @@ func printScripted() bool {
 }
 `
 
-// buildFakeHopStub compiles fakeHopSource once for the calling test into a
-// temporary module under the test's artifact directory, mirroring
-// buildFixtureWorker's own build shape.
-func buildFakeHopStub(t *testing.T, artifacts *artifactDir) string {
+// fakeHopBinary caches the single fake-hop build every test in one `go test`
+// process shares, for the same two reasons as fixtureWorkerBinary: one build
+// instead of one per test, and one first execution instead of one per test.
+// It is a narrow, process-lifetime mutable global guarded by sync.Once and
+// cleaned up by TestMain.
+var fakeHopBinary struct { //nolint:gochecknoglobals // process-lifetime build cache guarded by sync.Once; see fakeHopBinary's own doc comment.
+	once        sync.Once
+	dir         string
+	path        string
+	err         error
+	fingerprint sharedBinaryFingerprint
+}
+
+// buildFakeHopStub compiles fakeHopSource once per `go test` process into a
+// temporary module of its own, mirroring buildFixtureWorker's build shape,
+// and returns the built executable every test in the process shares.
+func buildFakeHopStub(t *testing.T) string {
 	t.Helper()
-	src := artifacts.dir(t, "fake-hop-src")
-	if err := os.WriteFile(filepath.Join(src, "go.mod"), []byte("module fakehop\n\ngo 1.21\n"), 0o600); err != nil {
-		t.Fatal(err)
+	fakeHopBinary.once.Do(func() {
+		dir, err := os.MkdirTemp("", "hop-fake-hop")
+		if err != nil {
+			fakeHopBinary.err = err
+			return
+		}
+		fakeHopBinary.dir = dir
+		src := filepath.Join(dir, "src")
+		if mkErr := os.MkdirAll(src, 0o700); mkErr != nil {
+			fakeHopBinary.err = mkErr
+			return
+		}
+		if writeErr := os.WriteFile(filepath.Join(src, "go.mod"), []byte("module fakehop\n\ngo 1.21\n"), 0o600); writeErr != nil {
+			fakeHopBinary.err = writeErr
+			return
+		}
+		if writeErr := os.WriteFile(filepath.Join(src, "main.go"), []byte(fakeHopSource), 0o600); writeErr != nil {
+			fakeHopBinary.err = writeErr
+			return
+		}
+		goBin, err := exec.LookPath("go")
+		if err != nil {
+			fakeHopBinary.err = fmt.Errorf("the go tool is required to build the fake hop stub: %w", err)
+			return
+		}
+		out := filepath.Join(dir, "fakehop")
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		build := exec.CommandContext(ctx, goBin, "build", "-o", out, ".") //nolint:gosec // G204: the go tool builds this test's own generated fixture module.
+		build.Dir = src
+		if combined, buildErr := build.CombinedOutput(); buildErr != nil {
+			fakeHopBinary.err = fmt.Errorf("go build fake hop stub: %w\n%s", buildErr, combined)
+			return
+		}
+		// An empty argv reaches this stub's default branch, which refuses
+		// and returns at once, spawning nothing; with the environment
+		// emptied its invocation log is unset, so the warm-up leaves no
+		// trace a test could observe. Warmed here, with the build, so the
+		// cost is paid once for the whole process and outside every
+		// deadline.
+		warmExecutable(t, out)
+		fingerprint, statErr := fingerprintSharedBinary(out)
+		if statErr != nil {
+			fakeHopBinary.err = statErr
+			return
+		}
+		fakeHopBinary.fingerprint = fingerprint
+		fakeHopBinary.path = out
+	})
+	if fakeHopBinary.err != nil {
+		t.Fatalf("build fake hop stub: %v", fakeHopBinary.err)
 	}
-	if err := os.WriteFile(filepath.Join(src, "main.go"), []byte(fakeHopSource), 0o600); err != nil {
-		t.Fatal(err)
+	return fakeHopBinary.path
+}
+
+// fixturePrincipalBudget bounds one fixture-principal invocation driven
+// directly by this file. The principal never exits on its own — every
+// scenario here ends with it idling in the section 7 poll loop — so a run
+// ends either when the markers it was started for arrive or when this
+// budget expires.
+//
+// It has to cover the fixture's own work and nothing else: the binaries are
+// warmed where they are built (warmExecutable), so no first-execution cost
+// falls inside it.
+const fixturePrincipalBudget = 3 * time.Second
+
+// fixtureManagerReplanBudget bounds the two short manager invocations
+// TestFixtureManagerResumeSkipsReplanning drives. It is smaller than
+// fixturePrincipalBudget because the second invocation proves an absence —
+// no task created, no plan closed — and a run whose whole purpose is to
+// elapse should elapse briefly. Both invocations exec the shared, warmed
+// binaries, so the work inside it is milliseconds.
+const fixtureManagerReplanBudget = 1 * time.Second
+
+// principalOutcome is what one fixture-principal invocation revealed: its
+// combined output, when each awaited marker first appeared, and how long the
+// invocation ran.
+type principalOutcome struct {
+	stdout  string
+	arrived map[string]time.Duration
+	elapsed time.Duration
+}
+
+// saw reports whether marker appeared on the principal's output.
+func (o principalOutcome) saw(marker string) bool {
+	_, ok := o.arrived[marker]
+	return ok
+}
+
+// timeline renders when each awaited marker arrived, so a failing assertion
+// says whether the principal was working and decided otherwise or never got
+// going at all.
+func (o principalOutcome) timeline() string {
+	if len(o.arrived) == 0 {
+		return "no awaited marker arrived"
 	}
-	goBin, err := exec.LookPath("go")
-	if err != nil {
-		t.Fatalf("the go tool is required to build the fake hop stub: %v", err)
+	parts := make([]string, 0, len(o.arrived))
+	for marker, at := range o.arrived {
+		parts = append(parts, fmt.Sprintf("%s@%s", marker, at.Round(time.Millisecond)))
 	}
-	binDir := artifacts.dir(t, "fake-hop-bin")
-	out := filepath.Join(binDir, "fakehop")
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
-	defer cancel()
-	build := exec.CommandContext(ctx, goBin, "build", "-o", out, ".") //nolint:gosec // G204: the go tool builds this test's own generated fixture module.
-	build.Dir = src
-	if combined, buildErr := build.CombinedOutput(); buildErr != nil {
-		t.Fatalf("go build fake hop stub: %v\n%s", buildErr, combined)
+	slices.Sort(parts)
+	return strings.Join(parts, " ")
+}
+
+// markerWatcher accumulates a principal's combined output and closes settled
+// once the run reaches the point its caller is waiting for.
+type markerWatcher struct {
+	mu       sync.Mutex
+	start    time.Time
+	out      strings.Builder
+	arrived  map[string]time.Duration
+	ready    string
+	settling []string
+	settled  chan struct{}
+	closed   bool
+}
+
+func (w *markerWatcher) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.out.Write(p)
+	text := w.out.String()
+	for _, marker := range append([]string{w.ready}, w.settling...) {
+		if _, seen := w.arrived[marker]; !seen && strings.Contains(text, marker) {
+			w.arrived[marker] = time.Since(w.start)
+		}
 	}
-	return out
+	if !w.closed && w.done() {
+		w.closed = true
+		close(w.settled)
+	}
+	return len(p), nil
+}
+
+// done reports the caller's stop condition: the principal announced itself
+// ready and then reached one of the outcomes the caller distinguishes
+// between. A caller naming no settling marker has a run whose end is defined
+// by exhausting a script rather than by any one marker, so it never settles
+// early and the budget governs.
+func (w *markerWatcher) done() bool {
+	if len(w.settling) == 0 {
+		return false
+	}
+	if _, ok := w.arrived[w.ready]; !ok {
+		return false
+	}
+	for _, marker := range w.settling {
+		if _, ok := w.arrived[marker]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// fixtureManagerReady is the marker a manager principal prints once it has
+// read its assignment, before it runs any hop verb — so its absence means
+// the principal never reached its own first step.
+const fixtureManagerReady = "FIXTURE-MANAGER-READY"
+
+// runFixtureManager starts cmd, watches its combined output, and stops it as
+// soon as the manager reports ready and then reaches any one of the settling
+// markers — or when budget expires, whichever comes first. Naming no settling
+// marker runs the full budget, for a scenario whose end is exhausting a
+// script rather than reaching a marker.
+// stop must be the cancel function of the context cmd was built with:
+// canceling its own context is how an idling principal is ended here, and it
+// names no pid.
+//
+// A manager that never reports ready exercised none of what its caller
+// asserts, so that is reported here — naming the marker awaited, the time
+// waited, and whether any output arrived at all — instead of reaching the
+// caller as a missing-marker assertion, which cannot tell a principal that
+// never started from one that started and decided otherwise.
+func runFixtureManager(t *testing.T, cmd *exec.Cmd, stop context.CancelFunc, budget time.Duration, settling ...string) principalOutcome {
+	t.Helper()
+	watcher := &markerWatcher{
+		start:    time.Now(),
+		arrived:  map[string]time.Duration{},
+		ready:    fixtureManagerReady,
+		settling: settling,
+		settled:  make(chan struct{}),
+	}
+	cmd.Stdout = watcher
+	cmd.Stderr = watcher
+	// Without a bound here, stopping the principal would additionally wait
+	// on anything that inherited its output pipe.
+	cmd.WaitDelay = 5 * time.Second
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start fixture principal: %v", err)
+	}
+	expiry := time.NewTimer(budget)
+	defer expiry.Stop()
+	select {
+	case <-watcher.settled:
+	case <-expiry.C:
+	}
+	stop()
+	_ = cmd.Wait() //nolint:errcheck // this principal idles until it is stopped, so being killed is the expected outcome; what it wrote beforehand is the assertion material.
+
+	watcher.mu.Lock()
+	defer watcher.mu.Unlock()
+	outcome := principalOutcome{
+		stdout:  watcher.out.String(),
+		arrived: watcher.arrived,
+		elapsed: time.Since(watcher.start),
+	}
+	if _, ok := outcome.arrived[fixtureManagerReady]; !ok {
+		t.Fatalf("fixture manager never reported %q within %s (waited %s): %s\noutput:\n%s",
+			fixtureManagerReady, budget, outcome.elapsed.Round(time.Millisecond), describeSilence(outcome.stdout), outcome.stdout)
+	}
+	return outcome
+}
+
+// describeSilence separates the two ways a readiness marker goes missing,
+// which need different investigations: a principal that wrote nothing was
+// still being started when its budget ran out, while one that wrote
+// something got going and then stopped short.
+func describeSilence(stdout string) string {
+	if strings.TrimSpace(stdout) == "" {
+		return "it wrote nothing at all, so it had not reached its first output"
+	}
+	return fmt.Sprintf("it wrote %d bytes, so it was running but never reached that marker", len(stdout))
 }
 
 // fakeMessageBlock renders one hop msg wait/next scripted response block,
@@ -757,8 +972,8 @@ func countLogLinesWithPrefix(log, prefix string) int {
 // fix task and a second plan close.
 func TestFixtureManagerScriptDispatch(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	principal := buildFixtureWorker(t, artifacts)
-	fakeHop := buildFakeHopStub(t, artifacts)
+	principal := buildFixtureWorker(t)
+	fakeHop := buildFakeHopStub(t)
 
 	stateDir := artifacts.dir(t, "state")
 	scratchDir := artifacts.dir(t, "manager-scratch")
@@ -834,7 +1049,7 @@ func TestFixtureManagerScriptDispatch(t *testing.T) {
 	const rolePath, cribPath = "/state/runs/r/artifacts/roles/manager.md", "/state/runs/r/artifacts/worker-protocol.md"
 	prompt := testManagerInitialPrompt(assignmentPath, rolePath, cribPath, fakeHop)
 
-	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	cmd := exec.CommandContext(ctx, principal, "--session-id", "22222222-2222-2222-2222-222222222222", prompt) //nolint:gosec // G204: fixed test-owned binary and arguments.
 	cmd.Dir = cwd
@@ -860,17 +1075,15 @@ func TestFixtureManagerScriptDispatch(t *testing.T) {
 		"FAKE_HOP_STATUS_SUBJECT=cccccccccccccccccccccccccccccccccccccccc",
 		"FAKE_HOP_STATUS_REASONS=" + rejectNoticeBody,
 	}
-	var out strings.Builder
-	cmd.Stdout = &out
-	cmd.Stderr = &out
 	// The manager never exits on its own (per-attempt retirement is what a
-	// real scenario proves terminates it); this test bounds it with a
-	// context deadline instead, exactly like waiting out an intentionally
-	// endless composer-idle loop, and asserts on everything it did before
-	// the deadline killed it.
-	_ = cmd.Run() //nolint:errcheck // the context deadline killing this intentionally endless manager is the expected outcome, asserted on its captured stdout below, never on this error.
+	// real scenario proves terminates it); this test waits it out, exactly
+	// like an intentionally endless composer-idle loop, and asserts on
+	// everything it did. It names no settling marker because the last things
+	// it asserts — the closing ack and the reclose of the plan — leave no
+	// mark on stdout, so no marker can stand for "finished".
+	run := runFixtureManager(t, cmd, cancel, fixturePrincipalBudget)
 
-	stdout := out.String()
+	stdout := run.stdout
 	for _, want := range []string{
 		"FIXTURE-MANAGER-READY",
 		"FIXTURE-TASK-CREATED label=[t1] id=[00000000-0000-4000-8000-000000000001]",
@@ -886,7 +1099,7 @@ func TestFixtureManagerScriptDispatch(t *testing.T) {
 		"FIXTURE-FIX-TASK-CREATED label=[fix3] id=[00000000-0000-4000-8000-000000000003] review=[dddddddd-dddd-4ddd-8ddd-dddddddddddd]",
 	} {
 		if !strings.Contains(stdout, want) {
-			t.Errorf("manager stdout missing %q; got:\n%s", want, stdout)
+			t.Errorf("manager stdout missing %q after %s (%s); got:\n%s", want, run.elapsed.Round(time.Millisecond), run.timeline(), stdout)
 		}
 	}
 
@@ -941,8 +1154,8 @@ func TestFixtureManagerScriptDispatch(t *testing.T) {
 // must add neither.
 func TestFixtureManagerResumeSkipsReplanning(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	principal := buildFixtureWorker(t, artifacts)
-	fakeHop := buildFakeHopStub(t, artifacts)
+	principal := buildFixtureWorker(t)
+	fakeHop := buildFakeHopStub(t)
 
 	stateDir := artifacts.dir(t, "state")
 	scratchDir := artifacts.dir(t, "manager-scratch")
@@ -981,21 +1194,19 @@ func TestFixtureManagerResumeSkipsReplanning(t *testing.T) {
 		"FAKE_HOP_TASK_COUNTER_FILE=" + counterPath,
 		"FAKE_HOP_LOG=" + logPath,
 	}
-	run := func(args ...string) string {
-		ctx, cancel := context.WithTimeout(t.Context(), 1*time.Second)
+	run := func(settling []string, args ...string) string {
+		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
 		cmd := exec.CommandContext(ctx, principal, args...) //nolint:gosec // G204: fixed test-owned binary and arguments.
 		cmd.Dir = cwd
 		cmd.Env = baseEnv
-		var out strings.Builder
-		cmd.Stdout = &out
-		cmd.Stderr = &out
-		_ = cmd.Run() //nolint:errcheck // bounded by the context deadline; the manager never exits on its own (per-attempt retirement is what a real scenario proves terminates it).
-		return out.String()
+		return runFixtureManager(t, cmd, cancel, fixtureManagerReplanBudget, settling...).stdout
 	}
 
 	firstPrompt := testManagerInitialPrompt(assignmentPath, rolePath, cribPath, fakeHop)
-	firstStdout := run("--session-id", "22222222-2222-2222-2222-222222222222", firstPrompt)
+	// Closing the plan is the last step the first launch drives, and both log
+	// counts asserted below are written before it.
+	firstStdout := run([]string{"FIXTURE-PLAN-CLOSED"}, "--session-id", "22222222-2222-2222-2222-222222222222", firstPrompt)
 	if !strings.Contains(firstStdout, "FIXTURE-TASK-CREATED label=[t1]") || !strings.Contains(firstStdout, "FIXTURE-PLAN-CLOSED") {
 		t.Fatalf("first (non-resumed) launch did not plan; stdout:\n%s", firstStdout)
 	}
@@ -1009,7 +1220,10 @@ func TestFixtureManagerResumeSkipsReplanning(t *testing.T) {
 
 	const nativeRef = "88888888-8888-4888-8888-888888888888"
 	continuationPrompt := testManagerContinuationPrompt(assignmentPath, rolePath, cribPath, fakeHop)
-	secondStdout := run("--resume", nativeRef, continuationPrompt)
+	// No settling marker: what this half proves is an ABSENCE — that the
+	// resumed manager creates no task and closes no plan — and no marker
+	// stands for a step not taken, so the budget has to elapse.
+	secondStdout := run(nil, "--resume", nativeRef, continuationPrompt)
 	if strings.Contains(secondStdout, "FIXTURE-TASK-CREATED") || strings.Contains(secondStdout, "FIXTURE-PLAN-CLOSED") {
 		t.Errorf("resumed launch re-planned; stdout:\n%s", secondStdout)
 	}
@@ -1046,8 +1260,8 @@ type preForwardBarrierFixture struct {
 
 func buildPreForwardBarrierFixture(t *testing.T, artifacts *artifactDir) preForwardBarrierFixture {
 	t.Helper()
-	principal := buildFixtureWorker(t, artifacts)
-	fakeHop := buildFakeHopStub(t, artifacts)
+	principal := buildFixtureWorker(t)
+	fakeHop := buildFakeHopStub(t)
 
 	stateDir := artifacts.dir(t, "state")
 	scratchDir := artifacts.dir(t, "manager-scratch")
@@ -1125,15 +1339,18 @@ func buildPreForwardBarrierFixture(t *testing.T, artifacts *artifactDir) preForw
 // own intentionally endless drive — and returns its captured stdout.
 func runPreForwardBarrierManager(t *testing.T, fx preForwardBarrierFixture) string { //nolint:gocritic // hugeParam: preForwardBarrierFixture is a one-shot per-subtest fixture struct; a pointer would only complicate the two call sites.
 	t.Helper()
-	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	cmd := exec.CommandContext(ctx, fx.principal, "--session-id", "22222222-2222-2222-2222-222222222222", fx.prompt) //nolint:gosec // G204: fixed test-owned binary and arguments.
 	cmd.Dir = fx.cwd
 	cmd.Env = fx.env
-	var out strings.Builder
-	cmd.Stdout, cmd.Stderr = &out, &out
-	_ = cmd.Run() //nolint:errcheck // the context deadline ending this intentionally endless manager is the expected outcome, asserted on its captured stdout below.
-	return out.String()
+	// No settling marker: both barriers share this helper, and each asserts
+	// something that happens after the forward — the post-forward barrier
+	// fires only once the forward is done, and every subtest asserts the ack
+	// that follows it, which stdout never shows. Stopping at a marker here
+	// would cut the run before the behavior under test.
+	run := runFixtureManager(t, cmd, cancel, fixturePrincipalBudget)
+	return run.stdout
 }
 
 // TestFixtureManagerPreForwardBarrier proves RelayedQuestion's opt-in
@@ -1248,15 +1465,15 @@ func testFixtureManagerPreForwardBarrierEnabledButResumed(t *testing.T) {
 // runPreForwardBarrierManager's --session-id first-launch shape.
 func runPreForwardBarrierManagerResumed(t *testing.T, fx preForwardBarrierFixture, nativeRef string) string { //nolint:gocritic // hugeParam: preForwardBarrierFixture is a one-shot per-subtest fixture struct; a pointer would only complicate the call sites.
 	t.Helper()
-	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	cmd := exec.CommandContext(ctx, fx.principal, "--resume", nativeRef, fx.continuationPrompt) //nolint:gosec // G204: fixed test-owned binary and arguments.
 	cmd.Dir = fx.cwd
 	cmd.Env = fx.env
-	var out strings.Builder
-	cmd.Stdout, cmd.Stderr = &out, &out
-	_ = cmd.Run() //nolint:errcheck // the context deadline ending this intentionally endless manager is the expected outcome, asserted on its captured stdout below.
-	return out.String()
+	// No settling marker, for the same reason as the first-launch helper:
+	// the ack this run is driven to prove leaves no mark on stdout.
+	run := runFixtureManager(t, cmd, cancel, fixturePrincipalBudget)
+	return run.stdout
 }
 
 // TestFixtureManagerPostForwardBarrier proves RelayedQuestion's opt-in
@@ -1400,8 +1617,8 @@ type managerScriptDispatchFixture struct {
 func buildManagerScriptDispatchFixture(t *testing.T, artifacts *artifactDir) managerScriptDispatchFixture {
 	t.Helper()
 	fx := managerScriptDispatchFixture{
-		principal: buildFixtureWorker(t, artifacts),
-		fakeHop:   buildFakeHopStub(t, artifacts),
+		principal: buildFixtureWorker(t),
+		fakeHop:   buildFakeHopStub(t),
 		stateDir:  artifacts.dir(t, "state"),
 		runID:     "a1a1a1a1-a1a1-4a1a-8a1a-a1a1a1a1a1a1",
 	}
@@ -1445,7 +1662,7 @@ func TestFixtureManagerRetriesTransientTaskCreate(t *testing.T) {
 	const rolePath, cribPath = "/state/runs/a1/artifacts/roles/manager.md", "/state/runs/a1/artifacts/worker-protocol.md"
 	prompt := testManagerInitialPrompt(fx.assignmentPath, rolePath, cribPath, fx.fakeHop)
 
-	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	cmd := exec.CommandContext(ctx, fx.principal, "--session-id", "22222222-2222-2222-2222-222222222222", prompt) //nolint:gosec // G204: fixed test-owned binary and arguments.
 	cmd.Dir = fx.cwd
@@ -1466,19 +1683,19 @@ func TestFixtureManagerRetriesTransientTaskCreate(t *testing.T) {
 		"FAKE_HOP_TASK_CREATE_TRANSIENT_COUNT=1",
 		"FAKE_HOP_TASK_CREATE_TRANSIENT_COUNTER_FILE=" + transientCounterPath,
 	}
-	var out strings.Builder
-	cmd.Stdout = &out
-	cmd.Stderr = &out
-	_ = cmd.Run() //nolint:errcheck // the context deadline killing this intentionally endless manager is the expected outcome, asserted on its captured stdout below, never on this error.
+	// Settling here is safe because everything asserted below happens before
+	// it: closing the plan is the last step this one-task script drives, and
+	// both task create attempts are already logged by the time it prints.
+	run := runFixtureManager(t, cmd, cancel, fixturePrincipalBudget, "FIXTURE-PLAN-CLOSED")
 
-	stdout := out.String()
+	stdout := run.stdout
 	for _, want := range []string{
 		"FIXTURE-MANAGER-READY",
 		"FIXTURE-TASK-CREATED label=[t1] id=[00000000-0000-4000-8000-000000000001]",
 		"FIXTURE-PLAN-CLOSED",
 	} {
 		if !strings.Contains(stdout, want) {
-			t.Errorf("manager stdout missing %q (the transient retry must eventually succeed); got:\n%s", want, stdout)
+			t.Errorf("manager stdout missing %q (the transient retry must eventually succeed) after %s (%s); got:\n%s", want, run.elapsed.Round(time.Millisecond), run.timeline(), stdout)
 		}
 	}
 
@@ -1648,7 +1865,7 @@ func runVerdictCorrelationCase(t *testing.T, artifacts *artifactDir, noticeBodyP
 	const rolePath, cribPath = "/state/runs/a1/artifacts/roles/manager.md", "/state/runs/a1/artifacts/worker-protocol.md"
 	prompt := testManagerInitialPrompt(fx.assignmentPath, rolePath, cribPath, fx.fakeHop)
 
-	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	cmd := exec.CommandContext(ctx, fx.principal, "--session-id", "22222222-2222-2222-2222-222222222222", prompt) //nolint:gosec // G204: fixed test-owned binary and arguments.
 	cmd.Dir = fx.cwd
@@ -1664,13 +1881,12 @@ func runVerdictCorrelationCase(t *testing.T, artifacts *artifactDir, noticeBodyP
 		"FAKE_HOP_TASK_COUNTER_FILE=" + fx.counterPath,
 		"FAKE_HOP_LOG=" + fx.logPath,
 	}, statusEnv...)
-	var out strings.Builder
-	cmd.Stdout = &out
-	cmd.Stderr = &out
-	_ = cmd.Run() //nolint:errcheck // the context deadline killing this intentionally endless manager is the expected outcome once its scripted notices are exhausted, asserted on its captured stdout/log below, never on this error.
+	// This scenario ends by exhausting its scripted notices rather than at
+	// any one marker, so it names none and runs the whole budget.
+	run := runFixtureManager(t, cmd, cancel, fixturePrincipalBudget)
 
 	log = readFakeHopLog(t, fx.logPath)
-	return countLogLinesWithPrefix(log, "task\tcreate\t--title\tfix from reject\t"), out.String(), log
+	return countLogLinesWithPrefix(log, "task\tcreate\t--title\tfix from reject\t"), run.stdout, log
 }
 
 // TestFixtureManagerVerdictRejectedCorrelation proves the manager's own
@@ -1793,7 +2009,7 @@ func runNeedsReworkCase(t *testing.T, artifacts *artifactDir, noticeBodyPath str
 	const rolePath, cribPath = "/state/runs/a1/artifacts/roles/manager.md", "/state/runs/a1/artifacts/worker-protocol.md"
 	prompt := testManagerInitialPrompt(fx.assignmentPath, rolePath, cribPath, fx.fakeHop)
 
-	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	cmd := exec.CommandContext(ctx, fx.principal, "--session-id", "22222222-2222-2222-2222-222222222222", prompt) //nolint:gosec // G204: fixed test-owned binary and arguments.
 	cmd.Dir = fx.cwd
@@ -1810,12 +2026,19 @@ func runNeedsReworkCase(t *testing.T, artifacts *artifactDir, noticeBodyPath str
 		"FAKE_HOP_LOG=" + fx.logPath,
 		"FAKE_HOP_STATUS_SHORTFALL=evidence-inconsistent",
 	}
-	var out strings.Builder
-	cmd.Stdout = &out
-	cmd.Stderr = &out
-	_ = cmd.Run() //nolint:errcheck // the context deadline killing this intentionally endless manager is the expected outcome once its scripted notice is exhausted, asserted on its captured stdout below, never on this error.
-	stdout = out.String()
-	return strings.Contains(stdout, "FIXTURE-RETRIED label=[t1]"), stdout
+	// Every notice shape reaches exactly one of these two: the body parses
+	// as a task consequence and the manager retries, or it does not and the
+	// manager falls through to the status correlation instead. Naming both
+	// is what lets a case that must NOT retry prove the manager considered
+	// the notice and declined, rather than passing because it never ran.
+	// Settling here is safe because callers assert only on stdout, all of
+	// which is written by the time either marker appears.
+	run := runFixtureManager(t, cmd, cancel, fixturePrincipalBudget, "FIXTURE-RETRIED label=[t1]", "FIXTURE-STATUS-CHECKED")
+	if !run.saw("FIXTURE-RETRIED label=[t1]") && !run.saw("FIXTURE-STATUS-CHECKED") {
+		t.Fatalf("manager reached no decision on the notice within %s (%s): it neither retried t1 nor fell through to the status correlation, so a caller asserting that it did NOT retry would be proving nothing; stdout:\n%s",
+			fixturePrincipalBudget, run.timeline(), run.stdout)
+	}
+	return run.saw("FIXTURE-RETRIED label=[t1]"), run.stdout
 }
 
 // TestFixtureManagerNeedsReworkNoticeShapes proves parseNeedsReworkLabel
@@ -1974,8 +2197,8 @@ func TestFixtureManagerNeedsReworkNoticeShapes(t *testing.T) {
 // reviewer session always is — must find the marker and approve.
 func TestFixtureReviewerRejectOnce(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	principal := buildFixtureWorker(t, artifacts)
-	fakeHop := buildFakeHopStub(t, artifacts)
+	principal := buildFixtureWorker(t)
+	fakeHop := buildFakeHopStub(t)
 
 	stateDir := artifacts.dir(t, "state")
 	scratchDir := artifacts.dir(t, "reviewer-scratch")
@@ -2056,8 +2279,8 @@ func TestFixtureReviewerRejectOnce(t *testing.T) {
 // from any real messaging store.
 func TestFixtureWorkerHoldBarrier(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	worker := buildFixtureWorker(t, artifacts)
-	fakeHop := buildFakeHopStub(t, artifacts)
+	worker := buildFixtureWorker(t)
+	fakeHop := buildFakeHopStub(t)
 	repo := newFixtureRepo(t, artifacts, nil, "repo")
 
 	stateDir := artifacts.dir(t, "state")
@@ -2195,8 +2418,8 @@ type workerHoldSendGateFixture struct {
 
 func buildWorkerHoldSendGateFixture(t *testing.T, artifacts *artifactDir) workerHoldSendGateFixture {
 	t.Helper()
-	worker := buildFixtureWorker(t, artifacts)
-	fakeHop := buildFakeHopStub(t, artifacts)
+	worker := buildFixtureWorker(t)
+	fakeHop := buildFakeHopStub(t)
 	repo := newFixtureRepo(t, artifacts, nil, "repo")
 
 	stateDir := artifacts.dir(t, "state")
@@ -2387,8 +2610,8 @@ func TestFixtureWorkerHoldFetchLoopFatalsOnUnexpectedRefusal(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			artifacts := newArtifactDir(t)
-			worker := buildFixtureWorker(t, artifacts)
-			fakeHop := buildFakeHopStub(t, artifacts)
+			worker := buildFixtureWorker(t)
+			fakeHop := buildFakeHopStub(t)
 			repo := newFixtureRepo(t, artifacts, nil, "repo")
 
 			stateDir := artifacts.dir(t, "state")
@@ -2475,8 +2698,8 @@ func TestFixtureWorkerFetchCrash(t *testing.T) {
 
 func testFixtureWorkerFetchCrashBlocksBeforeAck(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	worker := buildFixtureWorker(t, artifacts)
-	fakeHop := buildFakeHopStub(t, artifacts)
+	worker := buildFixtureWorker(t)
+	fakeHop := buildFakeHopStub(t)
 	repo := newFixtureRepo(t, artifacts, nil, "fetch-crash-repo")
 
 	stateDir := artifacts.dir(t, "state")
@@ -2599,8 +2822,8 @@ func testFixtureWorkerFetchCrashBlocksBeforeAck(t *testing.T) {
 
 func testFixtureWorkerFetchCrashResumedWaitsForReleaseThenAcks(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	worker := buildFixtureWorker(t, artifacts)
-	fakeHop := buildFakeHopStub(t, artifacts)
+	worker := buildFixtureWorker(t)
+	fakeHop := buildFakeHopStub(t)
 	repo := newFixtureRepo(t, artifacts, nil, "fetch-crash-resumed-repo")
 
 	stateDir := artifacts.dir(t, "state")
@@ -2774,8 +2997,8 @@ func testFixtureWorkerFetchCrashResumedWaitsForReleaseThenAcks(t *testing.T) {
 // an envelope it never actually read.
 func TestFixtureWorkerHoldMissingBodyFailsLoudly(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	worker := buildFixtureWorker(t, artifacts)
-	fakeHop := buildFakeHopStub(t, artifacts)
+	worker := buildFixtureWorker(t)
+	fakeHop := buildFakeHopStub(t)
 	repo := newFixtureRepo(t, artifacts, nil, "repo")
 
 	stateDir := artifacts.dir(t, "state")
@@ -2863,8 +3086,8 @@ func TestFixtureWorkerHoldMissingBodyFailsLoudly(t *testing.T) {
 // the drain fires from the retry path itself, not some earlier one.
 func TestFixtureWorkerDrainsOnUndeliveredResultTransient(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	worker := buildFixtureWorker(t, artifacts)
-	fakeHop := buildFakeHopStub(t, artifacts)
+	worker := buildFixtureWorker(t)
+	fakeHop := buildFakeHopStub(t)
 	repo := newFixtureRepo(t, artifacts, nil, "repo")
 
 	stateDir := artifacts.dir(t, "state")
@@ -2974,7 +3197,7 @@ func fakeHopValidEnv(t *testing.T, artifacts *artifactDir, overrides map[string]
 // real hop invocation ever could.
 func TestFakeHopRejectsInvalidInvocations(t *testing.T) {
 	artifacts := newArtifactDir(t)
-	fakeHop := buildFakeHopStub(t, artifacts)
+	fakeHop := buildFakeHopStub(t)
 
 	const validMessageID = "40404040-4040-4404-8404-404040404040"
 	tests := []struct {
