@@ -2125,7 +2125,69 @@ func buildFixtureWorker(t *testing.T, artifacts *artifactDir) string {
 	if combined, buildErr := build.CombinedOutput(); buildErr != nil {
 		t.Fatalf("go build fixture worker: %v\n%s", buildErr, combined)
 	}
+	if !strings.Contains(fixtureWorkerSource, strconv.Quote(fixtureWorkerWarmupArgv)) {
+		t.Fatalf("fixtureWorkerWarmupArgv (%q) names no mode in fixtureWorkerSource; warming would fall through to the role dispatch, which spawns a stand-in child this suite would then leak", fixtureWorkerWarmupArgv)
+	}
+	warmExecutable(t, out, fixtureWorkerWarmupArgv)
 	return out
+}
+
+// fixtureWorkerWarmupArgv reaches the first branch of fixtureWorkerSource's
+// main: the MCP stand-in child mode, which blocks on stdin and returns the
+// moment it reaches EOF, ahead of both spawnMCPStandIn and the role
+// dispatch. It is retyped from that source's own mcpStandInArg — the
+// fixture is compiled from a string literal, so the two cannot share a
+// symbol — and buildFixtureWorker fails loudly if the two ever drift.
+const fixtureWorkerWarmupArgv = "fixture-mcp-stand-in"
+
+// TestFixtureWorkerWarmupArgvIsInert pins what buildFixtureWorker's warm-up
+// depends on: the argv it uses cannot collide with a launch this binary
+// actually receives, and the mode it selects returns 0 having printed
+// nothing and written nothing — no observation dump, no role dispatch, no
+// stand-in child of its own. A warm-up that did any of those would be
+// performing, during setup, the very work a scenario exists to observe.
+//
+// The precondition carrying that weight is narrower than "no launch shape
+// looks like this", so it is worth checking rather than trusting: this
+// binary is only ever installed as the CLAUDE stub, and the two claude
+// shapes composeSessionArgvTail builds both place a flag at index 1 —
+// "--session-id" for a first launch, "--resume" for a cold relaunch, the
+// latter pinned by requireResumeShape. It is NOT the case that every shape
+// HOP composes is flag-shaped there: the codex shape is a bare prompt at
+// index 1. That shape never reaches this binary, because no codex or
+// opencode launch is composed anywhere in this suite.
+func TestFixtureWorkerWarmupArgvIsInert(t *testing.T) {
+	artifacts := newArtifactDir(t)
+	worker := buildFixtureWorker(t, artifacts)
+
+	for _, claudeLaunchFlag := range []string{"--session-id", "--resume"} {
+		if fixtureWorkerWarmupArgv == claudeLaunchFlag {
+			t.Errorf("warm-up argv %q is a claude launch flag; it must select the stand-in mode, never a launch", fixtureWorkerWarmupArgv)
+		}
+	}
+
+	cwd := artifacts.dir(t, "warmup-cwd")
+	ctx, cancel := context.WithTimeout(t.Context(), fixturePrincipalBudget)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, worker, fixtureWorkerWarmupArgv) //nolint:gosec // G204: fixed test-owned binary and argument.
+	cmd.Dir = cwd
+	cmd.Env = []string{}
+	cmd.Stdin = strings.NewReader("")
+	var out strings.Builder
+	cmd.Stdout, cmd.Stderr = &out, &out
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("the warm-up mode must exit 0: %v; output:\n%s", err, out.String())
+	}
+	if out.String() != "" {
+		t.Errorf("the warm-up mode wrote %q; it must reach no readiness marker and no role dispatch", out.String())
+	}
+	entries, err := os.ReadDir(cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("the warm-up mode created %d entries in its working directory; it must write nothing", len(entries))
+	}
 }
 
 // testAssignmentPrompt reproduces internal/app/usecase_execboundary.go's

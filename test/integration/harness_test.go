@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -763,6 +764,37 @@ func stagePlugin(t *testing.T) string {
 	}
 	copyFile(t, filepath.Join(root, "herdr-plugin.toml"), filepath.Join(stage, "herdr-plugin.toml"))
 	return stage
+}
+
+// warmExecutable runs a just-built binary once, for the execution itself
+// rather than for anything it does, and discards the outcome.
+//
+// The first execution of a newly written executable costs far more than
+// any later execution of that same file: the operating system evaluates
+// the new image once, through a single machine-wide service, so the cost
+// rises with how many processes anywhere are starting never-before-seen
+// binaries at that moment. Copying a warmed binary does not inherit the
+// warmth — a copy is a new image and pays in full — but a hard link to it
+// does, being the same image under another name.
+//
+// Without this call the whole of that cost lands on whichever run executes
+// the binary first, inside whatever budget that run is being held to, and
+// a test measures the loader instead of the fixture. Warming here spends it
+// once, deliberately, where no deadline is running.
+//
+// The environment is emptied so no behavior keyed off HOP_* or FAKE_HOP_*
+// can observe this invocation, and args must select a mode that returns
+// immediately without spawning children.
+func warmExecutable(t *testing.T, path string, args ...string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+	defer cancel()
+	warm := exec.CommandContext(ctx, path, args...) //nolint:gosec // G204: a binary this suite just built, with arguments this suite chose.
+	warm.Env = []string{}
+	// Reaching EOF on stdin is what ends the stand-in mode the fixture
+	// worker is warmed through; an empty reader gives it one immediately.
+	warm.Stdin = strings.NewReader("")
+	_ = warm.Run() //nolint:errcheck // only the exec matters here: the fake hop stub refuses an empty argv by design, and that refusal carries no information this warm-up wants.
 }
 
 // copyFile copies one regular file.
