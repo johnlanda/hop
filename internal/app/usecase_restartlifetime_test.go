@@ -315,6 +315,63 @@ func nativeRefFor(tc *testController, w workerFixture) string {
 	return tc.Store.Sessions[w.SessionID].value.NativeSessionRef
 }
 
+// TestReconcileServerRestartIgnoresSessionsThatAreAlreadyTerminal pins the
+// candidate filter, which is the OTHER half of "two sessions never identify
+// the same pane" — the half the identification ladder cannot supply.
+//
+// A terminal session keeps its binding: a binding is superseded by a
+// confirmed close, a resume's adoption or a feature cold relaunch, and by
+// nothing else, so a worker the settlement machinery terminated
+// (applyWorkerTermination) and a predecessor a solo cold relaunch marked
+// lost (coldRelaunch) both keep a CURRENT binding naming their recorded
+// pane. The lost one is the dangerous shape: a lineage SHARES its native
+// session reference, so the predecessor's own restore invocation is exactly
+// what its SUCCESSOR's pane runs — and a recorded pane id is not a durable
+// address, so after a restart the predecessor's id can answer for that
+// successor's pane. A predecessor admitted as a candidate would then
+// identify its successor's pane by the harness rung and close a live agent.
+func TestReconcileServerRestartIgnoresSessionsThatAreAlreadyTerminal(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		state run.SessionState
+	}{
+		{name: "a terminated worker keeps the binding nothing superseded", state: run.SessionTerminated},
+		{name: "a lost predecessor shares its lineage's native reference", state: run.SessionLost},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			controller, fr, w, binding := restartWorker(t)
+			controller.Store.Sessions[w.SessionID].value.State = tc.state
+			serverRestarted(controller)
+			// The recorded pane id answers for a pane running THIS lineage's
+			// restore invocation: the shape a successor's pane presents once
+			// a reissued workspace id makes the predecessor's recorded id
+			// address it.
+			controller.Runtime.InspectPaneFn = func(paneID string) (app.PaneProcess, error) {
+				if paneID == binding.PaneID {
+					return restoredHarnessPane(w.PID+900, nativeRefFor(controller, w)), nil
+				}
+				return app.PaneProcess{}, pinnedPaneNotFound("inspect", paneID)
+			}
+
+			report, err := controller.Controller.ReconcileServerRestart(context.Background(), fr.Handle, restartOptions())
+			if err != nil {
+				t.Fatalf("ReconcileServerRestart() error = %v", err)
+			}
+			if len(controller.Runtime.ClosedPanes) != 0 {
+				t.Fatalf("panes closed = %v, want none: a %s session is not this step's business", controller.Runtime.ClosedPanes, tc.state)
+			}
+			for _, entry := range append(append(append([]string{}, report.Closed...), report.Relaunched...), report.Outstanding...) {
+				if strings.Contains(entry, w.SessionID.String()) {
+					t.Fatalf("report names the %s session: %q", tc.state, entry)
+				}
+			}
+			if got := controller.Store.Sessions[w.SessionID].value.State; got != tc.state {
+				t.Fatalf("session state = %s, want it left %s", got, tc.state)
+			}
+		})
+	}
+}
+
 // TestReconcileServerRestartProcessConjunct pins that a CHANGED lifetime
 // replaces the CONTINUITY conjunct only: the recorded process must still be
 // OBSERVED gone by a successful group listing, and a live or unobservable
