@@ -264,20 +264,21 @@ func TestRealProcessChildLaunchInFlightAcrossResume(t *testing.T) {
 	}
 
 	// The crash: the controller dies with the claim still exec_pending and
-	// the pane still holding that very process — every inspection of it,
-	// live or resumed, reads unresolved (no launch marker in its argv or
-	// cmdline), so no pass could ever have settled or reclassified it.
+	// the pane still holding that very process — every inspection of it
+	// since it stripped its own argv, live or resumed, reads unresolved (no
+	// launch marker in its argv or cmdline), so no pass has settled or
+	// reclassified it.
 	killControllerLeader(t, fx.controller)
 	waitForLeaseExpiry(t, fx.dbPath(), fx.runID)
 	if state := fx.claimState(t, sessionID); state != "exec_pending" {
 		t.Fatalf("launch claim state after the kill = %q, want it unchanged at exec_pending", state)
 	}
-	if state := fx.sessionState(t, sessionID); state != "launching" {
-		t.Fatalf("session state after the kill = %q, want it unchanged at launching: this scenario's whole point is the launching disjunct", state)
-	}
 	info = fx.server.processInfo(t, paneID)
 	if int(info.ShellPID) != claimPID {
 		t.Fatalf("pane %s shell pid after the kill = %d, want the still-claimed pid %d unchanged", paneID, info.ShellPID, claimPID)
+	}
+	if state := fx.sessionState(t, sessionID); state != "launching" {
+		t.Fatalf("session state after the kill = %q, want it unchanged at launching: this scenario's whole point is the launching disjunct", state)
 	}
 
 	resumed := fx.server.startHopController(t, fx.stateDir, "resume", "resume", "-C", fx.repo.Root, fx.runID)
