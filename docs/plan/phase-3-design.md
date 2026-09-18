@@ -690,11 +690,18 @@ session, before its disposition is decided:
   exactly this session — the member at the pane's shell pid reporting
   argv exactly equal to the placement's frozen `hop launch --run <run>
   --session <session>` command, itself a launcher invocation naming this
-  run and session. Under one lifetime a pane id names one pane and a
-  command pane keeps its process for its whole life, so that process is
-  the one the placement spawned with this incarnation's environment
-  (`TestSpikeVanishedPaneShapes` pins that the pane's own process reports
-  exactly the argv `layout.apply` ran it with). The run then resumes and the loop's corroboration
+  run and session. Under one lifetime a pane id names one pane, and
+  ORDINARILY a command pane keeps its process for its whole life, so that
+  process is the one the placement spawned with this incarnation's
+  environment (`TestSpikeVanishedPaneShapes` pins that the pane's own
+  process reports exactly the argv `layout.apply` ran it with). The known
+  exception is a live handoff (Herdr's own graceful server-replacement
+  mechanism), which can respawn a pane's shell process without itself
+  ending the server lifetime that identifies the pane — which is why
+  identity is never trusted alone: the argv match above, run against
+  whatever process actually occupies the pane, is what the corroboration
+  predicate decides from, and a respawned shell fails that match exactly
+  as any other foreign occupant does. The run then resumes and the loop's corroboration
   finishes the launch — settlement, the forking-wrapper reconcile, the
   launch-ended row, or the pre-claim launch deadline — exactly as a live
   controller would. Server continuity is a conjunct because a graceful
