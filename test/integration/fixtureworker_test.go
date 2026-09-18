@@ -1401,15 +1401,29 @@ var integrationNoticeStates = map[string]bool{
 	"rolled-back": true,
 }
 
-// matchIntegrationLine reports whether line is EXACTLY "integration <id>
-// <state>" — the same anchored, exact three-field shape as
-// matchTaskNeedsReworkLine — and, if so, the state token.
-func matchIntegrationLine(line string) (state string, ok bool) {
+// matchIntegrationLine reports whether line CLAIMS to be
+// renderIntegrationNotice's own line — first field "integration",
+// whatever else follows — and, only when it is EXACTLY the well-formed
+// three-field shape ("integration <id> <state>"), its state token. A
+// line that claims the shape but is malformed (any field count other
+// than three) reports isIntegrationLine true with an empty state, which
+// integrationNoticeStates never contains — so a malformed line is
+// treated as an unrecognized state, not as "no integration line at
+// all". This keeps the gate below fail-CLOSED on a malformed or
+// widened line rather than fail-open: this fixture is a retyped mirror
+// of a real production grammar, and a gate that silently stops firing
+// when a field is added would let the excluded interrupted state (or
+// any future state) start retrying again with nothing failing to catch
+// it.
+func matchIntegrationLine(line string) (state string, isIntegrationLine bool) {
 	fields := strings.Fields(line)
-	if len(fields) == 3 && fields[0] == "integration" {
+	if len(fields) == 0 || fields[0] != "integration" {
+		return "", false
+	}
+	if len(fields) == 3 {
 		return fields[2], true
 	}
-	return "", false
+	return "", true
 }
 
 // parseNeedsReworkLabel extracts the task label from a manager notice

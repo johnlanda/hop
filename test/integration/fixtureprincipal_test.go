@@ -1939,6 +1939,32 @@ func TestFixtureManagerNeedsReworkNoticeShapes(t *testing.T) {
 			t.Errorf("manager did not process the notice through the status-check branch; want \"FIXTURE-STATUS-CHECKED matched=[false]\"; stdout:\n%s", stdout)
 		}
 	})
+
+	t.Run("malformed integration line at line 2 never retries", func(t *testing.T) {
+		artifacts := newArtifactDir(t)
+		noticePath := filepath.Join(artifacts.dir(t, "notice-bodies"), "notice.txt")
+		// A line 2 that CLAIMS to be renderIntegrationNotice's own line
+		// (first field "integration") but has the wrong field count is
+		// production this fixture has never seen — no real renderer emits
+		// it today — but it is exactly the shape a later slice would
+		// produce by widening the grammar. The gate must fail CLOSED on
+		// it (no retry), not treat "not exactly three fields" as "not an
+		// integration line at all": a fail-open here would silently stop
+		// catching the interrupted-state case the moment production's
+		// line 2 grew or shrank a field, since matchIntegrationLine would
+		// then report every line 2 as unrecognized and the gate above
+		// would never fire.
+		if err := os.WriteFile(noticePath, []byte("task t1 needs-rework\nintegration ffffffff-4444-4fff-8fff-ffffffffffff\nreason: malformed integration line, missing state\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		retried, stdout := runNeedsReworkCase(t, artifacts, noticePath)
+		if retried {
+			t.Errorf("manager retried t1 for a malformed (two-field) integration line; want no retry (fail closed); stdout:\n%s", stdout)
+		}
+		if !strings.Contains(stdout, "FIXTURE-STATUS-CHECKED matched=[false]") {
+			t.Errorf("manager did not process the notice through the status-check branch; want \"FIXTURE-STATUS-CHECKED matched=[false]\"; stdout:\n%s", stdout)
+		}
+	})
 }
 
 // TestFixtureReviewerRejectOnce drives the compiled fixture principal as a
