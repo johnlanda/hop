@@ -368,8 +368,14 @@ func isLauncherInvocation(argv []string) bool {
 // Anything else — either token unknown, or inequality — is NOT
 // continuity: ambiguous, never absence. A deferred native restore fires
 // only after a server restart, so an unchanged server process with the
-// pane gone cannot have a restore pending; a restart or live handoff
-// changes the identity and fails closed here.
+// pane gone has no restore pending against the session state that
+// process has already persisted; a restart or live handoff changes the
+// identity and fails closed here. That persisted state can itself be
+// stale: Herdr saves its session snapshot on its own debounce, so a pane
+// closed within that window can still be recorded as present, and the
+// NEXT restart may restore it — an orphan with no HOP environment and a
+// stale incarnation, unable to act through HOP (docs/plan/phase-3-design.md
+// section 4's residual).
 func ServerContinuityEstablished(recorded, observed string) bool {
 	return recorded != "" && recorded == observed
 }

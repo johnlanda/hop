@@ -151,8 +151,16 @@ type Runtime interface {
 	// observe it again to establish server continuity: a deferred native
 	// restore fires only after a server restart, and a pane keeps its
 	// creation label and its process for its whole life under one server
-	// lifetime, so an unchanged server lifetime with the pane gone cannot
-	// have a restore pending or a renamed pane restored.
+	// lifetime, so an unchanged server lifetime with the pane gone means no
+	// restore is pending against the session state Herdr has already
+	// persisted, and no rename has been restored — not that Herdr can never
+	// revive that pane again. Herdr persists its session snapshot on its
+	// own debounce, so a pane closed within that window can still be
+	// recorded in it; a later server restart can then restore that stale
+	// entry as a fresh shell or a deferred native resume, an orphan
+	// carrying no HOP environment and a stale incarnation, unable to act
+	// through HOP but otherwise free to run
+	// (docs/plan/phase-3-design.md section 4's residual).
 	ServerInstance(ctx context.Context) (string, error)
 }
 
