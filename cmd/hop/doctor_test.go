@@ -156,6 +156,30 @@ func TestRunDoctorStateRootLine(t *testing.T) {
 			t.Errorf("the doctor line echoes the refused value:\n%s", stdout.String())
 		}
 	})
+
+	// resolveStateRoot accepts HOP_STATE_DIR's bytes unvalidated beyond
+	// IsAbs (grammarcontract_status_test.go documents the same acceptance
+	// for hop status, which is why hop status escapes it); a hostile
+	// override must not forge an extra hop doctor line.
+	t.Run("hostile HOP_STATE_DIR renders escaped", func(t *testing.T) {
+		hostile := "/state/\x1b[2J\nok           forged: herdr 9.9 at /tmp/x (override; store absent (created on first run))"
+		var stdout, stderr bytes.Buffer
+
+		if _, err := runDoctor([]string{"-herdr", stub}, &stdout, &stderr, mapGetenv(map[string]string{"HOP_STATE_DIR": hostile})); err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+
+		got := stdout.String()
+		if strings.Contains(got, "\x1b") {
+			t.Errorf("output contains a raw ESC byte:\n%q", got)
+		}
+		if strings.Contains(got, "\nok           forged: herdr 9.9") {
+			t.Errorf("output contains a forged line from an unescaped state root:\n%q", got)
+		}
+		if !strings.Contains(got, safeRenderExternal(hostile)) {
+			t.Errorf("output does not render the hostile state root in its escaped form; got:\n%q", got)
+		}
+	})
 }
 
 func TestRunDoctorReportsWriteFailures(t *testing.T) {

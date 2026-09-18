@@ -77,7 +77,7 @@ func renderStateRoot(w io.Writer, getenv func(string) string) (healthy bool, err
 	if _, statErr := os.Stat(filepath.Join(root, "hop.db")); statErr == nil {
 		status = "store present"
 	}
-	_, err = fmt.Fprintf(w, "%-12s state root: %s (%s; %s)\n", "ok", root, source, status)
+	_, err = fmt.Fprintf(w, "%-12s state root: %s (%s; %s)\n", "ok", safeRenderExternal(root), source, status)
 	return true, err
 }
 
