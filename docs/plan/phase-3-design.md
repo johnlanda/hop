@@ -1132,11 +1132,23 @@ Herdr pane client and rename its own pane.
 HOP DOES NOT RACE IT, AND THE RULE DOES NOT PRETEND TO. HOP cannot win a
 sub-second race it does not start in, and does not try to: the orphan may
 START; the close ENDS it and prevents every later one. That is an
-observation rather than a prediction. In the real-process scenario's own
-evidence, the scrollback HOP captured before closing the MANAGER's pane
-already held Herdr's restored invocation, while the worker's pane in the
-same run had not yet been given one — both restore windows, in one
-restart. The orphan there self-terminated only because the fixture
+observation rather than a prediction. The real-process scenario logs the
+scrollback HOP captured before each close, and a passing run reads:
+
+    the implementer session's pane had not yet been given Herdr's
+    restored agent when HOP closed it: the close prevented it
+          | Mac:hop-r1-t1a1 jonathanlanda$
+    the manager session's pane had ALREADY been given Herdr's restored
+    agent when HOP closed it: the close is what ended it
+          | claude --resume 11111111-2222-4333-8444-555555555555
+          | Mac:repo jonathanlanda$ claude --resume 11111111-2222-4333-8444-555555555555
+          | fixture principal: required HOP_STATE_DIR is not set
+          | Mac:repo jonathanlanda$
+
+Both restore windows, in one restart: one pane already carrying Herdr's
+own resume invocation, the other still at a bare shell prompt. The
+reference in that invocation is one HOP never uses, so the process it
+names can only be Herdr's restore firing behind HOP's back. The orphan there self-terminated only because the fixture
 principal refuses to run without HOP's environment; a real harness would
 have resumed its conversation and kept working on the repository until
 the close killed its pane. This is the argument for closing rather than
@@ -1226,6 +1238,25 @@ recorded was closed". `hop status` renders only a reduction of those
 reasons to two fixed strings — closed, or relaunched — so the journal
 keeps the detail and the surface carries no token, pid, label or path;
 the manager's renders on the manager's own session line.
+
+A RESTART DURING THE OBSERVATIONS CONCLUDES NOTHING, deliberately. The
+two fresh lifetime reads must differ from the recorded token AND equal
+each other; if they differ from each other, a further restart landed
+mid-observation, and neither the identification nor the process listing
+can be trusted to describe one world. The rule refuses to act and the
+next round re-observes. That is a refusal, not an oversight.
+
+WHAT HAS REAL-PROCESS EVIDENCE, and what does not. The real-process
+scenario exercises the trigger, the close in both restore windows, the
+LABEL rung, the relaunch branch, the manager-last ordering and the
+journal's naming of the cause; every close it has made was carried by the
+label. The RESTORED-HARNESS rung is pinned by the probe's argv shape and
+by the application tables, but no real-process run has closed a pane
+through it, because that needs a pane whose label a rename removed AND
+whose restore has already fired. The ambiguous refusals and the solo stop
+path are likewise table-only. This is a coverage statement, not a defect:
+a reader must not assume the renamed path has real-process evidence
+behind it.
 
 SCOPE AND RESIDUALS. `Runtime.ServerInstance` is implemented on darwin
 alone, so off darwin every read is unknown, the verdict is never CHANGED,
