@@ -294,11 +294,17 @@ Your role instructions are at:
 
 Work in this directory (your attempt's worktree) and commit your work
 here. If you need a decision before you can continue, send your manager
-a question with %s msg send --kind question --to manager --file <path>,
-then loop %s msg wait until the reply arrives and acknowledge it with
-%s msg ack <message-uuid>; before you submit, drain anything else queued
-with %s msg next and acknowledge each the same way. When your work is
-complete and committed, submit it by running:
+a question with:
+
+    %s msg send --kind question --to manager --file <path>
+
+Then loop %s msg wait until the reply arrives, and acknowledge it with:
+
+    %s msg ack <message-uuid>
+
+Before you submit, drain anything else queued with %s msg next and
+acknowledge each the same way. When your work is complete and committed,
+submit it by running:
 
     %s result submit --summary "<one-line summary>" --commit <commit-oid>
 
@@ -388,10 +394,16 @@ Your role instructions are at:
     %s
 
 If you need a decision before you can continue, send your manager a
-question with %s msg send --kind question --to manager --file <path>,
-then loop %s msg wait until the reply arrives and acknowledge it with
-%s msg ack <message-uuid>; before you submit, drain anything else queued
-with %s msg next and acknowledge each the same way.
+question with:
+
+    %s msg send --kind question --to manager --file <path>
+
+Then loop %s msg wait until the reply arrives, and acknowledge it with:
+
+    %s msg ack <message-uuid>
+
+Before you submit, drain anything else queued with %s msg next and
+acknowledge each the same way.
 
 Write your reasons to a file, then submit your verdict by running:
 

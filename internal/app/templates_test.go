@@ -233,9 +233,9 @@ func TestTemplatesQuoteGrammar(t *testing.T) {
 	// done after an accepted or duplicate result, stop on a stale line,
 	// and the result verb's own refusal lines.
 	for _, sentence := range []string{
-		"If you need a decision before you can continue, send your manager a question with /hop msg send --kind question --to manager --file <path>, " +
-			"then loop /hop msg wait until the reply arrives and acknowledge it with /hop msg ack <message-uuid>; " +
-			"before you submit, drain anything else queued with /hop msg next and acknowledge each the same way.",
+		"If you need a decision before you can continue, send your manager a question with: /hop msg send --kind question --to manager --file <path> " +
+			"Then loop /hop msg wait until the reply arrives, and acknowledge it with: /hop msg ack <message-uuid> " +
+			"Before you submit, drain anything else queued with /hop msg next and acknowledge each the same way.",
 		"A first line of " + GrammarResultAcceptedLine("<result-uuid>") + " or " + GrammarResultDuplicateLine("<result-uuid>") +
 			" means your work is done: end your turn without polling for messages.",
 		"A first line of " + GrammarResultRefusalLine(GrammarReasonStale, "<detail>") + " (or " + GrammarRefusalLine(GrammarReasonStale) +
@@ -266,9 +266,9 @@ func TestTemplatesQuoteGrammar(t *testing.T) {
 	for _, sentence := range []string{
 		"refused with " + GrammarRefusalLine(GrammarReasonSubjectMismatch) +
 			". On that first line, resubmit with the subject commit this assignment names.",
-		"If you need a decision before you can continue, send your manager a question with /hop msg send --kind question --to manager --file <path>, " +
-			"then loop /hop msg wait until the reply arrives and acknowledge it with /hop msg ack <message-uuid>; " +
-			"before you submit, drain anything else queued with /hop msg next and acknowledge each the same way.",
+		"If you need a decision before you can continue, send your manager a question with: /hop msg send --kind question --to manager --file <path> " +
+			"Then loop /hop msg wait until the reply arrives, and acknowledge it with: /hop msg ack <message-uuid> " +
+			"Before you submit, drain anything else queued with /hop msg next and acknowledge each the same way.",
 		"A first line of " + GrammarVerdictAcceptedLine("<review-uuid>") + " or " + GrammarVerdictDuplicateLine("<review-uuid>") +
 			" means your review is done: end your turn without polling for messages.",
 		"A first line of " + GrammarRefusalLine(GrammarReasonStale) + " or " + GrammarRefusalLine(GrammarReasonNotReviewer) +
