@@ -31,7 +31,7 @@ const workerInterruptionNoticeFirstLine = "task t1 needs-rework"
 func TestRealProcessWorkerInterruption(t *testing.T) {
 	artifacts := newArtifactDir(t)
 	server := prepareServer(t, artifacts)
-	worker := buildFixtureWorker(t, artifacts)
+	worker := buildFixtureWorker(t)
 	installFixtureWorkerAsClaudeStub(t, server, worker)
 	server.start(t)
 

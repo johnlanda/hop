@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -317,10 +318,119 @@ func writeHarnessStubs(t *testing.T, binDir string) {
 	t.Helper()
 	for _, name := range []string{"claude", "codex", "opencode"} {
 		script := "#!/bin/sh\necho \"" + name + " 0.0.0-stub\"\n"
-		if err := os.WriteFile(filepath.Join(binDir, name), []byte(script), 0o755); err != nil { //nolint:gosec // G306: a stub must be executable; it lives in this test's private roots.
-			t.Fatal(err)
-		}
+		writeHarnessStub(t, filepath.Join(binDir, name), []byte(script))
 	}
+}
+
+// replaceHarnessStub removes whatever currently occupies a harness stub path,
+// so its caller can create the path afresh rather than write into it.
+//
+// Every writer of a stub path in this package goes through here, and the
+// invariant that requires it is this: NO PATH THAT LINKS TO A SHARED BINARY
+// IS EVER WRITTEN IN PLACE. A stub path may be a hard link to a binary shared
+// by every test in the process — linkHarnessStub installs the fixture worker
+// that way, because a link shares the target's image and costs what running
+// the target again costs, while a copy is a new image and pays a full first
+// execution. Writing such a path in place writes THROUGH the link to the
+// shared file, and every later test in the process then executes whatever the
+// writer left behind. Removing the name first breaks the link, never the
+// file; installRealClaudeStub's symlink relies on the same property.
+func replaceHarnessStub(t *testing.T, path string) {
+	t.Helper()
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		t.Fatalf("remove existing %s stub: %v", filepath.Base(path), err)
+	}
+}
+
+// writeHarnessStub installs content as an executable stub, replacing whatever
+// occupied the path.
+func writeHarnessStub(t *testing.T, path string, content []byte) {
+	t.Helper()
+	replaceHarnessStub(t, path)
+	if err := os.WriteFile(path, content, 0o755); err != nil { //nolint:gosec // G306: a stub must be executable; it lives in this test's private roots.
+		t.Fatalf("install %s stub: %v", filepath.Base(path), err)
+	}
+}
+
+// linkSharedBinary makes path another name for target's image rather than a
+// duplicate of it, replacing whatever occupied path.
+//
+// What the link buys depends on the target, not on this call. Where target is
+// one of the binaries built and warmed once per process, every name linked to
+// it executes that already-evaluated image and costs a small fraction of a
+// first execution. Where target is a per-test build — a caller staging its own
+// wrapper as the harness — there is no warmth to inherit and the first
+// execution is paid once regardless; linking there only avoids copying the
+// image.
+//
+// Either way the name becomes another entry for one file, which is why
+// replaceHarnessStub exists: a later writer must unlink such a path, never
+// write through it.
+//
+// It falls back to a copy for one expected reason only — target living on
+// another filesystem, where no hard link can exist — and fails on anything
+// else. A copy is correct but pays a full first execution, so a blanket
+// fallback would quietly restore the per-test cost this linking exists to
+// remove and leave no signal that the mechanism had stopped working. A link
+// this machine cannot make is worth learning about once, loudly.
+func linkSharedBinary(t *testing.T, path, target string) {
+	t.Helper()
+	replaceHarnessStub(t, path)
+	err := os.Link(target, path)
+	switch {
+	case err == nil:
+		return
+	case errors.Is(err, syscall.EXDEV):
+		copyExecutable(t, target, path)
+	default:
+		t.Fatalf("link %s to %s: %v", filepath.Base(path), filepath.Base(target), err)
+	}
+}
+
+// linkHarnessStub points a harness stub path at target, sharing its image.
+func linkHarnessStub(t *testing.T, path, target string) {
+	t.Helper()
+	linkSharedBinary(t, path, target)
+}
+
+// sharedBinaryFingerprint is what a shared binary looked like the instant it
+// was built and warmed.
+type sharedBinaryFingerprint struct {
+	size    int64
+	modTime time.Time
+}
+
+// fingerprintSharedBinary records path's current size and modification time.
+func fingerprintSharedBinary(path string) (sharedBinaryFingerprint, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return sharedBinaryFingerprint{}, err
+	}
+	return sharedBinaryFingerprint{size: info.Size(), modTime: info.ModTime()}, nil
+}
+
+// checkSharedBinaryIntact returns a description of a violated invariant, or
+// the empty string. The invariant is the one every stub writer depends on: no
+// path that links to a shared binary is ever written in place. A stub path may
+// be a hard link to this file, so a writer that truncated its own path instead
+// of unlinking it first would have rewritten THIS file, and the symptom would
+// otherwise be an exec failure in whichever unrelated test happened to run
+// afterwards — an order-dependent mystery rather than a diagnosis.
+//
+// It must run before the shared directories are removed, since removing them
+// destroys the one piece of evidence worth having.
+func checkSharedBinaryIntact(name, path string, want sharedBinaryFingerprint) string {
+	if path == "" {
+		return ""
+	}
+	got, err := fingerprintSharedBinary(path)
+	if err != nil {
+		return fmt.Sprintf("the shared %s binary can no longer be read (%v); a stub path linking to it was replaced in place. The invariant: no path that links to a shared binary is ever written in place — stub writers must go through replaceHarnessStub", name, err)
+	}
+	if got.size != want.size || !got.modTime.Equal(want.modTime) {
+		return fmt.Sprintf("the shared %s binary changed after it was built (size %d then %d): a stub path linking to it was written in place. The invariant: no path that links to a shared binary is ever written in place — stub writers must go through replaceHarnessStub", name, want.size, got.size)
+	}
+	return ""
 }
 
 // environ builds the hermetic environment for one subprocess: temporary
@@ -750,19 +860,51 @@ func stagePlugin(t *testing.T) string {
 			t.Logf("remove staged plugin: %v", removeErr)
 		}
 	})
-	goBin, err := exec.LookPath("go")
-	if err != nil {
-		t.Fatalf("the go tool is required to build the plugin binary: %v", err)
+	// The staging directory must be fresh per test — that is the shape these
+	// scenarios register with herdr — but the executable inside it need not
+	// be: it is byte-for-byte the build buildHopBinary already made and
+	// warmed, so linking shares that image instead of producing a new one
+	// herdr would then execute for the first time. Nothing writes to this
+	// path afterwards, and the per-test cleanup below unlinks the name
+	// without touching the shared file.
+	binDir := filepath.Join(stage, ".bin")
+	if err := os.MkdirAll(binDir, 0o700); err != nil {
+		t.Fatal(err)
 	}
-	buildCtx, cancelBuild := context.WithTimeout(t.Context(), 2*time.Minute)
-	defer cancelBuild()
-	build := exec.CommandContext(buildCtx, goBin, "build", "-o", filepath.Join(stage, ".bin", "hop"), "./cmd/hop") //nolint:gosec // G204: the go tool builds this repository's own command.
-	build.Dir = root
-	if out, buildErr := build.CombinedOutput(); buildErr != nil {
-		t.Fatalf("go build ./cmd/hop: %v\n%s", buildErr, out)
-	}
+	linkSharedBinary(t, filepath.Join(binDir, "hop"), buildHopBinary(t))
 	copyFile(t, filepath.Join(root, "herdr-plugin.toml"), filepath.Join(stage, "herdr-plugin.toml"))
 	return stage
+}
+
+// warmExecutable runs a just-built binary once, for the execution itself
+// rather than for anything it does, and discards the outcome.
+//
+// The first execution of a newly written executable costs far more than
+// any later execution of that same file: the operating system evaluates
+// the new image once, through a single machine-wide service, so the cost
+// rises with how many processes anywhere are starting never-before-seen
+// binaries at that moment. Copying a warmed binary does not inherit the
+// warmth — a copy is a new image and pays in full — but a hard link to it
+// does, being the same image under another name.
+//
+// Without this call the whole of that cost lands on whichever run executes
+// the binary first, inside whatever budget that run is being held to, and
+// a test measures the loader instead of the fixture. Warming here spends it
+// once, deliberately, where no deadline is running.
+//
+// The environment is emptied so no behavior keyed off HOP_* or FAKE_HOP_*
+// can observe this invocation, and args must select a mode that returns
+// immediately without spawning children.
+func warmExecutable(t *testing.T, path string, args ...string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+	defer cancel()
+	warm := exec.CommandContext(ctx, path, args...) //nolint:gosec // G204: a binary this suite just built, with arguments this suite chose.
+	warm.Env = []string{}
+	// Reaching EOF on stdin is what ends the stand-in mode the fixture
+	// worker is warmed through; an empty reader gives it one immediately.
+	warm.Stdin = strings.NewReader("")
+	_ = warm.Run() //nolint:errcheck // only the exec matters here: the fake hop stub refuses an empty argv by design, and that refusal carries no information this warm-up wants.
 }
 
 // copyFile copies one regular file.
